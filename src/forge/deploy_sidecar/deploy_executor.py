@@ -673,7 +673,11 @@ class DeployExecutor:
         self._parent = parent_environment
         self._command_seconds = float(command_seconds)
         self._stop_confirm_seconds = float(stop_confirm_seconds)
-        self._spawn = spawn or self._default_spawn
+        # The injected seam, if any (tests stand in for the process); the
+        # executor always starts a command through :meth:`_spawn`, which
+        # calls it or the real default directly (14 October 2026: a runner is
+        # only ever called, never held as a value).
+        self._spawn_seam = spawn
         self._clock = clock
         # TWO LOCKS, AND THE SECOND ONE MATTERS (the stage's reviewer, third
         # finding). This one is the executor's own bookkeeping lock: which
@@ -1580,6 +1584,12 @@ class DeployExecutor:
         return None
 
     # -- starting one ------------------------------------------------------
+
+    def _spawn(self, **kwargs: Any) -> "subprocess.Popen[bytes]":
+        """Start one command: through the injected seam, or for real."""
+        if self._spawn_seam is not None:
+            return self._spawn_seam(**kwargs)
+        return self._default_spawn(**kwargs)
 
     @staticmethod
     def _default_spawn(**kwargs: Any) -> "subprocess.Popen[bytes]":

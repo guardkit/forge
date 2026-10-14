@@ -1842,22 +1842,19 @@ GENERIC_RUNNERS: dict[tuple[str, str], dict[str, Any]] = {
         "dotted": {"forge.build.test_verification._execute_via_deepagents"},
         "names": {"_execute_via_deepagents"},
     },
-    ("deploy_sidecar/deploy_executor.py", "_default_spawn"): {
-        "dotted": {"forge.deploy_sidecar.deploy_executor.DeployExecutor._default_spawn"},
+    ("deploy_sidecar/deploy_executor.py", "_spawn"): {
+        "dotted": {
+            "forge.deploy_sidecar.deploy_executor.DeployExecutor._spawn",
+            "forge.deploy_sidecar.deploy_executor.DeployExecutor._default_spawn",
+        },
         "names": {"_spawn", "_default_spawn"},
+        # Its two bodies: the seam-or-real switch and the real launch.
+        "bodies": {"_spawn", "_default_spawn"},
     },
     ("deploy_sidecar/service.py", "_start_and_collect"): {
         "dotted": {"forge.deploy_sidecar.service._start_and_collect"},
         "names": {"_start_and_collect"},
     },
-}
-
-#: Places a generic runner may be used as a value, each with its reason.
-RUNNER_VALUE_USES: dict[tuple[str, str], str] = {
-    ("deploy_sidecar/deploy_executor.py", "__init__"): (
-        "the executor's own spawn seam: tests inject one, and every call "
-        "through it (self._spawn) is judged"
-    ),
 }
 
 #: The only two places that may build an issued preview value.
@@ -2559,6 +2556,112 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
     return problems
 
 
+def _guarded_callables() -> set[str]:
+    """Names that may only ever be called: the helper's and every generic
+    runner's."""
+    names = {target.rsplit(".", 1)[1] for target in HELPERS}
+    for (_rel, fname), spec in GENERIC_RUNNERS.items():
+        names.add(fname)
+        names.update(spec["names"])
+        names.update(spec.get("bodies", ()))
+    return names
+
+
+def _direct_use_violations(modules: list[_Module]) -> list[str]:
+    """The direct-use-only rule (14 October 2026).
+
+    For every guarded name — a launch module, a launch function, a generic
+    runner and the helper:
+
+    1. it is imported only under its own name: any ``as`` is a violation;
+    2. every reference to it is a direct use: a function, runner or the
+       helper only as the ``func`` of a call; a module only as the base of an
+       attribute, and when that attribute is a launch function, that
+       attribute only as the ``func`` of a call. Any other reference — an
+       assignment, an argument, a keyword value, a return, a default, a
+       container, a lambda's value, a decorator — is a violation, and so is
+       rebinding a runner or the helper as an attribute.
+
+    Type annotations name things without running them and are left out.
+    """
+    callables = _guarded_callables()
+    launch_functions = {name for names in _LAUNCHES.values() for name in names}
+    problems: list[str] = []
+    for mod in modules:
+        skip = _annotation_nodes(mod.tree)
+
+        def report(node: ast.AST, sentence: str) -> None:
+            holder = _enclosing_function(mod, node) or _enclosing(mod, node, ast.ClassDef)
+            where = getattr(holder, "name", "<module>")
+            problems.append(f"{mod.rel}:{getattr(node, 'lineno', 0)} in {where}: {sentence}")
+
+        runner_dotted = {d for spec in GENERIC_RUNNERS.values() for d in spec["dotted"]}
+
+        def names_a_callable(name: str) -> bool:
+            """The name itself is guarded, or an import makes it one."""
+            if name in callables:
+                return True
+            return any(
+                t in HELPERS or t in runner_dotted or t.rpartition(".")[2] in callables
+                for t in _targets(mod, name)
+            )
+
+        def called(node: ast.AST) -> bool:
+            parent = mod.parents.get(id(node))
+            return isinstance(parent, ast.Call) and parent.func is node
+
+        for node in ast.walk(mod.tree):
+            if id(node) in skip:
+                continue
+            # (1) imported only under its own name
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    if alias.asname and alias.name in _LAUNCHES:
+                        report(node, f"the launch module {alias.name} is imported as {alias.asname!r}")
+            elif isinstance(node, ast.ImportFrom):
+                for alias in node.names:
+                    if not alias.asname or alias.asname == alias.name:
+                        continue
+                    guarded = alias.name in callables or (
+                        not node.level
+                        and node.module in _LAUNCHES
+                        and alias.name in _LAUNCHES[node.module]
+                    )
+                    if guarded:
+                        report(node, f"{alias.name} is imported as {alias.asname!r}")
+            # (2) every reference is a direct use
+            elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+                targets = _targets(mod, node.id)
+                if names_a_callable(node.id) and not called(node):
+                    report(node, f"{node.id} is referred to other than by calling it")
+                elif any(
+                    t.rpartition(".")[0] in _LAUNCHES
+                    and t.rpartition(".")[2] in _LAUNCHES[t.rpartition(".")[0]]
+                    for t in targets
+                ) and not called(node):
+                    report(node, f"the launch function {node.id} is referred to other than by calling it")
+                elif targets & set(_LAUNCHES):
+                    parent = mod.parents.get(id(node))
+                    if not (isinstance(parent, ast.Attribute) and parent.value is node):
+                        report(node, f"the launch module {node.id} is referred to other than as the base of an attribute")
+                    elif any(
+                        parent.attr in _LAUNCHES[m] for m in targets & set(_LAUNCHES)
+                    ) and not called(parent):
+                        report(
+                            node,
+                            f"the launch function {node.id}.{parent.attr} is referred "
+                            "to other than by calling it",
+                        )
+            elif isinstance(node, ast.Attribute):
+                if node.attr in callables or node.attr in _ANY_RECEIVER_LAUNCHES:
+                    if isinstance(node.ctx, (ast.Store, ast.Del)):
+                        report(node, f"{node.attr} is rebound as an attribute")
+                    elif not called(node):
+                        report(node, f"{node.attr} is referred to other than by calling it")
+    del launch_functions
+    return problems
+
+
 def unaccounted_launches(package: Path) -> list[str]:
     _SCOPE_CACHE.clear()
     modules = _load_modules(package)
@@ -2588,8 +2691,6 @@ def unaccounted_launches(package: Path) -> list[str]:
             problems.append(f"{mod.rel}:{node.lineno} in {fname}: {sentence}")
 
     for mod in modules:
-        called = {id(n.func) for n in ast.walk(mod.tree) if isinstance(n, ast.Call)}
-        called |= _annotation_nodes(mod.tree)
         for node in ast.walk(mod.tree):
             if isinstance(node, ast.Call):
                 kind = _launch_kind(mod, node.func)
@@ -2628,37 +2729,15 @@ def unaccounted_launches(package: Path) -> list[str]:
                             "is built outside the preview's preparation and the "
                             "helper's reader"
                         )
-            elif isinstance(node, (ast.Attribute, ast.Name)) and id(node) not in called:
-                runner = _runner_named(mod, node)
-                if runner and isinstance(getattr(node, "ctx", None), ast.Load):
-                    _, fname = place(mod, node)
-                    if (mod.rel, fname) not in RUNNER_VALUE_USES and not (
-                        mod.rel == runner[0] and fname == runner[1]
-                    ):
-                        problems.append(
-                            f"{mod.rel}:{node.lineno} in {fname}: the generic runner "
-                            f"{runner[1]} is used as a value (held in a variable, "
-                            "passed on or wrapped), so its env= cannot be checked"
-                        )
-                    continue
-                kind = _launch_kind(mod, node)
-                if kind and isinstance(getattr(node, "ctx", None), ast.Load):
-                    if isinstance(mod.parents.get(id(node)), ast.Attribute):
-                        continue  # part of a longer dotted name, judged there
-                    flag(
-                        mod, node,
-                        f"the launch function {kind} is used as a value (held in "
-                        "a variable, passed on or wrapped), so its env= cannot be "
-                        "checked",
-                    )
     problems.extend(_reserved_name_rebindings(modules))
+    problems.extend(_direct_use_violations(modules))
     for (rel, fname), spec in GENERIC_RUNNERS.items():
         for mod in modules:
             for node in ast.walk(mod.tree):
                 if not isinstance(node, ast.Call) or _runner_named(mod, node.func) != (rel, fname):
                     continue
                 func = _enclosing_function(mod, node)
-                if mod.rel == rel and getattr(func, "name", None) == fname:
+                if mod.rel == rel and getattr(func, "name", None) in spec.get("bodies", {fname}):
                     continue  # the runner's own body
                 judge(mod, node, f"call to the generic runner {fname}")
     return sorted(set(problems))
@@ -3401,7 +3480,10 @@ def test_defaults_and_reserved_names_are_caught(tmp_path: Path) -> None:
     assert expected - set(by_function) == set(), problems
     assert not {n for n in by_function if n.startswith("ok_")}, problems
     assert any("reserved name '_start_and_collect'" in why for why in by_function["p7_same_named_default_capture"])
-    assert any("used as a value" in why for why in by_function["p7_differently_named_default"])
+    assert any(
+        "referred to other than by calling it" in why
+        for why in by_function["p7_differently_named_default"]
+    )
     assert any("call to the generic runner" in why for why in by_function["p7_lambda_default_calling_runner"])
     assert any(
         "reserved name 'build_project_command_env'" in why
@@ -3553,6 +3635,90 @@ def test_every_binding_and_every_import_is_seen(
     if prefix == "p9_":
         assert any("is imported as 'tool'" in p for p in problems), problems
         assert any("is imported as 'go'" in p for p in problems), problems
+
+
+#: The direct-use-only rule, probed (14 October 2026): a runner imported
+#: ``as`` another name that is reused elsewhere, a launch module assigned to a
+#: variable, passed as an argument or taken as a default, a launch function
+#: kept in a dict, and a runner returned.
+GUARD_PROBES_10 = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.deploy_sidecar.service import _start_and_collect
+    from forge.launch_environment import build_project_command_env
+
+
+    def p10_runner_alias_reused(cmd, folder):
+        from forge.deploy_sidecar.service import _start_and_collect as invoke
+
+        return invoke(argv=cmd, cwd=".", env=build_project_command_env(folder), timeout=1, what="x")
+
+
+    def _elsewhere():
+        from json import dumps as invoke
+
+        return invoke({})
+
+
+    def p10_module_assigned_to_a_variable(cmd, folder):
+        tool = subprocess
+        tool.run(cmd, env=build_project_command_env(folder))
+
+
+    def _hand_on(module, cmd):
+        return module, cmd
+
+
+    def p10_module_passed_as_an_argument(cmd):
+        _hand_on(subprocess, cmd)
+
+
+    def p10_module_as_a_default(cmd, folder, tool=subprocess):
+        tool.run(cmd, env=build_project_command_env(folder))
+
+
+    def p10_launch_function_in_a_dict(cmd):
+        table = {"go": subprocess.run}
+        table["go"](cmd)
+
+
+    def p10_runner_returned(cmd):
+        return _start_and_collect
+
+
+    def ok_direct_subprocess_run_with_helper(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def ok_direct_runner_with_helper(cmd, folder):
+        return _start_and_collect(
+            argv=cmd, cwd=".", env=build_project_command_env(folder), timeout=1, what="x"
+        )
+
+
+    def ok_os_path_and_environ(path):
+        return os.path.join(path, "x"), os.environ.get("HOME")
+    '''
+)
+
+
+def test_guarded_names_are_only_used_directly(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe10.py").write_text(GUARD_PROBES_10, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_10).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p10_")
+    }
+    assert len(expected) == 6
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
 
 
 def test_every_process_launch_is_accounted_for() -> None:

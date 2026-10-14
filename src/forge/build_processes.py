@@ -48,6 +48,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -330,7 +331,10 @@ def signal_process_group(proc: Any, sig: int) -> None:
     pid = getattr(proc, "pid", None)
     if pid is None:  # pragma: no cover — asyncio always sets pid
         return
-    if hasattr(os, "killpg"):
+    # Every POSIX system has killpg (the launch guard keeps ``os`` to direct
+    # attribute use, 14 October 2026, so this asks the platform rather than
+    # handing the module to hasattr).
+    if sys.platform != "win32":
         try:
             os.killpg(pid, sig)
             return
@@ -583,13 +587,16 @@ async def remove_fixture_containers(build_id: str) -> list[str] | None:
         build_id,
     )
     try:
+        # The launch is written as a direct call (14 October 2026), so the
+        # launch guard sees exactly what runs.
         await asyncio.to_thread(
-            subprocess.run,
-            [engine, "rm", "--force", *ids],
-            capture_output=True,
-            text=True,
-            timeout=_ENGINE_TIMEOUT_SECONDS,
-            check=False,
+            lambda: subprocess.run(  # noqa: S603 — the container engine, fixed argv
+                [engine, "rm", "--force", *ids],
+                capture_output=True,
+                text=True,
+                timeout=_ENGINE_TIMEOUT_SECONDS,
+                check=False,
+            )
         )
     except (OSError, subprocess.TimeoutExpired) as exc:
         logger.warning(

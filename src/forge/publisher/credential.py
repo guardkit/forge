@@ -153,7 +153,17 @@ def _read_without_following(
     With ``identity`` given, the file opened has to be that very file — the
     ``(st_dev, st_ino)`` recorded when it was looked at — or nothing is read.
     """
-    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    # Read as attributes, not through getattr(os, ...): the launch guard keeps
+    # ``os`` to direct attribute use (14 October 2026).
+    try:
+        no_follow = os.O_NOFOLLOW
+    except AttributeError:  # pragma: no cover — every POSIX system has it
+        no_follow = 0
+    try:
+        close_on_exec = os.O_CLOEXEC
+    except AttributeError:  # pragma: no cover — every POSIX system has it
+        close_on_exec = 0
+    flags = os.O_RDONLY | no_follow | close_on_exec
     descriptor = os.open(str(where), flags)
     try:
         found = os.fstat(descriptor)
