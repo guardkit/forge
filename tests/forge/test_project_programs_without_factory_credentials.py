@@ -2241,10 +2241,16 @@ def _feeds_values_from_parameters(call: ast.Call, func: Any) -> bool:
 
 
 def _inline_helper(node: ast.AST | None, mod: _Module, func: Any, wrappers: set[str]) -> bool:
-    """``node`` is a call to the helper — or to a function that only ever
-    returns one inline — written right there, with no argument fed from this
-    process's own environment."""
-    if not isinstance(node, ast.Call):
+    """``node`` is a call to the helper — or to a module-level function that
+    only ever returns one inline — written right there by its plain name,
+    with no argument fed from this process's own environment.
+
+    A call through an attribute (``self.env()``, ``cls.env()``,
+    ``obj.env()``) never counts (14 October 2026): which method runs is
+    decided at run time, by the instance's class, a subclass's override or
+    a conditional definition, so no definition can vouch for it.
+    """
+    if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
         return False
     target = _resolve(mod, node.func, node)
     if target in HELPERS:
@@ -2350,15 +2356,17 @@ def _defined_once(mod: _Module, node: Any) -> bool:
 
 
 def _wrappers(modules: list[_Module]) -> set[str]:
-    """Functions whose whole body is ``return <helper call>`` (or a call to
-    another such function), by dotted name, none of whose parameters flows
-    into the helper's ``additions`` or ``parent``."""
+    """MODULE-LEVEL functions whose whole body is ``return <helper call>``
+    (or a call to another such function), by dotted name, none of whose
+    parameters flows into the helper's ``additions`` or ``parent``. A method
+    or a nested function is never a wrapper: it is reached by dispatch or
+    by a closure, not by one fixed definition (14 October 2026)."""
     found: set[str] = set()
     changed = True
     while changed:
         changed = False
         for mod in modules:
-            for node in ast.walk(mod.tree):
+            for node in mod.tree.body:
                 if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                     continue
                 full = f"{mod.dotted}.{_qualname(mod, node)}"
@@ -2667,6 +2675,11 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
             # launch module's), whatever module text precedes it, or when it
             # is a launch function of a launch module. Generic words (run,
             # call, spawn ...) count only on a launch module.
+            if isinstance(node, ast.ImportFrom) and any(a.name == "*" for a in node.names):
+                # A wildcard import binds names nobody can see, so nothing it
+                # brings in can be checked (14 October 2026).
+                where = "." * node.level + (node.module or "")
+                report(node, f"wildcard import from {where}")
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 aliases = [a for a in node.names if a.asname]
                 for alias, (local, target) in zip(
@@ -4062,13 +4075,14 @@ GUARD_PROBES_13 = textwrap.dedent(
         subprocess.run(cmd, env=env(folder))
 
 
-    class Single:
-        def env(self, folder):
-            return build_project_command_env(folder)
+    def _single(folder):
+        return build_project_command_env(folder)
 
 
-    def ok_single_class_method_wrapper(cmd, folder):
-        subprocess.run(cmd, env=Single.env(None, folder))
+    def ok_single_module_level_wrapper(cmd, folder):
+        # (A method wrapper is no longer trusted at all, 14 October 2026:
+        # method dispatch is decided at run time.)
+        subprocess.run(cmd, env=_single(folder))
 
 
     def ok_inline_helper(cmd, folder):
@@ -4091,6 +4105,116 @@ def test_only_the_one_definition_of_a_qualified_identity_is_trusted(tmp_path: Pa
     }
     assert len(expected) == 4
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Wildcard imports and method dispatch, probed (14 October 2026): a
+#: wildcard import from subprocess, from os and from an unrelated module are
+#: each a violation; a method wrapper reached through ``self`` and a
+#: subclass override defined under a class-level ``if`` are never trusted.
+GUARD_PROBES_14_WILD_SUBPROCESS = textwrap.dedent(
+    '''\
+    from subprocess import *  # noqa: F403
+
+
+    def p14_launch_after_wildcard_subprocess(cmd):
+        run(cmd)  # noqa: F405
+    '''
+)
+GUARD_PROBES_14_WILD_OS = textwrap.dedent(
+    '''\
+    from os import *  # noqa: F403
+
+
+    def p14_launch_after_wildcard_os(cmd):
+        system(cmd)  # noqa: F405
+    '''
+)
+GUARD_PROBES_14_WILD_OTHER = textwrap.dedent(
+    '''\
+    from json import *  # noqa: F403
+
+
+    def p14_name_after_unrelated_wildcard(value):
+        return dumps(value)  # noqa: F405
+    '''
+)
+GUARD_PROBES_14_DISPATCH = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+
+
+    class Base:
+        def env(self, folder):
+            return build_project_command_env(folder)
+
+        def p14_plain_method_wrapper_via_self(self, cmd, folder):
+            subprocess.run(cmd, env=self.env(folder))
+
+
+    class Child(Base):
+        if os.environ.get("SOME_SWITCH"):
+
+            def env(self, folder):
+                return dict(os.environ)
+
+        def p14_conditional_subclass_override(self, cmd, folder):
+            subprocess.run(cmd, env=self.env(folder))
+
+
+    def _module_wrapper(folder):
+        return build_project_command_env(folder)
+
+
+    def ok_module_level_wrapper(cmd, folder):
+        subprocess.run(cmd, env=_module_wrapper(folder))
+
+
+    def ok_inline_helper(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def ok_explicit_import_launch_with_helper_env(cmd, folder):
+        from subprocess import run
+
+        run(cmd, env=build_project_command_env(folder))
+    '''
+)
+
+
+def test_wildcard_imports_and_method_dispatch_are_never_trusted(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    sources = {
+        "zz_wild_subprocess.py": GUARD_PROBES_14_WILD_SUBPROCESS,
+        "zz_wild_os.py": GUARD_PROBES_14_WILD_OS,
+        "zz_wild_other.py": GUARD_PROBES_14_WILD_OTHER,
+        "zz_dispatch.py": GUARD_PROBES_14_DISPATCH,
+    }
+    for name, text in sources.items():
+        (pkg / name).write_text(text, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    for name, module in (
+        ("zz_wild_subprocess.py", "subprocess"),
+        ("zz_wild_os.py", "os"),
+        ("zz_wild_other.py", "json"),
+    ):
+        assert any(
+            p.startswith(name) and f"wildcard import from {module}" in p for p in problems
+        ), problems
+    named = {
+        p.split(" in ", 1)[1].split(":", 1)[0]
+        for p in problems
+        if p.startswith("zz_dispatch.py")
+    }
+    assert {
+        "p14_plain_method_wrapper_via_self",
+        "p14_conditional_subclass_override",
+    } <= named, problems
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
