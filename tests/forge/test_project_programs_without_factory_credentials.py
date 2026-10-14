@@ -2019,15 +2019,9 @@ def _finalise(dotted: str, seen: frozenset[str] = frozenset()) -> set[str]:
     parts = dotted.split(".")
     if dotted in seen:
         return {UNRESOLVED + dotted}
-    # EVERY way the dotted name can be read inside the package (R3). The
-    # longest prefix that is one of its modules is one reading. When the
-    # WHOLE name is a module file AND its package's ``__init__`` explicitly
-    # binds the same name — ``forge/run.py`` exists and ``forge/__init__.py``
-    # says ``from subprocess import run`` — ``from forge import run`` may be
-    # either, so that binding is a second reading. All possible identities
-    # are kept: a launch if ANY is, the helper or a runner only if ALL are.
-    # (A longer name, ``forge.run.x``, is reached through its base, whose
-    # readings are already both kept, so only the whole-name case adds one.)
+    # The longest prefix that is one of the package's modules. A name that
+    # is both a package binding and a submodule cannot arise: that collision
+    # is itself a violation (:func:`_module_name_collisions`).
     readings: list[tuple[str, int]] = []
     for cut in range(len(parts), 0, -1):
         if ".".join(parts[:cut]) in _PACKAGE_MODULES:
@@ -2035,14 +2029,6 @@ def _finalise(dotted: str, seen: frozenset[str] = frozenset()) -> set[str]:
             break
     if not readings:
         return {dotted}
-    if readings[0][1] == len(parts) and len(parts) > 1:
-        package = _PACKAGE_MODULES.get(".".join(parts[:-1]))
-        if (
-            package is not None
-            and package.rel.endswith("__init__.py")
-            and _bindings(package.tree).get(parts[-1])
-        ):
-            readings.append((".".join(parts[:-1]), len(parts) - 1))
     result: set[str] = set()
     for prefix, cut in readings:
         result |= _follow(_PACKAGE_MODULES[prefix], parts, cut, dotted, seen)
@@ -2078,11 +2064,6 @@ def _follow(
         for _kind, node in bound:
             for local, target in _import_bindings(node, mod.package):
                 if local != name:
-                    continue
-                if target == dotted:
-                    # A package importing its own submodule under the
-                    # submodule's name: the binding is that very module.
-                    result.add(dotted)
                     continue
                 for final in _finalise(target, seen | {dotted}):
                     if not rest:
@@ -2926,8 +2907,8 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
 
 def _attribute_chain_targets(mod: _Module, node: ast.Attribute) -> set[str]:
     """Every dotted name an attribute chain ``a.b.c`` may refer to: its base
-    name resolved (by scope, and by every import of it in the module), with
-    the whole chain of attributes appended."""
+    name resolved (by scope, and by every import of it in the module), then
+    each attribute in turn."""
     attributes: list[str] = []
     current: ast.AST = node
     while isinstance(current, ast.Attribute):
@@ -2935,15 +2916,92 @@ def _attribute_chain_targets(mod: _Module, node: ast.Attribute) -> set[str]:
         current = current.value
     if not isinstance(current, ast.Name):
         return set()
-    suffix = ".".join(reversed(attributes))
-    bases = _resolve_all(mod, current, current) | _targets(mod, current.id)
-    out: set[str] = set()
-    for base in bases:
-        if base.startswith(UNRESOLVED):
-            out.add(f"{base}.{suffix}")  # stays unresolved down the chain
-        else:
-            out |= _finalise(f"{base}.{suffix}")
-    return out
+    # Component by component, as :func:`_resolve_all` does: each attribute
+    # is resolved from what the chain so far finally is, and an unresolved
+    # step stays unresolved to the end (14 October 2026, review 3, R4).
+    names = _resolve_all(mod, current, current) | _targets(mod, current.id)
+    for attribute in reversed(attributes):
+        step: set[str] = set()
+        for base in names:
+            if base.startswith(UNRESOLVED):
+                step.add(f"{base}.{attribute}")
+            else:
+                step |= _finalise(f"{base}.{attribute}")
+        names = step
+    return names
+
+
+#: Names no module or package inside the scanned package may have: the launch
+#: module roots, and ``nt``.
+FORBIDDEN_MODULE_NAMES: frozenset[str] = frozenset({*LAUNCH_MODULES, "nt"})
+
+#: The real source's two existing name collisions, reported for a decision
+#: (14 October 2026) rather than renamed in this change. Each is keyed by the
+#: file and the name; remove the entry when the name is changed.
+PENDING_NAME_DECISIONS: dict[tuple[str, str], str] = {
+    ("pipeline/dispatchers/subprocess.py", "subprocess"): (
+        "the subprocess-stage dispatcher, imported as "
+        "forge.pipeline.dispatchers.subprocess by serve and three other "
+        "modules; awaiting a decision to rename"
+    ),
+    ("discovery/__init__.py", "resolve"): (
+        "the package re-exports the function resolve from its own submodule "
+        "resolve (from forge.discovery.resolve import resolve); awaiting a "
+        "decision to rename one of the two"
+    ),
+}
+
+
+def _module_name_collisions(modules: list[_Module]) -> list[str]:
+    """Two blunt rules that make name collisions impossible (14 October 2026,
+    review 3, R4: the coordinator's decision to stop emulating import
+    semantics for them, as with aliases).
+
+    1. No module or package inside the scanned package is named like a launch
+       module root (``subprocess``, ``os``, ``asyncio``, ``pty``,
+       ``multiprocessing``, ``posix``, ``nt``).
+    2. A package's ``__init__`` binds no name that is also the name of one
+       of its own submodules or subpackages, except the plain import of that
+       very submodule (``from pkg import sub``, ``from . import sub``); any
+       other binding of it — an import of something else, a definition, a
+       class, an assignment — is a violation.
+    """
+    problems: list[str] = []
+    for mod in modules:
+        parts = Path(mod.rel).with_suffix("").parts
+        for part in parts:
+            if part in FORBIDDEN_MODULE_NAMES and (mod.rel, part) not in PENDING_NAME_DECISIONS:
+                problems.append(
+                    f"{mod.rel}:0 in <module>: a module or package is named "
+                    f"{part!r}, the name of a launch module"
+                )
+                break
+    by_dotted = {mod.dotted: mod for mod in modules}
+    for mod in modules:
+        if not mod.rel.endswith("__init__.py"):
+            continue
+        children = {
+            dotted.rpartition(".")[2]
+            for dotted in by_dotted
+            if dotted.rpartition(".")[0] == mod.dotted and dotted != mod.dotted
+        }
+        bound = _bindings(mod.tree)
+        for child in sorted(children):
+            if (mod.rel, child) in PENDING_NAME_DECISIONS:
+                continue
+            for kind, node in bound.get(child, []):
+                if kind == "import" and all(
+                    target == f"{mod.dotted}.{child}"
+                    for local, target in _import_bindings(node, mod.package)
+                    if local == child
+                ):
+                    continue  # the plain import of that very submodule
+                problems.append(
+                    f"{mod.rel}:{getattr(node, 'lineno', 0)} in <module>: the "
+                    f"package binds {child!r} by a {kind} binding, and {child!r} "
+                    "is also one of its own submodules"
+                )
+    return problems
 
 
 def unaccounted_launches(package: Path) -> list[str]:
@@ -3034,6 +3092,7 @@ def unaccounted_launches(package: Path) -> list[str]:
                     continue  # the runner's own body
                 judge(mod, node, f"call to the generic runner {fname}")
     problems.extend(problems_of_trust)
+    problems.extend(_module_name_collisions(modules))
     return sorted(set(problems))
 
 
@@ -4796,9 +4855,9 @@ def test_a_reexport_is_resolved_all_the_way_and_unresolved_spreads(tmp_path: Pat
 
 #: A name that is both a package binding and a submodule, probed (14 October
 #: 2026, review 2, R3): ``forge/__init__.py`` binds ``run`` from subprocess
-#: while an empty ``forge/run.py`` also exists; ``from forge import run`` is
-#: kept as both, so calling or storing it is a launch. A genuine submodule
-#: with no package binding stays an ordinary module.
+#: while an empty ``forge/run.py`` also exists. Since review 3 (R4) that
+#: collision is itself a violation. A genuine submodule with no package
+#: binding stays an ordinary module.
 GUARD_PROBES_20: dict[str, str] = {
     "__init__.py": textwrap.dedent(
         '''\
@@ -4838,15 +4897,120 @@ GUARD_PROBES_20: dict[str, str] = {
 }
 
 
-def test_a_package_binding_and_a_same_named_submodule_are_both_kept(tmp_path: Path) -> None:
+def test_a_package_binding_and_a_same_named_submodule_are_a_violation(tmp_path: Path) -> None:
+    """Review 2 (R3) kept both identities; review 3 (R4) made the collision
+    itself a violation instead, as with aliases: the package's __init__ may
+    not bind a name that is also one of its own submodules."""
     pkg = tmp_path / "forge"
     pkg.mkdir()
     for name, text in GUARD_PROBES_20.items():
         (pkg / name).write_text(text, encoding="utf-8")
     problems = unaccounted_launches(pkg)
-    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
-    assert {"p20_collision_call", "p20_collision_store"} <= named, problems
-    assert not {n for n in named if n.startswith("ok_")}, problems
+    assert any(
+        p.startswith("__init__.py:") and "binds 'run'" in p and "own submodules" in p
+        for p in problems
+    ), problems
+    assert not any(" in ok_" in p for p in problems), problems
+
+
+#: Name collisions made impossible, probed (14 October 2026, review 3, R4):
+#: a package that imports subprocess while holding its own subprocess.py
+#: (both blunt rules), and a subpackage whose __init__ binds a non-launch
+#: name that is also one of its submodules. The controls (a call with the
+#: helper's environment, a genuine local submodule, and the plain import of
+#: the package's own submodule in its __init__) stay clean.
+GUARD_PROBES_21_R4: dict[str, str] = {
+    "__init__.py": textwrap.dedent(
+        '''\
+        import subprocess
+        '''
+    ),
+    "subprocess.py": textwrap.dedent(
+        '''\
+        def run(cmd):
+            return cmd
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import forge
+
+
+        def p21_store_through_a_colliding_name(cmd):
+            saved = forge.subprocess.run
+            return saved
+        '''
+    ),
+}
+GUARD_PROBES_21_COLLISION: dict[str, str] = {
+    "__init__.py": "",
+    "sub/__init__.py": textwrap.dedent(
+        '''\
+        from . import tool
+        from .tool import helper as reporting
+
+        reporting_level = 1
+        '''
+    ),
+    "sub/reporting.py": textwrap.dedent(
+        '''\
+        def summary(value):
+            return value
+        '''
+    ),
+    "sub/tool.py": textwrap.dedent(
+        '''\
+        def helper(value):
+            return value
+        '''
+    ),
+    "sub/zz_main.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+        from forge.launch_environment import build_project_command_env
+
+        from . import tool
+
+
+        def ok_helper_environment_call(cmd, folder):
+            subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+        def ok_genuine_local_submodule(value):
+            return tool.helper(value)
+        '''
+    ),
+}
+
+
+def _write_package(root: Path, files: dict[str, str]) -> Path:
+    pkg = root / "forge"
+    for name, text in files.items():
+        (pkg / name).parent.mkdir(parents=True, exist_ok=True)
+        (pkg / name).write_text(text, encoding="utf-8")
+    return pkg
+
+
+def test_name_collisions_are_violations(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path / "r4", GUARD_PROBES_21_R4))
+    assert any(
+        p.startswith("subprocess.py:") and "named 'subprocess'" in p for p in problems
+    ), problems
+    assert any(
+        p.startswith("__init__.py:") and "binds 'subprocess'" in p for p in problems
+    ), problems
+
+    problems = unaccounted_launches(
+        _write_package(tmp_path / "collision", GUARD_PROBES_21_COLLISION)
+    )
+    assert any(
+        p.startswith("sub/__init__.py:") and "binds 'reporting'" in p for p in problems
+    ), problems
+    # The plain import of its own submodule is not a collision, and the
+    # controls are clean.
+    assert not any("binds 'tool'" in p for p in problems), problems
+    assert not any(" in ok_" in p for p in problems), problems
 
 
 def test_every_process_launch_is_accounted_for() -> None:
@@ -4876,6 +5040,20 @@ def test_the_allowed_list_names_only_real_places() -> None:
         if fname not in names:
             missing.append(f"{rel}:{fname}")
     assert not missing, f"allowed-list entries that name nothing: {missing}"
+
+
+def test_every_pending_name_decision_is_still_a_real_collision() -> None:
+    """A pending entry is removed once its name is changed."""
+    _SCOPE_CACHE.clear()
+    modules = _load_modules(PACKAGE)
+    saved = dict(PENDING_NAME_DECISIONS)
+    PENDING_NAME_DECISIONS.clear()
+    try:
+        found = _module_name_collisions(modules)
+    finally:
+        PENDING_NAME_DECISIONS.update(saved)
+    for rel, name in saved:
+        assert any(p.startswith(f"{rel}:") and repr(name) in p for p in found), (rel, name)
 
 
 def test_the_guard_catches_a_new_launch(tmp_path: Path) -> None:
