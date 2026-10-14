@@ -234,8 +234,10 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
     ),
     (
         "OPENAI_API_KEY",
-        "satisfies that client's key check — on this estate a placeholder, not "
-        "a secret, and it is never read or logged here",
+        "satisfies that client's key check. In the sandbox it is a fixed "
+        "placeholder, not a secret: the model door on the gateway adds the "
+        "real key outside the sandbox (14 October 2026). It is never read or "
+        "logged here",
     ),
     (
         "ANTHROPIC_BASE_URL",
@@ -392,9 +394,17 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "whether this build uses memory at all",
     ),
     (
+        "FLEET_MEMORY_MCP_URL",
+        "the memory door: the memory service at the gateway address, which "
+        "needs no key. In the sandbox, where no database address or bus "
+        "password is handed in (14 October 2026), the build system reads and "
+        "writes memory through it",
+    ),
+    (
         "FLEET_MEMORY_PG_DSN",
-        "where the memory store is; without it the build system falls back to "
-        "a code default that is not the fleet store at all",
+        "where the memory store is, for a build that reads it directly. It is "
+        "not handed into the sandbox, where reads go through the memory door "
+        "above instead",
     ),
     (
         "FLEET_MEMORY_EMBED_URL",
@@ -412,12 +422,13 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
     ),
     (
         "FLEET_MEMORY_NATS_URL",
-        "where a build's memory writes are published",
+        "where a build's memory writes are published, outside the sandbox; in "
+        "the sandbox they go through the memory door instead",
     ),
     (
         "GUARDKIT_NATS_PASSWORD",
         "what lets those writes be published at all; it moves opaquely and is "
-        "never read or printed here",
+        "never read or printed here, and it is not handed into the sandbox",
     ),
 )
 
