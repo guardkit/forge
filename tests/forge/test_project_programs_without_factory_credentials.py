@@ -2017,36 +2017,72 @@ def _finalise(dotted: str, seen: frozenset[str] = frozenset()) -> set[str]:
     if cached is not None and not seen:
         return set(cached)
     parts = dotted.split(".")
-    for cut in range(len(parts), 0, -1):
-        prefix = ".".join(parts[:cut])
-        if prefix in _PACKAGE_MODULES:
-            break
-    else:
-        return {dotted}
-    if cut == len(parts):
-        return {dotted}
     if dotted in seen:
         return {UNRESOLVED + dotted}
-    mod = _PACKAGE_MODULES[prefix]
+    # EVERY way the dotted name can be read inside the package (R3). The
+    # longest prefix that is one of its modules is one reading. When the
+    # WHOLE name is a module file AND its package's ``__init__`` explicitly
+    # binds the same name — ``forge/run.py`` exists and ``forge/__init__.py``
+    # says ``from subprocess import run`` — ``from forge import run`` may be
+    # either, so that binding is a second reading. All possible identities
+    # are kept: a launch if ANY is, the helper or a runner only if ALL are.
+    # (A longer name, ``forge.run.x``, is reached through its base, whose
+    # readings are already both kept, so only the whole-name case adds one.)
+    readings: list[tuple[str, int]] = []
+    for cut in range(len(parts), 0, -1):
+        if ".".join(parts[:cut]) in _PACKAGE_MODULES:
+            readings.append((".".join(parts[:cut]), cut))
+            break
+    if not readings:
+        return {dotted}
+    if readings[0][1] == len(parts) and len(parts) > 1:
+        package = _PACKAGE_MODULES.get(".".join(parts[:-1]))
+        if (
+            package is not None
+            and package.rel.endswith("__init__.py")
+            and _bindings(package.tree).get(parts[-1])
+        ):
+            readings.append((".".join(parts[:-1]), len(parts) - 1))
+    result: set[str] = set()
+    for prefix, cut in readings:
+        result |= _follow(_PACKAGE_MODULES[prefix], parts, cut, dotted, seen)
+    if not seen:
+        _FINAL_CACHE[dotted] = frozenset(result)
+    return result
+
+
+def _follow(
+    mod: _Module, parts: list[str], cut: int, dotted: str, seen: frozenset[str]
+) -> set[str]:
+    """One reading of ``dotted``: ``parts[:cut]`` is the package module
+    ``mod``, and ``parts[cut]`` is a name it binds (or ``dotted`` is the
+    module itself)."""
+    if cut == len(parts):
+        return {dotted}
     name, rest = parts[cut], parts[cut + 1:]
     bound = _bindings(mod.tree).get(name, [])
     kinds = {kind for kind, _node in bound}
-    result: set[str]
     if not bound and mod.rel.endswith("__init__.py"):
         # A package's ``__init__`` that does not bind the name: the name is
         # a submodule of the package (one this scan did not load), never a
         # re-export, so it is its own end.
-        result = {dotted}
-    elif len(bound) == 1 and kinds <= {"def", "class", "assign", "annassign"}:
+        return {dotted}
+    if len(bound) == 1 and kinds <= {"def", "class", "assign", "annassign"}:
         # A single definition, or a single plain assignment, is an end: the
         # exporting module's own direct-use rule already refuses to store a
         # launch function, runner or launch module in a name.
-        result = {dotted}
-    elif bound and kinds == {"import"}:
-        result = set()
+        prefix = ".".join(parts[: cut + 1])
+        return {prefix if not rest else f"{prefix}.{'.'.join(rest)}"}
+    if bound and kinds == {"import"}:
+        result: set[str] = set()
         for _kind, node in bound:
             for local, target in _import_bindings(node, mod.package):
                 if local != name:
+                    continue
+                if target == dotted:
+                    # A package importing its own submodule under the
+                    # submodule's name: the binding is that very module.
+                    result.add(dotted)
                     continue
                 for final in _finalise(target, seen | {dotted}):
                     if not rest:
@@ -2060,12 +2096,8 @@ def _finalise(dotted: str, seen: frozenset[str] = frozenset()) -> set[str]:
                         result |= _finalise(
                             f"{final}.{'.'.join(rest)}", seen | {dotted}
                         )
-        result = result or {UNRESOLVED + dotted}
-    else:
-        result = {UNRESOLVED + dotted}
-    if not seen:
-        _FINAL_CACHE[dotted] = frozenset(result)
-    return result
+        return result or {UNRESOLVED + dotted}
+    return {UNRESOLVED + dotted}
 
 
 def _targets(mod: _Module, name: str) -> set[str]:
@@ -4759,6 +4791,61 @@ def test_a_reexport_is_resolved_all_the_way_and_unresolved_spreads(tmp_path: Pat
         "in p19_storage_through_a_reexported_module: the launch function subprocess.run" in p
         for p in problems
     ), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: A name that is both a package binding and a submodule, probed (14 October
+#: 2026, review 2, R3): ``forge/__init__.py`` binds ``run`` from subprocess
+#: while an empty ``forge/run.py`` also exists; ``from forge import run`` is
+#: kept as both, so calling or storing it is a launch. A genuine submodule
+#: with no package binding stays an ordinary module.
+GUARD_PROBES_20: dict[str, str] = {
+    "__init__.py": textwrap.dedent(
+        '''\
+        from subprocess import run
+        '''
+    ),
+    "run.py": "",
+    "tool.py": textwrap.dedent(
+        '''\
+        def helper_function(value):
+            return value
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        from forge import run, tool
+        from forge.launch_environment import build_project_command_env
+
+
+        def p20_collision_call(cmd):
+            run(cmd)
+
+
+        def p20_collision_store():
+            saved = run
+            return saved
+
+
+        def ok_collision_call_with_helper_env(cmd, folder):
+            run(cmd, env=build_project_command_env(folder))
+
+
+        def ok_genuine_submodule_without_a_package_binding(value):
+            return tool.helper_function(value)
+        '''
+    ),
+}
+
+
+def test_a_package_binding_and_a_same_named_submodule_are_both_kept(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    for name, text in GUARD_PROBES_20.items():
+        (pkg / name).write_text(text, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    assert {"p20_collision_call", "p20_collision_store"} <= named, problems
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
