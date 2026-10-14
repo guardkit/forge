@@ -2557,9 +2557,14 @@ def _reads_this_process_environment(
     could pass a factory credential under a name the helper does not refuse."""
     for sub in ast.walk(node):
         if isinstance(sub, ast.Attribute) and sub.attr in ("environ", "environb", "getenv"):
-            if isinstance(sub.value, ast.Name) and "os" in _targets(mod, sub.value.id):
+            if isinstance(sub.value, ast.Name) and "os" in _possible_name_targets(
+                mod, sub.value.id, sub.value
+            ):
                 return True
-        if isinstance(sub, ast.Name) and _targets(mod, sub.id) & {"os.environ", "os.getenv"}:
+        if isinstance(sub, ast.Name) and _possible_name_targets(mod, sub.id, sub) & {
+            "os.environ",
+            "os.getenv",
+        }:
             return True
         if (
             func is not None
@@ -2787,11 +2792,16 @@ def _launch_kind(mod: _Module, node: ast.AST) -> str | None:
     if isinstance(node, ast.Attribute):
         if node.attr in _ANY_RECEIVER_LAUNCHES:
             return _dotted(node)
+        # Every name is read through the one scoped lookup (class body first,
+        # then the scopes Python searches), never module-wide imports alone
+        # (15 October 2026, class bodies, review 1).
         candidates |= _resolve_all(mod, node, node)
         if isinstance(node.value, ast.Name):
-            candidates |= {f"{t}.{node.attr}" for t in _targets(mod, node.value.id)}
+            candidates |= {
+                f"{t}.{node.attr}" for t in _possible_name_targets(mod, node.value.id, node.value)
+            }
     elif isinstance(node, ast.Name):
-        candidates |= _resolve_all(mod, node, node) | _targets(mod, node.id)
+        candidates |= _resolve_all(mod, node, node)
     for target in sorted(candidates):
         if _is_launch(target) or target.startswith(UNRESOLVED):
             return target
@@ -3078,6 +3088,8 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
     problems: list[str] = []
     for mod in modules:
         reserved = set(base)
+        # Deliberately module-wide (not a lookup): a name imported anywhere
+        # in the module as a guarded thing is reserved in the whole module.
         for alias in mod.imports:
             for target in _targets(mod, alias):
                 last = target.rpartition(".")[2]
@@ -3184,13 +3196,14 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
 
         runner_dotted = {d for spec in GENERIC_RUNNERS.values() for d in spec["dotted"]}
 
-        def names_a_callable(name: str) -> bool:
-            """The name itself is guarded, or an import makes it one."""
+        def names_a_callable(name: str, at: ast.AST) -> bool:
+            """The name itself is guarded, or an import visible where it is
+            used (the scoped lookup) makes it one."""
             if name in callables:
                 return True
             return any(
                 t in HELPERS or t in runner_dotted or t.rpartition(".")[2] in callables
-                for t in _targets(mod, name)
+                for t in _possible_name_targets(mod, name, at)
             )
 
         def called(node: ast.AST) -> bool:
@@ -3232,8 +3245,8 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                         report(node, f"{target} is imported as {local!r}")
             # (2) every reference is a direct use
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
-                targets = _targets(mod, node.id)
-                if names_a_callable(node.id) and not called(node):
+                targets = _possible_name_targets(mod, node.id, node)
+                if names_a_callable(node.id, node) and not called(node):
                     report(node, f"{node.id} is referred to other than by calling it")
                 elif any(_is_launch(t) for t in targets) and not called(node):
                     report(node, f"the launch function {node.id} is referred to other than by calling it")
@@ -3303,7 +3316,7 @@ def _attribute_chain_targets(mod: _Module, node: ast.Attribute) -> set[str]:
     # Component by component, as :func:`_resolve_all` does: each attribute
     # is resolved from what the chain so far finally is, and an unresolved
     # step stays unresolved to the end (14 October 2026, review 3, R4).
-    names = _resolve_all(mod, current, current) | _targets(mod, current.id)
+    names = _resolve_all(mod, current, current)
     for attribute in reversed(attributes):
         step: set[str] = set()
         for base in names:
@@ -6423,6 +6436,48 @@ def test_class_bodies_are_never_trusted(tmp_path: Path) -> None:
     ), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
     assert not any(p.startswith("zz_ok.py") for p in problems), problems
+
+
+#: Class bodies, review 1 (15 October 2026): every check reads a name
+#: through the one scoped lookup, class body first. The control (clean): a
+#: class that rebinds ``subprocess`` to a string in its own body and then
+#: stores that name, which there is the string, not the module. The probe
+#: (still rejected): a class body that stores the real imported module.
+GUARD_PROBES_31: dict[str, str] = {
+    "__init__.py": "",
+    "zz_ok.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class ok_class_local_rebinding_then_stored:
+            subprocess = "label"
+            label = subprocess
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class p31_class_body_stores_the_imported_module:
+            m = subprocess
+        '''
+    ),
+}
+
+
+def test_a_class_body_name_is_read_through_the_class_first(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_31))
+    assert any(
+        p.startswith("zz_main.py:")
+        and " in p31_class_body_stores_the_imported_module: " in p
+        and "the launch module subprocess" in p
+        for p in problems
+    ), problems
+    assert not any(
+        p.startswith("zz_ok.py:") and "referred to other than" in p for p in problems
+    ), problems
 
 
 def test_env_slots_are_read_from_signatures() -> None:
