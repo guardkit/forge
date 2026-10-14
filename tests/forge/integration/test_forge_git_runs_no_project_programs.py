@@ -978,6 +978,76 @@ def test_autobuild_git_calls_have_a_time_limit(monkeypatch: pytest.MonkeyPatch,
     assert text.startswith("git worktree") and "did not finish within" in text
 
 
+def _a_stale_build_worktree(lab: Lab, tmp_path: Path) -> tuple[Path, Path, Path]:
+    """A repository, a kept build worktree in it, and that worktree's index
+    lock as a command stopped by the time limit leaves it."""
+    repo = lab.base_repo("repo")
+    lab.setup_git(repo, "branch", "kept")
+    tree = tmp_path / "kept-worktree"
+    lab.setup_git(repo, "worktree", "add", "-q", str(tree), "kept")
+    (tree / "forensics.md").write_text("kept for a person to read\n")
+    git_dir = Path(lab.setup_git(tree, "rev-parse", "--absolute-git-dir").strip())
+    lock = git_dir / "index.lock"
+    lock.write_text("")
+    return repo, tree, lock
+
+
+def _time_out_once(monkeypatch: pytest.MonkeyPatch, autobuild_runner: Any) -> None:
+    """The next command stops at its time limit, as a hung git would."""
+    real = autobuild_runner.run_git_async
+    state = {"done": False}
+
+    async def once(args, **kwargs):  # noqa: ANN001, ANN003
+        if not state["done"]:
+            state["done"] = True
+            raise subprocess.TimeoutExpired("git checkout", kwargs.get("timeout") or 0,
+                                            stderr="git checkout did not finish within 1 seconds.")
+        return await real(args, **kwargs)
+
+    monkeypatch.setattr(autobuild_runner, "run_git_async", once)
+
+
+def test_a_timed_out_checkout_does_not_leave_the_worktree_locked(
+    lab: Lab, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The F3 sweep's ``checkout --detach`` in a kept build worktree stops at
+    its time limit and leaves that worktree's ``index.lock``; today every
+    later checkout there fails (exit 128), so the sweep skips the branch for
+    ever. With no git still running for it, the lock is cleared, the kept
+    files stay, and the next run succeeds."""
+    from forge.subagents import autobuild_runner
+
+    repo, tree, lock = _a_stale_build_worktree(lab, tmp_path)
+    _time_out_once(monkeypatch, autobuild_runner)
+    code, text = asyncio.run(autobuild_runner._run_git(
+        ["-C", str(tree), "checkout", "--detach"], cwd=repo))
+    assert code == 124 and "did not finish" in text
+    assert not lock.exists()
+    assert (tree / "forensics.md").read_text() == "kept for a person to read\n"
+    again, _ = asyncio.run(autobuild_runner._run_git(
+        ["-C", str(tree), "checkout", "--detach"], cwd=repo))
+    assert again == 0
+
+
+def test_a_lock_is_kept_while_a_git_for_that_worktree_still_runs(
+    lab: Lab, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge.subagents import autobuild_runner
+
+    repo, tree, lock = _a_stale_build_worktree(lab, tmp_path)
+    still = subprocess.Popen([GIT, "-C", str(tree), "cat-file", "--batch"],
+                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL)
+    try:
+        _time_out_once(monkeypatch, autobuild_runner)
+        code, _ = asyncio.run(autobuild_runner._run_git(
+            ["-C", str(tree), "checkout", "--detach"], cwd=repo))
+        assert code == 124
+        assert lock.exists(), "a git still working in that worktree may hold the lock"
+    finally:
+        still.kill()
+        still.wait()
+
+
 # ---------------------------------------------------------------------------
 # Last: nothing in this module ran git without the helper's settings
 

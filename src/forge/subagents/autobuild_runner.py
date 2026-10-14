@@ -2138,17 +2138,99 @@ async def _run_git(args: list[str], *, cwd: Path) -> tuple[int, str]:
     per-operation limit the planning runner gives its git; a command that
     does not finish is stopped and answers exit code 124 with the helper's
     fixed sentence ("git worktree did not finish within 180 seconds.").
+
+    A command stopped by that limit can leave the worktree's ``index.lock``
+    behind (a ``checkout --detach`` in the F3 sweep did, and every later
+    checkout there then failed, so the sweep skipped that branch for ever).
+    The kept worktree is never removed for it (the F11 forensics law), so the
+    lock alone is cleared, and only when no git process is still working in
+    that worktree (:func:`_clear_a_lock_left_by_a_timeout`).
     """
     try:
         done = await run_git_async(list(args), cwd=cwd, timeout=GIT_COMMAND_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired as exc:
         said = exc.stderr if isinstance(exc.stderr, str) else ""
         label = next((a for a in args if not str(a).startswith("-")), "git")
+        await asyncio.to_thread(_clear_a_lock_left_by_a_timeout, list(args), cwd)
         return 124, said or timeout_sentence(str(label), GIT_COMMAND_TIMEOUT_SECONDS)
     code = done.returncode if done.returncode is not None else -1
     if code == 0:
         return code, (done.stdout or "").strip()
     return code, (done.stderr or "").strip()
+
+
+#: Commands that take the worktree's index lock while they run.
+_INDEX_LOCKING_COMMANDS: frozenset[str] = frozenset(
+    {"checkout", "switch", "restore", "reset", "merge", "rebase", "stash", "apply",
+     "cherry-pick", "revert", "read-tree", "update-index", "add", "commit"}
+)
+
+
+def _a_git_still_works_in(folder: Path, git_dir: Path) -> bool:
+    """True when any git process is still working in ``folder`` or on
+    ``git_dir`` (its working folder is inside one, or its command line names
+    one), or when that cannot be told. Read from ``/proc``."""
+    proc = Path("/proc")
+    if not proc.is_dir():
+        return True
+    targets = {str(folder.resolve()), str(git_dir.resolve())}
+    for entry in proc.iterdir():
+        if not entry.name.isdigit() or entry.name == str(os.getpid()):
+            continue
+        try:
+            argv = [a.decode("utf-8", "replace") for a in
+                    (entry / "cmdline").read_bytes().split(b"\0") if a]
+            if not argv or not os.path.basename(argv[0]).startswith("git"):
+                continue
+            where = os.readlink(entry / "cwd")
+        except OSError:
+            continue
+        if any(where == t or where.startswith(t + "/") for t in targets):
+            return True
+        if any(t in word for t in targets for word in argv):
+            return True
+    return False
+
+
+def _clear_a_lock_left_by_a_timeout(args: list[str], cwd: Path) -> None:
+    """After a command that takes the index lock was stopped by the time
+    limit, remove the ``index.lock`` it left in its worktree's git folder, so
+    the next run can use that worktree. Only when no git process is still
+    working there: the stopped command was killed and waited for by the git
+    helper, and with the helper's fixed settings it starts no other program
+    (no hooks, filters, file monitor or background work). Never raises."""
+    command = [str(a) for a in args]
+    folder = Path(cwd)
+    while command[:1] == ["-C"] and len(command) > 1:
+        folder = folder / command[1]
+        command = command[2:]
+    if not command or command[0] not in _INDEX_LOCKING_COMMANDS:
+        return
+    try:
+        found = run_git(["-C", str(folder), "rev-parse", "--absolute-git-dir"], timeout=30)
+        git_dir = Path((found.stdout or "").strip())
+        if found.returncode != 0 or not git_dir.is_absolute():
+            return
+        lock = git_dir / "index.lock"
+        if not lock.is_file() or _a_git_still_works_in(folder, git_dir):
+            return
+        lock.unlink()
+        logger.warning(
+            "autobuild_runner: git %s in %s was stopped by its time limit and "
+            "left %s; no git is still working there, so the lock was removed "
+            "(the worktree and its files are kept)",
+            command[0],
+            folder,
+            lock,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.warning(
+            "autobuild_runner: a lock left by a stopped git %s in %s could not "
+            "be cleared (%s)",
+            command[0] if command else "command",
+            folder,
+            type(exc).__name__,
+        )
 
 
 async def _local_branch_exists(repo_path: Path, branch: str) -> bool:
