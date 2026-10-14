@@ -1826,7 +1826,8 @@ def make_validate_gate_registry(
 # feature (``forge.pipeline.routing_stamps.resolve_routing_law``). Forge
 # invokes it through the SAME frozen ``forge.adapters.guardkit.run`` seam the
 # validate oracles ride, with cwd = the planning worktree, so what it writes
-# rides the plan commit (``commit_all`` = ``git add -A``).
+# rides the plan commit (``commit_all``: ``git add -A`` with the factory's own
+# records left out, :func:`forge.adapters.git.operations.prepare_index`).
 #
 # Contract of the CLI's stdout (JSON, indent=2) + exit codes:
 #   exit 0 → the NormalizeResult dict (``written``, ``stamped``, ``rules``,
