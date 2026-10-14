@@ -19,6 +19,13 @@ does ONE thing, so it is told only the things that one thing needs:
   protected, read-only folder the container mounts
   (:data:`ROUTE_KEYS_DIR`). A route that names no key uses the
   publisher-wide credential, exactly as before;
+* **the folder names that exist only on the factory's own machines**
+  (``private_path_prefixes``, 14 October 2026): each owner's home folder, the
+  receipts folder, the sandbox storage folder. Required. Before every send
+  the publisher refuses a commit that would publish a file holding one
+  (:mod:`forge.publisher.git_work`). The values live in the deploy settings
+  file only, never in code, and are never logged: the start-up line gives a
+  count;
 * **where to listen** — an address and a port. The loopback address by
   default; every address inside its own container when it is run as the
   service the compose fragment beside this package describes, which
@@ -36,6 +43,7 @@ branch name that came off the ledger are the whole of what it knows.
 from __future__ import annotations
 
 import json
+import posixpath
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -129,6 +137,10 @@ class PublisherSettings:
     #: The pinned host keys for remotes reached over SSH, as a file. Never
     #: fetched at run time; needed only when a remote is an SSH address.
     known_hosts_file: str = ""
+    #: Folder names that exist only on the factory's own machines. Required
+    #: in the settings file (:func:`load_settings` refuses it missing, empty
+    #: or generic). With none, nothing is sent: the publisher cannot look.
+    private_path_prefixes: tuple[str, ...] = ()
 
     def route(self, project: str) -> ProjectRoute | None:
         return self.projects.get(str(project or "").strip())
@@ -161,6 +173,9 @@ class PublisherSettings:
             "host": self.host,
             "port": self.port,
             "known_hosts_file": self.known_hosts_file,
+            # A count, never the values: they name folders on the factory's
+            # own machines.
+            "private_path_prefix_count": len(self.private_path_prefixes),
         }
 
 
@@ -197,6 +212,80 @@ def _a_route_s_key_name(block: Any, project: str) -> str | None:
             "publisher-wide credential. The value is not repeated here."
         )
     return str(value)
+
+
+#: THE RULE FOR A PRIVATE FOLDER (coach review 1). A value is refused when:
+#:
+#: 1. it is not an absolute path at least two folders deep;
+#: 2. it is under a system folder (:data:`_SYSTEM_FOLDERS`), at any depth;
+#: 3. it is exactly two deep under a shared top folder (:data:`_SHARED_TOPS`),
+#:    such as ``/opt/app`` or ``/var/lib``;
+#: 4. it is the home folder of a common container or CI user
+#:    (:data:`_SHARED_USERS`), such as ``/home/node``.
+#:
+#: Every one of these is a folder that ordinary products name, so it would
+#: refuse ordinary work. A factory machine's own folders (an owner's home
+#: folder, the receipts folder, the sandbox storage folder) pass.
+_SYSTEM_FOLDERS = frozenset(
+    {"usr", "bin", "sbin", "lib", "lib64", "etc", "proc", "sys", "dev", "run", "boot"}
+)
+_SHARED_TOPS = frozenset(
+    {"var", "opt", "tmp", "srv", "root", "mnt", "media", "app", "data",
+     "workspace", "workspaces", "private", "Volumes"}
+)
+_SHARED_USERS = frozenset(
+    {"node", "runner", "ubuntu", "user", "app", "admin", "root", "vscode",
+     "codespace", "jenkins", "circleci", "gitpod", "coder", "docker", "guest",
+     "Shared", "www-data", "dev"}
+)
+
+
+def _a_shared_folder(parts: list[str]) -> bool:
+    """Rules 2 to 4 above, for a path's folder names (rule 1 already held)."""
+    if parts[0] in _SYSTEM_FOLDERS:
+        return True
+    if len(parts) == 2 and parts[0] in _SHARED_TOPS:
+        return True
+    return len(parts) == 2 and parts[0] in ("home", "Users") and parts[1] in _SHARED_USERS
+
+
+#: Why a ``private_path_prefixes`` value was refused. The values are not
+#: repeated: they name folders on the factory's own machines.
+_PREFIXES_SENTENCE = (
+    "'private_path_prefixes' in the publisher's settings must be a list of "
+    "the folders that exist only on the factory's own machines (each owner's "
+    "home folder, the receipts folder, the sandbox storage folder), each an "
+    "absolute path at least two folders deep and not a folder ordinary "
+    "products name, such as /home/, /var/lib, /opt/app, /usr/local/bin or "
+    "/home/node. Before every send the publisher refuses a commit that "
+    "would publish a file naming one, so it will not start without them. The "
+    "values are not repeated here"
+)
+
+
+def _private_path_prefixes(decoded: dict[str, Any]) -> tuple[str, ...]:
+    """The required ``private_path_prefixes``: a non-empty list of absolute
+    folders, each at least two deep and none a shared folder. Each is kept
+    without its trailing ``/``."""
+    value = decoded.get("private_path_prefixes")
+    if not isinstance(value, list) or not value:
+        raise SettingsRefused(_PREFIXES_SENTENCE)
+    kept: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            raise SettingsRefused(_PREFIXES_SENTENCE)
+        text = item.strip()
+        if not text.startswith("/") or "\0" in text or ".." in text.split("/"):
+            raise SettingsRefused(_PREFIXES_SENTENCE)
+        normal = posixpath.normpath(text)
+        if normal.startswith("//"):
+            normal = "/" + normal.lstrip("/")
+        parts = [part for part in normal.split("/") if part]
+        if len(parts) < 2 or _a_shared_folder(parts):
+            raise SettingsRefused(_PREFIXES_SENTENCE)
+        if normal not in kept:
+            kept.append(normal)
+    return tuple(kept)
 
 
 def load_settings(path: str | Path) -> PublisherSettings:
@@ -275,14 +364,19 @@ def load_settings(path: str | Path) -> PublisherSettings:
             "a project's remote is an SSH address, so the publisher's settings "
             "need 'known_hosts_file': the file holding that host's pinned key"
         )
+    credential_file = _text(decoded, "credential_file", where="the settings")
+    ledger = _text(decoded, "ledger", where="the settings")
+    state_dir = _text(decoded, "state_dir", where="the settings")
+    private_path_prefixes = _private_path_prefixes(decoded)
     return PublisherSettings(
-        credential_file=_text(decoded, "credential_file", where="the settings"),
-        ledger=_text(decoded, "ledger", where="the settings"),
-        state_dir=_text(decoded, "state_dir", where="the settings"),
+        credential_file=credential_file,
+        ledger=ledger,
+        state_dir=state_dir,
         projects=projects,
         host=_text(decoded, "host", where="the settings", required=False)
         or "127.0.0.1",
         port=int(port),
         git_timeout_seconds=float(timeout),
         known_hosts_file=known_hosts,
+        private_path_prefixes=private_path_prefixes,
     )

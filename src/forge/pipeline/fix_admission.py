@@ -78,6 +78,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -458,6 +459,12 @@ class RepairTaskFacts:
     checks_passed: int | None = None
     checks_total: int | None = None
     failed_checks: tuple[FailedCheck, ...] = ()
+    #: Where the merge report and the failure pack are, as the task file
+    #: says it (14 October 2026): a name relative to the factory's receipts
+    #: root, "in the factory's receipts, `merge-<build>/<report>`", or a
+    #: sentence that the location is not written down. Never an absolute
+    #: path: a repair task is committed, and the receipts root sits under the
+    #: owner's home folder on a factory machine.
     merge_report_path: str | None = None
     gate_evidence_path: str | None = None
     failure_pack_path: str | None = None
@@ -466,6 +473,9 @@ class RepairTaskFacts:
     #: repository's clone, read through its helper). Said in the task file
     #: rather than silently left out.
     not_read: tuple[str, ...] = ()
+    #: How many failed checks the merge report names by a name that is not a
+    #: plain identifier; those names stay in the receipts.
+    unnamed_report_checks: int = 0
 
 
 def repair_task_relpath(folder: str, task_id: str) -> str:
@@ -518,17 +528,22 @@ def render_repair_task_file(facts: RepairTaskFacts) -> str:
     front["dependencies"] = []
     header = yaml.safe_dump(front, sort_keys=False, allow_unicode=True)
 
+    # A committed repair task carries fixed sentences, plain identifiers and
+    # portable receipts names only (coach review 1, 14 October 2026). The
+    # merge report's own words (its detail, a check name that is not a plain
+    # identifier) and a helper's error text stay in the receipts and the
+    # local log: the task is committed into the project, which may be public.
     observed: list[str] = []
     if facts.result:
-        line = f"- Result: {facts.result}"
-        if facts.detail:
-            line += f" — {facts.detail}"
-        observed.append(line)
+        if _PLAIN_WORD.fullmatch(facts.result):
+            observed.append(f"- Result: {facts.result}")
+        else:
+            observed.append("- Result: recorded in the merge report")
     elif facts.filed_because:
         observed.append(f"- Why the repair was filed: {facts.filed_because}")
     if facts.source_build_id:
         line = f"- Source build: {facts.source_build_id} (feature {facts.feature_id}"
-        if facts.merged_sha:
+        if facts.merged_sha and _A_COMMIT_NAME.fullmatch(facts.merged_sha):
             line += f", merged commit {facts.merged_sha[:12]}"
         observed.append(line + ")")
     if facts.checks_passed is not None and facts.checks_total is not None:
@@ -549,6 +564,11 @@ def render_repair_task_file(facts: RepairTaskFacts) -> str:
         observed.append(
             "- No failing check was named on the report or the gate evidence; "
             "the evidence below is the record."
+        )
+    if facts.unnamed_report_checks:
+        observed.append(
+            f"- The merge report names {facts.unnamed_report_checks} more failed "
+            "check(s); their names are kept in the factory's receipts."
         )
 
     if facts.merge_report_path:
@@ -606,6 +626,18 @@ def render_repair_task_file(facts: RepairTaskFacts) -> str:
     return f"---\n{header}---\n\n{body}"
 
 
+#: A result word from the merge report, written into a task only as this.
+_PLAIN_WORD = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+
+#: A commit name, written into a task only as this.
+_A_COMMIT_NAME = re.compile(r"[0-9a-f]{7,64}")
+
+#: A check name from the merge report, written into a task only as this: a
+#: plain identifier (``hurl-twins::delete-existing-user::40``), never a
+#: sentence and never a path.
+_A_CHECK_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@#+=,-]{0,199}")
+
+
 def _frontmatter(text: str) -> dict[str, Any]:
     """The YAML between the leading ``---`` lines, or ``{}``."""
     import yaml
@@ -637,6 +669,34 @@ def _default_receipts_root() -> Path:
         return receipts_root()
     except Exception:  # noqa: BLE001 — the report is then simply not found
         return Path("~/forge-state/receipts").expanduser()
+
+
+#: How a repair task names a receipts file that is not under the receipts
+#: root it was read from: nothing about where it is.
+NOT_WRITTEN_HERE = "kept in the factory's receipts (its location is not written here)"
+
+
+def in_the_receipts(path: Path | str | None, receipts_root: Path | str | None) -> str | None:
+    """How a committed repair task names ``path``: by its name relative to the
+    receipts root, which means the same on every machine, never by an
+    absolute path (design "Factory records never enter a project's commits",
+    14 October 2026). ``None`` when there is no path; :data:`NOT_WRITTEN_HERE`
+    when it is not under the root. A folder keeps its trailing ``/``."""
+    if not path:
+        return None
+    root = Path(receipts_root).expanduser() if receipts_root else _default_receipts_root()
+    where = Path(str(path)).expanduser()
+    for base, target in ((root, where), (Path(os.path.realpath(root)), Path(os.path.realpath(where)))):
+        try:
+            name = target.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        if not name or name == "." or name.startswith(".."):
+            break
+        if str(path).endswith(("/", os.sep)) or where.is_dir():
+            name += "/"
+        return f"in the factory's receipts, `{name}`"
+    return NOT_WRITTEN_HERE
 
 
 def _read_merge_report(
@@ -781,6 +841,7 @@ def gather_repair_facts(
     result = detail = merged_sha = None
     checks_passed = checks_total = None
     failed: list[FailedCheck] = []
+    unnamed = 0
     report_path: str | None = None
     if source_build_id:
         report_path, report = _read_merge_report(source_build_id, receipts_root)
@@ -793,8 +854,12 @@ def gather_repair_facts(
             gate = report.get("gate_before_merge")
             if isinstance(gate, dict):
                 for check in gate.get("failed_checks") or []:
-                    if _text(check):
+                    if not _text(check):
+                        continue
+                    if _A_CHECK_NAME.fullmatch(_one_line(check)):
                         failed.append(FailedCheck(name=_one_line(check)))
+                    else:
+                        unnamed += 1
                 if checks_total is None:
                     checks_total = _int(gate.get("checks_total"))
                     checks_passed = _int(gate.get("checks_passed"))
@@ -828,9 +893,11 @@ def gather_repair_facts(
         checks_passed=checks_passed,
         checks_total=checks_total,
         failed_checks=tuple(failed),
-        merge_report_path=report_path,
+        merge_report_path=in_the_receipts(report_path, receipts_root),
         gate_evidence_path=evidence_path,
-        failure_pack_path=_text(note.get("failure_pack_path")),
+        failure_pack_path=in_the_receipts(
+            _text(note.get("failure_pack_path")), receipts_root
+        ),
         parent_review=_parent_review_on_branch(
             clone.read_on_branch
             if clone is not None
@@ -841,6 +908,7 @@ def gather_repair_facts(
             files,
         ),
         not_read=tuple(clone.not_read) if clone is not None else (),
+        unnamed_report_checks=unnamed,
     )
 
 
@@ -2083,16 +2151,28 @@ class _SandboxClone:
                 f"{self._url}{route}", {"repo": self._repo, **body}, self._timeout_s
             )
         except Exception as exc:  # noqa: BLE001 — transport boundary
-            self._not_read(
-                f"{what} (the sandbox helper at {self._url} could not be reached: "
-                f"{type(exc).__name__}: {str(exc)[:160]})"
+            # The helper's address and the transport's own words stay in the
+            # local log: the sentence is committed in the repair task.
+            logger.warning(
+                "fix admission: the sandbox helper at %s could not be reached "
+                "(%s: %s)",
+                self._url,
+                type(exc).__name__,
+                str(exc)[:160],
             )
+            self._not_read(f"{what} (the sandbox helper could not be reached)")
             return None
         if status != 200 or not isinstance(decoded, dict):
             said = decoded.get("error") if isinstance(decoded, dict) else decoded
-            self._not_read(
-                f"{what} (the sandbox helper answered {status}: {str(said)[:200]})"
+            # The helper's own words stay in the local log: the sentence can
+            # reach a committed repair task.
+            logger.warning(
+                "fix admission: the sandbox helper answered %s for %s: %s",
+                status,
+                what,
+                str(said)[:200],
             )
+            self._not_read(f"{what} (the sandbox helper answered {status})")
             return None
         return decoded
 

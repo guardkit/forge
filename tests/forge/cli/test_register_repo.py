@@ -96,6 +96,7 @@ PUBLISHER_JSON = {
     "credential_file": "/etc/forge-publisher/credential",
     "ledger": "/var/lib/forge/forge.db",
     "state_dir": "/var/lib/publisher/state",
+    "private_path_prefixes": ["/home/example"],
     "host": "0.0.0.0",
     "port": 8711,
     "git_timeout_seconds": 180,

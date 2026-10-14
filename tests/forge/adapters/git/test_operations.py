@@ -100,6 +100,19 @@ def _fail(exit_code: int = 1, stdout: str = "", stderr: str = "boom") -> Execute
     return ExecuteResult(exit_code=exit_code, stdout=stdout, stderr=stderr)
 
 
+#: The answers ``prepare_index`` asks for when nothing needs taking out and
+#: something is staged: the add, no moves of records, nothing staged outside
+#: the records to compare, no staged records, and "something is staged"
+#: (``git diff --cached --quiet`` exits 1).
+_PREPARED_WITH_SOMETHING_STAGED = (
+    _ok(),
+    _ok(),
+    _ok(),
+    _ok(),
+    ExecuteResult(exit_code=1, stdout="", stderr=""),
+)
+
+
 # --------------------------------------------------------------------------- #
 # prepare_worktree
 # --------------------------------------------------------------------------- #
@@ -315,7 +328,7 @@ class TestCommitAll:
     async def test_success_returns_sha_from_rev_parse(self, tmp_path: Path) -> None:
         fake = FakeExecute(
             responses=[
-                _ok(),  # git add -A
+                *_PREPARED_WITH_SOMETHING_STAGED,
                 _ok(stdout="[main abc1234] msg\n"),  # git commit -m
                 _ok(stdout="abc1234567890abcdef\n"),  # git rev-parse HEAD
             ]
@@ -328,11 +341,17 @@ class TestCommitAll:
         assert result.operation == "commit_all"
         assert result.sha == "abc1234567890abcdef"
         assert result.exit_code == 0
-        # AC-002: three calls — add, commit, rev-parse.
-        assert [c.command[:2] for c in fake.calls] == [
-            ["git", "add"],
-            ["git", "commit"],
-            ["git", "rev-parse"],
+        # AC-002: the index is prepared (add with the factory's records left
+        # out, two listings, the "anything staged?" question), then commit
+        # and rev-parse (14 October 2026).
+        assert [c.command[:3] for c in fake.calls] == [
+            ["git", "add", "-A"],
+            ["git", "diff", "--cached"],
+            ["git", "diff", "--cached"],
+            ["git", "diff", "--cached"],
+            ["git", "diff", "--cached"],
+            ["git", "commit", "-m"],
+            ["git", "rev-parse", "HEAD"],
         ]
         # AC-003: every call's cwd is the build worktree.
         assert all(c.cwd == str(worktree) for c in fake.calls)
@@ -343,11 +362,17 @@ class TestCommitAll:
     ) -> None:
         # AC-009: ``;`` / ``&&`` / quotes never break out of a single argv slot.
         nasty = 'feat: pwn; rm -rf / && echo "owned"'
-        fake = FakeExecute(responses=[_ok(), _ok(), _ok(stdout="deadbeef\n")])
+        fake = FakeExecute(
+            responses=[
+                *_PREPARED_WITH_SOMETHING_STAGED,
+                _ok(),
+                _ok(stdout="deadbeef\n"),
+            ]
+        )
 
         result = await commit_all(tmp_path / "wt", nasty, execute=fake)
 
-        commit_call = fake.calls[1]
+        commit_call = fake.calls[len(_PREPARED_WITH_SOMETHING_STAGED)]
         assert commit_call.command == ["git", "commit", "-m", nasty]
         # The metacharacters live in a single list element — they have
         # not been split, escaped, or otherwise mangled.
@@ -377,7 +402,7 @@ class TestCommitAll:
         # words); callers that care ask ``git diff --cached --quiet`` first.
         fake = FakeExecute(
             responses=[
-                _ok(),  # add -A
+                *_PREPARED_WITH_SOMETHING_STAGED,
                 ExecuteResult(
                     exit_code=1,
                     stdout="nothing to commit, working tree clean\n",
@@ -388,6 +413,7 @@ class TestCommitAll:
 
         result = await commit_all(tmp_path / "wt", "msg", execute=fake)
 
+        assert fake.calls[-1].command[:2] == ["git", "commit"]
         assert result.status == "failed"
         assert result.exit_code == 1
         assert result.stderr is None

@@ -99,7 +99,8 @@ class TestTheSelfCheck:
         settings = _settings(tmp_path, mode=0o644)
         settings_file = tmp_path / "settings.json"
         settings_file.write_text(
-            '{"credential_file": "%s", "ledger": "%s", "state_dir": "%s"}'
+            '{"credential_file": "%s", "ledger": "%s", "state_dir": "%s", '
+            '"private_path_prefixes": ["/home/example"]}'
             % (settings.credential_file, settings.ledger, settings.state_dir),
             encoding="utf-8",
         )
@@ -338,6 +339,7 @@ class TestEachRouteKeyIsCheckedToo:
                     "credential_file": settings.credential_file,
                     "ledger": settings.ledger,
                     "state_dir": settings.state_dir,
+                    "private_path_prefixes": ["/home/example"],
                     "projects": {
                         ROUTED: {
                             "source": "git://192.0.2.1:9418/p",
@@ -377,6 +379,7 @@ class TestEachRouteKeyIsCheckedToo:
                     "credential_file": settings.credential_file,
                     "ledger": settings.ledger,
                     "state_dir": settings.state_dir,
+                    "private_path_prefixes": ["/home/example"],
                     "projects": {
                         ROUTED: {
                             "source": "git://192.0.2.1:9418/p",

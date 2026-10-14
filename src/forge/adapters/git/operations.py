@@ -10,7 +10,9 @@ Three operations:
 - :func:`prepare_worktree` — ``git worktree add`` for the build's path,
   optionally ``-b <branch> <path> <base>`` when the branch must be
   CREATED (the fix journey's per-build branch, conductor activation §1).
-- :func:`commit_all` — ``git add -A`` + ``git commit -m`` + ``git rev-parse HEAD``.
+- :func:`commit_all` — :func:`prepare_index` + ``git commit -m`` + ``git rev-parse HEAD``.
+- :func:`prepare_index` — stage the working folder with the factory's own
+  records left out, and say whether anything is left to commit.
 - :func:`cleanup_worktree` — ``git worktree remove --force``; **best-effort**:
   failure is logged and returned as ``status="failed"`` but never raises,
   so callers (the build state machine) can treat it as a warning rather
@@ -57,14 +59,26 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
+import os
+import stat
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
 from forge.adapters.git.models import GitOpResult
-from forge.project_git import run_git_async
+from forge.factory_files import (
+    factory_record_content_pathspecs,
+    factory_record_exclusions,
+    factory_record_pathspecs,
+    is_factory_record,
+    is_record_content,
+)
+from forge.project_git import PatternPathspec, run_git_async
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +141,12 @@ async def _default_execute(
     a ``stderr`` that says which git command did not finish in time, so the
     caller sees a loud, retryable failure rather than an unbounded hang.
     """
-    argv = [str(token) for token in command]
+    # A pathspec the factory wrote as a pattern keeps its marker: the git
+    # helper takes every other name literally.
+    argv = [
+        token if isinstance(token, PatternPathspec) else str(token)
+        for token in command
+    ]
     if not argv or argv[0] != "git":
         return ExecuteResult(
             exit_code=-1,
@@ -296,17 +315,417 @@ async def prepare_worktree(
         return _exception_failure(operation, exc)
 
 
+#: The warning given when moves or copies of a record were left out.
+MOVED_RECORDS_WARNING = (
+    "Left %d file(s) out of the commit in %s: they are moves or copies of "
+    "GuardKit's own records (first: %s), which can hold private paths. They "
+    "stay on disk and are never committed."
+)
+
+#: The warning given when records that were staged were taken out.
+STAGED_RECORDS_WARNING = (
+    "Left %d of the factory's own record file(s) out of the commit in %s "
+    "(%s). They stay on disk and are never committed; nothing reads them "
+    "from git."
+)
+
+
+@dataclass(frozen=True)
+class PreparedIndex:
+    """What :func:`prepare_index` found: whether anything is left to commit,
+    or the failure that stopped it (then ``staged`` means nothing)."""
+
+    staged: bool
+    failure: GitOpResult | None = None
+
+
+#: The empty blob, in both object formats. An empty file is never a copy of
+#: a record: git pairs empty files with each other (coach review 1, F1).
+_EMPTY_BLOBS = frozenset(
+    {
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+    }
+)
+
+#: How many file names one ``git reset`` is given.
+_NAMES_PER_COMMAND = 200
+
+
+def _moved_out_of_records(raw: str) -> list[str]:
+    """Destinations of staged renames or copies whose source is a record and
+    whose destination is neither a record nor empty, from ``git diff --raw
+    -z`` output with rename detection on. A rename or copy names two paths;
+    every other status names one."""
+    fields = raw.split("\0")
+    found: list[str] = []
+    index = 0
+    while index < len(fields):
+        head = fields[index].lstrip("\n")
+        index += 1
+        if not head.startswith(":"):
+            continue
+        parts = head[1:].split()
+        status = parts[4] if len(parts) >= 5 else ""
+        if status[:1] in ("R", "C"):
+            source, destination = (fields[index : index + 2] + ["", ""])[:2]
+            index += 2
+            if (
+                is_factory_record(source)
+                and destination
+                and not is_factory_record(destination)
+                and parts[3] not in _EMPTY_BLOBS
+            ):
+                found.append(destination)
+        else:
+            index += 1
+    return found
+
+
+#: How long a commit waits for record files to be read. A read on a stalled
+#: filesystem (a hung network mount) cannot be interrupted, and the planning
+#: writer must never block on it: every other step it takes has a time limit
+#: (GuardKit e0b72800 waits the same 5 seconds).
+RECORD_READ_BOUND_S: float = 5.0
+
+#: Records smaller than this are not compared with product files at commit
+#: time (coordinator decision, 14 October 2026). A tiny record such as ``[]``
+#: carries nothing worth protecting, and a product file holding the same few
+#: bytes must never be silently left out. Private text in any file is still
+#: refused by the publisher, whose own content look keeps no size exemption.
+SMALLEST_COMPARED_RECORD: int = 64
+
+
+def git_blob_id(data: bytes, object_format: str) -> str:
+    """The id git gives a file holding exactly ``data``: the ``sha1`` or
+    ``sha256`` digest of ``b"blob <length>\\0"`` followed by the bytes, as
+    lower-case hex. No line-ending or filter conversion is applied."""
+    digest = hashlib.new(object_format)
+    digest.update(b"blob %d\0" % len(data))
+    digest.update(data)
+    return digest.hexdigest()
+
+
+def _read_regular_file(path: Path) -> bytes | None:
+    """A regular file's bytes, or ``None`` when it is gone, unreadable, empty
+    or not a regular file. A link is never followed, and opening never waits
+    on a pipe. GuardKit replaces records by renaming a temporary file over
+    them, so a file listed a moment ago may be gone: that is never an error."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        handle = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            return None
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(handle, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(handle)
+    return b"".join(chunks) or None
+
+
+def _inner_build_record_files(root: Path) -> list[Path]:
+    """The record files of each inner build folder under the top-level
+    ``.guardkit/worktrees/``, at any depth (Codex implementation round 1,
+    R1). Each inner folder is walked whole, never following a link and never
+    entering a ``.git`` folder or a further inner build folder, and only
+    files whose path relative to that inner folder is a record
+    (:func:`forge.factory_files.is_record_content`) are returned: no other
+    file is ever read. git's own listing stops at an inner build folder,
+    because each is a repository of its own."""
+    worktrees = root / ".guardkit" / "worktrees"
+    if any(p.is_symlink() for p in (root / ".guardkit", worktrees)):
+        return []
+    try:
+        inner_folders = [e for e in os.scandir(worktrees) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+    found: list[Path] = []
+    for entry in inner_folders:
+        inner = entry.path
+        for folder, subfolders, names in os.walk(inner, followlinks=False):
+            here = os.path.relpath(folder, inner).replace(os.sep, "/")
+            here = "" if here == "." else here + "/"
+            # Never into git's own folder or a further inner build folder.
+            subfolders[:] = [
+                name
+                for name in subfolders
+                if name != ".git"
+                and not (name == "worktrees" and here.endswith(".guardkit/"))
+            ]
+            found.extend(
+                Path(folder) / name for name in names if is_record_content(here + name)
+            )
+    return found
+
+
+async def _record_blob_ids(root: Path, listed: list[str], object_format: str) -> set[str]:
+    """The blob id of every regular file of at least
+    :data:`SMALLEST_COMPARED_RECORD` bytes at a record path (as git listed
+    them) and of each inner build folder's records, computed here from the
+    bytes (:func:`git_blob_id`).
+
+    The files are read in a thread of their own, waited for at most
+    :data:`RECORD_READ_BOUND_S`. Files not read by then are left out of the
+    comparison, with one warning, and the thread is left behind."""
+    ids: set[str] = set()
+    progress = {"listed": 0, "read": 0, "finished": False}
+    lock = threading.Lock()
+    loop = asyncio.get_running_loop()
+    finished = asyncio.Event()
+
+    def read_all() -> None:
+        try:
+            paths = {root / name for name in listed if not name.endswith("/")}
+            paths.update(_inner_build_record_files(root))
+            with lock:
+                progress["listed"] = len(paths)
+            for path in sorted(paths):
+                data = _read_regular_file(path)
+                with lock:
+                    if data is not None and len(data) >= SMALLEST_COMPARED_RECORD:
+                        ids.add(git_blob_id(data, object_format))
+                    progress["read"] += 1
+            with lock:
+                progress["finished"] = True
+        finally:
+            try:
+                loop.call_soon_threadsafe(finished.set)
+            except RuntimeError:
+                pass  # the commit stopped waiting and its loop is gone
+
+    threading.Thread(
+        target=read_all, name="forge-commit: reading records", daemon=True
+    ).start()
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=RECORD_READ_BOUND_S)
+    except asyncio.TimeoutError:
+        pass
+    with lock:
+        found = set(ids)
+        done = progress["finished"]
+        unread = progress["listed"] - progress["read"]
+    if not done:
+        logger.warning(
+            "Reading the factory's record files in %s did not finish within "
+            "%.0fs (%s not read); exact copies of those were not looked for in "
+            "this commit.",
+            root,
+            RECORD_READ_BOUND_S,
+            f"{unread} file(s)" if unread > 0 else "the folders could not be listed",
+        )
+    return found
+
+
+def _staged_outside_records(raw: str) -> list[tuple[str, str]]:
+    """``(blob id, path)`` for every file staged as added, changed or retyped
+    outside the record paths, from ``git diff --cached --raw -z --no-renames``
+    output. Embedded-repository links and empty files are left out."""
+    fields = raw.split("\0")
+    staged: list[tuple[str, str]] = []
+    index = 0
+    while index + 1 < len(fields):
+        meta, path = fields[index].lstrip("\n").split(), fields[index + 1]
+        index += 2
+        if len(meta) < 4 or meta[1] == "160000" or is_factory_record(path):
+            continue
+        if meta[3] in _EMPTY_BLOBS:
+            continue
+        staged.append((meta[3], path))
+    return staged
+
+
+async def prepare_index(
+    worktree: Path,
+    *,
+    execute: ExecuteCallable = _default_execute,
+    operation: str = "commit_all",
+) -> PreparedIndex:
+    """Stage ``worktree`` for a commit with the factory's records left out.
+
+    Design "Factory records never enter a project's commits" (14 October
+    2026); the same step as GuardKit's checkpoint, written again here because
+    Forge does not import GuardKit:
+
+    1. ``git add -A -- . <record exclusions>`` — record paths 1 to 6 and 8
+       are never staged in the first place (path 7, the top-level transcript
+       folder, cannot be named here without git refusing the add in a project
+       that ignores it);
+    2. before anything is restored, every staged rename or copy whose source
+       is a record and whose destination is not has its DESTINATION
+       unstaged, with one warning. ``--find-copies-harder`` is needed for a
+       plain move on disk (the source's deletion is never staged, so git sees
+       a copy), and ``-l0`` stops git skipping the comparison quietly on a
+       large change. An empty destination is not a copy of anything. Then
+       every staged file outside the record paths whose content is exactly
+       that of a record file on disk, committed or not, is unstaged too;
+    3. whatever is still staged under any of the eight record paths (a record
+       force-added earlier, a change to a tracked record, the transcript
+       folder) is unstaged, with one warning naming the count and the first
+       five paths;
+    4. ``git diff --cached --quiet`` answers whether anything is left.
+
+    Files left out stay on disk. Safe to run twice. Never raises.
+    """
+    cwd = str(worktree)
+
+    def failed(result: ExecuteResult) -> PreparedIndex:
+        return PreparedIndex(
+            staged=False,
+            failure=GitOpResult(
+                status="failed",
+                operation=operation,
+                stderr=_failure_stderr(result.stderr, result.stdout),
+                exit_code=result.exit_code,
+            ),
+        )
+
+    async def _reset(names: list[str]) -> ExecuteResult | None:
+        """Unstage ``names`` literally, in batches; the failed step, if any."""
+        for start in range(0, len(names), _NAMES_PER_COMMAND):
+            done = await execute(
+                command=["git", "reset", "-q", "--", *names[start : start + _NAMES_PER_COMMAND]],
+                cwd=cwd,
+            )
+            if done.exit_code != 0:
+                return done
+        return None
+
+    async def _exact_copies_of_records() -> list[str] | ExecuteResult:
+        """Staged files outside the record paths whose content is byte for
+        byte that of a record file on disk, committed or not (GuardKit
+        e6bd14d2). Records are never committed, so git's copy detection,
+        which only looks at what ``HEAD`` or the index holds, cannot see an
+        exact copy of one. The record files are listed tracked, untracked and
+        ignored alike, and each inner build folder's own records are walked
+        (never its product files). Each non-empty regular file's blob id is
+        computed here from its bytes (GuardKit e0b72800), so a record
+        replaced while this runs is skipped, never an error.
+        """
+        staged_res = await execute(
+            command=[
+                "git", "diff", "--cached", "--raw", "-z", "--no-abbrev",
+                "--no-renames", "--diff-filter=AMT",
+            ],
+            cwd=cwd,
+        )
+        if staged_res.exit_code != 0:
+            return staged_res
+        staged = _staged_outside_records(staged_res.stdout or "")
+        if not staged:
+            return []
+        listed = await execute(
+            command=[
+                "git", "ls-files", "-z", "--cached", "--others", "--",
+                *factory_record_content_pathspecs(),
+            ],
+            cwd=cwd,
+        )
+        if listed.exit_code != 0:
+            return listed
+        shown = await execute(command=["git", "rev-parse", "--show-object-format"], cwd=cwd)
+        object_format = (shown.stdout or "").strip()
+        if shown.exit_code != 0 or object_format not in ("sha1", "sha256"):
+            return shown if shown.exit_code != 0 else ExecuteResult(
+                exit_code=1,
+                stdout="",
+                stderr="git rev-parse named an object format the factory does not know.",
+            )
+        record_ids = await _record_blob_ids(
+            Path(cwd),
+            sorted({n for n in (listed.stdout or "").split("\0") if n}),
+            object_format,
+        )
+        return [path for blob, path in staged if blob in record_ids]
+
+    try:
+        added = await execute(
+            command=["git", "add", "-A", "--", ".", *factory_record_exclusions()],
+            cwd=cwd,
+        )
+        if added.exit_code != 0:
+            return failed(added)
+
+        moves = await execute(
+            command=[
+                "git", "diff", "--cached", "--raw", "--no-abbrev", "-z",
+                "-M", "-C", "--find-copies-harder", "-l0",
+            ],
+            cwd=cwd,
+        )
+        if moves.exit_code != 0:
+            return failed(moves)
+        moved = _moved_out_of_records(moves.stdout or "")
+        if moved:
+            reset = await _reset(moved)
+            if reset is not None:
+                return failed(reset)
+            logger.warning(MOVED_RECORDS_WARNING, len(moved), worktree, moved[0])
+
+        copied = await _exact_copies_of_records()
+        if isinstance(copied, ExecuteResult):
+            return failed(copied)
+        if copied:
+            reset = await _reset(copied)
+            if reset is not None:
+                return failed(reset)
+            logger.warning(MOVED_RECORDS_WARNING, len(copied), worktree, copied[0])
+
+        # ``--no-renames``: a record renamed to another record path must list
+        # both names, or the source's deletion stays staged (coach review 1, F3).
+        listed = await execute(
+            command=[
+                "git", "diff", "--cached", "--name-only", "--no-renames", "-z", "--",
+                *factory_record_pathspecs(),
+            ],
+            cwd=cwd,
+        )
+        if listed.exit_code != 0:
+            return failed(listed)
+        records = [name for name in (listed.stdout or "").split("\0") if name]
+        if records:
+            reset = await _reset(records)
+            if reset is not None:
+                return failed(reset)
+            logger.warning(
+                STAGED_RECORDS_WARNING,
+                len(records),
+                worktree,
+                ", ".join(records[:5]) + (", ..." if len(records) > 5 else ""),
+            )
+
+        quiet = await execute(command=["git", "diff", "--cached", "--quiet"], cwd=cwd)
+        if quiet.exit_code == 0:
+            return PreparedIndex(staged=False)
+        if quiet.exit_code == 1:
+            return PreparedIndex(staged=True)
+        return failed(quiet)
+    except Exception as exc:  # noqa: BLE001 — adapter boundary, ADR-ARCH-025
+        logger.exception("prepare_index failed (worktree=%s)", worktree)
+        return PreparedIndex(staged=False, failure=_exception_failure(operation, exc))
+
+
 async def commit_all(
     worktree: Path,
     message: str,
     *,
     execute: ExecuteCallable = _default_execute,
 ) -> GitOpResult:
-    """Stage all changes and commit them inside ``worktree``.
+    """Stage all changes, without the factory's records, and commit them.
 
-    Issues three separate, list-token git invocations:
+    Issues these list-token git invocations:
 
-    1. ``git add -A``
+    1. :func:`prepare_index` — ``git add -A`` with the factory's own record
+       paths left out, then any staged record (or move or copy of one) taken
+       out again (14 October 2026; before, a plain ``git add -A``);
     2. ``git commit -m <message>`` — the message is passed as a single
        argv token, so shell metacharacters are literal.
     3. ``git rev-parse HEAD`` — to retrieve the commit SHA.
@@ -321,14 +740,9 @@ async def commit_all(
     operation = "commit_all"
     cwd = str(worktree)
     try:
-        add_res = await execute(command=["git", "add", "-A"], cwd=cwd)
-        if add_res.exit_code != 0:
-            return GitOpResult(
-                status="failed",
-                operation=operation,
-                stderr=_failure_stderr(add_res.stderr, add_res.stdout),
-                exit_code=add_res.exit_code,
-            )
+        prepared = await prepare_index(worktree, execute=execute, operation=operation)
+        if prepared.failure is not None:
+            return prepared.failure
 
         commit_res = await execute(command=["git", "commit", "-m", message], cwd=cwd)
         if commit_res.exit_code != 0:
@@ -424,7 +838,10 @@ async def cleanup_worktree(
 __all__ = [
     "ExecuteCallable",
     "ExecuteResult",
+    "PreparedIndex",
     "cleanup_worktree",
+    "git_blob_id",
     "commit_all",
+    "prepare_index",
     "prepare_worktree",
 ]

@@ -24,6 +24,11 @@ WHAT IT DOES. Given ``{project, build_id, turn, j_commit, target_branch}``:
    merge commit whose parents are exactly the recorded G and the recorded
    build tip, and that G is part of the remote's target branch as it is NOW,
    so that sending moves the branch forwards and never sideways;
+3a. it looks at the commits the send would add, and refuses when they bring
+   in one of the factory's own build records, move or copy one elsewhere, or
+   add a file version naming one of the factory's private folders (14
+   October 2026, design "Factory records never enter a project's commits").
+   A look that cannot be made refuses too. It never removes anything;
 4. it sends the joined commit to the remote's recorded target branch with an
    ordinary, NON-FORCING push, using the one credential it holds;
 5. it reads the remote back and answers whether the branch now CONTAINS the
@@ -130,6 +135,13 @@ THE_REMOTE_MOVED: str = "the-remote-moved"
 
 #: The refusal said when a route's key is not the file read at start.
 THE_ROUTE_KEY_CHANGED: str = "the-route-credential-changed"
+
+#: The refusals of the looks before a send (design "Factory records never
+#: enter a project's commits"). None is retried: the way forward is a fresh
+#: build, or a product file with the private folder name taken out.
+IT_HOLDS_FACTORY_RECORDS: str = "it-holds-factory-records"
+IT_HOLDS_PRIVATE_PATHS: str = "it-holds-private-paths"
+THE_COMMITS_COULD_NOT_BE_CHECKED: str = "the-commits-could-not-be-checked"
 
 
 def the_remote_moved(answer: dict[str, Any] | None) -> bool:
@@ -664,6 +676,13 @@ class Publisher:
                 remote_now=remote_now,
             )
 
+        # -- what must not be published -----------------------------------
+        kept_back = self._what_must_not_be_published(
+            commits, remote_now=remote_now, j_commit=j_commit, target_branch=target_branch
+        )
+        if kept_back is not None:
+            return kept_back
+
         # -- the send ------------------------------------------------------
         # Looked at once more, immediately before the push, so the window in
         # which a route's key could be swapped is as short as it can be.
@@ -702,6 +721,78 @@ class Publisher:
                 remote_now=read_back.out,
             )
         return Answer(published=True, remote_now=read_back.out, contains_j=True)
+
+    # -- what must not be published ---------------------------------------
+
+    def _what_must_not_be_published(
+        self,
+        commits: Any,
+        *,
+        remote_now: str,
+        j_commit: str,
+        target_branch: str,
+    ) -> Answer | None:
+        """``None`` when the commits the send adds may be published; a
+        refusal otherwise. Looks a to c (records) are said before look d
+        (private folder names). Nothing is ever removed or rewritten."""
+        findings = commits.what_must_not_be_published(
+            remote_now,
+            j_commit,
+            private_prefixes=self._settings.private_path_prefixes,
+        )
+        if findings is None:
+            return _refused(
+                THE_COMMITS_COULD_NOT_BE_CHECKED,
+                f"The commits {j_commit[:10]} would add to '{target_branch}' "
+                "could not be checked for the factory's own build records and "
+                "private folder names. Nothing was sent.",
+                remote_now=remote_now,
+            )
+        records = [f for f in findings if not f.private_paths]
+        private = [f for f in findings if f.private_paths]
+        if records:
+            paths = {path for f in records for path in f.paths}
+            count = len(paths) or sum(f.count for f in records)
+            logger.warning(
+                "publisher: %s holds %d of the factory's own records (looks %s); "
+                "nothing was sent",
+                j_commit[:10],
+                count,
+                ", ".join(f.look for f in records),
+            )
+            return _refused(
+                IT_HOLDS_FACTORY_RECORDS,
+                f"{j_commit[:10]} would publish {count} of the factory's own "
+                f"build records (for example {records[0].first}), added, "
+                "changed, moved or copied by commits that are not yet on "
+                f"'{target_branch}'. These are working files of the factory, "
+                "not part of the project, and they can hold private paths. "
+                "Nothing was sent. Build the feature again on a release that "
+                "keeps them out of commits.",
+                remote_now=remote_now,
+            )
+        if private:
+            logger.warning(
+                "publisher: %s holds %d file version(s), file name(s) or commit "
+                "message(s) naming a private folder; nothing was sent",
+                j_commit[:10],
+                private[0].count,
+            )
+            return _refused(
+                IT_HOLDS_PRIVATE_PATHS,
+                f"{j_commit[:10]} would publish {private[0].count} new file "
+                "version(s), file name(s) or commit message(s) naming a folder "
+                "that exists only on the factory's own machines (first: "
+                f"{private[0].first}). Nothing was sent. Build the feature "
+                "again on a release that keeps such paths out of commits.",
+                remote_now=remote_now,
+            )
+        logger.info(
+            "publisher: %s — the four looks found no factory record and no "
+            "private folder name in the commits it adds",
+            j_commit[:10],
+        )
+        return None
 
     # -- what the record refuses -------------------------------------------
 

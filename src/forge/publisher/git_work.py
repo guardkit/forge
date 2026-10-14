@@ -39,6 +39,14 @@ that the commits it fetches have somewhere to live that is nobody else's. It
 is a bare repository: there is no working tree, nothing is checked out and
 nothing can be built or run out of it.
 
+WHAT MUST NOT BE PUBLISHED (14 October 2026, design "Factory records never
+enter a project's commits"). Before a send, :meth:`TheProjectsCommits.what_must_not_be_published`
+looks at exactly the commits the send would add, four ways: a record path
+added or changed (a), a record moved or copied out, on the final state (b), a
+record's exact content under another path (c), and any new file version
+holding one of the factory's private folder names (d). It only reads the
+publisher's own copy; it never removes or rewrites anything.
+
 AGNOSTIC. Two git addresses and a branch name. Nothing here knows what a
 project contains, what language it is written in, who hosts its remote or how
 it is deployed.
@@ -52,6 +60,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
+from forge.factory_files import factory_record_pathspecs, is_factory_record
 from forge.network_git import run_network_git
 from forge.publisher.credential import (
     Credential,
@@ -65,6 +74,7 @@ from forge.publisher.settings import ProjectRoute
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "Finding",
     "GitSaid",
     "THE_ADDRESS_IS_NOT_WRITTEN_DOWN",
     "TheProjectsCommits",
@@ -149,6 +159,210 @@ class GitSaid:
     ok: bool
     out: str = ""
     said: str = ""
+
+
+@dataclass(frozen=True)
+class Finding:
+    """One look's answer: what it found, how many, and the first one.
+
+    ``look`` is ``"a"``, ``"b"``, ``"c"`` or ``"d"``. ``first`` names a file
+    (and, for looks b and c, the record it came from); it never quotes a
+    file's content or a private folder name.
+    """
+
+    look: str
+    count: int
+    first: str
+    #: The files found, for looks a to c (so one file found by two looks is
+    #: counted once); for look d, the files whose new version matched. Used
+    #: for counting only and never written into a sentence: only ``first``
+    #: is, after every file name in it has been checked for a private folder.
+    paths: tuple[str, ...] = ()
+
+    @property
+    def private_paths(self) -> bool:
+        return self.look == "d"
+
+
+#: An object id of all zeros: no object (a deletion, or nothing before).
+_NO_OBJECT = re.compile(r"^0+$")
+
+#: The empty blob, in both object formats. Look c never counts it: an empty
+#: product file beside an empty record is not a copy of anything.
+_EMPTY_BLOBS = frozenset(
+    {
+        "e69de29bb2d1d6434b8b29ae775ad8c2e48c5391",
+        "473a0f4c3be8a93681a267e3b1e9a7dcda1185436fe141f7749120a303721813",
+    }
+)
+
+#: The modes whose object is a blob: a file, an executable, a symbolic link
+#: (whose blob is the link's text). A gitlink (160000) is never read.
+_BLOB_MODES = frozenset({"100644", "100755", "120000"})
+
+#: Options every history read carries: the commits being sent, merges judged
+#: only on files whose result differs from every parent, no rename pairing,
+#: full object names, NUL-separated, nothing but the raw lines. ``--full-history``
+#: keeps a record one commit added and a later one deleted.
+_HISTORY = (
+    "log",
+    "--no-ext-diff",
+    "--no-textconv",
+    "--full-history",
+    "--diff-merges=dense-combined",
+    "--no-renames",
+    "--raw",
+    "--no-abbrev",
+    "-z",
+    "--format=",
+)
+
+#: How many blobs one ``cat-file --batch`` reads at a time.
+_BLOBS_PER_READ = 256
+
+
+@dataclass(frozen=True)
+class _Entry:
+    """One raw entry: the result's mode and object, and the path."""
+
+    mode: str
+    object_id: str
+    path: str
+
+    @property
+    def is_new_blob(self) -> bool:
+        return self.mode in _BLOB_MODES and not _NO_OBJECT.match(self.object_id)
+
+
+def _raw_entries(text: str) -> list[_Entry]:
+    """Parse ``--raw -z`` output, ordinary and combined (``::``) entries alike.
+
+    An entry is a header (``:<modes> <objects> <status>``) and one path, each
+    ended by a NUL; ``--no-renames`` means there is never a second path. The
+    header's last mode and object are the result's.
+    """
+    fields = text.split("\0")
+    entries: list[_Entry] = []
+    index = 0
+    while index < len(fields):
+        head = fields[index].lstrip("\n")
+        index += 1
+        if not head.startswith(":"):
+            continue
+        path = fields[index] if index < len(fields) else ""
+        index += 1
+        colons = len(head) - len(head.lstrip(":"))
+        parts = head[colons:].split()
+        sides = colons + 1
+        if len(parts) < 2 * sides:
+            continue
+        entries.append(_Entry(parts[sides - 1], parts[2 * sides - 1], path))
+    return entries
+
+
+def _raw_moves(text: str) -> list[tuple[str, str, str]]:
+    """``(source, destination, destination's object)`` of each rename or copy
+    in ``git diff --raw -z`` output with rename detection on. A rename or copy
+    names two paths; every other status names one."""
+    fields = text.split("\0")
+    moves: list[tuple[str, str, str]] = []
+    index = 0
+    while index < len(fields):
+        head = fields[index].lstrip("\n")
+        index += 1
+        if not head.startswith(":"):
+            continue
+        parts = head[1:].split()
+        status = parts[4] if len(parts) >= 5 else ""
+        if status[:1] in ("R", "C"):
+            source, destination = (fields[index : index + 2] + ["", ""])[:2]
+            index += 2
+            moves.append((source, destination, parts[3]))
+        else:
+            index += 1
+    return moves
+
+
+#: What may follow a private folder name for it to count: anything but a
+#: character that would continue the folder's own name. A ``.`` continues it
+#: only when a name character follows (coach review 2, G1). So
+#: ``/home/example`` is found in ``/home/example/x``, ``"/home/example"``, at
+#: the end of a file and at the end of a sentence (``in /home/example.``), and
+#: not in ``/home/examples-shop`` or ``/home/example.org`` (coach review 1, F4).
+_NAME_GOES_ON = rb"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_\-])"
+
+
+def _private_folder_pattern(prefixes: list[str]) -> "re.Pattern[bytes]":
+    """One pattern matching any of ``prefixes`` on a folder-name boundary."""
+    alternatives = b"|".join(re.escape(p.encode("utf-8")) for p in prefixes)
+    return re.compile(b"(?:" + alternatives + b")" + _NAME_GOES_ON)
+
+
+def _blobs_holding(
+    data: bytes, wanted: list[str], private: "re.Pattern[bytes]"
+) -> set[str] | None:
+    """The blob ids among ``wanted`` whose bytes hold a private folder name,
+    from ``git cat-file --batch`` output. ``None`` when the output is not
+    what was asked for (a missing object, a short read)."""
+    found: set[str] = set()
+    at = 0
+    for object_id in wanted:
+        end = data.find(b"\n", at)
+        if end < 0:
+            return None
+        header = data[at:end].split()
+        if len(header) != 3 or header[0].decode("ascii", "replace") != object_id:
+            return None
+        if header[1] != b"blob":
+            return None
+        try:
+            size = int(header[2])
+        except ValueError:
+            return None
+        start = end + 1
+        content = data[start : start + size]
+        if len(content) != size:
+            return None
+        if private.search(content):
+            found.add(object_id)
+        at = start + size + 1  # the newline after the content
+    return found
+
+
+#: What a finding says in place of a file name that holds a private folder.
+NAME_NOT_WRITTEN = "a file whose name is not written here"
+
+
+def _names_a_private_folder(
+    name: str, private: "re.Pattern[bytes]", prefixes: list[str]
+) -> bool:
+    """Whether a file name holds a private folder name, checked the way
+    detection checks it (with a leading ``/``, so a folder at the top of the
+    repository counts) and, more bluntly, for the folder name without its
+    leading ``/`` anywhere in the text (Codex implementation round 1, R2)."""
+    text = str(name or "")
+    if private.search(("/" + text).encode("utf-8", "surrogateescape")):
+        return True
+    return any(p.strip("/") and p.strip("/") in text for p in prefixes)
+
+
+def _unquoted(finding: Finding, prefixes: list[str]) -> Finding:
+    """The same finding, with any text holding a private folder name
+    replaced: a refusal sentence never quotes one. A last check over the
+    finished text; each file name is also checked before it is formatted."""
+    def clean(text: str) -> str:
+        return (
+            NAME_NOT_WRITTEN
+            if any(p.strip("/") and p.strip("/") in text for p in prefixes)
+            else text
+        )
+
+    return Finding(
+        finding.look,
+        finding.count,
+        clean(finding.first),
+        finding.paths,
+    )
 
 
 def without_the_addresses(said: str, addresses: "Iterable[str]" = ()) -> str:
@@ -384,6 +598,231 @@ class TheProjectsCommits:
         if done.returncode == 1:
             return False
         return None
+
+    def _read(self, *args: str) -> str | None:
+        """Run one reading command in the publisher's own copy; its whole
+        output, or ``None`` when git failed."""
+        done = run_network_git(
+            list(args), transport="none", git_dir=self._where, timeout=self._timeout
+        )
+        return done.stdout if done.ok else None
+
+    def what_must_not_be_published(
+        self,
+        since: str,
+        commit: str,
+        *,
+        private_prefixes: "Iterable[str]",
+    ) -> list[Finding] | None:
+        """What the commits a send would add hold that must not be published.
+
+        The range is ``<since>..<commit>``: the commits reachable from the
+        join and not from the published target branch, which is exactly what
+        the send adds. An empty list means nothing was found; ``None`` means a
+        look could not be made (git failed, or no private prefixes were given),
+        and the caller sends nothing.
+
+        a. **Records added or changed**, at any depth, including one a commit
+           added and a later one deleted: every entry at a record path whose
+           result is not a deletion. Merges are judged only on files whose
+           result differs from every parent, so a record inherited unchanged
+           from the target is not reported, while one the join itself
+           introduces is.
+        b. **Records moved out, judged on the final state**: the published
+           branch's tree against the join's, with copies found against
+           unchanged files too (``-C -C``) and no rename limit (``-l0``,
+           because over a limit git skips the comparison quietly). Any rename
+           or copy whose source is a record and whose destination is not,
+           except an empty destination (git pairs empty files with each
+           other; an empty file holds nothing of a record).
+        c. **Record content elsewhere**: every non-empty blob that sat at a
+           record path in the range's boundary commits, or that look a saw a
+           new commit put at one; then any added, changed or retyped file
+           outside the record paths whose new blob is one of them.
+        d. **Private folder names**: every blob the range adds, changes or
+           retypes, at any path, merges included, is read whole and its raw
+           bytes searched for each private prefix. A gitlink is never read.
+           A blob seen twice is read once. The names of the files the range
+           adds, changes or retypes (as ``-z`` prints them, never quoted, and
+           with a leading ``/`` so a folder at the top counts) and every
+           commit message in the range are searched too (coach review 1). A
+           prefix counts only where the folder's name ends: followed by
+           ``/``, the end, or any character that cannot continue a name.
+
+        No look parses a patch, and nothing is removed or rewritten. No
+        finding's sentence quotes a private folder name: a name holding one
+        is not written down.
+        """
+        prefixes = [str(p) for p in private_prefixes if str(p or "")]
+        if not prefixes:
+            return None
+        private = _private_folder_pattern(prefixes)
+
+        def shown(name: str) -> str:
+            """A file name as a refusal may write it."""
+            return NAME_NOT_WRITTEN if _names_a_private_folder(name, private, prefixes) else name
+
+        if a_plain_commit_name(since) is None or a_plain_commit_name(commit) is None:
+            return None
+        span = f"{since}..{commit}"
+
+        # -- a. records added or changed ------------------------------------
+        raw = self._read(*_HISTORY, span, "--", *factory_record_pathspecs())
+        if raw is None:
+            return None
+        record_paths: list[str] = []
+        record_blobs: dict[str, str] = {}
+        for entry in _raw_entries(raw):
+            if _NO_OBJECT.match(entry.object_id) or not is_factory_record(entry.path):
+                continue
+            if entry.path not in record_paths:
+                record_paths.append(entry.path)
+            if entry.is_new_blob:
+                record_blobs.setdefault(entry.object_id, entry.path)
+        findings: list[Finding] = []
+        if record_paths:
+            findings.append(
+                Finding(
+                    "a",
+                    len(record_paths),
+                    shown(record_paths[0]),
+                    tuple(record_paths),
+                )
+            )
+
+        # -- b. records moved out, judged on the final state ---------------
+        moved = self._read(
+            "diff", "--no-ext-diff", "--no-textconv", "--raw", "--no-abbrev",
+            "-z", "-M", "-C", "-C", "-l0", since, commit,
+        )
+        if moved is None:
+            return None
+        # An empty file is never a copy of anything: git pairs empty files
+        # with each other, and an empty product file beside an empty record
+        # is ordinary work (design test 32's control).
+        moved_out = [
+            (source, destination)
+            for source, destination, object_id in _raw_moves(moved)
+            if is_factory_record(source)
+            and destination
+            and not is_factory_record(destination)
+            and object_id not in _EMPTY_BLOBS
+        ]
+        if moved_out:
+            source, destination = moved_out[0]
+            findings.append(
+                Finding(
+                    "b",
+                    len(moved_out),
+                    f"{shown(destination)}, moved or copied from {shown(source)}",
+                    tuple(dict.fromkeys(d for _, d in moved_out)),
+                )
+            )
+
+        # -- c. record content elsewhere -----------------------------------
+        listed = self._read("rev-list", "--boundary", span)
+        if listed is None:
+            return None
+        boundary = [
+            line[1:].strip()
+            for line in listed.splitlines()
+            if line.startswith("-") and a_plain_commit_name(line[1:].strip())
+        ]
+        for edge in boundary:
+            tree = self._read("ls-tree", "-r", "-l", "-z", edge)
+            if tree is None:
+                return None
+            for item in tree.split("\0"):
+                meta, _, path = item.partition("\t")
+                parts = meta.split()
+                if len(parts) != 4 or parts[1] != "blob" or not is_factory_record(path):
+                    continue
+                record_blobs.setdefault(parts[2], path)
+        for empty in _EMPTY_BLOBS:
+            record_blobs.pop(empty, None)
+
+        added = self._read(*_HISTORY, "--diff-filter=AMT", span)
+        if added is None:
+            return None
+        added_entries = [
+            entry for entry in _raw_entries(added) if not _NO_OBJECT.match(entry.object_id)
+        ]
+        new_blobs = [entry for entry in added_entries if entry.is_new_blob]
+        copies: dict[str, str] = {}
+        for entry in new_blobs:
+            if is_factory_record(entry.path) or entry.object_id not in record_blobs:
+                continue
+            copies.setdefault(entry.path, record_blobs[entry.object_id])
+        if copies:
+            path, record = next(iter(copies.items()))
+            findings.append(
+                Finding(
+                    "c",
+                    len(copies),
+                    f"{shown(path)}, the same content as {shown(record)}",
+                    tuple(copies),
+                )
+            )
+
+        # -- d. private folder names in any new file version ---------------
+        wanted = list(dict.fromkeys(entry.object_id for entry in new_blobs))
+        holding: set[str] = set()
+        for start in range(0, len(wanted), _BLOBS_PER_READ):
+            chunk = wanted[start : start + _BLOBS_PER_READ]
+            done = run_network_git(
+                ["cat-file", "--batch"],
+                transport="none",
+                git_dir=self._where,
+                timeout=self._timeout,
+                binary=True,
+                input_bytes="".join(f"{o}\n" for o in chunk).encode("ascii"),
+            )
+            if not done.ok:
+                return None
+            found = _blobs_holding(done.data, chunk, private)
+            if found is None:
+                return None
+            holding |= found
+        matched = tuple(
+            dict.fromkeys(e.path for e in new_blobs if e.object_id in holding)
+        )
+        named_in_path = list(
+            dict.fromkeys(
+                e.path
+                for e in added_entries
+                if private.search(("/" + e.path).encode("utf-8", "surrogateescape"))
+            )
+        )
+        messages = run_network_git(
+            ["log", "-z", "--format=%H%n%B", span],
+            transport="none",
+            git_dir=self._where,
+            timeout=self._timeout,
+            binary=True,
+        )
+        if not messages.ok:
+            return None
+        named_in_message = [
+            record.split(b"\n", 1)[0].decode("ascii", "replace").strip()
+            for record in messages.data.split(b"\0")
+            if record.strip() and private.search(record.split(b"\n", 1)[-1])
+        ]
+        if holding or named_in_path or named_in_message:
+            if matched:
+                first = shown(matched[0])
+            elif named_in_path:
+                first = "a file name in those commits"
+            else:
+                first = f"the message of commit {named_in_message[0][:10]}"
+            findings.append(
+                Finding(
+                    "d",
+                    len(holding) + len(named_in_path) + len(named_in_message),
+                    first,
+                    matched,
+                )
+            )
+        return [_unquoted(f, prefixes) for f in findings]
 
     def send(self, commit: str, branch: str) -> GitSaid:
         """An ordinary, non-forcing push of one commit to one branch."""
