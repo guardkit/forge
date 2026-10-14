@@ -34,10 +34,14 @@ ROOT = Path(__file__).resolve().parents[2]
 TEMPLATE = ROOT / 'src/forge/cli/deploy_templates/sandbox-runner.sh'
 HANDOFF = Path(__file__).with_name('hand-release-image-to-sandbox.sh')
 EMPTY_STOP = '[Service]\nExecStop=\nExecStopPost=\n'
-MEMORY_NAMES = ('FLEET_MEMORY_ENABLED', 'FLEET_MEMORY_PG_DSN',
+# The memory settings a sandbox is handed. Since 14 October 2026 both
+# directions of a build's memory go through the memory door
+# (FLEET_MEMORY_MCP_URL), and the store's address, the memory bus address and
+# the build account's bus password are not handed into a sandbox at all: the
+# start scripts refuse them.
+MEMORY_NAMES = ('FLEET_MEMORY_ENABLED', 'FLEET_MEMORY_MCP_URL',
                 'FLEET_MEMORY_EMBED_URL', 'FLEET_MEMORY_EMBED_MODEL',
-                'FLEET_MEMORY_EMBED_DIMS', 'FLEET_MEMORY_NATS_URL',
-                'GUARDKIT_NATS_PASSWORD')
+                'FLEET_MEMORY_EMBED_DIMS')
 
 
 class Refusal(Exception):
@@ -327,7 +331,7 @@ class Rollout:
                               or self.forwarded_values.get('SANDBOX_RECEIPTS_PATH'))
         require(effective_receipts == s['receipts_path'], 'effective forwarded receipts path differs from sandbox.receipts_path or is missing; declare and forward the matching receipt setting before stopping the sandbox')
         if self.values['FLEET_MEMORY_ENABLED'] == 'true':
-            require(all(self.values.get(name) for name in MEMORY_NAMES), 'enabled memory lacks explicit private values; supply all seven names through the named files')
+            require(all(self.values.get(name) for name in MEMORY_NAMES), 'enabled memory lacks explicit values; supply all five memory names through the named files')
         self.evidence = Path(s['evidence_dir'])
         forbidden = [ROOT.resolve(),Path(s['profile_source']).resolve().parent]
         forbidden += [Path(x).resolve() for x in c['forbidden_roots']]

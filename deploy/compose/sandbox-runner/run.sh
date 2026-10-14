@@ -15,7 +15,9 @@
 #      runner unit did: one session, running the command the project declares,
 #      with the settings it needs handed in on the front of the line. This
 #      service knows none of those settings by name: it forwards the NAMES
-#      listed in SANDBOX_ENV_NAMES and never looks at a value.
+#      listed in SANDBOX_ENV_NAMES and never prints a value. It looks at a
+#      value only to refuse one that carries a password (see "nothing
+#      credential-shaped is handed into the sandbox" below).
 #   3. ON STOP, ENDS THE WORK INSIDE. This is the heart of it. The client runs
 #      out here and all the work runs in there, so ending the client ends
 #      NOTHING: the bootstrap keeps running inside the sandbox and keeps
@@ -99,8 +101,9 @@
 #                           quietly decides it is talking to a hosted service
 #                           and complains about authentication.
 #
-# EXIT. 0 after a clean stop. 2 when a required setting is missing — said in
-# one sentence, at the door, rather than started half-configured. 3 when the
+# EXIT. 0 after a clean stop. 2 when a required setting is missing, or when
+# SANDBOX_ENV_NAMES would hand something credential-shaped into the sandbox —
+# said in one sentence, at the door, rather than started half-configured. 3 when the
 # work inside would not stop: nothing was started on top of it, nothing claims
 # to have stopped, and the container comes back under its restart policy to try
 # the same stop again.
@@ -161,6 +164,68 @@ fi
 # shellcheck disable=SC2206
 CLIENT_CALL=("${CLIENT}" ${SANDBOX_CLIENT_ARGUMENTS:-} exec "${NAME}")
 
+# NOTHING CREDENTIAL-SHAPED IS HANDED INTO THE SANDBOX (14 October 2026).
+# Whatever crosses here ends up in the settings of the bootstrap's own process
+# inside the sandbox, and from there in both factory containers, where the code
+# a build runs can read it. The factory's keys stay outside: model calls go
+# through the model door on the gateway and memory through the memory door.
+# So a name in SANDBOX_ENV_NAMES that looks like a credential stops the start
+# here, before the sandbox client is called at all, with one sentence naming
+# each setting and never a value. The same rule, word for word, is in the
+# bootstrap inside the sandbox (src/forge/cli/deploy_templates/
+# sandbox-runner.sh):
+#   - a name containing one of Forge's own credential words
+#     (RESERVED_CREDENTIAL_WORDS in src/forge/launch_environment.py), or DSN;
+#   - a value that is an address with a password in it (scheme://user:pw@).
+# ONE EXACT NAME IS EXCUSED, and no pattern is: the stamp check's token count,
+# whose name contains TOKEN. It may cross only as a plain number; anything
+# else in it (a letter, a space, nothing at all) refuses the start too.
+CREDENTIAL_WORDS=(TOKEN SECRET PASSWORD PASSWD API_KEY APIKEY CREDENTIAL PRIVATE_KEY DSN)
+CREDENTIAL_SHAPED_BUT_ALLOWED=(GUARDKIT_STAMP_MODEL_MAX_TOKENS)
+PASSWORD_IN_AN_ADDRESS='[A-Za-z][A-Za-z0-9+.-]*://[^/?#@[:space:]]*:[^/?#@[:space:]]*@'
+
+# Prints why one named setting may not be handed in, or nothing when it may.
+# It reads the value only to judge it, and never prints it.
+why_this_setting_may_not_cross() {
+  local name="$1" word allowed
+  if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    printf '%s (that is not a setting name)' "${name}"
+    return 0
+  fi
+  for allowed in "${CREDENTIAL_SHAPED_BUT_ALLOWED[@]}"; do
+    if [[ "${name}" == "${allowed}" ]]; then
+      if [[ -n "${!name+set}" && ! "${!name}" =~ ^[0-9]+$ ]]; then
+        printf '%s (it may be handed in only as a plain number)' "${name}"
+      fi
+      return 0
+    fi
+  done
+  for word in "${CREDENTIAL_WORDS[@]}"; do
+    if [[ "${name^^}" == *"${word}"* ]]; then
+      printf '%s (its name says it is a credential)' "${name}"
+      return 0
+    fi
+  done
+  if [[ -n "${!name:-}" && "${!name}" =~ ${PASSWORD_IN_AN_ADDRESS} ]]; then
+    printf '%s (its value is an address with a password in it)' "${name}"
+  fi
+  return 0
+}
+
+NAMES_TO_HAND_IN="${SANDBOX_ENV_NAMES:-}"
+REFUSED_SETTINGS=()
+for name in ${NAMES_TO_HAND_IN//,/ }; do
+  reason="$(why_this_setting_may_not_cross "${name}")"
+  if [[ -n "${reason}" ]]; then
+    REFUSED_SETTINGS+=("${reason}")
+  fi
+done
+if ((${#REFUSED_SETTINGS[@]})); then
+  joined="$(printf '%s, ' "${REFUSED_SETTINGS[@]}")"
+  log "FATAL: refusing to start, because no key belongs in the sandbox and SANDBOX_ENV_NAMES would hand these settings in: ${joined%, }. Take them off SANDBOX_ENV_NAMES; the model door and the memory door on the gateway hold the factory's keys outside the sandbox. Nothing was started inside ${NAME}."
+  exit 2
+fi
+
 # The settings handed to the bootstrap: the NAMES the project declares, each
 # with whatever this container's environment has under it. A name with nothing
 # set is left out, so the bootstrap's own "setting X: unset" line stays true.
@@ -168,7 +233,6 @@ CLIENT_CALL=("${CLIENT}" ${SANDBOX_CLIENT_ARGUMENTS:-} exec "${NAME}")
 ENV_PREFIX=()
 FORWARDED=()
 SKIPPED=()
-NAMES_TO_HAND_IN="${SANDBOX_ENV_NAMES:-}"
 for name in ${NAMES_TO_HAND_IN//,/ }; do
   if [[ -n "${!name:-}" ]]; then
     ENV_PREFIX+=("${name}=${!name}")

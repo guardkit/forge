@@ -461,9 +461,16 @@
 #   value): FORGE_TARGET_OWNER_URL — where the coordinator's read-only answer
 #   is, which the helper asks what commit a build was recorded as starting from
 #   and who holds a deployment target; unset, it cannot ask, and refuses a
-#   request naming a commit rather than believing it. FORGE_NATS_URL — the bus.
-#   FACTORY_GATEWAY_ADDRESS — the one machine address every route across the
-#   sandbox boundary goes through. And the rest of the list below.
+#   request naming a commit rather than believing it. FACTORY_GATEWAY_ADDRESS —
+#   the one machine address every route across the sandbox boundary goes
+#   through. And the rest of the list below.
+#
+#   NO FACTORY KEY IS HANDED IN (14 October 2026). Nothing on that list is a
+#   credential: model calls go through the model door on the gateway, which
+#   adds the key itself, and memory goes through the memory door, which needs
+#   none. This script refuses to start, by name and never by value, if it is
+#   asked to hand in anything that looks like one (see "nothing
+#   credential-shaped crosses in" below).
 #
 # SAFETY. In the build lane this script is proven against a stand-in `docker`
 # program on PATH that records every call and answers as told; no sandbox,
@@ -607,7 +614,6 @@ RUNNER_CONFIG_IN_CONTAINER="/opt/forge/runner/langgraph.json"
 # names it in SANDBOX_CONTAINER_ENV_NAMES, in its own .env.
 FACTORY_ENV_NAMES=(
   FORGE_TARGET_OWNER_URL
-  FORGE_NATS_URL
   FORGE_CONFIG_PATH
   FORGE_RECEIPTS_DIR
   # Both containers are told where the per-build worktrees are, because both
@@ -650,13 +656,18 @@ FACTORY_ENV_NAMES=(
   FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES
   FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES
   # THE MODEL THE PLAN'S STAMP CHECK ASKS (5 October 2026). The helper runs
-  # the build system's stamp check at the end of planning; it reads these four.
+  # the build system's stamp check at the end of planning; it reads these.
   # Left off, the check asked the build system's built-in default, a retired
   # model whose load ran the machine's GPU out of memory. The build system's
   # settings, not a project's, so they belong here rather than in a project's
   # SANDBOX_CONTAINER_ENV_NAMES.
+  # GUARDKIT_STAMP_MODEL_URL IS NOT HANDED IN (14 October 2026). The check
+  # prefers it over OPENAI_BASE_URL, so a value left pointing at the model
+  # router itself would go round the model door. Without it the check uses
+  # OPENAI_BASE_URL, the one model address in here, which is the door.
+  # The token count's name contains TOKEN, so it is the one name the refusal
+  # below excuses, and only while its value is a plain number.
   GUARDKIT_STAMP_MODEL
-  GUARDKIT_STAMP_MODEL_URL
   GUARDKIT_STAMP_MODEL_TIMEOUT_S
   GUARDKIT_STAMP_MODEL_MAX_TOKENS
   # THE QA VERIFIER'S SECOND OPINION (5 October 2026). The build system's
@@ -675,24 +686,74 @@ FACTORY_ENV_NAMES=(
   # everything here.
   FORGE_IMAGE_IDENTITY
   FORGE_SIDECAR_IN_SANDBOX
+  # THE MODEL ADDRESS, and no model key (14 October 2026). OPENAI_BASE_URL is
+  # the model door on the gateway, which replaces whatever key a caller sends
+  # with its own. Both containers are given a fixed placeholder for the key
+  # instead (start_helper and start_runner below): the model clients need
+  # some value to start, and this one is the same in every release.
   OPENAI_BASE_URL
-  OPENAI_API_KEY
   # THE FACTORY'S MEMORY, both directions (Codex's stage 4b sign-off, 25
   # September 2026: this list forwarded none of these, so a build inside a
-  # sandbox neither read project memory nor wrote an outcome, even when the
-  # machine supplied every one). The build system defaults memory to OFF
-  # without the first; it reads the store with the DSN; it writes outcomes over
-  # the bus as the account whose password is the last name. Two of these are
-  # secrets: they travel by NAME from the sandbox's own environment into the
-  # containers and are never written to a file or a log by this script.
+  # sandbox neither read project memory nor wrote an outcome). The build
+  # system defaults memory to OFF without the first.
+  # SINCE 14 OCTOBER 2026 BOTH DIRECTIONS GO THROUGH THE MEMORY DOOR,
+  # FLEET_MEMORY_MCP_URL, the memory service at the gateway address, which
+  # needs no key. The store's address, the memory bus address and the build
+  # account's bus password are no longer handed in: each carried a password,
+  # and anything in these containers can be read by the code a build runs.
+  # The embedding settings are plain addresses and names.
   FLEET_MEMORY_ENABLED
-  FLEET_MEMORY_PG_DSN
+  FLEET_MEMORY_MCP_URL
   FLEET_MEMORY_EMBED_URL
   FLEET_MEMORY_EMBED_MODEL
   FLEET_MEMORY_EMBED_DIMS
-  FLEET_MEMORY_NATS_URL
-  GUARDKIT_NATS_PASSWORD
 )
+
+# NOTHING CREDENTIAL-SHAPED CROSSES IN (14 October 2026). Every process in the
+# two containers runs as one user, and both hold this sandbox's engine socket,
+# so the code a build runs can read every setting either container is given:
+# from another process, or with `docker inspect`. So nothing that could serve
+# as a key is handed in at all, and a start that is asked to hand one in is
+# refused, by the setting's NAME and never its value. Two rules:
+#   - a name containing one of Forge's own credential words
+#     (RESERVED_CREDENTIAL_WORDS in src/forge/launch_environment.py), or DSN;
+#   - a value that is an address with a password in it (scheme://user:pw@).
+# ONE EXACT NAME IS EXCUSED, and no pattern is: the stamp check's token count,
+# whose name contains TOKEN. It may cross only as a plain number; anything
+# else in it (a letter, a space, nothing at all) refuses the start too.
+# A project whose own tests need a secret is a separate question; the answer
+# will be a door outside the sandbox, never a value handed in.
+CREDENTIAL_WORDS=(TOKEN SECRET PASSWORD PASSWD API_KEY APIKEY CREDENTIAL PRIVATE_KEY DSN)
+CREDENTIAL_SHAPED_BUT_ALLOWED=(GUARDKIT_STAMP_MODEL_MAX_TOKENS)
+PASSWORD_IN_AN_ADDRESS='[A-Za-z][A-Za-z0-9+.-]*://[^/?#@[:space:]]*:[^/?#@[:space:]]*@'
+
+# Prints why one named setting may not be handed in, or nothing when it may.
+# It reads the value only to judge it, and never prints it.
+why_this_setting_may_not_cross() {
+  local name="$1" word allowed
+  if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    printf '%s (that is not a setting name)' "${name}"
+    return 0
+  fi
+  for allowed in "${CREDENTIAL_SHAPED_BUT_ALLOWED[@]}"; do
+    if [[ "${name}" == "${allowed}" ]]; then
+      if [[ -n "${!name+set}" && ! "${!name}" =~ ^[0-9]+$ ]]; then
+        printf '%s (it may be handed in only as a plain number)' "${name}"
+      fi
+      return 0
+    fi
+  done
+  for word in "${CREDENTIAL_WORDS[@]}"; do
+    if [[ "${name^^}" == *"${word}"* ]]; then
+      printf '%s (its name says it is a credential)' "${name}"
+      return 0
+    fi
+  done
+  if [[ -n "${!name:-}" && "${!name}" =~ ${PASSWORD_IN_AN_ADDRESS} ]]; then
+    printf '%s (its value is an address with a password in it)' "${name}"
+  fi
+  return 0
+}
 
 # --- the containers ---------------------------------------------------------
 #
@@ -933,6 +994,24 @@ case "${1:-start}" in
   start) ;;
   *) log "usage: $0 [start|stop]"; exit 2 ;;
 esac
+
+# --- nothing credential-shaped is handed in, checked before anything --------
+# The rule is written beside FACTORY_ENV_NAMES above. It is checked here, at
+# the door, before the lock, the image or the engine is touched, so a refused
+# start has started, stopped and removed nothing. A stop is never refused: it
+# hands nothing in, and it must always be able to take the containers down.
+REFUSED_SETTINGS=()
+for name in "${FACTORY_ENV_NAMES[@]}" ${EXTRA_ENV_NAMES//,/ }; do
+  reason="$(why_this_setting_may_not_cross "${name}")"
+  if [[ -n "${reason}" ]]; then
+    REFUSED_SETTINGS+=("${reason}")
+  fi
+done
+if ((${#REFUSED_SETTINGS[@]})); then
+  joined="$(printf '%s, ' "${REFUSED_SETTINGS[@]}")"
+  log "FATAL: refusing to start, because no key belongs in this sandbox and these settings would hand one to both containers: ${joined%, }. Take them off the list that names them (the factory's own list in this script, or SANDBOX_CONTAINER_ENV_NAMES); the model door and the memory door on the gateway hold the factory's keys outside the sandbox. Nothing was started."
+  exit 2
+fi
 
 # --- one supervisor, and only one -------------------------------------------
 mkdir -p "${STATE_ROOT}"
@@ -1407,6 +1486,16 @@ done
 log "settings handed to the two containers (names only): ${FORWARDED[*]:-none}"
 log "settings named but not set here: ${SKIPPED[*]:-none}"
 
+# THE MODEL KEY BOTH CONTAINERS ARE GIVEN, which is not a key (14 October
+# 2026). The model clients in both containers will not start without some
+# value, and the model door on the gateway replaces whatever a caller sends
+# with the factory's own key, which never enters this sandbox. So both are
+# given this fixed text, the same in every release, AFTER the named settings so
+# that it is the value they see whatever this script's own environment holds
+# (the sandbox client sets a placeholder of its own there).
+MODEL_KEY_PLACEHOLDER="no-key-the-model-door-adds-it"
+log "both containers are given the fixed model key placeholder ${MODEL_KEY_PLACEHOLDER}; the model door adds the real key outside this sandbox"
+
 CONTAINER_USER="${SANDBOX_CONTAINER_USER:-$(id -u):$(id -g)}"
 if [[ -n "${SANDBOX_CONTAINER_USER:-}" ]]; then
   log "the two containers run as ${CONTAINER_USER}, which this sandbox was told to use; the shared folders above were made by this script's own user, so that user and this one have to be able to write the same folders"
@@ -1484,6 +1573,10 @@ printf '%s\n' "${RUNNER_GRAPH_CONFIG}" > "${RUNNER_CONFIG_FILE}"
 # sandbox's own network the build's code can also reach anything listening on
 # the sandbox's loopback, the product's own published ports included — which,
 # again, the sandbox's own user always could.
+# What the socket NO LONGER gives (14 October 2026): any factory key. Nothing
+# either container is given, and nothing this script holds, is a credential
+# any more (see "nothing credential-shaped crosses in" above), so reading
+# every container's settings through the socket finds no key to take.
 # What would change this: a sandbox shared by more than one project, or a
 # deployment in here that must be protected from the build. The way to close
 # the deployment risk is to take the deployment out of the build's engine, not
@@ -1582,6 +1675,7 @@ start_helper() {
     --env "FORGE_DEPLOY_SIDECAR_PORT=${SIDECAR_PORT}" \
     --env "FORGE_DEPLOY_SIDECAR_HOST=${BIND}" \
     ${ENV_ARGUMENTS[@]+"${ENV_ARGUMENTS[@]}"} \
+    --env "OPENAI_API_KEY=${MODEL_KEY_PLACEHOLDER}" \
     "${MOUNTS[@]}" \
     ${ENGINE_SOCKET_ARGUMENTS[@]+"${ENGINE_SOCKET_ARGUMENTS[@]}"} \
     --workdir "${REPO_ROOT}" \
@@ -1631,6 +1725,7 @@ start_runner() {
     --init \
     --network host \
     ${ENV_ARGUMENTS[@]+"${ENV_ARGUMENTS[@]}"} \
+    --env "OPENAI_API_KEY=${MODEL_KEY_PLACEHOLDER}" \
     "${MOUNTS[@]}" \
     ${ENGINE_SOCKET_ARGUMENTS[@]+"${ENGINE_SOCKET_ARGUMENTS[@]}"} \
     --volume "${RUNNER_CONFIG_FILE}:${RUNNER_CONFIG_IN_CONTAINER}:ro" \

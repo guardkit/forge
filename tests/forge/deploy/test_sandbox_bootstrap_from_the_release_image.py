@@ -894,15 +894,12 @@ class TestItStartsTwoContainersFromThatOneImage:
             env=_settings(
                 sandbox,
                 FORGE_TARGET_OWNER_URL=secret,
-                FORGE_NATS_URL=secret,
                 FACTORY_GATEWAY_ADDRESS=secret,
                 FLEET_MEMORY_ENABLED="1",
-                FLEET_MEMORY_PG_DSN=secret,
+                FLEET_MEMORY_MCP_URL=secret,
                 FLEET_MEMORY_EMBED_URL=secret,
                 FLEET_MEMORY_EMBED_MODEL="a-model",
                 FLEET_MEMORY_EMBED_DIMS="768",
-                FLEET_MEMORY_NATS_URL=secret,
-                GUARDKIT_NATS_PASSWORD=secret,
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -916,19 +913,19 @@ class TestItStartsTwoContainersFromThatOneImage:
             runs = " || ".join(c for c in _calls(sandbox) if c.startswith("run "))
             for name in (
                 "FORGE_TARGET_OWNER_URL",
-                "FORGE_NATS_URL",
                 "FACTORY_GATEWAY_ADDRESS",
                 # Both directions of a build's memory (Codex's stage 4b
                 # sign-off, 25 September 2026): before this the list carried
                 # none of these, so a build inside a sandbox read no project
                 # memory and wrote no outcome, even when the machine had them.
+                # Since 14 October 2026 both go through the memory door, and
+                # the store's address and the bus settings are not handed in
+                # at all (test_sandbox_keeps_no_factory_keys.py).
                 "FLEET_MEMORY_ENABLED",
-                "FLEET_MEMORY_PG_DSN",
+                "FLEET_MEMORY_MCP_URL",
                 "FLEET_MEMORY_EMBED_URL",
                 "FLEET_MEMORY_EMBED_MODEL",
                 "FLEET_MEMORY_EMBED_DIMS",
-                "FLEET_MEMORY_NATS_URL",
-                "GUARDKIT_NATS_PASSWORD",
             ):
                 assert f"--env {name}" in runs, f"{name} was not handed to the containers"
             assert secret not in runs
@@ -971,12 +968,13 @@ class TestItStartsTwoContainersFromThatOneImage:
 
     def test_the_stamp_checks_model_settings_reach_the_helper(self, sandbox):
         """The model the plan's stamp check asks (5 October 2026). The helper
-        runs that check, so it must be handed all four by name from this
+        runs that check, so it must be handed these by name from this
         script's own list, not only when a release adds them to the extra
-        names. Left off, the check asked a retired model."""
+        names. Left off, the check asked a retired model. Its own address is
+        no longer one of them (14 October 2026): the check uses
+        OPENAI_BASE_URL, the model door."""
         names = {
             "GUARDKIT_STAMP_MODEL": "flash-next-t06",
-            "GUARDKIT_STAMP_MODEL_URL": "http://router:4000/v1",
             "GUARDKIT_STAMP_MODEL_TIMEOUT_S": "60",
             "GUARDKIT_STAMP_MODEL_MAX_TOKENS": "8192",
         }
@@ -2879,13 +2877,16 @@ class TestAFreshInstallForwardsWhatTheBootstrapNeeds:
         """5 October 2026: set on the machine, these reach the sandbox, and
         from there the helper that runs the plan's stamp check. An estate set
         up from these files would otherwise never hand the model's name in,
-        and the check would not ask the model it was told to."""
+        and the check would not ask the model it was told to. Its own
+        address is not forwarded (14 October 2026): the check uses
+        OPENAI_BASE_URL, the model door, so nothing can send it round the
+        door."""
         assert {
             "GUARDKIT_STAMP_MODEL",
-            "GUARDKIT_STAMP_MODEL_URL",
             "GUARDKIT_STAMP_MODEL_TIMEOUT_S",
             "GUARDKIT_STAMP_MODEL_MAX_TOKENS",
         } <= self._names(relative)
+        assert "GUARDKIT_STAMP_MODEL_URL" not in self._names(relative)
 
     @pytest.mark.parametrize(
         "relative", ["deploy/estate/.env.example", "deploy/compose/.env.example"]

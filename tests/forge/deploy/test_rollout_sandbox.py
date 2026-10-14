@@ -549,8 +549,11 @@ def test_private_env_cannot_override_public_authority(inventory,monkeypatch):
 def test_normal_runner_private_values_are_not_evidence(inventory,monkeypatch):
     config,path,args=inventory
     env=Path(config['env_file'])
-    with env.open('a') as f:f.write('FLEET_MEMORY_PG_DSN=${PRIVATE_DSN}\n')
-    private=env.parent/'secrets.env';private.write_text('PRIVATE_DSN=postgres://fixture:private-canary@example.invalid/db\n');private.chmod(0o600)
+    # A private value of a forwarded name. Since 14 October 2026 no memory
+    # setting handed into a sandbox carries a password (the start scripts
+    # refuse one), so the private value is a plain one.
+    with env.open('a') as f:f.write('FLEET_MEMORY_EMBED_MODEL=${PRIVATE_MODEL}\n')
+    private=env.parent/'secrets.env';private.write_text('PRIVATE_MODEL=private-canary-model\n');private.chmod(0o600)
     b=Boundary(config,monkeypatch)
     assert m.main([*args,'--secret-env-file',str(private)])==0
     runtime=Path(config['sandbox']['bootstrap_env_file'])
