@@ -76,6 +76,7 @@ from forge.factory_files import (
     factory_record_exclusions,
     factory_record_pathspecs,
     is_factory_record,
+    is_record_content,
 )
 from forge.project_git import PatternPathspec, run_git_async
 
@@ -381,17 +382,6 @@ def _moved_out_of_records(raw: str) -> list[str]:
     return found
 
 
-#: Inside each inner build folder (``.guardkit/worktrees/<id>``), the record
-#: folders that are read. Its product files are never read. The same as
-#: GuardKit's ``_INNER_RECORD_FOLDERS`` (GuardKit e0b72800).
-INNER_RECORD_FOLDERS: tuple[str, ...] = (
-    ".guardkit/autobuild",
-    ".guardkit/autobuild-private",
-    ".guardkit/qav-shadow",
-    "conversation_history",
-    "large_tool_results",
-)
-
 #: How long a commit waits for record files to be read. A read on a stalled
 #: filesystem (a hung network mount) cannot be interrupted, and the planning
 #: writer must never block on it: every other step it takes has a time limit
@@ -444,10 +434,13 @@ def _read_regular_file(path: Path) -> bytes | None:
 
 def _inner_build_record_files(root: Path) -> list[Path]:
     """The record files of each inner build folder under the top-level
-    ``.guardkit/worktrees/``, found by walking :data:`INNER_RECORD_FOLDERS`
-    and the ``.guardkit`` folder's own record files, never following a link.
-    git's own listing stops at an inner build folder, because each is a
-    repository of its own."""
+    ``.guardkit/worktrees/``, at any depth (Codex implementation round 1,
+    R1). Each inner folder is walked whole, never following a link and never
+    entering a ``.git`` folder or a further inner build folder, and only
+    files whose path relative to that inner folder is a record
+    (:func:`forge.factory_files.is_record_content`) are returned: no other
+    file is ever read. git's own listing stops at an inner build folder,
+    because each is a repository of its own."""
     worktrees = root / ".guardkit" / "worktrees"
     if any(p.is_symlink() for p in (root / ".guardkit", worktrees)):
         return []
@@ -457,25 +450,20 @@ def _inner_build_record_files(root: Path) -> list[Path]:
         return []
     found: list[Path] = []
     for entry in inner_folders:
-        inner = Path(entry.path)
-        guardkit = inner / ".guardkit"
-        if guardkit.is_symlink():
-            continue
-        for relative in INNER_RECORD_FOLDERS:
-            top = inner / relative
-            if top.is_symlink() or not top.is_dir():
-                continue
-            for folder, _subfolders, names in os.walk(top):
-                found.extend(Path(folder) / name for name in names)
-        try:
-            names = [e.name for e in os.scandir(guardkit) if e.is_file(follow_symlinks=False)]
-        except OSError:
-            continue
-        found.extend(
-            guardkit / name
-            for name in names
-            if name == "bootstrap_state.json" or name.startswith("memory-query-log.jsonl")
-        )
+        inner = entry.path
+        for folder, subfolders, names in os.walk(inner, followlinks=False):
+            here = os.path.relpath(folder, inner).replace(os.sep, "/")
+            here = "" if here == "." else here + "/"
+            # Never into git's own folder or a further inner build folder.
+            subfolders[:] = [
+                name
+                for name in subfolders
+                if name != ".git"
+                and not (name == "worktrees" and here.endswith(".guardkit/"))
+            ]
+            found.extend(
+                Path(folder) / name for name in names if is_record_content(here + name)
+            )
     return found
 
 

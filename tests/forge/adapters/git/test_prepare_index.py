@@ -490,3 +490,72 @@ class TestCoachFixPass3:
 
         assert result.status == "success", result
         assert _committed(project) == {"src/app.txt"}
+
+
+class TestCodexRound1:
+    """Codex implementation round 1, R1: records anywhere inside an inner
+    build folder, and records named by a record folder's bare name."""
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            "packages/api/.guardkit/memory-query-log.jsonl",
+            "packages/api/large_tool_results/output.txt",
+            "services/web/.guardkit/autobuild/TASK-2/player_turn_1.json",
+            ".guardkit/autobuild",
+            "packages/api/large_tool_results",
+        ],
+        ids=["nested query log", "nested tool output", "nested autobuild",
+             "bare folder name", "nested bare folder name"],
+    )
+    @pytest.mark.asyncio
+    async def test_a_copy_of_a_record_anywhere_in_an_inner_build_is_left_out(
+        self, project: Path, record: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        inner = project / ".guardkit" / "worktrees" / "FEAT-1"
+        inner.mkdir(parents=True)
+        _git(inner, "init", "-q", "-b", "main")
+        _write(inner, {record: OLD_RECORD, "packages/api/src/main.txt": "product\n" * 10})
+        _write(project, {"notes/copied.json": OLD_RECORD, "src/main.txt": "product\n" * 10})
+
+        with caplog.at_level(logging.WARNING):
+            result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/main.txt"}
+        assert "notes/copied.json" in caplog.text
+
+    @pytest.mark.parametrize(
+        "record", [".guardkit/qav-shadow", "large_tool_results", "pkg/.guardkit/autobuild-private"]
+    )
+    @pytest.mark.asyncio
+    async def test_a_copy_of_a_bare_named_record_file_is_left_out(
+        self, project: Path, record: str
+    ) -> None:
+        _write(project, {record: OLD_RECORD, "notes/copied.json": OLD_RECORD, "src/app.txt": "two\n"})
+
+        result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/app.txt"}
+
+    def test_the_inner_walk_reads_nothing_but_records(self, project: Path) -> None:
+        from forge.adapters.git.operations import _inner_build_record_files
+
+        inner = project / ".guardkit" / "worktrees" / "FEAT-1"
+        _write(
+            inner,
+            {
+                "packages/api/.guardkit/memory-query-log.jsonl": "q\n",
+                "packages/api/src/main.txt": "product\n",
+                ".git/objects/x": "git's own\n",
+                ".guardkit/worktrees/INNER/.guardkit/autobuild/x.json": "{}\n",
+                ".guardkit/worktrees/INNER/src/product.txt": "product\n",
+                "README": "product\n",
+            },
+        )
+        (inner / "linked").symlink_to(project / "src")
+
+        found = {p.relative_to(inner).as_posix() for p in _inner_build_record_files(project)}
+
+        assert found == {"packages/api/.guardkit/memory-query-log.jsonl"}

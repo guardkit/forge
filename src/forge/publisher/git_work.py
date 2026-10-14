@@ -174,7 +174,9 @@ class Finding:
     count: int
     first: str
     #: The files found, for looks a to c (so one file found by two looks is
-    #: counted once); for look d, the files whose new version matched.
+    #: counted once); for look d, the files whose new version matched. Used
+    #: for counting only and never written into a sentence: only ``first``
+    #: is, after every file name in it has been checked for a private folder.
     paths: tuple[str, ...] = ()
 
     @property
@@ -331,17 +333,35 @@ def _blobs_holding(
 NAME_NOT_WRITTEN = "a file whose name is not written here"
 
 
+def _names_a_private_folder(
+    name: str, private: "re.Pattern[bytes]", prefixes: list[str]
+) -> bool:
+    """Whether a file name holds a private folder name, checked the way
+    detection checks it (with a leading ``/``, so a folder at the top of the
+    repository counts) and, more bluntly, for the folder name without its
+    leading ``/`` anywhere in the text (Codex implementation round 1, R2)."""
+    text = str(name or "")
+    if private.search(("/" + text).encode("utf-8", "surrogateescape")):
+        return True
+    return any(p.strip("/") and p.strip("/") in text for p in prefixes)
+
+
 def _unquoted(finding: Finding, prefixes: list[str]) -> Finding:
-    """The same finding, with any file name holding a private folder name
-    replaced: a refusal sentence never quotes one."""
+    """The same finding, with any text holding a private folder name
+    replaced: a refusal sentence never quotes one. A last check over the
+    finished text; each file name is also checked before it is formatted."""
     def clean(text: str) -> str:
-        return NAME_NOT_WRITTEN if any(p in text for p in prefixes) else text
+        return (
+            NAME_NOT_WRITTEN
+            if any(p.strip("/") and p.strip("/") in text for p in prefixes)
+            else text
+        )
 
     return Finding(
         finding.look,
         finding.count,
         clean(finding.first),
-        tuple(clean(path) for path in finding.paths),
+        finding.paths,
     )
 
 
@@ -637,6 +657,11 @@ class TheProjectsCommits:
         if not prefixes:
             return None
         private = _private_folder_pattern(prefixes)
+
+        def shown(name: str) -> str:
+            """A file name as a refusal may write it."""
+            return NAME_NOT_WRITTEN if _names_a_private_folder(name, private, prefixes) else name
+
         if a_plain_commit_name(since) is None or a_plain_commit_name(commit) is None:
             return None
         span = f"{since}..{commit}"
@@ -657,7 +682,12 @@ class TheProjectsCommits:
         findings: list[Finding] = []
         if record_paths:
             findings.append(
-                Finding("a", len(record_paths), record_paths[0], tuple(record_paths))
+                Finding(
+                    "a",
+                    len(record_paths),
+                    shown(record_paths[0]),
+                    tuple(record_paths),
+                )
             )
 
         # -- b. records moved out, judged on the final state ---------------
@@ -684,7 +714,7 @@ class TheProjectsCommits:
                 Finding(
                     "b",
                     len(moved_out),
-                    f"{destination}, moved or copied from {source}",
+                    f"{shown(destination)}, moved or copied from {shown(source)}",
                     tuple(dict.fromkeys(d for _, d in moved_out)),
                 )
             )
@@ -729,7 +759,7 @@ class TheProjectsCommits:
                 Finding(
                     "c",
                     len(copies),
-                    f"{path}, the same content as {record}",
+                    f"{shown(path)}, the same content as {shown(record)}",
                     tuple(copies),
                 )
             )
@@ -779,7 +809,7 @@ class TheProjectsCommits:
         ]
         if holding or named_in_path or named_in_message:
             if matched:
-                first = matched[0]
+                first = shown(matched[0])
             elif named_in_path:
                 first = "a file name in those commits"
             else:

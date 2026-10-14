@@ -25,13 +25,6 @@
     ":(exclude,glob)**/large_tool_results",
     ":(exclude,glob)**/large_tool_results/**"
   ],
-  "inner_record_folders": [
-    ".guardkit/autobuild",
-    ".guardkit/autobuild-private",
-    ".guardkit/qav-shadow",
-    "conversation_history",
-    "large_tool_results"
-  ],
   "is_factory_record": {
     ".guardkit/autobuild/x.json": true,
     ".guardkit/autobuild": true,

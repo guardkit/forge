@@ -800,3 +800,38 @@ class TestCoachFixPass3:
         project = world.join()
 
         published(world, world.publish(project), project)
+
+
+class TestCodexRound1Redaction:
+    """Codex implementation round 1, R2: a file name holding a private
+    folder at the top of the repository (no leading ``/``) is never written
+    into a refusal, whichever look found the problem."""
+
+    TOP = PRIVATE.lstrip("/")
+
+    def test_a_record_under_a_root_relative_private_folder(self, world: World) -> None:
+        world.commit({f"{self.TOP}/.guardkit/autobuild/x.json": '{"turn": 1}\n'})
+        project = world.join()
+
+        sentence = refused(world, world.publish(project), RECORDS_KIND)
+
+        assert self.TOP not in sentence
+
+    def test_a_record_moved_to_a_root_relative_private_folder(self, tmp_path: Path) -> None:
+        world = tracking(tmp_path, {".guardkit/autobuild/old.json": OLD_RECORD})
+        (world.copy / self.TOP).mkdir(parents=True)
+        world.run("mv", ".guardkit/autobuild/old.json", f"{self.TOP}/old.json")
+        world.commit({f"{self.TOP}/old.json": EDITED})
+        project = world.join()
+
+        sentence = refused(world, world.publish(project), RECORDS_KIND)
+
+        assert self.TOP not in sentence
+
+    def test_private_content_in_a_root_relative_private_file(self, world: World) -> None:
+        world.commit({f"{self.TOP}/notes.txt": f"see {PRIVATE}/x\n"})
+        project = world.join()
+
+        sentence = refused(world, world.publish(project), PRIVATE_KIND)
+
+        assert self.TOP not in sentence

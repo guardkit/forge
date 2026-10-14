@@ -41,6 +41,7 @@ __all__ = [
     "factory_record_exclusions",
     "factory_record_pathspecs",
     "is_factory_record",
+    "is_record_content",
     "is_shipped_script",
     "shipped_script_path",
 ]
@@ -84,8 +85,19 @@ _ALL_RECORD_PATTERNS: tuple[str, ...] = FACTORY_RECORD_PATHS + FACTORY_RECORD_FO
 _NOT_AT_ADD_TIME = ("conversation_history/**", "conversation_history")
 
 #: The inner build folders hold copies of the product itself, so their content
-#: is never compared with product files.
-_NOT_FOR_CONTENT = "**/.guardkit/worktrees/**"
+#: is never compared with product files (their own records are walked
+#: separately, by :func:`forge.adapters.git.operations._inner_build_record_files`).
+_NOT_FOR_CONTENT = ("**/.guardkit/worktrees/**", "**/.guardkit/worktrees")
+
+_INNER_BUILDS = re.compile(r"(?:.*/)?\.guardkit/worktrees(?:/.*)?", re.DOTALL)
+
+
+def is_record_content(path: str) -> bool:
+    """True when ``path`` is a record whose content may be compared with
+    product files: a record path or folder name, but never anything inside
+    an inner build folder (``.guardkit/worktrees``), which holds the product
+    itself."""
+    return is_factory_record(path) and not _INNER_BUILDS.fullmatch(str(path))
 
 
 def _glob_to_regex(pattern: str) -> "re.Pattern[str]":
@@ -154,14 +166,15 @@ def factory_record_pathspecs() -> tuple[str, ...]:
 
 def factory_record_content_pathspecs() -> tuple[str, ...]:
     """Where record CONTENT is looked for on disk, to catch an exact copy of
-    a record that was never committed: every record path except the inner
-    build folders, as ``:(glob)`` pathspecs marked as patterns."""
+    a record that was never committed: every record path and folder name
+    except the inner build folders, as ``:(glob)`` pathspecs marked as
+    patterns."""
     from forge.project_git import pattern_pathspec
 
     return tuple(
         pattern_pathspec(f":(glob){p}")
-        for p in FACTORY_RECORD_PATHS
-        if p != _NOT_FOR_CONTENT
+        for p in _ALL_RECORD_PATTERNS
+        if p not in _NOT_FOR_CONTENT
     )
 
 #: Each script the factory ships for a project's sandbox, by file name, and
