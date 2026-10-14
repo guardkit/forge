@@ -2156,6 +2156,26 @@ def _enclosing(mod: _Module, node: ast.AST, kinds: Any) -> ast.AST | None:
     return current
 
 
+def _nearest_scope(mod: _Module, node: ast.AST) -> ast.AST | None:
+    """The nearest enclosing LEXICAL scope of ``node``: walking up through
+    ``if``, ``for``, ``while``, ``with``, ``try`` and ``match`` bodies (which
+    are no scope of their own) to the first class, function or lambda;
+    ``None`` at module level (15 October 2026, review 4, R5)."""
+    current = mod.parents.get(id(node))
+    while current is not None and not isinstance(
+        current, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    ):
+        current = mod.parents.get(id(current))
+    return current
+
+
+def _is_method(mod: _Module, definition: ast.AST) -> bool:
+    """``definition`` is a method: its nearest lexical scope is a class body,
+    however deep inside that body's conditionals, loops, ``with`` or ``try``
+    blocks it is written."""
+    return isinstance(_nearest_scope(mod, definition), ast.ClassDef)
+
+
 def _enclosing_function(mod: _Module, node: ast.AST) -> ast.AST | None:
     return _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef))
 
@@ -2821,7 +2841,7 @@ def _def_env_slot(mod: _Module, definition: Any) -> EnvSlot:
     kept), keyword-only, through ``**kwargs``, or none."""
     args = definition.args
     positional = [(a.arg, True) for a in args.posonlyargs] + [(a.arg, False) for a in args.args]
-    in_class = isinstance(mod.parents.get(id(definition)), ast.ClassDef)
+    in_class = _is_method(mod, definition)
     static = any(_last_name(d) == "staticmethod" for d in definition.decorator_list)
     if in_class and not static and positional:
         positional = positional[1:]
@@ -6142,6 +6162,80 @@ def test_an_unknown_slot_never_takes_env_by_keyword_as_proof() -> None:
     # A launch function whose signature cannot be read: never its first.
     assert _env_argument(with_positional, ("unknown", 1))[0] == "given"
     assert _env_argument(two_positionals, ("unknown", 1))[0] == "positional"
+
+
+#: Review 4 of round 22, probed (15 October 2026, R5): a method written
+#: inside a class-level ``if`` or ``try`` block is still a method (its
+#: nearest lexical scope is the class), so its ``self`` is dropped and it
+#: takes env only by keyword. The probe is the reproducer: a bound call
+#: whose second positional argument is the real env (this process's own)
+#: and whose third, which the old reading took for env, is the helper's.
+#: The control: the same method with the helper's env by keyword.
+_CONDITIONAL_METHOD_MAIN = textwrap.dedent(
+    '''\
+    import os
+
+    from forge.launch_environment import build_project_command_env
+
+
+    def p29_conditional_method_unsafe_bound_call(executor, cmd, folder):
+        return executor._spawn(cmd, dict(os.environ), build_project_command_env(folder))
+
+
+    def ok_conditional_method_helper_env_by_keyword(executor, cmd, folder):
+        return executor._spawn(args=cmd, env=build_project_command_env(folder))
+    '''
+)
+GUARD_PROBES_29_IF: dict[str, str] = {
+    "__init__.py": "",
+    "deploy_sidecar/__init__.py": "",
+    "deploy_sidecar/deploy_executor.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class DeployExecutor:
+            if True:
+                def _spawn(self, args, env=None, extra=None):
+                    return self._default_spawn(args=args, env=env)
+
+            @staticmethod
+            def _default_spawn(**kwargs):
+                return subprocess.Popen(**kwargs)
+        '''
+    ),
+    "zz_main.py": _CONDITIONAL_METHOD_MAIN,
+}
+GUARD_PROBES_29_TRY: dict[str, str] = {
+    **GUARD_PROBES_29_IF,
+    "deploy_sidecar/deploy_executor.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class DeployExecutor:
+            try:
+                def _spawn(self, args, env=None, extra=None):
+                    return self._default_spawn(args=args, env=env)
+            except Exception:
+                pass
+
+            @staticmethod
+            def _default_spawn(**kwargs):
+                return subprocess.Popen(**kwargs)
+        '''
+    ),
+}
+
+
+@pytest.mark.parametrize("source", ["GUARD_PROBES_29_IF", "GUARD_PROBES_29_TRY"])
+def test_a_method_inside_a_class_level_block_is_still_a_method(
+    tmp_path: Path, source: str
+) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, globals()[source]))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    assert "p29_conditional_method_unsafe_bound_call" in named, problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
 
 
 def test_env_slots_are_read_from_signatures() -> None:
