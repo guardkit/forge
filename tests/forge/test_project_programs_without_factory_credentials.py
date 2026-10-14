@@ -34,6 +34,7 @@ import asyncio
 import contextlib
 import functools
 import importlib.util
+import inspect
 import json
 import os
 import sqlite3
@@ -2155,6 +2156,26 @@ def _enclosing(mod: _Module, node: ast.AST, kinds: Any) -> ast.AST | None:
     return current
 
 
+def _nearest_scope(mod: _Module, node: ast.AST) -> ast.AST | None:
+    """The nearest enclosing LEXICAL scope of ``node``: walking up through
+    ``if``, ``for``, ``while``, ``with``, ``try`` and ``match`` bodies (which
+    are no scope of their own) to the first class, function or lambda;
+    ``None`` at module level (15 October 2026, review 4, R5)."""
+    current = mod.parents.get(id(node))
+    while current is not None and not isinstance(
+        current, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+    ):
+        current = mod.parents.get(id(current))
+    return current
+
+
+def _is_method(mod: _Module, definition: ast.AST) -> bool:
+    """``definition`` is a method: its nearest lexical scope is a class body,
+    however deep inside that body's conditionals, loops, ``with`` or ``try``
+    blocks it is written."""
+    return isinstance(_nearest_scope(mod, definition), ast.ClassDef)
+
+
 def _enclosing_function(mod: _Module, node: ast.AST) -> ast.AST | None:
     return _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef))
 
@@ -2554,10 +2575,19 @@ def _single_use_helper_name(name: str, mod: _Module, func: Any, wrappers: set[st
         if not (isinstance(node, ast.Name) and node.id == name and isinstance(node.ctx, ast.Load)):
             continue
         parent = mod.parents.get(id(node))
-        if not (isinstance(parent, ast.keyword) and parent.arg == "env"):
+        if isinstance(parent, ast.keyword) and parent.arg == "env":
+            call = mod.parents.get(id(parent))
+        elif isinstance(parent, ast.Call) and node in parent.args:
+            call = parent  # possibly in the callee's own env position
+        else:
             return False  # an attribute, subscript, argument, return, alias ...
-        call = mod.parents.get(id(parent))
         if not isinstance(call, ast.Call) or not _is_launch_or_runner(mod, call):
+            return False
+        # Used exactly where the callee's derived env slot takes it, bound as
+        # Python binds it (15 October 2026, review 1, R1 and R2): ``env=``
+        # to a parameter that accepts it, or the argument in env's position.
+        status, value = _env_argument(call, _callee_env_slot(mod, call))
+        if status != "given" or value is not node:
             return False
         scope = mod.parents.get(id(call))
         while scope is not None and scope is not func:
@@ -2739,6 +2769,173 @@ def _env_keyword(call: ast.Call) -> ast.AST | None:
         if kw.arg == "env":
             return kw.value
     return None
+
+
+#: Where a callee takes its environment (14 October 2026, round 22):
+#: ``("index", i)`` the i-th positional argument or ``env=``,
+#: ``("positional-only", i)`` the i-th positional argument ONLY (an
+#: ``env=`` keyword never reaches it: Python puts it in ``**kwargs`` or
+#: refuses the call), ``("keyword", None)`` only by keyword (a keyword-only
+#: ``env`` or a ``**kwargs`` that may hold it), ``("none", None)`` no
+#: environment parameter at all, ``("unknown", i)`` the signature cannot
+#: be read and env could be at any position from i on (0 for a runner, 1 for
+#: a launch function, whose first argument is never env). The parameter's kind is kept, as Python binds arguments. A
+#: method's positional env is ``("method", i)`` or
+#: ``("method-positional-only", i)``: a method takes env only by keyword,
+#: because an explicit ``Class.method(instance, ...)`` call shifts every
+#: positional argument by one (15 October 2026, review 2).
+EnvSlot = tuple[str, int | None]
+
+#: subprocess's convenience functions hand their positional arguments
+#: straight to ``Popen`` (``run(*popenargs, ...)``), so their env slot is
+#: Popen's.
+_FORWARDS_TO_POPEN = frozenset({"run", "call", "check_call", "check_output"})
+
+
+def _slot_from_parameters(
+    positional: list[tuple[str, bool]], keyword_only: list[str], var_keyword: bool
+) -> EnvSlot:
+    """``positional``: each parameter a caller may fill by position, in
+    order, with whether it is positional-only."""
+    for index, (name, positional_only) in enumerate(positional):
+        if name == "env":
+            return ("positional-only" if positional_only else "index", index)
+    if "env" in keyword_only or var_keyword:
+        return ("keyword", None)
+    return ("none", None)
+
+
+@functools.lru_cache(maxsize=None)
+def _launch_env_slot(dotted: str) -> EnvSlot:
+    """A launch function's env slot, read from its real signature
+    (``inspect.signature``), never written by hand. When it cannot be read,
+    ``("unknown", 1)``: env could be at any position from the second on (no
+    launch function takes its environment first; its first argument is the
+    command, program or path)."""
+    if dotted.startswith(UNRESOLVED):
+        return ("unknown", 1)
+    module_name, _, name = dotted.rpartition(".")
+    try:
+        module = sys.modules.get(module_name) or __import__(module_name, fromlist=[name])
+        target = getattr(module, name)
+        if module_name == "subprocess" and name in _FORWARDS_TO_POPEN:
+            target = subprocess.Popen
+        parameters = list(inspect.signature(target).parameters.values())
+    except Exception:  # noqa: BLE001 — not importable here, or no readable signature
+        return ("unknown", 1)
+    return _slot_from_parameters(
+        [
+            (p.name, p.kind == inspect.Parameter.POSITIONAL_ONLY)
+            for p in parameters
+            if p.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        ],
+        [p.name for p in parameters if p.kind == inspect.Parameter.KEYWORD_ONLY],
+        any(p.kind == inspect.Parameter.VAR_KEYWORD for p in parameters),
+    )
+
+
+def _def_env_slot(mod: _Module, definition: Any) -> EnvSlot:
+    """A function's env slot, read from its own ``def`` in the scanned
+    source: the position of ``env`` among the parameters a caller fills
+    positionally (a method's ``self`` or ``cls`` dropped, a staticmethod's
+    kept), keyword-only, through ``**kwargs``, or none."""
+    args = definition.args
+    positional = [(a.arg, True) for a in args.posonlyargs] + [(a.arg, False) for a in args.args]
+    in_class = _is_method(mod, definition)
+    static = any(_last_name(d) == "staticmethod" for d in definition.decorator_list)
+    if in_class and not static and positional:
+        positional = positional[1:]
+    slot = _slot_from_parameters(
+        positional, [a.arg for a in args.kwonlyargs], args.kwarg is not None
+    )
+    if in_class and slot[0] in ("index", "positional-only"):
+        return ("method" if slot[0] == "index" else "method-positional-only", slot[1])
+    return slot
+
+
+def _runner_identity_of_call(mod: _Module, call: ast.Call, key: tuple[str, str]) -> str | None:
+    """Which of a generic runner's qualified identities ``call`` calls: the
+    one it resolves to, else the one whose last name it is called by
+    (``self._spawn``); ``None`` when that is not exactly one."""
+    dotted = GENERIC_RUNNERS[key]["dotted"]
+    resolved = _resolve_all(mod, call.func, call) & dotted
+    if len(resolved) == 1:
+        return next(iter(resolved))
+    by_name = {d for d in dotted if d.rsplit(".", 1)[1] == _last_name(call.func)}
+    return next(iter(by_name)) if len(by_name) == 1 else None
+
+
+def _runner_env_slot(modules: list[_Module], rel: str, identity: str | None) -> EnvSlot:
+    """A generic runner's env slot, from the one definition whose QUALIFIED
+    identity is ``identity`` in its module (15 October 2026, review 2, R3:
+    never by a bare name across scopes, so an unrelated method of the same
+    name elsewhere in the file changes nothing). ``unknown`` when there is
+    not exactly one such definition, bound once."""
+    if identity is None:
+        return ("unknown", None)
+    for mod in modules:
+        if mod.rel != rel:
+            continue
+        found = [
+            n
+            for n in ast.walk(mod.tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and f"{mod.dotted}.{_qualname(mod, n)}" == identity
+        ]
+        if len(found) == 1 and _defined_once(mod, found[0]):
+            return _def_env_slot(mod, found[0])
+    return ("unknown", None)
+
+
+def _callee_env_slot(mod: _Module, call: ast.Call) -> EnvSlot:
+    """The env slot of what ``call`` calls: a launch function's from its
+    signature, a generic runner's from its def."""
+    kind = _launch_kind(mod, call.func)
+    if kind:
+        return _launch_env_slot(kind)
+    runner = _runner_named(mod, call.func)
+    if runner:
+        return _runner_env_slot(
+            list(_PACKAGE_MODULES.values()), runner[0], _runner_identity_of_call(mod, call, runner)
+        )
+    return ("unknown", None)
+
+
+def _env_argument(call: ast.Call, slot: EnvSlot) -> tuple[str, ast.AST | None]:
+    """How a call gives its callee's environment, bound as Python binds it:
+    ``given`` (with the value, by ``env=`` or in env's position),
+    ``omitted`` (provably not given), ``unpacked`` (a ``*`` or ``**`` that
+    may carry it), ``positional`` (an argument past the first where env's
+    position is unknown), ``misdirected`` (an ``env=`` keyword to a
+    positional-only env, which never reaches it), or ``absent`` (the callee
+    has no env parameter at all)."""
+    kind, index = slot
+    if kind == "none":
+        return ("absent", None)
+    if any(isinstance(a, ast.Starred) for a in call.args) or any(
+        kw.arg is None for kw in call.keywords
+    ):
+        return ("unpacked", None)
+    keyword = _env_keyword(call)
+    if kind == "unknown" and len(call.args) > (index or 0):
+        # An unknown slot never takes env= as proof while any positional
+        # argument might reach env (15 October 2026, review 2, R3).
+        return ("positional", None)
+    if kind in ("method", "method-positional-only") and index is not None and len(call.args) > index:
+        # A method takes env only by keyword: bound or called through its
+        # class (which shifts every argument by one), a positional argument
+        # may land in env (15 October 2026, review 2).
+        return ("method-positional", None)
+    if kind in ("positional-only", "method-positional-only") and keyword is not None:
+        # Conservative (15 October 2026, review 1, R2): the keyword lands in
+        # the callee's **kwargs (or the call fails), so what env really is
+        # cannot be read from it.
+        return ("misdirected", None)
+    if keyword is not None:
+        return ("given", keyword)
+    if kind in ("index", "positional-only") and index is not None and len(call.args) > index:
+        return ("given", call.args[index])
+    return ("omitted", None)
 
 
 def _annotation_nodes(tree: ast.AST) -> set[int]:
@@ -3271,16 +3468,34 @@ def unaccounted_launches(package: Path) -> list[str]:
         named = func or _enclosing(mod, node, ast.ClassDef)
         return func, getattr(named, "name", "<module>")
 
-    def judge(mod: _Module, call: ast.Call, what: str) -> None:
+    def judge(mod: _Module, call: ast.Call, what: str, slot: EnvSlot) -> None:
         func, fname = place(mod, call)
         if (mod.rel, fname) in ALLOWED and func is not None and _defined_once(mod, func):
             return
         if _factory_program(call):
             return
-        env = _env_keyword(call)
-        if _helper_shaped(env, mod, func, wrappers):
+        # The environment by keyword or in env's own position is judged the
+        # same way; a * or ** unpacking that may carry it is never trusted
+        # (14 October 2026, round 22). There is no safe-default exemption:
+        # an omitted environment is always a violation here.
+        status, env = _env_argument(call, slot)
+        if status == "given" and _helper_shaped(env, mod, func, wrappers):
             return
-        reason = "no env= (it inherits everything)" if env is None else "env= is not the helper's"
+        reason = {
+            "given": "env= is not the helper's",
+            "omitted": "no env= (it inherits everything)",
+            "absent": "it takes no environment, so it inherits everything",
+            "unpacked": "a * or ** unpacking may carry env, so it cannot be checked",
+            "positional": "a positional argument may be env, so it cannot be checked",
+            "method-positional": (
+                "a positional argument may reach a method runner's env, which it "
+                "takes only by keyword"
+            ),
+            "misdirected": (
+                "env= is passed to a positional-only env, so it never reaches env "
+                "and cannot be checked"
+            ),
+        }[status]
         problems.append(f"{mod.rel}:{call.lineno} in {fname}: {what}: {reason}")
 
     def flag(mod: _Module, node: ast.AST, sentence: str) -> None:
@@ -3293,7 +3508,7 @@ def unaccounted_launches(package: Path) -> list[str]:
             if isinstance(node, ast.Call):
                 kind = _launch_kind(mod, node.func)
                 if kind:
-                    judge(mod, node, f"process launch {kind}")
+                    judge(mod, node, f"process launch {kind}", _launch_env_slot(kind))
                 elif (
                     _dotted(node.func) in ("__import__", "importlib.import_module", "import_module")
                     and node.args
@@ -3341,7 +3556,14 @@ def unaccounted_launches(package: Path) -> list[str]:
                     and _defined_once(mod, func)
                 ):
                     continue  # the runner's own body
-                judge(mod, node, f"call to the generic runner {fname}")
+                judge(
+                    mod,
+                    node,
+                    f"call to the generic runner {fname}",
+                    _runner_env_slot(
+                        modules, rel, _runner_identity_of_call(mod, node, (rel, fname))
+                    ),
+                )
     problems.extend(problems_of_trust)
     problems.extend(_module_name_collisions(modules))
     problems.extend(_module_object_and_dynamic_import_violations(modules))
@@ -5621,6 +5843,417 @@ def test_a_value_the_guard_cannot_follow_is_never_stored(tmp_path: Path) -> None
         " in p25_annotated_module_stored_then_run: a module object" in p for p in problems
     ), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Where the environment goes, probed (14 October 2026, round 22). The
+#: runner's env slot is read from its own ``def`` in the scanned source; here
+#: the probe package's ``_start_and_collect`` takes ``env`` as its third
+#: positional parameter, and a launch function's slot is read from its real
+#: signature (``Popen``'s eleventh). An environment in env's position is
+#: judged exactly like ``env=``; a ``**options`` or ``*args`` that may carry
+#: it is a violation. There is no safe-default exemption in this guard: an
+#: omitted environment is always a violation, so the coordinator's
+#: "omitted on a default-safe runner" control is a probe here. The controls:
+#: the helper's environment by keyword and in env's position, for the
+#: runner and for ``Popen``.
+GUARD_PROBES_26: dict[str, str] = {
+    "__init__.py": "",
+    "deploy_sidecar/__init__.py": "",
+    "deploy_sidecar/service.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        def _start_and_collect(argv, cwd, env, timeout=1, what="x"):
+            return subprocess.run(argv, cwd=cwd, env=env, timeout=timeout)
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import os
+        import subprocess
+
+        from forge.deploy_sidecar.service import _start_and_collect
+        from forge.launch_environment import build_project_command_env
+
+
+        def p26_runner_env_positional_not_the_helpers(cmd):
+            return _start_and_collect(cmd, ".", dict(os.environ))
+
+
+        def p26_runner_options_holding_env(cmd):
+            options = {"env": dict(os.environ)}
+            return _start_and_collect(argv=cmd, cwd=".", **options)
+
+
+        def p26_runner_args_reaching_the_env_position(cmd):
+            parts = [cmd, ".", dict(os.environ)]
+            return _start_and_collect(*parts)
+
+
+        def p26_runner_env_omitted(cmd):
+            return _start_and_collect(cmd, ".")
+
+
+        def p26_launch_env_positional_not_the_helpers(cmd):
+            return subprocess.Popen(
+                cmd, -1, None, None, None, None, None, True, False, None, dict(os.environ)
+            )
+
+
+        def p26_launch_options_unpacked(cmd, folder):
+            options = {"env": build_project_command_env(folder)}
+            return subprocess.run(cmd, **options)
+
+
+        def ok_runner_helper_env_by_keyword(cmd, folder):
+            return _start_and_collect(argv=cmd, cwd=".", env=build_project_command_env(folder))
+
+
+        def ok_runner_helper_env_positionally(cmd, folder):
+            return _start_and_collect(cmd, ".", build_project_command_env(folder))
+
+
+        def ok_launch_helper_env_positionally(cmd, folder):
+            return subprocess.Popen(
+                cmd, -1, None, None, None, None, None, True, False, None,
+                build_project_command_env(folder),
+            )
+        '''
+    ),
+}
+
+
+def test_env_by_position_or_unpacking_is_judged(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_26))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_26["zz_main.py"]).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p26_")
+    }
+    assert len(expected) == 6
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Review 1 of round 22, probed (15 October 2026). R1: the helper's result
+#: held in a single-use local name and passed in the callee's derived env
+#: position is accepted exactly like ``env=`` (controls, for a runner whose
+#: ``env`` is its third parameter and for ``Popen``), while the same name
+#: used anywhere else is not. R2: a positional-only ``env``
+#: (``def f(argv, env=None, /, **options)``) is reached only by position;
+#: an ``env=`` keyword lands in ``**options``, so it is a violation whether
+#: env is then omitted or given something unsafe by position. The controls
+#: there: the helper's result by position, inline and through a local name.
+GUARD_PROBES_27_POSITIONAL: dict[str, str] = {
+    "__init__.py": "",
+    "deploy_sidecar/__init__.py": "",
+    "deploy_sidecar/service.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        def _start_and_collect(argv, cwd, env, timeout=1, what="x"):
+            return subprocess.run(argv, cwd=cwd, env=env, timeout=timeout)
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+        from forge.deploy_sidecar.service import _start_and_collect
+        from forge.launch_environment import build_project_command_env
+
+
+        def p27_local_helper_name_in_a_non_env_position(cmd, folder):
+            env = build_project_command_env(folder)
+            return _start_and_collect(cmd, env, env)
+
+
+        def ok_runner_local_helper_env_positionally(cmd, folder):
+            env = build_project_command_env(folder)
+            return _start_and_collect(cmd, ".", env)
+
+
+        def ok_runner_local_helper_env_by_keyword(cmd, folder):
+            env = build_project_command_env(folder)
+            return _start_and_collect(argv=cmd, cwd=".", env=env)
+
+
+        def ok_popen_local_helper_env_positionally(cmd, folder):
+            env = build_project_command_env(folder)
+            return subprocess.Popen(cmd, -1, None, None, None, None, None, True, False, None, env)
+
+
+        def ok_popen_local_helper_env_by_keyword(cmd, folder):
+            env = build_project_command_env(folder)
+            return subprocess.Popen(cmd, env=env)
+        '''
+    ),
+}
+
+GUARD_PROBES_27_POSITIONAL_ONLY: dict[str, str] = {
+    "__init__.py": "",
+    "deploy_sidecar/__init__.py": "",
+    "deploy_sidecar/service.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        def _start_and_collect(argv, env=None, /, **options):
+            return subprocess.run(argv, env=env, **options)
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import os
+
+        from forge.deploy_sidecar.service import _start_and_collect
+        from forge.launch_environment import build_project_command_env
+
+
+        def p27_positional_only_env_omitted_with_a_helper_keyword(cmd, folder):
+            return _start_and_collect(cmd, env=build_project_command_env(folder))
+
+
+        def p27_positional_only_env_unsafe_with_a_helper_keyword(cmd, folder):
+            return _start_and_collect(cmd, dict(os.environ), env=build_project_command_env(folder))
+
+
+        def p27_positional_only_env_local_helper_name_by_keyword(cmd, folder):
+            env = build_project_command_env(folder)
+            return _start_and_collect(cmd, env=env)
+
+
+        def ok_positional_only_env_helper_by_position(cmd, folder):
+            return _start_and_collect(cmd, build_project_command_env(folder))
+
+
+        def ok_positional_only_env_local_helper_name_by_position(cmd, folder):
+            env = build_project_command_env(folder)
+            return _start_and_collect(cmd, env)
+        '''
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "source", ["GUARD_PROBES_27_POSITIONAL", "GUARD_PROBES_27_POSITIONAL_ONLY"]
+)
+def test_env_is_bound_as_python_binds_it(tmp_path: Path, source: str) -> None:
+    files = globals()[source]
+    problems = unaccounted_launches(_write_package(tmp_path, files))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(files["zz_main.py"]).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p27_")
+    }
+    assert expected
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+def test_a_positional_only_env_keeps_its_kind() -> None:
+    tree = ast.parse("def f(argv, env=None, /, **options):\n    pass\n")
+    mod = _Module(
+        parents={id(child): node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
+    )
+    assert _def_env_slot(mod, tree.body[0]) == ("positional-only", 1)
+    call = ast.parse("f(cmd, env=helper())").body[0].value
+    assert _env_argument(call, ("positional-only", 1))[0] == "misdirected"
+
+
+#: Review 2 of round 22, probed (15 October 2026). R3: the runner's module
+#: also defines an unrelated ``class Other`` with a method of the runner's
+#: name; the runner's signature is still found by its qualified identity, so
+#: an ``env=`` keyword to its positional-only env stays a violation, alone
+#: or beside safe-looking positional arguments. A method runner takes env
+#: only by keyword: a positional env, bound or through an explicit
+#: ``Class.method(instance, ...)`` call, is a violation. The controls: the
+#: bound method with the helper's env by keyword, and the function runner
+#: with the helper's env by position.
+GUARD_PROBES_28: dict[str, str] = {
+    "__init__.py": "",
+    "deploy_sidecar/__init__.py": "",
+    "deploy_sidecar/service.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        def _start_and_collect(argv, env=None, /, **options):
+            return subprocess.run(argv, env=env, **options)
+
+
+        class Other:
+            def _start_and_collect(self):
+                return None
+        '''
+    ),
+    "deploy_sidecar/deploy_executor.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class DeployExecutor:
+            def _spawn(self, args, env=None):
+                return self._default_spawn(args=args, env=env)
+
+            @staticmethod
+            def _default_spawn(**kwargs):
+                return subprocess.Popen(**kwargs)
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        from forge.deploy_sidecar.deploy_executor import DeployExecutor
+        from forge.deploy_sidecar.service import _start_and_collect
+        from forge.launch_environment import build_project_command_env
+
+
+        def p28_same_named_method_elsewhere_keyword_to_positional_only(cmd, folder):
+            return _start_and_collect(cmd, env=build_project_command_env(folder))
+
+
+        def p28_same_named_method_elsewhere_with_safe_positionals(cmd, folder):
+            return _start_and_collect(cmd, build_project_command_env(folder), env=build_project_command_env(folder))
+
+
+        def p28_method_runner_env_by_position(executor, cmd, folder):
+            return executor._spawn(cmd, build_project_command_env(folder))
+
+
+        def p28_explicit_class_call_env_by_position(executor, cmd, folder):
+            return DeployExecutor._spawn(executor, cmd, build_project_command_env(folder))
+
+
+        def ok_bound_method_runner_helper_env_by_keyword(executor, cmd, folder):
+            return executor._spawn(args=cmd, env=build_project_command_env(folder))
+
+
+        def ok_function_runner_helper_env_by_position(cmd, folder):
+            return _start_and_collect(cmd, build_project_command_env(folder))
+        '''
+    ),
+}
+
+
+def test_runner_signatures_are_found_by_qualified_identity(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_28))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_28["zz_main.py"]).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p28_")
+    }
+    assert len(expected) == 4
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+def test_an_unknown_slot_never_takes_env_by_keyword_as_proof() -> None:
+    with_positional = ast.parse("f(cmd, env=helper())").body[0].value
+    two_positionals = ast.parse("f(cmd, other, env=helper())").body[0].value
+    keyword_only = ast.parse("f(argv=cmd, env=helper())").body[0].value
+    # A runner whose def cannot be found: env could be any argument.
+    assert _env_argument(with_positional, ("unknown", 0))[0] == "positional"
+    assert _env_argument(keyword_only, ("unknown", 0))[0] == "given"
+    # A launch function whose signature cannot be read: never its first.
+    assert _env_argument(with_positional, ("unknown", 1))[0] == "given"
+    assert _env_argument(two_positionals, ("unknown", 1))[0] == "positional"
+
+
+#: Review 4 of round 22, probed (15 October 2026, R5): a method written
+#: inside a class-level ``if`` or ``try`` block is still a method (its
+#: nearest lexical scope is the class), so its ``self`` is dropped and it
+#: takes env only by keyword. The probe is the reproducer: a bound call
+#: whose second positional argument is the real env (this process's own)
+#: and whose third, which the old reading took for env, is the helper's.
+#: The control: the same method with the helper's env by keyword.
+_CONDITIONAL_METHOD_MAIN = textwrap.dedent(
+    '''\
+    import os
+
+    from forge.launch_environment import build_project_command_env
+
+
+    def p29_conditional_method_unsafe_bound_call(executor, cmd, folder):
+        return executor._spawn(cmd, dict(os.environ), build_project_command_env(folder))
+
+
+    def ok_conditional_method_helper_env_by_keyword(executor, cmd, folder):
+        return executor._spawn(args=cmd, env=build_project_command_env(folder))
+    '''
+)
+GUARD_PROBES_29_IF: dict[str, str] = {
+    "__init__.py": "",
+    "deploy_sidecar/__init__.py": "",
+    "deploy_sidecar/deploy_executor.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class DeployExecutor:
+            if True:
+                def _spawn(self, args, env=None, extra=None):
+                    return self._default_spawn(args=args, env=env)
+
+            @staticmethod
+            def _default_spawn(**kwargs):
+                return subprocess.Popen(**kwargs)
+        '''
+    ),
+    "zz_main.py": _CONDITIONAL_METHOD_MAIN,
+}
+GUARD_PROBES_29_TRY: dict[str, str] = {
+    **GUARD_PROBES_29_IF,
+    "deploy_sidecar/deploy_executor.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+
+        class DeployExecutor:
+            try:
+                def _spawn(self, args, env=None, extra=None):
+                    return self._default_spawn(args=args, env=env)
+            except Exception:
+                pass
+
+            @staticmethod
+            def _default_spawn(**kwargs):
+                return subprocess.Popen(**kwargs)
+        '''
+    ),
+}
+
+
+@pytest.mark.parametrize("source", ["GUARD_PROBES_29_IF", "GUARD_PROBES_29_TRY"])
+def test_a_method_inside_a_class_level_block_is_still_a_method(
+    tmp_path: Path, source: str
+) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, globals()[source]))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    assert "p29_conditional_method_unsafe_bound_call" in named, problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+def test_env_slots_are_read_from_signatures() -> None:
+    """Each generic runner's env slot comes from its own def, and a launch
+    function's from its real signature; none is written by hand."""
+    unaccounted_launches(PACKAGE)
+    modules = list(_PACKAGE_MODULES.values())
+    slots = {
+        identity: _runner_env_slot(modules, rel, identity)
+        for (rel, _fname), spec in GENERIC_RUNNERS.items()
+        for identity in spec["dotted"]
+    }
+    assert all(slot[0] != "unknown" for slot in slots.values()), slots
+    assert _launch_env_slot("subprocess.Popen") == ("index", 10)
+    assert _launch_env_slot("subprocess.run") == ("index", 10)
+    assert _launch_env_slot("os.execve") == ("index", 2)
+    assert _launch_env_slot("asyncio.create_subprocess_exec") == ("keyword", None)
+    assert _launch_env_slot("os.system") == ("none", None)
 
 
 def test_every_dynamic_import_allowance_is_still_needed() -> None:
