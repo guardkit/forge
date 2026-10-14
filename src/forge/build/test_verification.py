@@ -202,7 +202,10 @@ async def verify_tests(
     # they are given an environment built from nothing — none of the
     # factory's credentials, a private HOME and TMPDIR in the repository's
     # own git directory.
-    from forge.launch_environment import build_project_command_env
+    from forge.launch_environment import (
+        build_project_command_env,
+        project_program_note,
+    )
 
     # Anchored on the checkout itself (``repository``, or the worktree, which
     # is a checkout of its own): no folder above it is ever looked at.
@@ -219,13 +222,20 @@ async def verify_tests(
 
     output_tail = stdout[-output_tail_chars:] if output_tail_chars > 0 else ""
 
+    # A FAILED OR TIMED-OUT RUN IS TOLD WHAT IT WAS NOT GIVEN (design section
+    # 4): the names of the settings the factory holds and did not pass, never
+    # a value. It follows the run's own tail.
+    def _with_the_note(tail: str) -> str:
+        note = project_program_note()
+        return f"{tail}\n{note}" if tail else note
+
     if timed_out or exit_code == 124:
         return TestVerificationResult(
             passed=False,
             pass_count=0,
             fail_count=0,
             failing_tests=[TIMEOUT_MARKER],
-            output_tail=output_tail,
+            output_tail=_with_the_note(output_tail),
             duration_seconds=duration,
         )
 
@@ -242,6 +252,6 @@ async def verify_tests(
         pass_count=pass_count,
         fail_count=fail_count,
         failing_tests=failing_tests,
-        output_tail=output_tail,
+        output_tail=output_tail if passed else _with_the_note(output_tail),
         duration_seconds=parsed_duration,
     )

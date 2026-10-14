@@ -892,9 +892,12 @@ def _run_declared_command(
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
+        # A TIMED-OUT COMMAND IS TOLD WHAT IT WAS NOT GIVEN too (design
+        # section 4): names only, never a value.
         return None, (
             f"the declared test command {command!r} did not finish within "
-            f"{timeout_seconds}s in {cwd}"
+            f"{timeout_seconds}s in {cwd}. "
+            + project_program_note(declared=launch_settings or ())
         )
     except Exception as exc:  # noqa: BLE001 — could not run is not could not pass
         return None, (

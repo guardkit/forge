@@ -136,6 +136,7 @@ def build_deploy_stage_runner(
     #: from ``build_id`` being absent: that is also what a dropped stamp looks
     #: like, and the whole point is to tell the two apart.
     by_hand: bool = False,
+    launch_settings: tuple[str, ...] = (),
 ) -> DeployStageRunner | None:
     """Compose the deploy-stage runner, gated on ``config.enabled``.
 
@@ -199,6 +200,7 @@ def build_deploy_stage_runner(
         build_id=build_id,
         start_commit=start_commit,
         by_hand=by_hand,
+        launch_settings=tuple(launch_settings),
     )
 
 
@@ -323,6 +325,9 @@ async def dispatch_deploy_stage(
         build_id=build_id,
         start_commit=declared_at,
         by_hand=by_hand,
+        # THE BUILD'S DECLARED SETTING NAMES, for every step that runs the
+        # project's own scripts (14 October 2026) — not only the compose step.
+        launch_settings=tuple(launch_settings),
     )
     if runner is None:
         # Flag OFF — no dispatch. Byte-for-byte no-op.

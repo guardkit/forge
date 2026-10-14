@@ -564,6 +564,7 @@ class DeployStageRunner:
         build_id: str | None = None,
         start_commit: str | None = None,
         by_hand: bool = False,
+        launch_settings: tuple[str, ...] = (),
     ) -> None:
         self._repo = repository
         self._runbook_publisher = runbook_publisher
@@ -605,6 +606,12 @@ class DeployStageRunner:
         # it is never derived from "there is no build here", because that
         # would turn a dropped stamp into a claim.
         self._by_hand = bool(by_hand)
+        # THE SETTING NAMES THE PROJECT DECLARED for this build (14 October
+        # 2026), read off the coordinator's ledger by whoever composed this
+        # stage. Every step that runs the project's own scripts is handed them
+        # (:meth:`_with_the_checkout`), so a health check, a fixture script or
+        # a smoke test gets what the project declared, as the deploy step does.
+        self._launch_settings = tuple(str(name) for name in launch_settings)
 
     def _resolve_script_runner(self) -> ScriptRunner | None:
         """The docker-touching-step execution seam for this stage.
@@ -1613,7 +1620,14 @@ class DeployStageRunner:
         return await executor.run(runbook.runbook_id, correlation_id=correlation_id)
 
     def _with_the_checkout(self, runbook: Runbook) -> Runbook:
-        """The runbook with its script steps told which checkout they belong to.
+        """The runbook with its script steps told what the project declared,
+        and which checkout they belong to.
+
+        EVERY STEP THAT RUNS THE PROJECT'S SCRIPTS IS GIVEN THE BUILD'S
+        DECLARED SETTING NAMES (14 October 2026), unless the step already
+        carries its own: a project program's environment is built from
+        nothing, so a step without them would run with none of what the
+        project declared.
 
         THE PROJECT'S SCRIPTS GET A PRIVATE HOME IN THEIR OWN CHECKOUT'S GIT
         DIRECTORY (13 October 2026), and for a repository with no sandbox
@@ -1623,16 +1637,25 @@ class DeployStageRunner:
         with a sandbox is left as it is: its scripts run in the sandbox's
         helper, which knows its own checkout.
         """
-        if self._sandbox is not None or not self._target_repo_root:
-            return runbook
-        checkout = str(self._target_repo_root)
-        steps = tuple(
-            replace(step, params={**dict(step.params), "repository": checkout})
-            if step.step_type in _STEPS_THAT_RUN_PROJECT_SCRIPTS
-            else step
-            for step in runbook.steps
+        checkout = (
+            str(self._target_repo_root)
+            if self._sandbox is None and self._target_repo_root
+            else None
         )
-        return replace(runbook, steps=steps)
+        if checkout is None and not self._launch_settings:
+            return runbook
+
+        def told(step: Step) -> Step:
+            if step.step_type not in _STEPS_THAT_RUN_PROJECT_SCRIPTS:
+                return step
+            params = dict(step.params)
+            if checkout is not None:
+                params["repository"] = checkout
+            if self._launch_settings and not params.get("launch_settings"):
+                params["launch_settings"] = list(self._launch_settings)
+            return replace(step, params=params)
+
+        return replace(runbook, steps=tuple(told(step) for step in runbook.steps))
 
     def _claims_from_runbook(
         self, runbook: Runbook | None, *, when: datetime

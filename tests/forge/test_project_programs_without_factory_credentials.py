@@ -1535,6 +1535,171 @@ def test_the_local_stage_tells_its_script_steps_their_checkout(tmp_path: Path) -
 
 
 # ---------------------------------------------------------------------------
+# Every project-script step gets the declared names; F6 and F8 say what was
+# withheld when they fail or time out (Codex implementation review 1, R1, R3)
+# ---------------------------------------------------------------------------
+
+
+def _a_local_stage(root: Path, tmp_path: Path) -> Any:
+    from unittest.mock import AsyncMock
+
+    from forge.config.models import DeployStageConfig
+    from forge.deploy.live_gate import DryRunBrokerInspector, DryRunLiveGateInvoker
+    from forge.deploy.reservation import InProcessReservationLease
+    from forge.deploy.stage import DeployStageRunner
+    from forge.persistence.migrations.runbook import apply
+    from forge.persistence.repositories.runbook import RunbookRepository
+
+    conn = sqlite3.connect(str(tmp_path / "deploy.db"))
+    apply(conn)
+    return DeployStageRunner(
+        repository=RunbookRepository(connection=conn),
+        runbook_publisher=AsyncMock(),
+        deploy_publisher=AsyncMock(),
+        reservation=InProcessReservationLease(),
+        live_gate_invoker=DryRunLiveGateInvoker(),
+        broker_inspector=DryRunBrokerInspector(),
+        config=DeployStageConfig(),
+        deploy_record_root=str(tmp_path / "records"),
+        target_repo_root=str(root),
+        launch_settings=(DECLARED,),
+    )
+
+
+class TestEveryProjectScriptStepGetsTheDeclaredNames:
+    def test_a_local_runbook_hands_the_health_check_the_declared_names(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.deploy.profile import parse_deploy_profile
+        from forge.deploy.runbook_builder import build_deploy_runbook
+
+        root = _a_project(tmp_path / "shop")
+        runner = _a_local_stage(root, tmp_path)
+        profile = parse_deploy_profile(
+            {**yaml.safe_load((root / "deploy" / "profile.yaml").read_text()), "cwd": str(root)}
+        )
+        runbook = build_deploy_runbook(
+            profile, runbook_id="d1", target="shop", now=datetime(2026, 10, 14, tzinfo=timezone.utc)
+        )
+        result = asyncio.run(runner._run_runbook(runbook, "corr"))
+        assert result.status == "complete", result
+        for label in ("deploy", "check"):
+            given = _given(root, label)
+            assert given[DECLARED] == "present", label
+            _no_sentinel(given, f"the local {label} step")
+            _home_is_private(given, root)
+
+    def test_a_local_smoke_test_gets_the_declared_names(self, tmp_path: Path) -> None:
+        from forge.persistence.repositories.runbook_models import (
+            Runbook,
+            Step,
+            StepStatus,
+        )
+
+        root = _a_project(tmp_path / "shop")
+        runner = _a_local_stage(root, tmp_path)
+        runbook = Runbook(
+            runbook_id="s1",
+            target="shop",
+            steps=(
+                Step(
+                    step_type="run_smoke_tests",
+                    params={"cwd": str(root), "script": "deploy/check.sh"},
+                    status=StepStatus.pending,
+                    sequence_index=0,
+                ),
+            ),
+            current_step_index=0,
+            status=StepStatus.pending,
+            created_at=datetime(2026, 10, 14, tzinfo=timezone.utc),
+        )
+        result = asyncio.run(runner._run_runbook(runbook, "corr"))
+        assert result.status == "complete", result
+        given = _given(root, "check")
+        assert given[DECLARED] == "present"
+        _no_sentinel(given, "the local smoke test")
+
+    def test_the_health_check_handler_forwards_them_to_its_runner(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.deploy.steps import make_health_check_handler
+        from forge.persistence.repositories.runbook_models import Step, StepStatus
+
+        seen: list[dict[str, Any]] = []
+
+        def _runner(**kwargs: Any) -> tuple[int, str]:
+            seen.append(kwargs)
+            return 0, ""
+
+        make_health_check_handler(dry_run=False, script_runner=_runner)(
+            Step(
+                step_type="health_check",
+                params={
+                    "cwd": str(tmp_path),
+                    "checks": [{"cmd": "deploy/check.sh"}],
+                    "launch_settings": [DECLARED],
+                },
+                status=StepStatus.pending,
+                sequence_index=0,
+            )
+        )
+        assert seen and seen[0]["launch_settings"] == (DECLARED,)
+
+
+class TestTimeoutsAndTheBuildPackageAreToldWhatWasWithheld:
+    def test_the_build_packages_failed_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.build.test_verification import verify_tests
+
+        monkeypatch.setenv(WITHHELD, WITHHELD_VALUE)
+        root = _a_project(tmp_path / "shop")
+        bin_dir = tmp_path / "pytest-bin"
+        _writer(bin_dir / "pytest", "pytest", exit_code=1)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        result = asyncio.run(verify_tests(root, test_command="pytest"))
+        assert result["passed"] is False
+        assert WITHHELD in result["output_tail"]
+        assert WITHHELD_VALUE not in json.dumps(result)
+        _no_sentinel(json.dumps(result), "the build package's failed run")
+
+    def test_the_build_packages_timed_out_run(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.build.test_verification import verify_tests
+
+        monkeypatch.setenv(WITHHELD, WITHHELD_VALUE)
+        root = _a_project(tmp_path / "shop")
+        bin_dir = tmp_path / "pytest-bin"
+        bin_dir.mkdir()
+        slow = bin_dir / "pytest"
+        slow.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
+        slow.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        result = asyncio.run(verify_tests(root, test_command="pytest", timeout_seconds=1))
+        assert result["passed"] is False
+        assert WITHHELD in result["output_tail"]
+        assert WITHHELD_VALUE not in json.dumps(result)
+
+    def test_the_coordinators_declared_test_that_times_out(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.cli._serve_conductor import _run_declared_command
+
+        monkeypatch.setenv(WITHHELD, WITHHELD_VALUE)
+        monkeypatch.delenv(UNSET_DECLARED, raising=False)
+        root = _a_project(tmp_path / "shop")
+        exit_code, detail = _run_declared_command(
+            command="exec sleep 30",
+            cwd=root,
+            timeout_seconds=1,
+            launch_settings=[DECLARED, UNSET_DECLARED],
+        )
+        assert exit_code is None
+        _names_never_values(detail, "the declared test's timeout")
+
+
+# ---------------------------------------------------------------------------
 # Section 5: a guard that cannot be missed by leaving a site out
 # ---------------------------------------------------------------------------
 #
@@ -1583,7 +1748,10 @@ ALLOWED: dict[tuple[str, str], str] = {
     ("adapters/guardkit/run.py", "_execute_subprocess"): "starts GuardKit with the factory's launch list",
     ("build/git_operations.py", "_execute_via_deepagents"): "generic runner; every call to it is checked below",
     ("build/git_operations.py", "_run_via_execute"): "git and gh, the factory's own programs, with its own environment",
-    ("build/test_verification.py", "_execute_via_deepagents"): "a pass-through seam; its caller verify_tests is checked",
+    ("build/test_verification.py", "_execute_via_deepagents"): (
+        "a pass-through seam onto the git operations' runner; it is a generic "
+        "runner itself, so every call to it (verify_tests) is checked"
+    ),
     ("build_processes.py", "_engine_ids"): "the container engine, called through a variable",
     ("build_processes.py", "_remove_networks_and_volumes"): "the container engine, called through a variable",
     ("build_processes.py", "remove_fixture_containers"): "the container engine, run in a worker thread",
@@ -1619,6 +1787,10 @@ ALLOWED: dict[tuple[str, str], str] = {
 GENERIC_RUNNERS: dict[tuple[str, str], dict[str, Any]] = {
     ("build/git_operations.py", "_execute_via_deepagents"): {
         "dotted": {"forge.build.git_operations._execute_via_deepagents"},
+        "names": {"_execute_via_deepagents"},
+    },
+    ("build/test_verification.py", "_execute_via_deepagents"): {
+        "dotted": {"forge.build.test_verification._execute_via_deepagents"},
         "names": {"_execute_via_deepagents"},
     },
     ("deploy_sidecar/deploy_executor.py", "_default_spawn"): {
@@ -1739,19 +1911,108 @@ def _qualname(mod: _Module, func: Any) -> str:
     return ".".join(reversed(names))
 
 
+#: Each scope's bindings, worked out once per guard run (cleared by
+#: :func:`unaccounted_launches`): scope id -> name -> (kinds, definition).
+_SCOPE_CACHE: dict[int, dict[str, tuple[set[str], ast.AST | None]]] = {}
+
+
+def _scope_bindings(scope: ast.AST, name: str) -> tuple[set[str], ast.AST | None]:
+    every = _SCOPE_CACHE.get(id(scope))
+    if every is None:
+        every = _SCOPE_CACHE[id(scope)] = _all_scope_bindings(scope)
+    return every.get(name, (set(), None))
+
+
+def _all_scope_bindings(scope: ast.AST) -> dict[str, tuple[set[str], ast.AST | None]]:
+    """How each name is bound directly in ``scope`` (a function or a module).
+
+    For each name, the kinds of binding found — ``"def"`` (a nested or
+    module-level function or class), ``"import"``, or ``"other"`` (a
+    parameter, with its default; an assignment of any kind; a for, with,
+    except or comprehension target; a ``global`` or ``nonlocal``; a ``del``)
+    — and the definition node for a ``"def"``. Nested function, class and
+    lambda bodies are their own scopes and are not looked inside, but their
+    names are bindings here.
+    """
+    found: dict[str, tuple[set[str], ast.AST | None]] = {}
+
+    def bind(name: str, kind: str, definition: ast.AST | None = None) -> None:
+        kinds, current = found.get(name, (set(), None))
+        kinds.add(kind)
+        found[name] = (kinds, definition if definition is not None else current)
+
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+        args = scope.args
+        every = [*args.posonlyargs, *args.args, *args.kwonlyargs]
+        every += [a for a in (args.vararg, args.kwarg) if a is not None]
+        for arg in every:
+            bind(arg.arg, "other")
+    pending = list(ast.iter_child_nodes(scope))
+    if isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        pending = list(scope.body)
+    while pending:
+        node = pending.pop()
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            bind(node.name, "def", node)
+            continue  # its body is a scope of its own
+        if isinstance(node, ast.Lambda):
+            continue
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                bind(alias.asname or alias.name.split(".")[0], "import")
+            continue
+        if isinstance(node, (ast.Global, ast.Nonlocal)):
+            for name in node.names:
+                bind(name, "other")
+        targets: list[ast.AST] = []
+        if isinstance(node, ast.Assign):
+            targets = list(node.targets)
+        elif isinstance(
+            node,
+            (ast.AnnAssign, ast.AugAssign, ast.NamedExpr, ast.For, ast.AsyncFor, ast.comprehension),
+        ):
+            targets = [node.target]
+        elif isinstance(node, (ast.With, ast.AsyncWith)):
+            targets = [i.optional_vars for i in node.items if i.optional_vars is not None]
+        elif isinstance(node, ast.Delete):
+            targets = list(node.targets)
+        elif isinstance(node, ast.ExceptHandler) and node.name:
+            bind(node.name, "other")
+        for target in targets:
+            for sub in ast.walk(target):
+                if isinstance(sub, ast.Name):
+                    bind(sub.id, "other")
+        pending.extend(ast.iter_child_nodes(node))
+    return found
+
+
 def _resolve(mod: _Module, func_node: ast.AST, at: ast.AST) -> str | None:
-    """The dotted name a call target refers to, or ``None`` when unknown."""
+    """The dotted name a call target refers to, or ``None`` when unknown.
+
+    A bare name is looked up as Python would: in each enclosing function,
+    innermost first, then in the module. A name bound in a function by
+    anything but a nested definition or an import (a parameter or its
+    default, an assignment, a loop, ``with`` or ``except`` target, a
+    comprehension, ``global``/``nonlocal``) is unknown; so is a module name
+    that is rebound at module level after it is imported.
+    """
     if isinstance(func_node, ast.Name):
         name = func_node.id
         scope = _enclosing_function(mod, at)
-        while scope is not None:  # a function defined in an enclosing function
-            for child in ast.iter_child_nodes(scope):
-                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child.name == name:
-                    return f"{mod.dotted}.{_qualname(mod, child)}"
+        while scope is not None:
+            kinds, definition = _scope_bindings(scope, name)
+            if "other" in kinds:
+                return None
+            if "def" in kinds and definition is not None:
+                return f"{mod.dotted}.{_qualname(mod, definition)}"
+            if "import" in kinds:
+                return mod.imports.get(name)
             scope = _enclosing_function(mod, scope)
-        for child in mod.tree.body:
-            if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and child.name == name:
-                return f"{mod.dotted}.{name}"
+        kinds, _definition = _scope_bindings(mod.tree, name)
+        if "other" in kinds:
+            return None
+        if "def" in kinds:
+            return f"{mod.dotted}.{name}"
         return mod.imports.get(name)
     if isinstance(func_node, ast.Attribute):
         value = func_node.value
@@ -1935,9 +2196,9 @@ def _helper_shaped(node: ast.AST | None, mod: _Module, func: Any, wrappers: set[
 
 
 def _wrappers(modules: list[_Module]) -> set[str]:
-    """Functions whose every return is an inline helper call (or a call to
-    another such function), by dotted name, and none of whose parameters
-    flows into the helper's ``additions`` or ``parent``."""
+    """Functions whose whole body is ``return <helper call>`` (or a call to
+    another such function), by dotted name, none of whose parameters flows
+    into the helper's ``additions`` or ``parent``."""
     found: set[str] = set()
     changed = True
     while changed:
@@ -1949,17 +2210,28 @@ def _wrappers(modules: list[_Module]) -> set[str]:
                 full = f"{mod.dotted}.{_qualname(mod, node)}"
                 if full in found:
                     continue
-                returns = [
-                    r for r in ast.walk(node)
-                    if isinstance(r, ast.Return) and _enclosing_function(mod, r) is node
-                ]
-                helper_calls = [
-                    c for c in ast.walk(node)
-                    if isinstance(c, ast.Call) and _resolve(mod, c.func, c) in HELPERS
-                ]
-                if any(_feeds_values_from_parameters(c, node) for c in helper_calls):
+                # Never a decorated function: a decorator can turn the
+                # helper's refusal into None, and env=None inherits everything.
+                if node.decorator_list:
                     continue
-                if returns and all(_inline_helper(r.value, mod, node, found) for r in returns):
+                # Its body, a leading docstring aside, is exactly one
+                # statement: ``return <helper call>`` (or a call to another
+                # such function). Anything else can fall through to an
+                # implicit None, and env=None inherits everything.
+                body = list(node.body)
+                if (
+                    body
+                    and isinstance(body[0], ast.Expr)
+                    and isinstance(body[0].value, ast.Constant)
+                    and isinstance(body[0].value.value, str)
+                ):
+                    body = body[1:]
+                if len(body) != 1 or not isinstance(body[0], ast.Return):
+                    continue
+                only = body[0].value
+                if isinstance(only, ast.Call) and _feeds_values_from_parameters(only, node):
+                    continue
+                if _inline_helper(only, mod, node, found):
                     found.add(full)
                     changed = True
     return found
@@ -2060,6 +2332,7 @@ def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
     for key, spec in GENERIC_RUNNERS.items():
         if target and target in spec["dotted"]:
             return key
+    for key, spec in GENERIC_RUNNERS.items():
         if isinstance(node, ast.Attribute) and node.attr in spec["names"]:
             return key
         if isinstance(node, ast.Name) and node.id in spec["names"] and target is None:
@@ -2068,6 +2341,7 @@ def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
 
 
 def unaccounted_launches(package: Path) -> list[str]:
+    _SCOPE_CACHE.clear()
     modules = _load_modules(package)
     wrappers = _wrappers(modules)
     problems: list[str] = []
@@ -2628,6 +2902,216 @@ def test_the_strict_rules_catch_every_probe(tmp_path: Path) -> None:
         if isinstance(n, ast.FunctionDef) and n.name.startswith("q4_")
     }
     assert len(expected) == 6
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: The forwarding seam in the build package and the one-statement wrapper
+#: rule, probed (14 October 2026): the seam's local call and an imported
+#: alias of it carrying this process's environment, the seam held as a
+#: value, and wrappers that can fall through to an implicit None (an
+#: exception swallowed, a conditional return, an extra statement first).
+GUARD_PROBES_5_SEAM = textwrap.dedent(
+    '''\
+    import os
+
+    from forge.build.git_operations import _execute_via_deepagents as _inner
+
+
+    async def _execute_via_deepagents(*, command, cwd, timeout, env):
+        return await _inner(command=command, cwd=cwd, timeout=timeout, env=env)
+
+
+    async def p5_local_call(cmd):
+        return await _execute_via_deepagents(
+            command=cmd, cwd=".", timeout=1, env=dict(os.environ)
+        )
+
+
+    async def ok_local_call_with_helper(cmd, folder):
+        from forge.launch_environment import build_project_command_env
+
+        return await _execute_via_deepagents(
+            command=cmd, cwd=".", timeout=1, env=build_project_command_env(folder)
+        )
+    '''
+)
+GUARD_PROBES_5 = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.build.test_verification import _execute_via_deepagents as seam
+    from forge.launch_environment import build_project_command_env
+
+
+    async def p5_imported_alias(cmd):
+        return await seam(command=cmd, cwd=".", timeout=1, env=dict(os.environ))
+
+
+    def p5_seam_as_value(cmd):
+        runner = seam
+        return runner
+
+
+    def _exception_fallthrough(folder):
+        try:
+            return build_project_command_env(folder)
+        except OSError:
+            pass
+
+
+    def p5_exception_fallthrough(cmd, folder):
+        subprocess.run(cmd, env=_exception_fallthrough(folder))
+
+
+    def _conditional(folder, flag):
+        if flag:
+            return build_project_command_env(folder)
+
+
+    def p5_conditional_return(cmd, folder):
+        subprocess.run(cmd, env=_conditional(folder, True))
+
+
+    def _extra_statement(folder):
+        os.environ["X"] = "1"
+        return build_project_command_env(folder)
+
+
+    def p5_extra_statement(cmd, folder):
+        subprocess.run(cmd, env=_extra_statement(folder))
+
+
+    def _single(folder):
+        \"\"\"A docstring is not a statement that can fall through.\"\"\"
+        return build_project_command_env(folder)
+
+
+    def ok_single_return_wrapper(cmd, folder):
+        subprocess.run(cmd, env=_single(folder))
+
+
+    def ok_inline_helper(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    async def ok_alias_with_helper(cmd, folder):
+        return await seam(command=cmd, cwd=".", timeout=1, env=build_project_command_env(folder))
+    '''
+)
+
+
+def test_the_build_seam_and_the_wrapper_rule_catch_every_probe(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    (pkg / "build").mkdir(parents=True)
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "build" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "build" / "test_verification.py").write_text(GUARD_PROBES_5_SEAM, encoding="utf-8")
+    (pkg / "zz_probe5.py").write_text(GUARD_PROBES_5, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for source in (GUARD_PROBES_5_SEAM, GUARD_PROBES_5)
+        for n in ast.parse(source).body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("p5_")
+    }
+    assert len(expected) == 6
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_") or n == "_single"}, problems
+
+
+#: Decorators and shadowing, probed (14 October 2026): a decorated wrapper
+#: (its decorator turns the helper's refusal into None), the helper's name
+#: shadowed by a parameter default, by a local assignment, and rebound at
+#: module level after its import.
+GUARD_PROBES_6 = textwrap.dedent(
+    '''\
+    import functools
+    import os
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+    from forge.launch_environment import build_project_command_env as make_env
+
+
+    def _none_on_refusal(fn):
+        @functools.wraps(fn)
+        def wrapped(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except OSError:
+                return None
+
+        return wrapped
+
+
+    @_none_on_refusal
+    def _decorated(folder):
+        return build_project_command_env(folder)
+
+
+    def p6_decorated_wrapper(cmd, folder):
+        subprocess.run(cmd, env=_decorated(folder))
+
+
+    def p6_parameter_default_shadowing(cmd, folder, build_project_command_env=lambda *a: dict(os.environ)):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def p6_local_reassignment(cmd, folder):
+        build_project_command_env = lambda *a: dict(os.environ)  # noqa: E731
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def _single(folder):
+        return build_project_command_env(folder)
+
+
+    def ok_undecorated_single_return_wrapper(cmd, folder):
+        subprocess.run(cmd, env=_single(folder))
+
+
+    def ok_unshadowed_import_alias(cmd, folder):
+        subprocess.run(cmd, env=make_env(folder))
+
+
+    def ok_inline_helper(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+    '''
+)
+GUARD_PROBES_6_REBOUND = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+
+    build_project_command_env = lambda *a: dict(os.environ)  # noqa: E731
+
+
+    def p6_module_level_rebinding(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+    '''
+)
+
+
+def test_decorators_and_shadowed_names_are_never_the_helper(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe6.py").write_text(GUARD_PROBES_6, encoding="utf-8")
+    (pkg / "zz_probe6_rebound.py").write_text(GUARD_PROBES_6_REBOUND, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for source in (GUARD_PROBES_6, GUARD_PROBES_6_REBOUND)
+        for n in ast.parse(source).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p6_")
+    }
+    assert len(expected) == 4
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert not {n for n in named if n.startswith("ok_")}, problems
 

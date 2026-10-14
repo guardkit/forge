@@ -162,7 +162,10 @@ def _run_script_step(
     # refuses it, rather than one of the two being quietly dropped.
     try:
         env = build_project_command_env(
-            cwd,
+            # A step whose profile names no working folder runs where this
+            # process is, as it always has; its private home then goes in the
+            # checkout the stage named, when it named one.
+            cwd if cwd is not None else (repository or os.curdir),
             declared=launch_settings or (),
             additions={"ENV_FILE": env_file} if env_file is not None else None,
             issued=issued_env or None,
@@ -422,6 +425,14 @@ def run_smoke_tests(step: Step) -> StepOutcome:
     output_cap = step.params.get("output_cap", DEFAULT_OUTPUT_CAP_BYTES)
 
     checkout = step.params.get("repository")
+    # The setting names the project declared, put on the step by the stage
+    # (14 October 2026): a smoke test is the project's own program too.
+    declared = step.params.get("launch_settings")
+    launch_settings = (
+        tuple(str(name) for name in declared if isinstance(name, str))
+        if isinstance(declared, (list, tuple))
+        else ()
+    )
 
     # Delegate to shared core
     exit_code, captured_output = _run_script_step(
@@ -431,6 +442,7 @@ def run_smoke_tests(step: Step) -> StepOutcome:
         timeout=timeout,
         output_cap=output_cap,
         repository=checkout if isinstance(checkout, str) and checkout.strip() else None,
+        launch_settings=launch_settings,
     )
 
     # Map exit status to verdict: 0 → passed, non-zero → failed

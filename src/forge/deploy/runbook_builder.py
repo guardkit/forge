@@ -357,6 +357,10 @@ def build_deploy_runbook(
             check_params["extra_env"] = check_env
         if check_issued_env:
             check_params["issued_env"] = dict(check_issued_env)
+        # The health checks are the project's own scripts too, so they are
+        # handed the names the project declared, as the compose step is.
+        if launch_settings:
+            check_params["launch_settings"] = [str(name) for name in launch_settings]
         steps.append(_step("health_check", check_params, idx))
         idx += 1
 

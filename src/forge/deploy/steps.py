@@ -85,6 +85,14 @@ def _default_secret_presence(name: str) -> bool:
     return name in os.environ
 
 
+def _the_declared_names(step: Step) -> tuple[str, ...]:
+    """The setting names the project declared, as the stage put them on the step."""
+    value = step.params.get("launch_settings")
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(str(name) for name in value if isinstance(name, str))
+
+
 def _the_checkout(step: Step) -> str | None:
     """The checkout a step's scripts belong to, when the stage put it there."""
     value = step.params.get("repository")
@@ -101,6 +109,7 @@ def _run_scripts(
     extra_env: dict[str, str] | None = None,
     issued_env: dict[str, str] | None = None,
     repository: str | None = None,
+    launch_settings: tuple[str, ...] = (),
 ) -> StepOutcome:
     """Run a list of ``{script, cwd?, env_file?}`` entries as subprocess steps.
 
@@ -146,6 +155,10 @@ def _run_scripts(
             # The checkout these scripts belong to, when the stage knows it:
             # their private home is made in its own git directory.
             issued["repository"] = repository
+        if launch_settings:
+            # The setting names the project declared: its scripts' environment
+            # is built from nothing, so without them it would get none.
+            issued["launch_settings"] = tuple(launch_settings)
         exit_code, output = runner(
             cwd=cwd,
             script=script,
@@ -261,6 +274,7 @@ def make_import_realm_handler(*, dry_run: bool):
             default_env_file=step.params.get("env_file"),
             dry_run=False,
             repository=_the_checkout(step),
+            launch_settings=_the_declared_names(step),
         )
 
     return import_realm
@@ -371,6 +385,7 @@ def make_seed_fixtures_handler(*, dry_run: bool):
             default_env_file=step.params.get("env_file"),
             dry_run=dry_run,
             repository=_the_checkout(step),
+            launch_settings=_the_declared_names(step),
         )
 
     return seed_fixtures
@@ -422,6 +437,7 @@ def make_warm_models_handler(*, dry_run: bool):
             default_env_file=step.params.get("env_file"),
             dry_run=False,
             repository=_the_checkout(step),
+            launch_settings=_the_declared_names(step),
         )
 
     return warm_models
@@ -496,6 +512,7 @@ def make_health_check_handler(
             default_env_file=step.params.get("env_file"),
             dry_run=dry_run,
             repository=_the_checkout(step),
+            launch_settings=_the_declared_names(step),
             runner=runner,
             extra_env=extra_env,
             issued_env=issued_env,
