@@ -2746,7 +2746,33 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                         report(node, f"{node.attr} is rebound as an attribute")
                     elif not called(node):
                         report(node, f"{node.attr} is referred to other than by calling it")
+                elif isinstance(node.ctx, ast.Load) and not called(node):
+                    # The WHOLE dotted chain, at any depth (14 October 2026):
+                    # ``multiprocessing.popen_fork.Popen`` is a launch however
+                    # deep it sits, and held as a value it cannot be checked.
+                    launch = next(
+                        (t for t in sorted(_attribute_chain_targets(mod, node)) if _is_launch(t)),
+                        None,
+                    )
+                    if launch is not None:
+                        report(node, f"the launch function {launch} is referred to other than by calling it")
     return problems
+
+
+def _attribute_chain_targets(mod: _Module, node: ast.Attribute) -> set[str]:
+    """Every dotted name an attribute chain ``a.b.c`` may refer to: its base
+    name resolved (by scope, and by every import of it in the module), with
+    the whole chain of attributes appended."""
+    attributes: list[str] = []
+    current: ast.AST = node
+    while isinstance(current, ast.Attribute):
+        attributes.append(current.attr)
+        current = current.value
+    if not isinstance(current, ast.Name):
+        return set()
+    suffix = ".".join(reversed(attributes))
+    bases = _resolve_all(mod, current, current) | _targets(mod, current.id)
+    return {f"{base}.{suffix}" for base in bases}
 
 
 def unaccounted_launches(package: Path) -> list[str]:
@@ -4311,6 +4337,56 @@ def test_one_launch_predicate_sees_every_import_form(tmp_path: Path) -> None:
     }
     assert len(expected) == 5
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Deep attribute chains, probed (14 October 2026, implementation review 1,
+#: R1): ``multiprocessing.popen_fork.Popen`` and
+#: ``asyncio.subprocess.create_subprocess_exec`` held in a variable. ``os.path``
+#: held is not a launch, and the deep direct call with the helper's
+#: environment stays clean.
+GUARD_PROBES_16 = textwrap.dedent(
+    '''\
+    import asyncio
+    import multiprocessing.popen_fork
+    import os
+
+    from forge.launch_environment import build_project_command_env
+
+
+    def p16_deep_launch_held_in_a_variable(obj):
+        launch = multiprocessing.popen_fork.Popen
+        return launch(obj)
+
+
+    def p16_deep_create_subprocess_exec_held(cmd):
+        f = asyncio.subprocess.create_subprocess_exec
+        return f(cmd)
+
+
+    def ok_os_path_held_is_not_a_launch(path):
+        x = os.path
+        return x.join(path, "x")
+
+
+    async def ok_direct_deep_call_with_helper_env(cmd, folder):
+        await asyncio.subprocess.create_subprocess_exec(cmd, env=build_project_command_env(folder))
+    '''
+)
+
+
+def test_a_launch_is_seen_at_any_depth_of_an_attribute_chain(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe16.py").write_text(GUARD_PROBES_16, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    assert {
+        "p16_deep_launch_held_in_a_variable",
+        "p16_deep_create_subprocess_exec_held",
+    } <= named, problems
+    assert any("multiprocessing.popen_fork.Popen" in p for p in problems), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
