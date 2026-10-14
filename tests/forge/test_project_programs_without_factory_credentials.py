@@ -2049,9 +2049,17 @@ def _finalise(dotted: str, seen: frozenset[str] = frozenset()) -> set[str]:
                 if local != name:
                     continue
                 for final in _finalise(target, seen | {dotted}):
-                    if rest and not final.startswith(UNRESOLVED):
-                        final = f"{final}.{'.'.join(rest)}"
-                    result.add(final)
+                    if not rest:
+                        result.add(final)
+                    elif final.startswith(UNRESOLVED):
+                        result.add(f"{final}.{'.'.join(rest)}")
+                    else:
+                        # The remaining attribute path is resolved again from
+                        # where the import led (R1): ``a.b.run`` where ``a``
+                        # imports ``b`` and ``b`` imports ``subprocess.run``.
+                        result |= _finalise(
+                            f"{final}.{'.'.join(rest)}", seen | {dotted}
+                        )
         result = result or {UNRESOLVED + dotted}
     else:
         result = {UNRESOLVED + dotted}
@@ -2283,12 +2291,14 @@ def _resolve_all(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[str]:
             if klass is not None:
                 return {f"{mod.dotted}.{klass.name}.{func_node.attr}"}
             return set()
-        return {
-            final
-            for base in _resolve_all(mod, value, at)
-            if not base.startswith(UNRESOLVED)
-            for final in _finalise(f"{base}.{func_node.attr}")
-        }
+        out: set[str] = set()
+        for base in _resolve_all(mod, value, at):
+            if base.startswith(UNRESOLVED):
+                # An unresolved base stays unresolved down the chain (R2).
+                out.add(f"{base}.{func_node.attr}")
+            else:
+                out |= _finalise(f"{base}.{func_node.attr}")
+        return out
     return set()
 
 
@@ -2854,7 +2864,17 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                     # ``multiprocessing.popen_fork.Popen`` is a launch however
                     # deep it sits, and held as a value it cannot be checked.
                     chain = sorted(_attribute_chain_targets(mod, node))
-                    launch = next((t for t in chain if _is_launch(t)), None)
+                    launch = next(
+                        (
+                            t for t in chain
+                            if _is_launch(t)
+                            or (
+                                t.startswith(UNRESOLVED)
+                                and t.rpartition(".")[2] in LAUNCH_NAMES
+                            )
+                        ),
+                        None,
+                    )
                     parent = mod.parents.get(id(node))
                     bearing = next((t for t in chain if _is_launch_bearing_module(t)), None)
                     if launch is not None:
@@ -2885,12 +2905,13 @@ def _attribute_chain_targets(mod: _Module, node: ast.Attribute) -> set[str]:
         return set()
     suffix = ".".join(reversed(attributes))
     bases = _resolve_all(mod, current, current) | _targets(mod, current.id)
-    return {
-        final
-        for base in bases
-        if not base.startswith(UNRESOLVED)
-        for final in _finalise(f"{base}.{suffix}")
-    }
+    out: set[str] = set()
+    for base in bases:
+        if base.startswith(UNRESOLVED):
+            out.add(f"{base}.{suffix}")  # stays unresolved down the chain
+        else:
+            out |= _finalise(f"{base}.{suffix}")
+    return out
 
 
 def unaccounted_launches(package: Path) -> list[str]:
@@ -4660,6 +4681,84 @@ def test_a_reexported_launch_is_followed_to_what_it_finally_is(tmp_path: Path) -
         "p18_cyclic",
     } <= named, problems
     assert any("in p18_two_hop: process launch subprocess.run" in p for p in problems), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Re-exports, second review (14 October 2026, R1 and R2): a launch stored
+#: and called through a re-exported module (``a.b.run``, where ``a`` imports
+#: ``b`` and ``b`` imports ``subprocess.run``), and a module-qualified call and
+#: a stored chain through a name its module binds twice (unresolved). The
+#: control calls through the re-exported module with the helper's
+#: environment.
+GUARD_PROBES_19: dict[str, str] = {
+    "zz_r1_b.py": textwrap.dedent(
+        '''\
+        from subprocess import run
+        '''
+    ),
+    "zz_r1_a.py": textwrap.dedent(
+        '''\
+        from . import zz_r1_b
+        '''
+    ),
+    "zz_r2_a.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+        subprocess: object
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        from forge.launch_environment import build_project_command_env
+
+        from . import zz_r1_a, zz_r2_a
+
+
+        def p19_storage_through_a_reexported_module():
+            saved = zz_r1_a.zz_r1_b.run
+            return saved
+
+
+        def p19_call_through_a_reexported_module(cmd):
+            zz_r1_a.zz_r1_b.run(cmd, shell=True)
+
+
+        def p19_module_qualified_call_through_an_unresolved_binding(cmd):
+            zz_r2_a.subprocess.run(cmd)
+
+
+        def p19_storing_an_unresolved_chain_ending_in_a_launch_name():
+            saved = zz_r2_a.subprocess.run
+            return saved
+
+
+        def ok_call_through_a_reexported_module_with_helper_env(cmd, folder):
+            zz_r1_a.zz_r1_b.run(cmd, env=build_project_command_env(folder))
+        '''
+    ),
+}
+
+
+def test_a_reexport_is_resolved_all_the_way_and_unresolved_spreads(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    for name, text in GUARD_PROBES_19.items():
+        (pkg / name).write_text(text, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_19["zz_main.py"]).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p19_")
+    }
+    assert len(expected) == 4
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert any(
+        "in p19_storage_through_a_reexported_module: the launch function subprocess.run" in p
+        for p in problems
+    ), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
