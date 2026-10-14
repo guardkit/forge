@@ -917,7 +917,7 @@ class TestSearch:
         """The shape is normally read with the parser Python's own ``re``
         module uses. If that reading is ever unavailable, the door falls back
         to refusing any repeated group — more than it must, never less."""
-        monkeypatch.setattr(sidecar, "_re_parser", None)
+        monkeypatch.setattr(sidecar, "_re_parse", None)
 
         refused = process_code_search_request(
             {"repo": REPO_KEY, "pattern": r"(get|set)+"}, config=cfg

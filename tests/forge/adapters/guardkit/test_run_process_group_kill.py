@@ -379,7 +379,7 @@ class TestTheSurrenderedOutputIsNamedOnTheResult:
     """The daemon log is NOT the only channel — the FB1 spec deviation.
 
     ``GuardKitResult.warnings`` are threaded verbatim into the dispatch
-    rationale (``pipeline/dispatchers/subprocess.py``, the
+    rationale (``pipeline/dispatchers/subprocess_dispatcher.py``, the
     ``warning[{code}]: {message}`` line), so a warning here is what puts
     the loss in the stage_log row and the receipt. Without it a 1800s
     work leg that LOST its tails is byte-indistinguishable from a leg

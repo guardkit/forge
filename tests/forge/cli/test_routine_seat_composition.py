@@ -17,7 +17,7 @@ import functools
 
 from forge.cli.serve import compose_routine_subprocess_dispatcher
 from forge.config.models import ForgeConfig
-from forge.pipeline.dispatchers.subprocess import dispatch_subprocess_stage
+from forge.pipeline.dispatchers.subprocess_dispatcher import dispatch_subprocess_stage
 
 
 def _config(seat: object = None) -> ForgeConfig:

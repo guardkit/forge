@@ -408,7 +408,7 @@ def compose_routine_subprocess_dispatcher(forge_config: Any) -> Any:
     Logs one line naming which of the two it did, so the answer to "which
     model is writing the code?" is in the daemon's boot log.
     """
-    from forge.pipeline.dispatchers.subprocess import dispatch_subprocess_stage
+    from forge.pipeline.dispatchers.subprocess_dispatcher import dispatch_subprocess_stage
 
     configured = getattr(getattr(forge_config, "routine", None), "seat", None)
     seat = (str(configured).strip() if configured else "") or None
@@ -2534,7 +2534,7 @@ def _configure_logging(level_name: str) -> None:
     no-op. Tests that invoke ``serve_cmd`` more than once therefore
     do not pile up duplicate handlers on the root logger.
     """
-    resolved = getattr(logging, level_name.upper(), None)
+    resolved = logging.getLevelNamesMapping().get(level_name.upper())
     if not isinstance(resolved, int):
         sys.stderr.write(
             f"unrecognised FORGE_LOG_LEVEL={level_name!r}, defaulting to INFO\n"

@@ -1333,7 +1333,7 @@ class TestWorktreeConfinement:
         self,
     ) -> None:
         # Simulates the contract from
-        # ``forge.pipeline.dispatchers.subprocess._partition_paths_by_allowlist``:
+        # ``forge.pipeline.dispatchers.subprocess_dispatcher._partition_paths_by_allowlist``:
         # given a tuple of paths the dispatcher would write, paths outside
         # the worktree are partitioned into the rejected set and not
         # forwarded to downstream consumers.

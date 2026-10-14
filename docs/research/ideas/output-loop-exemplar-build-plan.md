@@ -36,7 +36,7 @@ The output-side loop's first exemplar. Full rationale is in the scope doc + the 
 
 ## What already exists
 
-Forge gives the substrate the executor reuses: SQLite lifecycle + state machine (`src/forge/lifecycle/`, `adapters/sqlite/connect.py`) for the runbook record; NATS publishers (`adapters/nats/pipeline_publisher.py` as the pattern) for lifecycle events; the subprocess dispatch pattern (`pipeline/dispatchers/subprocess.py`) for the step types; and the guardkit adapter + `subagents/autobuild_runner.py` for the *later* `run_autobuild` step. fleet-memory gives the deploy: idempotent `deploy.sh` (SSH + rsync + `docker compose up`, GATE G2) and `smoke.sh` (GATES G3–G5, exit non-zero on fail).
+Forge gives the substrate the executor reuses: SQLite lifecycle + state machine (`src/forge/lifecycle/`, `adapters/sqlite/connect.py`) for the runbook record; NATS publishers (`adapters/nats/pipeline_publisher.py` as the pattern) for lifecycle events; the subprocess dispatch pattern (`pipeline/dispatchers/subprocess_dispatcher.py`) for the step types; and the guardkit adapter + `subagents/autobuild_runner.py` for the *later* `run_autobuild` step. fleet-memory gives the deploy: idempotent `deploy.sh` (SSH + rsync + `docker compose up`, GATE G2) and `smoke.sh` (GATES G3–G5, exit non-zero on fail).
 
 ## What this phase adds
 

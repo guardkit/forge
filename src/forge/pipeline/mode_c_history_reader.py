@@ -510,7 +510,7 @@ def _project_finding_anchors(details: Mapping[str, Any]) -> tuple[str, ...] | No
 
 #: ``details_json`` key carrying a dispatch's own account of itself. On a
 #: failed subprocess leg it holds the leg's banner and output tail verbatim
-#: (composed by ``dispatchers/subprocess.py``), which is the only durable
+#: (composed by ``dispatchers/subprocess_dispatcher.py``), which is the only durable
 #: place the leg's own words survive to the terminal.
 RATIONALE_DETAILS_KEY: str = "rationale"
 

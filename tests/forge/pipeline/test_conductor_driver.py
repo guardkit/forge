@@ -43,7 +43,7 @@ from typing import Any
 import pytest
 
 from forge.adapters.guardkit.parser import parse_guardkit_output
-from forge.pipeline.dispatchers.subprocess import (
+from forge.pipeline.dispatchers.subprocess_dispatcher import (
     StageDispatchResult,
     StageDispatchStatus,
 )

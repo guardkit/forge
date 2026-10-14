@@ -11,7 +11,7 @@ with a *supervisor* vocabulary::
 
     stage, build_id, feature_id, rationale, [fix_task], [forward_context]
 
-:func:`~forge.pipeline.dispatchers.subprocess.dispatch_subprocess_stage`
+:func:`~forge.pipeline.dispatchers.subprocess_dispatcher.dispatch_subprocess_stage`
 speaks a *dispatcher* vocabulary and shares only the first three names. Two
 things were therefore broken at this seam and neither could be seen from
 either side alone:
@@ -65,7 +65,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
-from forge.pipeline.dispatchers.subprocess import (
+from forge.pipeline.dispatchers.subprocess_dispatcher import (
     MODE_C_STAGES,
     StageDispatchResult,
     StageDispatchStatus,

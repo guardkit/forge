@@ -39,7 +39,7 @@ from typing import Any
 
 import pytest
 
-from forge.pipeline.dispatchers.subprocess import (
+from forge.pipeline.dispatchers.subprocess_dispatcher import (
     StageDispatchStatus,
     dispatch_subprocess_stage,
 )

@@ -1855,12 +1855,16 @@ def declared_test_command(
     Never raises.
     """
     for candidate in module_candidates:
+        # The imported module is only ever the base of an attribute (the
+        # launch guard holds every module object to that, 14 October 2026).
         try:
-            module = import_module(candidate)
+            import_module(candidate)
         except (ImportError, ModuleNotFoundError, ValueError):
             continue
         try:
-            declaration = module.load_toolchain_declaration(Path(repo_path))
+            declaration = import_module(candidate).load_toolchain_declaration(
+                Path(repo_path)
+            )
         except Exception as exc:  # noqa: BLE001 — a loader defect is not a pass
             return None, None, (
                 f"{repo_path}/.guardkit/config.yaml could not be read: "
@@ -6598,8 +6602,7 @@ def _import_kind(module: str) -> str:
     if not module or module.startswith("."):
         return "local"
     top = module.split(".")[0]
-    names: frozenset[str] = getattr(sys, "stdlib_module_names", frozenset())
-    return "stdlib" if top in names else "third-party"
+    return "stdlib" if top in sys.stdlib_module_names else "third-party"
 
 
 def process_code_imports_request(
@@ -6741,9 +6744,17 @@ def process_code_imports_request(
 try:  # pragma: no cover - present in every Python this service runs on
     from re import _compiler as _re_compiler  # type: ignore[attr-defined]
     from re import _parser as _re_parser  # type: ignore[attr-defined]
+
+    # The parser's three pieces this reader uses, held as functions and a
+    # class rather than the modules themselves (the launch guard allows a
+    # module object only as the base of an attribute).
+    _re_parse: Any = _re_parser.parse
+    _re_compile: Any = _re_compiler.compile
+    _re_sub_pattern: Any = _re_parser.SubPattern
 except Exception:  # pragma: no cover - a Python without the private parser
-    _re_parser = None  # type: ignore[assignment]
-    _re_compiler = None  # type: ignore[assignment]
+    _re_parse = None
+    _re_compile = None
+    _re_sub_pattern = None
 
 #: The fallback used only if the parser above is missing: a quantifier applied
 #: to a group.
@@ -6755,7 +6766,7 @@ _REPEAT_OPS = frozenset({"MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT"})
 
 def _pattern_parts(arguments: Any) -> list[Any]:
     """Every sub-pattern buried in one parsed node's arguments."""
-    if _re_parser is not None and isinstance(arguments, _re_parser.SubPattern):
+    if _re_sub_pattern is not None and isinstance(arguments, _re_sub_pattern):
         return [arguments]
     if isinstance(arguments, (tuple, list)):
         found: list[Any] = []
@@ -6809,10 +6820,10 @@ def _characters_matched(body: Any, flags: int) -> frozenset[str] | None:
     ``None`` means "this piece could match anything", which is what a piece
     this reader cannot work out is treated as.
     """
-    if _re_compiler is None:
+    if _re_compile is None:
         return None
     try:
-        matcher = _re_compiler.compile(body, flags)
+        matcher = _re_compile(body, flags)
     except Exception:  # noqa: BLE001 — an unreadable piece matches everything
         return None
     found = set()
@@ -6885,9 +6896,9 @@ def _explosive_pattern_error(pattern: str, flags: int) -> str | None:
         "characters"
     )
     try:
-        if _re_parser is None:
+        if _re_parse is None:
             raise RuntimeError("this Python has no regular-expression parser")
-        parsed = _re_parser.parse(pattern, flags)
+        parsed = _re_parse(pattern, flags)
         if _work_can_explode(parsed):
             shape = nested
         elif _repeats_overlap(parsed, flags):
@@ -7654,21 +7665,19 @@ def _load_code_search() -> Any:
     process's environment, so the file is loaded by itself instead. Raises
     ``ImportError`` when GuardKitFactory is not installed.
     """
-    import importlib.util
-
     with _CODE_SEARCH_LOAD_LOCK:
         cached = sys.modules.get("_forge_code_search")
         if cached is not None:
             return cached
-        return _load_code_search_once(importlib.util)
+        return _load_code_search_once()
 
 
 #: One request at a time loads the module, so none sees it half loaded.
 _CODE_SEARCH_LOAD_LOCK = threading.Lock()
 
 
-def _load_code_search_once(util: Any) -> Any:
-    package = util.find_spec("guardkitfactory")
+def _load_code_search_once() -> Any:
+    package = importlib.util.find_spec("guardkitfactory")
     locations = list(package.submodule_search_locations or []) if package else []
     source = next(
         (Path(where) / "code_search.py" for where in locations
@@ -7677,10 +7686,10 @@ def _load_code_search_once(util: Any) -> Any:
     )
     if source is None:
         raise ImportError("guardkitfactory.code_search is not installed")
-    spec = util.spec_from_file_location("_forge_code_search", source)
+    spec = importlib.util.spec_from_file_location("_forge_code_search", source)
     if spec is None or spec.loader is None:
         raise ImportError(f"cannot load {source}")
-    module = util.module_from_spec(spec)
+    module = importlib.util.module_from_spec(spec)
     sys.modules["_forge_code_search"] = module
     try:
         spec.loader.exec_module(module)
