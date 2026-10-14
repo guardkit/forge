@@ -1242,7 +1242,10 @@ class TestABuildFailureRepairsItsRetainedCandidate:
         assert "next repair number for FEAT-44A8 could not be established" in (
             caught.value.message
         )
-        assert "connection reset" in caught.value.message
+        # The helper's address and the transport's own words stay in the local
+        # log (14 October 2026): the sentence can reach a committed task file.
+        assert "the sandbox helper could not be reached" in caught.value.message
+        assert "connection reset" not in caught.value.message
         assert sidecar.written == {}
 
     def test_a_failed_task_file_listing_refuses_rather_than_reusing(
@@ -1264,7 +1267,10 @@ class TestABuildFailureRepairsItsRetainedCandidate:
 
         assert caught.value.reason == "repair-number"
         assert caught.value.permanent is False
-        assert "connection reset" in caught.value.message
+        # The helper's address and the transport's own words stay in the local
+        # log (14 October 2026): the sentence can reach a committed task file.
+        assert "the sandbox helper could not be reached" in caught.value.message
+        assert "connection reset" not in caught.value.message
         assert sidecar.written == {}
         assert [route for route, _ in sidecar.calls] == ["list-files"]
 
@@ -1987,7 +1993,13 @@ class TestTheRepairTaskFile:
             "observed actual value is <503>\n"
         ) in body
         assert "## Where the evidence is" in body
-        assert f"- Merge report: {report}" in body
+        # Named relative to the receipts root, never by an absolute path
+        # (design "Factory records never enter a project's commits").
+        assert (
+            "- Merge report: in the factory's receipts, "
+            f"`{report.parent.name}/{report.name}`"
+        ) in body
+        assert str(receipts) not in body
         assert (
             "- Gate evidence: qa/gates/evidence/FEAT-44A8-local-20260907T083219Z/"
             "EVIDENCE.yaml"
@@ -2527,3 +2539,120 @@ class TestSandboxOnlyRepairAdmission:
         assert caught.value.reason == "sandbox-required"
         assert not missing_repo.exists()
         assert len(build_rows(pool)) == 1
+
+
+# ---------------------------------------------------------------------------
+# Design "Factory records never enter a project's commits" (14 October 2026),
+# test 14: a committed repair task names its evidence by a name that means
+# the same on every machine, never by an absolute path, on both repair routes.
+# ---------------------------------------------------------------------------
+
+
+class _UnreachableEvidenceSidecar(_RetainedCandidateSidecar):
+    """The sandbox stub, except that reading a file's text cannot reach it."""
+
+    def __call__(self, url: str, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+        if url.endswith("/code/read-file"):
+            self.calls.append(("read-file", body))
+            raise OSError(f"connection refused by {url}")
+        return super().__call__(url, body, timeout)
+
+
+class TestRepairTasksNameTheirEvidencePortably:
+    #: A made-up home folder; the receipts root sits under it, as it does on
+    #: a factory machine.
+    HELPER = "http://127.0.0.1:8925"
+
+    def _receipts(self, tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
+        home = tmp_path / "home" / "example"
+        receipts = home / "forge-state" / "receipts"
+        report = _write_merge_report(receipts)
+        pack = receipts / SOURCE_BUILD
+        pack.mkdir(parents=True)
+        return home, report, {"failure_pack_path": str(pack), "source": SOURCE_MERGE_REPORT}
+
+    def _says_it_portably(self, text: str, home: Path, report: Path) -> None:
+        receipts = report.parent.parent
+        assert str(home) not in text
+        assert str(receipts) not in text
+        assert (
+            "- Merge report: in the factory's receipts, "
+            f"`{report.parent.name}/{report.name}`"
+        ) in text
+        assert f"- Failure pack: in the factory's receipts, `{SOURCE_BUILD}/`" in text
+
+    def test_the_local_route_commits_no_absolute_path(
+        self, repo_root: Path, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.fix_admission import materialise_repair_task
+
+        home, report, minted = self._receipts(tmp_path)
+
+        prepared = materialise_repair_task(
+            repo_path=repo_root,
+            task_id="TASK-FEAT44A8FIX1",
+            feature_id=FEATURE_ID,
+            name=MERGE_SENTENCE,
+            source_build_id=SOURCE_BUILD,
+            minted=minted,
+            receipts_root=report.parent.parent,
+        )
+
+        committed = show(repo_root, prepared.branch, prepared.task_file_path)
+        self._says_it_portably(committed, home, report)
+
+    def test_the_sandbox_route_commits_no_absolute_path_or_helper_address(
+        self, repo_root: Path, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.fix_admission import materialise_repair_task
+
+        home, report, minted = self._receipts(tmp_path)
+        evidence = f"qa/gates/evidence/{FEATURE_ID}-local-20260907T083219Z/EVIDENCE.yaml"
+        sidecar = _UnreachableEvidenceSidecar("a" * 40, tracked={evidence: EVIDENCE_TEXT})
+        sidecar.shas["main"] = "b" * 40
+        sidecar.on_branch = {"main": {}}
+
+        prepared = materialise_repair_task(
+            repo_path=repo_root,
+            task_id="TASK-FEAT44A8FIX1",
+            feature_id=FEATURE_ID,
+            name=MERGE_SENTENCE,
+            source_build_id=SOURCE_BUILD,
+            minted=minted,
+            receipts_root=report.parent.parent,
+            sidecar=(self.HELPER, REPO_KEY),
+            post=sidecar,
+        )
+
+        written = sidecar.written[prepared.task_file_path]
+        self._says_it_portably(written, home, report)
+        assert "- Could not be read:" in written
+        assert "the sandbox helper could not be reached" in written
+        assert self.HELPER not in written
+        assert "127.0.0.1" not in written
+
+    def test_a_path_outside_the_receipts_root_is_not_written_down(
+        self, repo_root: Path, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.fix_admission import materialise_repair_task
+
+        home, report, _minted = self._receipts(tmp_path)
+        elsewhere = tmp_path / "home" / "example" / "somewhere-else" / SOURCE_BUILD
+        elsewhere.mkdir(parents=True)
+
+        prepared = materialise_repair_task(
+            repo_path=repo_root,
+            task_id="TASK-FEAT44A8FIX1",
+            feature_id=FEATURE_ID,
+            name=MERGE_SENTENCE,
+            source_build_id=SOURCE_BUILD,
+            minted={"failure_pack_path": str(elsewhere)},
+            receipts_root=report.parent.parent,
+        )
+
+        committed = show(repo_root, prepared.branch, prepared.task_file_path)
+        assert str(home) not in committed
+        assert (
+            "- Failure pack: kept in the factory's receipts (its location is not "
+            "written here)"
+        ) in committed

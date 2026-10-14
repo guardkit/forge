@@ -78,6 +78,7 @@ from __future__ import annotations
 import inspect
 import json
 import logging
+import os
 import re
 import subprocess
 from dataclasses import dataclass
@@ -458,6 +459,12 @@ class RepairTaskFacts:
     checks_passed: int | None = None
     checks_total: int | None = None
     failed_checks: tuple[FailedCheck, ...] = ()
+    #: Where the merge report and the failure pack are, as the task file
+    #: says it (14 October 2026): a name relative to the factory's receipts
+    #: root, "in the factory's receipts, `merge-<build>/<report>`", or a
+    #: sentence that the location is not written down. Never an absolute
+    #: path: a repair task is committed, and the receipts root sits under the
+    #: owner's home folder on a factory machine.
     merge_report_path: str | None = None
     gate_evidence_path: str | None = None
     failure_pack_path: str | None = None
@@ -637,6 +644,34 @@ def _default_receipts_root() -> Path:
         return receipts_root()
     except Exception:  # noqa: BLE001 — the report is then simply not found
         return Path("~/forge-state/receipts").expanduser()
+
+
+#: How a repair task names a receipts file that is not under the receipts
+#: root it was read from: nothing about where it is.
+NOT_WRITTEN_HERE = "kept in the factory's receipts (its location is not written here)"
+
+
+def in_the_receipts(path: Path | str | None, receipts_root: Path | str | None) -> str | None:
+    """How a committed repair task names ``path``: by its name relative to the
+    receipts root, which means the same on every machine, never by an
+    absolute path (design "Factory records never enter a project's commits",
+    14 October 2026). ``None`` when there is no path; :data:`NOT_WRITTEN_HERE`
+    when it is not under the root. A folder keeps its trailing ``/``."""
+    if not path:
+        return None
+    root = Path(receipts_root).expanduser() if receipts_root else _default_receipts_root()
+    where = Path(str(path)).expanduser()
+    for base, target in ((root, where), (Path(os.path.realpath(root)), Path(os.path.realpath(where)))):
+        try:
+            name = target.relative_to(base).as_posix()
+        except ValueError:
+            continue
+        if not name or name == "." or name.startswith(".."):
+            break
+        if str(path).endswith(("/", os.sep)) or where.is_dir():
+            name += "/"
+        return f"in the factory's receipts, `{name}`"
+    return NOT_WRITTEN_HERE
 
 
 def _read_merge_report(
@@ -828,9 +863,11 @@ def gather_repair_facts(
         checks_passed=checks_passed,
         checks_total=checks_total,
         failed_checks=tuple(failed),
-        merge_report_path=report_path,
+        merge_report_path=in_the_receipts(report_path, receipts_root),
         gate_evidence_path=evidence_path,
-        failure_pack_path=_text(note.get("failure_pack_path")),
+        failure_pack_path=in_the_receipts(
+            _text(note.get("failure_pack_path")), receipts_root
+        ),
         parent_review=_parent_review_on_branch(
             clone.read_on_branch
             if clone is not None
@@ -2083,10 +2120,16 @@ class _SandboxClone:
                 f"{self._url}{route}", {"repo": self._repo, **body}, self._timeout_s
             )
         except Exception as exc:  # noqa: BLE001 — transport boundary
-            self._not_read(
-                f"{what} (the sandbox helper at {self._url} could not be reached: "
-                f"{type(exc).__name__}: {str(exc)[:160]})"
+            # The helper's address and the transport's own words stay in the
+            # local log: the sentence is committed in the repair task.
+            logger.warning(
+                "fix admission: the sandbox helper at %s could not be reached "
+                "(%s: %s)",
+                self._url,
+                type(exc).__name__,
+                str(exc)[:160],
             )
+            self._not_read(f"{what} (the sandbox helper could not be reached)")
             return None
         if status != 200 or not isinstance(decoded, dict):
             said = decoded.get("error") if isinstance(decoded, dict) else decoded
