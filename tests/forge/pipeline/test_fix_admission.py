@@ -1210,11 +1210,12 @@ class TestABuildFailureRepairsItsRetainedCandidate:
             )
 
         _, body = _frontmatter_and_body(sidecar.written[admission.task_file_path])
+        # The helper's own words stay in the local log (coach review 1).
         assert (
             f"- Could not be read: the files in the sandbox's clone of {REPO_KEY} "
-            "(the sandbox helper answered 400: the repository is not a directory "
-            "on this box)"
+            "(the sandbox helper answered 400)"
         ) in body
+        assert "not a directory on this box" not in body
         assert f"- Could not be read: the gate evidence for {FEATURE_ID}" in body
         assert (
             f"- Could not be read: the files under tasks/ on autobuild/{FEATURE_ID}"
@@ -1976,10 +1977,10 @@ class TestTheRepairTaskFile:
         }
         assert f"# Repair of {SOURCE_BUILD}\n\n{MERGE_SENTENCE}\n" in body
         assert "## What was observed" in body
-        assert (
-            "- Result: merged-deploy-failed — FEAT-44A8 merged, but the deploy "
-            "ended failed — nothing further was touched"
-        ) in body
+        # The result word only; the report's detail stays in the receipts
+        # (coach review 1).
+        assert "- Result: merged-deploy-failed\n" in body
+        assert "nothing further was touched" not in body
         assert (
             f"- Source build: {SOURCE_BUILD} (feature FEAT-44A8, merged commit "
             "9131bc6b495a)"
@@ -2656,3 +2657,102 @@ class TestRepairTasksNameTheirEvidencePortably:
             "- Failure pack: kept in the factory's receipts (its location is not "
             "written here)"
         ) in committed
+
+
+class _RevealingSidecar(_RetainedCandidateSidecar):
+    """The sandbox stub, except that listing the clone's files is refused with
+    an error that quotes a private folder and the helper's address."""
+
+    def __call__(self, url: str, body: dict[str, Any], timeout: float) -> tuple[int, Any]:
+        if url.endswith("/code/list-files"):
+            self.calls.append(("list-files", body))
+            return 400, {
+                "error": "fatal: /home/example/sandbox/clone is not a directory "
+                "(http://127.0.0.1:8925)"
+            }
+        return super().__call__(url, body, timeout)
+
+
+class TestRepairTasksCarryNoFreeText:
+    """Coach review 1, item 5: a committed repair task carries fixed sentences
+    and portable receipts names only; the merge report's own words, and the
+    helper's error text, stay in the receipts and the local log."""
+
+    def _report(self, tmp_path: Path) -> tuple[Path, Path]:
+        home = tmp_path / "home" / "example"
+        receipts = home / "forge-state" / "receipts"
+        where = receipts / f"merge-{SOURCE_BUILD}"
+        where.mkdir(parents=True)
+        (where / "merge_deploy_report.json").write_text(
+            json.dumps(
+                {
+                    "build_id": SOURCE_BUILD,
+                    "feature_id": FEATURE_ID,
+                    "result": "merged-deploy-failed",
+                    "detail": f"compose failed in {home}/projects/shop: exit 17",
+                    "merged_sha": "9131bc6b495a489921ab22aeabb71fa477a16cbd",
+                    "gate_before_merge": {
+                        "failed_checks": [
+                            "hurl-twins::delete-existing-user::40",
+                            f"a check that ran in {home}/x",
+                        ],
+                        "checks_total": 4,
+                        "checks_passed": 2,
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        return home, receipts
+
+    def _carries_no_free_text(self, text: str, home: Path) -> None:
+        assert str(home) not in text
+        assert "/home/example" not in text
+        assert "compose failed" not in text
+        assert "exit 17" not in text
+        assert "a check that ran in" not in text
+        assert "- Result: merged-deploy-failed" in text
+        assert "hurl-twins::delete-existing-user::40" in text
+
+    def test_the_local_route(self, repo_root: Path, tmp_path: Path) -> None:
+        from forge.pipeline.fix_admission import materialise_repair_task
+
+        home, receipts = self._report(tmp_path)
+
+        prepared = materialise_repair_task(
+            repo_path=repo_root,
+            task_id="TASK-FEAT44A8FIX1",
+            feature_id=FEATURE_ID,
+            name=MERGE_SENTENCE,
+            source_build_id=SOURCE_BUILD,
+            receipts_root=receipts,
+        )
+
+        self._carries_no_free_text(
+            show(repo_root, prepared.branch, prepared.task_file_path), home
+        )
+
+    def test_the_sandbox_route(self, repo_root: Path, tmp_path: Path) -> None:
+        from forge.pipeline.fix_admission import materialise_repair_task
+
+        home, receipts = self._report(tmp_path)
+        sidecar = _RevealingSidecar("a" * 40)
+        sidecar.shas["main"] = "b" * 40
+        sidecar.on_branch = {"main": {}}
+
+        prepared = materialise_repair_task(
+            repo_path=repo_root,
+            task_id="TASK-FEAT44A8FIX1",
+            feature_id=FEATURE_ID,
+            name=MERGE_SENTENCE,
+            source_build_id=SOURCE_BUILD,
+            receipts_root=receipts,
+            sidecar=("http://127.0.0.1:8925", REPO_KEY),
+            post=sidecar,
+        )
+
+        written = sidecar.written[prepared.task_file_path]
+        self._carries_no_free_text(written, home)
+        assert "(the sandbox helper answered 400)" in written
+        assert "127.0.0.1" not in written
+        assert "fatal:" not in written
