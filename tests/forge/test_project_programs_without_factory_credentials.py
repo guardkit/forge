@@ -1806,6 +1806,25 @@ def _is_launch_module(dotted: str) -> bool:
         return False
 
 
+@functools.lru_cache(maxsize=None)
+def _is_launch_bearing_module(dotted: str) -> bool:
+    """``dotted`` is a launch module itself, or a real submodule of one that
+    defines at least one launch name (14 October 2026): ``subprocess``,
+    ``multiprocessing``, ``asyncio.subprocess`` and
+    ``multiprocessing.popen_fork`` bear launches; ``os.path`` does not. A
+    submodule is decided by importing the (standard library) module and
+    reading its attributes; cached."""
+    if not _is_launch_module(dotted):
+        return False
+    if dotted in LAUNCH_MODULES:
+        return True
+    try:
+        module = importlib.import_module(dotted)
+    except Exception:  # noqa: BLE001 — a module that cannot be imported here
+        return True  # cannot be shown harmless, so it is treated as bearing launches
+    return any(_is_launch(f"{dotted}.{name}") and hasattr(module, name) for name in LAUNCH_NAMES)
+
+
 def _is_launch(dotted: str) -> bool:
     """THE one launch predicate (14 October 2026): a resolved function is a
     launch when its last component is a launch name and its module is a
@@ -2731,7 +2750,8 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                 elif any(_is_launch_module(t) for t in targets):
                     parent = mod.parents.get(id(node))
                     if not (isinstance(parent, ast.Attribute) and parent.value is node):
-                        report(node, f"the launch module {node.id} is referred to other than as the base of an attribute")
+                        if any(_is_launch_bearing_module(t) for t in targets):
+                            report(node, f"the launch module {node.id} is referred to other than as the base of an attribute")
                     elif any(
                         _is_launch(f"{m}.{parent.attr}") for m in targets if _is_launch_module(m)
                     ) and not called(parent):
@@ -2750,12 +2770,22 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                     # The WHOLE dotted chain, at any depth (14 October 2026):
                     # ``multiprocessing.popen_fork.Popen`` is a launch however
                     # deep it sits, and held as a value it cannot be checked.
-                    launch = next(
-                        (t for t in sorted(_attribute_chain_targets(mod, node)) if _is_launch(t)),
-                        None,
-                    )
+                    chain = sorted(_attribute_chain_targets(mod, node))
+                    launch = next((t for t in chain if _is_launch(t)), None)
+                    parent = mod.parents.get(id(node))
+                    bearing = next((t for t in chain if _is_launch_bearing_module(t)), None)
                     if launch is not None:
                         report(node, f"the launch function {launch} is referred to other than by calling it")
+                    elif bearing is not None and not (
+                        isinstance(parent, ast.Attribute) and parent.value is node
+                    ):
+                        # A submodule that bears launches, held or passed on,
+                        # lets a launch be called through it unseen (R2).
+                        report(
+                            node,
+                            f"the launch-bearing module {bearing} is referred to other "
+                            "than as the base of an attribute",
+                        )
     return problems
 
 
@@ -4387,6 +4417,70 @@ def test_a_launch_is_seen_at_any_depth_of_an_attribute_chain(tmp_path: Path) -> 
         "p16_deep_create_subprocess_exec_held",
     } <= named, problems
     assert any("multiprocessing.popen_fork.Popen" in p for p in problems), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Launch-bearing modules, probed (14 October 2026, implementation review 2,
+#: R2): a submodule that defines launches stored in a variable and called
+#: through (``multiprocessing.popen_fork``, ``asyncio.subprocess``), a launch
+#: module stored, and a launch module stored then reached deeply. The direct
+#: dotted call and ``os.path`` held (it defines no launch) stay clean.
+GUARD_PROBES_17 = textwrap.dedent(
+    '''\
+    import asyncio
+    import multiprocessing.popen_fork
+    import os
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+
+
+    def p17_submodule_stored_then_called_through(obj):
+        backend = multiprocessing.popen_fork
+        return backend.Popen(obj)
+
+
+    async def p17_asyncio_subprocess_stored(cmd):
+        m = asyncio.subprocess
+        await m.create_subprocess_exec(cmd)
+
+
+    def p17_subprocess_stored(cmd):
+        s = subprocess
+        return s
+
+
+    def p17_root_stored_then_deep_call(obj):
+        m = multiprocessing
+        return m.popen_fork.Popen(obj)
+
+
+    async def ok_direct_dotted_call(cmd, folder):
+        await asyncio.subprocess.create_subprocess_exec(cmd, env=build_project_command_env(folder))
+
+
+    def ok_os_path_held(path):
+        x = os.path
+        return x.join(path, "x")
+    '''
+)
+
+
+def test_a_launch_bearing_module_is_only_ever_an_attribute_base(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe17.py").write_text(GUARD_PROBES_17, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_17).body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("p17_")
+    }
+    assert len(expected) == 4
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert any("multiprocessing.popen_fork is referred to" in p for p in problems), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
