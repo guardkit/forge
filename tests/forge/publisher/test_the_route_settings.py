@@ -45,6 +45,7 @@ def _a_settings_file(tmp_path: Path, route: dict) -> Path:
                 "credential_file": "/etc/forge-publisher/credential",
                 "ledger": "/var/lib/forge/forge.db",
                 "state_dir": "/home/publisher/state",
+                "private_path_prefixes": ["/home/example"],
                 "projects": {
                     "guardkit/fixture": {
                         "source": "git://192.0.2.1:9418/fixture",

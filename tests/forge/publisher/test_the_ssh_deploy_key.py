@@ -64,6 +64,7 @@ def _settings_with_remote(tmp_path: Path, remote: str) -> Path:
                 "credential_file": "/k",
                 "ledger": "/l",
                 "state_dir": "/s",
+                "private_path_prefixes": ["/home/example"],
                 "known_hosts_file": "/etc/forge-publisher/known_hosts",
                 "projects": {"p": {"source": "git://10.0.0.1:9418/p", "remote": remote}},
             }
@@ -187,6 +188,7 @@ def test_an_ssh_remote_without_pinned_host_keys_is_refused(tmp_path: Path) -> No
                 "credential_file": "/k",
                 "ledger": "/l",
                 "state_dir": "/s",
+                "private_path_prefixes": ["/home/example"],
                 "projects": {
                     "p": {"source": "git://h/p", "remote": "git@example.invalid:o/p.git"}
                 },

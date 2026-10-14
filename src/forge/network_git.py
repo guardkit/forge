@@ -165,6 +165,9 @@ class NetworkResult:
     stdout: str = ""
     sentence: str = ""
     reason: Optional[str] = None
+    #: The output as raw bytes, for a command run with ``binary=True`` (the
+    #: publisher's whole-blob read); empty otherwise.
+    data: bytes = b""
 
     @property
     def ok(self) -> bool:
@@ -408,6 +411,8 @@ def run_network_git(
     git_dir: Optional[Path] = None,
     timeout: Optional[float] = None,
     credential_env: Optional[Mapping[str, str]] = None,
+    binary: bool = False,
+    input_bytes: Optional[bytes] = None,
 ) -> NetworkResult:
     """Run one git command at the network boundary. Never raises.
 
@@ -416,7 +421,15 @@ def run_network_git(
     folder that is also ``HOME``, with :func:`isolated_environment` and
     :data:`NETWORK_SETTINGS`. Git's stderr is read only to recognise one of
     :data:`REASONS`; it is never returned.
+
+    ``binary`` returns the output as raw bytes in :attr:`NetworkResult.data`
+    (14 October 2026: the publisher reads whole blobs with ``git cat-file
+    --batch`` and searches their bytes). ``input_bytes``, allowed only with
+    ``binary``, is what the command reads on its standard input; otherwise
+    standard input is empty.
     """
+    if input_bytes is not None and not binary:
+        raise ValueError("run_network_git takes input_bytes only with binary=True")
     label = _label(args)
     argv: List[str] = [project_git.git_program(), "--no-pager"]
     if git_dir is not None:
@@ -435,10 +448,11 @@ def run_network_git(
                 argv,
                 cwd=str(home),
                 env=env,
-                stdin=subprocess.DEVNULL,
+                stdin=None if input_bytes is not None else subprocess.DEVNULL,
+                input=input_bytes,
                 capture_output=True,
-                text=True,
-                errors="replace",
+                text=not binary,
+                errors=None if binary else "replace",
                 timeout=limit,
                 check=False,
             )
@@ -446,6 +460,18 @@ def run_network_git(
             return NetworkResult(124, "", project_git.timeout_sentence(label, limit))
         except OSError:
             return NetworkResult(127, "", f"git {label} could not be started.")
+    if binary:
+        data = done.stdout or b""
+        stderr = (done.stderr or b"").decode("utf-8", errors="replace")
+        if done.returncode == 0:
+            return NetworkResult(0, "", "", data=data)
+        return NetworkResult(
+            done.returncode,
+            "",
+            project_git.failure_sentence(label, done.returncode),
+            _reason(stderr),
+            data=data,
+        )
     if done.returncode == 0:
         return NetworkResult(0, done.stdout or "", "")
     return NetworkResult(
