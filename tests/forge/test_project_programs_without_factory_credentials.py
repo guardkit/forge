@@ -2613,22 +2613,30 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
         for node in ast.walk(mod.tree):
             if id(node) in skip:
                 continue
-            # (1) imported only under its own name
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.asname and alias.name in _LAUNCHES:
-                        report(node, f"the launch module {alias.name} is imported as {alias.asname!r}")
-            elif isinstance(node, ast.ImportFrom):
-                for alias in node.names:
-                    if not alias.asname or alias.asname == alias.name:
+            # (1) imported only under its own name. Every import — relative
+            # ones included — is first resolved to the absolute name it binds
+            # by the one resolver (:func:`_import_bindings`, 14 October 2026).
+            # An ``as`` is a violation when the imported name's last
+            # component is a guarded name's (the helper's, a runner's or a
+            # launch module's), whatever module text precedes it, or when it
+            # is a launch function of a launch module. Generic words (run,
+            # call, spawn ...) count only on a launch module.
+            if isinstance(node, (ast.Import, ast.ImportFrom)):
+                aliases = [a for a in node.names if a.asname]
+                for alias, (local, target) in zip(
+                    node.names, _import_bindings(node, mod.package)
+                ):
+                    if alias not in aliases or local == alias.name.rpartition(".")[2]:
                         continue
-                    guarded = alias.name in callables or (
-                        not node.level
-                        and node.module in _LAUNCHES
-                        and alias.name in _LAUNCHES[node.module]
-                    )
-                    if guarded:
-                        report(node, f"{alias.name} is imported as {alias.asname!r}")
+                    module, _, last = target.rpartition(".")
+                    if (
+                        last in callables
+                        or last in _LAUNCHES
+                        or target in HELPERS
+                        or target in runner_dotted
+                        or (module in _LAUNCHES and last in _LAUNCHES[module])
+                    ):
+                        report(node, f"{target} is imported as {local!r}")
             # (2) every reference is a direct use
             elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
                 targets = _targets(mod, node.id)
@@ -3718,6 +3726,87 @@ def test_guarded_names_are_only_used_directly(tmp_path: Path) -> None:
     }
     assert len(expected) == 6
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Relative imports, probed (14 October 2026): a runner imported by a
+#: relative ``from .service import ... as go`` and assigned to a variable, the
+#: same alias reused in an unrelated scope, a parent-relative alias, and an
+#: ``import ... as`` whose last component is a guarded name under other module
+#: text. Every import is resolved by the one resolver first.
+GUARD_PROBES_11_SIDECAR = textwrap.dedent(
+    '''\
+    import os
+
+    from .service import _start_and_collect as go
+    from ..launch_environment import build_project_command_env
+
+
+    def p11_relative_runner_alias_assigned(cmd):
+        runner = go
+        return runner(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+    def p11_relative_runner_alias_reused_here(cmd, folder):
+        return go(argv=cmd, cwd=".", env=build_project_command_env(folder), timeout=1, what="x")
+    '''
+)
+GUARD_PROBES_11_BUILD = textwrap.dedent(
+    '''\
+    import os
+
+
+    def p11_parent_relative_alias_in_one_scope(cmd):
+        from ..deploy_sidecar.service import _start_and_collect as go
+
+        return go(argv=cmd, cwd=".", env=dict(os.environ), timeout=1, what="x")
+
+
+    def p11_same_alias_unrelated_scope(cmd):
+        from json import dumps as go
+
+        return go({"cmd": cmd})
+
+
+    def p11_last_component_alias(cmd):
+        import tools.vendored.subprocess as sp
+
+        return sp.run(cmd)
+
+
+    def ok_unaliased_relative_import_with_helper(cmd, folder):
+        from ..deploy_sidecar.service import _start_and_collect
+        from ..launch_environment import build_project_command_env
+
+        return _start_and_collect(
+            argv=cmd, cwd=".", env=build_project_command_env(folder), timeout=1, what="x"
+        )
+    '''
+)
+
+
+def test_relative_imports_are_resolved_before_every_check(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    for sub in ("deploy_sidecar", "build"):
+        (pkg / sub).mkdir(parents=True)
+        (pkg / sub / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "deploy_sidecar" / "zz_probe11.py").write_text(GUARD_PROBES_11_SIDECAR, encoding="utf-8")
+    (pkg / "build" / "zz_probe11.py").write_text(GUARD_PROBES_11_BUILD, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        "p11_relative_runner_alias_assigned",
+        "p11_parent_relative_alias_in_one_scope",
+        "p11_same_alias_unrelated_scope",
+        "p11_last_component_alias",
+    }
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert any(
+        "deploy_sidecar/zz_probe11.py:3 in <module>: "
+        "forge.deploy_sidecar.service._start_and_collect is imported as 'go'" in p
+        for p in problems
+    ), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
