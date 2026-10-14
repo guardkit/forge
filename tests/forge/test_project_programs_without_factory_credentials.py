@@ -2307,6 +2307,45 @@ def _scope_bindings(scope: ast.AST, name: str) -> tuple[set[str], ast.AST | None
     return kinds, definition
 
 
+def _evaluation_scope(mod: _Module, at: ast.AST) -> ast.AST | None:
+    """The scope whose body evaluates ``at``: the nearest function, lambda
+    or CLASS body (15 October 2026, class bodies): a parameter's default, an
+    annotation, a decorator or a class's bases are evaluated where the
+    function or class is written, so they belong to the scope outside it.
+    ``None`` at module level."""
+    child: ast.AST = at
+    current = mod.parents.get(id(at))
+    while current is not None:
+        if isinstance(current, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            outside = (
+                child is current.args
+                or child is current.returns
+                or any(child is d for d in current.decorator_list)
+            )
+            if not outside:
+                return current
+        elif isinstance(current, ast.Lambda):
+            if child is not current.args:
+                return current
+        elif isinstance(current, ast.ClassDef):
+            outside = (
+                any(child is b for b in current.bases)
+                or any(child is k for k in current.keywords)
+                or any(child is d for d in current.decorator_list)
+            )
+            if not outside:
+                return current
+        child, current = current, mod.parents.get(id(current))
+    return None
+
+
+def _class_body_at(mod: _Module, at: ast.AST) -> ast.ClassDef | None:
+    """The class whose body ``at`` is written directly in (outside any
+    method), if any."""
+    scope = _evaluation_scope(mod, at)
+    return scope if isinstance(scope, ast.ClassDef) else None
+
+
 def _defining_scope(mod: _Module, at: ast.AST) -> ast.AST | None:
     """The function whose scope a name at ``at`` is looked up in.
 
@@ -2342,6 +2381,22 @@ def _possible_name_targets(mod: _Module, name: str, at: ast.AST) -> set[str]:
     being "shadowed" or rebound never exempts a name. ``global`` sends the
     lookup to the module as well; ``nonlocal`` to the enclosing function."""
     out: set[str] = set()
+    # A name used directly in a class body is looked up in that class's own
+    # bindings first, then in the scopes around the class (15 October 2026).
+    klass = _class_body_at(mod, at)
+    if klass is not None:
+        found = _bindings(klass).get(name, [])
+        if found:
+            kinds = {kind for kind, _node in found}
+            if "import" in kinds:
+                out |= _targets(mod, name)
+            out |= {
+                f"{mod.dotted}.{_qualname(mod, node)}"
+                for kind, node in found
+                if kind in ("def", "class")
+            }
+            if not kinds & {"global", "nonlocal"}:
+                return out
     scope = _defining_scope(mod, at)
     while scope is not None:
         found = _bindings(scope).get(name, [])
@@ -2406,6 +2461,16 @@ def _resolve_all_strict(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[st
     """
     if isinstance(func_node, ast.Name):
         name = func_node.id
+        klass = _class_body_at(mod, at)
+        if klass is not None and _bindings(klass).get(name):
+            # Bound in the class body it is used in: that binding, if it is
+            # a single definition or import, else unknown (15 October 2026).
+            kinds, definition = _scope_bindings(klass, name)
+            if "other" in kinds or ("def" in kinds and "import" in kinds):
+                return set()
+            if "def" in kinds and definition is not None:
+                return {f"{mod.dotted}.{_qualname(mod, definition)}"}
+            return set(_targets(mod, name))
         scope = _defining_scope(mod, at)
         while scope is not None:
             kinds, definition = _scope_bindings(scope, name)
@@ -2651,6 +2716,17 @@ def _defined_once(mod: _Module, node: Any) -> bool:
     return True
 
 
+def _module_wide_binding_count(mod: _Module, name: str) -> int:
+    """How many bindings ``name`` has in the whole module: at module level
+    and in every function, lambda and class body."""
+    scopes: list[ast.AST] = [mod.tree] + [
+        n
+        for n in ast.walk(mod.tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef))
+    ]
+    return sum(len(_bindings(scope).get(name, [])) for scope in scopes)
+
+
 def _wrappers(modules: list[_Module]) -> set[str]:
     """MODULE-LEVEL functions whose whole body is ``return <helper call>``
     (or a call to another such function), by dotted name, none of whose
@@ -2694,7 +2770,12 @@ def _wrappers(modules: list[_Module]) -> set[str]:
                 only = body[0].value
                 if isinstance(only, ast.Call) and _feeds_values_from_parameters(only, node):
                     continue
-                if _inline_helper(only, mod, node, found):
+                # And its name is reserved in its whole module (15 October
+                # 2026): any other binding of it, in any function, class
+                # body or lambda, disqualifies it.
+                if _inline_helper(only, mod, node, found) and (
+                    _module_wide_binding_count(mod, node.name) == 1
+                ):
                     found.add(full)
                     changed = True
     return found
@@ -3503,8 +3584,27 @@ def unaccounted_launches(package: Path) -> list[str]:
         if (mod.rel, fname) not in ALLOWED:
             problems.append(f"{mod.rel}:{node.lineno} in {fname}: {sentence}")
 
+    environment_names = {t.rsplit(".", 1)[1] for t in HELPERS | wrappers}
     for mod in modules:
         for node in ast.walk(mod.tree):
+            if isinstance(node, ast.Call) and _class_body_at(mod, node) is not None:
+                # Written directly in a class body, outside any method
+                # (15 October 2026): no launch, runner, helper or wrapper
+                # call is trusted there.
+                reached = _resolve_all(mod, node.func, node) if isinstance(
+                    node.func, (ast.Name, ast.Attribute)
+                ) else set()
+                if (
+                    _launch_kind(mod, node.func)
+                    or _runner_named(mod, node.func)
+                    or reached & (HELPERS | wrappers)
+                    or _last_name(node.func) in environment_names
+                ):
+                    _, fname = place(mod, node)
+                    problems.append(
+                        f"{mod.rel}:{node.lineno} in {fname}: a launch, generic runner "
+                        "or environment helper is called directly in a class body"
+                    )
             if isinstance(node, ast.Call):
                 kind = _launch_kind(mod, node.func)
                 if kind:
@@ -6236,6 +6336,93 @@ def test_a_method_inside_a_class_level_block_is_still_a_method(
     named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
     assert "p29_conditional_method_unsafe_bound_call" in named, problems
     assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Class bodies, probed (15 October 2026, GuardKit's round 24). A call
+#: written directly in a class body (outside any method) to a launch, a
+#: runner, the helper or a wrapper is a violation; a name used there is
+#: looked up in the class's own bindings first; and a wrapper's name is
+#: reserved in its whole module. Probes: the reproducer (a class-local
+#: function shadowing a module wrapper, called for env= by a launch in the
+#: class body), a class-body launch with the helper inline, a function that
+#: rebinds a wrapper name, and a use elsewhere of the wrapper so rebound.
+#: Controls, in a module of their own: an unshadowed module wrapper used
+#: inside a method, and the helper inline inside a method.
+GUARD_PROBES_30: dict[str, str] = {
+    "__init__.py": "",
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import os
+        import subprocess
+
+        from forge.launch_environment import build_project_command_env
+
+
+        def wrapper_name(folder):
+            return build_project_command_env(folder)
+
+
+        def project_env_two(folder):
+            return build_project_command_env(folder)
+
+
+        class p30_class_local_shadow_of_a_wrapper:
+            def wrapper_name(folder):
+                return dict(os.environ)
+
+            x = subprocess.run(["make"], env=wrapper_name("."))
+
+
+        class p30_class_body_launch_with_the_helper_inline:
+            x = subprocess.run(["make"], env=build_project_command_env("."))
+
+
+        def p30_function_rebinding_a_wrapper_name(cmd):
+            project_env_two = lambda folder: dict(os.environ)  # noqa: E731
+            subprocess.run(cmd, env=project_env_two("."))
+
+
+        def p30_wrapper_rebound_elsewhere_then_used(cmd, folder):
+            subprocess.run(cmd, env=project_env_two(folder))
+        '''
+    ),
+    "zz_ok.py": textwrap.dedent(
+        '''\
+        import subprocess
+
+        from forge.launch_environment import build_project_command_env
+
+
+        def project_env(folder):
+            return build_project_command_env(folder)
+
+
+        class Runner:
+            def ok_unshadowed_module_wrapper_inside_a_method(self, cmd, folder):
+                subprocess.run(cmd, env=project_env(folder))
+
+            def ok_helper_inline_inside_a_method(self, cmd, folder):
+                subprocess.run(cmd, env=build_project_command_env(folder))
+        '''
+    ),
+}
+
+
+def test_class_bodies_are_never_trusted(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_30))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_30["zz_main.py"]).body
+        if isinstance(n, (ast.FunctionDef, ast.ClassDef)) and n.name.startswith("p30_")
+    }
+    assert len(expected) == 4
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert any(
+        " in p30_class_local_shadow_of_a_wrapper: a launch, generic runner" in p for p in problems
+    ), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+    assert not any(p.startswith("zz_ok.py") for p in problems), problems
 
 
 def test_env_slots_are_read_from_signatures() -> None:
