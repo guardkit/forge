@@ -263,6 +263,7 @@ class TestTheEstateRenders:
             "nats-provision:",
             "memory:",
             "memory-relay:",
+            "model-door:",
         ):
             assert service in rendered, f"{service} is missing from the estate"
 
@@ -454,7 +455,10 @@ class TestNothingOfThisMachineIsInIt:
         assert "127.0.0.1" not in rendered
 
     def test_no_home_directory_but_the_images_own(self, rendered: str) -> None:
-        for line in rendered.splitlines():
+        # The bundle's own files, bound from beside compose.yaml (the model
+        # door's settings, 14 October 2026), render as a path to wherever the
+        # bundle was checked out. That folder is the bundle, not a machine's.
+        for line in rendered.replace(str(ESTATE), "<the bundle>").splitlines():
             if "/home/" not in line:
                 continue
             assert any(home in line for home in _IN_IMAGE_HOMES), (
@@ -491,7 +495,18 @@ class TestNothingOfThisMachineIsInIt:
 
 class TestWhatTheEstatePromises:
     def test_nothing_runs_on_the_host_network(self, rendered: str) -> None:
-        assert "network_mode: host" not in rendered
+        """Nothing but the model door (14 October 2026). It reaches the model
+        router on this machine's loopback, which only the host's network
+        has, and it binds only the gateway address named in the env file.
+        Everything else is on a declared network."""
+        import yaml
+
+        services = yaml.safe_load(rendered)["services"]
+        on_the_host = sorted(
+            name for name, service in services.items()
+            if service.get("network_mode") == "host"
+        )
+        assert on_the_host == ["model-door"], on_the_host
 
     def test_three_published_ports_and_only_three(self, rendered: str) -> None:
         """Every crossing of the sandbox boundary goes through the factory

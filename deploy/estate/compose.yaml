@@ -516,6 +516,80 @@ services:
       start_period: 30s
 
   # -------------------------------------------------------------------------
+  # THE MODEL DOOR (14 October 2026) — how a project's sandbox reaches the
+  # model router without holding a key.
+  #
+  # The sandbox used to be given a model-router key, and anything a build runs
+  # in there can read whatever its containers are given. Now its containers
+  # get a fixed placeholder, and this small proxy, at the gateway address,
+  # replaces the caller's key with its own and passes the call to the router.
+  # Its settings are model-door.cfg, beside this file, bound read-only.
+  #
+  # THE HOST'S NETWORK, AND WHY THIS ONE SERVICE IS ON IT. The model router
+  # listens on this machine and a guard refuses Docker's bridges on its port,
+  # so the door reaches it on the loopback, which only the host's network
+  # has. It binds only MODEL_DOOR_BIND, the gateway address and its own port,
+  # and the machine's guard admits only the sandbox's machine to that port.
+  # It publishes nothing and joins no Compose network.
+  #
+  # ITS KEY IS A FILE, the same way the memory service's database address is:
+  # read from the environment the command was run in, handed to the container
+  # under /run/secrets, and put into the environment of HAProxy's own process
+  # by the entry shell below. It is in no declared setting, so 'docker
+  # inspect' does not show it, and it is in no file in this bundle.
+  #
+  # The image is the stock HAProxy the feature router is built from, pinned by
+  # digest (estate-pins.conf). It runs as the image's own unprivileged user,
+  # with every capability dropped and no way to gain one: it binds a port
+  # above 1024 and writes nothing.
+  #
+  # WHY IT IS NOT MARKED read_only (found by starting it, 14 October 2026).
+  # Compose hands a secret read from the environment into a container by
+  # copying it in, and it refuses to do that for a read-only service ("`file`
+  # is the sole supported option"), so a read-only door could not be given its
+  # key the way every other estate secret is given. Nothing is lost: the
+  # image's user can write nowhere on the image's filesystem (checked on the
+  # pinned image), and HAProxy writes nothing.
+  # -------------------------------------------------------------------------
+  model-door:
+    image: ${FACTORY_MODEL_DOOR_IMAGE:?name the model door's image in the env file, pinned by digest - estate-pins.conf says which}
+    restart: unless-stopped
+    network_mode: host
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        key_file=/run/secrets/sandbox_model_key
+        if [ ! -s "$$key_file" ]; then
+            echo "the model door was given no key: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with SANDBOX_MODEL_KEY passed in from a child process." >&2
+            exit 1
+        fi
+        MODEL_DOOR_KEY="$$(cat "$$key_file")"
+        export MODEL_DOOR_KEY
+        exec "$$@"
+      - the-estate-hands-the-model-door-its-key-as-a-file
+    command: ["haproxy", "-db", "-f", "/usr/local/etc/haproxy/model-door.cfg"]
+    environment:
+      # Where it listens: the gateway address and the door's port, built in
+      # the env file. Never 0.0.0.0, which would open it to every network.
+      MODEL_DOOR_BIND: ${MODEL_DOOR_BIND:?name the address and port the model door listens on in the env file - the factory gateway address and MODEL_DOOR_PORT}
+    secrets:
+      - source: sandbox-model-key
+        target: sandbox_model_key
+    volumes:
+      - type: bind
+        source: ./model-door.cfg
+        target: /usr/local/etc/haproxy/model-door.cfg
+        read_only: true
+        bind:
+          create_host_path: false
+
+  # -------------------------------------------------------------------------
   # THE MEMORY RELAY — it listens on the bus and writes what it hears into the
   # store. It PUBLISHES NOTHING: nothing outside the estate ever calls it, so
   # it has no port, and a sandbox cannot reach it at all.
@@ -1258,6 +1332,15 @@ secrets:
   # container's declared environment and in nothing either service prints.
   memory-database-address:
     environment: FLEET_MEMORY_PG_DSN
+
+  # THE MODEL DOOR'S KEY (14 October 2026). A model-router key minted for the
+  # door alone, read from the environment the command was run in — the same
+  # child process the other secrets come from — and handed to the model door
+  # as a file. It is in no file in this bundle, in no image, in no container's
+  # declared environment and in nothing the door prints. It never enters a
+  # project's sandbox: that is the whole point of the door.
+  sandbox-model-key:
+    environment: SANDBOX_MODEL_KEY
 
   # THE FRONT DOOR'S TWO SLACK CREDENTIALS, added 25 September 2026.
   #
