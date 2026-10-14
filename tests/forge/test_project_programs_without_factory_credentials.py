@@ -2308,14 +2308,45 @@ def _helper_shaped(node: ast.AST | None, mod: _Module, func: Any, wrappers: set[
     return False
 
 
-def _defined_once(mod: _Module, node: Any) -> bool:
-    """``node``'s name has exactly ONE binding in the scope it is defined in —
-    this very definition — by the single binding enumerator: no second
-    definition, no conditional alternative, no later rebinding of any form
-    (14 October 2026). Only such a function's identity is trusted."""
+#: How many definitions each full qualified identity has in a module, worked
+#: out once per guard run (cleared by :func:`unaccounted_launches`).
+_QUALNAME_CACHE: dict[int, dict[str, int]] = {}
+
+
+def _definitions_by_identity(mod: _Module) -> dict[str, int]:
+    counted = _QUALNAME_CACHE.get(id(mod.tree))
+    if counted is None:
+        counted = {}
+        for node in ast.walk(mod.tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                name = _qualname(mod, node)
+                counted[name] = counted.get(name, 0) + 1
+        _QUALNAME_CACHE[id(mod.tree)] = counted
+    return counted
+
+
+def _bound_once_where_defined(mod: _Module, node: Any) -> bool:
     scope = _enclosing(mod, node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) or mod.tree
     bound = _bindings(scope).get(node.name, [])
     return len(bound) == 1 and bound[0][1] is node
+
+
+def _defined_once(mod: _Module, node: Any) -> bool:
+    """``node`` is the ONLY definition of its full qualified identity in the
+    module, and it and every class or function enclosing it is bound exactly
+    once in its own scope, by the single binding enumerator: no second
+    definition, no conditional alternative (two conditional ``class X:``
+    blocks each with a method of the same name included), no later
+    rebinding of any form (14 October 2026). Only such a function's identity
+    is trusted."""
+    if _definitions_by_identity(mod).get(_qualname(mod, node), 0) != 1:
+        return False
+    current: Any = node
+    while current is not None:
+        if not _bound_once_where_defined(mod, current):
+            return False
+        current = _enclosing(mod, current, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+    return True
 
 
 def _wrappers(modules: list[_Module]) -> set[str]:
@@ -2687,6 +2718,7 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
 
 def unaccounted_launches(package: Path) -> list[str]:
     _SCOPE_CACHE.clear()
+    _QUALNAME_CACHE.clear()
     modules = _load_modules(package)
     wrappers = _wrappers(modules)
     problems_of_trust = _untrusted_definitions(modules)
@@ -3957,6 +3989,108 @@ def test_only_a_function_defined_once_is_trusted(tmp_path: Path) -> None:
         "deploy_sidecar/service.py" in p and "has more than one binding" in p
         for p in problems
     ), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Qualified identity, probed (14 October 2026): two conditional ``class``
+#: definitions each with a method of the same name (one safe, one not), two
+#: plain duplicate classes, a class rebound by an assignment, and nested
+#: functions of the same name under a duplicated outer function. A wrapper
+#: is trusted only as the one definition of its full qualified identity,
+#: with every enclosing class and function bound once.
+GUARD_PROBES_13 = textwrap.dedent(
+    '''\
+    import os
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+
+    if os.environ.get("SOME_SWITCH"):
+
+        class Conditional:
+            def env(self, folder):
+                return build_project_command_env(folder)
+
+    else:
+
+        class Conditional:
+            def env(self, folder):
+                return dict(os.environ)
+
+
+    def p13_conditional_duplicate_classes(cmd, folder):
+        subprocess.run(cmd, env=Conditional.env(None, folder))
+
+
+    class Plain:
+        def env(self, folder):
+            return build_project_command_env(folder)
+
+
+    class Plain:  # noqa: F811
+        def env(self, folder):
+            return dict(os.environ)
+
+
+    def p13_duplicate_plain_classes(cmd, folder):
+        subprocess.run(cmd, env=Plain.env(None, folder))
+
+
+    class Rebound:
+        def env(self, folder):
+            return build_project_command_env(folder)
+
+
+    Rebound = dict  # noqa: F811
+
+
+    def p13_class_rebound_by_assignment(cmd, folder):
+        subprocess.run(cmd, env=Rebound.env(None, folder))
+
+
+    def p13_duplicated_outer(cmd, folder):
+        def env(f):
+            return build_project_command_env(f)
+
+        subprocess.run(cmd, env=env(folder))
+
+
+    def p13_duplicated_outer(cmd, folder):  # noqa: F811
+        def env(f):
+            return dict(os.environ)
+
+        subprocess.run(cmd, env=env(folder))
+
+
+    class Single:
+        def env(self, folder):
+            return build_project_command_env(folder)
+
+
+    def ok_single_class_method_wrapper(cmd, folder):
+        subprocess.run(cmd, env=Single.env(None, folder))
+
+
+    def ok_inline_helper(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+    '''
+)
+
+
+def test_only_the_one_definition_of_a_qualified_identity_is_trusted(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe13.py").write_text(GUARD_PROBES_13, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_13).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p13_")
+    }
+    assert len(expected) == 4
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
