@@ -32,6 +32,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import contextlib
+import functools
+import importlib.util
 import json
 import os
 import sqlite3
@@ -1769,20 +1771,53 @@ HELPERS = {"forge.launch_environment.build_project_command_env"}
 #: The factory's own programs, recognised from a literal first argument.
 FACTORY_PROGRAMS = {"git", "docker", "pgrep", "ps"}
 
-_LAUNCHES = {
-    "subprocess": {
-        "run", "Popen", "call", "check_call", "check_output", "getoutput",
-        "getstatusoutput",
-    },
-    "asyncio": {"create_subprocess_exec", "create_subprocess_shell"},
-    "os": {
-        "system", "popen", "execl", "execle", "execlp", "execlpe", "execv",
-        "execve", "execvp", "execvpe", "spawnl", "spawnle", "spawnlp",
-        "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe", "posix_spawn",
-        "posix_spawnp", "fork", "forkpty",
-    },
-    "pty": {"spawn", "fork"},
-}
+#: The modules that can start a process, each with all its submodules.
+LAUNCH_MODULES: tuple[str, ...] = (
+    "subprocess", "os", "asyncio", "pty", "multiprocessing", "posix",
+)
+
+#: Every function name the guard knows to start a process.
+LAUNCH_NAMES: frozenset[str] = frozenset(
+    {
+        "run", "call", "check_call", "check_output", "Popen", "getoutput",
+        "getstatusoutput", "create_subprocess_shell", "create_subprocess_exec",
+        "subprocess_shell", "subprocess_exec", "system", "popen", "spawn",
+        "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve",
+        "spawnvp", "spawnvpe", "execl", "execle", "execlp", "execlpe",
+        "execv", "execve", "execvp", "execvpe", "posix_spawn",
+        "posix_spawnp", "fork", "forkpty", "startfile",
+    }
+)
+
+
+@functools.lru_cache(maxsize=None)
+def _is_launch_module(dotted: str) -> bool:
+    """``dotted`` is a launch module or one of its real submodules (found
+    with ``importlib.util.find_spec``), never a function or class inside
+    one: ``asyncio.subprocess`` is a module, ``os.getenv`` is not."""
+    root = dotted.split(".", 1)[0]
+    if root not in LAUNCH_MODULES:
+        return False
+    if dotted == root:
+        return True
+    try:
+        return importlib.util.find_spec(dotted) is not None
+    except (ImportError, ValueError):
+        return False
+
+
+def _is_launch(dotted: str) -> bool:
+    """THE one launch predicate (14 October 2026): a resolved function is a
+    launch when its last component is a launch name and its module is a
+    launch module or a submodule of one — so ``asyncio.subprocess.
+    create_subprocess_shell`` imported directly is as much a launch as
+    ``asyncio.create_subprocess_shell``. One carve-out: asyncio's ``run``
+    (``asyncio.run``, ``asyncio.Runner.run``) runs a coroutine, not a
+    program."""
+    module, _, last = dotted.rpartition(".")
+    if not module or last not in LAUNCH_NAMES or not _is_launch_module(module):
+        return False
+    return not (last == "run" and (module == "asyncio" or module.startswith("asyncio.")))
 #: Launch methods recognised on any object: ``asyncio.subprocess.create_*``
 #: and an event loop's ``subprocess_exec`` / ``subprocess_shell``.
 _ANY_RECEIVER_LAUNCHES = {
@@ -2406,18 +2441,18 @@ def _wrappers(modules: list[_Module]) -> set[str]:
 
 def _launch_kind(mod: _Module, node: ast.AST) -> str | None:
     """What launch ``node`` (a call target or a value) names, if any."""
+    candidates: set[str] = set()
     if isinstance(node, ast.Attribute):
         if node.attr in _ANY_RECEIVER_LAUNCHES:
             return _dotted(node)
+        candidates |= _resolve_all(mod, node, node)
         if isinstance(node.value, ast.Name):
-            for module in sorted(_targets(mod, node.value.id)):
-                if module in _LAUNCHES and node.attr in _LAUNCHES[module]:
-                    return f"{module}.{node.attr}"
-    if isinstance(node, ast.Name):
-        for target in sorted(_targets(mod, node.id)):
-            module, _, name = target.rpartition(".")
-            if module in _LAUNCHES and name in _LAUNCHES[module]:
-                return target
+            candidates |= {f"{t}.{node.attr}" for t in _targets(mod, node.value.id)}
+    elif isinstance(node, ast.Name):
+        candidates |= _resolve_all(mod, node, node) | _targets(mod, node.id)
+    for target in sorted(candidates):
+        if _is_launch(target):
+            return target
     return None
 
 
@@ -2537,11 +2572,7 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
         for alias, every in mod.imports.items():
             for target in every:
                 module, _, last = target.rpartition(".")
-                if (
-                    last in base
-                    or target in HELPERS
-                    or (module in _LAUNCHES and last in _LAUNCHES[module])
-                ):
+                if last in base or target in HELPERS or _is_launch(target):
                     reserved.add(alias)
 
         def flag(node: ast.AST, sentence: str) -> None:
@@ -2560,8 +2591,8 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
                 if not (
                     target in HELPERS
                     or any(target in spec["dotted"] for spec in GENERIC_RUNNERS.values())
-                    or (module in _LAUNCHES and last in _LAUNCHES[module])
-                    or target in _LAUNCHES
+                    or _is_launch(target)
+                    or _is_launch_module(target)
                 ):
                     return False
             return True
@@ -2589,24 +2620,18 @@ def _reserved_name_rebindings(modules: list[_Module]) -> list[str]:
                         f"runner's or a launch function's) is rebound by a "
                         f"{kind} binding",
                     )
-        # A launch module or launch function imported under another name.
+        # A launch module or launch function imported under another name, by
+        # the one launch predicate on the resolved import.
         for node in ast.walk(mod.tree):
-            if isinstance(node, ast.Import):
-                for alias in node.names:
-                    if alias.asname and alias.name in _LAUNCHES and alias.asname != alias.name:
-                        flag(node, f"the launch module {alias.name} is imported as {alias.asname!r}")
-            elif isinstance(node, ast.ImportFrom) and node.module in _LAUNCHES and not node.level:
-                for alias in node.names:
-                    if (
-                        alias.asname
-                        and alias.name in _LAUNCHES[node.module]
-                        and alias.asname != alias.name
-                    ):
-                        flag(
-                            node,
-                            f"the launch function {node.module}.{alias.name} is "
-                            f"imported as {alias.asname!r}",
-                        )
+            if not isinstance(node, (ast.Import, ast.ImportFrom)):
+                continue
+            for alias, (local, target) in zip(node.names, _import_bindings(node, mod.package)):
+                if not alias.asname or local == alias.name.rpartition(".")[2]:
+                    continue
+                if _is_launch(target):
+                    flag(node, f"the launch function {target} is imported as {local!r}")
+                elif _is_launch_module(target):
+                    flag(node, f"the launch module {target} is imported as {local!r}")
     return problems
 
 
@@ -2639,7 +2664,6 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
     Type annotations name things without running them and are left out.
     """
     callables = _guarded_callables()
-    launch_functions = {name for names in _LAUNCHES.values() for name in names}
     problems: list[str] = []
     for mod in modules:
         skip = _annotation_nodes(mod.tree)
@@ -2687,13 +2711,14 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                 ):
                     if alias not in aliases or local == alias.name.rpartition(".")[2]:
                         continue
-                    module, _, last = target.rpartition(".")
+                    last = target.rpartition(".")[2]
                     if (
                         last in callables
-                        or last in _LAUNCHES
+                        or last in LAUNCH_MODULES
                         or target in HELPERS
                         or target in runner_dotted
-                        or (module in _LAUNCHES and last in _LAUNCHES[module])
+                        or _is_launch(target)
+                        or _is_launch_module(target)
                     ):
                         report(node, f"{target} is imported as {local!r}")
             # (2) every reference is a direct use
@@ -2701,18 +2726,14 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                 targets = _targets(mod, node.id)
                 if names_a_callable(node.id) and not called(node):
                     report(node, f"{node.id} is referred to other than by calling it")
-                elif any(
-                    t.rpartition(".")[0] in _LAUNCHES
-                    and t.rpartition(".")[2] in _LAUNCHES[t.rpartition(".")[0]]
-                    for t in targets
-                ) and not called(node):
+                elif any(_is_launch(t) for t in targets) and not called(node):
                     report(node, f"the launch function {node.id} is referred to other than by calling it")
-                elif targets & set(_LAUNCHES):
+                elif any(_is_launch_module(t) for t in targets):
                     parent = mod.parents.get(id(node))
                     if not (isinstance(parent, ast.Attribute) and parent.value is node):
                         report(node, f"the launch module {node.id} is referred to other than as the base of an attribute")
                     elif any(
-                        parent.attr in _LAUNCHES[m] for m in targets & set(_LAUNCHES)
+                        _is_launch(f"{m}.{parent.attr}") for m in targets if _is_launch_module(m)
                     ) and not called(parent):
                         report(
                             node,
@@ -2725,7 +2746,6 @@ def _direct_use_violations(modules: list[_Module]) -> list[str]:
                         report(node, f"{node.attr} is rebound as an attribute")
                     elif not called(node):
                         report(node, f"{node.attr} is referred to other than by calling it")
-    del launch_functions
     return problems
 
 
@@ -2769,7 +2789,7 @@ def unaccounted_launches(package: Path) -> list[str]:
                     _dotted(node.func) in ("__import__", "importlib.import_module", "import_module")
                     and node.args
                     and isinstance(node.args[0], ast.Constant)
-                    and str(node.args[0].value).split(".")[0] in _LAUNCHES
+                    and _is_launch_module(str(node.args[0].value))
                 ):
                     flag(
                         mod, node,
@@ -4215,6 +4235,82 @@ def test_wildcard_imports_and_method_dispatch_are_never_trusted(tmp_path: Path) 
         "p14_plain_method_wrapper_via_self",
         "p14_conditional_subclass_override",
     } <= named, problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: The one launch predicate, probed (14 October 2026): create_subprocess_shell
+#: and create_subprocess_exec imported directly from asyncio.subprocess,
+#: system from os, spawn from pty and create_subprocess_exec from asyncio, each
+#: called bare. The controls pass the helper's environment, and asyncio.run is
+#: not a launch.
+GUARD_PROBES_15 = textwrap.dedent(
+    '''\
+    import asyncio
+    import subprocess
+
+    from forge.launch_environment import build_project_command_env
+
+
+    async def p15_create_subprocess_shell_from_asyncio_subprocess(cmd):
+        from asyncio.subprocess import create_subprocess_shell
+
+        await create_subprocess_shell(cmd)
+
+
+    async def p15_create_subprocess_exec_from_asyncio_subprocess(cmd):
+        from asyncio.subprocess import create_subprocess_exec
+
+        await create_subprocess_exec(cmd)
+
+
+    def p15_system_from_os(cmd):
+        from os import system
+
+        system(cmd)
+
+
+    def p15_spawn_from_pty(cmd):
+        from pty import spawn
+
+        spawn(cmd)
+
+
+    async def p15_create_subprocess_exec_from_asyncio(cmd):
+        from asyncio import create_subprocess_exec
+
+        await create_subprocess_exec(cmd)
+
+
+    async def ok_create_subprocess_shell_with_helper_env(cmd, folder):
+        from asyncio.subprocess import create_subprocess_shell
+
+        await create_subprocess_shell(cmd, env=build_project_command_env(folder))
+
+
+    def ok_subprocess_run_with_helper_env(cmd, folder):
+        subprocess.run(cmd, env=build_project_command_env(folder))
+
+
+    def ok_asyncio_run_is_not_a_launch(main):
+        return asyncio.run(main())
+    '''
+)
+
+
+def test_one_launch_predicate_sees_every_import_form(tmp_path: Path) -> None:
+    pkg = tmp_path / "forge"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "zz_probe15.py").write_text(GUARD_PROBES_15, encoding="utf-8")
+    problems = unaccounted_launches(pkg)
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_15).body
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("p15_")
+    }
+    assert len(expected) == 5
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
