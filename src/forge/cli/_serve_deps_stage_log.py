@@ -420,7 +420,7 @@ def default_fix_tasks_extractor(
 
     ``/task-review`` emits one task artefact per fix it wants done; the
     dispatcher hands those paths back on
-    :attr:`~forge.pipeline.dispatchers.subprocess.StageDispatchResult.artefact_paths`
+    :attr:`~forge.pipeline.dispatchers.subprocess_dispatcher.StageDispatchResult.artefact_paths`
     after allowlist gating. The identifier is the artefact's own file stem —
     the same ``TASK-XXX`` name a developer types into ``/task-work``.
 

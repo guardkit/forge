@@ -28,7 +28,7 @@ from forge.pipeline.dispatchers.conductor_subprocess import (
     make_conductor_subprocess_dispatcher,
     mint_stage_correlation_id,
 )
-from forge.pipeline.dispatchers.subprocess import (
+from forge.pipeline.dispatchers.subprocess_dispatcher import (
     StageDispatchStatus,
     dispatch_subprocess_stage,
 )

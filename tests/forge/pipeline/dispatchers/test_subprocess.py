@@ -1,4 +1,4 @@
-"""Tests for ``forge.pipeline.dispatchers.subprocess`` (TASK-MAG7-008).
+"""Tests for ``forge.pipeline.dispatchers.subprocess_dispatcher`` (TASK-MAG7-008).
 
 Validates :func:`dispatch_subprocess_stage` — the thin composition layer
 between FEAT-FORGE-005's GuardKit subprocess engine and TASK-MAG7-006's
@@ -28,7 +28,7 @@ from typing import Any
 import pytest
 
 from forge.adapters.guardkit.models import GuardKitResult, GuardKitWarning
-from forge.pipeline.dispatchers.subprocess import (
+from forge.pipeline.dispatchers.subprocess_dispatcher import (
     SUBPROCESS_STAGE_COMMANDS,
     StageDispatchResult,
     StageDispatchStatus,

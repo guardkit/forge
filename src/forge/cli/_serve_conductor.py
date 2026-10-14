@@ -409,12 +409,15 @@ def load_declared_toolchain(
     merge-ready checkpoint treats as RED.
     """
     for candidate in module_candidates:
+        # The imported module is only ever the base of an attribute (the
+        # launch guard holds every module object to that, 14 October 2026):
+        # imported once to see it is there, then its loader read off it.
         try:
-            module = import_module(candidate)
+            import_module(candidate)
         except (ImportError, ModuleNotFoundError, ValueError):
             continue
         try:
-            return module.load_toolchain_declaration(Path(repo_root))
+            return import_module(candidate).load_toolchain_declaration(Path(repo_root))
         except Exception as exc:  # noqa: BLE001 — a loader defect is not green
             logger.error(
                 "conductor gates: %s.load_toolchain_declaration raised %s: %s "

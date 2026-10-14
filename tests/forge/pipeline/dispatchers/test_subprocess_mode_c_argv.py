@@ -39,7 +39,7 @@ import pytest
 
 from forge.adapters.guardkit.models import GuardKitResult
 from forge.adapters.guardkit.parser import parse_guardkit_output
-from forge.pipeline.dispatchers.subprocess import (
+from forge.pipeline.dispatchers.subprocess_dispatcher import (
     MODE_C_STAGES,
     SUBPROCESS_STAGE_COMMANDS,
     StageDispatchStatus,

@@ -665,7 +665,7 @@ async def run(
             # byte-indistinguishable from a leg that produced none. This
             # warning rides the result, and the dispatcher threads every
             # warning verbatim into the stage's rationale
-            # (``pipeline/dispatchers/subprocess.py``), so the stage_log
+            # (``pipeline/dispatchers/subprocess_dispatcher.py``), so the stage_log
             # row and the receipt both NAME the loss.
             warnings.append(
                 GuardKitWarning(

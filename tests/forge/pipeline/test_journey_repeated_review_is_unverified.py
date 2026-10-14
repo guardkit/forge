@@ -66,7 +66,7 @@ from forge.pipeline.conductor_driver import (
     ConductorRunOutcome,
     drive_fix_journey,
 )
-from forge.pipeline.dispatchers.subprocess import (
+from forge.pipeline.dispatchers.subprocess_dispatcher import (
     StageDispatchResult,
     StageDispatchStatus,
 )

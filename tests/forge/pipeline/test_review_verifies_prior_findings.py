@@ -38,7 +38,7 @@ from forge.pipeline.dispatchers.conductor_subprocess import (
     make_conductor_subprocess_dispatcher,
     with_review_verification,
 )
-from forge.pipeline.dispatchers.subprocess import dispatch_subprocess_stage
+from forge.pipeline.dispatchers.subprocess_dispatcher import dispatch_subprocess_stage
 from forge.pipeline.fix_task_context_builder import (
     VERIFY_DOCUMENT_NAME,
     VERIFY_INSTRUCTION,

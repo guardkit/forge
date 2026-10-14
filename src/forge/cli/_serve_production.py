@@ -1126,11 +1126,16 @@ class _RepoRoutedAsyncTaskStarter:
 
 def build_repo_routed_async_task_starter(
     *,
-    serve_module: Any,
+    build_middleware: Callable[..., Any],
     forge_config: Any,
     default_starter: AsyncTaskStarter,
 ) -> AsyncTaskStarter:
     """Return the starter the dispatch chain uses — routed only if it must be.
+
+    ``build_middleware`` is the serve module's
+    ``_build_async_subagent_middleware``, passed as the function rather than
+    the module (the launch guard allows a module object only as the base of
+    an attribute).
 
     Compatibility mode with no sandbox registrations returns
     ``default_starter`` unchanged. Otherwise this builds one middleware per
@@ -1158,7 +1163,7 @@ def build_repo_routed_async_task_starter(
                 getattr(entry, "name", "?"),
             )
             continue
-        middleware = serve_module._build_async_subagent_middleware(
+        middleware = build_middleware(
             autobuild_runner_url=runner_url,
         )
         by_repo[str(repo)] = _resolve_async_task_starter(middleware)
@@ -1426,7 +1431,7 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # installed and run there and never on the host. With planning.sandboxes
     # empty this is the same object Step 6 just made.
     async_task_starter = build_repo_routed_async_task_starter(
-        serve_module=serve_module,
+        build_middleware=serve_module._build_async_subagent_middleware,
         forge_config=forge_config,
         default_starter=async_task_starter,
     )

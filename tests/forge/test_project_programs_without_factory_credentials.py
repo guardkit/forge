@@ -2029,6 +2029,19 @@ def _finalise(dotted: str, seen: frozenset[str] = frozenset()) -> set[str]:
             break
     if not readings:
         return {dotted}
+    if readings[0][1] == len(parts) and len(parts) > 1:
+        # The whole name is a submodule file. When its package's __init__
+        # binds the same name (allowed only as that submodule itself or a
+        # name imported from it), the package's binding is what the name
+        # means, as in Python: ``from forge.discovery import resolve`` is the
+        # function ``forge.discovery.resolve.resolve``.
+        package = _PACKAGE_MODULES.get(".".join(parts[:-1]))
+        if (
+            package is not None
+            and package.rel.endswith("__init__.py")
+            and _bindings(package.tree).get(parts[-1])
+        ):
+            readings = [(".".join(parts[:-1]), len(parts) - 1)]
     result: set[str] = set()
     for prefix, cut in readings:
         result |= _follow(_PACKAGE_MODULES[prefix], parts, cut, dotted, seen)
@@ -2064,6 +2077,11 @@ def _follow(
         for _kind, node in bound:
             for local, target in _import_bindings(node, mod.package):
                 if local != name:
+                    continue
+                if target == dotted:
+                    # The package importing its own submodule under the
+                    # submodule's name: the binding is that very module.
+                    result.add(dotted)
                     continue
                 for final in _finalise(target, seen | {dotted}):
                     if not rest:
@@ -2268,14 +2286,77 @@ def _defining_scope(mod: _Module, at: ast.AST) -> ast.AST | None:
     return None
 
 
-def _resolve_all(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[str]:
-    """Every dotted name a call target may refer to (empty when unknown).
+def _possible_name_targets(mod: _Module, name: str, at: ast.AST) -> set[str]:
+    """Every dotted name a bare ``name`` at ``at`` MAY hold (14 October 2026,
+    round 21): looked up scope by scope as Python would, and in the scope
+    that binds it, the union over EVERY binding there — each import (one
+    identity per import of the name anywhere in the module) and each
+    definition. Another binding (an assignment, a parameter, ``del``...)
+    adds nothing but never removes what the imports and definitions give:
+    being "shadowed" or rebound never exempts a name. ``global`` sends the
+    lookup to the module as well; ``nonlocal`` to the enclosing function."""
+    out: set[str] = set()
+    scope = _defining_scope(mod, at)
+    while scope is not None:
+        found = _bindings(scope).get(name, [])
+        if found:
+            kinds = {kind for kind, _node in found}
+            if "import" in kinds:
+                out |= _targets(mod, name)
+            out |= {
+                f"{mod.dotted}.{_qualname(mod, node)}"
+                for kind, node in found
+                if kind in ("def", "class")
+            }
+            if "global" in kinds:
+                break
+            if "nonlocal" not in kinds:
+                return out
+        scope = _enclosing_function(mod, scope)
+    kinds = {kind for kind, _node in _bindings(mod.tree).get(name, [])}
+    if "import" in kinds:
+        out |= _targets(mod, name)
+    if kinds & {"def", "class"}:
+        out.add(f"{mod.dotted}.{name}")
+    if not kinds:
+        out |= _targets(mod, name)
+    return out
 
-    A bare name is looked up as Python would: in each enclosing function,
-    innermost first, then in the module. Bound in a function by anything but
-    a nested definition or an import, it is unknown; so is a module name
-    rebound at module level after it is imported. An imported name may name
-    several things, one per import of it anywhere in the module.
+
+def _resolve_all(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[str]:
+    """Every dotted name a call target or value may refer to: for a bare
+    name, the union over every binding of it in the scope Python looks it up
+    in (:func:`_possible_name_targets`), so a launch function, a runner or a
+    module reached through a name is seen however else the name is bound;
+    for an attribute, each step followed through re-exports."""
+    if isinstance(func_node, ast.Name):
+        return _possible_name_targets(mod, func_node.id, at)
+    if isinstance(func_node, ast.Attribute):
+        value = func_node.value
+        if isinstance(value, ast.Name) and value.id in ("self", "cls"):
+            klass = _enclosing(mod, at, ast.ClassDef)
+            if klass is not None:
+                return {f"{mod.dotted}.{klass.name}.{func_node.attr}"}
+            return set()
+        out: set[str] = set()
+        for base in _resolve_all(mod, value, at):
+            if base.startswith(UNRESOLVED):
+                out.add(f"{base}.{func_node.attr}")
+            else:
+                out |= _finalise(f"{base}.{func_node.attr}")
+        return out
+    return set()
+
+
+def _resolve_all_strict(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[str]:
+    """What a call target refers to when EVERY binding agrees (empty when
+    unknown): the reading that may vouch for a call, so only for trust (the
+    helper, the issued-values type). A bare name is looked up as Python
+    would: in each enclosing function, innermost first, then in the module.
+    Bound in a function by anything but a nested definition or an import,
+    it is unknown; so is a module name rebound at module level after it is
+    imported. An imported name may name several things, one per import of
+    it anywhere in the module.
     """
     if isinstance(func_node, ast.Name):
         name = func_node.id
@@ -2305,7 +2386,7 @@ def _resolve_all(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[str]:
                 return {f"{mod.dotted}.{klass.name}.{func_node.attr}"}
             return set()
         out: set[str] = set()
-        for base in _resolve_all(mod, value, at):
+        for base in _resolve_all_strict(mod, value, at):
             if base.startswith(UNRESOLVED):
                 # An unresolved base stays unresolved down the chain (R2).
                 out.add(f"{base}.{func_node.attr}")
@@ -2318,7 +2399,7 @@ def _resolve_all(mod: _Module, func_node: ast.AST, at: ast.AST) -> set[str]:
 def _resolve(mod: _Module, func_node: ast.AST, at: ast.AST) -> str | None:
     """The one dotted name a call target refers to, or ``None`` when it is
     unknown or could be more than one thing."""
-    every = _resolve_all(mod, func_node, at)
+    every = _resolve_all_strict(mod, func_node, at)
     return next(iter(every)) if len(every) == 1 else None
 
 
@@ -2656,7 +2737,7 @@ def _runner_named(mod: _Module, node: ast.AST) -> tuple[str, str] | None:
     (an import under any name, a module attribute) or, on an object, by the
     attribute name it is reached by (``self._spawn``)."""
     every = _resolve_all(mod, node, node) if isinstance(node, (ast.Name, ast.Attribute)) else set()
-    target = next(iter(every)) if len(every) == 1 else None
+    target = _resolve(mod, node, node) if isinstance(node, (ast.Name, ast.Attribute)) else None
     for key, spec in GENERIC_RUNNERS.items():
         if every & spec["dotted"]:
             return key
@@ -2935,23 +3016,6 @@ def _attribute_chain_targets(mod: _Module, node: ast.Attribute) -> set[str]:
 #: module roots, and ``nt``.
 FORBIDDEN_MODULE_NAMES: frozenset[str] = frozenset({*LAUNCH_MODULES, "nt"})
 
-#: The real source's two existing name collisions, reported for a decision
-#: (14 October 2026) rather than renamed in this change. Each is keyed by the
-#: file and the name; remove the entry when the name is changed.
-PENDING_NAME_DECISIONS: dict[tuple[str, str], str] = {
-    ("pipeline/dispatchers/subprocess.py", "subprocess"): (
-        "the subprocess-stage dispatcher, imported as "
-        "forge.pipeline.dispatchers.subprocess by serve and three other "
-        "modules; awaiting a decision to rename"
-    ),
-    ("discovery/__init__.py", "resolve"): (
-        "the package re-exports the function resolve from its own submodule "
-        "resolve (from forge.discovery.resolve import resolve); awaiting a "
-        "decision to rename one of the two"
-    ),
-}
-
-
 def _module_name_collisions(modules: list[_Module]) -> list[str]:
     """Two blunt rules that make name collisions impossible (14 October 2026,
     review 3, R4: the coordinator's decision to stop emulating import
@@ -2962,15 +3026,16 @@ def _module_name_collisions(modules: list[_Module]) -> list[str]:
        ``multiprocessing``, ``posix``, ``nt``).
     2. A package's ``__init__`` binds no name that is also the name of one
        of its own submodules or subpackages, except the plain import of that
-       very submodule (``from pkg import sub``, ``from . import sub``); any
-       other binding of it — an import of something else, a definition, a
-       class, an assignment — is a violation.
+       very submodule (``from pkg import sub``, ``from . import sub``) or an
+       import of a name from that same submodule (``from .resolve import
+       resolve``); any other binding of it — an import from elsewhere, a
+       definition, a class, an assignment — is a violation.
     """
     problems: list[str] = []
     for mod in modules:
         parts = Path(mod.rel).with_suffix("").parts
         for part in parts:
-            if part in FORBIDDEN_MODULE_NAMES and (mod.rel, part) not in PENDING_NAME_DECISIONS:
+            if part in FORBIDDEN_MODULE_NAMES:
                 problems.append(
                     f"{mod.rel}:0 in <module>: a module or package is named "
                     f"{part!r}, the name of a launch module"
@@ -2987,20 +3052,183 @@ def _module_name_collisions(modules: list[_Module]) -> list[str]:
         }
         bound = _bindings(mod.tree)
         for child in sorted(children):
-            if (mod.rel, child) in PENDING_NAME_DECISIONS:
-                continue
+            submodule = f"{mod.dotted}.{child}"
             for kind, node in bound.get(child, []):
                 if kind == "import" and all(
-                    target == f"{mod.dotted}.{child}"
+                    target == submodule or target.startswith(submodule + ".")
                     for local, target in _import_bindings(node, mod.package)
                     if local == child
                 ):
-                    continue  # the plain import of that very submodule
+                    # The submodule itself, or a name imported FROM that same
+                    # submodule (``from .resolve import resolve``): the
+                    # package attribute then resolves through that
+                    # submodule's own binding, which the guard follows.
+                    continue
                 problems.append(
                     f"{mod.rel}:{getattr(node, 'lineno', 0)} in <module>: the "
                     f"package binds {child!r} by a {kind} binding, and {child!r} "
                     "is also one of its own submodules"
                 )
+    return problems
+
+
+#: Functions that import a module by a name decided at run time, and those
+#: that load code from a file (14 October 2026).
+DYNAMIC_IMPORTERS: frozenset[str] = frozenset(
+    {"importlib.import_module", "importlib.__import__", "builtins.__import__", "__import__"}
+)
+CODE_LOADERS: frozenset[str] = frozenset(
+    {
+        "importlib.util.module_from_spec",
+        "importlib.util.spec_from_file_location",
+        "importlib.util.spec_from_loader",
+        "importlib.machinery.SourceFileLoader",
+    }
+)
+
+#: Real-source places allowed to import dynamically, load code from a file
+#: or hand a module object on, each with its reason, keyed by file and
+#: function. Each is reported; none can be written as a literal without
+#: losing a tested seam or the design it serves.
+DYNAMIC_IMPORT_ALLOWED: dict[tuple[str, str], str] = {
+    ("cli/_serve_conductor.py", "load_declared_toolchain"): (
+        "imports the build system's own toolchain loader from a tuple of its "
+        "two module names (wheel and source layouts), a seam tests replace; "
+        "the module is used only as the base of one attribute"
+    ),
+    ("deploy_sidecar/service.py", "declared_test_command"): (
+        "the same toolchain loader, the same two candidate module names and "
+        "the same tested seam"
+    ),
+    ("deploy_sidecar/service.py", "_load_code_search_once"): (
+        "loads the build system's code_search.py from its installed location "
+        "by file, because that package's own __init__ needs the model "
+        "harness this service does not install; the file uses only the "
+        "standard library and the module is returned to the one caller that "
+        "reads its search functions"
+    ),
+    ("subagents/inmem_cancel_compat.py", "install_inmem_cancel_listener_compat"): (
+        "holds the in-memory graph runtime's ops module (a third-party module "
+        "that starts no process) behind a test seam, because the reviewed "
+        "compatibility fix replaces one function on that module"
+    ),
+    ("planning/target_terminal_tools.py", "discover_target_test_roots"): (
+        "takes importlib.import_module as the default of an injected importer "
+        "that tests replace, to reach the build system's test-root discovery"
+    ),
+}
+
+
+@functools.lru_cache(maxsize=None)
+def _is_installed_module(name: str) -> bool:
+    """``name`` is a module Python can find: standard library or installed."""
+    try:
+        return importlib.util.find_spec(name) is not None
+    except Exception:  # noqa: BLE001 — a name that is not a module at all
+        return False
+
+
+def _module_object_and_dynamic_import_violations(
+    modules: list[_Module],
+    allowed: dict[tuple[str, str], str] = DYNAMIC_IMPORT_ALLOWED,
+) -> list[str]:
+    """Two rules on modules as values (14 October 2026).
+
+    1. ANY module object — one of the package's own, a standard-library one,
+       or any bound by an ``import`` statement — may only be used as the
+       base of an attribute access. Storing, passing, returning, defaulting
+       or containing one is a violation.
+    2. A dynamic import (``importlib.import_module``, ``__import__``,
+       ``importlib.__import__``) is a violation unless its module argument is
+       a string literal naming a module that is not a launch module and its
+       result is used only as the base of an attribute access; loading code
+       from a file or a spec (``module_from_spec``,
+       ``spec_from_file_location`` ...) is always one; and a dynamic importer
+       or code loader held as a value is one.
+    """
+    problems: list[str] = []
+    for mod in modules:
+        skip = _annotation_nodes(mod.tree)
+
+        def place(node: ast.AST) -> str:
+            holder = _enclosing_function(mod, node) or _enclosing(mod, node, ast.ClassDef)
+            return getattr(holder, "name", "<module>")
+
+        def report(node: ast.AST, sentence: str) -> None:
+            holder = _enclosing_function(mod, node)
+            if (
+                (mod.rel, place(node)) in allowed
+                and holder is not None
+                and _defined_once(mod, holder)
+            ):
+                return
+            problems.append(f"{mod.rel}:{getattr(node, 'lineno', 0)} in {place(node)}: {sentence}")
+
+        def attribute_base(node: ast.AST) -> bool:
+            parent = mod.parents.get(id(node))
+            return isinstance(parent, ast.Attribute) and parent.value is node
+
+        def called(node: ast.AST) -> bool:
+            parent = mod.parents.get(id(node))
+            return isinstance(parent, ast.Call) and parent.func is node
+
+        def is_module(dotted: str) -> bool:
+            return (
+                not dotted.startswith(UNRESOLVED)
+                and (dotted in _PACKAGE_MODULES or _is_installed_module(dotted))
+            )
+
+        for node in ast.walk(mod.tree):
+            if id(node) in skip:
+                continue
+            if isinstance(node, ast.Call):
+                callee = _resolve_all(mod, node.func, node) if isinstance(
+                    node.func, (ast.Name, ast.Attribute)
+                ) else set()
+                if isinstance(node.func, ast.Name) and node.func.id == "__import__" and not callee:
+                    callee = {"__import__"}
+                if callee & CODE_LOADERS:
+                    report(node, "code is loaded from a file or a spec, so what it runs cannot be checked")
+                elif callee & DYNAMIC_IMPORTERS:
+                    argument = node.args[0] if node.args else None
+                    literal = (
+                        isinstance(argument, ast.Constant)
+                        and isinstance(argument.value, str)
+                        and argument.value.split(".", 1)[0] not in FORBIDDEN_MODULE_NAMES
+                    )
+                    if not literal:
+                        report(
+                            node,
+                            "a module is imported by a name that is not a literal naming "
+                            "a module other than a launch module",
+                        )
+                    elif not attribute_base(node):
+                        report(node, "a dynamically imported module is used other than as an attribute base")
+                    else:
+                        # What the attribute finally is, followed through
+                        # re-exports as for a written import.
+                        reached = _finalise(f"{argument.value}.{mod.parents[id(node)].attr}")
+                        if any(
+                            t.startswith(UNRESOLVED) or _is_launch(t) or _is_launch_bearing_module(t)
+                            for t in reached
+                        ):
+                            report(node, "a dynamically imported module's attribute is a launch")
+                continue
+            if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(
+                getattr(node, "ctx", None), ast.Load
+            ):
+                # Scope by scope, as Python looks a name up: a name bound to
+                # a module in one function is not one in another.
+                identities = (
+                    _resolve_all(mod, node, node)
+                    if isinstance(node, ast.Name)
+                    else _attribute_chain_targets(mod, node)
+                )
+                module_like = any(is_module(t) for t in identities)
+                if (identities & (DYNAMIC_IMPORTERS | CODE_LOADERS)) and not called(node):
+                    report(node, "a dynamic importer or code loader is held as a value")
+                elif module_like and not attribute_base(node):
+                    report(node, "a module object is used other than as the base of an attribute")
     return problems
 
 
@@ -3093,6 +3321,7 @@ def unaccounted_launches(package: Path) -> list[str]:
                 judge(mod, node, f"call to the generic runner {fname}")
     problems.extend(problems_of_trust)
     problems.extend(_module_name_collisions(modules))
+    problems.extend(_module_object_and_dynamic_import_violations(modules))
     return sorted(set(problems))
 
 
@@ -4576,8 +4805,10 @@ def test_one_launch_predicate_sees_every_import_form(tmp_path: Path) -> None:
 #: Deep attribute chains, probed (14 October 2026, implementation review 1,
 #: R1): ``multiprocessing.popen_fork.Popen`` and
 #: ``asyncio.subprocess.create_subprocess_exec`` held in a variable. ``os.path``
-#: held is not a launch, and the deep direct call with the helper's
-#: environment stays clean.
+#: held was a control here until the module-object rule (14 October 2026,
+#: round 20): any module held is now a violation, so it is a probe, and
+#: ``os.path`` used directly is the control. The deep direct call with the
+#: helper's environment stays clean.
 GUARD_PROBES_16 = textwrap.dedent(
     '''\
     import asyncio
@@ -4597,9 +4828,13 @@ GUARD_PROBES_16 = textwrap.dedent(
         return f(cmd)
 
 
-    def ok_os_path_held_is_not_a_launch(path):
+    def p16_os_path_held_is_a_module_object(path):
         x = os.path
         return x.join(path, "x")
+
+
+    def ok_os_path_used_directly(path):
+        return os.path.join(path, "x")
 
 
     async def ok_direct_deep_call_with_helper_env(cmd, folder):
@@ -4618,6 +4853,7 @@ def test_a_launch_is_seen_at_any_depth_of_an_attribute_chain(tmp_path: Path) -> 
     assert {
         "p16_deep_launch_held_in_a_variable",
         "p16_deep_create_subprocess_exec_held",
+        "p16_os_path_held_is_a_module_object",
     } <= named, problems
     assert any("multiprocessing.popen_fork.Popen" in p for p in problems), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
@@ -4627,7 +4863,9 @@ def test_a_launch_is_seen_at_any_depth_of_an_attribute_chain(tmp_path: Path) -> 
 #: R2): a submodule that defines launches stored in a variable and called
 #: through (``multiprocessing.popen_fork``, ``asyncio.subprocess``), a launch
 #: module stored, and a launch module stored then reached deeply. The direct
-#: dotted call and ``os.path`` held (it defines no launch) stay clean.
+#: dotted call stays clean. ``os.path`` held (it defines no launch) was a
+#: control until the module-object rule (14 October 2026, round 20) made any
+#: module held a violation; ``os.path`` used directly is the control now.
 GUARD_PROBES_17 = textwrap.dedent(
     '''\
     import asyncio
@@ -4662,9 +4900,13 @@ GUARD_PROBES_17 = textwrap.dedent(
         await asyncio.subprocess.create_subprocess_exec(cmd, env=build_project_command_env(folder))
 
 
-    def ok_os_path_held(path):
+    def p17_os_path_held(path):
         x = os.path
         return x.join(path, "x")
+
+
+    def ok_os_path_used_directly(path):
+        return os.path.join(path, "x")
     '''
 )
 
@@ -4681,7 +4923,7 @@ def test_a_launch_bearing_module_is_only_ever_an_attribute_base(tmp_path: Path) 
         for n in ast.parse(GUARD_PROBES_17).body
         if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) and n.name.startswith("p17_")
     }
-    assert len(expected) == 4
+    assert len(expected) == 5
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert any("multiprocessing.popen_fork is referred to" in p for p in problems), problems
     assert not {n for n in named if n.startswith("ok_")}, problems
@@ -5013,6 +5255,280 @@ def test_name_collisions_are_violations(tmp_path: Path) -> None:
     assert not any(" in ok_" in p for p in problems), problems
 
 
+#: The narrowed rule 2, probed (14 October 2026): a package __init__ that
+#: imports a name FROM its own same-named submodule (``from .resolve import
+#: resolve``) is allowed, and the package attribute then means what that
+#: submodule binds: harmless for a plain function, and a launch when the
+#: submodule's binding is one (``from .run import run`` where ``run.py``
+#: imports subprocess.run).
+GUARD_PROBES_22: dict[str, str] = {
+    "__init__.py": "",
+    "resolver/__init__.py": "from .resolve import resolve\n",
+    "resolver/resolve.py": textwrap.dedent(
+        '''\
+        def resolve(value):
+            return value
+        '''
+    ),
+    "launcher/__init__.py": "from .run import run\n",
+    "launcher/run.py": "from subprocess import run\n",
+    "zz_main.py": textwrap.dedent(
+        '''\
+        from forge.launch_environment import build_project_command_env
+        from forge.launcher import run
+        from forge.resolver import resolve
+
+
+        def ok_name_imported_from_the_same_submodule(value):
+            return resolve(value)
+
+
+        def p22_launch_reexported_from_the_same_submodule(cmd):
+            run(cmd)
+
+
+        def ok_launch_reexported_from_the_same_submodule_with_helper_env(cmd, folder):
+            run(cmd, env=build_project_command_env(folder))
+        '''
+    ),
+}
+
+
+def test_a_name_imported_from_the_same_submodule_is_allowed_and_followed(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_22))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    assert not any("own submodules" in p for p in problems), problems
+    assert "p22_launch_reexported_from_the_same_submodule" in named, problems
+    assert any("process launch subprocess.run" in p for p in problems), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Modules as values and dynamic imports, probed (14 October 2026, round
+#: 20): a package module that re-exports ``subprocess.run`` stored and then
+#: called through; a standard module stored, returned, defaulted and put in a
+#: container; a package module passed to a function; a launch module and a
+#: variable name given to ``importlib.import_module``; a launch reached
+#: through a literal package module that re-exports one; ``__import__`` held;
+#: the importer itself held; code loaded from a file. The controls: the
+#: re-export called directly with the helper's environment, ``json.dumps``,
+#: ``importlib.import_module("json").dumps`` and ``__import__("json").dumps``.
+GUARD_PROBES_23: dict[str, str] = {
+    "__init__.py": "",
+    "process_api.py": "from subprocess import run\n",
+    "helpers.py": textwrap.dedent(
+        '''\
+        def describe(value):
+            return repr(value)
+        '''
+    ),
+    "zz_main.py": textwrap.dedent(
+        '''\
+        import importlib
+        import importlib.util
+        import json
+        from importlib import import_module
+
+        from forge import helpers, process_api
+        from forge.launch_environment import build_project_command_env
+
+
+        def p23_reexporting_module_stored_then_called(cmd):
+            api = process_api
+            api.run(cmd, shell=True)
+
+
+        def p23_json_stored():
+            j = json
+            return j.dumps({})
+
+
+        def p23_json_returned():
+            return json
+
+
+        def p23_json_defaulted(value, codec=json):
+            return codec.dumps(value)
+
+
+        def p23_json_in_a_container():
+            return [json]
+
+
+        def p23_package_module_passed(value):
+            return helpers.describe(helpers)
+
+
+        def p23_import_module_of_a_launch_module(cmd):
+            importlib.import_module("subprocess").run(cmd)
+
+
+        def p23_import_module_with_a_variable(name, value):
+            return importlib.import_module(name).dumps(value)
+
+
+        def p23_from_imported_import_module_with_a_variable(name, value):
+            return import_module(name).dumps(value)
+
+
+        def p23_literal_package_module_reexporting_a_launch(cmd):
+            importlib.import_module("forge.process_api").run(cmd)
+
+
+        def p23_dynamic_module_stored(value):
+            m = importlib.import_module("json")
+            return m.dumps(value)
+
+
+        def p23_dunder_import_held(value):
+            m = __import__("json")
+            return m.dumps(value)
+
+
+        def p23_importer_held(name):
+            loader = importlib.import_module
+            return loader(name)
+
+
+        def p23_code_loaded_from_a_file(path):
+            spec = importlib.util.spec_from_file_location("x", path)
+            return importlib.util.module_from_spec(spec)
+
+
+        def ok_reexport_called_directly_with_helper_env(cmd, folder):
+            process_api.run(cmd, env=build_project_command_env(folder))
+
+
+        def ok_json_dumps(value):
+            return json.dumps(value)
+
+
+        def ok_import_module_json_dumps(value):
+            return importlib.import_module("json").dumps(value)
+
+
+        def ok_dunder_import_json_dumps(value):
+            return __import__("json").dumps(value)
+
+
+        def ok_package_module_attribute(value):
+            return helpers.describe(value)
+        '''
+    ),
+}
+
+
+def test_module_objects_are_only_attribute_bases_and_dynamic_imports_are_literal(
+    tmp_path: Path,
+) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_23))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_23["zz_main.py"]).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p23_")
+    }
+    assert len(expected) == 14
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+#: Every binding counts, probed (14 October 2026, round 21): a name that
+#: may hold a module, by ANY of its bindings in the scope Python looks it up
+#: in, is a module wherever it is used other than as an attribute base, and
+#: the same for a launch function. The reproducer (the module aliased, then
+#: the name rebound to ``None``, then a launch through the alias), the
+#: rebinding before the alias, a conditional rebinding, an optional import
+#: tested against ``None``, and a launch function rebound conditionally. The
+#: control: a name rebound only to plain values.
+GUARD_PROBES_24: dict[str, str] = {
+    "__init__.py": "",
+    "process_api.py": "from subprocess import run\n",
+    "zz_main.py": textwrap.dedent(
+        '''\
+        try:
+            import yaml
+        except ImportError:
+            yaml = None
+
+
+        def p24_aliased_then_rebound(cmd):
+            from . import process_api
+            api = process_api
+            process_api = None
+            api.run(cmd, shell=True)
+
+
+        def p24_rebound_before_the_alias(cmd):
+            from . import process_api
+            process_api = None
+            api = process_api
+            return api
+
+
+        def p24_conditionally_rebound(cmd, flag):
+            from . import process_api
+            if flag:
+                process_api = None
+            api = process_api
+            api.run(cmd, shell=True)
+
+
+        def p24_optional_import_tested_against_none(text):
+            if yaml is None:
+                return None
+            return yaml.safe_load(text)
+
+
+        def p24_launch_function_conditionally_rebound(cmd, flag):
+            from subprocess import run
+            if flag:
+                run = print
+            run(cmd)
+
+
+        def ok_rebound_only_to_plain_values(value):
+            codec = None
+            if value:
+                codec = "plain"
+            held = codec
+            return held
+        '''
+    ),
+}
+
+
+def test_every_binding_of_a_name_counts(tmp_path: Path) -> None:
+    problems = unaccounted_launches(_write_package(tmp_path, GUARD_PROBES_24))
+    named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
+    expected = {
+        n.name
+        for n in ast.parse(GUARD_PROBES_24["zz_main.py"]).body
+        if isinstance(n, ast.FunctionDef) and n.name.startswith("p24_")
+    }
+    assert len(expected) == 5
+    assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
+    assert any(
+        " in p24_launch_function_conditionally_rebound: process launch subprocess.run" in p
+        for p in problems
+    ), problems
+    assert not {n for n in named if n.startswith("ok_")}, problems
+
+
+def test_every_dynamic_import_allowance_is_still_needed() -> None:
+    """Each allowance names one real function and, without it, the guard
+    would report that function: none is left behind once its use is gone."""
+    unaccounted_launches(PACKAGE)
+    unallowed = _module_object_and_dynamic_import_violations(
+        list(_PACKAGE_MODULES.values()), allowed={}
+    )
+    stale = [
+        f"{rel}:{fname}"
+        for rel, fname in DYNAMIC_IMPORT_ALLOWED
+        if not any(p.startswith(f"{rel}:") and f" in {fname}: " in p for p in unallowed)
+    ]
+    assert not stale, f"allowances the source no longer needs: {stale}"
+
+
 def test_every_process_launch_is_accounted_for() -> None:
     problems = unaccounted_launches(PACKAGE)
     assert not problems, (
@@ -5040,20 +5556,6 @@ def test_the_allowed_list_names_only_real_places() -> None:
         if fname not in names:
             missing.append(f"{rel}:{fname}")
     assert not missing, f"allowed-list entries that name nothing: {missing}"
-
-
-def test_every_pending_name_decision_is_still_a_real_collision() -> None:
-    """A pending entry is removed once its name is changed."""
-    _SCOPE_CACHE.clear()
-    modules = _load_modules(PACKAGE)
-    saved = dict(PENDING_NAME_DECISIONS)
-    PENDING_NAME_DECISIONS.clear()
-    try:
-        found = _module_name_collisions(modules)
-    finally:
-        PENDING_NAME_DECISIONS.update(saved)
-    for rel, name in saved:
-        assert any(p.startswith(f"{rel}:") and repr(name) in p for p in found), (rel, name)
 
 
 def test_the_guard_catches_a_new_launch(tmp_path: Path) -> None:

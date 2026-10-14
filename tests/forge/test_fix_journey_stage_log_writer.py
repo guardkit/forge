@@ -29,7 +29,7 @@ from forge.cli._serve_deps_stage_log import (
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import Build, SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import BuildState
-from forge.pipeline.dispatchers.subprocess import StageDispatchStatus
+from forge.pipeline.dispatchers.subprocess_dispatcher import StageDispatchStatus
 from forge.pipeline.mode_c_history_reader import (
     FINDING_ANCHORS_DETAILS_KEY,
     FIX_TASK_ID_DETAILS_KEY,

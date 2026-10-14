@@ -34,7 +34,7 @@ If true: the executor and the two step types exist, the runbook record plus NATS
 | fleet-memory deploy runbook (human operator, phased, PASS/FAIL gates) | `fleet-memory/docs/runbooks/RUNBOOK-nas-postgres-deploy.md` | written |
 | Forge NATS-native orchestrator: serve daemon, dispatch, SQLite lifecycle + state machine, NATS publishers (pipeline/approval/fleet) | `forge/src/forge/` | live |
 | GuardKit AutoBuild subprocess adapter + the `run_autobuild` seam (for later) | `forge/src/forge/adapters/guardkit/run.py` + `subagents/autobuild_runner.py` | exists (placeholder node body) |
-| Subprocess dispatch pattern the step types follow | `forge/src/forge/pipeline/dispatchers/subprocess.py` | exists |
+| Subprocess dispatch pattern the step types follow | `forge/src/forge/pipeline/dispatchers/subprocess_dispatcher.py` | exists |
 | AutoBuild (Player-Coach loop) | guardkit | done (local + Claude SDK) |
 
 ## What this phase adds — at scope level

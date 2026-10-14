@@ -22,7 +22,7 @@ The dispatcher itself fans the work out for exactly two stages —
 refuses (raises :class:`ValueError`) for any other stage class. This
 matches FEAT-FORGE-007 Group A where the product-owner and architect
 are the only specialist stages: every other stage is a subprocess
-(:mod:`forge.pipeline.dispatchers.subprocess`, TASK-MAG7-008) or an
+(:mod:`forge.pipeline.dispatchers.subprocess_dispatcher`, TASK-MAG7-008) or an
 async autobuild (:mod:`forge.pipeline.dispatchers.autobuild`,
 TASK-MAG7-009) and travels via a different surface.
 

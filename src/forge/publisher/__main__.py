@@ -196,7 +196,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     parsed = parser.parse_args(list(argv) if argv is not None else None)
     logging.basicConfig(
-        level=getattr(logging, str(parsed.log_level).upper(), logging.INFO),
+        level=logging.getLevelNamesMapping().get(
+            str(parsed.log_level).upper(), logging.INFO
+        ),
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
     try:
@@ -236,9 +238,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     def _stop(_signum: int, _frame: object) -> None:
         stop.set()
 
-    for name in ("SIGINT", "SIGTERM"):
-        if hasattr(signal, name):
-            signal.signal(getattr(signal, name), _stop)
+    for signal_number in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(signal_number, _stop)
     try:
         stop.wait()
     finally:

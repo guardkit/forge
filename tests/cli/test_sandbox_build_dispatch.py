@@ -119,7 +119,7 @@ class TestARepositoryWithNoSandboxIsDispatchedExactlyAsBefore:
         module = _FakeServeModule()
 
         routed = build_repo_routed_async_task_starter(
-            serve_module=module,
+            build_middleware=module._build_async_subagent_middleware,
             forge_config=_config(with_sandbox=False),
             default_starter=default,
         )
@@ -135,7 +135,7 @@ class TestARepositoryWithNoSandboxIsDispatchedExactlyAsBefore:
         seen: list[tuple[str, str]] = []
         module = _FakeServeModule()
         routed = build_repo_routed_async_task_starter(
-            serve_module=module,
+            build_middleware=module._build_async_subagent_middleware,
             forge_config=_config(with_sandbox=True),
             default_starter=_default_starter(seen),
         )
@@ -155,7 +155,7 @@ class TestARepositoryWithNoSandboxIsDispatchedExactlyAsBefore:
         seen: list[tuple[str, str]] = []
         module = _FakeServeModule()
         routed = build_repo_routed_async_task_starter(
-            serve_module=module,
+            build_middleware=module._build_async_subagent_middleware,
             forge_config=_config(with_sandbox=True),
             default_starter=_default_starter(seen),
         )
@@ -170,7 +170,7 @@ class TestARepositoryWithASandboxIsDispatchedIntoIt:
         seen: list[tuple[str, str]] = []
         module = _FakeServeModule()
         routed = build_repo_routed_async_task_starter(
-            serve_module=module,
+            build_middleware=module._build_async_subagent_middleware,
             forge_config=_config(with_sandbox=True),
             default_starter=_default_starter(seen),
         )
@@ -193,7 +193,7 @@ class TestARepositoryWithASandboxIsDispatchedIntoIt:
         seen: list[tuple[str, str]] = []
         module = _FakeServeModule()
         routed = build_repo_routed_async_task_starter(
-            serve_module=module,
+            build_middleware=module._build_async_subagent_middleware,
             forge_config=_config(with_sandbox=True),
             default_starter=_default_starter(seen),
         )
@@ -223,7 +223,7 @@ class TestARepositoryWithASandboxIsDispatchedIntoIt:
 
         with caplog.at_level("WARNING"):
             routed = build_repo_routed_async_task_starter(
-                serve_module=module, forge_config=config, default_starter=default
+                build_middleware=module._build_async_subagent_middleware, forge_config=config, default_starter=default
             )
 
         assert routed is default
@@ -519,7 +519,7 @@ class TestSandboxOnlyRoutingHasNoGlobalFallback:
         seen: list[tuple[str, str]] = []
         module = _FakeServeModule()
         routed = build_repo_routed_async_task_starter(
-            serve_module=module,
+            build_middleware=module._build_async_subagent_middleware,
             forge_config=_config(with_sandbox=False, strict=True),
             default_starter=_default_starter(seen),
         )
@@ -543,7 +543,7 @@ class TestSandboxOnlyRoutingHasNoGlobalFallback:
         module = _FakeServeModule()
         config = _config(with_sandbox=True, strict=True)
         routed = build_repo_routed_async_task_starter(
-            serve_module=module,
+            build_middleware=module._build_async_subagent_middleware,
             forge_config=config,
             default_starter=_default_starter(seen),
         )

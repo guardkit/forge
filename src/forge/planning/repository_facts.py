@@ -622,9 +622,9 @@ def _returns_of(decorator: ast.Call, function: ast.AST) -> str:
 
 
 def _shape(node: ast.AST) -> str:
-    text = ast.unparse(node) if hasattr(ast, "unparse") else "a value"
+    text = ast.unparse(node)
     if isinstance(node, ast.Subscript):
-        head = ast.unparse(node.value).lower() if hasattr(ast, "unparse") else ""
+        head = ast.unparse(node.value).lower()
         if head in ("list", "typing.list", "sequence"):
             return f"an unwrapped list ({text})"
     if isinstance(node, ast.Constant) and node.value is None:
