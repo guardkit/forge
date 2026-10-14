@@ -560,10 +560,14 @@ def bring_in_from_copy(
       refused by git before anything runs;
     * git's own ``upload-pack`` is named on the command line, which beats any
       ``remote.*.uploadpack`` setting;
-    * no tags, no submodules, no ``FETCH_HEAD``.
+    * no tags, no submodules, no ``FETCH_HEAD``;
+    * ``--atomic``: either every requested ref is updated or none is, so a
+      fetch that fails part way leaves no ref at a commit nobody verified
+      (implementation review round 1, 14 October 2026).
 
     The caller must then check that what arrived is what the copy holds (a
-    rewrite to another local repository is caught there).
+    rewrite to another local repository is caught there), and on any failure
+    forget the refs it asked for (:func:`_bring_in_or_forget`).
     """
     copy_text = os.fspath(copy)
     if not os.path.isabs(copy_text) or "://" in copy_text or not os.path.isdir(copy_text):
@@ -576,10 +580,38 @@ def bring_in_from_copy(
     upload_pack = os.path.join(project_git.git_exec_folder(), "git-upload-pack")
     return project_git.run_from_local_copy(
         clone,
-        ["fetch", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head",
+        ["fetch", "--atomic", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head",
          f"--upload-pack={upload_pack}", "--", copy_text, *refspecs],
         timeout=timeout,
     )
+
+
+def _bring_in_or_forget(
+    clone: Path, copy: Path, branches: Sequence[str], timeout: float
+) -> Optional[str]:
+    """Bring ``branches`` in from the copy, one exact refspec each (never a
+    wildcard), into ``refs/remotes/origin/<branch>``. ``None`` on success;
+    otherwise the sentence, after forgetting every ref it asked for, so a
+    failed or timed-out bring-in leaves no ref at an unverified commit."""
+    wanted = [f"refs/remotes/origin/{b}" for b in branches]
+    try:
+        brought = bring_in_from_copy(
+            clone, copy, [f"+refs/heads/{b}:refs/remotes/origin/{b}" for b in branches],
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        _forget(clone, wanted, timeout)
+        return (
+            "The commits could not be brought into the project's copy from the "
+            f"factory's own copy: git fetch did not finish within {timeout:g} seconds."
+        )
+    if brought.returncode != 0:
+        _forget(clone, wanted, timeout)
+        return (
+            "The commits could not be brought into the project's copy from the "
+            f"factory's own copy: {brought.stderr}"
+        )
+    return None
 
 
 REDIRECTED_SENTENCE = (
@@ -714,17 +746,9 @@ def fetch_start_point(
             return StartPoint(
                 refusal="The factory's own copy could not say which commit it holds."
             )
-        brought = bring_in_from_copy(
-            clone, copy, [f"+refs/heads/{b}:refs/remotes/origin/{b}" for b in branches],
-            timeout=timeout,
-        )
-        if brought.returncode != 0:
-            return StartPoint(
-                refusal=(
-                    "The commit could not be brought into the project's copy from "
-                    f"the factory's own copy: {brought.stderr}"
-                )
-            )
+        refused = _bring_in_or_forget(clone, copy, branches, timeout)
+        if refused:
+            return StartPoint(refusal=refused)
     got = _clone_refs(clone, "refs/remotes/origin/", timeout)
     if got is None:
         return StartPoint(refusal="The project's copy could not say which commit it holds.")
@@ -785,26 +809,32 @@ def fetch_all_branches(
         held = _copy_refs(copy, "refs/heads/", timeout)
         if held is None:
             return StartPoint(refusal="The factory's own copy could not say which commits it holds.")
-        brought = bring_in_from_copy(
-            clone, copy, ["+refs/heads/*:refs/remotes/origin/*"], timeout=timeout
-        )
-        if brought.returncode != 0:
-            return StartPoint(
-                refusal=(
-                    "The commits could not be brought into the project's copy from "
-                    f"the factory's own copy: {brought.stderr}"
-                )
-            )
+        # The copy's own verified branch inventory, one exact refspec per
+        # branch (implementation review round 1): a wildcard would take in
+        # whatever a rewritten source offers besides. A name that cannot go
+        # on a command line is left out, and so is not expected below.
+        branches: Dict[str, str] = {
+            ref[len("refs/heads/"):]: sha
+            for ref, sha in held.items()
+            if _BRANCH.match(ref[len("refs/heads/"):])
+        }
+        if branches:
+            refused = _bring_in_or_forget(clone, copy, sorted(branches), timeout)
+            if refused:
+                return StartPoint(refusal=refused)
     got = _clone_refs(clone, "refs/remotes/origin/", timeout)
     if got is None:
         return StartPoint(refusal="The project's copy could not say which commits it holds.")
-    branches: Dict[str, str] = {}
-    wrong: List[str] = []
-    for ref, sha in held.items():
-        name = ref[len("refs/heads/"):]
-        if got.get(f"refs/remotes/origin/{name}") != sha:
-            wrong.append(f"refs/remotes/origin/{name}")
-        branches[name] = sha
+    expected = {f"refs/remotes/origin/{name}": sha for name, sha in branches.items()}
+    # Exactly the copy's branches at the copy's commits: anything else under
+    # refs/remotes/origin/ is not the recorded repository's, and goes
+    # (origin/HEAD, git's own pointer to one of them, is left).
+    strays = [
+        ref for ref in got if ref not in expected and ref != "refs/remotes/origin/HEAD"
+    ]
+    wrong = [ref for ref, sha in expected.items() if got.get(ref) != sha]
+    if strays:
+        _forget(clone, strays, timeout)
     if wrong:
         _forget(clone, wrong, timeout)
         return StartPoint(refusal=REDIRECTED_SENTENCE)

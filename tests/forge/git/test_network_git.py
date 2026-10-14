@@ -426,3 +426,111 @@ def test_the_sandbox_command_line_carries_login_free_proxies_only() -> None:
             transport="https", home="/tmp/h", proxy_env={"HTTPS_PROXY": "http://u:p@proxy:1"},
         )
     assert "HTTPS_PROXY" in str(refused.value) and "u:p" not in str(refused.value)
+
+
+# ---------------------------------------------------------------------------
+# Implementation review round 1 (14 October 2026): the bring-in takes only the
+# copy's own branches, and a failed bring-in leaves no unverified ref
+
+
+def _push_branch(netlab: NetLab, repo: Path, branch: str, text: str) -> str:
+    """Add ``branch`` with one more commit to the bare ``repo``; its commit."""
+    lab = netlab.lab
+    work = lab.root / f"work-{repo.name}-{branch.replace('/', '-')}"
+    lab.setup_git(lab.root, "clone", "-q", str(repo), str(work))
+    lab.setup_git(work, "checkout", "-q", "-b", branch)
+    (work / f"{branch.replace('/', '-')}.md").write_text(text)
+    lab.setup_git(work, "add", "-A")
+    lab.setup_git(work, "-c", "user.name=Lab", "-c", "user.email=lab@example.invalid",
+                  "commit", "-qm", text)
+    lab.setup_git(work, "push", "-q", str(repo), branch)
+    lab.setup_git(repo, "update-server-info")
+    return lab.setup_git(work, "rev-parse", "HEAD").strip()
+
+
+def _tracking(netlab: NetLab, clone: Path) -> dict:
+    out = netlab.lab.setup_git(clone, "for-each-ref", "--format=%(objectname) %(refname)",
+                               "refs/remotes/origin/")
+    return {ref: sha for sha, _, ref in (line.partition(" ") for line in out.splitlines()) if ref}
+
+
+def test_all_branches_takes_only_the_copys_branches(netlab: NetLab) -> None:
+    """R1: the copy's folder is rewritten to another local repository that
+    shares ``main`` (same commit) and adds an extra branch and a branch named
+    like an existing tracking ref. Nothing but the copy's own branches, at the
+    copy's commits, is left under refs/remotes/origin/."""
+    ng = _ng()
+    lab = netlab.lab
+    assert ng.fetch_start_point(netlab.clone("warm"), netlab.recorded).refusal is None
+    copy = ng.factory_copy_for(netlab.recorded)
+    evil = lab.root / "evil.git"
+    lab.setup_git(lab.root, "clone", "-q", "--bare", str(netlab.good), str(evil))
+    extra = _push_branch(netlab, evil, "extra", "not the recorded repository")
+    overwrite = _push_branch(netlab, evil, "old", "an overwrite")
+    clone = netlab.clone()
+    # A tracking ref the clone already has, which the copy does not.
+    lab.setup_git(clone, "update-ref", "refs/remotes/origin/old",
+                  lab.setup_git(clone, "rev-parse", "HEAD").strip())
+    lab.setup_git(clone, "config", f"url.{evil}.insteadOf", str(copy))
+    # Positive control: a wildcard fetch of the copy's folder brings both in.
+    lab.plain(clone, "fetch", "--no-tags", "--", str(copy), "+refs/heads/*:refs/plain/*")
+    plain = lab.setup_git(clone, "for-each-ref", "--format=%(refname)", "refs/plain/")
+    assert "refs/plain/extra" in plain and "refs/plain/old" in plain
+    got = ng.fetch_all_branches(clone, netlab.recorded, repo="org/good")
+    held = _tracking(netlab, clone)
+    assert extra not in held.values() and overwrite not in held.values()
+    assert set(held) <= {"refs/remotes/origin/main", "refs/remotes/origin/HEAD"}
+    if got.refusal is None:
+        assert held.get("refs/remotes/origin/main") == netlab.good_commit
+        assert set(got.branches) == {"main"}
+
+
+def test_a_failed_bring_in_leaves_no_unverified_ref(netlab: NetLab) -> None:
+    """R2: two requested branches, the copy's folder rewritten to another
+    local repository, and a lock on one destination ref: the fetch fails part
+    way, and no destination ref is left at a commit nobody verified."""
+    ng = _ng()
+    lab = netlab.lab
+    _push_branch(netlab, netlab.good, "feature/x", "the recorded feature")
+    assert ng.fetch_start_point(netlab.clone("warm"), netlab.recorded,
+                                branch="feature/x").refusal is None
+    copy = ng.factory_copy_for(netlab.recorded)
+    other = lab.root / "other-two.git"
+    lab.setup_git(lab.root, "clone", "-q", "--bare", str(netlab.good.parent / "other.git"),
+                  str(other))
+    wrong = _push_branch(netlab, other, "feature/x", "not the recorded feature")
+    clone = netlab.clone()
+    lab.setup_git(clone, "config", f"url.{other}.insteadOf", str(copy))
+    locks = clone / ".git" / "refs" / "remotes" / "origin" / "feature"
+    locks.mkdir(parents=True)
+    (locks / "x.lock").write_text("")
+    start = ng.fetch_start_point(clone, netlab.recorded, branch="feature/x", repo="org/good")
+    assert start.refusal, "refused"
+    held = _tracking(netlab, clone)
+    assert netlab.other_commit not in held.values()
+    assert wrong not in held.values()
+    (locks / "x.lock").unlink()
+    (locks / "x.lock").write_text("")
+    got = ng.fetch_all_branches(clone, netlab.recorded, repo="org/good")
+    assert got.refusal
+    held = _tracking(netlab, clone)
+    assert netlab.other_commit not in held.values() and wrong not in held.values()
+
+
+def test_the_bring_in_is_atomic(netlab: NetLab) -> None:
+    """``--atomic`` on the local bring-in: one ref that cannot be updated
+    means none is."""
+    ng = _ng()
+    lab = netlab.lab
+    _push_branch(netlab, netlab.good, "feature/y", "y")
+    clone = netlab.clone()
+    assert ng.fetch_start_point(netlab.clone("warm"), netlab.recorded,
+                                branch="feature/y").refusal is None
+    copy = ng.factory_copy_for(netlab.recorded)
+    locks = clone / ".git" / "refs" / "remotes" / "origin" / "feature"
+    locks.mkdir(parents=True)
+    (locks / "y.lock").write_text("")
+    done = ng.bring_in_from_copy(clone, copy, ["+refs/heads/main:refs/remotes/origin/main",
+                                               "+refs/heads/feature/y:refs/remotes/origin/feature/y"])
+    assert done.returncode != 0
+    assert "refs/remotes/origin/main" not in _tracking(netlab, clone)
