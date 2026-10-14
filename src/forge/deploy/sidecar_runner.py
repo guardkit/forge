@@ -115,6 +115,8 @@ class SidecarScriptRunner:
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
         deploy: dict[str, object] | None = None,
+        issued_env: dict[str, str] | None = None,
+        repository: str | None = None,  # noqa: ARG002 — the far side knows its own
     ) -> tuple[int, str]:
         env: dict[str, str] = dict(extra_env or {})
         if env_file is not None:
@@ -152,6 +154,12 @@ class SidecarScriptRunner:
         # through the far side's EXECUTOR rather than straight to a runner.
         if deploy:
             body["deploy"] = dict(deploy)
+        # THE VALUES THE REVIEW PREVIEW ISSUED (13 October 2026), in a field of
+        # their own and never inside ``env``: the far side checks where they
+        # came from before a program is given them, and refuses a preview
+        # name sent the ordinary way.
+        if issued_env:
+            body["issued_env"] = {str(k): str(v) for k, v in dict(issued_env).items()}
         if isinstance(cwd, str) and cwd.strip():
             # The sidecar decides: a candidate tree is honoured, anything else
             # is ignored in favour of the profile's own working directory.

@@ -39,15 +39,17 @@ def _env_probe_script(tmp_path: Path) -> Path:
 class TestDeployComposeHandler:
     """Test suite for deploy_compose handler (AC-001 through AC-006)."""
 
-    def test_handler_satisfies_protocol(self) -> None:
+    def test_handler_satisfies_protocol(self, tmp_path: Path) -> None:
         """AC-001: deploy_compose satisfies StepHandler Protocol."""
         # Verify callable signature: (step: Step) -> StepOutcome
         # This is validated structurally by the type system, but we verify it's
-        # actually callable with a Step instance.
+        # actually callable with a Step instance. It runs in a git checkout of
+        # its own (13 October 2026): a project's program is given a private
+        # HOME in its checkout's git directory, never one found elsewhere.
         step = Step(
             step_type="deploy_compose",
             params={
-                "cwd": "/tmp",
+                "cwd": str(tmp_path),
                 "script": "/bin/true",
                 "env_file": None,
             },
@@ -522,3 +524,16 @@ exit 0
         assert outcome.status == StepStatus.passed
         # Output should be truncated
         assert "TRUNCATED" in outcome.result["captured_output"]
+
+
+@pytest.fixture(autouse=True)
+def _tmp_path_is_a_checkout(tmp_path):
+    """A project's own program runs only inside a git checkout (13 October
+    2026): its private HOME and TMPDIR are made in the checkout's own git
+    directory, outside the project's files. So the folder these tests run
+    programs in is one."""
+    import subprocess as _subprocess
+
+    _subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )

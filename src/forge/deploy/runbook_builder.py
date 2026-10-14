@@ -168,6 +168,8 @@ def build_deploy_runbook(
     deploy_ownership: dict[str, Any] | None = None,
     memory_project: str | None = None,
     launch_settings: Sequence[str] | None = None,
+    compose_issued_env: dict[str, str] | None = None,
+    check_issued_env: dict[str, str] | None = None,
 ) -> Runbook:
     """Render the DEPLOY-stage runbook for ``profile``.
 
@@ -214,6 +216,13 @@ def build_deploy_runbook(
             carried onto the step so whatever runs it can build the child's
             environment from the factory's named list rather than copying its
             own (the environment door).
+        compose_issued_env: The values the REVIEW PREVIEW issued to the
+            project (13 October 2026): its ports, address, link token, label,
+            evidence folder, compose project and ``PREVIEW=1``. Carried as the
+            ``deploy_compose`` step's ``issued_env``, NEVER inside its
+            ``extra_env``, so the helper can tell an issued token from a
+            factory credential. ``None`` ⇒ no such key ⇒ byte-identical.
+        check_issued_env: The same, for the ``health_check`` step.
         inside_sandbox: True when these steps run INSIDE the repository's own
             sandbox, so the settings that say how to make that sandbox are not
             threaded onto them — there is nothing there to make and nothing
@@ -314,6 +323,8 @@ def build_deploy_runbook(
     )
     if compose_env:
         compose_params["extra_env"] = compose_env
+    if compose_issued_env:
+        compose_params["issued_env"] = dict(compose_issued_env)
     # WHO OWNS THE TARGET THIS STEP CHANGES, and what the project declared.
     # Only the compose step carries them: it is the one that changes the live
     # thing, and the identity it is handed is the one it must deploy.
@@ -344,6 +355,12 @@ def build_deploy_runbook(
         )
         if check_env:
             check_params["extra_env"] = check_env
+        if check_issued_env:
+            check_params["issued_env"] = dict(check_issued_env)
+        # The health checks are the project's own scripts too, so they are
+        # handed the names the project declared, as the compose step is.
+        if launch_settings:
+            check_params["launch_settings"] = [str(name) for name in launch_settings]
         steps.append(_step("health_check", check_params, idx))
         idx += 1
 

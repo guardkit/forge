@@ -73,7 +73,11 @@ class FakeExecute:
         command: list[str],
         cwd: str,
         timeout: int,
+        env: dict[str, str],
     ) -> tuple[str, str, int, float, bool]:
+        # The seam is now told exactly what its child gets (13 October 2026);
+        # git and gh are the factory's own programs and get its environment.
+        assert isinstance(env, dict)
         # Record a defensive copy of ``command`` so a caller mutating
         # the list in-place after the await can't retroactively rewrite
         # what the test asserts against.

@@ -94,7 +94,11 @@ from __future__ import annotations
 import logging
 import os
 import re
-from typing import Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from forge.deploy.review_preview import IssuedPreviewValues
 
 logger = logging.getLogger(__name__)
 
@@ -108,11 +112,20 @@ __all__ = [
     "LAUNCH_SETTINGS",
     "MAX_DECLARED_SETTINGS",
     "MAX_DECLARED_NAME_LENGTH",
+    "PROJECT_CHECKED_PROXY_NAMES",
+    "PROJECT_HOME_DIRNAME",
+    "PROJECT_PROXY_NAMES",
+    "ProjectCommandEnvironmentError",
     "RESERVED_CREDENTIAL_WORDS",
     "RESERVED_NAMES",
     "RESERVED_PREFIXES",
     "SETTINGS_DELIBERATELY_NOT_PASSED",
     "build_launch_env",
+    "build_project_command_env",
+    "declared_settings_not_set",
+    "minimal_environment_note",
+    "project_program_note",
+    "withheld_settings",
     "declared_setting_refusal",
     "launch_setting_names",
 ]
@@ -639,3 +652,550 @@ def build_launch_env(
             )
         env[GUARDKIT_FEATURE_ROUTING_REQUIRED_ENV] = "1"
     return env
+
+
+# ===========================================================================
+# A PROJECT'S OWN PROGRAMS: built from nothing (13 October 2026)
+# ===========================================================================
+#
+# The list above is the factory's own, and it is right for the build system,
+# which needs the model seat, the bus and the memory. It is WRONG for a
+# project's own program — its declared test, its live-gate driver, its deploy
+# script and checks — because that program is code a local model wrote, and a
+# library that reads ``OPENAI_API_KEY`` by default would spend the factory's
+# key with it. So a project's program gets an environment built from an empty
+# dictionary, in the same five steps GuardKit's
+# ``guardkit/orchestrator/project_command_env.py`` uses (design "Project
+# commands run without the factory's credentials", 13 October 2026). Forge
+# does not import GuardKit as a library, so the rule is mirrored here, as the
+# name rules above already are, and a mirror test pins the passed names.
+
+#: Proxy settings copied into the base when set: GuardKit's ``PROXY_NAMES``.
+PROJECT_PROXY_NAMES: tuple[str, ...] = tuple(
+    name
+    for base in ("HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY")
+    for name in (base, base.lower())
+)
+
+#: Proxy settings, in any case, checked for a user name or password on the
+#: composed environment: GuardKit's ``_CHECKED_PROXY_NAMES``.
+PROJECT_CHECKED_PROXY_NAMES: frozenset[str] = frozenset(
+    {"HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "FTP_PROXY", "NO_PROXY"}
+)
+
+#: The folder, inside the repository's own git directory, that holds a
+#: project program's private ``HOME`` and ``TMPDIR``. Outside the project's
+#: files, and outside every candidate tree (those are copies with no git
+#: directory), so nothing a program writes there is ever committed or
+#: deployed.
+PROJECT_HOME_DIRNAME: str = "forge-project-home"
+
+
+class ProjectCommandEnvironmentError(OSError):
+    """A project program's environment could not be built, so it was not run.
+
+    An ``OSError``, so every caller that already treats "the command could
+    not start" as the command's failure treats this the same way, with this
+    plain sentence. No sentence here ever quotes a setting's value.
+    """
+
+
+def _a_real_git_directory(folder: Path) -> Path | None:
+    """``folder`` resolved, when it is a real git directory; else ``None``.
+
+    A real one has a ``HEAD`` file and either its own ``objects`` folder or a
+    ``commondir`` file naming the shared one (a linked worktree's). A folder
+    that merely happens to be called ``.git`` — empty, or made by somebody
+    else — is not one. With a ``commondir``, the shared directory it names is
+    returned, and it must be a real one too.
+    """
+    try:
+        folder = folder.resolve()
+    except OSError:
+        return None
+    if not folder.is_dir() or not (folder / "HEAD").is_file():
+        return None
+    common = folder / "commondir"
+    if common.is_file():
+        try:
+            named = common.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not named:
+            return None
+        shared = Path(named)
+        shared = (shared if shared.is_absolute() else folder / shared).resolve()
+        if shared == folder or not (shared / "HEAD").is_file() or not (shared / "objects").is_dir():
+            return None
+        return shared
+    return folder if (folder / "objects").is_dir() else None
+
+
+def _git_directory_from_marker(marker: Path) -> Path | None:
+    """The shared git directory a checkout's ``.git`` entry names, or ``None``.
+
+    A folder must be the checkout's own git directory: real, and not itself
+    pointing elsewhere with a ``commondir``. A file (a linked worktree's) must
+    say ``gitdir: <path>`` with a path that is not empty, and that path must
+    be one of a real git directory's own worktree folders
+    (``<git directory>/worktrees/<name>``) whose ``gitdir`` file points back
+    at this very ``.git`` file — so a checkout cannot borrow an unrelated
+    repository's git directory. A link is never followed.
+    """
+    if marker.is_symlink():
+        return None
+    if marker.is_dir():
+        if (marker / "commondir").exists():
+            return None
+        return _a_real_git_directory(marker)
+    if not marker.is_file():
+        return None
+    try:
+        line = marker.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    named = line[len("gitdir:"):].strip()
+    if not named:
+        return None
+    own = Path(named)
+    if not own.is_absolute():
+        own = marker.parent / own
+    try:
+        own = own.resolve()
+    except OSError:
+        return None
+    shared = _a_real_git_directory(own)
+    if shared is None or shared == own or own.parent != shared / "worktrees":
+        return None
+    try:
+        back = Path((own / "gitdir").read_text(encoding="utf-8").strip())
+        if not back.is_absolute():
+            back = own / back
+        if back.resolve() != marker.resolve():
+            return None
+    except OSError:
+        return None
+    return shared
+
+
+def _git_directory_of(
+    work_folder: Path, repository: Path | None = None
+) -> Path | None:
+    """The real git directory a project program's private home goes in.
+
+    With ``repository`` — the checkout the caller knows the program belongs
+    to — only that checkout's own ``.git`` is used, and ``work_folder`` must
+    be inside it; nothing above it is ever looked at. Without one, the walk
+    up from ``work_folder`` stops at the FIRST ``.git`` it meets: a real one
+    is used, and anything else (an empty folder called ``.git``, a ``gitdir:``
+    with no path, a link) is ``None``, never a reason to keep climbing.
+
+    The answer is never ``work_folder`` itself nor a folder above it, so the
+    private home can never land among the project's own files. Read, never
+    run: no program is started to find it.
+    """
+    try:
+        here = work_folder.resolve()
+    except OSError:
+        return None
+    if repository is not None:
+        try:
+            root = Path(repository).resolve()
+        except OSError:
+            return None
+        if here != root and root not in here.parents:
+            return None
+        markers = [root / ".git"]
+    else:
+        markers = []
+        for folder in (here, *here.parents):
+            marker = folder / ".git"
+            if marker.is_symlink() or marker.exists():
+                markers = [marker]
+                break
+    for marker in markers:
+        found = _git_directory_from_marker(marker)
+        if found is None or found == here or found in here.parents:
+            return None
+        return found
+    return None
+
+
+def _private_folder(path: Path) -> Path:
+    """Make ``path`` (owner-only) or refuse; never follow a link."""
+    if path.is_symlink():
+        raise ProjectCommandEnvironmentError(
+            f"the private folder {path} is a link, so a project program was "
+            f"not given it and was not run"
+        )
+    try:
+        # Never ``parents=True``: the git directory must already be there, and
+        # a folder that is not is never made on a guess.
+        path.mkdir(mode=0o700, exist_ok=True)
+        path.chmod(0o700)
+    except OSError as exc:
+        raise ProjectCommandEnvironmentError(
+            f"the private folder {path} could not be made ({exc.strerror or exc}), "
+            f"so the project program was not run"
+        ) from exc
+    if not path.is_dir():
+        raise ProjectCommandEnvironmentError(
+            f"the private folder {path} is not a folder, so the project program "
+            f"was not run"
+        )
+    return path
+
+
+def _addition_refusal(name: object) -> str | None:
+    """Why a value the factory sets may not be passed, or ``None``.
+
+    The same rule a project's own declared names meet
+    (:func:`declared_setting_refusal`): never one of the factory's own names
+    or prefixes, never credential-shaped, and never the run-owner marker.
+    """
+    if not isinstance(name, str) or not DECLARED_NAME_PATTERN.fullmatch(name):
+        return f"{name!r} is not the shape of a setting name"
+    upper = name.upper()
+    if upper == GUARDKIT_RUN_OWNER_ENV:
+        return f"{name!r} comes only from the build's own record (run_owner)"
+    return declared_setting_refusal(name)
+
+
+def _carries_a_factory_value(
+    values: Mapping[str, str], source: Mapping[str, str]
+) -> str | None:
+    """The sentence when one of ``values`` equals the value of a setting the
+    factory keeps for itself in ``source``; never shows the value.
+
+    A value the factory sets for a command under an ordinary name (say
+    ``DATABASE_URL``) could otherwise carry the memory store's address or the
+    bus's out of the factory's own settings, past every check on names.
+    """
+    reserved = {
+        str(value): name
+        for name, value in source.items()
+        if str(value) and declared_setting_refusal(name) is not None
+    }
+    for name, value in values.items():
+        held = reserved.get(str(value))
+        if held is not None:
+            return (
+                f"the value given for {name!r} is the value of {held!r}, a "
+                f"setting the factory keeps for itself"
+            )
+    return None
+
+
+def build_project_command_env(
+    work_folder: Path | str,
+    *,
+    declared: Sequence[str] | Iterable[str] | None = (),
+    additions: Mapping[str, str] | None = None,
+    issued: "IssuedPreviewValues | None" = None,
+    overlay: Mapping[str, str] | None = None,
+    run_owner: str | None = None,
+    parent: Mapping[str, str] | None = None,
+    repository: Path | str | None = None,
+) -> dict[str, str]:
+    """The whole environment for one of a project's own programs.
+
+    ``repository`` is the checkout the caller knows the program belongs to;
+    when given, the private home goes in that checkout's own git directory
+    and ``work_folder`` must be inside it. Without it, the first ``.git``
+    above ``work_folder`` is used, and only if it is a real git directory.
+
+    Built from an empty dictionary, in this order, each step working on the
+    one before:
+
+    1. **The base:** ``PATH`` from ``parent``; ``HOME`` and ``TMPDIR`` set to
+       private folders under ``<git directory>/forge-project-home``; ``LANG``,
+       ``LC_ALL`` and ``LC_*`` when set; the eight proxy names when set; and
+       the names the project ``declared`` (``launch.settings``), when set and
+       when the project may declare them.
+    2. **Additions:** values the factory itself sets for this one command
+       (``ENV_FILE``, the identity and artifact the step must deploy). A
+       credential-shaped name, or the run-owner marker, is a programming error
+       and raises ``ValueError``.
+    3. **Issued values:** the review preview's values, made for this one
+       preview (:class:`forge.deploy.review_preview.IssuedPreviewValues`, and
+       nothing else). Their names and the link token's shape are checked, and
+       the token may equal no value in ``parent``, the additions or the
+       overlay.
+    4. **Overlay:** the profile-allowed values a request carries. A name a
+       project could not declare, a name an addition set, or a preview name
+       sent this way is refused.
+    5. **The proxy check, on everything composed so far**, then **the
+       run-owner marker, last**: set from ``run_owner`` (the build on the
+       coordinator's record) when given, and absent otherwise — never taken
+       from ``parent`` or the overlay.
+
+    Raises
+    ------
+    ProjectCommandEnvironmentError
+        No private folder can be made (``work_folder`` is in no git
+        checkout), an overlay or issued value is refused, or a proxy setting
+        carries a user name or password. The sentence names the setting and
+        never its value.
+    ValueError
+        ``additions`` holds a refused name.
+    """
+    source: Mapping[str, str] = os.environ if parent is None else parent
+    additions = dict(additions or {})
+    overlay = dict(overlay or {})
+    for name in additions:
+        refusal = _addition_refusal(name)
+        if refusal is not None:
+            raise ValueError(
+                f"a factory-set value for a project program was refused: {refusal}"
+            )
+
+    # Step 1: the base, from an empty dictionary.
+    env: dict[str, str] = {}
+    if "PATH" in source:
+        env["PATH"] = str(source["PATH"])
+    for name, value in source.items():
+        if name in ("LANG", "LC_ALL") or name.startswith("LC_"):
+            env[name] = str(value)
+    for name in PROJECT_PROXY_NAMES:
+        if name in source:
+            env[name] = str(source[name])
+    git_directory = _git_directory_of(
+        Path(work_folder), Path(repository) if repository is not None else None
+    )
+    if git_directory is None:
+        where = (
+            f"{work_folder} is not inside the checkout {repository} that has a "
+            f"real git directory"
+            if repository is not None
+            else f"{work_folder} is in no git checkout with a real git directory"
+        )
+        raise ProjectCommandEnvironmentError(
+            f"{where}, so there is nowhere outside the project to give its "
+            f"program a private HOME and TMPDIR, and it was not run"
+        )
+    home_root = _private_folder(git_directory / PROJECT_HOME_DIRNAME)
+    env["HOME"] = str(_private_folder(home_root / "HOME"))
+    env["TMPDIR"] = str(_private_folder(home_root / "TMPDIR"))
+    for raw in declared or ():
+        refusal = declared_setting_refusal(raw)
+        name = str(raw).strip()
+        if refusal is not None:
+            logger.warning(
+                "project program: a declared setting name is not passed — %s",
+                refusal,
+            )
+            continue
+        if name in source:
+            env[name] = str(source[name])
+        else:
+            logger.info(
+                "the project declares `%s` in `launch.settings`, but it is not "
+                "set where the factory runs, so the command ran without it",
+                name,
+            )
+
+    # Step 2: additions — and none of them may carry a value of the
+    # factory's own settings under another name.
+    carried = _carries_a_factory_value(additions, source)
+    if carried is not None:
+        raise ProjectCommandEnvironmentError(
+            f"a value the factory set for this project program was refused, so "
+            f"it was not run: {carried}"
+        )
+    env.update({name: str(value) for name, value in additions.items()})
+
+    # Step 3: issued values.
+    issued_names: set[str] = set()
+    if issued is not None:
+        from forge.deploy.review_preview import (
+            IssuedPreviewValues,
+            issued_preview_refusal,
+        )
+
+        if not isinstance(issued, IssuedPreviewValues):
+            raise ProjectCommandEnvironmentError(
+                "values handed to a project program as issued by the preview "
+                "must come from the preview's own preparation; a plain mapping "
+                "is not accepted, so the program was not run"
+            )
+        values = issued.as_dict()
+        refusal = issued_preview_refusal(
+            values, parent=source, others=(additions, overlay)
+        )
+        if refusal is not None:
+            raise ProjectCommandEnvironmentError(
+                f"a value issued to this project program was refused, so it "
+                f"was not run: {refusal}"
+            )
+        env.update(values)
+        issued_names = set(values)
+
+    # Step 4: overlay.
+    from forge.deploy.review_preview import PREVIEW_ENV_KEYS
+
+    for name in overlay:
+        refusal = declared_setting_refusal(name)
+        if refusal is None and name in additions:
+            refusal = f"{name!r} is set by the factory for this command"
+        if refusal is None and (name in PREVIEW_ENV_KEYS or name in issued_names):
+            refusal = (
+                f"{name!r} is one of the review preview's own values, which "
+                f"travel only as values the preview issued"
+            )
+        if refusal is not None:
+            raise ProjectCommandEnvironmentError(
+                f"a setting the request carried for this project program was "
+                f"refused, so the program was not run: {refusal}"
+            )
+    env.update({name: str(value) for name, value in overlay.items()})
+
+    # Step 5: the proxy check on everything composed, then the marker last.
+    carrying = sorted(
+        name
+        for name, value in env.items()
+        if name.upper() in PROJECT_CHECKED_PROXY_NAMES and "@" in str(value)
+    )
+    if carrying:
+        raise ProjectCommandEnvironmentError(
+            f"could not run: the proxy setting {', '.join(carrying)} carries a "
+            f"user name and password, and the factory does not pass credentials "
+            f"to project commands"
+        )
+    for name in [key for key in env if key.upper() == GUARDKIT_RUN_OWNER_ENV]:
+        del env[name]
+    if run_owner and str(run_owner).strip():
+        env[GUARDKIT_RUN_OWNER_ENV] = str(run_owner).strip()
+    return env
+
+
+# ===========================================================================
+# What the project is told when its program fails: names only, never values
+# ===========================================================================
+#
+# Design section 4. A project program now runs with the factory's minimal
+# environment, so a command that used to find a setting by accident may fail
+# without it. Its failure detail says so in plain words, naming the settings
+# the factory holds that the project could ask for and the ones it declared
+# that are not set here. No value of any setting ever appears. The wording
+# mirrors GuardKit's ``project_command_env.minimal_environment_note``.
+
+#: Shell bookkeeping nobody means to pass; left out so the names that matter
+#: are not buried.
+_SHELL_BOOKKEEPING: frozenset[str] = frozenset({"_", "PWD", "OLDPWD", "SHLVL"})
+
+
+def withheld_settings(
+    env: Mapping[str, str], *, parent: Mapping[str, str] | None = None
+) -> tuple[list[str], int]:
+    """Settings ``parent`` holds that a program given ``env`` did not get.
+
+    Returns the names a project may declare (they pass
+    :func:`declared_setting_refusal`), sorted, and how many of the factory's
+    own reserved names were held back too. Those are counted, never offered.
+    Values are never read out.
+    """
+    source: Mapping[str, str] = os.environ if parent is None else parent
+    offerable: list[str] = []
+    own = 0
+    for name in source:
+        if name in env or name in _SHELL_BOOKKEEPING:
+            continue
+        if declared_setting_refusal(name) is None:
+            offerable.append(name)
+        else:
+            own += 1
+    return sorted(offerable), own
+
+
+def declared_settings_not_set(
+    declared: Sequence[str] | Iterable[str] | None,
+    *,
+    parent: Mapping[str, str] | None = None,
+) -> list[str]:
+    """The declared names this process does not hold (so none were passed)."""
+    source: Mapping[str, str] = os.environ if parent is None else parent
+    return [
+        str(name).strip()
+        for name in (declared or ())
+        if declared_setting_refusal(name) is None and str(name).strip() not in source
+    ]
+
+
+def minimal_environment_note(
+    env: Mapping[str, str] | None,
+    *,
+    declared: Sequence[str] | Iterable[str] | None = (),
+    parent: Mapping[str, str] | None = None,
+) -> str:
+    """The plain words added to a failed project program's detail.
+
+    Empty when ``env`` is ``None`` (the program never had an environment, so
+    it never ran). Names only: no value of any setting appears in it.
+    """
+    if env is None:
+        return ""
+    offerable, own = withheld_settings(env, parent=parent)
+    listed = ", ".join(f"`{name}`" for name in offerable)
+    held = (
+        f"Settings the factory holds that were not given to it: {listed}."
+        if offerable
+        else "The factory holds no other setting a project could declare."
+    )
+    if own:
+        held += (
+            f" ({own} of the factory's own settings were also held back; a "
+            f"project cannot declare those.)"
+        )
+    unset = "".join(
+        f" The project declares `{name}` in `launch.settings`, but it is not "
+        f"set where the factory runs, so the command ran without it."
+        for name in declared_settings_not_set(declared, parent=parent)
+    )
+    return (
+        "This command ran with the factory's minimal environment. "
+        + held
+        + unset
+        + " If the command needs one, add its name to `launch.settings` in "
+        "`.guardkit/config.yaml`."
+    )
+
+
+def project_program_note(
+    *,
+    declared: Sequence[str] | Iterable[str] | None = (),
+    additions: Mapping[str, str] | None = None,
+    overlay: Mapping[str, str] | None = None,
+    issued: "IssuedPreviewValues | None" = None,
+    run_owner: str | None = None,
+    parent: Mapping[str, str] | None = None,
+) -> str:
+    """:func:`minimal_environment_note` worked out from the same inputs
+    :func:`build_project_command_env` was given, without the environment.
+
+    A launch hands the environment it built to the program and to nothing
+    else (the launch guard holds it to that), so the plain words for a failed
+    program are worked out here from what went in: the names it was given are
+    the shell's own three, the locale and proxy settings this process holds,
+    the declared names this process holds, the additions, the overlay, the
+    issued values and the run-owner marker. Names only, never a value.
+    """
+    source: Mapping[str, str] = os.environ if parent is None else parent
+    declared_names = [str(name).strip() for name in (declared or ())]
+    given: dict[str, str] = {name: "" for name in ("PATH", "HOME", "TMPDIR")}
+    for name in source:
+        if (
+            name in ("LANG", "LC_ALL")
+            or name.startswith("LC_")
+            or name in PROJECT_PROXY_NAMES
+            or (name in declared_names and declared_setting_refusal(name) is None)
+        ):
+            given[name] = ""
+    given.update({name: "" for name in (additions or {})})
+    given.update({name: "" for name in (overlay or {})})
+    if issued is not None:
+        given.update({name: "" for name in issued.names()})
+    if run_owner and str(run_owner).strip():
+        given[GUARDKIT_RUN_OWNER_ENV] = ""
+    return minimal_environment_note(given, declared=declared_names, parent=source)

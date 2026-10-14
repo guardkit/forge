@@ -19,10 +19,11 @@ card goes out. This module prepares that and looks after it afterwards:
 2. **Lease a slot.** One row in the ledger's ``preview_leases`` table,
    waiting up to the profile's ``slot_wait_minutes`` for a free slot.
 3. **Stand it up.** The candidate leg's own deploy steps, through the deploy
-   dispatch the merge press uses, with the preview overlay (``PREVIEW=1``,
-   the slot's ports and address, the link token, the resource label
-   ``forge.preview.lease=<lease>``, the evidence folder and the compose
-   project ``<env>-pv<slot>``).
+   dispatch the merge press uses, with the values the preview issues
+   (``PREVIEW=1``, the slot's ports and address, the link token, the resource
+   label ``forge.preview.lease=<lease>``, the evidence folder and the compose
+   project ``<env>-pv<slot>``), carried apart from every other setting as
+   ``issued_env``.
 4. **Check the link.** Inside the sandbox, the slot's public listener must
    refuse a request with no token and one with a wrong token (403 or 410)
    and accept the right one.
@@ -114,8 +115,10 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "EVIDENCE_FOLDER",
+    "IssuedPreviewValues",
     "LEASE_LABEL",
     "PREVIEW_ENV_KEYS",
+    "issued_preview_refusal",
     "PREVIEW_ROUTES",
     "PreviewLease",
     "PreviewLeaseStore",
@@ -145,9 +148,11 @@ PREVIEW_TREE_PREFIX: str = "preview-"
 #: The folder inside the preview's tree the project writes its evidence into.
 EVIDENCE_FOLDER: str = ".factory-evidence"
 
-#: Every setting name the preview overlay can carry. The sandbox's deploy
-#: sidecar permits these, and only for a project whose committed profile has
-#: its preview switched on.
+#: Every setting name the preview issues to the project. They travel only as
+#: values the preview issued (:class:`IssuedPreviewValues`, the ``issued_env``
+#: field), never as an ordinary overlay, and the sandbox's deploy sidecar
+#: accepts them only for a project whose committed profile has its preview
+#: switched on.
 PREVIEW_ENV_KEYS: frozenset[str] = frozenset(
     {
         "PREVIEW",
@@ -161,6 +166,120 @@ PREVIEW_ENV_KEYS: frozenset[str] = frozenset(
         "FACTORY_RECORD_VIDEO",
     }
 )
+
+#: The one preview name that is a credential: the link token. The factory
+#: makes it fresh for each preview and issues it TO the project; it is never
+#: one of the factory's own.
+PREVIEW_TOKEN_NAME: str = "FACTORY_PREVIEW_TOKEN"
+
+#: What a freshly made token looks like: ``secrets.token_urlsafe(32)`` makes
+#: 43 of these characters, and anything shorter or wider is not one.
+_FRESH_TOKEN = re.compile(r"^[A-Za-z0-9_-]{32,}$")
+
+
+class IssuedPreviewValues:
+    """Values the review preview issues to the project's own programs.
+
+    The preview's link token is a credential, but one the factory makes for
+    this one preview and hands TO the project, which is meant to have it.
+    Every other credential-shaped name is refused on the way to a project
+    program (design "Project commands run without the factory's credentials",
+    section 1a), so these values travel on a narrow path of their own: this
+    type, the separate ``issued_env`` field at every hop, and the helper's
+    separate ``issued`` argument.
+
+    Built in two places only — the preview's own preparation
+    (:meth:`ReviewPreviewService._prepare`) and the helper service's reader
+    for a request's ``issued_env`` — which a guard test checks. Only the
+    names in :data:`PREVIEW_ENV_KEYS` are accepted. Its text form names the
+    settings and never shows a value.
+    """
+
+    __slots__ = ("_values",)
+
+    def __init__(self, values: Mapping[str, str]) -> None:
+        checked: dict[str, str] = {}
+        for name, value in dict(values).items():
+            if name not in PREVIEW_ENV_KEYS:
+                raise ValueError(
+                    f"{name!r} is not one of the review preview's own settings"
+                )
+            if not isinstance(value, str):
+                raise ValueError(f"the preview's {name!r} must be text")
+            checked[name] = value
+        object.__setattr__(self, "_values", checked)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("issued preview values cannot be changed")
+
+    def __getitem__(self, name: str) -> str:
+        return self._values[name]
+
+    def names(self) -> frozenset[str]:
+        return frozenset(self._values)
+
+    def as_dict(self) -> dict[str, str]:
+        """A plain copy, for a hop that serialises (a runbook, a request)."""
+        return dict(self._values)
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, IssuedPreviewValues) and other._values == self._values
+
+    def __hash__(self) -> int:
+        return hash(tuple(sorted(self._values.items())))
+
+    def __repr__(self) -> str:
+        return f"IssuedPreviewValues(names={sorted(self._values)})"
+
+
+def issued_preview_refusal(
+    values: Any,
+    *,
+    parent: Mapping[str, str],
+    others: Sequence[Mapping[str, str]] = (),
+) -> str | None:
+    """Why these values cannot be taken as issued by the preview, or ``None``.
+
+    Asked where the values are read (the helper service) and again where a
+    program's environment is built. The sentence names the setting and never
+    shows its value.
+
+    * every name is one of :data:`PREVIEW_ENV_KEYS`, and every value is text;
+    * the token has the shape of a freshly made one (at least 32 of
+      ``A-Z a-z 0-9 _ -``);
+    * the token equals no value in ``parent`` (the process building the
+      program's environment) or in ``others`` (the additions and the overlay),
+      so a credential the factory holds cannot be passed off as issued. The
+      other names are not compared: a port or a project name can match by
+      chance, and they are neither credential-shaped nor free to choose.
+    """
+    if not isinstance(values, Mapping):
+        return "the preview's issued values must be a JSON object of text values"
+    for name, value in values.items():
+        if name not in PREVIEW_ENV_KEYS:
+            return (
+                f"{name!r} is not one of the review preview's own settings "
+                f"({', '.join(sorted(PREVIEW_ENV_KEYS))})"
+            )
+        if not isinstance(value, str):
+            return f"the preview's {name!r} must be text"
+    token = values.get(PREVIEW_TOKEN_NAME)
+    if token is None:
+        return None
+    if not _FRESH_TOKEN.fullmatch(token):
+        return (
+            f"{PREVIEW_TOKEN_NAME} does not have the shape of a freshly made "
+            f"link token (at least 32 letters, digits, '_' or '-')"
+        )
+    if any(token == str(v) for v in parent.values()) or any(
+        token == str(v) for other in others for v in other.values()
+    ):
+        return (
+            f"{PREVIEW_TOKEN_NAME} equals a setting the factory already holds, "
+            f"so it was not issued by the preview"
+        )
+    return None
+
 
 #: A lease id: ``pv`` and twelve lower-case hex digits. It becomes a git ref
 #: name, a folder name and a label value, so it is held to one plain shape.
@@ -1605,7 +1724,12 @@ class ReviewPreviewService:
         slot = preview.slots[slot_index]
         compose_project = f"{profile.env_id}-pv{slot_index}"
         vm_evidence_dir = f"{laid.path.rstrip('/')}/{EVIDENCE_FOLDER}"
-        overlay = {
+        # THE VALUES THIS PREVIEW ISSUES TO THE PROJECT (13 October 2026). They
+        # travel apart from every other setting, as values the preview issued,
+        # so the link token reaches the project's programs while every other
+        # credential-shaped name stays refused. The journey's copy also asks
+        # for the recording.
+        values = {
             "COMPOSE_PROJECT_NAME": compose_project,
             "FACTORY_PREVIEW_PORT": str(slot.port),
             "FACTORY_PREVIEW_INTERNAL_PORT": str(slot.internal_port),
@@ -1614,6 +1738,10 @@ class ReviewPreviewService:
             "FACTORY_RESOURCE_LABEL": f"{LEASE_LABEL}={lease_id}",
             "FACTORY_EVIDENCE_DIR": vm_evidence_dir,
         }
+        issued = IssuedPreviewValues(values)
+        issued_for_the_journey = IssuedPreviewValues(
+            {**values, "FACTORY_RECORD_VIDEO": "1"}
+        )
         context = _Preparation(
             req=req,
             run_id=run_id,
@@ -1638,7 +1766,7 @@ class ReviewPreviewService:
                 compose_project=compose_project,
                 evidence_dir=str(dest),
             )
-            return await self._stand_up(context, overlay)
+            return await self._stand_up(context, issued, issued_for_the_journey)
         except asyncio.CancelledError:
             # Cancelled while the slot is held (during the start-up, the checks
             # or the journey): torn down and failed, shielded, then re-raised.
@@ -1689,7 +1817,10 @@ class ReviewPreviewService:
             )
 
     async def _stand_up(
-        self, context: "_Preparation", overlay: dict[str, str]
+        self,
+        context: "_Preparation",
+        issued: IssuedPreviewValues,
+        issued_for_the_journey: IssuedPreviewValues,
     ) -> "ReviewEvidence":
         """Steps 3 to 7: stand the preview up, check its link, record, keep, report."""
         req, venue, slot = context.req, context.venue, context.slot
@@ -1700,7 +1831,7 @@ class ReviewPreviewService:
             context.now,
         )
         # (3) Stand it up.
-        up = await self._leg(context, "preview_up", overlay)
+        up = await self._leg(context, "preview_up", issued)
         if up is None or getattr(up, "outcome", None) != "complete":
             return await self._fail(
                 context, f"the preview could not be started: {self._why(up)}"
@@ -1712,7 +1843,7 @@ class ReviewPreviewService:
         # find, while its teardown read as "confirmed".
         # EVERY container of the preview's compose project must carry it: one
         # left unlabelled would outlive the teardown unseen.
-        seen = await venue.preview_containers(overlay["COMPOSE_PROJECT_NAME"])
+        seen = await venue.preview_containers(issued["COMPOSE_PROJECT_NAME"])
         if seen is None:
             return await self._fail(
                 context, "the preview's containers could not be listed"
@@ -1741,9 +1872,7 @@ class ReviewPreviewService:
             )
 
         # (5) The journey, recorded.
-        journey_leg = await self._leg(
-            context, "preview_journey", {**overlay, "FACTORY_RECORD_VIDEO": "1"}
-        )
+        journey_leg = await self._leg(context, "preview_journey", issued_for_the_journey)
         if journey_leg is None or getattr(journey_leg, "outcome", None) != "complete":
             return await self._fail(
                 context, f"the key journey could not be run: {self._why(journey_leg)}"
@@ -1823,7 +1952,7 @@ class ReviewPreviewService:
             await self._sleep(self._slot_poll_seconds)
 
     async def _leg(
-        self, context: "_Preparation", leg: str, overlay: dict[str, str]
+        self, context: "_Preparation", leg: str, issued: IssuedPreviewValues
     ) -> Any:
         try:
             return await self._dispatch(
@@ -1837,7 +1966,7 @@ class ReviewPreviewService:
                 leg=leg,
                 candidate_cwd=context.tree.path,
                 deploy_run_id=context.run_id,
-                identity_env=dict(overlay),
+                issued_env=issued,
             )
         except Exception as exc:  # noqa: BLE001 — a leg's crash is a reason
             return _LegCrashed(f"{type(exc).__name__}: {exc}")

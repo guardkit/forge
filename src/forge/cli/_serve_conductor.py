@@ -840,7 +840,12 @@ def _detail_with_the_run_kept(
 
 
 def _run_declared_command(
-    *, command: str, cwd: "Path | str", timeout_seconds: int
+    *,
+    command: str,
+    cwd: "Path | str",
+    timeout_seconds: int,
+    launch_settings: "Sequence[str] | None" = None,
+    repository: "Path | str | None" = None,
 ) -> "tuple[int | None, str]":
     """Run one declared command, bounded. ``(exit_code, detail)``.
 
@@ -856,20 +861,43 @@ def _run_declared_command(
     (``npm test``, ``uv run pytest -q``), which is what the repo owner
     wrote and what guardkit's own executor runs. The command comes from
     the repo's checked-in config, not from a message.
+
+    WHAT IT IS GIVEN (13 October 2026). The project's own command, so none
+    of the coordinator's credentials: its environment is built from nothing
+    (:func:`forge.launch_environment.build_project_command_env`), with the
+    setting NAMES the project declared (``launch_settings``) and a private
+    ``HOME`` and ``TMPDIR`` in the repository's own git directory.
+    ``repository`` is the checkout the command belongs to; left out, it is
+    ``cwd`` itself (a declared test runs at the root of a worktree, which is
+    a checkout of its own), so no folder above it is ever looked at.
     """
+    from forge.launch_environment import (
+        build_project_command_env,
+        project_program_note,
+    )
+
     try:
+        env = build_project_command_env(
+            cwd,
+            declared=launch_settings or (),
+            repository=repository if repository is not None else cwd,
+        )
         completed = subprocess.run(  # noqa: S602 — the repo's own declared command
             command,
             shell=True,
             cwd=str(cwd),
+            env=env,
             capture_output=True,
             text=True,
             timeout=timeout_seconds,
         )
     except subprocess.TimeoutExpired:
+        # A TIMED-OUT COMMAND IS TOLD WHAT IT WAS NOT GIVEN too (design
+        # section 4): names only, never a value.
         return None, (
             f"the declared test command {command!r} did not finish within "
-            f"{timeout_seconds}s in {cwd}"
+            f"{timeout_seconds}s in {cwd}. "
+            + project_program_note(declared=launch_settings or ())
         )
     except Exception as exc:  # noqa: BLE001 — could not run is not could not pass
         return None, (
@@ -877,9 +905,17 @@ def _run_declared_command(
             f"{cwd}: {type(exc).__name__}: {exc}"
         )
     tail = (completed.stderr or completed.stdout or "").strip().splitlines()
+    # A FAILED COMMAND IS TOLD WHAT IT WAS NOT GIVEN (design section 4):
+    # names only, never a value.
+    note = (
+        " " + project_program_note(declared=launch_settings or ())
+        if completed.returncode != 0
+        else ""
+    )
     return completed.returncode, _detail_with_the_run_kept(
         f"`{command}` exited {completed.returncode} in {cwd}"
-        + (f" — last line: {tail[-1]}" if tail else ""),
+        + (f" — last line: {tail[-1]}" if tail else "")
+        + note,
         _both_streams(completed.stdout, completed.stderr),
         exit_code=completed.returncode,
         command=command,
@@ -2454,6 +2490,26 @@ def make_gates_green_reader(
         stamps_here: Callable[..., Any] | None = None
         if entry is None:
             load, run_command = _load, _run
+            if command_runner is None:
+                # THE PROJECT'S DECLARED NAMES, by name (13 October 2026): the
+                # command's environment is built from nothing now, so what the
+                # project declared for this build is handed over, read off the
+                # ledger exactly as the sandbox branch below reads it.
+                local_names = _the_builds_declared_settings(pool, build_id)
+
+                def run_command(  # type: ignore[misc]
+                    *,
+                    command: str,
+                    cwd: Any,
+                    timeout_seconds: int,
+                    _names: tuple[str, ...] = local_names,
+                ) -> Any:
+                    return _run_declared_command(
+                        command=command,
+                        cwd=cwd,
+                        timeout_seconds=timeout_seconds,
+                        launch_settings=_names,
+                    )
         else:
             def load(repo_root: Any, _entry: Any = entry, _repo: str = repo_key) -> Any:
                 return _sandbox_load(repo_root, sandbox=_entry, repo=_repo)

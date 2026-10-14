@@ -62,6 +62,7 @@ async def _execute_via_deepagents(
     command: list[str],
     cwd: str,
     timeout: int,
+    env: dict[str, str],
 ) -> tuple[str, str, int, float, bool]:
     """Default seam — delegates to :func:`asyncio.create_subprocess_exec`.
 
@@ -77,7 +78,7 @@ async def _execute_via_deepagents(
     from forge.build import git_operations as _git
 
     return await _git._execute_via_deepagents(
-        command=command, cwd=cwd, timeout=timeout
+        command=command, cwd=cwd, timeout=timeout, env=env
     )
 
 
@@ -159,6 +160,7 @@ async def verify_tests(
     test_command: str = "pytest",
     timeout_seconds: int = 600,
     output_tail_chars: int = 4000,
+    repository: Path | None = None,
 ) -> TestVerificationResult:
     """Run ``test_command`` inside ``worktree_path`` and parse its output.
 
@@ -196,13 +198,36 @@ async def verify_tests(
             f"{sorted(ALLOWED_BINARIES)!r}; allowlist changes require an ADR"
         )
 
+    # THE PROJECT'S TESTS ARE THE PROJECT'S OWN PROGRAM (13 October 2026), so
+    # they are given an environment built from nothing — none of the
+    # factory's credentials, a private HOME and TMPDIR in the repository's
+    # own git directory.
+    from forge.launch_environment import (
+        build_project_command_env,
+        project_program_note,
+    )
+
+    # Anchored on the checkout itself (``repository``, or the worktree, which
+    # is a checkout of its own): no folder above it is ever looked at.
+    env = build_project_command_env(
+        worktree_path,
+        repository=repository if repository is not None else worktree_path,
+    )
     stdout, _stderr, exit_code, duration, timed_out = await _execute_via_deepagents(
         command=argv,
         cwd=str(worktree_path),
         timeout=timeout_seconds,
+        env=env,
     )
 
     output_tail = stdout[-output_tail_chars:] if output_tail_chars > 0 else ""
+
+    # A FAILED OR TIMED-OUT RUN IS TOLD WHAT IT WAS NOT GIVEN (design section
+    # 4): the names of the settings the factory holds and did not pass, never
+    # a value. It follows the run's own tail.
+    def _with_the_note(tail: str) -> str:
+        note = project_program_note()
+        return f"{tail}\n{note}" if tail else note
 
     if timed_out or exit_code == 124:
         return TestVerificationResult(
@@ -210,7 +235,7 @@ async def verify_tests(
             pass_count=0,
             fail_count=0,
             failing_tests=[TIMEOUT_MARKER],
-            output_tail=output_tail,
+            output_tail=_with_the_note(output_tail),
             duration_seconds=duration,
         )
 
@@ -227,6 +252,6 @@ async def verify_tests(
         pass_count=pass_count,
         fail_count=fail_count,
         failing_tests=failing_tests,
-        output_tail=output_tail,
+        output_tail=output_tail if passed else _with_the_note(output_tail),
         duration_seconds=parsed_duration,
     )

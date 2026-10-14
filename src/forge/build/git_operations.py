@@ -65,8 +65,16 @@ async def _execute_via_deepagents(
     command: list[str],
     cwd: str,
     timeout: int,
+    env: dict[str, str],
 ) -> tuple[str, str, int, float, bool]:
     """Default seam — async subprocess executor (no shell).
+
+    ``env`` is REQUIRED (13 October 2026): the caller decides exactly what
+    the child is given. The git and gh operations below pass the factory's
+    own environment by name; the build's test run
+    (:func:`forge.build.test_verification.verify_tests`) passes a project
+    program's, built from nothing, so it carries none of the factory's
+    credentials.
 
     The kw-only signature matches the recorder in
     ``tests/bdd/conftest.py::execute_seam_recorder``. Production
@@ -87,6 +95,7 @@ async def _execute_via_deepagents(
     proc = await asyncio.create_subprocess_exec(
         *command,
         cwd=cwd,
+        env=env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -172,7 +181,12 @@ async def _run_via_execute(
     # Read the seam through the module so monkeypatching
     # ``_execute_via_deepagents`` at module scope is visible here.
     return await _execute_via_deepagents(
-        command=command, cwd=str(worktree_path), timeout=timeout
+        command=command,
+        cwd=str(worktree_path),
+        timeout=timeout,
+        # git and gh are the factory's own programs, and gh reads its token
+        # from this process's environment: they are given it, by name.
+        env=dict(os.environ),
     )
 
 

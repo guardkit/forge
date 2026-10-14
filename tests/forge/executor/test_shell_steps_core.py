@@ -55,8 +55,10 @@ class TestScriptExecution:
     def test_extra_env_merged_into_subprocess_environment(self, tmp_path, monkeypatch):
         """extra_env entries are exposed to the script alongside ENV_FILE (O-32).
 
-        The merge happens AFTER the ENV_FILE line, so extra_env wins on a key
-        collision — pinned here by overriding ENV_FILE itself.
+        Changed 13 October 2026: ``ENV_FILE`` is a value the factory sets for
+        this one command, and the request's overlay may not name it too. So
+        ``extra_env`` here no longer carries it; the clash itself is refused
+        (see the credentials tests).
         """
         from forge.executor.shell_steps import _run_script_step
 
@@ -74,12 +76,12 @@ class TestScriptExecution:
             cwd=str(tmp_path),
             script=str(script),
             env_file=str(env_file),
-            extra_env={"REVERT": "1", "ENV_FILE": "/overridden/by/extra_env"},
+            extra_env={"REVERT": "1"},
         )
 
         assert exit_code == 0
         assert "REVERT=1" in output
-        assert "ENV_FILE=/overridden/by/extra_env" in output
+        assert f"ENV_FILE={env_file}" in output
 
     def test_extra_env_none_leaves_environment_untouched(self, tmp_path, monkeypatch):
         """extra_env=None (the default) adds nothing — never-raises posture unchanged."""
@@ -414,3 +416,16 @@ class TestEnvFileValidation:
         # The script itself runs successfully; env_file is just passed as a path
         assert exit_code == 0
         assert "ok" in output
+
+
+@pytest.fixture(autouse=True)
+def _tmp_path_is_a_checkout(tmp_path):
+    """A project's own program runs only inside a git checkout (13 October
+    2026): its private HOME and TMPDIR are made in the checkout's own git
+    directory, outside the project's files. So the folder these tests run
+    programs in is one."""
+    import subprocess as _subprocess
+
+    _subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )

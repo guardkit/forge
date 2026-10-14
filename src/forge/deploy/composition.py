@@ -136,6 +136,7 @@ def build_deploy_stage_runner(
     #: from ``build_id`` being absent: that is also what a dropped stamp looks
     #: like, and the whole point is to tell the two apart.
     by_hand: bool = False,
+    launch_settings: tuple[str, ...] = (),
 ) -> DeployStageRunner | None:
     """Compose the deploy-stage runner, gated on ``config.enabled``.
 
@@ -199,6 +200,7 @@ def build_deploy_stage_runner(
         build_id=build_id,
         start_commit=start_commit,
         by_hand=by_hand,
+        launch_settings=tuple(launch_settings),
     )
 
 
@@ -261,6 +263,7 @@ async def dispatch_deploy_stage(
     by_hand: bool = False,
     identity_env: dict[str, str] | None = None,
     ask_env: dict[str, str] | None = None,
+    issued_env: Any = None,
 ) -> DeployStageResult | None:
     """Dispatch one DEPLOY (+ optional LIVE_GATE) stage through the runner.
 
@@ -293,7 +296,9 @@ async def dispatch_deploy_stage(
     * ``"preview_up"`` / ``"preview_journey"`` — the review preview's
       :meth:`DeployStageRunner.preview_up` and
       :meth:`DeployStageRunner.preview_journey`, run in ``candidate_cwd`` (the
-      preview's laid-out tree) with ``identity_env`` as the preview's overlay.
+      preview's laid-out tree) with ``issued_env`` — the values the preview
+      issued (:class:`forge.deploy.review_preview.IssuedPreviewValues`) —
+      carried apart from every other setting.
 
     Any other word is refused with a ``ValueError`` before a seam is touched.
 
@@ -320,6 +325,9 @@ async def dispatch_deploy_stage(
         build_id=build_id,
         start_commit=declared_at,
         by_hand=by_hand,
+        # THE BUILD'S DECLARED SETTING NAMES, for every step that runs the
+        # project's own scripts (14 October 2026) — not only the compose step.
+        launch_settings=tuple(launch_settings),
     )
     if runner is None:
         # Flag OFF — no dispatch. Byte-for-byte no-op.
@@ -410,18 +418,27 @@ async def dispatch_deploy_stage(
         # dispatch the merge press already uses is reused unchanged, so the
         # preview is composed exactly as a candidate is — the same sandbox,
         # the same stamps, the same live-gate driver. ``candidate_cwd`` is the
-        # preview's laid-out tree and ``identity_env`` carries the preview's
-        # overlay: both are "the working directory and the values the caller
-        # made for this leg", which is all the dispatcher's two parameters
-        # have ever been.
+        # preview's laid-out tree. The preview's values are the ones it ISSUED
+        # (13 October 2026): they travel as ``issued_env``, apart from every
+        # other setting, so the link token reaches the project's programs
+        # while every other credential-shaped name stays refused. A plain
+        # mapping is not accepted here: only the preview's own preparation
+        # makes these.
+        from forge.deploy.review_preview import IssuedPreviewValues
+
         if not candidate_cwd:
             raise ValueError(f"the {leg} leg needs the preview's laid-out tree")
+        if not isinstance(issued_env, IssuedPreviewValues):
+            raise ValueError(
+                f"the {leg} leg takes the values the preview issued, and was "
+                "handed none"
+            )
         if leg == "preview_up":
             return await runner.preview_up(
                 profile,
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
-                preview_env=dict(identity_env or {}),
+                issued_env=issued_env,
                 cwd=candidate_cwd,
                 memory_project=memory_project,
                 launch_settings=tuple(launch_settings),
@@ -431,7 +448,7 @@ async def dispatch_deploy_stage(
             correlation_id=correlation_id,
             deploy_run_id=deploy_run_id,
             feature=str(feature or feat_id or profile.env_id),
-            preview_env=dict(identity_env or {}),
+            issued_env=issued_env,
             cwd=candidate_cwd,
         )
     raise ValueError(

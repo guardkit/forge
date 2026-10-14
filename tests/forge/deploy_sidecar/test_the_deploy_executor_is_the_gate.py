@@ -1106,8 +1106,10 @@ class TestTheEnvironmentDoor:
         assert "SOMETHING_ON_NO_LIST" not in said
         assert "GH_TOKEN" not in said
         assert "SOME_TOOL_CACHE=the project asked for this" in said
-        assert "GUARDKIT_MEMORY_PROJECT=widget_shop" in said
-        assert "GUARDKIT_FACTORY_LAUNCH=1" in said
+        # A deploy step is the project's own program, not a build (13 October
+        # 2026): it is given no memory name and no factory-launch marker.
+        assert "GUARDKIT_MEMORY_PROJECT" not in said
+        assert "GUARDKIT_FACTORY_LAUNCH" not in said
         assert "DEPLOY_IDENTITY=j-abcdef@1234" in said
 
     def test_the_identity_travels_under_the_name_the_project_declared(
@@ -2014,3 +2016,16 @@ class _Background:
                         break
         if self._thread is not None:
             self._thread.join(timeout=30)
+
+
+@pytest.fixture(autouse=True)
+def _tmp_path_is_a_checkout(tmp_path):
+    """A project's own program runs only inside a git checkout (13 October
+    2026): its private HOME and TMPDIR are made in the checkout's own git
+    directory, outside the project's files. So the folder these tests run
+    programs in is one."""
+    import subprocess as _subprocess
+
+    _subprocess.run(
+        ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
+    )

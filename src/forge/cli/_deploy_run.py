@@ -67,14 +67,64 @@ def _resolve_db_path() -> Path:
     return Path(raw).expanduser() if raw else DEFAULT_DB_PATH.expanduser()
 
 
+def _declared_launch_settings(repo: str, repo_path: Path) -> tuple[str, ...]:
+    """The setting names the project declares, read at the commit being deployed.
+
+    An attended deploy names no build, so there is no ledger row to take the
+    names from. They are read the way every other door reads them: the
+    ``launch:`` block of the project's own ``.guardkit/config.yaml`` as it is
+    COMMITTED at the checkout's HEAD — the commit this deploy runs — never a
+    line in its working copy (14 October 2026). A project that declares
+    nothing gets nothing; a declaration that cannot be used refuses the deploy
+    in plain words before anything starts.
+    """
+    from forge.deploy_sidecar.service import _has_committed_history, _the_project_at
+    from forge.planning.declared_memory import (
+        DECLARATION_PATH,
+        read_declared_launch_settings,
+    )
+
+    content, found, unreadable_because = _the_project_at(
+        repo_path, "HEAD", DECLARATION_PATH
+    )
+    if unreadable_because is not None and not _has_committed_history(repo_path):
+        # A copy with no commits has no committed line to read, so it
+        # declares nothing — the same answer the helper service gives.
+        logger.warning(
+            "forge deploy: %s has no committed history, so no setting names "
+            "were taken from its %s",
+            repo_path,
+            DECLARATION_PATH,
+        )
+        return ()
+    answer = read_declared_launch_settings(
+        repo=repo,
+        commit="HEAD",
+        at=f"the committed HEAD of {repo_path}",
+        content=content,
+        found=found,
+        unreadable_because=unreadable_because,
+    )
+    if answer.refusal is not None:
+        raise click.ClickException(
+            f"refusing to deploy {repo!r}: {answer.refusal}"
+        )
+    return tuple(answer.names)
+
+
 def _make_live_gate_invoker(
-    profile: DeployProfile, repo_path: Path
+    profile: DeployProfile,
+    repo_path: Path,
+    launch_settings: tuple[str, ...] = (),
 ) -> LiveGateInvoker | None:
     """Build the per-target real live-gate backend from ``profile.live_gate``.
 
     Returns ``None`` when the profile carries no ``live_gate`` section — the
     seam then stays ``Unconfigured`` and loud-fails at the step (deny by
     default). A test seam: patched to inject a fixed-verdict invoker.
+
+    ``launch_settings`` are the names the project declared: the driver's
+    environment is built from nothing, so they are handed over by name.
     """
     spec = profile.live_gate
     if spec is None:
@@ -84,6 +134,7 @@ def _make_live_gate_invoker(
         driver_argv=list(spec.driver),
         timeout_seconds=spec.timeout_seconds,
         extra_env=dict(spec.env),
+        launch_settings=launch_settings,
     )
 
 
@@ -139,6 +190,7 @@ async def _adispatch(
     deploy_run_id: str,
     deployer: str | None,
     target_repo: str,
+    launch_settings: tuple[str, ...] = (),
 ) -> Any | None:
     """Open backends, dispatch the deploy stage, then tear the backends down."""
     (
@@ -173,6 +225,9 @@ async def _adispatch(
             # stamp looks like. So this run says what it is: by hand, at the
             # committed HEAD of the copy the helper has.
             by_hand=True,
+            # WHAT THE PROJECT DECLARED, read at the commit being deployed
+            # (14 October 2026), for every step that runs its own scripts.
+            launch_settings=tuple(launch_settings),
         )
     finally:
         await closer()
@@ -231,7 +286,8 @@ def execute_deploy(
             f"target repo {repo!r} is not deployable: {exc}"
         ) from exc
 
-    invoker = _make_live_gate_invoker(profile, repo_path)
+    launch_settings = _declared_launch_settings(repo, repo_path)
+    invoker = _make_live_gate_invoker(profile, repo_path, launch_settings)
     correlation_id = correlation or f"deploy-{uuid.uuid4()}"
     deploy_run_id = str(uuid.uuid4())
 
@@ -248,6 +304,7 @@ def execute_deploy(
             deploy_run_id=deploy_run_id,
             deployer=deployer,
             target_repo=repo,
+            launch_settings=launch_settings,
         )
     )
 

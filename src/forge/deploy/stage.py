@@ -108,7 +108,7 @@ import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
 
 from nats_core.events import (
     AssertionResult,
@@ -155,6 +155,21 @@ from forge.executor.registry import StepTypeRegistry
 from forge.executor.shell_steps import ScriptRunner
 from forge.persistence.repositories.runbook import RunbookRepository
 from forge.persistence.repositories.runbook_models import Runbook, Step
+
+if TYPE_CHECKING:  # pragma: no cover - typing only
+    from forge.deploy.review_preview import IssuedPreviewValues
+
+#: The runbook steps that run the project's own scripts.
+_STEPS_THAT_RUN_PROJECT_SCRIPTS: frozenset[str] = frozenset(
+    {
+        "deploy_compose",
+        "health_check",
+        "run_smoke_tests",
+        "seed_fixtures",
+        "import_realm",
+        "warm_models",
+    }
+)
 
 logger = logging.getLogger(__name__)
 
@@ -549,6 +564,7 @@ class DeployStageRunner:
         build_id: str | None = None,
         start_commit: str | None = None,
         by_hand: bool = False,
+        launch_settings: tuple[str, ...] = (),
     ) -> None:
         self._repo = repository
         self._runbook_publisher = runbook_publisher
@@ -590,6 +606,12 @@ class DeployStageRunner:
         # it is never derived from "there is no build here", because that
         # would turn a dropped stamp into a claim.
         self._by_hand = bool(by_hand)
+        # THE SETTING NAMES THE PROJECT DECLARED for this build (14 October
+        # 2026), read off the coordinator's ledger by whoever composed this
+        # stage. Every step that runs the project's own scripts is handed them
+        # (:meth:`_with_the_checkout`), so a health check, a fixture script or
+        # a smoke test gets what the project declared, as the deploy step does.
+        self._launch_settings = tuple(str(name) for name in launch_settings)
 
     def _resolve_script_runner(self) -> ScriptRunner | None:
         """The docker-touching-step execution seam for this stage.
@@ -941,7 +963,7 @@ class DeployStageRunner:
         *,
         correlation_id: str,
         deploy_run_id: str,
-        preview_env: dict[str, str],
+        issued_env: "IssuedPreviewValues",
         cwd: str,
         memory_project: str | None = None,
         launch_settings: tuple[str, ...] = (),
@@ -950,11 +972,13 @@ class DeployStageRunner:
 
         The candidate leg's own deploy steps — the same runbook, the same
         sidecar, the project's own deploy script — run in the preview's laid-out
-        tree ``cwd``. ``preview_env`` is the overlay that makes it a preview and
-        names it (the slot's ports and address, the link token, the resource
-        label, the evidence folder and the compose project); it goes to the
-        deploy step with ``PREVIEW=1`` beside it, and to the health checks, the
-        way ``candidate.env`` goes to the candidate's.
+        tree ``cwd``. ``issued_env`` is what makes it a preview and names it
+        (the slot's ports and address, the link token, the resource label, the
+        evidence folder and the compose project): the values the preview
+        ISSUED to the project (13 October 2026). They go to the deploy step
+        with ``PREVIEW=1`` beside them, and to the health checks, as the
+        steps' ``issued_env`` — never in their ``extra_env`` — so the helper
+        can tell an issued token from a factory credential.
 
         A preview is not a deploy: no queue, start or failure event is
         published, no deploy record is written and no reservation is taken.
@@ -967,8 +991,8 @@ class DeployStageRunner:
             runbook_id=f"deploy-pv-{deploy_run_id}",
             target=profile.env_id,
             now=self._clock(),
-            compose_extra_env={"PREVIEW": "1", **preview_env},
-            check_extra_env=dict(preview_env),
+            compose_issued_env={"PREVIEW": "1", **issued_env.as_dict()},
+            check_issued_env=issued_env.as_dict(),
             cwd_override=cwd,
             inside_sandbox=self._runs_inside_the_sandbox(),
             memory_project=memory_project,
@@ -1018,7 +1042,7 @@ class DeployStageRunner:
         correlation_id: str,
         deploy_run_id: str,
         feature: str,
-        preview_env: dict[str, str],
+        issued_env: "IssuedPreviewValues",
         cwd: str,
     ) -> DeployStageResult:
         """THE REVIEW PREVIEW'S RECORDED JOURNEY (web readiness W7).
@@ -1052,7 +1076,9 @@ class DeployStageRunner:
             now=self._clock(),
         )
         invoker_override = self._gate_invoker_for(
-            driver_cwd_override=cwd, driver_env_overlay=dict(preview_env)
+            driver_cwd_override=cwd,
+            driver_env_overlay=None,
+            driver_issued_env=issued_env,
         )
         # Only this journey reads the driver's evidence fields (its report,
         # screenshots, video and counts); every other gate reads the envelope
@@ -1584,6 +1610,7 @@ class DeployStageRunner:
         its driver addresses the ``-cand`` instance). ``None`` = the injected
         invoker unchanged.
         """
+        runbook = self._with_the_checkout(runbook)
         self._repo.create_runbook(runbook, correlation_id=correlation_id)
         executor = RunbookExecutor(
             self._repo,
@@ -1591,6 +1618,44 @@ class DeployStageRunner:
             self._runbook_publisher,
         )
         return await executor.run(runbook.runbook_id, correlation_id=correlation_id)
+
+    def _with_the_checkout(self, runbook: Runbook) -> Runbook:
+        """The runbook with its script steps told what the project declared,
+        and which checkout they belong to.
+
+        EVERY STEP THAT RUNS THE PROJECT'S SCRIPTS IS GIVEN THE BUILD'S
+        DECLARED SETTING NAMES (14 October 2026), unless the step already
+        carries its own: a project program's environment is built from
+        nothing, so a step without them would run with none of what the
+        project declared.
+
+        THE PROJECT'S SCRIPTS GET A PRIVATE HOME IN THEIR OWN CHECKOUT'S GIT
+        DIRECTORY (13 October 2026), and for a repository with no sandbox
+        this stage knows that checkout (``target_repo_root``). Each step that
+        runs the project's scripts is handed it as ``repository``, so the home
+        is made there and no folder above it is ever looked at. A repository
+        with a sandbox is left as it is: its scripts run in the sandbox's
+        helper, which knows its own checkout.
+        """
+        checkout = (
+            str(self._target_repo_root)
+            if self._sandbox is None and self._target_repo_root
+            else None
+        )
+        if checkout is None and not self._launch_settings:
+            return runbook
+
+        def told(step: Step) -> Step:
+            if step.step_type not in _STEPS_THAT_RUN_PROJECT_SCRIPTS:
+                return step
+            params = dict(step.params)
+            if checkout is not None:
+                params["repository"] = checkout
+            if self._launch_settings and not params.get("launch_settings"):
+                params["launch_settings"] = list(self._launch_settings)
+            return replace(step, params=params)
+
+        return replace(runbook, steps=tuple(told(step) for step in runbook.steps))
 
     def _claims_from_runbook(
         self, runbook: Runbook | None, *, when: datetime
@@ -1654,6 +1719,7 @@ class DeployStageRunner:
         *,
         driver_cwd_override: str | None,
         driver_env_overlay: dict[str, str] | None,
+        driver_issued_env: "IssuedPreviewValues | None" = None,
     ) -> LiveGateInvoker | None:
         """The invoker a gate run uses: moved into a tree, then given an overlay.
 
@@ -1697,6 +1763,25 @@ class DeployStageRunner:
                 logger.debug(
                     "live-gate invoker has no with_extra_env; candidate driver "
                     "overlay not applied"
+                )
+        # THE VALUES THE REVIEW PREVIEW ISSUED (13 October 2026), carried on
+        # their own so the helper can tell them from a factory credential. An
+        # invoker that cannot carry them separately refuses the gate rather
+        # than running the journey without them or mixing them into its
+        # ordinary overlay: a preview runs only inside a sandbox, and its
+        # invoker is the helper's.
+        if driver_issued_env is not None and not isinstance(
+            invoker_override, RefusingLiveGateInvoker
+        ):
+            base = invoker_override or self._live_gate_invoker
+            with_issued = getattr(base, "with_issued_env", None)
+            if callable(with_issued):
+                invoker_override = with_issued(driver_issued_env)
+            else:
+                invoker_override = RefusingLiveGateInvoker(
+                    f"the live-gate invoker ({type(base).__name__}) cannot carry "
+                    "the values the review preview issued, which run only in "
+                    "the repository's sandbox"
                 )
         return invoker_override
 

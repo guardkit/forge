@@ -5497,6 +5497,7 @@ def build_in_daemon_deploy_dispatcher(
         deploy_ownership: dict[str, Any] | None = None,
         identity_env: dict[str, str] | None = None,
         ask_env: dict[str, str] | None = None,
+        issued_env: Any = None,
     ) -> Any:
         from forge.adapters.nats.deploy_publisher import DeployPublisher
         from forge.adapters.nats.runbook_publisher import RunbookPublisher
@@ -5591,6 +5592,10 @@ def build_in_daemon_deploy_dispatcher(
                 driver_argv=list(spec.driver),
                 timeout_seconds=spec.timeout_seconds,
                 extra_env=dict(spec.env),
+                # The driver's environment is built from nothing now (13
+                # October 2026), so the names the project declared are handed
+                # over by name, as they are to the sandbox's helper.
+                launch_settings=build_declared,
             )
         connection = connect_writer(db_path)
         # Boot-idempotent DDL — the production DB predates it (C4 live-caught:
@@ -5664,6 +5669,10 @@ def build_in_daemon_deploy_dispatcher(
             # asked with. Both are names the project chose; this carries them.
             identity_env=identity_env,
             ask_env=ask_env,
+            # THE VALUES THE REVIEW PREVIEW ISSUED (13 October 2026), carried
+            # apart from ``identity_env`` all the way to the helper, which
+            # checks them again before a program is given them.
+            issued_env=issued_env,
         )
 
     return _dispatch

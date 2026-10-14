@@ -1107,9 +1107,14 @@ async def git_is_ancestor(
     root = Path(repo_root)
     args = ("merge-base", "--is-ancestor", str(ancestor), str(descendant))
     try:
+        # The whole command written inline (14 October 2026), so the launch
+        # guard can see it is git and nothing else.
         proc = await asyncio.create_subprocess_exec(
             "git",
-            *args,
+            "merge-base",
+            "--is-ancestor",
+            str(ancestor),
+            str(descendant),
             cwd=str(root),
             stdout=asyncio.subprocess.DEVNULL,
             stderr=asyncio.subprocess.DEVNULL,
