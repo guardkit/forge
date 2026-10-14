@@ -81,7 +81,13 @@ from typing import Any, Callable, Mapping, Sequence
 import click
 import yaml
 
-from forge.network_git import sandbox_git_command, sandbox_network_git, transport_of
+from forge.network_git import (
+    NetworkRefused,
+    proxy_environment,
+    sandbox_git_command,
+    sandbox_network_git,
+    transport_of,
+)
 from forge.project_git import FIXED_SETTINGS
 
 __all__ = ["register_repo_cmd"]
@@ -932,6 +938,12 @@ def check_project(
         host = urlsplit(url).hostname or ""
         address, transport = f"git@{host}:{org}/{leaf}.git", "ssh"
         credential_env["GIT_SSH_COMMAND"] = the_ssh_command_for(str(key_file), str(known_hosts))
+    # This machine's proxy settings, when it has any and they carry no login
+    # (one with a login is refused by name, before anything runs).
+    try:
+        proxies = proxy_environment()
+    except NetworkRefused as refused:
+        raise Refused("project", refused.sentence) from None
     # A fresh empty home folder for the clone, made after every check.
     home = Path(tempfile.mkdtemp(prefix="git-home-", dir=folder))
     cloned = _call(
@@ -943,6 +955,7 @@ def check_project(
             transport=transport,
             home=str(home),
             credential_env=credential_env,
+            proxy_env=proxies,
         ),
         timeout=CLONE_TIMEOUT,
     )
@@ -1362,10 +1375,13 @@ def check_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: st
             f"(git check-ignore stopped with exit code {ignored.returncode})",
         )
 
-    readable = sandbox_network_git(
-        sandbox, ["ls-remote", "--", url, "HEAD"], bare=True,
-        transport=transport_of(url) or "https",
-    )
+    try:
+        readable = sandbox_network_git(
+            sandbox, ["ls-remote", "--", url, "HEAD"], bare=True,
+            transport=transport_of(url) or "https",
+        )
+    except NetworkRefused as refused:
+        raise Refused("clone", f"{refused.sentence} Nothing was written") from None
     if readable.returncode != 0 or not readable.stdout.strip():
         raise Refused(
             "clone",
@@ -1396,12 +1412,15 @@ def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str
     """``git clone <url> <projects folder>/<leaf>`` as the sandbox user, from a
     fresh empty folder, into the absolute target path, isolated."""
     target = f"{clone.rstrip('/')}/{PROJECTS_FOLDER}/{leaf}"
-    made = sandbox_network_git(
-        sandbox,
-        ["clone", "--quiet", "--no-recurse-submodules", "--template=", "--", url, target],
-        bare=False,
-        transport=transport_of(url) or "https",
-    )
+    try:
+        made = sandbox_network_git(
+            sandbox,
+            ["clone", "--quiet", "--no-recurse-submodules", "--template=", "--", url, target],
+            bare=False,
+            transport=transport_of(url) or "https",
+        )
+    except NetworkRefused as refused:
+        raise Refused("clone", refused.sentence) from None
     if made.returncode != 0:
         raise Refused(
             "clone",

@@ -79,6 +79,7 @@ import os
 import re
 import shutil
 import sqlite3
+import subprocess
 import threading
 import uuid
 from collections.abc import Mapping
@@ -105,7 +106,7 @@ from typing_extensions import NotRequired, Required, TypedDict
 
 from forge import build_processes, receipts as _receipts
 from forge.lifecycle.feature_routing import FeatureRoutingError
-from forge.project_git import run_git, run_git_async
+from forge.project_git import run_git, run_git_async, timeout_sentence
 from forge.subagents import build_monitor
 from forge.subagents.autobuild_worktree_lifecycle import inspect_autobuild_worktree
 from forge.launch_environment import build_launch_env
@@ -2108,6 +2109,11 @@ class WorktreeMaterialisationError(RuntimeError):
     """Raised when a branch-isolated worktree cannot be created (DEFECT #19)."""
 
 
+#: How long one of the runner's own git commands may take: the planning
+#: runner's per-operation limit (``WorktreeGitRunner(op_timeout_s=180.0)``).
+GIT_COMMAND_TIMEOUT_SECONDS: float = 180.0
+
+
 async def _run_git(args: list[str], *, cwd: Path) -> tuple[int, str]:
     """Run ``git <args>`` in ``cwd``; return ``(returncode, text)``.
 
@@ -2124,9 +2130,21 @@ async def _run_git(args: list[str], *, cwd: Path) -> tuple[int, str]:
     standard output, which callers parse as data. On failure ``text`` is only
     the helper's fixed sentence ("git branch stopped with exit code 128."),
     never git's own error words, because callers put it in log lines and in
-    a build's failure reason. No time limit, as before.
+    a build's failure reason.
+
+    A TIME LIMIT (coach fix pass, 14 October 2026): the command runs in a
+    worker thread, so a git that never finishes would hold that thread for
+    ever. Each call gets :data:`GIT_COMMAND_TIMEOUT_SECONDS`, the same
+    per-operation limit the planning runner gives its git; a command that
+    does not finish is stopped and answers exit code 124 with the helper's
+    fixed sentence ("git worktree did not finish within 180 seconds.").
     """
-    done = await run_git_async(list(args), cwd=cwd)
+    try:
+        done = await run_git_async(list(args), cwd=cwd, timeout=GIT_COMMAND_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired as exc:
+        said = exc.stderr if isinstance(exc.stderr, str) else ""
+        label = next((a for a in args if not str(a).startswith("-")), "git")
+        return 124, said or timeout_sentence(str(label), GIT_COMMAND_TIMEOUT_SECONDS)
     code = done.returncode if done.returncode is not None else -1
     if code == 0:
         return code, (done.stdout or "").strip()

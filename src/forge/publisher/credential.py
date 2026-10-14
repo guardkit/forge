@@ -347,18 +347,15 @@ def the_remote_transport(address: str) -> str | None:
     ``ssh`` for the recognised SSH forms, ``https`` for an ``https://``
     address, else ``None``.
 
-    An absolute local folder answers ``file``. The publisher's settings never
-    accept one as a remote (:func:`a_remote_the_publisher_takes`), so only a
-    route built by hand, as the tests build theirs around a bare repository
-    on disk, can reach it; it is still exactly one transport.
+    Anything else, a local folder included, is refused here as the settings
+    refuse it (:func:`a_remote_the_publisher_takes`): a remote is only ever
+    reached over the network, with the route's own credential.
     """
     text = str(address or "").strip()
     if an_ssh_address(text):
         return "ssh"
     if text.startswith("https://"):
         return "https"
-    if text.startswith("/") and "://" not in text:
-        return "file"
     return None
 
 

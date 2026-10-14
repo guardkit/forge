@@ -1218,3 +1218,49 @@ def test_run_git_grep_still_searches(lab: Lab) -> None:
     assert done.returncode == 1  # a pattern that happens to look like -O is searched for
     found = pg.run_git(["grep", "-I", "-n", "-e", "one"], cwd=repo)
     assert found.returncode == 0 and "a.txt:1:one" in found.stdout
+
+
+# ---------------------------------------------------------------------------
+# Coach fix pass (14 October 2026): archive is an uncompressed tar only
+
+
+def test_planted_tar_filter_command_fires_with_plain_git(lab: Lab) -> None:
+    """Positive control: ``tar.<format>.command`` names a program that
+    ``git archive --format=<format>`` runs."""
+    repo = lab.base_repo("repo")
+    lab.setup_git(repo, "config", "tar.tgz.command", lab.path("clean"))
+    lab.fired()
+    lab.plain(repo, "archive", "--format=tgz", "HEAD")
+    fired = lab.fired()
+    assert "clean" in Lab.names(fired) and Lab.saw_secret(fired)
+
+
+@pytest.mark.parametrize(
+    "options",
+    [["--format=tgz"], ["--format=tar.gz"], ["--format=zip"], ["--format", "tgz"],
+     ["-o", "out.tgz"], ["--output=out.tar.gz"], ["--worktree-attributes", "--format=tar"],
+     ["--exec=x", "--format=tar"]],
+    ids=["tgz", "tar.gz", "zip", "two-word format", "-o", "--output", "worktree attributes",
+         "exec"],
+)
+def test_run_git_archive_is_an_uncompressed_tar_only(lab: Lab, options: List[str]) -> None:
+    pg = _pg()
+    repo = lab.base_repo("repo")
+    lab.setup_git(repo, "config", "tar.tgz.command", lab.path("clean"))
+    lab.setup_git(repo, "config", "tar.tar.gz.command", lab.path("clean"))
+    lab.fired()
+    done = pg.run_git(["archive", *options, "HEAD"], cwd=repo, text=False)
+    assert done.returncode != 0
+    assert done.stderr.decode() == pg.ARCHIVE_REFUSAL
+    assert lab.fired() == []
+    assert not (repo / "out.tgz").exists() and not (repo / "out.tar.gz").exists()
+    with pytest.raises(pg.GitRefused):
+        pg.open_git(["archive", *options, "HEAD"], cwd=repo)
+
+
+def test_run_git_archive_as_a_tar_still_works(lab: Lab) -> None:
+    pg = _pg()
+    repo = lab.base_repo("repo")
+    done = pg.run_git(["archive", "--format=tar", "--prefix=p/", "HEAD"], cwd=repo, text=False)
+    assert done.returncode == 0
+    assert b"p/a.txt" in done.stdout

@@ -839,6 +839,146 @@ def test_register_repo_ls_remote_ignores_a_surrounding_repository(
 
 
 # ---------------------------------------------------------------------------
+# Coach fix pass (14 October 2026)
+
+
+def _sandbox_with_proxies(answer: str) -> tuple[Any, list[list[str]]]:
+    """A stand-in sandbox whose proxy settings read back as ``answer``."""
+    from forge.cli import register_repo
+
+    commands: list[list[str]] = []
+
+    def run(argv, *, input=None, timeout=None):  # noqa: A002, ANN001
+        commands.append(list(argv))
+        if argv[5:7] == ["sh", "-c"]:
+            return subprocess.CompletedProcess(argv, 0, answer, "")
+        if "remote" in argv and "get-url" in argv:
+            return subprocess.CompletedProcess(argv, 0, "https://example.invalid/org/good\n", "")
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    return register_repo.SandboxStore("the-sandbox", run), commands
+
+
+def test_register_repo_sandbox_network_commands_carry_its_login_free_proxies() -> None:
+    """The sandbox reaches the internet through a proxy without a login; the
+    sandbox's own proxy settings are read and handed to the network command
+    (today ``env -i`` drops them, and ``sbx exec``'s own are not used)."""
+    from forge.cli import register_repo
+
+    sandbox, commands = _sandbox_with_proxies(
+        "HTTP_PROXY=http://proxy.invalid:3128\nHTTPS_PROXY=http://proxy.invalid:3128\n"
+        "NO_PROXY=localhost,127.0.0.1\nhttp_proxy=\nhttps_proxy=\nno_proxy=\n"
+        "ALL_PROXY=\nall_proxy=\n"
+    )
+    register_repo.make_sandbox_clone(sandbox, clone="/work/api_test", leaf="good",
+                                     url="https://example.invalid/org/good")
+    clone = next(c for c in commands if "clone" in c)
+    for value in ("HTTP_PROXY=http://proxy.invalid:3128", "HTTPS_PROXY=http://proxy.invalid:3128",
+                  "NO_PROXY=localhost,127.0.0.1"):
+        assert value in clone, value
+    assert not any(c.startswith(("http_proxy=", "ALL_PROXY=")) for c in clone)
+    reads = [c for c in commands if "remote" in c and "get-url" in c]
+    assert reads and not any("PROXY" in part.upper() for part in reads[0] if "=" in part)
+
+
+def test_register_repo_refuses_a_sandbox_proxy_with_a_login_by_name() -> None:
+    from forge.cli import register_repo
+
+    sandbox, commands = _sandbox_with_proxies("HTTPS_PROXY=http://user:secret@proxy.invalid:3128\n")
+    with pytest.raises(register_repo.Refused) as refused:
+        register_repo.make_sandbox_clone(sandbox, clone="/work/api_test", leaf="good",
+                                         url="https://example.invalid/org/good")
+    assert "HTTPS_PROXY" in str(refused.value)
+    assert "secret" not in str(refused.value)
+    assert not any("clone" in c for c in commands)
+
+
+def test_register_repo_check_clone_carries_the_machines_login_free_proxy(
+    served: SimpleNamespace, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge.cli import register_repo
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1,localhost")
+    seen: list[list[str]] = []
+
+    def run(argv, *, input=None, timeout=None):  # noqa: A002, ANN001
+        seen.append(list(argv))
+        return register_repo._run_command(argv, input=input, timeout=timeout or 120)
+
+    folder = tmp_path / "register"
+    folder.mkdir()
+    register_repo.check_project(run, key="org/good", url=served.http.url("org/good.git"),
+                                folder=folder)
+    clone = next(c for c in seen if "clone" in c)
+    assert "HTTPS_PROXY=http://proxy.invalid:3128" in clone
+    assert "NO_PROXY=127.0.0.1,localhost" in clone
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:secret@proxy.invalid:3128")
+    again = tmp_path / "again"
+    again.mkdir()
+    with pytest.raises(register_repo.Refused) as refused:
+        register_repo.check_project(run, key="org/good", url=served.http.url("org/good.git"),
+                                    folder=again)
+    assert "HTTPS_PROXY" in str(refused.value) and "secret" not in str(refused.value)
+
+
+def test_publisher_passes_a_login_free_proxy_and_refuses_one_with_a_login(
+    netlab: NetLab, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The publisher's own environment's proxy reaches its network commands
+    when it carries no login; one with a login is refused by name."""
+    commits = _route_commits(tmp_path, source=str(netlab.good), remote=netlab.recorded,
+                             token=None, monkeypatch=monkeypatch)
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("NO_PROXY", "127.0.0.1")
+    envs: list[dict[str, str]] = []
+    real = subprocess.run
+
+    def watch(argv, *args, **kwargs):  # noqa: ANN001, ANN003
+        if "fetch" in [str(a) for a in argv]:
+            envs.append(dict(kwargs.get("env") or {}))
+        return real(argv, *args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", watch)
+    assert commits.where_the_remotes_branch_is("main").ok
+    assert envs and envs[-1].get("HTTPS_PROXY") == "http://proxy.invalid:3128"
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:secret@proxy.invalid:3128")
+    said = commits.where_the_remotes_branch_is("main")
+    assert not said.ok
+    assert "HTTPS_PROXY" in said.said and "secret" not in said.said
+
+
+def test_publisher_refuses_a_remote_that_is_a_local_folder(tmp_path: Path) -> None:
+    """The settings never take a local folder as a remote, and neither does
+    the publisher's transport choice (today it answers ``file``)."""
+    from forge.publisher.credential import the_remote_transport
+
+    assert the_remote_transport(str(tmp_path / "remote.git")) is None
+    assert the_remote_transport("https://example.invalid/o/r.git") == "https"
+    assert the_remote_transport("git@example.invalid:o/r.git") == "ssh"
+
+
+def test_autobuild_git_calls_have_a_time_limit(monkeypatch: pytest.MonkeyPatch,
+                                               tmp_path: Path) -> None:
+    """A git command that does not finish is stopped, and the caller gets a
+    fixed sentence (today there is no limit and the thread waits forever)."""
+    from forge.subagents import autobuild_runner
+
+    asked: dict[str, Any] = {}
+
+    async def hangs(args, **kwargs):  # noqa: ANN001, ANN003
+        asked.update(kwargs)
+        raise subprocess.TimeoutExpired("git worktree", kwargs.get("timeout") or 0,
+                                        stderr="git worktree did not finish within 1 seconds.")
+
+    monkeypatch.setattr(autobuild_runner, "run_git_async", hangs)
+    code, text = asyncio.run(autobuild_runner._run_git(["worktree", "list"], cwd=tmp_path))
+    assert asked.get("timeout"), "a time limit is given"
+    assert code != 0
+    assert text.startswith("git worktree") and "did not finish within" in text
+
+
+# ---------------------------------------------------------------------------
 # Last: nothing in this module ran git without the helper's settings
 
 

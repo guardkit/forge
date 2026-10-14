@@ -54,6 +54,7 @@ import os
 import re
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
@@ -67,6 +68,8 @@ __all__ = [
     "COMMAND_OPTIONS",
     "FIXED_ENVIRONMENT",
     "FIXED_SETTINGS",
+    "ARCHIVE_REFUSAL",
+    "FORGE_ARCHIVE_OPTIONS",
     "FORGE_COMMAND_OPTIONS",
     "FORGE_REFUSED_OPTIONS",
     "GitRefused",
@@ -255,6 +258,12 @@ FORGE_REFUSED_OPTIONS: Dict[str, Tuple[str, ...]] = {
     "grep": ("-O", "--open-files-in-pager"),
 }
 
+#: The only options a factory ``git archive`` may carry: an uncompressed tar
+#: (``tar.<format>.command`` names a program for every other format, and
+#: ``-o <file>`` picks the format from the file name).
+FORGE_ARCHIVE_OPTIONS: Tuple[str, ...] = ("--format=tar",)
+FORGE_ARCHIVE_OPTION_PREFIXES: Tuple[str, ...] = ("--prefix=",)
+
 #: The only settings a caller may add with ``-c``: a folder-ownership
 #: exception, plain file names in output, and the repair branch's fallback
 #: commit identity. Anything else could switch a hook or a filter back on.
@@ -290,6 +299,11 @@ SETTINGS_REFUSAL = (
 UNSAFE_NAME_REFUSAL = (
     "git {command} was not run because the project's git settings use a name "
     "the factory cannot switch off."
+)
+ARCHIVE_REFUSAL = (
+    "The factory runs git archive only as an uncompressed tar of a commit "
+    "(--format=tar, optionally --prefix), because other formats and options "
+    "can run a program the settings name."
 )
 PAGER_REFUSAL = (
     "The factory does not run git grep with --open-files-in-pager, because it "
@@ -508,7 +522,8 @@ def _spawn(
 
 
 def _read_setting_names(
-    prefix: Sequence[str], cwd: Optional[str], timeout: float
+    prefix: Sequence[str], cwd: Optional[str], timeout: float,
+    env: Optional[Mapping[str, str]] = None,
 ) -> Optional[List[str]]:
     """Every setting name git sees in this place (includes followed).
 
@@ -517,9 +532,10 @@ def _read_setting_names(
     git's command line. ``None`` when the read did not succeed: it could not
     start, exited non-zero, or listed none of the repository's own settings
     although a repository is there. The caller then runs nothing. Raises
-    :class:`_ReadTimedOut` on a timeout.
+    :class:`_ReadTimedOut` on a timeout. ``env`` is the environment the
+    command itself will get (the default is :func:`_child_environment`'s).
     """
-    env = _child_environment({})
+    env = dict(env) if env is not None else _child_environment({})
     done = _spawn([*prefix, "config", "--list", "--name-only", "-z", "--show-scope"],
                   cwd, env, timeout)
     if done is None or done[0] != 0:
@@ -683,6 +699,19 @@ def _refusal_for(command: _Command) -> Optional[str]:
         return NETWORK_REFUSAL
     if name == "archive" and any(a == "--remote" or a.startswith("--remote=") for a in rest[1:]):
         return NETWORK_REFUSAL
+    if name == "archive":
+        options = []
+        for arg in rest[1:]:
+            if arg == "--":
+                break
+            if arg.startswith("-"):
+                options.append(arg)
+        if "--format=tar" not in options or any(
+            option not in FORGE_ARCHIVE_OPTIONS
+            and not option.startswith(FORGE_ARCHIVE_OPTION_PREFIXES)
+            for option in options
+        ):
+            return ARCHIVE_REFUSAL
     if name == "rebase":
         for arg in rest[1:]:
             if arg == "--":
@@ -887,7 +916,6 @@ def _launch(
 ) -> subprocess.CompletedProcess:
     kwargs: Dict[str, Any] = {
         "cwd": os.fspath(cwd) if cwd is not None else None,
-        "env": prepared.env,
         "capture_output": True,
         "timeout": timeout,
     }
@@ -903,7 +931,10 @@ def _launch(
         kwargs["stdin"] = subprocess.DEVNULL
     label = prepared.label
     try:
-        done = subprocess.run(prepared.argv, **kwargs)  # noqa: S603 - fixed argv
+        # The environment is passed by name, so the launch guard sees it.
+        done = subprocess.run(  # noqa: S603 - fixed argv
+            prepared.argv, env=prepared.env, **kwargs
+        )
     except subprocess.TimeoutExpired:
         sentence = timeout_sentence(label, timeout)
         raise subprocess.TimeoutExpired(
@@ -1068,27 +1099,49 @@ def run_from_local_copy(
     applied, because ``rest`` is that module's fixed ``fetch`` from a local
     folder; everything else is: the fixed settings, the names read just
     before and switched off, the fixed environment and the fixed sentence.
+
+    NO PERSONAL OR SYSTEM SETTINGS (coach fix pass, 14 October 2026). Git's
+    local upload-pack, which this fetch starts, honours
+    ``uploadpack.packObjectsHook`` from the personal and system settings
+    files. So, as for the network step, this command gets a fresh empty home
+    folder (removed after it), ``GIT_CONFIG_GLOBAL=/dev/null`` and
+    ``GIT_CONFIG_NOSYSTEM=1``: only the clone's own settings (whose program
+    names are switched off) and the fixed command-line settings are read.
     """
     dirs = [os.fspath(clone)]
     items = [str(a) for a in rest]
     label = items[0] if items else "git"
     shown = ["git", *items]
     read_timeout = min(float(timeout), _READ_TIMEOUT_S) if timeout else _READ_TIMEOUT_S
+    home = tempfile.mkdtemp(prefix="forge-git-home-")
     try:
-        names = _read_setting_names(_base_argv(dirs, [], literal=False), None, read_timeout)
-    except _ReadTimedOut:
-        names = None
-    if names is None:
-        return _refused(label, shown, SETTINGS_REFUSAL.format(command=label), True, False)
-    switch_offs = _switch_offs(names)
-    if switch_offs is None:
-        return _refused(label, shown, UNSAFE_NAME_REFUSAL.format(command=label), True, False)
-    argv = _base_argv(dirs, [], literal=False)
-    for setting in switch_offs:
-        argv += ["-c", setting]
-    argv += items
-    env = _child_environment({})
-    env["GIT_ALLOW_PROTOCOL"] = "file"
-    prepared = PreparedGit(argv, env, label)
-    return _launch(prepared, shown, cwd=None, check=False, timeout=timeout, input=None,
-                   text_mode=True, encoding=None, errors="replace")
+        env = _child_environment({})
+        for name in ("GIT_CONFIG_SYSTEM", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"):
+            env.pop(name, None)
+        env.update({
+            "HOME": home,
+            "XDG_CONFIG_HOME": os.path.join(home, ".config"),
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_CONFIG_GLOBAL": "/dev/null",
+            "GIT_ALLOW_PROTOCOL": "file",
+        })
+        try:
+            names = _read_setting_names(_base_argv(dirs, [], literal=False), None,
+                                        read_timeout, env=env)
+        except _ReadTimedOut:
+            names = None
+        if names is None:
+            return _refused(label, shown, SETTINGS_REFUSAL.format(command=label), True, False)
+        switch_offs = _switch_offs(names)
+        if switch_offs is None:
+            return _refused(label, shown, UNSAFE_NAME_REFUSAL.format(command=label), True,
+                            False)
+        argv = _base_argv(dirs, [], literal=False)
+        for setting in switch_offs:
+            argv += ["-c", setting]
+        argv += items
+        prepared = PreparedGit(argv, env, label)
+        return _launch(prepared, shown, cwd=None, check=False, timeout=timeout, input=None,
+                       text_mode=True, encoding=None, errors="replace")
+    finally:
+        shutil.rmtree(home, ignore_errors=True)

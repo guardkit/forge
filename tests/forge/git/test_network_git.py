@@ -316,3 +316,113 @@ def test_network_results_never_carry_git_text(netlab: NetLab) -> None:
     assert "IGNORE" not in done.said and "IGNORE" not in done.stdout
     assert done.said.startswith("git ls-remote stopped with exit code")
 
+
+
+# ---------------------------------------------------------------------------
+# Coach fix pass (14 October 2026)
+
+
+def test_a_refused_bring_in_leaves_no_wrong_tracking_ref(netlab: NetLab) -> None:
+    """Case C1: the clone's ``url.<other>.insteadOf`` rewrites the copy's folder
+    to another local repository. The bring-in is refused, and the clone's
+    ``refs/remotes/origin/main`` is not left pointing at the wrong commit."""
+    ng = _ng()
+    lab = netlab.lab
+    clone = netlab.clone()
+    copy = ng.factory_copy_for(netlab.recorded)
+    lab.setup_git(clone, "config", f"url.{netlab.good.parent / 'other.git'}.insteadOf", str(copy))
+    assert ng.fetch_start_point(netlab.clone("warm"), netlab.recorded).refusal is None
+    start = ng.fetch_start_point(clone, netlab.recorded, repo="org/good")
+    assert start.refusal == ng.REDIRECTED_SENTENCE
+    left = lab.plain(clone, "rev-parse", "-q", "--verify", "refs/remotes/origin/main")
+    assert left.stdout.strip() != netlab.other_commit
+    assert left.stdout.strip() in ("", netlab.good_commit)
+    all_branches = ng.fetch_all_branches(clone, netlab.recorded, repo="org/good")
+    assert all_branches.refusal == ng.REDIRECTED_SENTENCE
+    left = lab.plain(clone, "rev-parse", "-q", "--verify", "refs/remotes/origin/main")
+    assert left.stdout.strip() != netlab.other_commit
+
+
+def test_bringing_in_reads_no_personal_or_system_settings(
+    netlab: NetLab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Case C4: an ``uploadpack.packObjectsHook`` in Forge's own personal (or
+    system) settings is honoured by git's local upload-pack, so plain git runs
+    it with the secret visible. The local bring-in reads neither file."""
+    lab = netlab.lab
+    hook = f"[uploadpack]\n\tpackObjectsHook = {lab.path('envdump')}\n"
+    (lab.home / ".gitconfig").write_text(hook)
+    system = lab.root / "system-gitconfig"
+    system.write_text(hook)
+    monkeypatch.delenv("GIT_CONFIG_NOSYSTEM")
+    monkeypatch.setenv("GIT_CONFIG_SYSTEM", str(system))
+    ng = _ng()
+    assert ng.fetch_start_point(netlab.clone("warm"), netlab.recorded).refusal is None
+    copy = ng.factory_copy_for(netlab.recorded)
+    clone = netlab.clone()
+    lab.fired()
+    lab.plain(clone, "fetch", "--no-tags", "--", str(copy), "+refs/heads/main:refs/heads/plain")
+    fired = lab.fired()
+    assert "envdump" in Lab.names(fired)  # positive control
+    start = ng.fetch_start_point(clone, netlab.recorded, repo="org/good")
+    assert lab.fired() == []
+    assert start.refusal is None, start.refusal
+    assert start.commit == netlab.good_commit
+
+
+def test_a_credentialed_proxy_refuses_only_network_commands(
+    netlab: NetLab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A proxy with a login is refused by name for a command that reaches a
+    remote; local commands at the boundary (making the copy, reading its refs)
+    never look at proxies, and the sentence says it is about the proxy."""
+    ng = _ng()
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:pass@127.0.0.1:9")
+    made = netlab.lab.root / "local-only.git"
+    local = ng.run_network_git(["init", "--bare", "-q", str(made)], transport="none")
+    assert local.ok, local.said
+    reads = ng.run_network_git(["for-each-ref"], transport="none", git_dir=made)
+    assert reads.ok, reads.said
+    start = ng.fetch_start_point(netlab.clone(), netlab.recorded, repo="org/good")
+    assert start.refusal and "HTTPS_PROXY" in start.refusal
+    assert "could not be made" not in start.refusal
+    assert "pass@" not in start.refusal
+    assert netlab.http.seen == []
+
+
+def test_a_login_free_proxy_is_passed_to_network_commands(
+    netlab: NetLab, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ng = _ng()
+    lab = netlab.lab
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.invalid:3128")
+    monkeypatch.setenv("no_proxy", "127.0.0.1,localhost")
+    dump = lab.root / "ssh-environment.txt"
+    lab.program("envdump", f'env > "{dump}"\nexit 1\n')
+    ng.run_network_git(["ls-remote", "--", "ssh://lab@127.0.0.1:9/x.git"], transport="ssh",
+                       credential_env={"GIT_SSH_COMMAND": lab.path("envdump")}, timeout=20)
+    seen = dict(line.split("=", 1) for line in dump.read_text().splitlines() if "=" in line)
+    assert seen.get("HTTPS_PROXY") == "http://proxy.invalid:3128"
+    assert seen.get("no_proxy") == "127.0.0.1,localhost"
+    dump.unlink()
+    ng.run_network_git(["ls-remote", "--", "ssh://lab@127.0.0.1:9/x.git"], transport="none",
+                       credential_env={"GIT_SSH_COMMAND": lab.path("envdump")}, timeout=20)
+    assert not dump.exists() or "HTTPS_PROXY" not in dump.read_text()
+
+
+def test_the_sandbox_command_line_carries_login_free_proxies_only() -> None:
+    ng = _ng()
+    line = ng.sandbox_git_command(
+        ["sbx", "exec", "-u", "1000", "s"], ["ls-remote", "--", "https://example.invalid/o/r"],
+        transport="https", home="/tmp/h",
+        proxy_env={"HTTPS_PROXY": "http://proxy.invalid:3128", "NO_PROXY": "localhost"},
+    )
+    assert "HTTPS_PROXY=http://proxy.invalid:3128" in line
+    assert "NO_PROXY=localhost" in line
+    assert line.index("HTTPS_PROXY=http://proxy.invalid:3128") < line.index("git")
+    with pytest.raises(ng.NetworkRefused) as refused:
+        ng.sandbox_git_command(
+            ["sbx", "exec", "-u", "1000", "s"], ["ls-remote", "--", "https://example.invalid/o/r"],
+            transport="https", home="/tmp/h", proxy_env={"HTTPS_PROXY": "http://u:p@proxy:1"},
+        )
+    assert "HTTPS_PROXY" in str(refused.value) and "u:p" not in str(refused.value)

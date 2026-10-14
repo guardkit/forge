@@ -30,6 +30,7 @@ from click.testing import CliRunner
 
 from forge.cli import register_repo
 from forge.cli.main import main
+from forge.network_git import SANDBOX_PROXY_READ
 
 LEAF = "bench-one"
 KEY = f"guardkit/{LEAF}"
@@ -169,6 +170,9 @@ class FakeEstate:
         self.drained_answer: Any = None
         #: The environment the host's check clone was given.
         self.host_clone_env: dict[str, str] = {}
+        #: What the sandbox's proxy read answers, and how often it was asked.
+        self.sandbox_proxies = ""
+        self.proxy_reads = 0
         self.calls: list[list[str]] = []
         self.writes: list[str] = []
         self.project = tmp_path / "github" / LEAF
@@ -280,6 +284,10 @@ class FakeEstate:
             folder = command[2].rstrip("/") + "/"
             names = sorted(p[len(folder):] for p in self.sandbox_files if p.startswith(folder) and "/" not in p[len(folder):])
             return _ok("\n".join(names) + "\n")
+        if command[:2] == ["sh", "-c"] and command[2] == SANDBOX_PROXY_READ:
+            # The sandbox's own proxy settings (14 October 2026): none here.
+            self.proxy_reads += 1
+            return _ok(self.sandbox_proxies)
         if command[:2] == ["sh", "-c"]:
             assert interactive and input is not None
             assert command[2] == 'umask 077 && cat > "$1" && chmod "$(stat -c %a "$2")" "$1"'

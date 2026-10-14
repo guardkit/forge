@@ -595,7 +595,13 @@ def test_run_git_hands_its_command_to_the_git_helper(
         0,
         "out",
     )
-    assert seen == [(["worktree", "prune"], {"cwd": throwaway_repo})]
+    # With the runner's own time limit (14 October 2026).
+    assert seen == [
+        (
+            ["worktree", "prune"],
+            {"cwd": throwaway_repo, "timeout": ar.GIT_COMMAND_TIMEOUT_SECONDS},
+        )
+    ]
 
 
 # ---------------------------------------------------------------------------

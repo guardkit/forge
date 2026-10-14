@@ -60,6 +60,8 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "COPY_REFUSAL",
     "CREDENTIAL_ENVIRONMENT_NAMES",
+    "LOCAL_TRANSPORTS",
+    "NetworkRefused",
     "FETCH_ADDRESS_SETTING",
     "FETCH_COPIES_ENV",
     "FETCH_TRANSPORTS",
@@ -69,6 +71,7 @@ __all__ = [
     "REASONS",
     "StartPoint",
     "bring_in_from_copy",
+    "checked_proxies",
     "check_fetch_address",
     "factory_copy_for",
     "fetch_all_branches",
@@ -76,9 +79,11 @@ __all__ = [
     "https_address_problem",
     "isolated_environment",
     "no_fetch_address_sentence",
+    "proxy_environment",
     "run_network_git",
     "sandbox_git_command",
     "sandbox_network_git",
+    "sandbox_proxy_environment",
     "transport_of",
 ]
 
@@ -287,12 +292,27 @@ def address_for_path(
 # The isolated environment
 
 
-def _proxy_values() -> Dict[str, str]:
+#: Transports that reach nothing over a network, so no proxy is looked at.
+LOCAL_TRANSPORTS: Tuple[str, ...] = ("none", "file")
+
+
+def checked_proxies(values: Mapping[str, str]) -> Dict[str, str]:
+    """The proxy settings among ``values`` that may be handed to git.
+
+    Only :data:`PROXY_NAMES`, only when set to something, and never one that
+    carries a user name or password: that raises :class:`NetworkRefused`
+    with a sentence naming the setting (never its value).
+    """
     found: Dict[str, str] = {}
     for name in PROXY_NAMES:
-        value = os.environ.get(name)
-        if value is None:
+        value = str(values.get(name) or "")
+        if not value:
             continue
+        if any(ord(ch) < 32 for ch in value):
+            raise NetworkRefused(
+                f"The proxy setting {name} holds a control character, so the "
+                "command was not run (the value is not shown)."
+            )
         if name.upper() != "NO_PROXY":
             try:
                 parts = urlsplit(value if "://" in value else "http://" + value)
@@ -309,6 +329,15 @@ def _proxy_values() -> Dict[str, str]:
     return found
 
 
+def proxy_environment() -> Dict[str, str]:
+    """This process's login-free proxy settings (see :func:`checked_proxies`)."""
+    return checked_proxies(os.environ)
+
+
+def _proxy_values() -> Dict[str, str]:
+    return proxy_environment()
+
+
 def isolated_environment(
     transport: str,
     home: Path,
@@ -317,7 +346,8 @@ def isolated_environment(
     """The WHOLE environment a network git command gets. Built from nothing.
 
     ``transport`` is the one transport allowed (``none`` for a command that
-    needs none). ``credential_env`` may carry only
+    needs none). Login-free proxy settings of this process are passed only
+    for a transport that reaches a network. ``credential_env`` may carry only
     :data:`CREDENTIAL_ENVIRONMENT_NAMES`, chosen by the factory.
     """
     extra = dict(credential_env or {})
@@ -338,7 +368,11 @@ def isolated_environment(
         "GIT_NO_LAZY_FETCH": "1",
         "GIT_ALLOW_PROTOCOL": transport,
     }
-    env.update(_proxy_values())
+    # Proxies matter only to a command that reaches a remote: a local command
+    # (making the factory's copy, reading its refs) never looks at them, so a
+    # proxy with a login cannot refuse it (coach fix pass, 14 October 2026).
+    if transport not in LOCAL_TRANSPORTS:
+        env.update(_proxy_values())
     env.update({k: str(v) for k, v in extra.items()})
     return env
 
@@ -495,6 +529,13 @@ def _clone_refs(clone: Path, pattern: str, timeout: float) -> Optional[Dict[str,
 
 _BRANCH = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/\-]*$")
 
+
+def _forget(clone: Path, refs: Sequence[str], timeout: float) -> None:
+    """Delete remote-tracking refs a refused bring-in left pointing at the
+    wrong commit, so nothing later reads them as the starting point."""
+    for ref in refs:
+        project_git.run_git(["-C", str(clone), "update-ref", "-d", ref], timeout=timeout)
+
 COPY_REFUSAL = (
     "The commit could not be brought in from the factory's own copy, because "
     "that copy is not a local folder."
@@ -560,6 +601,18 @@ class StartPoint:
     branches: Dict[str, str] = field(default_factory=dict)
 
 
+def _proxy_refusal(transport: str) -> Optional[str]:
+    """The proxy sentence when a network fetch would be refused for a proxy
+    with a login, said as what it is before anything is made or run."""
+    if transport in LOCAL_TRANSPORTS:
+        return None
+    try:
+        _proxy_values()
+    except NetworkRefused as refused:
+        return refused.sentence
+    return None
+
+
 def fetch_start_point(
     clone: Path,
     address: Optional[str],
@@ -585,6 +638,9 @@ def fetch_start_point(
         return StartPoint(refusal=problem)
     address = str(address).strip()
     transport = transport_of(address) or "none"
+    refused = _proxy_refusal(transport)
+    if refused:
+        return StartPoint(refusal=refused)
     wanted = (branch or "").strip() or None
     if wanted is not None and not _BRANCH.match(wanted):
         return StartPoint(
@@ -672,9 +728,14 @@ def fetch_start_point(
     got = _clone_refs(clone, "refs/remotes/origin/", timeout)
     if got is None:
         return StartPoint(refusal="The project's copy could not say which commit it holds.")
-    for b in branches:
-        if got.get(f"refs/remotes/origin/{b}") != held[f"refs/heads/{b}"]:
-            return StartPoint(refusal=REDIRECTED_SENTENCE)
+    wrong = [
+        f"refs/remotes/origin/{b}"
+        for b in branches
+        if got.get(f"refs/remotes/origin/{b}") != held[f"refs/heads/{b}"]
+    ]
+    if wrong:
+        _forget(clone, wrong, timeout)
+        return StartPoint(refusal=REDIRECTED_SENTENCE)
     commit = held[f"refs/heads/{default}"]
     if wanted is None:
         return StartPoint(branch=default, commit=commit)
@@ -704,6 +765,9 @@ def fetch_all_branches(
         return StartPoint(refusal=problem)
     address = str(address).strip()
     transport = transport_of(address) or "none"
+    refused = _proxy_refusal(transport)
+    if refused:
+        return StartPoint(refusal=refused)
     copy = factory_copy_for(address, copies_root)
     with _held(copy):
         made = _ready(copy, timeout)
@@ -735,11 +799,15 @@ def fetch_all_branches(
     if got is None:
         return StartPoint(refusal="The project's copy could not say which commits it holds.")
     branches: Dict[str, str] = {}
+    wrong: List[str] = []
     for ref, sha in held.items():
         name = ref[len("refs/heads/"):]
         if got.get(f"refs/remotes/origin/{name}") != sha:
-            return StartPoint(refusal=REDIRECTED_SENTENCE)
+            wrong.append(f"refs/remotes/origin/{name}")
         branches[name] = sha
+    if wrong:
+        _forget(clone, wrong, timeout)
+        return StartPoint(refusal=REDIRECTED_SENTENCE)
     return StartPoint(branches=branches)
 
 
@@ -757,6 +825,7 @@ def sandbox_git_command(
     git_dir: Optional[str] = None,
     credential_env: Optional[Mapping[str, str]] = None,
     settings: Sequence[str] = NETWORK_SETTINGS,
+    proxy_env: Optional[Mapping[str, str]] = None,
 ) -> List[str]:
     """One whole command line for a git command run through ``env -i``.
 
@@ -765,8 +834,10 @@ def sandbox_git_command(
     ``["sbx", "exec", "-u", <user>, <sandbox>]``), or through register-repo's
     command runner on the operator's machine (``exec_prefix`` empty). The
     rest is ``env -i -C <cwd or home>`` with the isolated environment (no
-    proxy; the factory's own credential only when ``credential_env`` names
-    one), then ``git`` with ``settings`` and, when given, ``--git-dir``. So
+    proxy but the login-free ones in ``proxy_env`` for a command that reaches
+    a network, which raise :class:`NetworkRefused` when one carries a login;
+    the factory's own credential only when ``credential_env`` names one),
+    then ``git`` with ``settings`` and, when given, ``--git-dir``. So
     neither the machine's own settings files nor a repository around the
     working folder are read. ``home`` must be a folder that exists and is
     empty (or one that does not exist, for a read that needs no home).
@@ -788,6 +859,8 @@ def sandbox_git_command(
         "GIT_NO_LAZY_FETCH=1",
         f"GIT_ALLOW_PROTOCOL={transport}",
     ]
+    if transport not in LOCAL_TRANSPORTS:
+        env += [f"{name}={value}" for name, value in checked_proxies(proxy_env or {}).items()]
     env += [f"{name}={value}" for name, value in sorted(extra.items())]
     command = [*exec_prefix, "env", "-i", "-C", cwd or home, *env, "git", "--no-pager"]
     if git_dir is not None:
@@ -820,9 +893,13 @@ def sandbox_network_git(
     """
     import secrets
 
+    prefix = list(getattr(sandbox, "exec_prefix"))
+    # The sandbox's own proxy settings (its network may be reached only
+    # through one), read before anything is made: login-free ones go on the
+    # command line, one with a login raises NetworkRefused naming it.
+    proxies = sandbox_proxy_environment(sandbox) if transport not in LOCAL_TRANSPORTS else {}
     base = f"/tmp/forge-register-{secrets.token_hex(8)}"
     home = f"{base}/home"
-    prefix = list(getattr(sandbox, "exec_prefix"))
     made = sandbox.exec("mkdir", "-m", "700", base, home)  # type: ignore[attr-defined]
     if made.returncode != 0:
         return subprocess.CompletedProcess(list(args), made.returncode, "", "")
@@ -841,9 +918,32 @@ def sandbox_network_git(
         done = sandbox.run_whole(  # type: ignore[attr-defined]
             sandbox_git_command(
                 prefix, list(args), transport=transport, home=home, git_dir=git_dir,
+                proxy_env=proxies,
             ),
             timeout=timeout,
         )
         return subprocess.CompletedProcess(list(args), done.returncode, done.stdout, "")
     finally:
         sandbox.exec("rm", "-rf", base)  # type: ignore[attr-defined]
+
+
+#: Prints each proxy setting the sandbox holds as NAME=VALUE (empty when
+#: unset), one per line, and nothing else of its environment.
+SANDBOX_PROXY_READ: str = "printf '%s\\n' " + " ".join(
+    f'"{name}=${{{name}-}}"' for name in PROXY_NAMES
+)
+
+
+def sandbox_proxy_environment(sandbox: object) -> Dict[str, str]:
+    """The sandbox's own login-free proxy settings, read with one
+    ``sandbox.exec("sh", "-c", ...)`` that prints only the proxy names. Raises
+    :class:`NetworkRefused` naming a proxy that carries a login."""
+    done = sandbox.exec("sh", "-c", SANDBOX_PROXY_READ)  # type: ignore[attr-defined]
+    if getattr(done, "returncode", 1) != 0:
+        return {}
+    values: Dict[str, str] = {}
+    for line in str(getattr(done, "stdout", "") or "").splitlines():
+        name, sep, value = line.partition("=")
+        if sep and name in PROXY_NAMES and value:
+            values[name] = value
+    return checked_proxies(values)
