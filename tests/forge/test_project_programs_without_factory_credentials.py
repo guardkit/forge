@@ -3138,13 +3138,14 @@ def _module_object_and_dynamic_import_violations(
        or any bound by an ``import`` statement — may only be used as the
        base of an attribute access. Storing, passing, returning, defaulting
        or containing one is a violation.
-    2. A dynamic import (``importlib.import_module``, ``__import__``,
-       ``importlib.__import__``) is a violation unless its module argument is
-       a string literal naming a module that is not a launch module and its
-       result is used only as the base of an attribute access; loading code
-       from a file or a spec (``module_from_spec``,
-       ``spec_from_file_location`` ...) is always one; and a dynamic importer
-       or code loader held as a value is one.
+    2. ANY dynamic import (``importlib.import_module``, ``__import__``,
+       ``importlib.__import__``, ``builtins.__import__``), any loading of
+       code from a file or a spec (``module_from_spec``,
+       ``spec_from_file_location`` ...), and holding any of them as a value,
+       is a violation everywhere except the places allowed by name with a
+       reason (14 October 2026, review 4, R5: what a dynamically imported
+       module's attributes reach cannot be followed reliably, so no literal
+       name earns a pass).
     """
     problems: list[str] = []
     for mod in modules:
@@ -3172,6 +3173,10 @@ def _module_object_and_dynamic_import_violations(
             parent = mod.parents.get(id(node))
             return isinstance(parent, ast.Call) and parent.func is node
 
+        def builtin_import(name: ast.Name) -> bool:
+            """The builtin ``__import__``: the bare name, bound nowhere here."""
+            return name.id == "__import__" and not _possible_name_targets(mod, name.id, name)
+
         def is_module(dotted: str) -> bool:
             return (
                 not dotted.startswith(UNRESOLVED)
@@ -3185,34 +3190,12 @@ def _module_object_and_dynamic_import_violations(
                 callee = _resolve_all(mod, node.func, node) if isinstance(
                     node.func, (ast.Name, ast.Attribute)
                 ) else set()
-                if isinstance(node.func, ast.Name) and node.func.id == "__import__" and not callee:
-                    callee = {"__import__"}
+                if isinstance(node.func, ast.Name) and builtin_import(node.func):
+                    callee = callee | {"__import__"}
                 if callee & CODE_LOADERS:
                     report(node, "code is loaded from a file or a spec, so what it runs cannot be checked")
                 elif callee & DYNAMIC_IMPORTERS:
-                    argument = node.args[0] if node.args else None
-                    literal = (
-                        isinstance(argument, ast.Constant)
-                        and isinstance(argument.value, str)
-                        and argument.value.split(".", 1)[0] not in FORBIDDEN_MODULE_NAMES
-                    )
-                    if not literal:
-                        report(
-                            node,
-                            "a module is imported by a name that is not a literal naming "
-                            "a module other than a launch module",
-                        )
-                    elif not attribute_base(node):
-                        report(node, "a dynamically imported module is used other than as an attribute base")
-                    else:
-                        # What the attribute finally is, followed through
-                        # re-exports as for a written import.
-                        reached = _finalise(f"{argument.value}.{mod.parents[id(node)].attr}")
-                        if any(
-                            t.startswith(UNRESOLVED) or _is_launch(t) or _is_launch_bearing_module(t)
-                            for t in reached
-                        ):
-                            report(node, "a dynamically imported module's attribute is a launch")
+                    report(node, "a module is imported dynamically, so what it reaches cannot be checked")
                 continue
             if isinstance(node, (ast.Name, ast.Attribute)) and isinstance(
                 getattr(node, "ctx", None), ast.Load
@@ -3225,6 +3208,8 @@ def _module_object_and_dynamic_import_violations(
                     else _attribute_chain_targets(mod, node)
                 )
                 module_like = any(is_module(t) for t in identities)
+                if isinstance(node, ast.Name) and builtin_import(node):
+                    identities = identities | {"__import__"}
                 if (identities & (DYNAMIC_IMPORTERS | CODE_LOADERS)) and not called(node):
                     report(node, "a dynamic importer or code loader is held as a value")
                 elif module_like and not attribute_base(node):
@@ -5309,11 +5294,16 @@ def test_a_name_imported_from_the_same_submodule_is_allowed_and_followed(tmp_pat
 #: container; a package module passed to a function; a launch module and a
 #: variable name given to ``importlib.import_module``; a launch reached
 #: through a literal package module that re-exports one; ``__import__`` held;
-#: the importer itself held; code loaded from a file. The controls: the
-#: re-export called directly with the helper's environment, ``json.dumps``,
-#: ``importlib.import_module("json").dumps`` and ``__import__("json").dumps``.
+#: the importer itself held; code loaded from a file. After review 4, R5,
+#: every dynamic import outside the allowed places is a violation, literal
+#: or not: ``importlib.import_module("json").dumps``, ``__import__("json")``,
+#: the R5 reproducer (a literal package import whose second attribute is a
+#: re-exported launch), the intermediate package module stored, and the
+#: builtin ``__import__`` held. The controls: the re-export called directly
+#: with the helper's environment, ``json.dumps`` and a package module's
+#: attribute.
 GUARD_PROBES_23: dict[str, str] = {
-    "__init__.py": "",
+    "__init__.py": "from . import process_api\n",
     "process_api.py": "from subprocess import run\n",
     "helpers.py": textwrap.dedent(
         '''\
@@ -5402,12 +5392,31 @@ GUARD_PROBES_23: dict[str, str] = {
             return json.dumps(value)
 
 
-        def ok_import_module_json_dumps(value):
+        def p23_literal_import_module_outside_the_list(value):
             return importlib.import_module("json").dumps(value)
 
 
-        def ok_dunder_import_json_dumps(value):
+        def p23_literal_dunder_import_outside_the_list(value):
             return __import__("json").dumps(value)
+
+
+        def p23_package_reached_through_a_literal_import_then_a_launch(cmd):
+            importlib.import_module("forge").process_api.run(cmd)
+
+
+        def p23_intermediate_package_module_stored(cmd):
+            package = importlib.import_module("forge")
+            api = package.process_api
+            api.run(cmd)
+
+
+        def p23_dunder_import_held_as_a_value(name):
+            loader = __import__
+            return loader(name)
+
+
+        def ok_static_import_used_as_an_attribute_base(value):
+            return json.dumps(value)
 
 
         def ok_package_module_attribute(value):
@@ -5427,7 +5436,7 @@ def test_module_objects_are_only_attribute_bases_and_dynamic_imports_are_literal
         for n in ast.parse(GUARD_PROBES_23["zz_main.py"]).body
         if isinstance(n, ast.FunctionDef) and n.name.startswith("p23_")
     }
-    assert len(expected) == 14
+    assert len(expected) == 19
     assert expected - named == set(), f"slipped past the guard: {sorted(expected - named)}"
     assert not {n for n in named if n.startswith("ok_")}, problems
 
