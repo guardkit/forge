@@ -39,6 +39,7 @@ References: TASK-MP-012, FEAT-SPL-002, DF-009, RT-04, RT-08, DDR-007.
 from __future__ import annotations
 
 import asyncio
+import functools
 import dataclasses
 import difflib
 import hashlib
@@ -170,6 +171,8 @@ from forge.planning.spec_digest import (
 )
 from forge.planning.states import PlanningState
 from forge.planning.target_repos import format_known_repos
+from forge.network_git import fetch_all_branches
+from forge.project_git import run_git
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.config.models import PlanningConfig
@@ -623,7 +626,14 @@ _CLASSIFIER_FILE_MAX_BYTES = 256 * 1024
 _START_COMMIT_FETCH_TIMEOUT_SECONDS = 60
 
 
-def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
+def _lay_out_commit(
+    repo_path: str,
+    commit: str,
+    into: Path,
+    *,
+    fetch_address: str | None = None,
+    repo: str | None = None,
+) -> str | None:
     """Write the files the scenario check reads (:data:`CLASSIFIER_READS`),
     as ``commit`` has them, into the new folder ``into``; ``None`` on
     success, else one plain reason.
@@ -635,16 +645,20 @@ def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
     is not followed, and a file over :data:`_CLASSIFIER_FILE_MAX_BYTES` is
     refused before it is read. Nothing in the checkout is touched, and
     nothing of its working tree is copied (Codex review round 2, 7 October
-    2026: the earlier whole-commit archive was buffered with no limit)."""
+    2026: the earlier whole-commit archive was buffered with no limit).
+
+    Every git command goes through :func:`forge.project_git.run_git`, and a
+    missing start commit is fetched from the project's RECORDED address
+    (``fetch_address``), never the checkout's own origin (Forge git
+    hardening, 14 October 2026); git's own words are never repeated."""
     if not re.fullmatch(r"[0-9a-f]{7,40}", commit or ""):
         return f"{commit!r} is not a commit id"
 
     def git(*args: str, timeout: float = _REPO_INVENTORY_GIT_TIMEOUT_SECONDS) -> "subprocess.CompletedProcess[bytes]":
-        return subprocess.run(
-            ["git", "-c", "safe.directory=*", "-C", str(repo_path), *args],
-            capture_output=True,
+        return run_git(
+            ["-c", "safe.directory=*", "-C", str(repo_path), *args],
+            text=False,
             timeout=timeout,
-            check=False,
         )
 
     def present() -> bool:
@@ -655,19 +669,22 @@ def _lay_out_commit(repo_path: str, commit: str, into: Path) -> str | None:
         # work happens, which need not be this checkout: a commit missing
         # here is fetched from its remote once, time-limited (coach check 2).
         if not present():
-            fetched = git("fetch", "--quiet", "origin", timeout=_START_COMMIT_FETCH_TIMEOUT_SECONDS)
+            fetched = fetch_all_branches(
+                Path(repo_path),
+                fetch_address,
+                repo=repo,
+                timeout=_START_COMMIT_FETCH_TIMEOUT_SECONDS,
+            )
             if not present():
                 why = (
-                    "it is not there even after fetching its remote"
-                    if fetched.returncode == 0
-                    else "fetching its remote failed ("
-                    + (" ".join(fetched.stderr.decode("utf-8", errors="replace").split())[:200] or "no reason given")
-                    + ")"
+                    "it is not there even after fetching the project's recorded address"
+                    if fetched.refusal is None
+                    else f"fetching the project's recorded address failed ({fetched.refusal})"
                 )
                 return f"the checkout at {repo_path} does not have it: {why}"
         listed = git("ls-tree", "-z", "-l", f"{commit}^{{commit}}", "--", *CLASSIFIER_READS)
         if listed.returncode != 0:
-            said = " ".join(listed.stderr.decode("utf-8", errors="replace").split())[:200]
+            said = listed.stderr.decode("utf-8", errors="replace").strip()
             return f"git could not read the commit in the checkout at {repo_path} ({said or 'no reason given'})"
         into.mkdir(parents=True)
         for record in listed.stdout.split(b"\0"):
@@ -4195,10 +4212,27 @@ class PlanningRunDriver:
         if callable(make):
             reader = make(commit) if commit else make()
         else:
-            reader = LocalCheckoutReader(repo_path, commit=commit)
+            repo_key, address = self._fetch_address_for(repo_path)
+            reader = LocalCheckoutReader(
+                repo_path, commit=commit, fetch_address=address, repo=repo_key
+            )
         if correlation_id is not None:
             cache[key] = reader
         return reader
+
+    def _fetch_address_for(self, repo_path: str) -> tuple[str | None, str | None]:
+        """``(org/name, recorded fetch address)`` for the checkout at
+        ``repo_path``, from the coordinator's own settings
+        (``planning.target_repo_paths`` and ``planning.fetch_addresses``);
+        either may be ``None``. The checkout's own origin is never read."""
+        from forge.network_git import address_for_path
+
+        cfg = getattr(self._deps, "planning_config", None)
+        return address_for_path(
+            getattr(cfg, "target_repo_paths", None) or {},
+            getattr(cfg, "fetch_addresses", None) or {},
+            repo_path,
+        )
 
     async def _plan_repository_facts(
         self, correlation_id: str, repo_path: str, row: Any
@@ -5133,7 +5167,13 @@ class PlanningRunDriver:
                 # Only the files the check reads, as the start commit has
                 # them (CLASSIFIER_READS).
                 tree = Path(scratch) / "tree"
-                why = await asyncio.to_thread(_lay_out_commit, repo_path, start, tree)
+                repo_key, address = self._fetch_address_for(repo_path)
+                why = await asyncio.to_thread(
+                    functools.partial(
+                        _lay_out_commit, repo_path, start, tree,
+                        fetch_address=address, repo=repo_key,
+                    )
+                )
                 if why is not None:
                     return ScenarioProvabilityOutcome(
                         status="unavailable",

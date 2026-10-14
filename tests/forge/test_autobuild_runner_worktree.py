@@ -555,6 +555,49 @@ def test_materialise_refuses_low_capacity_before_git_or_directory_creation(
     assert not base.exists()
 
 
+def test_run_git_keeps_git_output_apart_and_failures_are_the_fixed_sentence(
+    throwaway_repo: Path, tmp_path: Path
+) -> None:
+    """``_run_git`` goes through the one git helper (14 October 2026). Git's
+    standard output and its error output are kept apart: a command that works
+    hands back only its standard output (``checkout --detach`` writes "HEAD
+    is now at ..." to the error output, which is not returned), and a failed
+    command hands back only the helper's fixed sentence, never git's words."""
+    code, said = asyncio.run(
+        ar._run_git(["branch", "-D", "no-such-branch"], cwd=throwaway_repo)
+    )
+    assert code != 0
+    assert said == f"git branch stopped with exit code {code}."
+
+    code, head = asyncio.run(ar._run_git(["rev-parse", "HEAD"], cwd=throwaway_repo))
+    assert (code, head) == (0, _git(throwaway_repo, "rev-parse", "HEAD"))
+
+    holder = tmp_path / "holder"
+    _git(throwaway_repo, "worktree", "add", str(holder), PLANNING_BRANCH)
+    code, said = asyncio.run(
+        ar._run_git(["-C", str(holder), "checkout", "--detach"], cwd=throwaway_repo)
+    )
+    assert (code, said) == (0, "")
+    assert _git(holder, "branch", "--show-current") == ""
+
+
+def test_run_git_hands_its_command_to_the_git_helper(
+    throwaway_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[tuple[list[str], dict[str, Any]]] = []
+
+    async def _helper(args: list[str], **kwargs: Any):
+        seen.append((list(args), kwargs))
+        return subprocess.CompletedProcess(args, 0, "out\n", "")
+
+    monkeypatch.setattr(ar, "run_git_async", _helper)
+    assert asyncio.run(ar._run_git(["worktree", "prune"], cwd=throwaway_repo)) == (
+        0,
+        "out",
+    )
+    assert seen == [(["worktree", "prune"], {"cwd": throwaway_repo})]
+
+
 # ---------------------------------------------------------------------------
 # F3 — preflight residue sweep
 # ---------------------------------------------------------------------------

@@ -5,18 +5,22 @@ Thin async wrappers around the project ``execute`` subprocess primitive
 ``git`` invocation into a structured :class:`GitOpResult` and never
 raise past the adapter boundary (ADR-ARCH-025).
 
-Four operations:
+Three operations:
 
 - :func:`prepare_worktree` — ``git worktree add`` for the build's path,
   optionally ``-b <branch> <path> <base>`` when the branch must be
   CREATED (the fix journey's per-build branch, conductor activation §1).
 - :func:`commit_all` — ``git add -A`` + ``git commit -m`` + ``git rev-parse HEAD``.
-- :func:`push` — ``git push origin <branch>``.
 - :func:`cleanup_worktree` — ``git worktree remove --force``; **best-effort**:
   failure is logged and returned as ``status="failed"`` but never raises,
   so callers (the build state machine) can treat it as a warning rather
   than a blocker (Scenario "A failed worktree cleanup is logged but does
   not prevent build completion").
+
+There is no push here (14 October 2026). The ``push`` operation that used
+to sit here was called by nothing in production, and it pushed to whatever
+address the clone's own ``origin`` named, so it was removed rather than
+kept as an unused way to reach another repository.
 
 Design notes
 ------------
@@ -31,10 +35,16 @@ Design notes
 
 * **No direct ``subprocess.run`` / ``os.system``.** Every git call goes
   through the injected ``execute`` callable. The default
-  :func:`_default_execute` uses :func:`asyncio.create_subprocess_exec`
-  (the list-token, no-shell equivalent). Production deployments swap in
-  a DeepAgents ``execute``-tool-backed implementation; tests inject a
-  fake.
+  :func:`_default_execute` hands the command to
+  :func:`forge.project_git.run_git` (14 October 2026), the one way Forge
+  runs git on a repository: a fixed environment with no factory secret,
+  no hooks or filters from the project's settings, and git's own error
+  text replaced by a fixed sentence. Tests inject a fake.
+
+* **Git's own words never leave this module.** On failure
+  ``GitOpResult.stderr`` carries the helper's fixed sentence (for example
+  "git commit stopped with exit code 1."), never git's text and never the
+  failed command's stdout.
 
 * **Adapter boundary contract (ADR-ARCH-025).** Each function is
   wrapped in ``try/except Exception`` and converts unexpected exceptions
@@ -47,18 +57,16 @@ Design notes
 
 from __future__ import annotations
 
-import asyncio
 import logging
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
 
 from forge.adapters.git.models import GitOpResult
+from forge.project_git import run_git_async
 
 logger = logging.getLogger(__name__)
-
-_KILL_GRACE_SECONDS: float = 5.0
-"""SIGTERM → SIGKILL grace window when a subprocess overruns its timeout."""
 
 
 # --------------------------------------------------------------------------- #
@@ -100,62 +108,48 @@ async def _default_execute(
     cwd: str | None = None,
     timeout: float | None = None,
 ) -> ExecuteResult:
-    """Default async subprocess executor.
+    """Default executor: run one git command through the local git helper.
 
-    Uses :func:`asyncio.create_subprocess_exec` — the no-shell,
-    list-token equivalent of ``subprocess.run``. This is the production
-    fallback when no ``execute`` callable is injected.
+    ``command`` is the git command line, starting with ``"git"``. Since 14
+    October 2026 it is handed to :func:`forge.project_git.run_git` (off the
+    event loop), so git runs with a fixed environment instead of Forge's,
+    the project's own settings cannot make it start another program, and
+    on failure ``stderr`` is the helper's fixed sentence ("git worktree add
+    stopped with exit code 128."), never git's own text. stdout is returned
+    whole, for the callers that read data from it on success.
 
-    Per ADR-ARCH-023 + ADR-ARCH-025, real deployments wire this through
-    the DeepAgents ``execute`` tool / sandbox backend so that
-    permissions are enforced framework-side. The default here mirrors
-    that contract (list tokens, no shell) so unit tests and seam tests
-    behave identically to production.
+    Only git is run here; any other program is refused with a plain
+    sentence rather than started.
 
-    **Timeout discipline (mirrors ``forge.adapters.guardkit.run``).** When
-    ``timeout`` is not ``None`` and the child overruns it, the child is
-    SIGTERM'd, given ``_KILL_GRACE_SECONDS`` to exit, then SIGKILL'd and
-    reaped — never left running. The overrun is surfaced as a *normal*
-    :class:`ExecuteResult` with ``exit_code=-1`` and a ``stderr`` noting
-    the timeout and the command, so the caller sees a loud, retryable
-    failure rather than an unbounded silent hang.
+    **Timeout discipline.** When ``timeout`` is not ``None`` and git
+    overruns it, the helper stops and reaps the child. The overrun is
+    surfaced as a *normal* :class:`ExecuteResult` with ``exit_code=-1`` and
+    a ``stderr`` that says which git command did not finish in time, so the
+    caller sees a loud, retryable failure rather than an unbounded hang.
     """
-    proc = await asyncio.create_subprocess_exec(
-        *command,
-        cwd=cwd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    if timeout is None:
-        stdout_b, stderr_b = await proc.communicate()
-    else:
-        try:
-            stdout_b, stderr_b = await asyncio.wait_for(
-                proc.communicate(), timeout=timeout
-            )
-        except asyncio.TimeoutError:
-            # Never leak a running child: SIGTERM, grace window, then SIGKILL,
-            # and always reap via communicate() so no zombie/pipe lingers.
-            proc.terminate()
-            try:
-                await asyncio.wait_for(
-                    proc.communicate(), timeout=_KILL_GRACE_SECONDS
-                )
-            except asyncio.TimeoutError:
-                proc.kill()
-                await proc.communicate()
-            return ExecuteResult(
-                exit_code=-1,
-                stdout="",
-                stderr=(
-                    f"git-runner timeout: command timed out after {timeout}s "
-                    f"and the child was terminated: {list(command)!r}"
-                ),
-            )
+    argv = [str(token) for token in command]
+    if not argv or argv[0] != "git":
+        return ExecuteResult(
+            exit_code=-1,
+            stdout="",
+            stderr="the git adapter runs only git commands; nothing was started.",
+        )
+    try:
+        done = await run_git_async(
+            argv, cwd=cwd, timeout=timeout, encoding="utf-8", errors="replace"
+        )
+    except subprocess.TimeoutExpired as exc:
+        # The helper's timeout text names only the command and the limit.
+        sentence = exc.stderr if isinstance(exc.stderr, str) else ""
+        return ExecuteResult(
+            exit_code=-1,
+            stdout="",
+            stderr=sentence or f"git did not finish within {timeout} seconds.",
+        )
     return ExecuteResult(
-        exit_code=proc.returncode if proc.returncode is not None else -1,
-        stdout=stdout_b.decode("utf-8", errors="replace"),
-        stderr=stderr_b.decode("utf-8", errors="replace"),
+        exit_code=done.returncode if done.returncode is not None else -1,
+        stdout=done.stdout or "",
+        stderr=done.stderr or "",
     )
 
 
@@ -168,18 +162,20 @@ _DEFAULT_BUILDS_ROOT = Path("/var/forge/builds")
 """Allowlisted ephemeral worktree root (ADR-ARCH-028)."""
 
 
-def _failure_stderr(stderr: str | None, stdout: str | None) -> str | None:
-    """Pick the most useful failure-message text without dropping signal.
+def _failure_stderr(stderr: str | None, stdout: str | None = None) -> str | None:
+    """The failure text a failed git step reports: its ``stderr`` only.
 
-    Some git invocations emit their diagnostic only on stdout (e.g.
-    ``git commit`` with no staged changes prints "nothing to commit" on
-    stdout, exit code 1). We prefer stderr but fall back to stdout so
-    callers can branch on the message.
+    Since 14 October 2026 the default executor's ``stderr`` is the git
+    helper's fixed sentence. A failed command's stdout is never used as a
+    fallback any more: it can carry git's own words ("nothing to commit"
+    and the like), which must not reach a log, a record or a card. Callers
+    that need to know whether there is anything to commit ask git directly
+    (``git diff --cached --quiet``) instead of reading its text.
+    ``stdout`` is accepted and ignored so existing callers keep working.
     """
+    del stdout  # deliberately unused: see above
     if stderr and stderr.strip():
         return stderr
-    if stdout and stdout.strip():
-        return stdout
     return None
 
 
@@ -221,7 +217,7 @@ async def prepare_worktree(
 
     On success returns ``GitOpResult.worktree_path`` populated with the
     absolute path of the created worktree. On any non-zero exit or
-    raised exception returns ``status="failed"`` with stderr preserved.
+    raised exception returns ``status="failed"`` with the failure sentence.
 
     Creating the branch (conductor activation §1)
     ---------------------------------------------
@@ -316,10 +312,11 @@ async def commit_all(
     3. ``git rev-parse HEAD`` — to retrieve the commit SHA.
 
     If any step exits non-zero, the function short-circuits and returns
-    ``status="failed"`` with that step's captured stderr (or stdout —
-    "nothing to commit" lands on stdout). Note that "no staged changes"
-    is a real, expected failure path: the caller decides whether to
-    treat it as success-with-no-push or escalate.
+    ``status="failed"`` with that step's ``stderr`` (with the default
+    executor, the git helper's fixed sentence). "No staged changes" makes
+    the commit step fail; a caller that wants to treat that as success asks
+    ``git diff --cached --quiet`` before calling this, rather than reading
+    git's text afterwards.
     """
     operation = "commit_all"
     cwd = str(worktree)
@@ -359,44 +356,6 @@ async def commit_all(
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception("commit_all failed (worktree=%s)", worktree)
-        return _exception_failure(operation, exc)
-
-
-async def push(
-    worktree: Path,
-    remote_branch: str,
-    *,
-    execute: ExecuteCallable = _default_execute,
-) -> GitOpResult:
-    """Push HEAD to ``origin/<remote_branch>`` from ``worktree``.
-
-    Runs ``git push origin <remote_branch>``. Non-zero exit becomes
-    ``status="failed"`` with stderr preserved (e.g. ``! [rejected]``,
-    ``error: failed to push some refs``). On success returns
-    ``status="success"``. The caller may follow up with
-    :func:`commit_all`'s SHA if the canonical pushed-commit SHA is
-    needed.
-    """
-    operation = "push"
-    try:
-        result = await execute(
-            command=["git", "push", "origin", remote_branch],
-            cwd=str(worktree),
-        )
-        if result.exit_code == 0:
-            return GitOpResult(
-                status="success",
-                operation=operation,
-                exit_code=0,
-            )
-        return GitOpResult(
-            status="failed",
-            operation=operation,
-            stderr=_failure_stderr(result.stderr, result.stdout),
-            exit_code=result.exit_code,
-        )
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("push failed (branch=%s)", remote_branch)
         return _exception_failure(operation, exc)
 
 
@@ -468,5 +427,4 @@ __all__ = [
     "cleanup_worktree",
     "commit_all",
     "prepare_worktree",
-    "push",
 ]

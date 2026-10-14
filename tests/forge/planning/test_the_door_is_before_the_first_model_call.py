@@ -51,6 +51,8 @@ from tests.forge.planning.test_memory_name_at_the_door import (  # noqa: E402
     ORIGINATOR,
     REPO_KEY,
     _git,
+    _local_remotes,  # noqa: F401 — the autouse fixture: the remote is a local folder
+    _recorded,
     make_remote_and_copy,
     store,  # noqa: F401 — the fixture
 )
@@ -119,7 +121,7 @@ def _driver_with_a_model(
         escalation_approver="U-ESC",
         originator_wait_seconds=300,
         escalated_wait_seconds=1800,
-        target_repo_paths={REPO_KEY: str(repo_path)},
+        **_recorded(repo_path),
         target_terminal={"enabled": True},
     )
     driver = PlanningRunDriver(
@@ -131,7 +133,9 @@ def _driver_with_a_model(
             subscriber_factory=lambda expected_approver, armed: object(),
             dispatch_product_owner=model,
             second_opinion_provider=object(),
-            git_runner=WorktreeGitRunner(worktrees_root=worktrees_root),
+            git_runner=WorktreeGitRunner(
+                worktrees_root=worktrees_root, **_recorded(repo_path)
+            ),
             planning_config=config,
             clock=_clock,
             publish_notification=publish_notification,

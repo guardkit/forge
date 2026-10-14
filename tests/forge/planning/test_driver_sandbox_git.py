@@ -76,12 +76,15 @@ from tests.forge.planning.test_driver_target_terminal import (
     _plan_result_native_versions,
     _plan_yaml_rel,
     _queue,
+    _recorded_runner,
     _rewritten_spec_result,
     _seed_gate_surface,
     _spec_by_round,
     _spec_result_native,
     _spec_result_with_seed,
 )
+
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 REPO_KEY = "guardkit/api_test"
 
@@ -94,6 +97,14 @@ def store(tmp_path: Path) -> SqlitePlanningRunStore:
     cx = sqlite_connect.connect_writer(tmp_path / "sandbox.db")
     migrations.apply_at_boot(cx)
     return SqlitePlanningRunStore(cx, target_terminal_enabled=True)
+
+
+@pytest.fixture(autouse=True)
+def _local_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every "remote" here is a bare repository in ``tmp_path``: let a local
+    folder be a recorded fetch address, and keep the factory's own fetch
+    copies inside ``tmp_path`` (Forge git hardening, 14 October 2026)."""
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
 
 
 @pytest.fixture(autouse=True)
@@ -173,7 +184,12 @@ def _sandbox(repo: Path, tmp_path: Path):
         server.shutdown()
         server.server_close()
 
-    return SidecarGitRunner(f"http://{host}:{port}", repo=REPO_KEY), shutdown
+    # The coordinator sends the project's recorded fetch address with each
+    # starting-point and code-read request.
+    runner = SidecarGitRunner(
+        f"http://{host}:{port}", repo=REPO_KEY, fetch_address=origin_of(repo)
+    )
+    return runner, shutdown
 
 
 @pytest.fixture
@@ -186,7 +202,7 @@ def sandbox_repo(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _commit_repo_routing_law(repo, law)
-    in_container = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    in_container = _recorded_runner(tmp_path / "wt", repo)
     runner, shutdown = _sandbox(repo, tmp_path)
     try:
         yield repo, in_container, runner
@@ -737,7 +753,7 @@ async def test_the_feature_gate_legs_check_runs_in_the_sandbox(
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
     _commit_repo_routing_law(repo, "enforced")
-    in_container = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    in_container = _recorded_runner(tmp_path / "wt", repo)
     runner, shutdown = _sandbox(repo, tmp_path)
     try:
         _queue(store)

@@ -1356,6 +1356,7 @@ async def admit_fix_row(
         sidecar=sidecar,
         sidecar_post=sidecar_post,
         merge_ending=_recorded_merge_ending(persistence, source),
+        fetch_address=_fetch_address_for(config, resolution.name),
     )
     base_branch = repair_base.branch
     if base_branch != branch or sidecar is not None:
@@ -1628,13 +1629,10 @@ def _minted_details(store: Any, queue_id: int) -> dict[str, Any]:
 def _git_text(repo: Path, *args: str) -> str | None:
     """One bounded, read-only Git query, or ``None`` when Git cannot answer."""
     try:
-        result = subprocess.run(
-            ["git", "-C", str(repo), *args],
-            capture_output=True,
-            text=True,
-            check=False,
-            timeout=60,
-        )
+        # Through the one git helper (14 October 2026).
+        from forge.project_git import run_git
+
+        result = run_git(["-C", str(repo), *args], timeout=60)
     except (OSError, subprocess.TimeoutExpired):
         return None
     value = result.stdout.strip()
@@ -1845,8 +1843,13 @@ async def resolve_repair_base(
     sidecar: tuple[str, str] | None,
     sidecar_post: Any = None,
     merge_ending: str | None = None,
+    fetch_address: str | None = None,
 ) -> RepairBase:
     """Choose the repair base, preserving a verified build-failed candidate.
+
+    ``fetch_address`` is the project's recorded address
+    (``planning.fetch_addresses``), sent to the sandbox helper when the
+    remote's target branch is fetched (Forge git hardening, 14 October 2026).
 
     A repair of a merge whose checks went red is cut from where the work
     really is (3 October 2026). When the joined result's checks failed,
@@ -1879,6 +1882,7 @@ async def resolve_repair_base(
             branch=chosen,
             sidecar=sidecar,
             sidecar_post=sidecar_post,
+            fetch_address=fetch_address,
         )
     if source != SOURCE_BUILD_FAILED:
         return RepairBase(branch=chosen)
@@ -1901,6 +1905,7 @@ async def _remote_target_base(
     branch: str,
     sidecar: tuple[str, str],
     sidecar_post: Any,
+    fetch_address: str | None = None,
 ) -> RepairBase:
     """Fetch the remote's target branch in the sandbox and pin where it is.
 
@@ -1921,7 +1926,10 @@ async def _remote_target_base(
     recorded = str(getattr(source_build, "target_branch", "") or "") or branch
     sidecar_url, repo_key = sidecar
     git = SidecarCandidateGit(
-        sidecar_url, repo=repo_key, post=sidecar_post or _urllib_post
+        sidecar_url,
+        repo=repo_key,
+        post=sidecar_post or _urllib_post,
+        fetch_address=fetch_address,
     )
     start = await git.fetch_remote_start_point()
     if not start.ok:
@@ -1937,8 +1945,8 @@ async def _remote_target_base(
     if start.branch != recorded:
         raise FixAdmissionRefused(
             f"Nothing was queued: the repair of {source_build_id} belongs on "
-            f"the branch '{recorded}', but the remote named 'origin' now says "
-            f"its default branch is '{start.branch}'. Which branch the repair "
+            f"the branch '{recorded}', but the project's remote (its recorded "
+            f"fetch address) now says its default branch is '{start.branch}'. Which branch the repair "
             "belongs on is a decision for a person, not a guess for the factory.",
             reason=REPAIR_BASE_REASON,
             permanent=True,
@@ -2004,6 +2012,17 @@ def choose_repair_base(
     if source == SOURCE_CANDIDATE_REFUSED and parent_feature:
         return f"autobuild/{parent_feature}"
     return branch
+
+
+def _fetch_address_for(config: Any, repo_key: str | None) -> str | None:
+    """The project's recorded fetch address (``planning.fetch_addresses``),
+    or ``None``. Never raises."""
+    addresses = getattr(getattr(config, "planning", None), "fetch_addresses", None) or {}
+    try:
+        found = addresses.get(str(repo_key)) if repo_key else None
+    except AttributeError:  # pragma: no cover — a mapping is what the model gives
+        return None
+    return str(found) if found else None
 
 
 def _sidecar_for(config: Any, repo_key: str | None) -> tuple[str, str] | None:

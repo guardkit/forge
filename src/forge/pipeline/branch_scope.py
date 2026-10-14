@@ -55,6 +55,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
+from forge.project_git import run_git
+
 logger = logging.getLogger(__name__)
 
 __all__ = [
@@ -197,10 +199,11 @@ def added_lines_of(patch: str) -> str:
 
 
 def _git(repo_root: "Path | str", *args: str) -> "subprocess.CompletedProcess[str]":
-    return subprocess.run(  # noqa: S603 — fixed argv, no shell
-        ["git", "-c", "core.quotepath=false", "-C", str(repo_root), *args],
-        capture_output=True,
-        text=True,
+    # Through the factory's one git helper: on a failure its ``stderr`` is a
+    # fixed sentence, never git's own text, so nothing git printed can reach
+    # the merge card's scope line.
+    return run_git(
+        ["-c", "core.quotepath=false", "-C", str(repo_root), *args],
         timeout=BRANCH_SCOPE_TIMEOUT_SECONDS,
         check=False,
     )
@@ -226,7 +229,9 @@ def read_branch_scope(
             )
         )
     if names.returncode != 0:
-        detail = (names.stderr or names.stdout or "").strip() or "<no output>"
+        # Only the helper's fixed sentence: a failed command's stdout could
+        # carry git's own words too.
+        detail = (names.stderr or "").strip() or "<no output>"
         return BranchScopeReading(
             error=(
                 f"git could not read what {head} changed against {base} in "

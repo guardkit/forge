@@ -36,12 +36,13 @@ from __future__ import annotations
 from typing import Any
 
 import logging
-import os
 import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
+
+from forge.project_git import run_git
 
 logger = logging.getLogger(__name__)
 
@@ -119,18 +120,14 @@ def repair_worktree_path(repo_root: Path | str, task_id: str) -> Path:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
-    """Run one git command and return it, never raising."""
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0"}
+    """Run one git command and return it, never raising.
+
+    Through the factory's one git helper, which gives git a fixed environment
+    (no prompts, none of Forge's own secrets) and, on a failure, a fixed
+    sentence in ``stderr`` instead of git's own text.
+    """
     try:
-        return subprocess.run(
-            ["git", *args],
-            cwd=str(cwd),
-            capture_output=True,
-            text=True,
-            check=False,
-            env=env,
-            timeout=GIT_TIMEOUT_SECONDS,
-        )
+        return run_git(list(args), cwd=str(cwd), check=False, timeout=GIT_TIMEOUT_SECONDS)
     except (OSError, subprocess.TimeoutExpired) as exc:
         return subprocess.CompletedProcess(
             ["git", *args],
@@ -141,7 +138,9 @@ def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess[str]:
 
 
 def _last_line(proc: subprocess.CompletedProcess[str]) -> str:
-    text = (proc.stderr or proc.stdout or "").strip()
+    # Only the helper's sentence: a failed command's stdout could carry git's
+    # own words, so it is never read here.
+    text = (proc.stderr or "").strip()
     return text.splitlines()[-1] if text else f"git exited {proc.returncode}"
 
 

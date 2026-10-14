@@ -36,6 +36,7 @@ from forge.planning.repository_facts import (
     read_repository_facts,
 )
 from forge.planning.sidecar_git_runner import SidecarCodeReader
+from tests.forge.recorded_fetch_address import local_remotes, origin_of  # noqa: F401
 
 REPO_KEY = "guardkit/api_test"
 
@@ -144,7 +145,9 @@ def _closed_port() -> int:
 def _driver_over(planning: PlanningConfig) -> PlanningRunDriver:
     """A driver whose git runner is the coordinator's own composition."""
     git_runner, _resolver = compose_planning_git_runner(planning)
-    return PlanningRunDriver(SimpleNamespace(git_runner=git_runner))  # type: ignore[arg-type]
+    return PlanningRunDriver(  # type: ignore[arg-type]
+        SimpleNamespace(git_runner=git_runner, planning_config=planning)
+    )
 
 
 def _sandboxed(url: str) -> PlanningConfig:
@@ -1961,7 +1964,11 @@ def test_a_start_commit_the_checkout_cannot_get_is_said_never_read_from_the_tree
     assert any("could not read the starting commit" in r for r in reasons)
 
 
-def test_a_start_commit_missing_locally_is_fetched_from_the_remote(tmp_path: Path) -> None:
+def test_a_start_commit_missing_locally_is_fetched_from_the_remote(
+    tmp_path: Path, local_remotes: Path
+) -> None:
+    """The remote is the project's recorded fetch address (14 October 2026),
+    here the repository the copy was cloned from."""
     seed = _repo(tmp_path / "seed", {"a.txt": "one\n"})
     git = ["git", "-c", "user.name=t", "-c", "user.email=t@t"]
     subprocess.run(["git", "clone", "-q", str(seed), str(tmp_path / "copy")], check=True)
@@ -1971,7 +1978,10 @@ def test_a_start_commit_missing_locally_is_fetched_from_the_remote(tmp_path: Pat
     newer = subprocess.run(
         ["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
-    reader = LocalCheckoutReader(str(tmp_path / "copy"), commit=newer)
+    copy = tmp_path / "copy"
+    reader = LocalCheckoutReader(
+        str(copy), commit=newer, fetch_address=origin_of(copy), repo=REPO_KEY
+    )
     assert reader.read_text("b.txt") == "two\n"
 
 
@@ -2065,19 +2075,28 @@ def test_a_rules_file_linking_out_of_the_tree_is_not_read_at_a_commit(tmp_path: 
 
 
 def test_a_commit_that_cannot_be_read_is_fetched_once_for_every_kind_of_read(
-    tmp_path: Path,
+    tmp_path: Path, local_remotes: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """R3: the reader remembers that the commit could not be read; the
-    remote is asked once, whichever reads follow."""
+    remote is asked once, whichever reads follow. The remote is the
+    project's recorded fetch address (14 October 2026)."""
+    from forge import network_git
+
     root = _repo(tmp_path / "checkout", {"a.txt": "one\n"})
-    asked: list[tuple[str, ...]] = []
+    remote = tmp_path / "remote.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(root), str(remote)], check=True)
+    fetches: list[str | None] = []
+    real_fetch = network_git.fetch_all_branches
 
-    class Counting(LocalCheckoutReader):
-        def _git(self, *args: str, timeout: float):
-            asked.append(args)
-            return super()._git(*args, timeout=timeout)
+    def counting_fetch(clone, address, **kwargs):
+        fetches.append(address)
+        return real_fetch(clone, address, **kwargs)
 
-    reader = Counting(str(root), commit="0123456789abcdef0123")
+    monkeypatch.setattr(network_git, "fetch_all_branches", counting_fetch)
+
+    reader = LocalCheckoutReader(
+        str(root), commit="0123456789abcdef0123", fetch_address=str(remote), repo=REPO_KEY
+    )
     for read in (
         reader.list_files,
         lambda: reader.read_text("a.txt"),
@@ -2086,25 +2105,46 @@ def test_a_commit_that_cannot_be_read_is_fetched_once_for_every_kind_of_read(
         lambda: reader.lines_mentioning("one"),
         reader.list_files,
     ):
-        with pytest.raises(RepositoryUnreadable, match="could not read the starting commit"):
+        with pytest.raises(
+            RepositoryUnreadable,
+            match="could not read the starting commit .* it is not there even after "
+            "fetching the project's recorded address",
+        ):
             read()
-    assert sum(1 for args in asked if args[0] == "fetch") == 1
+    assert fetches == [str(remote)]
 
 
-def test_a_fetch_that_times_out_is_remembered_too(tmp_path: Path) -> None:
+def test_a_fetch_that_times_out_is_remembered_too(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fetch from the recorded address (14 October 2026) never raises: a
+    fetch that runs out of time comes back as a refusal with git's timeout
+    sentence, and that too is remembered."""
+    from forge import network_git, project_git
+
     root = _repo(tmp_path / "checkout", {"a.txt": "one\n"})
     fetches = []
 
-    class Hanging(LocalCheckoutReader):
-        def _git(self, *args: str, timeout: float):
-            if args[0] == "fetch":
-                fetches.append(args)
-                raise RepositoryUnreadable("git could not read the checkout (TimeoutExpired)")
-            return super()._git(*args, timeout=timeout)
+    def hanging_fetch(clone, address, *, timeout, **kwargs):
+        fetches.append(address)
+        return network_git.StartPoint(
+            refusal="The project's recorded fetch address could not be fetched: "
+            + project_git.timeout_sentence("fetch", timeout)
+        )
 
-    reader = Hanging(str(root), commit="0123456789abcdef0123")
+    monkeypatch.setattr(network_git, "fetch_all_branches", hanging_fetch)
+
+    reader = LocalCheckoutReader(
+        str(root),
+        commit="0123456789abcdef0123",
+        fetch_address="https://git.example.invalid/guardkit/api_test",
+        repo=REPO_KEY,
+    )
     for _ in range(3):
-        with pytest.raises(RepositoryUnreadable, match="fetching its remote failed"):
+        with pytest.raises(
+            RepositoryUnreadable,
+            match="fetching the project's recorded address failed: .*did not finish within",
+        ):
             reader.list_files()
     assert len(fetches) == 1
 
@@ -2127,7 +2167,11 @@ def test_a_start_that_cannot_be_looked_up_is_never_a_working_tree(tmp_path: Path
             return "0123456789abcdef0123", "main"
 
     def driver(store: object) -> PlanningRunDriver:
-        return PlanningRunDriver(SimpleNamespace(git_runner=SimpleNamespace(), store=store))  # type: ignore[arg-type]
+        return PlanningRunDriver(SimpleNamespace(  # type: ignore[arg-type]
+            git_runner=SimpleNamespace(),
+            store=store,
+            planning_config=PlanningConfig(enabled=True),
+        ))
 
     broken = driver(Broken())._repository_reader_for(str(tmp_path), "cid-1")
     assert isinstance(broken, UnreadableRepository)
@@ -2197,6 +2241,11 @@ async def test_the_provability_check_reads_the_start_commit_not_the_checkout(
     def driver(answer: object) -> PlanningRunDriver:
         made = PlanningRunDriver(SimpleNamespace(  # type: ignore[arg-type]
             git_runner=Runner(), store=Store(answer), classify_scenarios=classify,
+            # The checkout is recorded with no fetch address: a start commit
+            # it lacks cannot be fetched, and is said to be unreadable.
+            planning_config=PlanningConfig(
+                enabled=True, target_repo_paths={REPO_KEY: str(root)}
+            ),
         ))
         return made
 
@@ -2317,9 +2366,12 @@ def test_the_copied_files_are_the_ones_guardkits_surface_detection_reads() -> No
     assert read == set(CLASSIFIER_READS)
 
 
-def test_the_check_copy_fetches_a_start_commit_this_checkout_lacks(tmp_path: Path) -> None:
+def test_the_check_copy_fetches_a_start_commit_this_checkout_lacks(
+    tmp_path: Path, local_remotes: Path
+) -> None:
     """Coach check 2: the start commit may have been fetched elsewhere; the
-    copy fetches this checkout's remote once before saying it is missing."""
+    copy fetches the project's recorded address (14 October 2026) once
+    before saying it is missing."""
     from forge.planning.driver import _lay_out_commit
 
     seed = _repo(tmp_path / "seed", {"README.md": "x\n"})
@@ -2332,7 +2384,10 @@ def test_the_check_copy_fetches_a_start_commit_this_checkout_lacks(tmp_path: Pat
         [*git, "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
     into = tmp_path / "tree"
-    assert _lay_out_commit(str(tmp_path / "copy"), newer, into) is None
+    copy = tmp_path / "copy"
+    recorded = {"fetch_address": origin_of(copy), "repo": REPO_KEY}
+    assert _lay_out_commit(str(copy), newer, into, **recorded) is None
     assert (into / "pyproject.toml").read_text(encoding="utf-8") == "[project]\nname = 'x'\n"
-    why = _lay_out_commit(str(tmp_path / "copy"), "0123456789abcdef0123", tmp_path / "tree2")
-    assert why is not None and "even after fetching its remote" in why
+    why = _lay_out_commit(str(copy), "0123456789abcdef0123", tmp_path / "tree2", **recorded)
+    assert why is not None
+    assert "even after fetching the project's recorded address" in why

@@ -3,7 +3,7 @@
 The unit tests inject a fake ``execute`` callable and assert on:
 
 * AC-001 / AC-004 / AC-005 / AC-006 / AC-007 — happy-path output shape
-  for each of the four operations.
+  for each of the three operations.
 * AC-002 — every git invocation goes through the injected ``execute``;
   no direct ``subprocess`` / ``os.system`` is used.
 * AC-003 — every recorded call's ``cwd`` is inside the build's worktree
@@ -25,11 +25,9 @@ worktree-add / commit / cleanup-failure-doesn't-block contract.
 
 from __future__ import annotations
 
-import asyncio
 import logging
-import os
 import shutil
-import time
+import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,7 +40,6 @@ from forge.adapters.git.operations import (
     cleanup_worktree,
     commit_all,
     prepare_worktree,
-    push,
 )
 
 # --------------------------------------------------------------------------- #
@@ -371,11 +368,13 @@ class TestCommitAll:
         assert len(fake.calls) == 1
 
     @pytest.mark.asyncio
-    async def test_commit_with_nothing_to_commit_returns_failed_with_stdout(
+    async def test_commit_failure_never_reports_the_commands_stdout(
         self, tmp_path: Path
     ) -> None:
-        # Real-world case: ``git commit`` writes "nothing to commit" to
-        # stdout (not stderr) and exits 1. We must preserve that signal.
+        # ``git commit`` with nothing staged writes "nothing to commit" to
+        # stdout and exits 1. Since 14 October 2026 a failed command's
+        # stdout is never used as its failure text (it can carry git's own
+        # words); callers that care ask ``git diff --cached --quiet`` first.
         fake = FakeExecute(
             responses=[
                 _ok(),  # add -A
@@ -391,8 +390,7 @@ class TestCommitAll:
 
         assert result.status == "failed"
         assert result.exit_code == 1
-        assert result.stderr is not None
-        assert "nothing to commit" in result.stderr
+        assert result.stderr is None
 
     @pytest.mark.asyncio
     async def test_exception_in_execute_does_not_raise(self, tmp_path: Path) -> None:
@@ -402,57 +400,6 @@ class TestCommitAll:
 
         assert result.status == "failed"
         assert result.stderr == "RuntimeError: kaboom"
-        assert result.exit_code == -1
-
-
-# --------------------------------------------------------------------------- #
-# push
-# --------------------------------------------------------------------------- #
-
-
-class TestPush:
-    """AC-001 / AC-002 / AC-003 / AC-006 / AC-008."""
-
-    @pytest.mark.asyncio
-    async def test_success_returns_success_with_zero_exit(self, tmp_path: Path) -> None:
-        fake = FakeExecute(responses=[_ok()])
-        worktree = tmp_path / "wt"
-
-        result = await push(worktree, "feature/x", execute=fake)
-
-        assert result.status == "success"
-        assert result.operation == "push"
-        assert result.exit_code == 0
-        assert fake.calls[0].command == [
-            "git",
-            "push",
-            "origin",
-            "feature/x",
-        ]
-        # AC-003: cwd is inside the build worktree.
-        assert fake.calls[0].cwd == str(worktree)
-
-    @pytest.mark.asyncio
-    async def test_non_zero_exit_preserves_stderr(self, tmp_path: Path) -> None:
-        fake = FakeExecute(
-            responses=[_fail(exit_code=1, stderr="! [rejected] non-fast-forward")]
-        )
-
-        result = await push(tmp_path / "wt", "main", execute=fake)
-
-        assert result.status == "failed"
-        assert result.exit_code == 1
-        assert result.stderr is not None
-        assert "rejected" in result.stderr
-
-    @pytest.mark.asyncio
-    async def test_exception_in_execute_does_not_raise(self, tmp_path: Path) -> None:
-        fake = FakeExecute(raise_exc=ConnectionError("network down"))
-
-        result = await push(tmp_path / "wt", "main", execute=fake)
-
-        assert result.status == "failed"
-        assert result.stderr == "ConnectionError: network down"
         assert result.exit_code == -1
 
 
@@ -533,9 +480,9 @@ class TestAdapterContract:
     """AC-002: the operations module relies on the injected execute, not
     a direct ``subprocess.run`` / ``os.system`` call.
 
-    We verify by source inspection — the only allowed subprocess
-    primitive is ``asyncio.create_subprocess_exec`` inside the documented
-    default executor (no shell, list tokens).
+    We verify by source inspection. Since 14 October 2026 the module
+    starts no process itself: the default executor hands each git command
+    to ``forge.project_git.run_git``.
     """
 
     def test_no_subprocess_run_or_os_system_in_module(self) -> None:
@@ -546,6 +493,8 @@ class TestAdapterContract:
         # only the documented async ``execute`` callable.
         assert "subprocess.run(" not in source
         assert "os.system(" not in source
+        assert "create_subprocess_exec(" not in source
+        assert "run_git_async(" in source
         # ``shell=True`` would defeat the list-token contract; ensure
         # it is not used as a kwarg in any call site (we tolerate the
         # backtick-quoted reference in the module docstring).
@@ -559,50 +508,80 @@ class TestAdapterContract:
 
 
 class TestDefaultExecuteTimeout:
-    """The 2026-07-18 hang fix: a bounded ``_default_execute`` that reaps
-    the child on overrun instead of awaiting ``communicate()`` forever."""
+    """The 2026-07-18 hang fix, now through the git helper (14 October
+    2026): ``_default_execute`` hands its git command to ``run_git``, whose
+    own time limit stops and reaps the child; an overrun is a normal failed
+    result, never a hang and never an exception."""
 
     @pytest.mark.asyncio
-    async def test_no_timeout_still_runs_to_completion(self) -> None:
-        # Regression guard: the unbounded path (timeout=None) is unchanged.
-        result = await _default_execute(command=["true"])
-        assert result.exit_code == 0
-
-    @pytest.mark.skipif(
-        shutil.which("sleep") is None, reason="sleep binary not available"
-    )
-    @pytest.mark.asyncio
-    async def test_real_subprocess_timeout_kills_child_and_returns_failed(
+    async def test_hands_the_git_command_to_run_git(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Capture the spawned child's pid so we can prove it is dead
-        # (reaped) once _default_execute returns — no leaked process.
-        pids: list[int] = []
-        real_spawn = asyncio.create_subprocess_exec
+        from forge.adapters.git import operations
 
-        async def _spy(*args: object, **kwargs: object):
-            proc = await real_spawn(*args, **kwargs)  # type: ignore[arg-type]
-            pids.append(proc.pid)
-            return proc
+        seen: list[tuple[list[str], dict[str, object]]] = []
 
-        monkeypatch.setattr(asyncio, "create_subprocess_exec", _spy)
+        async def _fake_run_git_async(args, **kwargs):
+            seen.append((list(args), kwargs))
+            return subprocess.CompletedProcess(args, 0, "abc123\n", "")
 
-        started = time.monotonic()
-        result = await _default_execute(command=["sleep", "300"], timeout=0.5)
-        elapsed = time.monotonic() - started
+        monkeypatch.setattr(operations, "run_git_async", _fake_run_git_async)
 
-        # Loud, retryable failure — not a silent hang.
+        result = await _default_execute(
+            command=["git", "rev-parse", "HEAD"], cwd="/somewhere", timeout=7.0
+        )
+
+        assert result == ExecuteResult(exit_code=0, stdout="abc123\n", stderr="")
+        assert seen[0][0] == ["git", "rev-parse", "HEAD"]
+        assert seen[0][1]["cwd"] == "/somewhere"
+        assert seen[0][1]["timeout"] == 7.0
+
+    @pytest.mark.asyncio
+    async def test_failure_carries_only_the_helpers_sentence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.adapters.git import operations
+
+        async def _fake_run_git_async(args, **kwargs):
+            return subprocess.CompletedProcess(
+                args, 128, "", "git worktree stopped with exit code 128."
+            )
+
+        monkeypatch.setattr(operations, "run_git_async", _fake_run_git_async)
+
+        result = await _default_execute(command=["git", "worktree", "remove", "x"])
+
+        assert result.exit_code == 128
+        assert result.stderr == "git worktree stopped with exit code 128."
+
+    @pytest.mark.asyncio
+    async def test_timeout_becomes_a_failed_result(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.adapters.git import operations
+
+        async def _times_out(args, **kwargs):
+            raise subprocess.TimeoutExpired(
+                "git rev-parse",
+                0.5,
+                stderr="git rev-parse did not finish within 0.5 seconds.",
+            )
+
+        monkeypatch.setattr(operations, "run_git_async", _times_out)
+
+        result = await _default_execute(
+            command=["git", "rev-parse", "HEAD"], timeout=0.5
+        )
+
         assert result.exit_code == -1
-        assert "timeout" in result.stderr.lower()
-        assert "sleep" in result.stderr  # command echoed for diagnosis
-        # SIGTERM on `sleep` is immediate, so we return far inside the
-        # 0.5s + 5s grace envelope.
-        assert elapsed < 6.0
+        assert result.stderr == "git rev-parse did not finish within 0.5 seconds."
 
-        # The child is dead and reaped: signalling it raises ProcessLookupError.
-        assert pids, "spy did not capture a child pid"
-        with pytest.raises(ProcessLookupError):
-            os.kill(pids[0], 0)
+    @pytest.mark.asyncio
+    async def test_a_program_other_than_git_is_not_started(self) -> None:
+        result = await _default_execute(command=["sleep", "300"], timeout=0.5)
+
+        assert result.exit_code == -1
+        assert "only git" in result.stderr
 
 
 # --------------------------------------------------------------------------- #

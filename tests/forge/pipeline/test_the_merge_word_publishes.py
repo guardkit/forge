@@ -65,6 +65,7 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     pool,
     repo_root,
 )
+from tests.forge.recorded_fetch_address import origin_of
 
 #: The publisher said it passed its start-up self-check. Without this,
 #: publication cannot switch on at all — the safe side.
@@ -76,7 +77,10 @@ def config_with_publication_on(repo_root: Path) -> ForgeConfig:  # noqa: F811
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "planning": {
+                "target_repo_paths": {REPO: str(repo_root)},
+                "fetch_addresses": {REPO: origin_of(repo_root)},
+            },
             "approval": {"expected_approver": "rich"},
             "merge_executor": {"enabled": True},
             "publication": {
@@ -94,7 +98,10 @@ def config_with_publication_off(repo_root: Path) -> ForgeConfig:  # noqa: F811
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "planning": {
+                "target_repo_paths": {REPO: str(repo_root)},
+                "fetch_addresses": {REPO: origin_of(repo_root)},
+            },
             "approval": {"expected_approver": "rich"},
             "merge_executor": {"enabled": True},
         }
@@ -464,7 +471,10 @@ class TestEveryOtherRefusalStopsAtOnce:
         config = ForgeConfig.model_validate(
             {
                 "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-                "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+                "planning": {
+                    "target_repo_paths": {REPO: str(repo_root)},
+                    "fetch_addresses": {REPO: origin_of(repo_root)},
+                },
                 "approval": {"expected_approver": "rich"},
                 "merge_executor": {"enabled": True},
                 "publication": {
@@ -2154,7 +2164,7 @@ class _ASurfaceWhoseCleanUpsSay:
                     return queued.pop(0)
                 return await super().remove_candidate_tree(feature_id, path)
 
-        return _Surface(repo_root)
+        return _Surface(repo_root, fetch_address=origin_of(repo_root), repo=REPO)
 
 
 class TestEverySandboxCleanUpIsGuarded:

@@ -106,11 +106,15 @@ class SidecarCandidateGit:
         post: HttpPost = _urllib_post,
         read_timeout_s: float = _DEFAULT_READ_TIMEOUT_S,
         layout_timeout_s: float = _DEFAULT_LAYOUT_TIMEOUT_S,
+        fetch_address: str | None = None,
     ) -> None:
         if not repo or not str(repo).strip():
             raise ValueError("SidecarCandidateGit needs the repository's org/name key")
         self._base_url = str(base_url).rstrip("/")
         self._repo = str(repo)
+        # The project's recorded fetch address (planning.fetch_addresses),
+        # sent with each starting-point request (14 October 2026).
+        self._fetch_address = fetch_address
         self._post = post
         self._read_timeout_s = read_timeout_s
         self._layout_timeout_s = layout_timeout_s
@@ -187,8 +191,9 @@ class SidecarCandidateGit:
     async def fetch_remote_start_point(
         self, branch: str | None = None
     ) -> RemoteStartPoint:
-        """Fetch the sandbox clone's remote ``origin`` and say where its
-        default branch is (one true copy, item 1).
+        """Fetch the project's recorded address inside the sandbox and say
+        where its default branch is (one true copy, item 1; the address is
+        sent, never the clone's origin read).
 
         A sandbox that could not be reached, or that answered anything but a
         starting point, is itself a refusal in plain words — the caller never
@@ -198,6 +203,8 @@ class SidecarCandidateGit:
         body: dict[str, Any] = {"repo": self._repo}
         if branch:
             body["branch"] = str(branch)
+        if self._fetch_address:
+            body["fetch_address"] = self._fetch_address
         decoded, why = await self._ok(
             "/git/remote-start-point",
             body,

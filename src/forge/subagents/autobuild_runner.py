@@ -105,6 +105,7 @@ from typing_extensions import NotRequired, Required, TypedDict
 
 from forge import build_processes, receipts as _receipts
 from forge.lifecycle.feature_routing import FeatureRoutingError
+from forge.project_git import run_git, run_git_async
 from forge.subagents import build_monitor
 from forge.subagents.autobuild_worktree_lifecycle import inspect_autobuild_worktree
 from forge.launch_environment import build_launch_env
@@ -2108,25 +2109,28 @@ class WorktreeMaterialisationError(RuntimeError):
 
 
 async def _run_git(args: list[str], *, cwd: Path) -> tuple[int, str]:
-    """Run ``git <args>`` in ``cwd``; return ``(returncode, combined output)``.
+    """Run ``git <args>`` in ``cwd``; return ``(returncode, text)``.
 
-    Uses :func:`asyncio.create_subprocess_exec` — the same subprocess seam the
-    guardkit invocation uses — so tests that stub the guardkit call can
-    dispatch on ``argv[0]`` and let real git run against a throwaway repo. Only
-    LOCAL git verbs are ever passed here (``rev-parse``, ``worktree``); no
+    The command goes through :func:`forge.project_git.run_git_async`, the one
+    way Forge runs git: a fixed environment with no factory secret, the
+    project's filters, hooks and helper programs switched off, and no network
+    command. Only LOCAL git verbs are ever passed here (``rev-parse``,
+    ``worktree``, ``branch``, ``checkout --detach``, ``for-each-ref``); no
     network verb (``fetch``/``pull``) is issued, honouring the DEFECT #19
     "read the local ref only" rule.
+
+    Git's standard output and its error output are kept apart (14 October
+    2026; before then they were merged). On success ``text`` is git's own
+    standard output, which callers parse as data. On failure ``text`` is only
+    the helper's fixed sentence ("git branch stopped with exit code 128."),
+    never git's own error words, because callers put it in log lines and in
+    a build's failure reason. No time limit, as before.
     """
-    proc = await asyncio.create_subprocess_exec(
-        "git",
-        *args,
-        cwd=str(cwd),
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.STDOUT,
-    )
-    out_bytes, _ = await proc.communicate()
-    code = proc.returncode if proc.returncode is not None else -1
-    return code, out_bytes.decode("utf-8", errors="replace").strip()
+    done = await run_git_async(list(args), cwd=cwd)
+    code = done.returncode if done.returncode is not None else -1
+    if code == 0:
+        return code, (done.stdout or "").strip()
+    return code, (done.stderr or "").strip()
 
 
 async def _local_branch_exists(repo_path: Path, branch: str) -> bool:
@@ -2381,7 +2385,9 @@ async def _sweep_build_refs(repo_path: Path, feature_id: str) -> None:
     itemised:
 
     1. ``git worktree prune --verbose`` — drops registrations whose dirs are
-       gone, and names each one in the log. The repository is shared with the
+       gone. (Git writes the names it prunes to its error output, which the
+       git helper discards since 14 October 2026, so the log says only that
+       the prune ran.) The repository is shared with the
        sandbox helper, whose planning worktrees live in ITS OWN temporary
        folder, which this container cannot see; the helper locks them while
        they are in use, and git never prunes a locked worktree (8 October
@@ -6194,16 +6200,13 @@ def _resolve_runner_code_version() -> str:
     """
     module_dir = Path(__file__).resolve().parent
     try:
-        import subprocess  # local import — runs once at module import
-
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "-C", str(module_dir), "rev-parse", "--short", "HEAD"],
-            capture_output=True,
-            text=True,
+        # Through the one git helper (14 October 2026), like every other git
+        # command Forge runs; the same five-second limit as before.
+        result = run_git(
+            ["-C", str(module_dir), "rev-parse", "--short", "HEAD"],
             timeout=5,
-            check=False,
         )
-        rev = result.stdout.strip()
+        rev = result.stdout.strip() if result.returncode == 0 else ""
         if rev:
             return f"git-{rev}"
     except Exception:  # noqa: BLE001 — never block import on the stamp

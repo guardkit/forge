@@ -486,7 +486,10 @@ async def cut_worktree_in_checkout(
         build_id: The build whose tree this is (also the leaf directory).
         branch: The journey branch to create.
         base_ref: The commit-ish that branch is cut from.
-        execute: Injected subprocess primitive.
+        execute: Injected subprocess primitive. The default is the git
+            adapter's, which runs every git command here through
+            :func:`forge.project_git.run_git` (14 October 2026); a failure
+            then carries only the helper's fixed sentence, never git's text.
         log: Where the reuse note goes.
     """
     from forge.adapters.git.operations import _default_execute, prepare_worktree

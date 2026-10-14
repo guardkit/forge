@@ -72,6 +72,7 @@ from forge.pipeline.dispatchers.conductor_subprocess import (
 )
 from forge.pipeline.merge_executor import MergeExecutorDeps, execute_merge_deploy
 from forge.pipeline.stage_taxonomy import StageClass
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 #: A repository, a build and a feature that exist nowhere but here.
 REPO = "acme/widget-shop"
@@ -110,17 +111,20 @@ def _git(where: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def project(tmp_path: Path) -> Path:
+def project(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     """A real git repository with a feature branch and a bare "remote".
 
     The merge word joins onto the branch of the remote the work was recorded
     against, so a press driven against this needs one; it is a bare repository
-    beside it — real git, nobody's account.
+    beside it — real git, nobody's account. A local folder is allowed as a
+    fetch address for the test, and :func:`_config` records it as the
+    project's fetch address.
 
     Its own declaration file names ``SOME_TOOL_CACHE``, and it is COMMITTED,
     because a declaration is a committed line: that is the whole point of
     reading it at a commit rather than off the working copy.
     """
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
     root = tmp_path / "widget-shop"
     root.mkdir()
     _git(root, "init", "-q", "-b", "main")
@@ -293,7 +297,10 @@ def _a_coordinator_that_recorded(
 def _config(project: Path, *, sandbox_url: str | None = None) -> ForgeConfig:
     raw: dict[str, Any] = {
         "permissions": {"filesystem": {"allowlist": [str(project.parent)]}},
-        "planning": {"target_repo_paths": {REPO: str(project)}},
+        "planning": {
+            "target_repo_paths": {REPO: str(project)},
+            "fetch_addresses": {REPO: origin_of(project)},
+        },
         "approval": {"expected_approver": "rich"},
         "merge_executor": {"enabled": True},
     }

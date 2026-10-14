@@ -230,10 +230,14 @@ def make_mode_c_commit_probe(
         stderr = (getattr(result, "stderr", "") or "").strip()
 
         if exit_code != 0:
+            # With the default executor ``stderr`` is the git helper's fixed
+            # sentence (14 October 2026), so that is what the failed decision
+            # records; git's own text never reaches it. A failed command's
+            # stdout is not used as a fallback: it could carry git's words.
             return _failed(
                 build_id,
                 f"git exited {exit_code} for {' '.join(command)} in "
-                f"{worktree}: {stderr or stdout or '<no output>'}",
+                f"{worktree}: {stderr or '<no output>'}",
             )
 
         try:

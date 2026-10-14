@@ -59,6 +59,7 @@ from nats_core.events import (
 )
 
 from forge.lifecycle.persistence import StageLogEntry
+from forge.project_git import run_git_async
 from forge.receipts import receipts_root
 
 logger = logging.getLogger(__name__)
@@ -193,15 +194,10 @@ async def git_rev_parse_main(
     """
     wanted = str(branch or "").strip() or "main"
     try:
-        proc = await asyncio.create_subprocess_exec(
-            "git",
-            "rev-parse",
-            wanted,
-            cwd=str(repo_root),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-        )
-        stdout_b, stderr_b = await proc.communicate()
+        # Through the factory's one git helper (in a worker thread): on a
+        # failure its ``stderr`` is a fixed sentence, so git's own text never
+        # reaches the log.
+        proc = await run_git_async(["rev-parse", wanted], cwd=str(repo_root))
     except Exception as exc:  # noqa: BLE001 — best-effort probe, honest None
         logger.warning(
             "merge-offer: git rev-parse %s failed to run in %s (%s)",
@@ -216,10 +212,10 @@ async def git_rev_parse_main(
             wanted,
             proc.returncode,
             repo_root,
-            stderr_b.decode("utf-8", errors="replace").strip(),
+            (proc.stderr or "").strip(),
         )
         return None
-    sha = stdout_b.decode("utf-8", errors="replace").strip()
+    sha = (proc.stdout or "").strip()
     return sha or None
 
 
@@ -2160,11 +2156,17 @@ class MergeOfferService:
         branch = branch_to_merge(feature_id, merge_branch)
         from forge.deploy.candidate_tree import InContainerCandidateGit
 
+        # With no venue composed, this container's git, given the project's
+        # recorded fetch address (Forge git hardening, 14 October 2026), as
+        # the press's own git_surface_for does.
+        addresses = getattr(self._config.planning, "fetch_addresses", None) or {}
         git = (
             self._git_surface(row.repo, repo_root)
             if self._git_surface is not None
             else None
-        ) or InContainerCandidateGit(repo_root)
+        ) or InContainerCandidateGit(
+            repo_root, fetch_address=addresses.get(row.repo), repo=row.repo
+        )
         # WHICH BRANCH OF THE REMOTE THIS WORK IS AIMED AT, off the build's own
         # row — the name written down when the work started, never one chosen
         # here (23 September 2026, carried from stage 4a's list). This used to

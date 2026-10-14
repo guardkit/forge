@@ -50,6 +50,7 @@ from tests.forge.pipeline.test_merge_executor import (
     _git,
     _stage_ids,
 )
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 BUILD_ID = "build-FEAT-MX1-20260910141815"
 FEATURE_ID = "FEAT-MX1"
@@ -67,8 +68,13 @@ def pool(tmp_path: Path) -> SqliteLifecyclePersistence:
 
 
 @pytest.fixture
-def repo_root(tmp_path: Path) -> Path:
-    """A real repository: main with one commit, the feature branch one ahead."""
+def repo_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A real repository: main with one commit, the feature branch one ahead.
+
+    Its "remote" is a local folder, which the test allows as a fetch address;
+    the configuration below records it as the project's fetch address.
+    """
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
     root = tmp_path / "api_test"
     root.mkdir()
     _git(root, "init", "-b", "main", "-q")
@@ -99,7 +105,10 @@ def config(repo_root: Path) -> ForgeConfig:
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
-            "planning": {"target_repo_paths": {REPO: str(repo_root)}},
+            "planning": {
+                "target_repo_paths": {REPO: str(repo_root)},
+                "fetch_addresses": {REPO: origin_of(repo_root)},
+            },
             "approval": {"expected_approver": "rich"},
             "merge_executor": {"enabled": True},
         }

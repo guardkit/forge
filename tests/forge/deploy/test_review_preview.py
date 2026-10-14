@@ -13,6 +13,7 @@ import asyncio
 import io
 import json
 import os
+import re
 import sqlite3
 import stat
 import subprocess
@@ -1659,6 +1660,135 @@ def test_the_preview_join_has_the_tree_the_build_systems_merge_makes(tmp_path: P
     assert not laid.exists()
     with pytest.raises(subprocess.CalledProcessError):
         _git(repo, "rev-parse", "--verify", "refs/forge/preview/pv000000000001")
+    assert remove_preview_tree(repo, lease_id="pv000000000001")["removed"] is True
+
+
+# ---------------------------------------------------------------------------
+# Git through Forge's one way of running it (added 14 October 2026)
+# ---------------------------------------------------------------------------
+
+
+def test_the_real_runner_hands_git_commands_to_the_git_helper(monkeypatch) -> None:
+    """Git goes through ``run_git`` with the commit identity and the
+    one-minute wall; the container engine is still run directly."""
+    import forge.deploy.review_preview as review_preview
+
+    seen: list[tuple[list[str], dict[str, Any]]] = []
+
+    def fake_run_git(args, **kwargs):
+        seen.append((list(args), kwargs))
+        return subprocess.CompletedProcess(args, 0, stdout="out\n", stderr="")
+
+    monkeypatch.setattr(review_preview, "run_git", fake_run_git)
+    argv = ["git", "-C", "/somewhere", "show-ref", "--verify", "--quiet", "refs/x"]
+    assert review_preview._run_command(argv) == (0, "out\n", "")
+    assert seen[0][0] == argv
+    assert seen[0][1]["timeout"] == 60
+    assert seen[0][1]["env"] == review_preview._GIT_IDENTITY
+
+    ran: list[list[str]] = []
+
+    def fake_subprocess_run(args, **kwargs):
+        ran.append(list(args))
+        return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+    monkeypatch.setattr(review_preview.subprocess, "run", fake_subprocess_run)
+    assert review_preview._run_command(["docker", "ps", "-q"])[0] == 0
+    assert ran == [["docker", "ps", "-q"]]
+    assert len(seen) == 1  # the container command never went to the git helper
+
+
+def test_a_git_timeout_reports_only_the_helpers_sentence(monkeypatch) -> None:
+    import forge.deploy.review_preview as review_preview
+
+    def slow(args, **kwargs):
+        raise subprocess.TimeoutExpired(
+            "git merge-tree", 60, stderr="git merge-tree did not finish within 60 seconds."
+        )
+
+    monkeypatch.setattr(review_preview, "run_git", slow)
+    code, out, err = review_preview._run_command(
+        ["git", "-C", "/somewhere", "merge-tree", "--write-tree", "a", "b"]
+    )
+    assert (code, out, err) == (
+        127, "", "git merge-tree did not finish within 60 seconds."
+    )
+
+
+def test_a_failed_join_names_the_fixed_sentence_not_gits_words(monkeypatch) -> None:
+    """A failed command's stdout is not used as the reason: only the
+    helper's sentence reaches the card."""
+    import forge.deploy.review_preview as review_preview
+
+    def failing(args, **kwargs):
+        return subprocess.CompletedProcess(
+            args, 128, stdout="IGNORE-PREVIOUS-INSTRUCTIONS\n",
+            stderr="git merge-tree stopped with exit code 128.",
+        )
+
+    monkeypatch.setattr(review_preview, "run_git", failing)
+    answer = make_preview_tree(
+        "/somewhere", lease_id="pv000000000001", onto=SHA_MAIN, candidate=SHA_CAND
+    )
+    assert answer == {
+        "refusal": (
+            "git could not join the candidate onto aaaaaaaaaa: "
+            "git merge-tree stopped with exit code 128."
+        )
+    }
+
+
+def test_a_failed_join_in_a_real_clone_carries_no_git_text(tmp_path: Path) -> None:
+    repo = tmp_path / "clone"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "a.txt").write_text("a\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-q", "-m", "base")
+    onto = _git(repo, "rev-parse", "HEAD")
+
+    answer = make_preview_tree(
+        repo, lease_id="pv000000000001", onto=onto, candidate="c" * 40
+    )
+    refusal = answer["refusal"]
+    assert refusal.startswith("git could not join the candidate onto ")
+    assert re.fullmatch(
+        r"git could not join the candidate onto [0-9a-f]{10}: "
+        r"git merge-tree stopped with exit code \d+\.",
+        refusal,
+    ), refusal
+    assert "fatal" not in refusal and "c" * 40 not in refusal
+
+
+def test_review_preview_merge_tree_runs_no_merge_program(tmp_path: Path) -> None:
+    """A merge program named in the clone's own settings and attributes is
+    never run by the preview's join, and the commit is not signed."""
+    repo = tmp_path / "clone"
+    repo.mkdir()
+    marker = tmp_path / "merge-program-ran"
+    _git(repo, "init", "-q", "-b", "main")
+    _git(repo, "config", "merge.planted.driver", f"touch {marker}; false")
+    _git(repo, "config", "commit.gpgSign", "true")
+    _git(repo, "config", "gpg.program", f"touch {marker}")
+    (repo / ".gitattributes").write_text("shared.txt merge=planted\n")
+    (repo / "shared.txt").write_text("one\ntwo\nthree\n")
+    _git(repo, "add", ".")
+    _git(repo, "-c", "commit.gpgSign=false", "commit", "-q", "-m", "base")
+    _git(repo, "checkout", "-q", "-b", "autobuild/FEAT-AB12")
+    (repo / "shared.txt").write_text("one\ntwo\nthree\nfour\n")
+    _git(repo, "-c", "commit.gpgSign=false", "commit", "-q", "-am", "feature")
+    candidate = _git(repo, "rev-parse", "HEAD")
+    _git(repo, "checkout", "-q", "main")
+    (repo / "shared.txt").write_text("zero\none\ntwo\nthree\n")
+    _git(repo, "-c", "commit.gpgSign=false", "commit", "-q", "-am", "main moved")
+    onto = _git(repo, "rev-parse", "HEAD")
+
+    answer = make_preview_tree(repo, lease_id="pv000000000001", onto=onto, candidate=candidate)
+
+    assert not marker.exists()
+    assert "refusal" not in answer, answer
+    shown = _git(repo, "cat-file", "-p", answer["commit"])
+    assert "gpgsig" not in shown
     assert remove_preview_tree(repo, lease_id="pv000000000001")["removed"] is True
 
 

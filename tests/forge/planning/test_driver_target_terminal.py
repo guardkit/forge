@@ -59,6 +59,7 @@ from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
 from forge.planning.states import PlanningState
 from forge.planning.target_terminal_tools import ToolOutcome
 from nats_core.events import ApprovalResponsePayload
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 CID = "tt-run-0001"
 PLAN_RUN_ID = f"plan-{CID}"
@@ -87,6 +88,38 @@ _AUTHLESS_SEED_YAML = (
 # ---------------------------------------------------------------------------
 # Fixtures / doubles
 # ---------------------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def _local_remotes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every "remote" here is a bare repository in ``tmp_path``: let a local
+    folder be a recorded fetch address, and keep the factory's own fetch
+    copies inside ``tmp_path`` (Forge git hardening, 14 October 2026)."""
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
+
+
+def _recorded_addresses(repo_path: str | Path) -> dict[str, str]:
+    """The coordinator's ``planning.fetch_addresses`` for the project whose
+    copy is at ``repo_path``: the bare repository the test gave that copy, or
+    nothing when the copy has none (or there is no copy on disk at all)."""
+    named = subprocess.run(
+        ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
+        capture_output=True,
+        text=True,
+    )
+    if not Path(repo_path).is_dir() or named.returncode != 0:
+        return {}
+    return {TARGET_REPO: origin_of(repo_path)}
+
+
+def _recorded_runner(worktrees_root: Path, repo: Path) -> WorktreeGitRunner:
+    """The real git runner, given the project's clone and recorded fetch
+    address exactly as the coordinator's settings give them in production."""
+    return WorktreeGitRunner(
+        worktrees_root=worktrees_root,
+        target_repo_paths={TARGET_REPO: str(repo)},
+        fetch_addresses=_recorded_addresses(repo),
+    )
 
 
 @pytest.fixture
@@ -761,6 +794,7 @@ def _make_driver(
     cfg = PlanningConfig(
         enabled=True,
         target_repo_paths={TARGET_REPO: repo_path},
+        fetch_addresses=_recorded_addresses(repo_path),
         target_terminal=TargetTerminalConfig(enabled=target_terminal_enabled),
         originator_wait_seconds=originator_wait_seconds,
         **({"digest_review": digest_review} if digest_review is not None else {}),
@@ -1002,7 +1036,7 @@ async def test_full_round_trip_commits_spec_and_plan_to_scratch_repo(
 ) -> None:
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     _queue(store)
     h = _make_driver(store, git_runner=git, repo_path=str(repo))
@@ -1064,7 +1098,7 @@ async def test_full_round_trip_on_the_DEPLOYED_native_reply_shape(
     """
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     _queue(store)
     h = _make_driver(
@@ -1123,7 +1157,7 @@ async def test_native_spec_validation_flag_is_advisory_and_proceeds(
     C5 bounded revision re-invoke is the named follow-on consumer."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -1167,7 +1201,7 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     _git(repo, "add", "-A")
     _git(repo, "commit", "-qm", "the test suites")
     _publish_to_origin(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     _queue(store)
     h = _make_driver(store, git_runner=git, repo_path=str(repo))
@@ -1223,7 +1257,7 @@ async def test_the_location_sent_to_the_writer_is_the_one_forge_checks_against(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     (repo / "tests" / "health").mkdir(parents=True)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     _queue(store)
     h = _make_driver(
@@ -1357,7 +1391,7 @@ async def test_replay_invented_tests_smoke_fails_the_real_validate(
     plan is NOT committed and the run never reaches BUILD_QUEUED."""
     repo = tmp_path / "api_test"
     _init_api_test_shaped_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     _queue(store)
     h = _make_driver(
@@ -1406,7 +1440,7 @@ async def test_replay_real_tests_health_passes_to_build_queued(
     BUILD_QUEUED — the good path is unblocked."""
     repo = tmp_path / "api_test"
     _init_api_test_shaped_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     _queue(store)
     h = _make_driver(
@@ -1441,7 +1475,7 @@ async def test_round_trip_is_idempotent_on_redrive(
 ) -> None:
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(store, git_runner=git, repo_path=str(repo))
 
@@ -1491,7 +1525,7 @@ async def test_normalizer_red_fails_and_does_not_commit(
 ) -> None:
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -1592,7 +1626,7 @@ async def test_validate_red_fails_and_plan_not_committed(
 ) -> None:
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -1984,7 +2018,7 @@ async def _auth_flagged_harness(
     """
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -2344,7 +2378,7 @@ async def test_auth_door_confirmation_is_never_re_asked_on_a_re_drive(
     durable confirmation short-circuits the door on the next drive."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
 
     # Drive once, confirming at the door, then rewind the durable record to the
@@ -2432,7 +2466,7 @@ async def test_auth_door_survives_a_restart_and_re_emits_the_same_card(
     """
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     publisher = FakePublisher()  # ONE wire across both boots
 
@@ -2504,7 +2538,7 @@ async def test_auth_door_never_published_says_undeliverable_not_silence(
     monkeypatch.setattr(driver_module, "_ARM_TIMEOUT_SECONDS", 0.05)
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -2596,7 +2630,7 @@ async def test_round19_authless_seed_mints_three_validated_bars(
     the PLAN commit sha, committed as ONE commit BEFORE the build trigger."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -2698,7 +2732,7 @@ async def test_round19_no_seed_fails_loudly_before_the_build(
     build anyway); no bars, no BUILD_QUEUED."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -2727,7 +2761,7 @@ async def test_unwired_pass_bar_validate_fails_loudly(
     (never a silent skip of the guardkit check)."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -2877,7 +2911,7 @@ async def test_f2_derivable_seed_registers_gate_as_one_commit_before_build(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -2974,7 +3008,7 @@ async def test_f2_underivable_seed_honest_skip_build_still_queues(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3049,7 +3083,7 @@ async def test_f2_digest_endpoint_gates_what_the_prose_cannot_derive(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3096,7 +3130,7 @@ async def test_f2_digest_address_with_a_placeholder_is_skipped_with_its_reason(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3137,7 +3171,7 @@ async def test_f2_digest_endpoint_absent_leaves_the_prose_path_exactly_as_it_was
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3177,7 +3211,7 @@ async def test_f2_digest_endpoint_non_get_does_not_widen_the_gate(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3264,7 +3298,7 @@ async def test_f2_prose_address_is_read_whole_and_skipped_with_its_reason(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3308,7 +3342,7 @@ async def test_f2_prose_plain_get_address_registers_the_whole_address(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3341,7 +3375,7 @@ async def test_f2_missing_template_honest_skip(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo, template=False, registry=True)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3374,7 +3408,7 @@ async def test_f2_missing_registry_skip_names_its_reason(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo, template=True, registry=False)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3403,7 +3437,7 @@ async def test_f2_validator_red_fails_loudly_zero_branch_mutation(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3444,7 +3478,7 @@ async def test_f2_unwired_gate_registry_validate_fails_loudly(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -3789,7 +3823,7 @@ async def test_leftover_dcl_config_is_ignored_end_to_end(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_leftover_dcl_config(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -4403,7 +4437,14 @@ def test_the_git_command_is_an_argument_list_with_no_shell(
 ) -> None:
     """The command forge runs, pinned: a plain argument list, no shell, a
     timeout, and the safe.directory setting that lets forge read a checkout it
-    does not own."""
+    does not own.
+
+    Since 14 October 2026 every git command goes through Forge's one git
+    helper: git is run by its full path, with no pager, file names taken
+    literally, the fixed settings that stop a project's own settings starting
+    another program, and a fixed environment rather than Forge's own."""
+    from forge import project_git
+
     repo = _repo_with_files(tmp_path, ["src/users/crud.py"])
     seen: dict[str, Any] = {}
     real_run = subprocess.run
@@ -4416,12 +4457,18 @@ def test_the_git_command_is_an_argument_list_with_no_shell(
     monkeypatch.setattr(repository_facts_module.subprocess, "run", _record)
     PlanningRunDriver._read_repository_inventory(str(repo))
 
+    fixed: list[str] = []
+    for setting in project_git.FIXED_SETTINGS:
+        fixed += ["-c", setting]
     assert seen["cmd"] == [
-        "git",
-        "-c",
-        "safe.directory=*",
+        project_git.git_program(),
+        "--no-pager",
+        "--literal-pathspecs",
         "-C",
         str(repo),
+        "-c",
+        "safe.directory=*",
+        *fixed,
         "ls-files",
         "-z",
     ]
@@ -4429,8 +4476,14 @@ def test_the_git_command_is_an_argument_list_with_no_shell(
         seen["kwargs"]["timeout"]
         == driver_module._REPO_INVENTORY_GIT_TIMEOUT_SECONDS
     )
-    assert seen["kwargs"]["check"] is False
     assert "shell" not in seen["kwargs"]
+    # git gets the fixed environment, never Forge's own.
+    assert seen["kwargs"]["env"]["GIT_ALLOW_PROTOCOL"] == "none"
+    assert set(seen["kwargs"]["env"]) <= {
+        "PATH",
+        *project_git.FIXED_ENVIRONMENT,
+        *project_git.KEPT_ENVIRONMENT_NAMES,
+    }
 
 
 def test_a_repository_of_paperwork_alone_sends_no_inventory(
@@ -4640,7 +4693,7 @@ async def test_stamp_normalizer_success_writes_stamps_that_ride_the_plan_commit(
     receipts and the owner line say so."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -4700,7 +4753,7 @@ async def test_stamp_normalizer_refusal_stops_the_run_with_the_titles_on_the_car
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _commit_repo_routing_law(repo, "enforced")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     titles = _UNDECIDABLE_TITLES
     refusal = StampNormalizerOutcome(
@@ -4762,7 +4815,7 @@ async def test_stamp_normalizer_enforced_partial_stops_with_the_titles_on_the_ca
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _commit_repo_routing_law(repo, "enforced")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -4811,7 +4864,7 @@ async def test_stamp_normalizer_not_enforced_partial_proceeds_with_receipt_and_o
     ``routing_law:`` (the hook never writes it)."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -4895,7 +4948,7 @@ async def test_stamp_normalizer_not_enforced_failed_proceeds_with_an_error_recei
     says the stamps were not minted."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     failed = StampNormalizerOutcome(
         status="failed",
@@ -4945,7 +4998,7 @@ async def test_stamp_normalizer_feature_level_off_wins_over_repo_enforced(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _commit_repo_routing_law(repo, "enforced")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -4972,7 +5025,7 @@ async def test_stamp_normalizer_feature_level_enforced_wins_over_a_silent_repo(
     enforced`` → ENFORCED → a partial stops with the card."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -4997,7 +5050,7 @@ async def test_stamp_normalizer_unenforced_line_is_receipted_as_not_sent_without
     receipt says 'line not sent (no notifier)' — never a silent drop."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -5053,7 +5106,7 @@ async def test_stamp_normalizer_unavailable_continues_and_is_receipted(
     say the plan is unstamped — never silent."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     unavailable = StampNormalizerOutcome(
         status="unavailable",
@@ -5103,7 +5156,7 @@ async def test_stamp_normalizer_failure_stops_the_run_with_the_reason(
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _commit_repo_routing_law(repo, "enforced")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     failed = StampNormalizerOutcome(
         status="failed",
@@ -5134,7 +5187,7 @@ async def test_stamp_normalizer_not_wired_is_receipted_and_byte_identical_otherw
     (no fill, no write, validate runs) and the receipts say ``not-wired``."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -5162,7 +5215,7 @@ async def test_stamp_normalizer_leaves_a_declared_feature_files_alone(
     it (a present key is the writer's statement) — no fill in the receipts."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
 
     def _plan_with_universe(feature_id: str) -> Any:
@@ -5248,7 +5301,7 @@ async def test_live_plan_leg_commits_rule_minted_stamps_with_the_real_normalizer
     checkout, python = live_guardkit_or_skip(Path(__file__))
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -5297,7 +5350,7 @@ async def test_live_plan_leg_enforced_refusal_card_names_the_real_normalizers_ti
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _commit_repo_routing_law(repo, "enforced")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -5333,7 +5386,7 @@ async def test_live_plan_leg_not_enforced_partial_proceeds_with_the_real_normali
     checkout, python = live_guardkit_or_skip(Path(__file__))
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -5409,7 +5462,7 @@ async def test_stamp_disagreements_reach_the_owner_on_a_clean_run_whatever_the_e
     _init_scratch_repo(repo)
     if enforcement == "enforced":
         _commit_repo_routing_law(repo, "enforced")
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -5669,7 +5722,7 @@ async def test_documentation_task_bar_lands_narrowed_on_the_branch(
     both committed, and the build still queued."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(
         store,
@@ -5901,7 +5954,7 @@ def _enforced_repo(tmp_path: Path) -> tuple[Path, WorktreeGitRunner]:
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _commit_repo_routing_law(repo, "enforced")
-    return repo, WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    return repo, _recorded_runner(tmp_path / "wt", repo)
 
 
 def _approved_spec_rows(store: SqlitePlanningRunStore) -> list[dict[str, Any]]:
@@ -6528,7 +6581,11 @@ async def test_when_the_approved_spec_cannot_be_put_back_nothing_is_stamped_on_t
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _commit_repo_routing_law(repo, "enforced")
-    git = _ForgetfulGitRunner(worktrees_root=tmp_path / "wt")
+    git = _ForgetfulGitRunner(
+        worktrees_root=tmp_path / "wt",
+        target_repo_paths={TARGET_REPO: str(repo)},
+        fetch_addresses=_recorded_addresses(repo),
+    )
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -6854,7 +6911,7 @@ async def test_a_restart_after_a_refused_rewrite_redoes_the_rewrite_and_the_mode
     sink2: dict[str, Any] = {}
     h2 = _make_driver(
         store,
-        git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt2"),
+        git_runner=_recorded_runner(tmp_path / "wt2", repo),
         repo_path=str(repo),
         spec_result_factory=_spec_by_round(_spec_result_native(), refused_round),
         plan_result_factory=_plan_result_native,
@@ -6940,7 +6997,7 @@ async def test_a_restart_after_the_row_was_written_does_not_rewrite_again(
     sink2: dict[str, Any] = {}
     h2 = _make_driver(
         store,
-        git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt2"),
+        git_runner=_recorded_runner(tmp_path / "wt2", repo),
         repo_path=str(repo),
         spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
         plan_result_factory=_plan_result_native,
@@ -6989,7 +7046,7 @@ async def test_a_restart_before_the_row_was_written_redoes_the_rewrite(
     sink2: dict[str, Any] = {}
     h2 = _make_driver(
         store,
-        git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt2"),
+        git_runner=_recorded_runner(tmp_path / "wt2", repo),
         repo_path=str(repo),
         spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
         plan_result_factory=_plan_result_native,
@@ -7044,7 +7101,7 @@ async def test_the_rewrite_fires_only_on_a_refusal_of_examples_where_the_law_is_
     sink2: dict[str, Any] = {}
     h2 = _make_driver(
         store2,
-        git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt-unenforced"),
+        git_runner=_recorded_runner(tmp_path / "wt-unenforced", repo2),
         repo_path=str(repo2),
         spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
         plan_result_factory=_plan_result_native,
@@ -7414,7 +7471,7 @@ async def test_an_unenforced_repo_stamps_as_before_even_with_the_switch_on(
     refused it)."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -7464,7 +7521,7 @@ async def test_after_the_one_rewrite_a_re_drive_stamps_with_the_model_allowed(
     sink2: dict[str, Any] = {}
     h2 = _make_driver(
         store,
-        git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt2"),
+        git_runner=_recorded_runner(tmp_path / "wt2", repo),
         repo_path=str(repo),
         spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
         plan_result_factory=_plan_result_native,
@@ -7997,7 +8054,7 @@ async def test_the_plan_leg_is_sent_the_sentence_and_the_fact_sheet(
     names the spec leg already uses."""
     repo = tmp_path / "api_test"
     _init_repo_with_a_stats_route(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     _queue(store)
     h = _make_driver(store, git_runner=git, repo_path=str(repo))
@@ -8040,7 +8097,7 @@ async def test_a_run_with_no_sentence_sends_the_set_that_shipped_before(
     order with no window in which planning is refused."""
     repo = tmp_path / "api_test"
     _init_repo_with_a_stats_route(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     store.record_queued(
         correlation_id=CID,
@@ -8094,7 +8151,7 @@ async def test_normalizer_rewrite_requests_exact_semantic_rereview(
 ) -> None:
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     sink: dict[str, Any] = {}
     h = _make_driver(
@@ -8120,7 +8177,7 @@ async def test_failed_exact_re_review_stops_normalized_plan_before_commit(
 ) -> None:
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
 
     async def _reviewer(**kwargs: Any) -> Any:
@@ -8206,7 +8263,7 @@ async def test_the_plan_writers_inventory_comes_from_the_sandbox_helper(
     subprocess.run(["git", "push", "-q", "origin", "HEAD"], cwd=clone, check=True, env=_git_env())
     url, stop = _helper_over(clone)
     try:
-        git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+        git = _recorded_runner(tmp_path / "wt", repo)
         git.code_reader = lambda commit=None: SidecarCodeReader(  # type: ignore[attr-defined]
             url, repo=TARGET_REPO, commit=commit
         )
@@ -8241,7 +8298,7 @@ async def test_an_unreadable_repository_reaches_the_plan_writer_and_the_build_ga
         url = f"http://127.0.0.1:{sock.getsockname()[1]}"
     repo = tmp_path / "api_test"
     _init_repo_with_a_stats_route(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     git.code_reader = lambda commit=None: SidecarCodeReader(  # type: ignore[attr-defined]
         url, repo=TARGET_REPO, commit=commit
     )
@@ -8421,7 +8478,7 @@ async def test_a_big_plan_carries_the_size_line_on_its_record_and_still_builds(
     _git(repo, "commit", "-qm", "earlier plans")
     # On the remote: the planner reads the commit the work starts from.
     _publish_to_origin(repo)
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
 
     def big_plan(feature_id: str) -> Any:
         return _plan_result(
@@ -8476,7 +8533,7 @@ async def test_the_planner_reads_the_commit_the_run_starts_from_not_the_checkout
     (repo / "src" / "local_only.py").write_text("y = 2\n")
     _git(repo, "add", "src/local_only.py")
 
-    git = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    git = _recorded_runner(tmp_path / "wt", repo)
     _queue(store)
     h = _make_driver(store, git_runner=git, repo_path=str(repo))
     await h.driver.drive(CID)

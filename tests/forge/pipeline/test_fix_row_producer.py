@@ -640,9 +640,18 @@ class TestTheRedMergeHook:
     MERGE_FEATURE = "FEAT-MRG1"
     MERGE_REPO = "appmilla_github/api_test"
 
+    @pytest.fixture(autouse=True)
+    def _remote_on_disk(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        """The repository's "remote" is a bare repository on disk: allow a
+        local folder as a fetch address, which :meth:`_config` records."""
+        from tests.forge.recorded_fetch_address import allow_local_remotes
+
+        allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
+
     @staticmethod
     def _config(repo_root: Path) -> Any:
         from forge.config.models import ForgeConfig
+        from tests.forge.recorded_fetch_address import origin_of
 
         return ForgeConfig.model_validate(
             {
@@ -650,7 +659,10 @@ class TestTheRedMergeHook:
                 "planning": {
                     "target_repo_paths": {
                         TestTheRedMergeHook.MERGE_REPO: str(repo_root)
-                    }
+                    },
+                    "fetch_addresses": {
+                        TestTheRedMergeHook.MERGE_REPO: origin_of(repo_root)
+                    },
                 },
                 "approval": {"expected_approver": "rich"},
                 "merge_executor": {"enabled": True},

@@ -26,8 +26,11 @@ from forge.pipeline.merge_join import (
     target_branch_now,
     working_folder_leaf,
 )
+from forge.network_git import no_fetch_address_sentence
+from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 FEATURE = "FEAT-JN1"
+PROJECT = "org/project"
 
 
 def _git(repo: Path, *args: str) -> str:
@@ -51,8 +54,13 @@ def _git(repo: Path, *args: str) -> str:
 
 
 @pytest.fixture
-def repo(tmp_path: Path) -> Path:
-    """A project, its build branch, and a bare repository as its remote."""
+def repo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A project, its build branch, and a bare repository as its remote.
+
+    The bare repository is a local folder, which the test allows as a fetch
+    address; :func:`_venue` records it as the project's fetch address.
+    """
+    allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
     root = tmp_path / "project"
     root.mkdir()
     _git(root, "init", "-b", "main", "-q")
@@ -76,7 +84,9 @@ def repo(tmp_path: Path) -> Path:
 
 
 def _venue(repo: Path) -> InContainerCandidateGit:
-    return InContainerCandidateGit(repo)
+    """This container's git for ``repo``, with its remote recorded as the
+    project's fetch address (the factory never reads the clone's origin)."""
+    return InContainerCandidateGit(repo, fetch_address=origin_of(repo), repo=PROJECT)
 
 
 class TestOneTargetBranchDecidedOnce:
@@ -108,15 +118,19 @@ class TestOneTargetBranchDecidedOnce:
 
     @pytest.mark.asyncio
     async def test_a_copy_with_no_remote_is_refused(self, tmp_path: Path) -> None:
+        """A copy with no remote, and so no fetch address recorded for its
+        project, is refused with the setting's own sentence, never git's."""
         lonely = tmp_path / "lonely"
         lonely.mkdir()
         _git(lonely, "init", "-b", "main", "-q")
         (lonely / "f").write_text("x\n", encoding="utf-8")
         _git(lonely, "add", "f")
         _git(lonely, "commit", "-q", "-m", "only")
-        where = await target_branch_now(_venue(lonely), recorded_branch="main")
+        venue = InContainerCandidateGit(lonely, repo=PROJECT)
+        where = await target_branch_now(venue, recorded_branch="main")
         assert not where.ok
-        assert "has no remote named 'origin'" in where.refusal
+        assert where.refusal == no_fetch_address_sentence(PROJECT)
+        assert "fatal:" not in where.refusal
 
 
 class TestTheWorkingFolderOfItsOwn:

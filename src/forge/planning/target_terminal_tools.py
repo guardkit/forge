@@ -59,6 +59,7 @@ import yaml
 
 from forge.adapters.guardkit.run import run as guardkit_run
 from forge.launch_environment import build_launch_env
+from forge.project_git import run_git
 
 logger = logging.getLogger(__name__)
 
@@ -1251,21 +1252,41 @@ def repair_frontmatter_feature_id(
     return "".join(lines), before
 
 
+def _has_git_entry(path: Path) -> bool:
+    """Does this directory, or any folder above it, hold a ``.git`` entry?
+
+    Git finds its repository by looking for that entry (a folder in a clone, a
+    file in a linked worktree) here and then upwards, so with none anywhere
+    there is no repository to ask about.
+    """
+    try:
+        start = path.resolve()
+    except OSError:
+        start = path
+    for folder in (start, *start.parents):
+        try:
+            if (folder / ".git").exists():
+                return True
+        except OSError:
+            return True  # cannot look: do not claim there is no repository
+    return False
+
+
 def _is_git_worktree(worktree_path: Path) -> bool | None:
     """Is this directory inside a git worktree? ``None`` when git cannot say."""
     try:
-        result = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "rev-parse", "--is-inside-work-tree"],
+        result = run_git(
+            ["rev-parse", "--is-inside-work-tree"],
             cwd=str(worktree_path),
-            capture_output=True,
-            text=True,
             timeout=_GIT_SCOPE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):
         return None
     if result.returncode == 0:
         return result.stdout.strip() == "true"
-    if "not a git repository" in (result.stderr or "").lower():
+    # Git's own error text is not kept, so "not a repository" is decided by
+    # looking for the ``.git`` entry git itself would have looked for.
+    if not _has_git_entry(worktree_path):
         return False
     return None
 
@@ -1279,11 +1300,9 @@ def _git_uncommitted_paths(worktree_path: Path) -> set[str] | None:
     caller then refuses every rewrite and says so.
     """
     try:
-        status = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            ["git", "status", "--porcelain", "-z", "--untracked-files=all"],
+        status = run_git(
+            ["status", "--porcelain", "-z", "--untracked-files=all"],
             cwd=str(worktree_path),
-            capture_output=True,
-            text=True,
             timeout=_GIT_SCOPE_TIMEOUT_SECONDS,
         )
     except (OSError, subprocess.SubprocessError):

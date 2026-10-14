@@ -66,7 +66,9 @@ import copy
 import json
 import os
 import re
+import secrets
 import shlex
+import stat
 import subprocess
 import tempfile
 import time
@@ -78,6 +80,9 @@ from typing import Any, Callable, Mapping, Sequence
 
 import click
 import yaml
+
+from forge.network_git import sandbox_git_command, sandbox_network_git, transport_of
+from forge.project_git import FIXED_SETTINGS
 
 __all__ = ["register_repo_cmd"]
 
@@ -156,6 +161,16 @@ BUS_STREAM: str = "PIPELINE"
 #: How long one outside command may take. A clone gets longer.
 COMMAND_TIMEOUT: float = 120.0
 CLONE_TIMEOUT: float = 900.0
+
+#: The home a git READ is given where it needs none: a folder that does not
+#: exist, so nothing can be read from it.
+_NO_HOME: str = "/nonexistent-forge-register-home"
+
+#: The estate settings that name the publisher's route keys, its pinned host
+#: keys and its user (for the check clone of a private repository).
+ESTATE_ENV_ROUTE_KEYS_DIR: str = "FORGE_PUBLISHER_ROUTE_KEYS_DIR"
+ESTATE_ENV_KNOWN_HOSTS: str = "FORGE_PUBLISHER_KNOWN_HOSTS_FILE"
+ESTATE_ENV_PUBLISHER_UID: str = "FORGE_PUBLISHER_UID"
 
 #: What a project's name and its last part may be: the repository map key is
 #: ``org/name``, and the last part becomes a folder name.
@@ -610,6 +625,28 @@ class SandboxStore:
         command += [self.sandbox, *argv]
         return _call(self.run, command, input=input, timeout=timeout)
 
+    @property
+    def exec_prefix(self) -> list[str]:
+        """``sbx exec -u <user> <sandbox>``, for a command line built whole."""
+        return ["sbx", "exec", "-u", SANDBOX_USER, self.sandbox]
+
+    def run_whole(
+        self, command: Sequence[str], *, timeout: float = COMMAND_TIMEOUT
+    ) -> "subprocess.CompletedProcess[str]":
+        """Run a command line built whole (by :mod:`forge.network_git`)."""
+        return _call(self.run, list(command), timeout=timeout)
+
+    def git_read(self, *args: str) -> "subprocess.CompletedProcess[str]":
+        """A local git read inside the sandbox, isolated (14 October 2026):
+        ``env -i``, no settings files, no transport, hooks and the file
+        monitor off. No home is needed for a read."""
+        return self.run_whole(
+            sandbox_git_command(
+                self.exec_prefix, list(args), transport="none",
+                home=_NO_HOME, cwd="/", settings=FIXED_SETTINGS,
+            )
+        )
+
     def where(self, name: str) -> str:
         return f"{self.sandbox}:{name}"
 
@@ -796,23 +833,142 @@ def _document_problems(repo: Path, config_text: str | None) -> list[str]:
     return problems
 
 
-def check_project(run: Runner, *, key: str, url: str, folder: Path) -> list[Step]:
+def _route_key_problem(
+    name: str, keys_dir: str | None, known_hosts: str | None, owner: int | None
+) -> tuple[Path | None, str | None]:
+    """``(key file, None)`` when the publisher's route key may be used for the
+    check clone, else ``(None, sentence)``. The same checks the publisher
+    makes of its own route keys: an ordinary file, not a link, owned by the
+    publisher's user, no access for group or others, not empty; read with
+    ``O_NOFOLLOW``. The sentence names what is wrong, never the contents."""
+    if not keys_dir:
+        return None, (
+            f"--publish-credential-name {name} names a route key, but no route-keys "
+            f"folder is known: set {ESTATE_ENV_ROUTE_KEYS_DIR} in the estate env file "
+            "(pass --estate-env-file). Nothing was run"
+        )
+    if not known_hosts:
+        return None, (
+            f"the route key {name} is for ssh, and ssh needs the pinned host keys: set "
+            f"{ESTATE_ENV_KNOWN_HOSTS} in the estate env file. Nothing was run"
+        )
+    if not Path(known_hosts).is_file():
+        return None, f"the pinned host keys file {known_hosts} is not there. Nothing was run"
+    where = Path(keys_dir) / name
+    said = f"the publisher's route key {where}"
+    try:
+        found = os.lstat(where)
+    except OSError as exc:
+        return None, f"{said} could not be looked at ({exc.strerror or type(exc).__name__}). Nothing was run"
+    if stat.S_ISLNK(found.st_mode):
+        return None, f"{said} is a symbolic link; a route's key has to be the file itself. Nothing was run"
+    if not stat.S_ISREG(found.st_mode):
+        return None, f"{said} is not a file. Nothing was run"
+    expected = owner if owner is not None else os.geteuid()
+    if found.st_uid != expected:
+        return None, (
+            f"{said} belongs to user {found.st_uid}, not to the publisher's user "
+            f"{expected}. Nothing was run"
+        )
+    if found.st_mode & 0o077:
+        return None, (
+            f"{said} can be read or written by others (mode {stat.S_IMODE(found.st_mode):o}); "
+            "it must be readable by the publisher's user alone. Nothing was run"
+        )
+    if found.st_size == 0:
+        return None, f"{said} is empty. Nothing was run"
+    try:
+        descriptor = os.open(str(where), os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        return None, f"{said} could not be opened ({exc.strerror or type(exc).__name__}). Nothing was run"
+    os.close(descriptor)
+    return where, None
+
+
+def check_project(
+    run: Runner,
+    *,
+    key: str,
+    url: str,
+    folder: Path,
+    credential_name: str | None = None,
+    route_keys_dir: str | None = None,
+    known_hosts: str | None = None,
+    publisher_uid: int | None = None,
+) -> list[Step]:
     """Step 1: a shallow clone of the default branch, read, never written.
+
+    THE CLONE IS ISOLATED (Forge git hardening, 14 October 2026; there is no
+    exception for register-repo). It runs through ``env -i`` with a fresh
+    empty home folder, no personal or system settings file (so no helper,
+    header, address rewrite or template hook of the operator's), the network
+    settings and exactly one transport, and the credential is chosen
+    explicitly, with no fallback between the two choices:
+
+    * no key named (a public repository): no credential, ``https`` only, to
+      the ``--github`` address;
+    * ``--publish-credential-name NAME``: the publisher's route key of that
+      name, by its path, with the publisher's own ssh command and pinned host
+      keys, ``ssh`` only, to ``git@<host>:<org>/<name>.git``.
 
     Returns the report lines; raises :class:`Refused` naming every gap at once.
     """
     from forge.planning.declared_memory import DECLARATION_PATH, read_declared_memory
 
     checkout = folder / "project"
+    credential_env: dict[str, str] = {}
+    # The one transport the checked address uses: https (the --github check
+    # takes nothing else).
+    address, transport = url, transport_of(url) or "https"
+    if credential_name is not None:
+        from forge.publisher.credential import the_ssh_command_for
+
+        key_file, problem = _route_key_problem(
+            credential_name, route_keys_dir, known_hosts, publisher_uid
+        )
+        if problem or key_file is None:
+            raise Refused("project", problem or "the route key could not be used")
+        org, _, leaf = key.partition("/")
+        host = urlsplit(url).hostname or ""
+        address, transport = f"git@{host}:{org}/{leaf}.git", "ssh"
+        credential_env["GIT_SSH_COMMAND"] = the_ssh_command_for(str(key_file), str(known_hosts))
+    # A fresh empty home folder for the clone, made after every check.
+    home = Path(tempfile.mkdtemp(prefix="git-home-", dir=folder))
     cloned = _call(
         run,
-        ["env", "GIT_TERMINAL_PROMPT=0", "git", "clone", "--depth", "1", "--quiet",
-         "--", url, str(checkout)],
+        sandbox_git_command(
+            [],
+            ["clone", "--depth", "1", "--quiet", "--no-recurse-submodules", "--template=",
+             "--", address, str(checkout)],
+            transport=transport,
+            home=str(home),
+            credential_env=credential_env,
+        ),
         timeout=CLONE_TIMEOUT,
     )
     if cloned.returncode != 0 or not checkout.is_dir():
-        raise Refused("project", f"could not read {url} ({_said(cloned)})")
-    head = _call(run, ["git", "-C", str(checkout), "rev-parse", "HEAD"])
+        if credential_name is None:
+            raise Refused(
+                "project",
+                f"Could not read {url} without a credential. If the repository is "
+                "private, add a deploy key to it, put the private half in the "
+                "publisher's route-keys folder, and run again with --publish "
+                "--publish-credential-name <its name>.",
+            )
+        raise Refused(
+            "project",
+            f"Could not read {address} with the publisher's route key "
+            f"{credential_name} (git clone stopped with exit code {cloned.returncode}). "
+            "Check that the key is the repository's deploy key and that the pinned "
+            "host keys are the host's.",
+        )
+    head = _call(
+        run,
+        sandbox_git_command(
+            [], ["-C", str(checkout), "rev-parse", "HEAD"], transport="none",
+            home=str(home), settings=FIXED_SETTINGS,
+        ),
+    )
     commit = head.stdout.strip()[:12] if head.returncode == 0 and head.stdout.strip() else "its default branch"
 
     config_path = checkout / DECLARATION_PATH
@@ -899,8 +1055,14 @@ class YamlEdit:
     reference_entry: dict[str, str] = field(default_factory=dict)
 
 
-def plan_settings_edit(text: str, *, which: str, key: str, path: str) -> YamlEdit:
-    """The three entries ``key`` needs in one ``forge.yaml``, by line insertion.
+def plan_settings_edit(
+    text: str, *, which: str, key: str, path: str, fetch_address: str | None = None
+) -> YamlEdit:
+    """The entries ``key`` needs in one ``forge.yaml``, by line insertion.
+
+    Three in every file (the allowlist, the repository map and the sandbox
+    entry); with ``fetch_address`` (the coordinator's file only, 14 October
+    2026) a fourth, ``planning.fetch_addresses``.
 
     ``path`` is the project's folder as that file's own world knows it. The
     sandbox entry copies the reference project's name and addresses from the
@@ -989,6 +1151,29 @@ def plan_settings_edit(text: str, *, which: str, key: str, path: str) -> YamlEdi
             expected["planning"]["sandboxes"][key] = dict(entry)
             steps.append(Step(which, "add", f"sandboxes {key} in sandbox {entry['name']}"))
             changed = True
+
+        if fetch_address is not None:
+            addresses = _mapping(planning.get("fetch_addresses"))
+            current_address = addresses.get(key)
+            if current_address == fetch_address:
+                steps.append(Step(which, "unchanged", f"fetch_addresses has {key}"))
+            elif current_address is not None:
+                raise Refused(
+                    which,
+                    f"planning.fetch_addresses already has a different address for {key}; "
+                    "fix that line by hand",
+                )
+            else:
+                set_mapping_entry(
+                    lines, ("planning", "fetch_addresses"), _scalar(key), _scalar(fetch_address)
+                )
+                expected.setdefault("planning", {})
+                expected["planning"]["fetch_addresses"] = {
+                    **(expected["planning"].get("fetch_addresses") or {}),
+                    key: fetch_address,
+                }
+                steps.append(Step(which, "add", f"fetch_addresses {key} -> {fetch_address}"))
+                changed = True
     except YamlEditRefused as exc:
         raise Refused(which, str(exc)) from None
 
@@ -1004,7 +1189,7 @@ def plan_settings_edit(text: str, *, which: str, key: str, path: str) -> YamlEdi
     if reread != expected:
         raise Refused(
             which,
-            "the edited forge.yaml would change more than the three entries; "
+            "the edited forge.yaml would change more than the project's own entries; "
             "nothing was written — edit it by hand",
         )
     if not _keeps_every_line(plain.split("\n"), lines):
@@ -1162,7 +1347,7 @@ def check_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: st
     Returns the report line and whether a clone must be made.
     """
     folder = f"{PROJECTS_FOLDER}/{leaf}"
-    ignored = sandbox.exec("git", "-C", clone, "check-ignore", "-q", folder)
+    ignored = sandbox.git_read("-C", clone, "check-ignore", "-q", folder)
     if ignored.returncode == 1:
         raise Refused(
             "clone",
@@ -1171,10 +1356,15 @@ def check_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: st
             "api_test's .gitignore first",
         )
     if ignored.returncode != 0:
-        raise Refused("clone", f"could not ask git whether {PROJECTS_FOLDER} is ignored in {clone} ({_said(ignored)})")
+        raise Refused(
+            "clone",
+            f"could not ask git whether {PROJECTS_FOLDER} is ignored in {clone} "
+            f"(git check-ignore stopped with exit code {ignored.returncode})",
+        )
 
-    readable = sandbox.exec(
-        "git", "ls-remote", url, "HEAD", env=("GIT_TERMINAL_PROMPT=0",), timeout=CLONE_TIMEOUT
+    readable = sandbox_network_git(
+        sandbox, ["ls-remote", "--", url, "HEAD"], bare=True,
+        transport=transport_of(url) or "https",
     )
     if readable.returncode != 0 or not readable.stdout.strip():
         raise Refused(
@@ -1190,7 +1380,7 @@ def check_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: st
         return Step("clone", "add", f"git clone {url} {target}"), True
     if exists.returncode != 0:
         raise Refused("clone", f"could not look at {target} in the sandbox ({_said(exists)})")
-    origin = sandbox.exec("git", "-C", target, "remote", "get-url", "origin")
+    origin = sandbox.git_read("-C", target, "remote", "get-url", "origin")
     if origin.returncode != 0:
         raise Refused("clone", f"{target} is already there and is not a clone with an origin; move it away first")
     if not _same_repository(origin.stdout, url):
@@ -1203,14 +1393,22 @@ def check_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: st
 
 
 def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str) -> Step:
-    """``git clone <url> <projects folder>/<leaf>`` as the sandbox user."""
+    """``git clone <url> <projects folder>/<leaf>`` as the sandbox user, from a
+    fresh empty folder, into the absolute target path, isolated."""
     target = f"{clone.rstrip('/')}/{PROJECTS_FOLDER}/{leaf}"
-    made = sandbox.exec(
-        "git", "clone", "--quiet", url, target, env=("GIT_TERMINAL_PROMPT=0",), timeout=CLONE_TIMEOUT
+    made = sandbox_network_git(
+        sandbox,
+        ["clone", "--quiet", "--no-recurse-submodules", "--template=", "--", url, target],
+        bare=False,
+        transport=transport_of(url) or "https",
     )
     if made.returncode != 0:
-        raise Refused("clone", f"git clone {url} in the sandbox failed ({_said(made)})")
-    origin = sandbox.exec("git", "-C", target, "remote", "get-url", "origin")
+        raise Refused(
+            "clone",
+            f"git clone {url} in the sandbox failed (git clone stopped with exit code "
+            f"{made.returncode})",
+        )
+    origin = sandbox.git_read("-C", target, "remote", "get-url", "origin")
     if origin.returncode != 0 or not _same_repository(origin.stdout, url):
         raise Refused("clone", f"{target} was cloned but does not name {url} as its origin")
     return Step("clone", "done", f"{target} cloned from {url}")
@@ -1813,6 +2011,11 @@ class Options:
     estate: Estate
     #: With --publish: the bare name of the route's own key, or None.
     publish_credential_name: str | None = None
+    #: The publisher's route-keys folder, pinned host keys and user, from the
+    #: estate env file (for the check clone with a route key).
+    route_keys_dir: str | None = None
+    known_hosts_file: str | None = None
+    publisher_uid: int | None = None
 
 
 def _parse_name(name: str) -> tuple[str, str]:
@@ -1976,6 +2179,13 @@ def resolve_options(
         publisher_settings=str(publisher_settings) if publisher_settings is not None else None,
         publish_source_base=publish_source_base,
         publish_credential_name=publish_credential_name,
+        route_keys_dir=estate_values.get(ESTATE_ENV_ROUTE_KEYS_DIR) or None,
+        known_hosts_file=estate_values.get(ESTATE_ENV_KNOWN_HOSTS) or None,
+        publisher_uid=(
+            int(estate_values[ESTATE_ENV_PUBLISHER_UID])
+            if str(estate_values.get(ESTATE_ENV_PUBLISHER_UID, "")).isdigit()
+            else None
+        ),
         estate=Estate(
             env_file=env_text,
             loaded_env_file=loaded_env_text,
@@ -1999,7 +2209,16 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     The project's own repository is never written.
     """
     with tempfile.TemporaryDirectory(prefix="forge-register-") as folder:
-        steps += check_project(run, key=options.key, url=options.url, folder=Path(folder))
+        steps += check_project(
+            run,
+            key=options.key,
+            url=options.url,
+            folder=Path(folder),
+            credential_name=options.publish_credential_name,
+            route_keys_dir=options.route_keys_dir,
+            known_hosts=options.known_hosts_file,
+            publisher_uid=options.publisher_uid,
+        )
 
     volume = VolumeStore(options.volume, run)
     sandbox = SandboxStore(options.sandbox, run)
@@ -2014,8 +2233,13 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
 
     coordinator_path = f"{COORDINATOR_PROJECTS_ROOT}/{options.leaf}"
     clone_path = f"{options.sandbox_clone}/{PROJECTS_FOLDER}/{options.leaf}"
+    # The coordinator's settings also record the project's fetch address
+    # (planning.fetch_addresses, 14 October 2026): the factory fetches a
+    # starting point from it and never from a clone's own origin. The
+    # sandbox's settings never carry it: that file sits inside a project clone.
     coordinator_edit = plan_settings_edit(
-        coordinator_text, which="coordinator", key=options.key, path=coordinator_path
+        coordinator_text, which="coordinator", key=options.key, path=coordinator_path,
+        fetch_address=options.url,
     )
     sandbox_edit = plan_settings_edit(sandbox_text, which="sandbox", key=options.key, path=clone_path)
 

@@ -2,7 +2,7 @@
 
 Two siblings live here:
 
-* :mod:`forge.build.git_operations` — branch / commit / push / PR creation
+* :mod:`forge.build.git_operations` — branch / commit / PR creation
   via the DeepAgents ``execute`` tool with a ``git``/``gh``/``pytest``
   binary allowlist.
 * :mod:`forge.build.test_verification` — pytest invocation via the same
@@ -27,7 +27,6 @@ from forge.build.git_operations import (
     commit_changes,
     create_branch,
     create_pull_request,
-    push_branch,
 )
 from forge.build.test_verification import (
     TIMEOUT_MARKER,
@@ -43,6 +42,5 @@ __all__ = [
     "commit_changes",
     "create_branch",
     "create_pull_request",
-    "push_branch",
     "verify_tests",
 ]

@@ -31,7 +31,6 @@ from typing import Any, Iterator
 
 import pytest
 
-from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli._serve_deps import (
     build_pipeline_consumer_deps,
@@ -49,7 +48,9 @@ from tests.forge.pipeline.test_prepared_admission import (
     Project,
     bundle,
     config_text,
+    recorded_runner,
 )
+from tests.forge.recorded_fetch_address import local_remotes  # noqa: F401
 
 CID = "corr-prepared-0001"
 
@@ -90,7 +91,7 @@ def persistence(tmp_path: Path) -> Iterator[SqliteLifecyclePersistence]:
 
 
 @pytest.fixture()
-def project(tmp_path: Path) -> Project:
+def project(tmp_path: Path, local_remotes: Path) -> Project:
     return Project(tmp_path / "project")
 
 
@@ -99,7 +100,10 @@ def forge_config(tmp_path: Path, project: Project) -> ForgeConfig:
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
-            "planning": {"target_repo_paths": {REPO: str(project.copy)}},
+            "planning": {
+                "target_repo_paths": {REPO: str(project.copy)},
+                "fetch_addresses": {REPO: project.fetch_address},
+            },
         }
     )
 
@@ -179,7 +183,7 @@ def _deps(
 def _admission(forge_config: ForgeConfig, tmp_path: Path) -> _Spy:
     return _Spy(
         build_prepared_build_admission(
-            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+            forge_config, git_runner=recorded_runner(forge_config, tmp_path / "wt")
         )
     )
 

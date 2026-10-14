@@ -56,6 +56,8 @@ from forge.deploy_sidecar.service import (
 )
 from forge.deploy_sidecar import service as sidecar
 
+from tests.forge.recorded_fetch_address import local_remotes, origin_of  # noqa: F401
+
 REPO_KEY = "guardkit/api_test"
 
 #: What the repository tracks, and why each file is there.
@@ -210,15 +212,17 @@ class TestListFiles:
     def test_the_one_git_command_is_exactly_this_argument_list(
         self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The door runs git for ONE thing, and this is the line it runs."""
+        """The door runs git for ONE thing, and this is the line it runs —
+        through the one git helper (14 October 2026), which adds its own
+        protections to it."""
         calls: list[list[str]] = []
-        real = subprocess.run
+        real = sidecar.run_git
 
-        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-            calls.append(list(argv))
-            return real(argv, *args, **kwargs)
+        def _run(args, *rest, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            calls.append(list(args))
+            return real(args, *rest, **kwargs)
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr(sidecar, "run_git", _run)
 
         status, _body = process_code_list_files_request(
             {"repo": REPO_KEY}, config=cfg
@@ -226,7 +230,7 @@ class TestListFiles:
 
         assert status == 200
         assert calls == [
-            ["git", "-c", "safe.directory=*", "-C", str(repo), "ls-files", "-z"]
+            ["-c", "safe.directory=*", "-C", str(repo), "ls-files", "-z"]
         ]
 
     def test_the_cap_caps_and_the_answer_says_it_was_reached(
@@ -279,10 +283,10 @@ class TestListFiles:
     def test_a_git_that_never_answers_is_a_500_not_an_empty_repository(
         self, cfg: ForgeConfig, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-            raise subprocess.TimeoutExpired(cmd=list(argv), timeout=60.0)
+        def _run(args, *rest, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            raise subprocess.TimeoutExpired(cmd="git ls-files", timeout=60.0)
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        monkeypatch.setattr(sidecar, "run_git", _run)
 
         status, body = process_code_list_files_request(
             {"repo": REPO_KEY}, config=cfg
@@ -697,14 +701,25 @@ class TestSearch:
     def test_it_never_shells_out_to_grep_or_starts_any_other_program(
         self, cfg: ForgeConfig, repo: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # Every program this route starts is git through the one helper
+        # (14 October 2026); recording the helper and every other launch
+        # shows it is the only one.
         calls: list[list[str]] = []
-        real = subprocess.run
+        others: list[Any] = []
+        real = sidecar.run_git
+        real_run = subprocess.run
 
-        def _run(argv, *args, **kwargs):  # noqa: ANN001, ANN002, ANN003
-            calls.append(list(argv))
-            return real(argv, *args, **kwargs)
+        def _run(args, *rest, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            calls.append(list(args))
+            return real(args, *rest, **kwargs)
 
-        monkeypatch.setattr(subprocess, "run", _run)
+        def _other(argv, *rest, **kwargs):  # noqa: ANN001, ANN002, ANN003
+            if not (isinstance(argv, (list, tuple)) and argv and str(argv[0]).endswith("git")):
+                others.append(argv)
+            return real_run(argv, *rest, **kwargs)
+
+        monkeypatch.setattr(sidecar, "run_git", _run)
+        monkeypatch.setattr(subprocess, "run", _other)
 
         status, _body = process_code_search_request(
             {"repo": REPO_KEY, "pattern": "get_user"}, config=cfg
@@ -712,8 +727,9 @@ class TestSearch:
 
         assert status == 200
         assert calls == [
-            ["git", "-c", "safe.directory=*", "-C", str(repo), "ls-files", "-z"]
+            ["-c", "safe.directory=*", "-C", str(repo), "ls-files", "-z"]
         ]
+        assert others == []
 
     def test_binary_and_over_cap_files_are_passed_over(
         self, cfg: ForgeConfig
@@ -1777,13 +1793,14 @@ class TestTheRefusalsThatAlreadyHeldStillHold:
         """The tracked set is worked out once and tested in memory: git is
         asked for the listing and never again, however many files are walked."""
         calls: list[list[str]] = []
-        real_run = subprocess.run
+        real_run = sidecar.run_git
 
-        def counting_run(argv: Any, *args: Any, **kwargs: Any) -> Any:
-            calls.append(list(argv))
-            return real_run(argv, *args, **kwargs)
+        def counting_run(args: Any, *rest: Any, **kwargs: Any) -> Any:
+            calls.append(list(args))
+            return real_run(args, *rest, **kwargs)
 
-        monkeypatch.setattr(sidecar.subprocess, "run", counting_run)
+        # git runs through the one helper (14 October 2026).
+        monkeypatch.setattr(sidecar, "run_git", counting_run)
         status, body = process_code_search_request(
             {"repo": REPO_KEY, "pattern": "list_users"}, config=linked_cfg
         )
@@ -1804,10 +1821,12 @@ class TestTheRefusalsThatAlreadyHeldStillHold:
 
 
 @pytest.fixture
-def lagging(tmp_path: Path) -> tuple[Path, str, str]:
+def lagging(tmp_path: Path, local_remotes: Path) -> tuple[Path, str, str]:
     """A remote whose main is one commit ahead of a clone's checked-out
     tree, and a clone whose working tree also carries a local edit and an
-    untracked file. Returns ``(clone, old commit, new commit)``."""
+    untracked file. Returns ``(clone, old commit, new commit)``. The remote
+    is a bare repository on disk; a request that needs the new commit sends
+    it as the project's recorded fetch address, as the coordinator does."""
     seed = tmp_path / "seed"
     (seed / "lib").mkdir(parents=True)
     (seed / "lib" / "thing.src").write_text("value = old\n", encoding="utf-8")
@@ -1844,6 +1863,8 @@ class TestTheCodeDoorAtACommit:
         self, lagging: tuple[Path, str, str]
     ) -> None:
         clone, old, new = lagging
+        # Each request carries the recorded address, as the coordinator sends it.
+        at = {"repo": REPO_KEY, "fetch_address": origin_of(clone)}
         cfg = self._cfg(clone)
         # The new commit is not in the clone yet: it is fetched once.
         missing = subprocess.run(
@@ -1851,7 +1872,7 @@ class TestTheCodeDoorAtACommit:
         )
         assert missing.returncode != 0
         status, body = process_code_list_files_request(
-            {"repo": REPO_KEY, "commit": new[:10]}, config=cfg
+            {**at, "commit": new[:10]}, config=cfg
         )
         assert status == 200, body
         assert body["commit"] == new
@@ -1859,17 +1880,17 @@ class TestTheCodeDoorAtACommit:
         assert "lib/untracked.src" not in body["files"]
 
         status, body = process_code_read_file_request(
-            {"repo": REPO_KEY, "path": "lib/thing.src", "commit": new}, config=cfg
+            {**at, "path": "lib/thing.src", "commit": new}, config=cfg
         )
         assert status == 200 and body["content"] == "value = new\n" and body["commit"] == new
         # The local edit in the working tree never reaches an answer.
         status, body = process_code_read_file_request(
-            {"repo": REPO_KEY, "path": "lib/same.src", "commit": new}, config=cfg
+            {**at, "path": "lib/same.src", "commit": new}, config=cfg
         )
         assert status == 200 and body["content"] == "unchanged\n"
 
         status, body = process_code_search_request(
-            {"repo": REPO_KEY, "pattern": "value =", "fixed_string": True, "commit": new},
+            {**at, "pattern": "value =", "fixed_string": True, "commit": new},
             config=cfg,
         )
         assert status == 200 and body["commit"] == new
@@ -1882,11 +1903,11 @@ class TestTheCodeDoorAtACommit:
 
         # And the old commit is still readable as itself.
         status, body = process_code_read_file_request(
-            {"repo": REPO_KEY, "path": "lib/thing.src", "commit": old}, config=cfg
+            {**at, "path": "lib/thing.src", "commit": old}, config=cfg
         )
         assert status == 200 and body["content"] == "value = old\n"
         status, body = process_code_read_file_request(
-            {"repo": REPO_KEY, "path": "lib/only_at_new.src", "commit": old}, config=cfg
+            {**at, "path": "lib/only_at_new.src", "commit": old}, config=cfg
         )
         assert status == 400 and "is not a file at the commit" in body["error"]
 
@@ -1894,12 +1915,14 @@ class TestTheCodeDoorAtACommit:
         self, lagging: tuple[Path, str, str]
     ) -> None:
         clone, _old, new = lagging
+        # Each request carries the recorded address, as the coordinator sends it.
+        at = {"repo": REPO_KEY, "fetch_address": origin_of(clone)}
         status, body = process_code_read_file_request(
-            {"repo": REPO_KEY, "path": "lib/away.src", "commit": new}, config=self._cfg(clone)
+            {**at, "path": "lib/away.src", "commit": new}, config=self._cfg(clone)
         )
         assert status == 400 and "leaves the repository" in body["error"]
         status, body = process_code_read_file_request(
-            {"repo": REPO_KEY, "path": "lib/alias.src", "commit": new}, config=self._cfg(clone)
+            {**at, "path": "lib/alias.src", "commit": new}, config=self._cfg(clone)
         )
         assert status == 200 and body["content"] == "value = new\n"
 
@@ -1959,18 +1982,22 @@ class TestAGitThatGoesQuietAtACommit:
         _git(clone, "commit", "-qm", "big")
         head = _git(clone, "rev-parse", "HEAD").stdout.strip()
         monkeypatch.setattr(sidecar, "CODE_GIT_TIMEOUT_SECONDS", 0.5)
-        monkeypatch.setattr(
-            sidecar._CommitTree, "_git_argv", lambda self, *args: ["sleep", "30"]
-        )
+        # The readers start through the one git helper's open_git (14
+        # October 2026); a stand-in for it starts a program that never
+        # answers, with the same pipes.
         started: list[Any] = []
-        real = subprocess.Popen
 
-        def recording(*args: Any, **kwargs: Any) -> Any:
-            process = real(*args, **kwargs)
+        def recording(args: Any, *, stdin: Any = None, **kwargs: Any) -> Any:
+            process = subprocess.Popen(
+                ["sleep", "30"],
+                stdin=subprocess.DEVNULL if stdin is None else stdin,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+            )
             started.append(process)
             return process
 
-        monkeypatch.setattr(sidecar.subprocess, "Popen", recording)
+        monkeypatch.setattr(sidecar, "open_git", recording)
         return _config({REPO_KEY: str(clone)}), head, started
 
     def test_a_read_is_stopped_said_and_its_child_reaped(
@@ -2023,6 +2050,8 @@ class TestManyOpenDescriptors:
         import resource
 
         clone, _old, new = lagging
+        # Each request carries the recorded address, as the coordinator sends it.
+        at = {"repo": REPO_KEY, "fetch_address": origin_of(clone)}
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
         wanted = 1300
         if soft < wanted:
@@ -2034,12 +2063,12 @@ class TestManyOpenDescriptors:
             assert max(held) >= 1024
             cfg = _config({REPO_KEY: str(clone)})
             status, body = process_code_read_file_request(
-                {"repo": REPO_KEY, "path": "lib/thing.src", "commit": new}, config=cfg
+                {**at, "path": "lib/thing.src", "commit": new}, config=cfg
             )
             assert status == 200, body
             assert body["content"] == "value = new\n"
             status, body = process_code_search_request(
-                {"repo": REPO_KEY, "pattern": "value =", "fixed_string": True, "commit": new},
+                {**at, "pattern": "value =", "fixed_string": True, "commit": new},
                 config=cfg,
             )
             assert status == 200 and not body["timed_out"] and body["matches"]

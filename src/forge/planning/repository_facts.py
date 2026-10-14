@@ -76,6 +76,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol, Sequence
 
+from forge.project_git import run_git
+
 __all__ = [
     "DECLARATION_KEY",
     "LocalCheckoutReader",
@@ -196,8 +198,14 @@ class LocalCheckoutReader:
     With ``commit`` (7 October 2026) every read is at that commit, out of
     git's objects (``git ls-tree``, ``git grep <commit>``, ``git cat-file``),
     never the working tree. A commit the checkout does not have is fetched
-    once from its remote; one still missing is "could not read the starting
+    once from the project's RECORDED address (``fetch_address``, the
+    coordinator's ``planning.fetch_addresses``; never the clone's own origin,
+    14 October 2026); one still missing is "could not read the starting
     commit" (:class:`RepositoryUnreadable`), never the working tree instead.
+
+    Every git command goes through :func:`forge.project_git.run_git`, so
+    git's own words never reach the planner's prompt or the card: a failure
+    is the helper's fixed sentence.
     """
 
     def __init__(
@@ -207,8 +215,12 @@ class LocalCheckoutReader:
         timeout_s: float = 10.0,
         search_timeout_s: float = 30.0,
         commit: str | None = None,
+        fetch_address: str | None = None,
+        repo: str | None = None,
     ) -> None:
         self._root = Path(str(repo_path))
+        self._fetch_address = fetch_address
+        self._repo = repo
         self._timeout_s = timeout_s
         self._search_timeout_s = search_timeout_s
         self._commit = (commit or "").strip() or None
@@ -242,14 +254,11 @@ class LocalCheckoutReader:
     def _git(self, *args: str, timeout: float) -> subprocess.CompletedProcess[str]:
         self._check_root()
         try:
-            return subprocess.run(
-                ["git", "-c", "safe.directory=*", "-C", str(self._root), *args],
-                capture_output=True,
-                text=True,
+            return run_git(
+                ["-c", "safe.directory=*", "-C", str(self._root), *args],
                 encoding="utf-8",
                 errors="replace",
                 timeout=timeout,
-                check=False,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise RepositoryUnreadable(
@@ -297,21 +306,21 @@ class LocalCheckoutReader:
 
         full = resolve()
         if full is None:
-            try:
-                fetched = self._git(
-                    "fetch", "--quiet", "origin", timeout=self._search_timeout_s
-                )
-            except RepositoryUnreadable as exc:
-                raise RepositoryUnreadable(
-                    f"could not read the starting commit {self._commit} in the "
-                    f"checkout at {self._root}: fetching its remote failed ({exc})"
-                ) from exc
+            from forge.network_git import fetch_all_branches
+
+            self._check_root()
+            fetched = fetch_all_branches(
+                self._root,
+                self._fetch_address,
+                repo=self._repo,
+                timeout=self._search_timeout_s,
+            )
             full = resolve()
             if full is None:
                 why = (
-                    "it is not there even after fetching its remote"
-                    if fetched.returncode == 0
-                    else f"fetching its remote failed: {self._first_line(fetched.stderr)}"
+                    "it is not there even after fetching the project's recorded address"
+                    if fetched.refusal is None
+                    else f"fetching the project's recorded address failed: {fetched.refusal}"
                 )
                 raise RepositoryUnreadable(
                     f"could not read the starting commit {self._commit} in "
@@ -368,7 +377,9 @@ class LocalCheckoutReader:
             # At a commit the tree-ish goes after the pattern, and every line
             # comes back prefixed by it.
             completed = self._git("grep", *args, commit, timeout=self._search_timeout_s)
-            if completed.returncode == 1 and not completed.stderr.strip():
+            # git grep answers 1 for "no match": that is an answer, not a
+            # failure (the helper's sentence is set for any non-zero exit).
+            if completed.returncode == 1:
                 return []
             if completed.returncode != 0:
                 raise RepositoryUnreadable(
@@ -382,7 +393,7 @@ class LocalCheckoutReader:
             ]
         completed = self._git("grep", *args, timeout=self._search_timeout_s)
         # git grep answers 1 for "no match": that is an answer, not a failure.
-        if completed.returncode == 1 and not completed.stderr.strip():
+        if completed.returncode == 1:
             return []
         if completed.returncode != 0:
             raise RepositoryUnreadable(
@@ -455,11 +466,10 @@ class LocalCheckoutReader:
                 )
                 return None
             try:
-                completed = subprocess.run(
-                    ["git", "-c", "safe.directory=*", "-C", str(self._root), "cat-file", "blob", oid],
-                    capture_output=True,
+                completed = run_git(
+                    ["-c", "safe.directory=*", "-C", str(self._root), "cat-file", "blob", oid],
+                    text=False,
                     timeout=self._timeout_s,
-                    check=False,
                 )
             except (OSError, subprocess.TimeoutExpired) as exc:
                 raise RepositoryUnreadable(

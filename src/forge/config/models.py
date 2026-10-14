@@ -995,6 +995,18 @@ class PlanningConfig(BaseModel):
             "working-copy paths. Used for handoff to local build."
         ),
     )
+    fetch_addresses: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Each project's fetch address, by the same 'org/name' key as "
+            "target_repo_paths: the plain https:// address the factory fetches "
+            "a project's starting point from (Forge git hardening, 14 October "
+            "2026). forge register-repo writes it from its --github argument. "
+            "The coordinator sends it with every starting-point and code-read "
+            "request; the clone's own origin is never asked, and a project "
+            "with no address here is refused with a plain sentence."
+        ),
+    )
     terminal: str = Field(
         default="planned-handoff",
         description=(
@@ -1087,6 +1099,30 @@ class PlanningConfig(BaseModel):
                 "one to target_repo_paths first"
             )
         return self
+
+    @field_validator("fetch_addresses")
+    @classmethod
+    def _fetch_addresses_are_plain_https(cls, value: dict[str, str]) -> dict[str, str]:
+        """Each key is an 'org/name' and each address a plain https:// one.
+
+        The refusal names the project, never the address: what was written
+        may hold a credential.
+        """
+        import re
+
+        from forge.network_git import check_fetch_address
+
+        for key, address in value.items():
+            if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", str(key)):
+                raise ValueError(
+                    f"planning.fetch_addresses has a key {key!r} that is not 'org/name'"
+                )
+            # The same check every fetch makes (forge.network_git): a plain
+            # https:// address.
+            problem = check_fetch_address(str(address))
+            if problem:
+                raise ValueError(f"planning.fetch_addresses for {key}: {problem}")
+        return {str(k): str(v).strip() for k, v in value.items()}
 
     @field_validator("default_target_repo")
     @classmethod

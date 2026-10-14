@@ -66,6 +66,9 @@ from forge.planning.states import PlanningState
 from forge.planning.target_terminal_tools import ToolOutcome
 from tests.forge.planning import test_driver_spec_digest_door as door
 from tests.forge.planning import test_memory_name_at_the_door as at_the_door
+from tests.forge.planning.test_memory_name_at_the_door import (  # noqa: F401
+    _local_remotes,  # the autouse fixture: the stand-in remote is a local folder
+)
 
 _DOCUMENTS_STAGE = "project-documents"
 START = "a" * 40

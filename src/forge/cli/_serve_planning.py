@@ -796,11 +796,22 @@ def compose_planning_git_runner(
     from forge.adapters.git.planning_runner import WorktreeGitRunner
     from forge.planning.sidecar_git_runner import RepoRoutedGitRunner, SidecarGitRunner
 
-    default = (worktree_runner_factory or WorktreeGitRunner)()
+    # Each project's recorded fetch address goes to the runner that fetches
+    # its starting point (Forge git hardening, 14 October 2026).
+    addresses = dict(getattr(planning, "fetch_addresses", None) or {})
+    default = (
+        worktree_runner_factory()
+        if worktree_runner_factory is not None
+        else WorktreeGitRunner(
+            target_repo_paths=planning.target_repo_paths, fetch_addresses=addresses
+        )
+    )
     if not planning.sandboxes:
         return default, None
     runners = {
-        repo: SidecarGitRunner(entry.sidecar_url, repo=repo)
+        repo: SidecarGitRunner(
+            entry.sidecar_url, repo=repo, fetch_address=addresses.get(repo)
+        )
         for repo, entry in planning.sandboxes.items()
     }
     for repo, entry in planning.sandboxes.items():
@@ -886,7 +897,6 @@ async def compose_planning_consumer_and_dispatch(
         # full dispatch stack available (BDD oracle / lint runners).
         from nats_core.events import PlanningFailedPayload
 
-        from forge.adapters.git.planning_runner import WorktreeGitRunner
         from forge.adapters.nats.approval_publisher import ApprovalPublisher
         from forge.adapters.nats.pipeline_publisher import PipelinePublisher
         from forge.adapters.nats.approval_subscriber import (
@@ -1425,8 +1435,10 @@ async def compose_planning_consumer_and_dispatch(
         # a sandboxed repository's commits are made by the sidecar inside its
         # sandbox; every other repository's by the in-container runner, as
         # before.
+        # The default in-container runner is given each project's recorded
+        # fetch address (14 October 2026).
         planning_git_runner, git_runner_for_repo = compose_planning_git_runner(
-            config.planning, worktree_runner_factory=WorktreeGitRunner
+            config.planning
         )
         driver = PlanningRunDriver(
             PlanningDriverDeps(

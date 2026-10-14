@@ -2,9 +2,11 @@
 
 The factory used to cut every new branch from whatever its own copy of a
 project happened to have checked out. These tests drive the one operation
-that changes that: fetch the remote named ``origin``, say which branch that
-remote calls its default and which commit it is at — and then cut the branch
-from exactly that commit.
+that changes that: fetch the project's remote, say which branch that remote
+calls its default and which commit it is at — and then cut the branch from
+exactly that commit. Since 14 October 2026 the remote is the address recorded
+for the project (``planning.fetch_addresses``), never the copy's own
+``origin``; each test records its bare remote as that address.
 
 **Nothing here touches a real remote.** Every "remote" is a bare repository
 in a temporary directory, so a fetch is real git against a local path: the
@@ -40,7 +42,10 @@ from forge.deploy_sidecar.service import (
     process_git_remote_start_point_request,
     process_git_write_tree_request,
 )
+from forge.network_git import no_fetch_address_sentence
 from forge.planning.sidecar_git_runner import RepoRoutedGitRunner, SidecarGitRunner
+
+from tests.forge.recorded_fetch_address import local_remotes, origin_of  # noqa: F401
 
 REPO_KEY = "guardkit/api_test"
 
@@ -120,6 +125,23 @@ def diverge_the_copy(copy: Path, commits: int) -> str:
     return _git(copy, "rev-parse", "HEAD")
 
 
+@pytest.fixture(autouse=True)
+def _local_remotes(local_remotes: Path) -> None:
+    """Every remote here is a bare repository on disk, recorded by its path."""
+
+
+def recorded_runner(
+    worktrees_root: Path, copy: Path, repo: str = REPO_KEY
+) -> WorktreeGitRunner:
+    """The coordinator's own runner, with the copy registered as ``repo`` and
+    the remote it was cloned from recorded as that project's fetch address."""
+    return WorktreeGitRunner(
+        worktrees_root=worktrees_root,
+        target_repo_paths={repo: str(copy)},
+        fetch_addresses={repo: origin_of(copy)},
+    )
+
+
 @pytest.fixture
 def remote(tmp_path: Path) -> Path:
     return make_remote(tmp_path / "origin.git")
@@ -139,7 +161,7 @@ def copy(tmp_path: Path, remote: Path) -> Path:
 async def test_the_remotes_default_branch_is_found_fetched_and_its_commit_returned(
     remote: Path, copy: Path
 ) -> None:
-    answer = await fetch_remote_start_point(copy)
+    answer = await fetch_remote_start_point(copy, fetch_address=origin_of(copy))
 
     assert answer.ok
     assert answer.branch == "main"
@@ -157,7 +179,7 @@ async def test_a_default_branch_that_is_not_called_main_is_read_from_the_remote(
     remote = make_remote(tmp_path / "trunk-origin.git", default_branch="trunk")
     copy = clone_of(remote, tmp_path / "trunk-copy")
 
-    answer = await fetch_remote_start_point(copy)
+    answer = await fetch_remote_start_point(copy, fetch_address=origin_of(copy))
 
     assert answer.ok
     assert answer.branch == "trunk"
@@ -165,42 +187,34 @@ async def test_a_default_branch_that_is_not_called_main_is_read_from_the_remote(
 
 
 @pytest.mark.asyncio
-async def test_a_copy_with_no_remote_named_origin_is_refused_in_plain_words(
-    tmp_path: Path,
+async def test_a_project_with_no_recorded_fetch_address_is_refused_with_the_settings_sentence(
+    copy: Path,
 ) -> None:
-    alone = tmp_path / "alone"
-    alone.mkdir()
-    _git(alone, "init", "-q")
-    (alone / "README.md").write_text("alone\n", encoding="utf-8")
-    _git(alone, "add", ".")
-    _git(alone, "commit", "-qm", "one")
-
-    answer = await fetch_remote_start_point(alone)
+    # The copy has a working origin; with no address recorded for the
+    # project it is still refused, never fetched from that origin.
+    answer = await fetch_remote_start_point(copy, repo=REPO_KEY)
 
     assert not answer.ok
     assert answer.branch is None and answer.commit is None
-    assert answer.refusal == (
-        f"the copy of this project at {alone} has no remote named 'origin', "
-        f"so there is nothing to start the work from. Add that remote to the "
-        f"copy, then ask again."
-    )
+    assert answer.refusal == no_fetch_address_sentence(REPO_KEY)
 
 
 @pytest.mark.asyncio
-async def test_a_remote_that_cannot_be_reached_is_refused_with_gits_own_words(
+async def test_an_unreachable_recorded_address_is_refused_in_a_fixed_sentence_without_gits_text(
     tmp_path: Path, remote: Path, copy: Path
 ) -> None:
     gone = tmp_path / "not-here.git"
-    _git(copy, "remote", "set-url", "origin", str(gone))
 
-    answer = await fetch_remote_start_point(copy)
+    answer = await fetch_remote_start_point(copy, fetch_address=str(gone))
 
     assert not answer.ok
     assert answer.refusal is not None
     assert answer.refusal.startswith(
-        f"the remote named 'origin' could not be reached from {copy}, so the "
-        f"work cannot be started from it: "
+        "The project's recorded fetch address could not be reached, so the "
+        "work cannot be started from it: git ls-remote stopped with exit code "
     )
+    assert "fatal" not in answer.refusal
+    assert str(gone) not in answer.refusal
 
 
 @pytest.mark.asyncio
@@ -210,13 +224,12 @@ async def test_a_remote_that_names_no_default_branch_is_refused(
     empty = tmp_path / "empty.git"
     empty.mkdir()
     _git(empty, "init", "--bare", "-q")
-    _git(copy, "remote", "set-url", "origin", str(empty))
 
-    answer = await fetch_remote_start_point(copy)
+    answer = await fetch_remote_start_point(copy, fetch_address=str(empty))
 
     assert not answer.ok
     assert answer.refusal == (
-        "the remote named 'origin' does not say which branch is its default, "
+        "The project's remote does not say which branch is its default, "
         "so there is nothing to start the work from. Set that remote's "
         "default branch, then ask again."
     )
@@ -232,7 +245,7 @@ async def test_the_copys_own_checked_out_branch_and_working_folder_are_untouched
     status_before = _git(copy, "status", "--porcelain")
     advance_remote(remote, "theirs")
 
-    answer = await fetch_remote_start_point(copy)
+    answer = await fetch_remote_start_point(copy, fetch_address=origin_of(copy))
 
     assert answer.ok
     assert _git(copy, "rev-parse", "--abbrev-ref", "HEAD") == branch_before
@@ -245,10 +258,10 @@ async def test_the_copys_own_checked_out_branch_and_working_folder_are_untouched
 async def test_the_answer_follows_the_remote_when_the_remote_moves(
     remote: Path, copy: Path
 ) -> None:
-    first = await fetch_remote_start_point(copy)
+    first = await fetch_remote_start_point(copy, fetch_address=origin_of(copy))
     moved = advance_remote(remote, "second")
 
-    second = await fetch_remote_start_point(copy)
+    second = await fetch_remote_start_point(copy, fetch_address=origin_of(copy))
 
     assert first.commit != second.commit
     assert second.commit == moved
@@ -256,7 +269,7 @@ async def test_the_answer_follows_the_remote_when_the_remote_moves(
 
 @pytest.mark.asyncio
 async def test_the_in_container_venue_offers_the_operation(copy: Path) -> None:
-    venue = InContainerCandidateGit(copy)
+    venue = InContainerCandidateGit(copy, fetch_address=origin_of(copy))
 
     answer = await venue.fetch_remote_start_point()
 
@@ -275,7 +288,7 @@ async def test_the_branch_is_cut_from_the_fetched_commit_not_from_the_copys_own(
     """The copy's own main is three commits away from the remote's. The
     planning branch is cut from the REMOTE's commit all the same."""
     local_head = diverge_the_copy(copy, 3)
-    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    runner = recorded_runner(tmp_path / "wt", copy)
     start = await runner.fetch_remote_start_point(str(copy))
     assert start.ok and start.commit != local_head
 
@@ -298,7 +311,7 @@ async def test_the_tree_write_cuts_from_the_fetched_commit_too(
     tmp_path: Path, copy: Path
 ) -> None:
     local_head = diverge_the_copy(copy, 3)
-    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    runner = recorded_runner(tmp_path / "wt", copy)
     start = await runner.fetch_remote_start_point(str(copy))
 
     result = await runner.prepare_branch_and_write_tree(
@@ -320,7 +333,7 @@ async def test_a_branch_that_already_exists_is_never_moved_onto_a_newer_commit(
 ) -> None:
     """Work that has already begun keeps its commit: the second write
     re-attaches the branch where it is, whatever the remote has done since."""
-    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+    runner = recorded_runner(tmp_path / "wt", copy)
     first = await runner.fetch_remote_start_point(str(copy))
     await runner.prepare_branch_and_write(
         repo_path=str(copy),
@@ -387,7 +400,8 @@ def _config(paths: dict[str, str]) -> ForgeConfig:
 
 def test_the_route_answers_the_starting_point(remote: Path, copy: Path) -> None:
     status, body = process_git_remote_start_point_request(
-        {"repo": REPO_KEY}, config=_config({REPO_KEY: str(copy)})
+        {"repo": REPO_KEY, "fetch_address": origin_of(copy)},
+        config=_config({REPO_KEY: str(copy)}),
     )
 
     assert status == 200
@@ -410,9 +424,10 @@ def test_the_route_answers_a_refusal_as_an_answer_not_as_an_error(
         {"repo": REPO_KEY}, config=_config({REPO_KEY: str(alone)})
     )
 
+    # No fetch address was sent: an answer about the project, not a fault.
     assert status == 200
     assert body["branch"] is None and body["commit"] is None
-    assert "has no remote named 'origin'" in body["refusal"]
+    assert body["refusal"] == no_fetch_address_sentence(REPO_KEY)
 
 
 def test_the_route_refuses_a_repository_it_does_not_serve(copy: Path) -> None:
@@ -502,7 +517,10 @@ def test_the_route_is_on_the_services_allow_list(remote: Path, copy: Path) -> No
     thread.start()
     try:
         base = f"http://127.0.0.1:{server.server_address[1]}"
-        status, body = _post(f"{base}{GIT_REMOTE_START_POINT_ROUTE}", {"repo": REPO_KEY})
+        status, body = _post(
+            f"{base}{GIT_REMOTE_START_POINT_ROUTE}",
+            {"repo": REPO_KEY, "fetch_address": origin_of(copy)},
+        )
         unknown, _ = _post(f"{base}/git/no-such-thing", {"repo": REPO_KEY})
     finally:
         server.shutdown()
@@ -596,7 +614,7 @@ async def test_the_chooser_routes_the_new_operation_the_way_it_routes_the_others
     routed = RepoRoutedGitRunner(
         runners_by_repo={REPO_KEY: sandboxed},
         repo_paths={REPO_KEY: "/srv/repos/api_test"},
-        default=WorktreeGitRunner(worktrees_root=tmp_path / "wt"),
+        default=recorded_runner(tmp_path / "wt", copy, repo="synthetic/local"),
     )
 
     in_the_sandbox = await routed.fetch_remote_start_point("/srv/repos/api_test")

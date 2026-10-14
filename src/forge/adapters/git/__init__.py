@@ -4,7 +4,9 @@ Currently exposes the declarative result DTOs returned by the adapter
 operations defined in TASK-GCI-006:
 
 - :class:`GitOpResult` — per-operation result for ``prepare_worktree``,
-  ``commit_all``, ``push``, and ``cleanup_worktree``.
+  ``commit_all`` and ``cleanup_worktree``. (The unused ``push`` was deleted
+  on 14 October 2026: the publisher is the only code that writes to a
+  remote.)
 - :class:`PRResult` — result of the ``gh pr create`` call (lives here
   because gh and git share the same adapter return contract; see
   ``docs/design/contracts/API-subprocess.md`` §4).

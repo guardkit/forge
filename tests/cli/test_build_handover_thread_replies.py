@@ -33,7 +33,6 @@ import pytest
 from nats_core.envelope import EventType, MessageEnvelope
 from nats_core.events import BuildQueuedPayload, NotificationPayload
 
-from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.adapters.nats.pipeline_consumer import handle_message
 from forge.adapters.nats.planning_consumer import (
     PlanningConsumerDeps,
@@ -59,7 +58,9 @@ from tests.forge.pipeline.test_prepared_admission import (
     REPO,
     Project,
     bundle,
+    recorded_runner,
 )
+from tests.forge.recorded_fetch_address import local_remotes  # noqa: F401
 
 USER = "U-RICH"
 THREAD = "1759660000.000300"
@@ -132,7 +133,7 @@ def planning_store(tmp_path: Path) -> Iterator[SqlitePlanningRunStore]:
 
 
 @pytest.fixture()
-def project(tmp_path: Path) -> Project:
+def project(tmp_path: Path, local_remotes: Path) -> Project:
     return Project(tmp_path / "project")
 
 
@@ -143,6 +144,7 @@ def forge_config(tmp_path: Path, project: Project) -> ForgeConfig:
             "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
             "planning": {
                 "target_repo_paths": {REPO: str(project.copy)},
+                "fetch_addresses": {REPO: project.fetch_address},
                 "default_target_repo": REPO,
             },
         }
@@ -176,7 +178,7 @@ def build_deps(
         async_task_starter=starter,
         record_build_rejection=lambda _cid, _reason: None,
         prepared_build_admission=build_prepared_build_admission(
-            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+            forge_config, git_runner=recorded_runner(forge_config, tmp_path / "wt")
         ),
     )
 
@@ -356,7 +358,7 @@ async def test_with_the_gate_wired_the_answer_waits_for_the_approval(
         gate_state_machine=object(),
         record_build_rejection=lambda _cid, _reason: None,
         prepared_build_admission=build_prepared_build_admission(
-            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+            forge_config, git_runner=recorded_runner(forge_config, tmp_path / "wt")
         ),
     )
 
@@ -393,7 +395,7 @@ async def test_a_build_declined_at_its_gate_is_told_so_never_building(
         gate_state_machine=object(),
         record_build_rejection=lambda _cid, _reason: None,
         prepared_build_admission=build_prepared_build_admission(
-            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+            forge_config, git_runner=recorded_runner(forge_config, tmp_path / "wt")
         ),
     )
 
@@ -435,7 +437,7 @@ async def test_a_build_whose_card_timed_out_is_told_so_once(
         gate_state_machine=object(),
         record_build_rejection=lambda _cid, _reason: None,
         prepared_build_admission=build_prepared_build_admission(
-            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+            forge_config, git_runner=recorded_runner(forge_config, tmp_path / "wt")
         ),
     )
 
@@ -470,7 +472,7 @@ async def test_a_dispatch_error_is_answered_in_plain_words(
         async_task_starter=_Broken(),
         record_build_rejection=lambda _cid, _reason: None,
         prepared_build_admission=build_prepared_build_admission(
-            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+            forge_config, git_runner=recorded_runner(forge_config, tmp_path / "wt")
         ),
     )
 
@@ -660,7 +662,7 @@ def _gated_deps(
         gate_state_machine=object(),
         record_build_rejection=lambda _cid, _reason: None,
         prepared_build_admission=build_prepared_build_admission(
-            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt")
+            forge_config, git_runner=recorded_runner(forge_config, tmp_path / "wt")
         ),
     )
 
@@ -933,7 +935,7 @@ async def test_a_launched_row_refused_as_a_second_build_is_not_restarted_not_uns
         async_task_starter=starter,
         record_build_rejection=lambda _cid, _reason: None,
         prepared_build_admission=build_prepared_build_admission(
-            forge_config, git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "wt2")
+            forge_config, git_runner=recorded_runner(forge_config, tmp_path / "wt2")
         ),
     )
     await handle_message(_Msg(request), after_restart)

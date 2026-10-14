@@ -127,6 +127,26 @@ def _no(code: int = 1, stderr: str = "") -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess([], code, "", stderr)
 
 
+def _isolated_git(argv: list[str]) -> tuple[dict[str, str], list[str]] | None:
+    """``env -i -C <folder> NAME=VALUE ... git --no-pager [--git-dir X] -c ...
+    <command>``, the shape every register-repo git command has had since
+    14 October 2026 (forge.network_git builds it whole), as ``(environment,
+    the git command)``; ``None`` for any other command."""
+    if argv[:3] != ["env", "-i", "-C"]:
+        return None
+    rest = argv[4:]
+    env: dict[str, str] = {}
+    while rest and rest[0] != "git":
+        name, _, value = rest.pop(0).partition("=")
+        env[name] = value
+    assert rest and rest[0] == "git", argv
+    rest = rest[1:]
+    while rest and rest[0] in ("--no-pager", "-c", "--git-dir"):
+        if rest.pop(0) != "--no-pager":
+            rest.pop(0)
+    return env, ["git", *rest]
+
+
 class FakeEstate:
     """The live estate as three dictionaries and a project folder.
 
@@ -147,6 +167,8 @@ class FakeEstate:
         self.sandbox_can_read = True
         self.host_can_read = True
         self.drained_answer: Any = None
+        #: The environment the host's check clone was given.
+        self.host_clone_env: dict[str, str] = {}
         self.calls: list[list[str]] = []
         self.writes: list[str] = []
         self.project = tmp_path / "github" / LEAF
@@ -170,14 +192,22 @@ class FakeEstate:
     def __call__(self, argv, *, input=None, timeout=None):  # noqa: A002 — the seam's name
         argv = list(argv)
         self.calls.append(argv)
-        if argv[:4] == ["env", "GIT_TERMINAL_PROMPT=0", "git", "clone"]:
-            if not self.host_can_read:
-                return _no(128, "fatal: could not read Username for 'https://github.com'")
-            dest = Path(argv[-1])
-            shutil.copytree(self.project, dest, symlinks=True)
-            return _ok()
-        if argv[:2] == ["git", "-C"] and argv[3:] == ["rev-parse", "HEAD"]:
-            return _ok("0123456789abcdef0123\n")
+        isolated = _isolated_git(argv)
+        if isolated is not None:
+            env, git = isolated
+            # Every git command here runs isolated: no settings files, no
+            # inherited environment, one transport.
+            assert env["GIT_CONFIG_NOSYSTEM"] == "1" and env["GIT_CONFIG_GLOBAL"] == "/dev/null"
+            if git[1] == "clone":
+                assert env["GIT_ALLOW_PROTOCOL"] in ("https", "ssh")
+                self.host_clone_env = env
+                if not self.host_can_read:
+                    return _no(128, "fatal: could not read Username for 'https://github.com'")
+                dest = Path(git[-1])
+                shutil.copytree(self.project, dest, symlinks=True)
+                return _ok()
+            if git[1] == "-C" and git[3:] == ["rev-parse", "HEAD"]:
+                return _ok("0123456789abcdef0123\n")
         if argv[:2] == ["docker", "run"]:
             return self._docker_run(argv)
         if argv[:2] == ["docker", "exec"]:
@@ -233,6 +263,16 @@ class FakeEstate:
         assert user == "1000", "every sandbox command runs as the sandbox user"
         assert rest[0] == SANDBOX
         command = rest[1:]
+        isolated = _isolated_git(command)
+        if isolated is not None:
+            # A git command built whole by forge.network_git: its environment
+            # is its own (env -i), never the sandbox's.
+            isolated_env, command = isolated
+            env += [f"{k}={v}" for k, v in isolated_env.items()]
+            if command[1] == "init":
+                return _ok()
+        if command[0] == "mkdir" or command[:2] == ["rm", "-rf"]:
+            return _ok()
         if command[0] == "cat":
             path = command[1]
             return _ok(self.sandbox_files[path]) if path in self.sandbox_files else _no(1, "cat: no such file")
@@ -363,7 +403,9 @@ def _added(old: str, new: str) -> list[str]:
     return remaining
 
 
-def test_the_coordinator_file_gains_exactly_the_three_entries(estate):
+def test_the_coordinator_file_gains_exactly_its_four_entries(estate):
+    """The three every file gains, and (14 October 2026) the project's fetch
+    address, which only the coordinator's file records."""
     result = _run()
     assert result.exit_code == 0, result.output
     staged = estate.volume[f"forge.yaml.{LEAF}-pending"]
@@ -375,6 +417,8 @@ def test_the_coordinator_file_gains_exactly_the_three_entries(estate):
         "      name: api-test-deploy",
         '      sidecar_url: "${FORGE_SANDBOX_SIDECAR_URL}"',
         '      runner_url: "${FORGE_SANDBOX_RUNNER_URL}"',
+        "  fetch_addresses:",
+        f'    {KEY}: "{URL}"',
     ]
     before, after = yaml.safe_load(COORDINATOR_YAML), yaml.safe_load(staged)
     assert after["permissions"]["filesystem"]["allowlist"] == [
@@ -384,9 +428,11 @@ def test_the_coordinator_file_gains_exactly_the_three_entries(estate):
         **before["planning"]["target_repo_paths"], KEY: COORDINATOR_PATH
     }
     assert after["planning"]["sandboxes"][KEY] == before["planning"]["sandboxes"]["guardkit/api_test"]
+    assert after["planning"]["fetch_addresses"] == {KEY: URL}
     del after["permissions"]["filesystem"]["allowlist"][-1]
     del after["planning"]["target_repo_paths"][KEY]
     del after["planning"]["sandboxes"][KEY]
+    del after["planning"]["fetch_addresses"]
     assert after == before
 
 
@@ -586,12 +632,38 @@ def test_a_route_already_there_is_unchanged_and_the_publisher_is_not_in_the_sequ
     assert "routes did not change" in result.output
 
 
-def test_publish_with_a_credential_name_puts_it_in_the_route(estate, publisher_file):
+@pytest.fixture
+def route_key_estate(tmp_path) -> Path:
+    """An estate env file naming the publisher's route-keys folder (with the
+    key ``widget-shop-key`` in it), its pinned host keys and its user: what
+    the check clone of a private repository uses (14 October 2026)."""
+    keys = tmp_path / "route-keys"
+    keys.mkdir()
+    key = keys / "widget-shop-key"
+    key.write_text("a made-up key, TESTONLY\n")
+    key.chmod(0o600)
+    known = tmp_path / "known_hosts"
+    known.write_text("github.com ssh-ed25519 AAAATESTONLY\n")
+    env = tmp_path / "estate.env"
+    env.write_text(
+        f"FORGE_PUBLISHER_ROUTE_KEYS_DIR={keys}\n"
+        f"FORGE_PUBLISHER_KNOWN_HOSTS_FILE={known}\n"
+        f"FORGE_PUBLISHER_UID={os.geteuid()}\n"
+        "FACTORY_GATEWAY_ADDRESS=192.0.2.10\n"
+    )
+    return env
+
+
+def test_publish_with_a_credential_name_puts_it_in_the_route(
+    estate, publisher_file, route_key_estate
+):
     """13 October 2026: the route names its own key, by bare name, and nothing
-    else about the route changes. The key itself is never read or made."""
+    else about the route changes. Since 14 October 2026 the check clone of the
+    project uses exactly that key (ssh only), and nothing else."""
     result = _run(
         "--publish", "--publisher-settings", str(publisher_file),
         "--publish-credential-name", "widget-shop-key",
+        "--estate-env-file", str(route_key_estate),
     )
     assert result.exit_code == 0, result.output
     staged = json.loads((publisher_file.parent / f"settings.json.{LEAF}-pending").read_text())
@@ -603,6 +675,10 @@ def test_publish_with_a_credential_name_puts_it_in_the_route(estate, publisher_f
     }
     assert staged == expected
     assert "its own key 'widget-shop-key'" in result.output
+    assert estate.host_clone_env["GIT_ALLOW_PROTOCOL"] == "ssh"
+    ssh = estate.host_clone_env["GIT_SSH_COMMAND"]
+    assert str(route_key_estate.parent / "route-keys" / "widget-shop-key") in ssh
+    assert "IdentitiesOnly=yes" in ssh and "StrictHostKeyChecking=yes" in ssh
 
 
 def test_publish_credential_name_without_publish_is_refused(estate, publisher_file):
@@ -628,7 +704,9 @@ def test_a_publish_credential_name_that_is_not_a_key_name_is_refused(estate, pub
     assert sorted(os.listdir(publisher_file.parent)) == ["settings.json"]
 
 
-def test_a_route_without_a_key_asked_again_with_one_is_refused(estate, publisher_file):
+def test_a_route_without_a_key_asked_again_with_one_is_refused(
+    estate, publisher_file, route_key_estate
+):
     data = json.loads(publisher_file.read_text())
     data["projects"][KEY] = {
         "source": f"git://192.0.2.10:8918/api_test/.guardkit/tmp/factory-runtime/projects/{LEAF}",
@@ -638,6 +716,7 @@ def test_a_route_without_a_key_asked_again_with_one_is_refused(estate, publisher
     result = _run(
         "--publish", "--publisher-settings", str(publisher_file),
         "--publish-credential-name", "widget-shop-key",
+        "--estate-env-file", str(route_key_estate),
     )
     assert result.exit_code == 1
     assert "different route" in result.output and "fix it by hand" in result.output
@@ -1410,7 +1489,11 @@ def test_a_project_the_machine_cannot_clone_is_refused(estate):
     estate.host_can_read = False
     result = _run()
     assert result.exit_code == 1
-    assert f"could not read {URL}" in result.output
+    # A fixed sentence that says what to provide (14 October 2026): the check
+    # clone uses no credential unless the publisher's route key is named.
+    assert f"Could not read {URL} without a credential." in result.output
+    assert "--publish-credential-name" in result.output
+    assert "terminal prompts" not in result.output and "Username" not in result.output
     assert estate.writes == []
 
 

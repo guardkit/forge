@@ -41,7 +41,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from forge.publisher.credential import a_remote_the_publisher_takes, an_ssh_address
+from forge.publisher.credential import (
+    a_remote_the_publisher_takes,
+    a_source_the_publisher_takes,
+    an_ssh_address,
+)
 
 __all__ = [
     "ROUTE_KEYS_DIR",
@@ -239,9 +243,17 @@ def load_settings(path: str | Path) -> PublisherSettings:
                 "user@host:path or ssh://user@host/path (pushed with a deploy "
                 "key); any other form is refused"
             )
+        source = _text(block, "source", where=f"projects.{readable}")
+        if not a_source_the_publisher_takes(source):
+            raise SettingsRefused(
+                f"the source of project '{readable}' must be a git:// address (the "
+                "factory's read-only export of the project's copy) or an absolute "
+                "local folder; file://, http(s), ssh, ext:: and relative paths are "
+                "refused (the value is not repeated here)"
+            )
         projects[readable] = ProjectRoute(
             name=readable,
-            source=_text(block, "source", where=f"projects.{readable}"),
+            source=source,
             remote=remote,
             credential_name=_a_route_s_key_name(block, readable),
         )
