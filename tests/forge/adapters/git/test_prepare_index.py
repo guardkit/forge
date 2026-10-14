@@ -291,9 +291,10 @@ class TestCoachFixPass1:
             project,
             {
                 ".guardkit/autobuild/TASK-1/player_turn_1.json": OLD_RECORD,
-                "large_tool_results/out.txt": "a lot of tool output\n",
+                # At least 64 bytes: tinier records are not compared.
+                "large_tool_results/out.txt": "a lot of tool output\n" * 4,
                 "docs/turn.json": OLD_RECORD,
-                "docs/out.txt": "a lot of tool output\n",
+                "docs/out.txt": "a lot of tool output\n" * 4,
                 "src/app.txt": "two\n",
             },
         )
@@ -451,3 +452,41 @@ class TestCoachFixPass2:
         assert result.status == "success", result
         assert "did not finish within" in caplog.text
         assert _committed(project) == {"notes/copy.json"}
+
+
+class TestCoachFixPass3:
+    """Coordinator decision: records under 64 bytes are not compared."""
+
+    @pytest.mark.asyncio
+    async def test_a_tiny_product_file_beside_a_tiny_record_is_committed(
+        self, project: Path
+    ) -> None:
+        _write(
+            project,
+            {".guardkit/autobuild/TASK-1/list.json": "[]", "data/seed.json": "[]"},
+        )
+
+        result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"data/seed.json"}
+
+    @pytest.mark.asyncio
+    async def test_a_copy_of_a_record_of_64_bytes_or_more_is_still_left_out(
+        self, project: Path
+    ) -> None:
+        sixty_four = '{"turn": 1, "said": "' + "x" * 41 + '"}'
+        assert len(sixty_four.encode()) == 64
+        _write(
+            project,
+            {
+                ".guardkit/autobuild/TASK-1/turn.json": sixty_four,
+                "notes/turn.json": sixty_four,
+                "src/app.txt": "two\n",
+            },
+        )
+
+        result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/app.txt"}

@@ -398,6 +398,13 @@ INNER_RECORD_FOLDERS: tuple[str, ...] = (
 #: (GuardKit e0b72800 waits the same 5 seconds).
 RECORD_READ_BOUND_S: float = 5.0
 
+#: Records smaller than this are not compared with product files at commit
+#: time (coordinator decision, 14 October 2026). A tiny record such as ``[]``
+#: carries nothing worth protecting, and a product file holding the same few
+#: bytes must never be silently left out. Private text in any file is still
+#: refused by the publisher, whose own content look keeps no size exemption.
+SMALLEST_COMPARED_RECORD: int = 64
+
 
 def git_blob_id(data: bytes, object_format: str) -> str:
     """The id git gives a file holding exactly ``data``: the ``sha1`` or
@@ -473,9 +480,10 @@ def _inner_build_record_files(root: Path) -> list[Path]:
 
 
 async def _record_blob_ids(root: Path, listed: list[str], object_format: str) -> set[str]:
-    """The blob id of every non-empty regular file at a record path (as git
-    listed them) and of each inner build folder's records, computed here
-    from the bytes (:func:`git_blob_id`).
+    """The blob id of every regular file of at least
+    :data:`SMALLEST_COMPARED_RECORD` bytes at a record path (as git listed
+    them) and of each inner build folder's records, computed here from the
+    bytes (:func:`git_blob_id`).
 
     The files are read in a thread of their own, waited for at most
     :data:`RECORD_READ_BOUND_S`. Files not read by then are left out of the
@@ -495,7 +503,7 @@ async def _record_blob_ids(root: Path, listed: list[str], object_format: str) ->
             for path in sorted(paths):
                 data = _read_regular_file(path)
                 with lock:
-                    if data is not None:
+                    if data is not None and len(data) >= SMALLEST_COMPARED_RECORD:
                         ids.add(git_blob_id(data, object_format))
                     progress["read"] += 1
             with lock:

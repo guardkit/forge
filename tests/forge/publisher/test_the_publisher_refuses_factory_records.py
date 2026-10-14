@@ -781,3 +781,22 @@ class TestTheSettingRefusesGenericFolders:
     def test_a_machine_s_own_folder_is_read(self, tmp_path: Path, value: str) -> None:
         loaded = load_settings(_settings_file(tmp_path, private_path_prefixes=[value]))
         assert loaded.private_path_prefixes == (value,)
+
+
+class TestCoachFixPass3:
+    def test_g1_a_private_folder_at_the_end_of_a_sentence_is_refused(
+        self, world: World
+    ) -> None:
+        world.commit({"docs/notes.md": f"The receipts live in {PRIVATE}.\n"})
+        project = world.join()
+
+        refused(world, world.publish(project), PRIVATE_KIND)
+
+    @pytest.mark.parametrize("longer", [f"{PRIVATE}.org/x", f"{PRIVATE}s-shop/app"])
+    def test_g1_a_longer_name_that_starts_the_same_is_published(
+        self, world: World, longer: str
+    ) -> None:
+        world.commit({"docs/notes.md": f"See {longer} for more.\n"})
+        project = world.join()
+
+        published(world, world.publish(project), project)

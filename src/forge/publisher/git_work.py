@@ -282,10 +282,12 @@ def _raw_moves(text: str) -> list[tuple[str, str, str]]:
 
 
 #: What may follow a private folder name for it to count: anything but a
-#: character that would continue the folder's own name. So ``/home/example``
-#: is found in ``/home/example/x``, ``"/home/example"`` and at the end of a
-#: file, and not in ``/home/examples-shop`` (coach review 1, F4).
-_NAME_GOES_ON = rb"(?![A-Za-z0-9._\-])"
+#: character that would continue the folder's own name. A ``.`` continues it
+#: only when a name character follows (coach review 2, G1). So
+#: ``/home/example`` is found in ``/home/example/x``, ``"/home/example"``, at
+#: the end of a file and at the end of a sentence (``in /home/example.``), and
+#: not in ``/home/examples-shop`` or ``/home/example.org`` (coach review 1, F4).
+_NAME_GOES_ON = rb"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_\-])"
 
 
 def _private_folder_pattern(prefixes: list[str]) -> "re.Pattern[bytes]":
