@@ -559,3 +559,23 @@ class TestCodexRound1:
         found = {p.relative_to(inner).as_posix() for p in _inner_build_record_files(project)}
 
         assert found == {"packages/api/.guardkit/memory-query-log.jsonl"}
+
+
+class TestGuardKitPin8c69:
+    """Parity with GuardKit 8c69c23e: a regular file named exactly
+    ``.guardkit/worktrees`` is a record whose content is compared; only what
+    lies inside an inner build folder is not."""
+
+    @pytest.mark.asyncio
+    async def test_a_copy_of_a_file_named_like_the_inner_builds_folder_is_left_out(
+        self, project: Path
+    ) -> None:
+        _write(
+            project,
+            {".guardkit/worktrees": OLD_RECORD, "notes/copied.json": OLD_RECORD, "src/app.txt": "two\n"},
+        )
+
+        result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert _committed(project) == {"src/app.txt"}

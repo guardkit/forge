@@ -21,6 +21,7 @@ import pytest
 
 from forge.factory_files import (
     FACTORY_RECORD_PATHS,
+    factory_record_content_pathspecs,
     factory_record_exclusions,
     factory_record_pathspecs,
     is_factory_record,
@@ -164,6 +165,8 @@ def test_the_list_matches_guardkits_pinned_copy() -> None:
     assert list(FACTORY_RECORD_PATHS) == pinned["FACTORY_RECORD_PATHS"]
     # GuardKit's add-time exclusions of its records are Forge's, in any order.
     assert sorted(factory_record_exclusions()) == pinned["record_exclusions"]
+    # And so is where record content is looked for.
+    assert sorted(factory_record_content_pathspecs()) == pinned["record_content_pathspecs"]
 
 
 def test_the_matcher_gives_guardkits_answers() -> None:

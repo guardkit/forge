@@ -87,16 +87,19 @@ _NOT_AT_ADD_TIME = ("conversation_history/**", "conversation_history")
 #: The inner build folders hold copies of the product itself, so their content
 #: is never compared with product files (their own records are walked
 #: separately, by :func:`forge.adapters.git.operations._inner_build_record_files`).
-_NOT_FOR_CONTENT = ("**/.guardkit/worktrees/**", "**/.guardkit/worktrees")
+_NOT_FOR_CONTENT = "**/.guardkit/worktrees/**"
 
-_INNER_BUILDS = re.compile(r"(?:.*/)?\.guardkit/worktrees(?:/.*)?", re.DOTALL)
+#: Anything inside a ``.guardkit/worktrees/`` folder. A file named exactly
+#: ``.guardkit/worktrees`` is not inside one, and is compared like any other
+#: record (as GuardKit 8c69c23e does).
+_INNER_BUILDS = re.compile(r"(?:.*/)?\.guardkit/worktrees/.+", re.DOTALL)
 
 
 def is_record_content(path: str) -> bool:
     """True when ``path`` is a record whose content may be compared with
     product files: a record path or folder name, but never anything inside
-    an inner build folder (``.guardkit/worktrees``), which holds the product
-    itself."""
+    an inner build folder (``.guardkit/worktrees/``), which holds the
+    product itself."""
     return is_factory_record(path) and not _INNER_BUILDS.fullmatch(str(path))
 
 
@@ -174,7 +177,7 @@ def factory_record_content_pathspecs() -> tuple[str, ...]:
     return tuple(
         pattern_pathspec(f":(glob){p}")
         for p in _ALL_RECORD_PATTERNS
-        if p not in _NOT_FOR_CONTENT
+        if p != _NOT_FOR_CONTENT
     )
 
 #: Each script the factory ships for a project's sandbox, by file name, and
