@@ -714,25 +714,62 @@ FACTORY_ENV_NAMES=(
 # so the code a build runs can read every setting either container is given:
 # from another process, or with `docker inspect`. So nothing that could serve
 # as a key is handed in at all, and a start that is asked to hand one in is
-# refused, by the setting's NAME and never its value. Two rules:
+# refused, by the setting's NAME and never its value. The rules:
 #   - a name containing one of Forge's own credential words
 #     (RESERVED_CREDENTIAL_WORDS in src/forge/launch_environment.py), or DSN;
-#   - a value that is an address with a password in it (scheme://user:pw@).
+#   - a name with KEY as a whole word in it (A_SERVICE_KEY, KEY_FILE);
+#   - a value that is an address with any user information in it, an address
+#     whose query names a credential, or a password=-style pair, including
+#     the same written with common escapes.
 # ONE EXACT NAME IS EXCUSED, and no pattern is: the stamp check's token count,
 # whose name contains TOKEN. It may cross only as a plain number; anything
 # else in it (a letter, a space, nothing at all) refuses the start too.
 # A project whose own tests need a secret is a separate question; the answer
 # will be a door outside the sandbox, never a value handed in.
 CREDENTIAL_WORDS=(TOKEN SECRET PASSWORD PASSWD API_KEY APIKEY CREDENTIAL PRIVATE_KEY DSN)
+# Words that make a name a credential only as a whole word between
+# underscores: KEY in A_SERVICE_KEY, KEY_FILE or MY_KEY_ID, but not in
+# KEYBOARD_LAYOUT or MONKEY_COUNT.
+CREDENTIAL_WHOLE_WORDS=(KEY)
 CREDENTIAL_SHAPED_BUT_ALLOWED=(GUARDKIT_STAMP_MODEL_MAX_TOKENS)
-PASSWORD_IN_AN_ADDRESS='[A-Za-z][A-Za-z0-9+.-]*://[^/?#@[:space:]]*:[^/?#@[:space:]]*@'
+# The three shapes of a value that carries a credential, matched on the value
+# in lower case, and again once common escapes are undone (%3a, %2f, %40 and
+# the rest, and JSON's \/), so an encoded copy is caught too:
+#   an address with any user information in it, a user alone or a user and a
+#   password (scheme://someone@ or scheme://someone:secret@);
+#   an address whose query names a credential (?access_token=, &api_key=,
+#   ;pwd=, ?auth=);
+#   a password=-style pair anywhere (password=, passwd=, pwd=).
+USER_IN_AN_ADDRESS='[a-z][a-z0-9+.-]*://[^/?#[:space:]]*@'
+CREDENTIAL_IN_A_QUERY='://[^?#[:space:]]*[?]([^#[:space:]]*[&;])?[^=&;#[:space:]]*(pass|pwd|token|secret|key|auth)[^=&;#[:space:]]*='
+PASSWORD_PAIR='(^|[^a-z0-9])(password|passwd|pwd)[[:space:]]*='
+
+# A value as a reader of it would see it: lower case, with the common escapes
+# undone. Used only to judge a value, never printed.
+the_value_unescaped() {
+  local value="${1,,}" escaped_slash='\/'
+  value="${value//"${escaped_slash}"/\/}"
+  value="${value//%3a/:}"
+  value="${value//%2f/\/}"
+  value="${value//%40/@}"
+  value="${value//%3f/?}"
+  value="${value//%3d/=}"
+  value="${value//%26/&}"
+  value="${value//%3b/;}"
+  value="${value//%23/#}"
+  value="${value//%20/ }"
+  printf '%s' "${value}"
+}
 
 # Prints why one named setting may not be handed in, or nothing when it may.
-# It reads the value only to judge it, and never prints it.
+# Arguments: the entry, the name of the list it came from, and its position
+# in that list. It reads the value only to judge it, and never prints it; an
+# entry that is not a setting name is named by its list and position only,
+# because its text may be a value written into the list by mistake.
 why_this_setting_may_not_cross() {
-  local name="$1" word allowed
+  local name="$1" list="$2" position="$3" word allowed value seen
   if [[ ! "${name}" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-    printf '%s (that is not a setting name)' "${name}"
+    printf 'an entry in %s is not a setting name (position %s)' "${list}" "${position}"
     return 0
   fi
   for allowed in "${CREDENTIAL_SHAPED_BUT_ALLOWED[@]}"; do
@@ -749,9 +786,28 @@ why_this_setting_may_not_cross() {
       return 0
     fi
   done
-  if [[ -n "${!name:-}" && "${!name}" =~ ${PASSWORD_IN_AN_ADDRESS} ]]; then
-    printf '%s (its value is an address with a password in it)' "${name}"
-  fi
+  for word in "${CREDENTIAL_WHOLE_WORDS[@]}"; do
+    if [[ "_${name^^}_" == *"_${word}_"* ]]; then
+      printf '%s (its name says it is a credential)' "${name}"
+      return 0
+    fi
+  done
+  value="${!name:-}"
+  [[ -n "${value}" ]] || return 0
+  for seen in "${value,,}" "$(the_value_unescaped "${value}")"; do
+    if [[ "${seen}" =~ ${USER_IN_AN_ADDRESS} ]]; then
+      printf '%s (its value is an address with a user or a password in it)' "${name}"
+      return 0
+    fi
+    if [[ "${seen}" =~ ${CREDENTIAL_IN_A_QUERY} ]]; then
+      printf '%s (its value is an address whose query carries a credential)' "${name}"
+      return 0
+    fi
+    if [[ "${seen}" =~ ${PASSWORD_PAIR} ]]; then
+      printf '%s (its value carries a password= pair)' "${name}"
+      return 0
+    fi
+  done
   return 0
 }
 
@@ -1001,8 +1057,18 @@ esac
 # start has started, stopped and removed nothing. A stop is never refused: it
 # hands nothing in, and it must always be able to take the containers down.
 REFUSED_SETTINGS=()
-for name in "${FACTORY_ENV_NAMES[@]}" ${EXTRA_ENV_NAMES//,/ }; do
-  reason="$(why_this_setting_may_not_cross "${name}")"
+position=0
+for name in "${FACTORY_ENV_NAMES[@]}"; do
+  position=$((position + 1))
+  reason="$(why_this_setting_may_not_cross "${name}" "this script's FACTORY_ENV_NAMES" "${position}")"
+  if [[ -n "${reason}" ]]; then
+    REFUSED_SETTINGS+=("${reason}")
+  fi
+done
+position=0
+for name in ${EXTRA_ENV_NAMES//,/ }; do
+  position=$((position + 1))
+  reason="$(why_this_setting_may_not_cross "${name}" "SANDBOX_CONTAINER_ENV_NAMES" "${position}")"
   if [[ -n "${reason}" ]]; then
     REFUSED_SETTINGS+=("${reason}")
   fi

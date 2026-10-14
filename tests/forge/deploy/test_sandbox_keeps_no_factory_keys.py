@@ -401,7 +401,21 @@ def test_the_model_door_image_agrees_with_the_pins_file():
     example = (ESTATE / ".env.example").read_text()
     assert f"\nFACTORY_MODEL_DOOR_IMAGE={image}@{digest}\n" in example
     assert "\nMODEL_DOOR_PORT=" in example
-    assert "\nMODEL_DOOR_BIND=" in example
+
+
+def test_the_model_door_listens_only_on_the_gateway_address(estate):
+    """Fix pass 1, item 6. The door's listening address is BUILT from the
+    gateway address and the door's port, like every other gateway service's,
+    so nobody can set it to every address of the machine by hand. There is no
+    free-text MODEL_DOOR_BIND line to edit."""
+    example = (ESTATE / ".env.example").read_text()
+    gateway = re.search(r"^FACTORY_GATEWAY_ADDRESS=(\S+)$", example, re.M).group(1)
+    port = re.search(r"^MODEL_DOOR_PORT=(\S+)$", example, re.M).group(1)
+    door = estate["services"]["model-door"]
+    assert door["environment"]["MODEL_DOOR_BIND"] == f"{gateway}:{port}"
+    assert "\nMODEL_DOOR_BIND=" not in example
+    compose = (ESTATE / "compose.yaml").read_text()
+    assert "MODEL_DOOR_BIND: ${FACTORY_GATEWAY_ADDRESS:?" in compose
 
 
 # ---------------------------------------------------------------------------
@@ -417,3 +431,237 @@ def test_the_memory_door_address_is_on_the_launch_list():
         parent={"PATH": "/usr/bin", "FLEET_MEMORY_MCP_URL": "http://192.0.2.1:31822/mcp"}
     )
     assert env["FLEET_MEMORY_MCP_URL"] == "http://192.0.2.1:31822/mcp"
+
+
+# ---------------------------------------------------------------------------
+# Fix pass 1 (14 October 2026): the coach's findings
+# ---------------------------------------------------------------------------
+
+#: The rule's own function, as each script defines it, so many cases can be
+#: put to both copies quickly. The end-to-end tests above and below prove the
+#: scripts really call it.
+_THE_RULE = re.compile(
+    r"^CREDENTIAL_WORDS=.*?^why_this_setting_may_not_cross\(\) \{.*?^}\n", re.M | re.S
+)
+
+
+def _the_rule_says(script: Path, name: str, value: str | None, label: str = "A_LIST",
+                   position: int = 1) -> str:
+    """What one script's rule says about one setting: '' when it may cross."""
+    rule = _THE_RULE.search(script.read_text())
+    assert rule, f"{script.name} has no refusal rule"
+    env = {"PATH": "/usr/bin:/bin"}
+    if value is not None:
+        env[name] = value
+    done = subprocess.run(
+        ["bash", "-c", rule.group(0) + '\nwhy_this_setting_may_not_cross "$@"',
+         "the-rule", name, label, str(position)],
+        env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout
+
+
+BOTH_SCRIPTS = pytest.mark.parametrize("script", [BOOTSTRAP, RUN_SH],
+                                       ids=["start-script", "supervisor"])
+
+
+@BOTH_SCRIPTS
+@pytest.mark.parametrize("name", [
+    "A_SERVICE_KEY", "KEY_FOR_THE_DOOR", "THE_KEY_HOLDER", "SANDBOX_MODEL_KEY",
+    "LITELLM_MASTER_KEY", "AWS_ACCESS_KEY_ID", "a_service_key",
+])
+def test_a_name_with_key_as_a_word_is_refused(script, name):
+    """Item 4: KEY as a whole word of a name, anywhere in it, is refused, by
+    name. The model door's own key name is one of them."""
+    said = _the_rule_says(script, name, "an-ordinary-value")
+    assert name in said and "credential" in said, said
+    assert "an-ordinary-value" not in said
+
+
+@BOTH_SCRIPTS
+@pytest.mark.parametrize("name", ["KEYBOARD_LAYOUT", "MONKEY_COUNT", "TURNKEYS"])
+def test_key_inside_a_longer_word_is_not_a_key(script, name):
+    """The control: KEY inside another word does not make a name a
+    credential, so ordinary settings are not caught by the new word rule."""
+    assert _the_rule_says(script, name, "an-ordinary-value") == ""
+
+
+#: Values that carry a credential, each made-up. The sentinel must never be
+#: printed. Each is refused by both scripts whatever the setting is called.
+CREDENTIAL_VALUES = {
+    "a-user-alone": f"https://{SENTINEL}@192.0.2.10/a-repository.git",
+    "user-and-password": f"postgresql://someone:{SENTINEL}@192.0.2.10:5432/db",
+    "an-empty-password": "https://someone:@192.0.2.10/",
+    "percent-encoded": f"https%3A%2F%2Fsomeone%3A{SENTINEL}%40192.0.2.10%2F",
+    "json-escaped": f"https:\\/\\/someone:{SENTINEL}@192.0.2.10\\/",
+    "a-token-in-the-query": f"https://192.0.2.10/v1?model=a&access_token={SENTINEL}",
+    "an-api-key-in-the-query": f"http://192.0.2.10:4000/v1?api_key={SENTINEL}",
+    "an-auth-in-the-query": f"http://192.0.2.10:4000/v1?Auth={SENTINEL}",
+    "a-pwd-in-the-query": f"http://192.0.2.10/?user=a;pwd={SENTINEL}",
+    "a-libpq-password": f"host=192.0.2.10 dbname=memory password={SENTINEL}",
+    "a-passwd-pair": f"passwd={SENTINEL}",
+    "an-upper-case-password-pair": f"user=a PASSWORD = {SENTINEL}",
+}
+
+
+@BOTH_SCRIPTS
+@pytest.mark.parametrize("value", list(CREDENTIAL_VALUES.values()),
+                         ids=list(CREDENTIAL_VALUES))
+def test_a_value_carrying_a_credential_is_refused_by_name(script, value):
+    """Item 4: a URL with any user information, a URL whose query names a
+    credential, and a password=-style pair are all refused, by the setting's
+    name, and the value is never printed."""
+    said = _the_rule_says(script, "FLEET_MEMORY_EMBED_URL", value)
+    assert "FLEET_MEMORY_EMBED_URL" in said, said
+    assert SENTINEL not in said
+
+
+@BOTH_SCRIPTS
+@pytest.mark.parametrize("value", [
+    "http://192.0.2.1:31822/mcp",
+    "http://192.0.2.1:9000/v1?model=an-embedding-model&dims=1024",
+    "a-project@example.invalid",
+    "an-ordinary-value-with=an-equals-sign",
+    "flash-next-t06",
+], ids=["the-memory-door", "a-plain-query", "an-email-address", "a-plain-pair", "a-model-name"])
+def test_an_ordinary_value_still_crosses(script, value):
+    """The control for the value rules: the addresses, names and numbers the
+    factory really hands in are not caught."""
+    assert _the_rule_says(script, "FLEET_MEMORY_EMBED_URL", value) == ""
+
+
+def test_the_tightened_rules_reach_the_start_script(sandbox):
+    """Item 4, end to end through the start script: a _KEY name, a URL with a
+    user only, a token in a query string and a password= pair each stop the
+    start, by name, and start nothing."""
+    status, said = _start_expecting_it_to_end(
+        sandbox,
+        SANDBOX_CONTAINER_ENV_NAMES="A_SERVICE_KEY A_REPOSITORY_URL A_MODEL_URL A_DATABASE",
+        A_SERVICE_KEY=SENTINEL,
+        A_REPOSITORY_URL=CREDENTIAL_VALUES["a-user-alone"],
+        A_MODEL_URL=CREDENTIAL_VALUES["a-token-in-the-query"],
+        A_DATABASE=CREDENTIAL_VALUES["a-libpq-password"],
+    )
+    assert status == 2, said
+    for name in ("A_SERVICE_KEY", "A_REPOSITORY_URL", "A_MODEL_URL", "A_DATABASE"):
+        assert name in said, name
+    assert SENTINEL not in said
+    assert SENTINEL not in "\n".join(_calls(sandbox))
+    assert not [call for call in _calls(sandbox) if call.startswith("run ")]
+
+
+def test_the_tightened_rules_reach_the_outer_supervisor(root):
+    """Item 4, end to end through the outer supervisor: the same four cases
+    stop it before the sandbox client is called."""
+    status, said = _run_the_supervisor(
+        root,
+        SANDBOX_ENV_NAMES="A_SERVICE_KEY A_REPOSITORY_URL A_MODEL_URL A_DATABASE",
+        A_SERVICE_KEY=SENTINEL,
+        A_REPOSITORY_URL=CREDENTIAL_VALUES["a-user-alone"],
+        A_MODEL_URL=CREDENTIAL_VALUES["a-token-in-the-query"],
+        A_DATABASE=CREDENTIAL_VALUES["a-libpq-password"],
+    )
+    assert status == 2, said
+    for name in ("A_SERVICE_KEY", "A_REPOSITORY_URL", "A_MODEL_URL", "A_DATABASE"):
+        assert name in said, name
+    assert SENTINEL not in said
+    assert _client_calls(root) == []
+
+
+def test_a_bad_entry_is_named_by_its_position_not_its_text(sandbox, root):
+    """Item 5: an entry that is not a setting name (say an operator wrote
+    NAME=value into a list) is refused by the list's name and the entry's
+    position, and its text, which may hold a value, is never printed."""
+    entry = f"A_SETTING={SENTINEL}"
+    status, said = _start_expecting_it_to_end(
+        sandbox, SANDBOX_CONTAINER_ENV_NAMES=f"FLEET_MEMORY_ENABLED {entry}"
+    )
+    assert status == 2, said
+    assert "an entry in SANDBOX_CONTAINER_ENV_NAMES is not a setting name (position 2)" in said
+    assert SENTINEL not in said
+
+    status, said = _run_the_supervisor(root, SANDBOX_ENV_NAMES=f"FORGE_IMAGE {entry}")
+    assert status == 2, said
+    assert "an entry in SANDBOX_ENV_NAMES is not a setting name (position 2)" in said
+    assert SENTINEL not in said
+    assert _client_calls(root) == []
+
+
+# --- the model door's own entry shell, run in the pinned image ------------
+
+def _the_pinned_door_image() -> str:
+    pins = (ESTATE / "estate-pins.conf").read_text()
+    image = re.search(r"^MODEL_DOOR_BASE_IMAGE=(\S+)$", pins, re.M).group(1)
+    digest = re.search(r"^MODEL_DOOR_BASE_DIGEST=(\S+)$", pins, re.M).group(1)
+    return f"{image.split(':')[0]}@{digest}"
+
+
+@pytest.fixture(scope="module")
+def door_entry(estate) -> list[str]:
+    """The door's entry shell exactly as the estate renders it, ready to run
+    in the pinned image with a harmless command in place of HAProxy."""
+    image = _the_pinned_door_image()
+    held = subprocess.run(["docker", "image", "inspect", image], capture_output=True)
+    if held.returncode != 0:
+        pytest.skip("the pinned HAProxy image is not on this machine; nothing is fetched")
+    entry = [part.replace("$$", "$") for part in estate["services"]["model-door"]["entrypoint"]]
+    return [image, *entry]
+
+
+def _start_the_door(door_entry, tmp_path: Path, key: bytes, bind: str):
+    """Run the door's entry shell with a key file and a listening address;
+    no network, every capability dropped, and `true` in place of HAProxy."""
+    image, *entry = door_entry
+    key_file = tmp_path / "sandbox_model_key"
+    key_file.write_bytes(key)
+    key_file.chmod(0o444)
+    return subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+         "-e", f"MODEL_DOOR_BIND={bind}",
+         "-v", f"{key_file}:/run/secrets/sandbox_model_key:ro",
+         "--entrypoint", entry[0], image, *entry[1:], "true"],
+        capture_output=True, text=True, timeout=120,
+    )
+
+
+@pytest.mark.parametrize("key", [b"\n", b"  \t\n", b"made-up key with spaces\n"],
+                         ids=["only-a-newline", "only-whitespace", "whitespace-inside"])
+def test_the_door_refuses_a_key_that_is_blank_or_broken(door_entry, tmp_path, key):
+    """Item 2: a key file holding only a newline, only whitespace, or a key
+    with whitespace in it stops the door at its start, instead of starting a
+    door that sends an empty key and fails every model call later."""
+    done = _start_the_door(door_entry, tmp_path, key, "192.0.2.1:31823")
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "the model door" in done.stderr
+    assert "made-up" not in done.stdout + done.stderr
+
+
+@pytest.mark.parametrize("bind", ["0.0.0.0:31823", "[::]:31823", ":::31823", ":31823", "*:31823"],
+                         ids=["every-ipv4-address", "every-ipv6-address", "every-ipv6-bare",
+                              "no-host", "a-wildcard"])
+def test_the_door_refuses_to_listen_everywhere(door_entry, tmp_path, bind):
+    """Item 6: whatever reaches it, the door refuses to listen on every
+    address of the machine."""
+    done = _start_the_door(door_entry, tmp_path, b"made-up-door-key-for-the-test\n", bind)
+    assert done.returncode != 0, done.stdout + done.stderr
+    assert "the model door" in done.stderr
+    assert "made-up" not in done.stdout + done.stderr
+
+
+def test_the_door_starts_with_a_good_key_and_the_gateway_address(door_entry, tmp_path):
+    """The control for the two refusals above."""
+    done = _start_the_door(door_entry, tmp_path, b"made-up-door-key-for-the-test\n",
+                           "192.0.2.1:31823")
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+def test_the_estate_readme_documents_the_model_door():
+    """Item 3: the door's own error message sends an operator to the README,
+    so the README says what the door is, which secret it needs and where it
+    listens, and no longer claims the bundle has no host network."""
+    readme = (ESTATE / "README.md").read_text()
+    for needed in ("model-door", "SANDBOX_MODEL_KEY", "MODEL_DOOR_PORT", "model-door.cfg"):
+        assert needed in readme, needed
+    assert "no checkout and no host network" not in readme
+    assert "a secret the sandbox's containers get by name" not in readme

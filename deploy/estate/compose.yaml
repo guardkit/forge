@@ -528,7 +528,7 @@ services:
   # THE HOST'S NETWORK, AND WHY THIS ONE SERVICE IS ON IT. The model router
   # listens on this machine and a guard refuses Docker's bridges on its port,
   # so the door reaches it on the loopback, which only the host's network
-  # has. It binds only MODEL_DOOR_BIND, the gateway address and its own port,
+  # has. It binds only the gateway address and its own port (MODEL_DOOR_PORT),
   # and the machine's guard admits only the sandbox's machine to that port.
   # It publishes nothing and joins no Compose network.
   #
@@ -547,9 +547,9 @@ services:
   # Compose hands a secret read from the environment into a container by
   # copying it in, and it refuses to do that for a read-only service ("`file`
   # is the sole supported option"), so a read-only door could not be given its
-  # key the way every other estate secret is given. Nothing is lost: the
-  # image's user can write nowhere on the image's filesystem (checked on the
-  # pinned image), and HAProxy writes nothing.
+  # key the way every other estate secret is given. What that costs is small:
+  # the image's user can write only in /tmp and /var/tmp (checked on the
+  # pinned image), HAProxy writes nothing, and it runs no code but its own.
   # -------------------------------------------------------------------------
   model-door:
     image: ${FACTORY_MODEL_DOOR_IMAGE:?name the model door's image in the env file, pinned by digest - estate-pins.conf says which}
@@ -564,20 +564,37 @@ services:
       - -c
       - |
         set -eu
+        # Where it listens: never every address of the machine.
+        host="$${MODEL_DOOR_BIND%:*}"
+        case "$$host" in
+            ""|"*"|0.0.0.0|::|"[::]"|:*)
+                echo "the model door was asked to listen on every address of this machine; it listens only on the factory gateway address. Set FACTORY_GATEWAY_ADDRESS and MODEL_DOOR_PORT in the env file (deploy/estate/README.md, 'The model door')." >&2
+                exit 1
+                ;;
+        esac
         key_file=/run/secrets/sandbox_model_key
         if [ ! -s "$$key_file" ]; then
-            echo "the model door was given no key: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with SANDBOX_MODEL_KEY passed in from a child process." >&2
+            echo "the model door was given no key: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says ('The model door'), with SANDBOX_MODEL_KEY passed in from a child process." >&2
             exit 1
         fi
         MODEL_DOOR_KEY="$$(cat "$$key_file")"
+        # A file holding only a newline or spaces is no key, and a key with
+        # whitespace in it is a broken one. Either would start a door that
+        # sends an empty or broken key and fails every model call later.
+        if [ -z "$$MODEL_DOOR_KEY" ] || [ "$$(printf '%s' "$$MODEL_DOOR_KEY" | tr -d '[:space:]')" != "$$MODEL_DOOR_KEY" ]; then
+            echo "the model door's key file holds no usable key (it is blank, or has spaces or line breaks in it). Mint the key again and pass it in as SANDBOX_MODEL_KEY, the way deploy/estate/README.md says ('The model door')." >&2
+            exit 1
+        fi
         export MODEL_DOOR_KEY
         exec "$$@"
       - the-estate-hands-the-model-door-its-key-as-a-file
     command: ["haproxy", "-db", "-f", "/usr/local/etc/haproxy/model-door.cfg"]
     environment:
-      # Where it listens: the gateway address and the door's port, built in
-      # the env file. Never 0.0.0.0, which would open it to every network.
-      MODEL_DOOR_BIND: ${MODEL_DOOR_BIND:?name the address and port the model door listens on in the env file - the factory gateway address and MODEL_DOOR_PORT}
+      # Where it listens: BUILT here from the gateway address and the door's
+      # port, as every other gateway service's address is, so it cannot be
+      # set to every address of the machine by hand. The entry shell above
+      # refuses an unspecified address as well.
+      MODEL_DOOR_BIND: ${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${MODEL_DOOR_PORT:?name the port the model door listens on at the gateway address in the env file}
     secrets:
       - source: sandbox-model-key
         target: sandbox_model_key
