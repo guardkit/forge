@@ -166,6 +166,13 @@ def test_the_list_matches_guardkits_pinned_copy() -> None:
     assert sorted(factory_record_exclusions()) == pinned["record_exclusions"]
 
 
+def test_the_inner_build_record_folders_match_guardkits() -> None:
+    from forge.adapters.git.operations import INNER_RECORD_FOLDERS
+
+    pinned = json.loads(PINNED.read_text(encoding="utf-8"))
+    assert list(INNER_RECORD_FOLDERS) == pinned["inner_record_folders"]
+
+
 def test_the_matcher_gives_guardkits_answers() -> None:
     pinned = json.loads(PINNED.read_text(encoding="utf-8"))["is_factory_record"]
     assert len(pinned) > 30

@@ -1,6 +1,6 @@
 {
   "source": "guardkit/orchestrator/worktree_checkpoints.py",
-  "guardkit_commit": "e6bd14d2bd271c8348f038d9844a327ed23732ad",
+  "guardkit_commit": "e0b728003e53670c4932cdae97184569c23b7322",
   "FACTORY_RECORD_PATHS": [
     "**/.guardkit/autobuild/**",
     "**/.guardkit/autobuild-private/**",
@@ -24,6 +24,13 @@
     ":(exclude,glob)**/.guardkit/worktrees/**",
     ":(exclude,glob)**/large_tool_results",
     ":(exclude,glob)**/large_tool_results/**"
+  ],
+  "inner_record_folders": [
+    ".guardkit/autobuild",
+    ".guardkit/autobuild-private",
+    ".guardkit/qav-shadow",
+    "conversation_history",
+    "large_tool_results"
   ],
   "is_factory_record": {
     ".guardkit/autobuild/x.json": true,

@@ -345,3 +345,109 @@ class TestCoachFixPass1:
 
         assert result.status == "success", result
         assert _committed(project) == {"src/app.txt"}
+
+
+class TestCoachFixPass2:
+    """Parity with GuardKit e0b72800: blob ids computed in-process, inner
+    build records read, and a bound on how long the reads may take."""
+
+    @pytest.mark.parametrize("object_format", ["sha1", "sha256"])
+    def test_git_blob_id_is_what_git_hash_object_says(
+        self, tmp_path: Path, object_format: str
+    ) -> None:
+        from forge.adapters.git.operations import git_blob_id
+
+        repo = tmp_path / object_format
+        repo.mkdir()
+        _git(repo, "init", "-q", f"--object-format={object_format}")
+        for name, data in (
+            ("plain", b"hello\n"),
+            ("crlf", b"one\r\ntwo\r\n"),
+            ("binary", bytes(range(256)) * 3),
+            ("no-newline", b"x"),
+        ):
+            (repo / name).write_bytes(data)
+            said = _git(repo, "hash-object", "--no-filters", "--", name).strip()
+            assert git_blob_id(data, object_format) == said, name
+
+    def test_a_file_that_cannot_be_read_as_a_regular_file_is_skipped(
+        self, tmp_path: Path
+    ) -> None:
+        import os
+
+        from forge.adapters.git.operations import _read_regular_file
+
+        (tmp_path / "file").write_bytes(b"data")
+        (tmp_path / "empty").write_bytes(b"")
+        (tmp_path / "link").symlink_to(tmp_path / "file")
+        os.mkfifo(tmp_path / "fifo")
+        assert _read_regular_file(tmp_path / "file") == b"data"
+        assert _read_regular_file(tmp_path / "empty") is None
+        assert _read_regular_file(tmp_path / "link") is None
+        assert _read_regular_file(tmp_path / "fifo") is None
+        assert _read_regular_file(tmp_path / "gone") is None
+
+    @pytest.mark.parametrize(
+        "record",
+        [
+            ".guardkit/autobuild/TASK-1/player_turn_1.json",
+            ".guardkit/autobuild-private/judge.json",
+            ".guardkit/qav-shadow/queue.jsonl",
+            "conversation_history/session.md",
+            "large_tool_results/out.txt",
+            ".guardkit/memory-query-log.jsonl.1",
+            ".guardkit/bootstrap_state.json",
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_a_copy_of_an_inner_builds_record_is_left_out(
+        self, project: Path, record: str, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        inner = project / ".guardkit" / "worktrees" / "FEAT-1"
+        inner.mkdir(parents=True)
+        _git(inner, "init", "-q", "-b", "main")
+        _write(inner, {record: OLD_RECORD, "src/feature.txt": "the product's own code\n"})
+        _write(
+            project,
+            {
+                "notes/copied.json": OLD_RECORD,
+                "src/feature.txt": "the product's own code\n",
+            },
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        # The inner build's product file is never read, so the outer copy of
+        # it is ordinary work.
+        assert _committed(project) == {"src/feature.txt"}
+        assert "notes/copied.json" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_reads_that_take_too_long_are_left_out_and_the_commit_goes_ahead(
+        self, project: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import time
+
+        from forge.adapters.git import operations
+
+        real = operations._read_regular_file
+
+        def slow(path: Path) -> bytes | None:
+            time.sleep(0.5)
+            return real(path)
+
+        monkeypatch.setattr(operations, "_read_regular_file", slow)
+        monkeypatch.setattr(operations, "RECORD_READ_BOUND_S", 0.2)
+        _write(
+            project,
+            {".guardkit/autobuild/x.json": OLD_RECORD, "notes/copy.json": OLD_RECORD},
+        )
+
+        with caplog.at_level(logging.WARNING):
+            result = await commit_all(project, "the work")
+
+        assert result.status == "success", result
+        assert "did not finish within" in caplog.text
+        assert _committed(project) == {"notes/copy.json"}

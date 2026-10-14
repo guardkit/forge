@@ -59,10 +59,13 @@ Design notes
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import logging
 import os
 import stat
 import subprocess
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable, Sequence
@@ -344,7 +347,7 @@ _EMPTY_BLOBS = frozenset(
     }
 )
 
-#: How many file names one ``git reset`` or ``git hash-object`` is given.
+#: How many file names one ``git reset`` is given.
 _NAMES_PER_COMMAND = 200
 
 
@@ -375,6 +378,154 @@ def _moved_out_of_records(raw: str) -> list[str]:
                 found.append(destination)
         else:
             index += 1
+    return found
+
+
+#: Inside each inner build folder (``.guardkit/worktrees/<id>``), the record
+#: folders that are read. Its product files are never read. The same as
+#: GuardKit's ``_INNER_RECORD_FOLDERS`` (GuardKit e0b72800).
+INNER_RECORD_FOLDERS: tuple[str, ...] = (
+    ".guardkit/autobuild",
+    ".guardkit/autobuild-private",
+    ".guardkit/qav-shadow",
+    "conversation_history",
+    "large_tool_results",
+)
+
+#: How long a commit waits for record files to be read. A read on a stalled
+#: filesystem (a hung network mount) cannot be interrupted, and the planning
+#: writer must never block on it: every other step it takes has a time limit
+#: (GuardKit e0b72800 waits the same 5 seconds).
+RECORD_READ_BOUND_S: float = 5.0
+
+
+def git_blob_id(data: bytes, object_format: str) -> str:
+    """The id git gives a file holding exactly ``data``: the ``sha1`` or
+    ``sha256`` digest of ``b"blob <length>\\0"`` followed by the bytes, as
+    lower-case hex. No line-ending or filter conversion is applied."""
+    digest = hashlib.new(object_format)
+    digest.update(b"blob %d\0" % len(data))
+    digest.update(data)
+    return digest.hexdigest()
+
+
+def _read_regular_file(path: Path) -> bytes | None:
+    """A regular file's bytes, or ``None`` when it is gone, unreadable, empty
+    or not a regular file. A link is never followed, and opening never waits
+    on a pipe. GuardKit replaces records by renaming a temporary file over
+    them, so a file listed a moment ago may be gone: that is never an error."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        handle = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(handle).st_mode):
+            return None
+        chunks: list[bytes] = []
+        while True:
+            chunk = os.read(handle, 1 << 20)
+            if not chunk:
+                break
+            chunks.append(chunk)
+    except OSError:
+        return None
+    finally:
+        os.close(handle)
+    return b"".join(chunks) or None
+
+
+def _inner_build_record_files(root: Path) -> list[Path]:
+    """The record files of each inner build folder under the top-level
+    ``.guardkit/worktrees/``, found by walking :data:`INNER_RECORD_FOLDERS`
+    and the ``.guardkit`` folder's own record files, never following a link.
+    git's own listing stops at an inner build folder, because each is a
+    repository of its own."""
+    worktrees = root / ".guardkit" / "worktrees"
+    if any(p.is_symlink() for p in (root / ".guardkit", worktrees)):
+        return []
+    try:
+        inner_folders = [e for e in os.scandir(worktrees) if e.is_dir(follow_symlinks=False)]
+    except OSError:
+        return []
+    found: list[Path] = []
+    for entry in inner_folders:
+        inner = Path(entry.path)
+        guardkit = inner / ".guardkit"
+        if guardkit.is_symlink():
+            continue
+        for relative in INNER_RECORD_FOLDERS:
+            top = inner / relative
+            if top.is_symlink() or not top.is_dir():
+                continue
+            for folder, _subfolders, names in os.walk(top):
+                found.extend(Path(folder) / name for name in names)
+        try:
+            names = [e.name for e in os.scandir(guardkit) if e.is_file(follow_symlinks=False)]
+        except OSError:
+            continue
+        found.extend(
+            guardkit / name
+            for name in names
+            if name == "bootstrap_state.json" or name.startswith("memory-query-log.jsonl")
+        )
+    return found
+
+
+async def _record_blob_ids(root: Path, listed: list[str], object_format: str) -> set[str]:
+    """The blob id of every non-empty regular file at a record path (as git
+    listed them) and of each inner build folder's records, computed here
+    from the bytes (:func:`git_blob_id`).
+
+    The files are read in a thread of their own, waited for at most
+    :data:`RECORD_READ_BOUND_S`. Files not read by then are left out of the
+    comparison, with one warning, and the thread is left behind."""
+    ids: set[str] = set()
+    progress = {"listed": 0, "read": 0, "finished": False}
+    lock = threading.Lock()
+    loop = asyncio.get_running_loop()
+    finished = asyncio.Event()
+
+    def read_all() -> None:
+        try:
+            paths = {root / name for name in listed if not name.endswith("/")}
+            paths.update(_inner_build_record_files(root))
+            with lock:
+                progress["listed"] = len(paths)
+            for path in sorted(paths):
+                data = _read_regular_file(path)
+                with lock:
+                    if data is not None:
+                        ids.add(git_blob_id(data, object_format))
+                    progress["read"] += 1
+            with lock:
+                progress["finished"] = True
+        finally:
+            try:
+                loop.call_soon_threadsafe(finished.set)
+            except RuntimeError:
+                pass  # the commit stopped waiting and its loop is gone
+
+    threading.Thread(
+        target=read_all, name="forge-commit: reading records", daemon=True
+    ).start()
+    try:
+        await asyncio.wait_for(finished.wait(), timeout=RECORD_READ_BOUND_S)
+    except asyncio.TimeoutError:
+        pass
+    with lock:
+        found = set(ids)
+        done = progress["finished"]
+        unread = progress["listed"] - progress["read"]
+    if not done:
+        logger.warning(
+            "Reading the factory's record files in %s did not finish within "
+            "%.0fs (%s not read); exact copies of those were not looked for in "
+            "this commit.",
+            root,
+            RECORD_READ_BOUND_S,
+            f"{unread} file(s)" if unread > 0 else "the folders could not be listed",
+        )
     return found
 
 
@@ -458,8 +609,10 @@ async def prepare_index(
         e6bd14d2). Records are never committed, so git's copy detection,
         which only looks at what ``HEAD`` or the index holds, cannot see an
         exact copy of one. The record files are listed tracked, untracked and
-        ignored alike, inner build folders are skipped, and each non-empty
-        regular file is hashed with ``git hash-object`` (nothing is written).
+        ignored alike, and each inner build folder's own records are walked
+        (never its product files). Each non-empty regular file's blob id is
+        computed here from its bytes (GuardKit e0b72800), so a record
+        replaced while this runs is skipped, never an error.
         """
         staged_res = await execute(
             command=[
@@ -482,27 +635,19 @@ async def prepare_index(
         )
         if listed.exit_code != 0:
             return listed
-        files: list[str] = []
-        for name in sorted({n for n in (listed.stdout or "").split("\0") if n}):
-            if name.endswith("/"):
-                continue  # a nested repository, never read
-            try:
-                info = os.lstat(os.path.join(cwd, name))
-            except OSError:
-                continue
-            if stat.S_ISREG(info.st_mode) and info.st_size > 0:
-                files.append(name)
-        record_ids: set[str] = set()
-        for start in range(0, len(files), _NAMES_PER_COMMAND):
-            hashed = await execute(
-                command=["git", "hash-object", "--", *files[start : start + _NAMES_PER_COMMAND]],
-                cwd=cwd,
+        shown = await execute(command=["git", "rev-parse", "--show-object-format"], cwd=cwd)
+        object_format = (shown.stdout or "").strip()
+        if shown.exit_code != 0 or object_format not in ("sha1", "sha256"):
+            return shown if shown.exit_code != 0 else ExecuteResult(
+                exit_code=1,
+                stdout="",
+                stderr="git rev-parse named an object format the factory does not know.",
             )
-            if hashed.exit_code != 0:
-                return hashed
-            record_ids.update(
-                line.strip() for line in (hashed.stdout or "").splitlines() if line.strip()
-            )
+        record_ids = await _record_blob_ids(
+            Path(cwd),
+            sorted({n for n in (listed.stdout or "").split("\0") if n}),
+            object_format,
+        )
         return [path for blob, path in staged if blob in record_ids]
 
     try:
@@ -699,6 +844,7 @@ __all__ = [
     "ExecuteResult",
     "PreparedIndex",
     "cleanup_worktree",
+    "git_blob_id",
     "commit_all",
     "prepare_index",
     "prepare_worktree",
