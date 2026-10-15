@@ -1533,21 +1533,48 @@ async def execute_merge_deploy(
     # WHICH JUDGE FILES THE MERGE CHECKED WITH MAIN'S COPIES (15 October 2026,
     # the merge-check design, item 8): the build system's report names them,
     # and the merge-checks record line keeps them, so a press that picks the
-    # join up can say the same. One sentence, added to every ending's detail
-    # in one place (``_settled``). A list of one, so a nested reader can set it.
+    # join up can say the same. Those the target does not have
+    # (``judge_files_not_on_target``) were left out, not checked with main's
+    # version, and are said so (review R4), as the build system's own receipt
+    # says it. At most two sentences, added to every ending's detail in one
+    # place (``_settled``). A list, so a nested reader can set it.
     _main_copies_said: list[str] = []
 
-    def _remember_main_copies(paths: Any) -> None:
-        names = [str(p) for p in (paths or []) if str(p or "").strip()]
-        if not names or _main_copies_said:
+    def _remember_main_copies(paths: Any, not_on_target: Any = None) -> None:
+        from forge.pipeline.merge_check_reading import shown_path
+
+        if _main_copies_said:
             return
-        many = len(names) > 1
-        listed = names[0] if not many else ", ".join(names[:-1]) + " and " + names[-1]
-        _main_copies_said.append(
-            f"The merge used main's {'versions' if many else 'version'} of "
-            f"{listed} and did not run this build's changes to "
-            f"{'them' if many else 'it'}."
-        )
+
+        def names_of(values: Any) -> list[str]:
+            if not isinstance(values, (list, tuple)):
+                return []
+            return [str(p) for p in values if str(p or "").strip()]
+
+        def listed(names: list[str]) -> str:
+            shown = [shown_path(n) for n in names]
+            if len(shown) == 1:
+                return shown[0]
+            return ", ".join(shown[:-1]) + " and " + shown[-1]
+
+        absent = set(names_of(not_on_target))
+        every = names_of(paths)
+        kept = [n for n in every if n not in absent]
+        left_out = [n for n in every if n in absent]
+        if kept:
+            many = len(kept) > 1
+            _main_copies_said.append(
+                f"The merge used main's {'versions' if many else 'version'} of "
+                f"{listed(kept)} and did not run this build's changes to "
+                f"{'them' if many else 'it'}."
+            )
+        if left_out:
+            many = len(left_out) > 1
+            _main_copies_said.append(
+                f"The merge left out {listed(left_out)}, which main does not "
+                f"have, and did not run this build's "
+                f"{'copies of them' if many else 'copy of it'}."
+            )
 
     def _settled(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         """Mark ``outcome`` as an ending where nothing this press started can
@@ -1555,8 +1582,9 @@ async def execute_merge_deploy(
         nonlocal press_settled
         if outcome.failed_step != "record":
             press_settled = True
-        if _main_copies_said and _main_copies_said[0] not in (outcome.detail or ""):
-            outcome.detail = f"{outcome.detail} {_main_copies_said[0]}".strip()
+        for said in _main_copies_said:
+            if said not in (outcome.detail or ""):
+                outcome.detail = f"{outcome.detail} {said}".strip()
         return outcome
     # THE COMMIT THIS BUILD STARTS FROM, off this coordinator's own record,
     # read once and kept (23 September 2026). It is what the project's own
@@ -4630,11 +4658,17 @@ async def execute_merge_deploy(
                         "judged_with_main_copies": list(
                             (report or {}).get("judged_with_main_copies") or []
                         ),
+                        "judge_files_not_on_target": list(
+                            (report or {}).get("judge_files_not_on_target") or []
+                        ),
                     },
                 ):
                     return _replaced_here()
                 merge_checks_ran_here = True
-                _remember_main_copies((report or {}).get("judged_with_main_copies"))
+                _remember_main_copies(
+                    (report or {}).get("judged_with_main_copies"),
+                    (report or {}).get("judge_files_not_on_target"),
+                )
 
                 # Advisory: does the joined tree keep the promises in the feature's
                 # spec digest? Deterministic and never blocking.
@@ -4715,10 +4749,11 @@ async def execute_merge_deploy(
                 # copies is said again, exactly as it was.
                 earlier = _the_recorded_line(STEP_MERGE_CHECKS)
                 if earlier is not None:
+                    said = getattr(earlier, "detail", None)
+                    said = said if isinstance(said, dict) else {}
                     _remember_main_copies(
-                        (getattr(earlier, "detail", None) or {}).get(
-                            "judged_with_main_copies"
-                        )
+                        said.get("judged_with_main_copies"),
+                        said.get("judge_files_not_on_target"),
                     )
             recorded_why = _why_the_recorded_step_failed(STEP_MERGE_CHECKS)
             if recorded_why is not None and not merge_checks_ran_here:

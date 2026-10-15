@@ -4883,3 +4883,101 @@ class TestTheMergeSaysItUsedMainsCopies:
         assert MAIN_COPIES in first.detail
         assert MAIN_COPIES in second.detail
         assert second.detail.count(MAIN_COPIES) == 1
+
+
+# Review R4: a judge file the target does not have was left out, not checked
+# with main's version (GuardKit's ``judge_files_not_on_target``).
+
+LEFT_OUT = (
+    "The merge left out tools/check.sh, which main does not have, and did not "
+    "run this build's copy of it."
+)
+
+
+class _JoinsWithOneLeftOut(_JoinsForReal):
+    """The merge command, reporting one judge restored from main and one the
+    target does not have, which was left out."""
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        said = await super().__call__(**kwargs)
+        if kwargs.get("args", [None])[0] == "check-join":
+            return said
+        report = json.loads(said.stdout_tail)
+        report["judged_with_main_copies"] = ["scripts/check.sh", "tools/check.sh"]
+        report["judge_files_not_on_target"] = ["tools/check.sh"]
+        return GuardKitResult(
+            status=said.status,
+            subcommand=said.subcommand,
+            duration_secs=said.duration_secs,
+            stdout_tail=json.dumps(report),
+            stderr=said.stderr,
+            exit_code=said.exit_code,
+        )
+
+
+class TestAJudgeTheTargetLacksWasLeftOut:
+    @pytest.mark.asyncio
+    async def test_the_outcome_says_left_out_not_mains_version(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=_JoinsWithOneLeftOut())
+        outcome = await _run_executor(deps, repo_root)
+
+        assert MAIN_COPIES in outcome.detail
+        assert LEFT_OUT in outcome.detail
+        assert "version of tools/check.sh" not in outcome.detail
+        assert "versions of scripts/check.sh and tools/check.sh" not in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_only_left_out_judges_say_nothing_about_mains_version(
+        self, config, pool, repo_root
+    ) -> None:
+        class _OnlyLeftOut(_JoinsWithOneLeftOut):
+            async def __call__(self, **kwargs: Any) -> GuardKitResult:
+                said = await super().__call__(**kwargs)
+                if kwargs.get("args", [None])[0] == "check-join":
+                    return said
+                report = json.loads(said.stdout_tail)
+                report["judged_with_main_copies"] = ["tools/check.sh"]
+                return GuardKitResult(
+                    status=said.status,
+                    subcommand=said.subcommand,
+                    duration_secs=said.duration_secs,
+                    stdout_tail=json.dumps(report),
+                    stderr=said.stderr,
+                    exit_code=said.exit_code,
+                )
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=_OnlyLeftOut())
+        outcome = await _run_executor(deps, repo_root)
+
+        assert LEFT_OUT in outcome.detail
+        assert "main's version" not in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_press_keeps_the_difference(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithOneLeftOut(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        recorded = [
+            l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"
+        ]
+        assert recorded[-1]["detail"]["judge_files_not_on_target"] == ["tools/check.sh"]
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        for outcome in (first, second):
+            assert MAIN_COPIES in outcome.detail
+            assert LEFT_OUT in outcome.detail
+            assert outcome.detail.count(LEFT_OUT) == 1
+            assert "version of tools/check.sh" not in outcome.detail
