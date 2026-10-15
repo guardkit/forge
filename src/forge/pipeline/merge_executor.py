@@ -3540,6 +3540,33 @@ async def execute_merge_deploy(
             gate_before_merge=_gate_for_report() if gate_began else None,
         )
 
+    def _nothing_was_published(
+        refused: MergeDeployOutcome, *, store: Any, turn: int
+    ) -> MergeDeployOutcome:
+        """The join was refused at its candidate check: the record says so.
+
+        THE RECORD GETS ITS RESULT (15 October 2026). A press that took the
+        lease and then stopped at the candidate check used to return without
+        writing any result, so its record said neither "published" nor "not
+        published" — only that somebody had held it — and anything that reads
+        an empty result as work still in progress waited on it for good. The
+        joined commit never left this machine, so the result is the same one
+        the other "checked and not sent" endings write: publication pending.
+
+        Only the result is written. The hold is left exactly as the end of
+        the press decides it (a candidate check that did not complete keeps
+        it, and it lapses on its own). A write refused because the record
+        has moved on is a replaced worker, and stops like every other one.
+        """
+        if store is not None and turn and not store.record(
+            build_id=build_id,
+            turn=turn,
+            now=deps.clock(),
+            result=RESULT_PUBLICATION_PENDING,
+        ):
+            return _replaced_here()
+        return refused
+
     def _publication_pending(
         *,
         j_commit: str | None,
@@ -5002,9 +5029,13 @@ async def execute_merge_deploy(
                     expected_preview_tree,
                     j_tree,
                 )
-                return _could_not_check(
-                    "main moved since the preview: previewed tree "
-                    f"{expected_preview_tree}, joined tree {j_tree}"
+                return _nothing_was_published(
+                    _could_not_check(
+                        "main moved since the preview: previewed tree "
+                        f"{expected_preview_tree}, joined tree {j_tree}"
+                    ),
+                    store=store,
+                    turn=turn,
                 )
 
             if store is not None and not store.about_to(
@@ -5023,10 +5054,12 @@ async def execute_merge_deploy(
 
             laid = await _lay_the_tree_out(str(j_commit))
             if laid is not None:
-                return laid
+                return _nothing_was_published(laid, store=store, turn=turn)
             checked_outcome = await _run_the_candidate_check(str(j_commit))
             if checked_outcome is not None:
-                return checked_outcome
+                return _nothing_was_published(
+                    checked_outcome, store=store, turn=turn
+                )
 
             what_was_checked = {
                 "j_commit": j_commit,

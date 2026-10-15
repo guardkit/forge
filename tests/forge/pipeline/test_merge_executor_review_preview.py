@@ -452,6 +452,14 @@ class TestTheTreeThatWasPreviewed:
         assert _git(tmp_path / "origin.git", "rev-parse", "main") == moved
         assert [r.result for r in publisher.reports] == ["candidate-refused"]
         assert _repair_rows(pool) == []
+        # The record says nothing was published (15 October 2026), and the
+        # hold is kept as every candidate refusal keeps it.
+        record = _the_record(pool)
+        assert record is not None and record[1] == "publication pending"
+        assert pool.connection.execute(
+            "SELECT lease_holder FROM publication_records WHERE build_id = ?",
+            (BUILD_ID,),
+        ).fetchone()[0]
 
     @pytest.mark.asyncio
     async def test_the_same_tree_is_checked_as_before(

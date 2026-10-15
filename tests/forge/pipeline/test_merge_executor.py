@@ -4572,6 +4572,108 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert "another worker" in again.detail
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "deploy",
+        [
+            lambda: _FakeDeploy(candidate_outcome="failed"),
+            # FEAT-0A2A, 15 October 2026: the candidate never came up.
+            lambda: _FakeDeploy(
+                candidate_outcome="failed",
+                gate={"verdict": None, "failed_checks": []},
+                candidate_reason="candidate_deploy_failed",
+                candidate_failed_step="deploy_compose",
+            ),
+            lambda: _FakeDeploy(candidate_raises=ValueError("no sidecar")),
+        ],
+        ids=["red-checks", "could-not-be-started", "check-raised"],
+    )
+    async def test_a_candidate_refusal_says_nothing_was_published(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        deploy: Any,
+    ) -> None:
+        """15 October 2026, FEAT-0A2A: a press refused at its candidate check
+        left its record with no result at all, so it read as work still in
+        progress for good. Nothing was sent, so the record says publication
+        pending; the hold is kept exactly as before and lapses on its own."""
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(), deploy=deploy()
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert held.lease_holder is not None
+        again = await _run_executor(deps, repo_root)
+        assert "another worker" in again.detail
+
+    @pytest.mark.asyncio
+    async def test_a_tree_that_cannot_be_laid_out_says_nothing_was_published(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.deploy import candidate_tree
+
+        async def _cannot(repo_root: Any, feature_id: str, sha: str) -> Any:
+            raise candidate_tree.CandidateTreeError(
+                f"git archive {sha} failed: the clone could not be read"
+            )
+
+        monkeypatch.setattr(candidate_tree, "materialise_candidate_tree", _cannot)
+        deps, _publisher, _gk, dp = _deps(config, pool, guardkit=_JoinsForReal())
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        assert "could not be laid out" in outcome.detail
+        assert "candidate_check" not in _legs(dp)
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        # The hold rule is unchanged: a candidate refusal never puts it down.
+        assert held.lease_holder is not None
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_refusal_whose_record_moved_on_stops_as_replaced(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> None:
+        """The result write is conditional on the turn like every other: a
+        worker replaced while its candidate was checked writes nothing."""
+
+        class _ReplacedDuringTheCheck(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") == "candidate_check":
+                    with pool.connection:
+                        pool.connection.execute(
+                            "UPDATE publication_records SET turn = turn + 1 "
+                            "WHERE build_id = ?",
+                            (BUILD_ID,),
+                        )
+                return await super().__call__(**kwargs)
+
+        deps, _publisher, _gk, _dp = _deps(
+            config,
+            pool,
+            guardkit=_JoinsForReal(),
+            deploy=_ReplacedDuringTheCheck(candidate_outcome="failed"),
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused"
+        assert outcome.failed_step == "record"
+        assert _the_hold(pool).result is None
+
+    @pytest.mark.asyncio
     async def test_a_refusal_before_anything_was_dispatched_puts_it_down(
         self,
         config: ForgeConfig,
