@@ -699,3 +699,11 @@ def test_the_guard_agrees_with_the_twelve_plan_retrospective() -> None:
     # plans draw a flag, and nine of the twelve draw one that can stop a run.
     assert flagged_plans == 11
     assert plans_that_can_stop_a_run == 9
+
+
+def test_a_closing_markup_tag_is_not_a_web_address() -> None:
+    from forge.planning.task_traceability import _route_shaped
+
+    found = _route_shaped('<span className="date">{created}</span> <time>{t}</time> GET /api/notes')
+    assert "/span" not in found and "/time" not in found
+    assert "/api/notes" in found

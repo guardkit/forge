@@ -490,9 +490,16 @@ def _quotes_three_consecutive_words(document: str, request_words: Sequence[str])
 
 def _route_shaped(text: str) -> list[str]:
     """Every route-shaped string in ``text``, by the route reader's own rule:
-    a slash-led path longer than three characters with a letter in it."""
+    a slash-led path longer than three characters with a letter in it.
+
+    A closing markup tag (``</span>``, ``</time>``) is not one: the slash right
+    after ``<`` put "/span" and "/time" on FEAT-7F19's card (15 October 2026)."""
     found: list[str] = []
-    for match in _ROUTE_PATH.findall(str(text or "")):
+    source = str(text or "")
+    for hit in _ROUTE_PATH.finditer(source):
+        match = hit.group(0)
+        if hit.start() > 0 and source[hit.start() - 1] == "<":
+            continue
         if len(match) > 3 and re.search(r"[A-Za-z]", match) and match not in found:
             found.append(match)
     return found
