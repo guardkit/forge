@@ -1544,10 +1544,19 @@ async def test_a_name_with_a_line_break_stays_on_its_own_line(config, pool, rule
         ("a\x1b[31mb/check.sh", "a\\x1b[31mb/check.sh"),
         ("a\x7fb/check.sh", "a\\x7fb/check.sh"),
         ("a\x85b/check.sh", "a\\x85b/check.sh"),
-        ("a b/check.sh", "a\\u2028b/check.sh"),
+        ("a\u2028b/check.sh", "a\\u2028b/check.sh"),
+        ("a\u2029b/check.sh", "a\\u2029b/check.sh"),
+        ("a\u202ab/check.sh", "a\\u202ab/check.sh"),
+        ("a\u202eb/check.sh", "a\\u202eb/check.sh"),
+        ("a\u2066b/check.sh", "a\\u2066b/check.sh"),
+        ("a\u2069b/check.sh", "a\\u2069b/check.sh"),
+        ("a\u200bb/check.sh", "a\\u200bb/check.sh"),
+        ("a\u200fb/check.sh", "a\\u200fb/check.sh"),
+        ("a\ufeffb/check.sh", "a\\ufeffb/check.sh"),
+        ("a\u00adb/check.sh", "a\\u00adb/check.sh"),
         ("caf\udce9/check.sh", "caf\\xe9/check.sh"),
         ("plain/check.sh", "plain/check.sh"),
-        ("café/check.sh", "café/check.sh"),
+        ("caf\u00e9/check.sh", "caf\u00e9/check.sh"),
     ],
 )
 def test_a_shown_name_has_no_control_characters_and_no_raw_bytes(name: str, shown: str) -> None:
@@ -1556,3 +1565,24 @@ def test_a_shown_name_has_no_control_characters_and_no_raw_bytes(name: str, show
     assert shown_path(name) == shown
     assert shown_path(shown_path(name)) == shown
     shown_path(name).encode("utf-8")
+    try:
+        from guardkit.orchestrator.merge_environment import shown_path as guardkits
+    except Exception:  # noqa: BLE001 - GuardKit not importable here
+        return
+    assert shown_path(name) == guardkits(name)
+
+
+@pytest.mark.parametrize("card", sorted(CARDS))
+@pytest.mark.asyncio
+async def test_a_right_to_left_override_in_a_name_is_shown_not_obeyed(
+    config, pool, rules, card: str
+) -> None:
+    # Obeyed, the override would make the folder name read backwards.
+    name = "tools/\u202ehs.kcehc/check.sh"
+    words, reading = await CARDS[card](
+        config, pool, trees=_trees(_project()), rules=rules, name_status=f"A\0{name}\0"
+    )
+
+    assert "\u202e" not in words
+    assert "This build adds tools/\\u202ehs.kcehc/check.sh" in words
+    assert [j["path"] for j in reading["judge_files"]] == ["tools/\\u202ehs.kcehc/check.sh"]

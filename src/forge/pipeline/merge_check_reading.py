@@ -44,9 +44,9 @@ the declared commands name.
 from __future__ import annotations
 
 import logging
-import os
 import re
 import tempfile
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Iterable, Sequence
@@ -103,38 +103,45 @@ def guardkit_rules() -> Any | None:
     )
 
 
-#: Characters that would let a name or a sentence start a line of its own, or
-#: hide or restyle text: the C0 and C1 control characters, DEL, and the
-#: Unicode line and paragraph separators.
-_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+#: The control characters with a short name of their own.
 _NAMED_CONTROL = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
-
-
-def _escaped(match: "re.Match[str]") -> str:
-    char = match.group(0)
-    if char in _NAMED_CONTROL:
-        return _NAMED_CONTROL[char]
-    code = ord(char)
-    return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"
 
 
 def shown_path(path: Any) -> str:
     """A file name, or the build system's words, as a person reads them.
 
-    Names are kept byte-exact (``os.fsdecode``, review R2), so a name that is
-    not UTF-8 holds characters no message can carry; those bytes are shown as
-    ``\\xe9``. Every control character, line break and line separator is
-    shown in the same backslash form (``\\n``, ``\\x1b``), so a name can never
-    add a line or words of its own to a card, a record or a sentence (coach
-    review 3). Ordinary text is unchanged, and showing shown text again
-    changes nothing.
+    The same rule as GuardKit's own ``shown_path`` (coach review 3), so the
+    card, the record, the press and the build system's receipt show a name
+    alike:
+
+    * a byte that is not UTF-8 (kept by ``os.fsdecode`` as a lone surrogate,
+      review R2) is shown as ``\\xNN``;
+    * a line break, carriage return or tab as ``\\n``, ``\\r`` or ``\\t``,
+      and any other control character (C0, C1, DEL) as ``\\xNN``;
+    * a line or paragraph separator, an invisible format character (a
+      right-to-left override, a zero-width space, a byte-order mark: Unicode
+      category Cf) or any other lone surrogate as ``\\uNNNN``.
+
+    So a name can never add a line, hide words, or make a card line read in
+    another order. Every other character is unchanged, and showing shown text
+    again changes nothing.
     """
-    text = str(path)
-    try:
-        text = os.fsencode(text).decode("utf-8", "backslashreplace")
-    except (UnicodeError, ValueError):
-        text = text.encode("utf-8", "backslashreplace").decode("utf-8")
-    return _CONTROL.sub(_escaped, text)
+    out: list[str] = []
+    for char in str(path):
+        code = ord(char)
+        if 0xDC80 <= code <= 0xDCFF:
+            out.append(f"\\x{code - 0xDC00:02x}")
+        elif char in _NAMED_CONTROL:
+            out.append(_NAMED_CONTROL[char])
+        else:
+            kind = unicodedata.category(char)
+            if kind == "Cc":
+                out.append(f"\\x{code:02x}")
+            elif kind in ("Zl", "Zp", "Cs", "Cf"):
+                out.append(f"\\u{code:04x}")
+            else:
+                out.append(char)
+    return "".join(out)
 
 
 #: Line breaks of every kind. In a sentence the build system wrote they are
