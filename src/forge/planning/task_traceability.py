@@ -177,6 +177,18 @@ _ALL_CAPABILITIES: tuple[tuple[str, re.Pattern[str]], ...] = (
 _DEFAULT_TEST_ROOTS: tuple[str, ...] = ("tests", "test", "spec", "specs")
 _DOC_FOLDERS: tuple[str, ...] = ("docs", "doc", "documentation")
 
+#: Top-level folders of the operating system's own disk. A slash-led path that
+#: starts with one of these is a file, never a web address: a Keycloak setup
+#: script writing ``/tmp/kcadm-`` and ``/dev/null`` put "TASK-xxx answers at
+#: /tmp/kcadm-" on an approval card on 15 October 2026. A blunt list on
+#: purpose. Names a web application might really use as its own address —
+#: ``home``, ``users``, ``private``, ``root``, ``run`` — are left off it, so
+#: ``/users/created-per-day`` is still read as the web address it is.
+_SYSTEM_FOLDERS: tuple[str, ...] = (
+    "tmp", "dev", "proc", "sys", "etc", "var", "usr", "opt",
+    "bin", "sbin", "lib", "lib64", "mnt", "srv", "nix", "boot",
+)
+
 #: How many consecutive words of the request count as quoting it.
 _QUOTE_WINDOW = 3
 
@@ -492,12 +504,14 @@ def _without(document: str, routes: Sequence[str]) -> str:
 
 
 def _is_a_place_on_disk(path: str, test_roots: Sequence[str]) -> bool:
-    """True when this slash-led string is a file under a test root or a
-    documentation folder, which is a place on disk and not a web address.
+    """True when this slash-led string is a file under a test root, a
+    documentation folder or one of the operating system's own folders, which
+    is a place on disk and not a web address.
 
     The repository declares its test roots as folders — ``tests/health``,
     ``tests/users`` — so the folder they all sit in is what a path is compared
     against: ``/tests/users/test_analytics.py`` is a file, not an endpoint.
+    ``/tmp/kcadm-`` and ``/dev/null`` in a setup script are files too.
     """
     first = path.lstrip("/").split("/", 1)[0].lower()
     roots = {
@@ -505,7 +519,7 @@ def _is_a_place_on_disk(path: str, test_roots: Sequence[str]) -> bool:
         for root in test_roots
         if str(root).strip("/ ")
     }
-    return first in roots or first in _DOC_FOLDERS
+    return first in roots or first in _DOC_FOLDERS or first in _SYSTEM_FOLDERS
 
 
 def review_task_traceability(

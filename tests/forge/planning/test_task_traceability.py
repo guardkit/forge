@@ -122,6 +122,34 @@ def test_a_file_under_a_declared_test_root_is_a_place_on_disk() -> None:
     assert review.findings == []
 
 
+@pytest.mark.parametrize("disk_path", ["/tmp/kcadm-", "/dev/null", "/var/log/app"])
+def test_an_operating_system_folder_is_a_place_on_disk(disk_path: str) -> None:
+    # Found live on 15 October 2026: a Keycloak setup script in a task
+    # document wrote its temporary files to /tmp/kcadm- and its noise to
+    # /dev/null, and the card said the task "answers at /tmp/kcadm-".
+    files = _task(
+        "# Set up the identity server\n\n"
+        "## Implementation Notes\n\n"
+        f"- The setup script writes to {disk_path} while it runs\n"
+    )
+    review = review_task_traceability(files, request_text=REQUEST)
+
+    assert [f.what for f in review.findings if f.flag == CONTRADICTED_PATH] == []
+
+
+def test_an_unnamed_web_address_beside_a_disk_path_is_still_named() -> None:
+    files = _task(
+        "# Set up the identity server\n\n"
+        "## Implementation Notes\n\n"
+        "- The script logs to /dev/null and the service answers at /api/notes\n"
+    )
+    review = review_task_traceability(files, request_text=REQUEST)
+
+    assert [f.what for f in review.findings if f.flag == CONTRADICTED_PATH] == [
+        "/api/notes"
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Question two: does it ask for a capability the request never mentioned?
 # ---------------------------------------------------------------------------
