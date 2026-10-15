@@ -525,7 +525,10 @@ def _is_a_place_on_disk(path: str, test_roots: Sequence[str]) -> bool:
     against: ``/tests/users/test_analytics.py`` is a file, not an endpoint.
     ``/tmp/kcadm-`` and ``/dev/null`` in a setup script are files too.
     """
-    first = path.lstrip("/").split("/", 1)[0].lower()
+    # A shell default such as ``${TMPDIR:-/tmp}/kc-readiness-XXXXXX`` arrives
+    # as ``/tmp}/...``: the closing brace is shell syntax, not part of the
+    # folder name (FEAT-6AC9's card, 15 October 2026).
+    first = path.lstrip("/").split("/", 1)[0].lower().rstrip("}")
     roots = {
         str(root).strip("/ ").lower().split("/", 1)[0]
         for root in test_roots
