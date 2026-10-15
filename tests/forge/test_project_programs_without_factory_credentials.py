@@ -441,6 +441,34 @@ class TestTheHelper:
             "http://p:3128"
         )
 
+    def test_a_candidate_may_name_its_own_compose_project(self, project: Path) -> None:
+        # FEAT-0A2A, 15 October 2026: the fixture's profile names its candidate's
+        # compose project, and refusing that stopped the check before the merge.
+        from forge.deploy.review_preview import IssuedPreviewValues
+        from forge.launch_environment import (
+            ProjectCommandEnvironmentError,
+            build_project_command_env,
+        )
+
+        env = build_project_command_env(
+            project,
+            overlay={"COMPOSE_PROJECT_NAME": "notes-live-cand", "CANDIDATE_PORT": "8961"},
+        )
+        assert env["COMPOSE_PROJECT_NAME"] == "notes-live-cand"
+        # The preview's other names are still refused outside a preview ...
+        for name in ("PREVIEW", "FACTORY_PREVIEW_TOKEN", "FACTORY_PREVIEW_PORT"):
+            with pytest.raises(ProjectCommandEnvironmentError) as refused:
+                build_project_command_env(project, overlay={name: "x"})
+            assert name in str(refused.value)
+        # ... and in a preview the issued compose project cannot be replaced.
+        with pytest.raises(ProjectCommandEnvironmentError) as refused:
+            build_project_command_env(
+                project,
+                issued=IssuedPreviewValues(_issued()),
+                overlay={"COMPOSE_PROJECT_NAME": "notes-live"},
+            )
+        assert "COMPOSE_PROJECT_NAME" in str(refused.value)
+
     def test_a_plain_dictionary_is_not_an_issued_value(self, project: Path) -> None:
         from forge.launch_environment import (
             ProjectCommandEnvironmentError,
