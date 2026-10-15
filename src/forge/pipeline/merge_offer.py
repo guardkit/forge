@@ -2174,7 +2174,7 @@ class MergeOfferService:
                 "reason": f"the reading could not be made ({type(exc).__name__})",
                 "judge_files": [],
                 "config_changed": False,
-                "link_unreadable": [],
+                "listing_unreadable": [],
             }
 
     async def offer(

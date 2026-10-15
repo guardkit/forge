@@ -38,6 +38,7 @@ from tests.forge.pipeline.test_merge_offer import (  # noqa: F401 - fixtures
     CANDIDATE_SHA,
     CANDIDATE_TREE,
     FEATURE_ID,
+    REPO,
     _event,
     _insert_build,
     _offer_rows,
@@ -189,10 +190,38 @@ class Trees:
     def __init__(self, trees: Mapping[str, Mapping[str, tuple[str, str]]]) -> None:
         self.trees = {commit: dict(files) for commit, files in trees.items()}
         self.refuse: set[str] = set()
-        self.refuse_modes_at: set[str] = set()
+        self.refuse_listing_at: set[str] = set()
         self.calls: list[tuple[str, str, bool]] = []
+        self.listed: list[str] = []
         self.hold: asyncio.Event | None = None
         self.entered = asyncio.Event()
+
+    async def list_tree_at_commit(self, repo_path: str, commit: str) -> Any:
+        """``git ls-tree -r -z --full-tree``: every leaf with its mode, type and
+        object id; no content."""
+        import hashlib
+
+        from forge.deploy.candidate_tree import TreeEntry, TreeListing
+
+        self.listed.append(commit)
+        self.entered.set()
+        if self.hold is not None:
+            await self.hold.wait()
+        if commit in self.refuse or commit in self.refuse_listing_at:
+            return TreeListing(refusal=f"the commit {commit[:10]} could not be listed")
+        if commit not in self.trees:
+            return TreeListing(refusal=f"the copy does not have {commit[:10]}")
+        return TreeListing(
+            entries=tuple(
+                TreeEntry(
+                    path=path,
+                    mode=mode,
+                    kind="blob",
+                    object=hashlib.sha1(text.encode()).hexdigest(),
+                )
+                for path, (mode, text) in sorted(self.trees[commit].items())
+            )
+        )
 
     async def read_file_at_commit(
         self,
@@ -208,7 +237,7 @@ class Trees:
         self.entered.set()
         if self.hold is not None:
             await self.hold.wait()
-        if commit in self.refuse or (mode_only and commit in self.refuse_modes_at):
+        if commit in self.refuse:
             return FileAtCommit(refusal=f"the commit {commit[:10]} could not be read")
         if commit not in self.trees:
             return FileAtCommit(refusal=f"the copy does not have {commit[:10]}")
@@ -586,7 +615,7 @@ async def test_10_a_stale_local_main_is_never_read(config, pool, rules) -> None:
     assert "This build changes qa/run.sh" in words
     assert "scripts/check.sh" not in words
     assert reading["declared_at"] == TARGET
-    commits = {commit for commit, _path, _mode in trees.calls}
+    commits = {commit for commit, _path, _mode in trees.calls} | set(trees.listed)
     assert LOCAL_MAIN not in commits
     assert "main" not in commits and "refs/heads/main" not in commits
     assert (TARGET, ".guardkit/config.yaml", False) in trees.calls
@@ -603,8 +632,9 @@ async def test_10_with_a_preview_it_reads_at_the_previews_base(config, pool, rul
     )
 
     assert reading["declared_at"] == PREVIEW_BASE
-    assert {commit for commit, _p, _m in trees.calls} <= {PREVIEW_BASE, CANDIDATE_SHA, JOINED}
-    assert any(commit == JOINED for commit, _p, _m in trees.calls)
+    seen = {commit for commit, _p, _m in trees.calls} | set(trees.listed)
+    assert seen <= {PREVIEW_BASE, CANDIDATE_SHA, JOINED}
+    assert JOINED in trees.listed
 
 
 @pytest.mark.asyncio
@@ -676,19 +706,21 @@ async def test_a_link_the_build_created_is_shown(config, pool, rules, judge) -> 
 
 
 @pytest.mark.asyncio
-async def test_unreadable_link_evidence_is_said_plainly(config, pool, rules) -> None:
+async def test_a_listing_that_cannot_be_read_is_said_plainly(config, pool, rules) -> None:
     trees = _trees(_project())
-    trees.refuse_modes_at.add(CANDIDATE_SHA)
+    trees.refuse_listing_at.add(CANDIDATE_SHA)
 
     words, reading = await _routine_card(
         config, pool, trees=trees, rules=rules, name_status="M\0src/app.txt\0"
     )
 
-    assert (
-        f"The factory could not read whether scripts/check.sh is a symbolic link at "
-        f"{CANDIDATE_SHA[:10]}, so the merge will not be able to check this build."
-    ) in words
-    assert reading["link_unreadable"]
+    assert words.splitlines()[-1] == (
+        f"The files at {CANDIDATE_SHA[:10]} could not be listed here, so this card "
+        "cannot say whether a file the project's declared commands run is a "
+        "symbolic link there."
+    )
+    assert "will not be able to check" not in words
+    assert reading["listing_unreadable"] == [CANDIDATE_SHA]
 
 
 # ---------------------------------------------------------------------------
@@ -801,3 +833,382 @@ def test_the_preview_names_its_joined_ref_only_while_it_has_one(
     found = ReviewPreviewService.joined_ref_for(service, SimpleNamespace(run_id="run-7"))  # type: ignore[arg-type]
 
     assert found == expected
+
+
+# ---------------------------------------------------------------------------
+# Coach review 1: the card uses GuardKit's exact rule on whole-tree listings
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_no_path_is_ever_looked_up_on_its_own(config, pool, rules) -> None:
+    trees = _trees(_project())
+
+    await _routine_card(config, pool, trees=trees, rules=rules, name_status="M\0scripts/check.sh\0")
+
+    # Only the declaration is read; every link decision comes from listings.
+    assert [path for _c, path, _m in trees.calls] == [".guardkit/config.yaml"]
+    assert sorted(set(trees.listed)) == sorted({TARGET, CANDIDATE_SHA})
+
+
+@pytest.mark.asyncio
+async def test_links_are_found_when_the_changes_cannot_be_read(config, pool, rules) -> None:
+    target = _project(**{"scripts/check.sh": ("120000", "../tools/real.sh")})
+    _insert_build(pool)
+    _record_start(pool)
+    recorder = _Recorder()
+    service = _service(config, pool, recorder, trees=_trees(target), rules=rules)
+    service._scope_pass = lambda **_k: ScopeReport(read=False)  # noqa: SLF001
+
+    await service.maybe_offer(_event())
+    words = _approval_words(recorder)
+
+    assert f"scripts/check.sh {LINK_SENTENCE}" in words
+    assert (
+        "Which files this build changed could not be read here, so this card cannot "
+        "say whether it changes a file the project's declared commands run."
+    ) in words
+    assert "Which files run the project's checks on main" not in words
+
+
+@pytest.mark.asyncio
+async def test_an_install_script_that_is_not_executable_still_runs(config, pool, rules) -> None:
+    target = _project(**{"scripts/install.sh": ("100644", "install\n")})
+
+    words, _reading = await _routine_card(
+        config, pool, trees=_trees(target), rules=rules, name_status="M\0scripts/install.sh\0"
+    )
+
+    assert "This build changes scripts/install.sh, which the project's install runs." in words
+
+
+@pytest.mark.asyncio
+async def test_a_judge_matched_only_by_name_is_described_as_named_like_one(config, pool, rules) -> None:
+    target = _project(**{"docs/check.sh": ("100644", "notes\n")})
+
+    words, _reading = await _routine_card(
+        config, pool, trees=_trees(target), rules=rules, name_status="M\0docs/check.sh\0"
+    )
+
+    assert (
+        "This build changes docs/check.sh, a file named like one the project's "
+        "checks run. The merge will check the joined code with main's version of "
+        "that file and will not run this build's changes to it."
+    ) in words
+    assert "docs/check.sh, which runs" not in words
+
+
+# ---------------------------------------------------------------------------
+# Real git, the real commit reader, and (when importable) GuardKit's own rules
+# ---------------------------------------------------------------------------
+
+
+def _git_run(root: Path, *args: str) -> str:
+    import subprocess
+
+    done = subprocess.run(
+        ["git", "-c", "user.email=t@example.invalid", "-c", "user.name=t", *args],
+        cwd=str(root), capture_output=True, text=True, check=True,
+    )
+    return done.stdout.strip()
+
+
+class RealProject:
+    """A real repository at the configured path: main, the build's branch, and
+    optionally the preview's joined commit kept under its ref."""
+
+    def __init__(self, root: Path) -> None:
+        import os
+
+        self.root = root
+        self.os = os
+        _git_run(root, "init", "-q", "-b", "main")
+
+    def write(self, files: Mapping[str, Any]) -> None:
+        for path, value in files.items():
+            where = self.root / path
+            if where.is_symlink() or where.exists():
+                where.unlink()
+            if value is None:
+                continue
+            where.parent.mkdir(parents=True, exist_ok=True)
+            if isinstance(value, tuple) and value[0] == "link":
+                self.os.symlink(value[1], where)
+            elif isinstance(value, bytes):
+                where.write_bytes(value)
+            else:
+                where.write_text(value, encoding="utf-8")
+
+    def commit(self, files: Mapping[str, Any], message: str) -> str:
+        self.write(files)
+        _git_run(self.root, "add", "-A")
+        _git_run(self.root, "commit", "-q", "--allow-empty", "-m", message)
+        return _git_run(self.root, "rev-parse", "HEAD")
+
+    def build(self, main: Mapping[str, Any], changes: Mapping[str, Any]) -> None:
+        self.main = self.commit(main, "main")
+        _git_run(self.root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
+        self.candidate = self.commit(changes, "the build")
+        self.name_status = _git_run(
+            self.root, "diff", "--name-status", "-z", "--no-renames", self.main, self.candidate
+        ) + "\0"
+        _git_run(self.root, "checkout", "-q", "main")
+
+    def join(self) -> str:
+        tree = _git_run(self.root, "merge-tree", "--write-tree", self.main, self.candidate).splitlines()[0]
+        joined = _git_run(
+            self.root, "commit-tree", tree, "-p", self.main, "-p", self.candidate, "-m", "preview"
+        )
+        _git_run(self.root, "update-ref", JOINED, joined)
+        return joined
+
+
+class RealGit:
+    def __init__(self, project: RealProject) -> None:
+        self.project = project
+
+    async def rev_parse(self, ref: str) -> str | None:
+        return _git_run(self.project.root, "rev-parse", ref) or None
+
+    async def fetch_remote_start_point(self, *_a: Any, **_k: Any) -> RemoteStartPoint:
+        return RemoteStartPoint(branch="main", commit=self.project.main)
+
+
+class _RealPreview(_Preview):
+    def __init__(self, project: RealProject) -> None:
+        super().__init__()
+        self.project = project
+
+    async def prepare(self, req: Any) -> _Evidence:
+        self.prepared.append(req)
+        self.project.join()
+        return _Evidence(self.state, self.project.main)
+
+
+async def _real_card(
+    config, pool, rules, project: RealProject, *, preview: bool = False, changes_read: bool = True
+) -> tuple[str, dict[str, Any]]:
+    from forge.adapters.git.planning_runner import WorktreeGitRunner
+
+    _insert_build(pool)
+    _record_start(pool)
+    recorder = _Recorder()
+    reader = WorktreeGitRunner(target_repo_paths={REPO: str(project.root)})
+    service = _service(
+        config, pool, recorder, trees=None, rules=rules,
+        name_status=project.name_status, git=RealGit(project),
+        preview=_RealPreview(project) if preview else None,
+    )
+    service._commit_reader = lambda _repo, _root: reader  # noqa: SLF001
+    if not changes_read:
+        service._scope_pass = lambda **_k: ScopeReport(read=False)  # noqa: SLF001
+    await service.maybe_offer(_event())
+    return _approval_words(recorder), _reading(pool)
+
+
+MAIN_FILES: dict[str, Any] = {
+    ".guardkit/config.yaml": CHECK_AND_INSTALL,
+    "scripts/check.sh": "#!/bin/sh\nrun the checks\n",
+    "scripts/install.sh": "#!/bin/sh\ninstall\n",
+    "src/app.txt": "the product\n",
+}
+
+
+@pytest.fixture()
+def real(repo_root: Path) -> RealProject:
+    return RealProject(repo_root)
+
+
+@pytest.mark.asyncio
+async def test_real_an_added_link_named_like_a_judge_stops_the_merge(config, pool, rules, real) -> None:
+    real.build(MAIN_FILES, {"tools/check.sh": ("link", "../scripts/check.sh")})
+
+    words, _reading = await _real_card(config, pool, rules, real)
+
+    assert f"tools/check.sh {LINK_SENTENCE}" in words
+    assert "The merge will run without it." not in words
+
+
+@pytest.mark.asyncio
+async def test_real_an_existing_link_elsewhere_on_main_stops_the_merge(config, pool, rules, real) -> None:
+    real.build(
+        {**MAIN_FILES, "vendor/x/check.sh": ("link", "../../scripts/check.sh")},
+        {"src/app.txt": "changed\n"},
+    )
+
+    words, _reading = await _real_card(config, pool, rules, real)
+
+    assert f"vendor/x/check.sh {LINK_SENTENCE}" in words
+
+
+@pytest.mark.parametrize(
+    "test_command",
+    ["pytest .", "cd .. && bash scripts/check.sh", "ruff check . && bash scripts/check.sh"],
+)
+@pytest.mark.asyncio
+async def test_real_dot_and_dot_dot_say_nothing_false(config, pool, rules, real, test_command) -> None:
+    declared = f"toolchain:\n  test: {test_command}\n"
+    real.build({**MAIN_FILES, ".guardkit/config.yaml": declared}, {"src/app.txt": "changed\n"})
+
+    words, reading = await _real_card(config, pool, rules, real)
+
+    assert reading["read"] is True
+    assert reading["judge_files"] == []
+    assert "symbolic link" not in words
+    assert "could not" not in words
+
+
+@pytest.mark.asyncio
+async def test_real_a_binary_judge_with_a_preview_says_nothing_false(config, pool, rules, real) -> None:
+    declared = "toolchain:\n  test: java -jar tools/checker.jar\n"
+    real.build(
+        {**MAIN_FILES, ".guardkit/config.yaml": declared, "tools/checker.jar": bytes(range(256)) * 4},
+        {"src/app.txt": "changed\n"},
+    )
+
+    words, reading = await _real_card(config, pool, rules, real, preview=True)
+
+    assert reading["declared_at"] == real.main
+    assert reading["judge_files"] == []
+    assert "symbolic link" not in words
+    assert "could not" not in words
+
+
+@pytest.mark.asyncio
+async def test_real_unreadable_changes_with_mains_judge_a_link(config, pool, rules, real) -> None:
+    real.build(
+        {**MAIN_FILES, "scripts/check.sh": ("link", "../tools/real.sh"), "tools/real.sh": "real\n"},
+        {"tools/real.sh": "exit 0\n"},
+    )
+
+    words, _reading = await _real_card(config, pool, rules, real, changes_read=False)
+
+    assert f"scripts/check.sh {LINK_SENTENCE}" in words
+    assert "Which files this build changed could not be read here" in words
+
+
+@pytest.mark.asyncio
+async def test_real_a_renamed_judge_is_listed_from_the_listings(config, pool, rules, real) -> None:
+    renamed = "toolchain:\n  test: bash scripts/verify.sh\n"
+    real.main = real.commit(MAIN_FILES, "main before the rename")
+    _git_run(real.root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
+    real.candidate = real.commit({"scripts/check.sh": "#!/bin/sh\nrun the checks\nexit 0\n"}, "weakened")
+    _git_run(real.root, "checkout", "-q", "main")
+    _git_run(real.root, "mv", "scripts/check.sh", "scripts/verify.sh")
+    real.main = real.commit({".guardkit/config.yaml": renamed}, "main renames its check")
+    real.name_status = "M\0scripts/check.sh\0"
+
+    words, reading = await _real_card(config, pool, rules, real, preview=True)
+
+    assert "This build changes scripts/verify.sh, which runs the project's checks." in words
+    assert [j["path"] for j in reading["judge_files"]] == ["scripts/verify.sh"]
+
+
+# ---------------------------------------------------------------------------
+# Item 4: the production composition hands the offer a working reader
+# ---------------------------------------------------------------------------
+
+
+def test_the_production_composition_wires_a_working_reader(pool, tmp_path, monkeypatch) -> None:
+    import tests.forge.test_serve_review_preview as boot
+    from forge.adapters.git.planning_runner import WorktreeGitRunner
+    from forge.config.models import ForgeConfig
+    from forge.planning.sidecar_git_runner import SidecarGitRunner
+
+    repo = tmp_path / "plain"
+    repo.mkdir()
+    project = RealProject(repo)
+    sha = project.commit(MAIN_FILES, "main")
+    raw = {
+        "pipeline": {
+            "build_queue_subject": "pipeline.build-queued.team-a",
+            "approved_originators": ["terminal"],
+        },
+        "permissions": {"filesystem": {"allowlist": ["/work"]}},
+        "merge_executor": {"enabled": True},
+        "planning": {
+            "target_repo_paths": {"o/plain": str(repo), "o/boxed": "/srv/boxed"},
+            "sandboxes": {
+                "o/boxed": {
+                    "name": "boxed",
+                    "sidecar_url": "http://127.0.0.1:1",
+                    "runner_url": "http://127.0.0.1:2",
+                }
+            },
+        },
+    }
+    monkeypatch.setattr(boot, "_config", lambda **_k: ForgeConfig.model_validate(raw))
+
+    seen = boot._drive_boot(pool, tmp_path, merge_on=True, preview=None, compose=False, preview_on=False)
+    reader_for = seen["offer"][0]["commit_reader"]
+    plain = reader_for("o/plain", repo)
+    boxed = reader_for("o/boxed", Path("/srv/boxed"))
+
+    assert isinstance(plain, WorktreeGitRunner)
+    assert isinstance(boxed, SidecarGitRunner)
+    declared = asyncio.run(
+        plain.read_file_at_commit(str(repo), sha, ".guardkit/config.yaml", ordinary_file_only=True)
+    )
+    assert declared.ok and declared.found
+    listing = asyncio.run(plain.list_tree_at_commit(str(repo), sha))
+    assert listing.ok
+    assert ("scripts/check.sh", "100644") in {(e.path, e.mode) for e in listing.entries}
+    assert callable(getattr(boxed, "list_tree_at_commit", None))
+
+
+# ---------------------------------------------------------------------------
+# The sandbox's listing route, and the sandbox runner that asks it
+# ---------------------------------------------------------------------------
+
+
+def test_the_sandbox_lists_a_commits_tree_with_modes_and_no_content(tmp_path: Path) -> None:
+    from forge.config.models import ForgeConfig
+    from forge.deploy.candidate_tree import TreeListing
+    from forge.deploy_sidecar.service import process_git_list_tree_at_commit_request
+    from forge.planning.sidecar_git_runner import SidecarGitRunner
+
+    repo = tmp_path / "clone"
+    repo.mkdir()
+    project = RealProject(repo)
+    sha = project.commit(
+        {**MAIN_FILES, "tools/check.sh": ("link", "../scripts/check.sh")}, "main"
+    )
+    config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+            "planning": {"target_repo_paths": {"o/boxed": str(repo)}},
+        }
+    )
+
+    status, body = process_git_list_tree_at_commit_request(
+        {"repo": "o/boxed", "commit": sha}, config=config
+    )
+    assert status == 200
+    listing = TreeListing.from_wire(body)
+    assert listing.ok
+    modes = {e.path: e.mode for e in listing.entries}
+    assert modes["tools/check.sh"] == "120000"
+    assert modes["scripts/check.sh"] == "100644"
+    assert "run the checks" not in json.dumps(body)
+
+    # A commit the clone does not have is an answer with a refusal; a name the
+    # route will not pass to git is refused outright.
+    status, body = process_git_list_tree_at_commit_request(
+        {"repo": "o/boxed", "commit": "0" * 40}, config=config
+    )
+    assert status == 200 and TreeListing.from_wire(body).refusal
+    status, _body = process_git_list_tree_at_commit_request(
+        {"repo": "o/boxed", "commit": "--output=x"}, config=config
+    )
+    assert status == 400
+
+    asked: list[tuple[str, Any]] = []
+
+    def post(url: str, body: Any, timeout: float) -> tuple[int, Any]:
+        asked.append((url, body))
+        return process_git_list_tree_at_commit_request(body, config=config)
+
+    runner = SidecarGitRunner("http://127.0.0.1:1", repo="o/boxed", post=post)
+    listing = asyncio.run(runner.list_tree_at_commit("/not/used", sha))
+    assert listing.ok
+    assert asked == [("http://127.0.0.1:1/git/list-tree-at-commit", {"repo": "o/boxed", "commit": sha})]

@@ -846,6 +846,16 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
             f"{'versions of those files' if many else 'version of that file'} "
             f"and will not run this build's changes to {'them' if many else 'it'}."
         )
+    named_like = paths("changed", "check-named-like")
+    if named_like:
+        many = len(named_like) > 1
+        sentences.append(
+            f"This build changes {_named(named_like)}, "
+            f"{'files' if many else 'a file'} named like one the project's checks "
+            "run. The merge will check the joined code with main's "
+            f"{'versions of those files' if many else 'version of that file'} "
+            f"and will not run this build's changes to {'them' if many else 'it'}."
+        )
     installs = paths("changed", "install")
     if installs:
         many = len(installs) > 1
@@ -874,6 +884,16 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
             f"declared commands run. The merge will run without "
             f"{'them' if many else 'it'}."
         )
+    install_like = paths("changed", "install-named-like")
+    if install_like:
+        many = len(install_like) > 1
+        sentences.append(
+            f"This build changes {_named(install_like)}, "
+            f"{'files' if many else 'a file'} named like one the project's "
+            "install runs. The merge will install with main's "
+            f"{'versions of those files' if many else 'version of that file'} "
+            f"and will not run this build's changes to {'them' if many else 'it'}."
+        )
     lists = paths("changed", "install-list")
     if lists:
         many = len(lists) > 1
@@ -891,17 +911,25 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
             "so the merge will not be able to check this build. Approving will "
             "join it but publish nothing."
         )
-    for unread in reading.get("link_unreadable") or []:
-        if not isinstance(unread, Mapping):
-            continue
-        at = str(unread.get("at") or "")
-        shown = at[:10] if len(at) == 40 and all(c in "0123456789abcdef" for c in at) else at
+    unlisted = [
+        str(at) for at in reading.get("listing_unreadable") or [] if str(at or "").strip()
+    ]
+    if unlisted:
+        shown = [
+            at[:10] if len(at) == 40 and all(c in "0123456789abcdef" for c in at) else at
+            for at in unlisted
+        ]
         sentences.append(
-            f"The factory could not read whether {unread.get('path')} is a "
-            f"symbolic link at {shown}, so the merge will not be able to check "
-            "this build."
+            f"The files at {_named(shown)} could not be listed here, so this card "
+            "cannot say whether a file the project's declared commands run is a "
+            "symbolic link there."
         )
-        break  # one sentence for this case
+    if reading.get("changes_read") is False:
+        sentences.append(
+            "Which files this build changed could not be read here, so this card "
+            "cannot say whether it changes a file the project's declared commands "
+            "run."
+        )
     if reading.get("config_changed"):
         sentences.append(
             "This build also changes .guardkit/config.yaml, where the project "

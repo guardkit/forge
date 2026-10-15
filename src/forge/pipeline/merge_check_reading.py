@@ -21,14 +21,14 @@ before anyone approves:
   path the build's ``name_status`` names, added, deleted and renamed ones
   included. With a preview, a judge file the target renamed is also listed
   when the joined tree's copy of it differs from the target's;
-* **links** are found on their own: every path a declared command's words
-  could name, and every folder on its path, is looked up component by
-  component with the reader's mode answer in the target tree, the candidate
-  tree and the preview's joined tree, and GuardKit's own link rule
-  (``links_on_judge_paths``) decides which of those entries is a link on a
-  judge's path. A link anywhere there means the merge will not verify; a tree
-  that cannot be read is said plainly. Which paths are looked up is a
-  generous list worked out here; whether one counts is GuardKit's answer.
+* **links** are found on their own, with GuardKit's exact merge rule on the
+  same inputs (coach review 1, 15 October 2026): the whole tree of the target
+  commit, the candidate commit and the preview's joined commit is listed
+  (names, modes, types and object ids, never any file's content), and each
+  listing is handed to GuardKit's ``links_on_judge_paths`` with the words
+  ``pin_merge_environment`` pinned, exactly as the merge does. No path is
+  looked up on its own. Link findings never depend on the build's changes. A
+  listing that cannot be read is said in one plain sentence naming the commit.
 
 Nothing here names a language or a stack: the paths are whatever git lists and
 the declared commands name.
@@ -53,9 +53,6 @@ __all__ = [
 #: Where a project declares its commands, relative to its top folder.
 CONFIG_PATH = ".guardkit/config.yaml"
 
-#: The modes a commit's tree gives a file whose content can be compared.
-_BLOB_MODES = frozenset({"100644", "100755"})
-_EXECUTABLE_MODE = "100755"
 
 #: The check time limit handed to GuardKit's pin. It only caps the install's
 #: own time limit, which the card never reads.
@@ -101,39 +98,54 @@ def _not_read(declared_at: str | None, reason: str) -> dict[str, Any]:
         "reason": reason,
         "judge_files": [],
         "config_changed": False,
-        "link_unreadable": [],
+        "listing_unreadable": [],
     }
 
 
-def _paths_to_look_up(words: Sequence[str]) -> list[str]:
-    """Every path a command word could name, and every folder on its path.
-
-    A generous list: each word, the part after its first ``=``, and the
-    pieces of both split on ``,`` and ``:``, each without a leading ``./``.
-    It only decides what is looked up; GuardKit's link rule decides whether
-    an entry found there counts."""
-    keys: list[str] = []
-    for word in words:
-        whole = [str(word)]
-        if "=" in whole[0]:
-            whole.append(whole[0].split("=", 1)[1])
-        pieces = list(whole)
-        for key in whole:
-            pieces.extend(p for p in key.replace(":", ",").split(",") if p)
-        for key in pieces:
-            while key.startswith("./"):
-                key = key[2:]
-            key = key.strip("/")
-            if key and key not in keys:
-                keys.append(key)
-    paths: list[str] = []
+def _match_keys(word: str) -> list[str]:
+    """The names one command word can stand for: the word, the part after its
+    first ``=``, and the pieces of both split on ``,`` and ``:``, each without
+    a leading ``./``. Used for the card's WORDING only (does a word name the
+    file by its path, and is it a whole word); what is a judge file and what
+    is a link is always GuardKit's answer."""
+    whole = [str(word)]
+    if "=" in whole[0]:
+        whole.append(whole[0].split("=", 1)[1])
+    keys = list(whole)
+    for key in whole:
+        keys.extend(piece for piece in key.replace(":", ",").split(",") if piece and piece != key)
+    out: list[str] = []
     for key in keys:
-        parts = [part for part in key.split("/") if part]
-        for end in range(1, len(parts) + 1):
-            path = "/".join(parts[:end])
-            if path not in paths:
-                paths.append(path)
-    return paths
+        while key.startswith("./"):
+            key = key[2:]
+        if key and key not in out:
+            out.append(key)
+    return out
+
+
+def _named_by_path(path: str, words: Sequence[str]) -> bool:
+    """True when some word names ``path`` by its path, not only by its name."""
+    return any(
+        key == path or key.endswith("/" + path)
+        for word in words
+        for key in _match_keys(word)
+    )
+
+
+def _install_runs(path: str, argv: Sequence[str]) -> bool:
+    """True when the install's argument list names ``path`` as a whole word
+    that is the program or one of its plain arguments; False when the file is
+    named only as an option's value (``-r requirements.txt``,
+    ``--requirement=requirements.txt``) or inside a word."""
+    for index, word in enumerate(argv):
+        key = str(word)
+        while key.startswith("./"):
+            key = key[2:]
+        if key != path and not key.endswith("/" + path):
+            continue
+        if index == 0 or not str(argv[index - 1]).startswith("-"):
+            return True
+    return False
 
 
 def _paths_of(changes: Iterable[Any]) -> list[str]:
@@ -160,15 +172,6 @@ def _how(changes: Sequence[Any], path: str) -> str:
                 return "deleted"
             return "changed"
     return "changed"
-
-
-async def _mode(reader: Any, repo_path: str, commit: str, path: str) -> tuple[str | None, str | None]:
-    """``(mode, refusal)`` of one path at one commit. A path that is not
-    there answers ``(None, None)``."""
-    answer = await reader.read_file_at_commit(repo_path, commit, path, mode_only=True)
-    if not answer.ok:
-        return None, str(answer.refusal or "the read was refused")
-    return (str(answer.mode) if answer.mode else None), None
 
 
 async def read_the_merge_check(
@@ -258,92 +261,81 @@ async def _read(
             "pin_problem": str(problem or ""),
             "judge_files": [],
             "config_changed": False,
-            "link_unreadable": [],
+            "listing_unreadable": [],
         }
     words = tuple(getattr(pinned, "judge_words", ()) or ())
     test_words: tuple[str, ...] = ()
     if test_command:
         said, _refusal = rules.judge_words(test_command, through_shell=True)
         test_words = tuple(said or ())
-    if changes is None:
-        return _not_read(declared_at, "the files this build changed could not be read")
+    install_text = str(
+        getattr(getattr(declarations, "toolchain", None), "install", "") or ""
+    )
+    install_argv: tuple[str, ...] = ()
+    if install_text:
+        said, _refusal = rules.judge_words(install_text, through_shell=False)
+        install_argv = tuple(said or ())
 
-    judges: list[dict[str, Any]] = []
-
-    async def role_of(path: str, how: str) -> str:
+    def role_of(path: str) -> str:
         if test_words and rules.judge_files([path], test_words):
-            return "check"
-        at = candidate if how == "added" else declared_at
-        mode, _refusal = await _mode(reader, repo_path, at, path)
-        return "install" if mode == _EXECUTABLE_MODE else "install-list"
+            return "check" if _named_by_path(path, test_words) else "check-named-like"
+        if not _named_by_path(path, install_argv):
+            return "install-named-like"
+        return "install" if _install_runs(path, install_argv) else "install-list"
 
-    # -- the build's changed judge files ------------------------------------
-    paths = _paths_of(changes)
-    for path in rules.judge_files(paths, words) if (paths and words) else []:
-        how = _how(changes, path)
-        judges.append({"path": path, "how": how, "role": await role_of(path, how)})
-
-    # -- links, found on their own, in every tree ----------------------------
-    unreadable: list[dict[str, str]] = []
+    # -- every tree, listed whole, judged by GuardKit's link rule ------------
     trees: list[tuple[str, str]] = [(declared_at, declared_at), (candidate, candidate)]
     if joined:
         trees.append((joined, "the preview's joined commit"))
-    link_paths = _paths_to_look_up(words) if words else []
-    if joined_expected and not joined and link_paths:
-        unreadable.append({"path": link_paths[-1], "at": "the preview's joined commit"})
+    unlisted: list[str] = []
+    if joined_expected and not joined:
+        unlisted.append("the preview's joined commit")
+    listed: dict[str, dict[str, Any]] = {}
     links: list[str] = []
     for commit, shown in trees:
-        entries: dict[str, str] = {}
-        for path in link_paths:
-            mode, refusal = await _mode(reader, repo_path, commit, path)
-            if refusal is not None:
-                if not any(u["path"] == path for u in unreadable):
-                    unreadable.append({"path": path, "at": shown})
+        listing = await reader.list_tree_at_commit(repo_path, commit)
+        if not listing.ok:
+            logger.info("merge card: %s could not be listed (%s)", shown, listing.refusal)
+            unlisted.append(shown)
+            continue
+        entries = {entry.path: entry for entry in listing.entries}
+        listed[commit] = entries
+        if words:
+            modes = {path: entry.mode for path, entry in entries.items()}
+            for path in rules.links_on_judge_paths(modes, words):
+                if path not in links:
+                    links.append(path)
+
+    judges: list[dict[str, Any]] = []
+
+    # -- the build's changed judge files ------------------------------------
+    paths = _paths_of(changes) if changes is not None else []
+    for path in rules.judge_files(paths, words) if (paths and words) else []:
+        judges.append({"path": path, "how": _how(changes or (), path), "role": role_of(path)})
+
+    # -- a judge the target renamed, whose joined copy differs ---------------
+    # The merge restores every file the target's commands name; one whose
+    # joined copy is not the target's carries the build's edits (round 4).
+    mains, joins = listed.get(declared_at), listed.get(joined or "")
+    if words and mains is not None and joins is not None:
+        listed_paths = {j["path"] for j in judges}
+        for path in rules.judge_files(sorted(mains), words):
+            if path in listed_paths or path in links:
                 continue
-            if mode:
-                entries[path] = mode
-        for path in rules.links_on_judge_paths(entries, words) if entries else []:
-            if path not in links:
-                links.append(path)
+            here, there = mains[path], joins.get(path)
+            if there is None or (here.mode, here.object) != (there.mode, there.object):
+                judges.append({"path": path, "how": "changed", "role": role_of(path)})
+
     for path in links:
         judges = [j for j in judges if j["path"] != path]
         judges.append({"path": path, "how": "link", "role": "link"})
 
-    # -- a judge the target renamed, whose joined copy differs ---------------
-    if joined:
-        listed = {j["path"] for j in judges}
-        for path in link_paths:
-            if path in listed or path in links:
-                continue
-            mode, _refusal = await _mode(reader, repo_path, declared_at, path)
-            if mode not in _BLOB_MODES or not rules.judge_files([path], words):
-                continue
-            mains = await reader.read_file_at_commit(repo_path, declared_at, path, raw=True)
-            joins = await reader.read_file_at_commit(repo_path, joined, path, raw=True)
-            if not (mains.ok and joins.ok):
-                unreadable.append({"path": path, "at": "the preview's joined commit"})
-                continue
-            if (mains.found, mains.content) != (joins.found, joins.content):
-                judges.append(
-                    {"path": path, "how": "changed", "role": await role_of(path, "changed")}
-                )
-
-    # The card names the first of these: a file's own path before a bare
-    # word (a program's name such as ``bash``) or a folder on the way to it.
-    every = [u["path"] for u in unreadable]
-
-    def specific_first(item: tuple[int, dict[str, str]]) -> tuple[int, int]:
-        index, entry = item
-        path = entry["path"]
-        leaf = "/" in path and not any(o.startswith(path + "/") for o in every)
-        return (0 if leaf else 1, index)
-
-    unreadable = [entry for _i, entry in sorted(enumerate(unreadable), key=specific_first)]
     return {
         "declared_at": declared_at,
         "read": True,
         "reason": None,
+        "changes_read": changes is not None,
         "judge_files": judges,
         "config_changed": CONFIG_PATH in paths,
-        "link_unreadable": unreadable,
+        "listing_unreadable": unlisted,
     }
