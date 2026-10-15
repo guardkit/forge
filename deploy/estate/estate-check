@@ -1392,7 +1392,10 @@ check_bus_storage() {
         for want in $(jq -r ".streams[].name" /bus/streams/stream-definitions.json); do
             printf "%s\n" "$held" | grep -qx "$want" || missing="$missing stream:$want"
         done
-        for want in $(jq -r ".kv_buckets[].name" /bus/kv/kv-definitions.json); do
+        # A bucket kept in memory (storage "memory", such as jarvis-session) is emptied
+        # whenever the bus restarts, by design, and nothing the coordinator needs lives in
+        # one, so only buckets kept on disk are required (15 October 2026).
+        for want in $(jq -r ".kv_buckets[] | select(.storage != \"memory\") | .name" /bus/kv/kv-definitions.json); do
             printf "%s\n" "$held" | grep -qx "KV_$want" || missing="$missing bucket:$want"
         done
         n_s=$(printf "%s\n" "$held" | grep -c . || true)
@@ -1406,7 +1409,7 @@ check_bus_storage() {
     ' 2>&1 | tail -1)"
     case "${out}" in
         ALL*)
-            ok 8b "the bus's storage is provisioned — ${out#ALL } — every one the bus repository's own definitions name, asked of the bus itself and not of the one-shot's exit code (those scripts exit 0 whatever they print)."
+            ok 8b "the bus's storage is provisioned — ${out#ALL } — every one the bus repository's own definitions name, apart from buckets kept only in memory, which a bus restart empties by design, asked of the bus itself and not of the one-shot's exit code (those scripts exit 0 whatever they print)."
             ;;
         MISSING*)
             fail 8b "the bus is missing storage the bus repository's definitions name: ${out#MISSING }. The coordinator needs its agent-registry bucket and its PIPELINE stream to register at all, which is why the estate provisions the bus before the coordinator starts."
