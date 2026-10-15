@@ -47,6 +47,11 @@ logger = logging.getLogger(__name__)
 #: relays verbatim) so a transport failure is not mistaken for a script failure.
 SIDECAR_TRANSPORT_EXIT_CODE = 1
 
+#: How the step's line begins when the request got NO ANSWER at all (could not
+#: be sent, timed out, or the connection was dropped): the script may still be
+#: running in the sandbox. Every other sidecar sentence is an answer.
+SIDECAR_NO_ANSWER_OPENING = "sidecar unreachable at "
+
 
 class SidecarScriptRunner:
     """A ``_run_script_step``-compatible callable that POSTs to the sidecar.
@@ -187,7 +192,7 @@ class SidecarScriptRunner:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             return (
                 SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar unreachable at {self._base_url}: {exc}",
+                f"{SIDECAR_NO_ANSWER_OPENING}{self._base_url}: {exc}",
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             return (
@@ -283,6 +288,7 @@ def candidate_tree_not_honoured(sent_cwd: object, answer: dict[str, object]) -> 
 
 __all__ = [
     "SidecarScriptRunner",
+    "SIDECAR_NO_ANSWER_OPENING",
     "SIDECAR_TRANSPORT_EXIT_CODE",
     "candidate_tree_not_honoured",
     "names_a_candidate_tree",

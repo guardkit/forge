@@ -1544,13 +1544,19 @@ async def execute_merge_deploy(
     # ``held_turn`` is the turn this press took the lease on; 0 = none.
     press_settled = False
     held_turn = 0
-    # Set when a deploy-stage leg did not report complete, or a candidate
-    # tree's removal was not confirmed done, or a join's working folder's
-    # removal or the retained worktree's retirement got no answer back; never
-    # cleared. A removal or retirement ANSWERED "not done" does not set it:
-    # that is a leftover folder, not running work. The final clean-up counts
-    # too: the hold is decided after it.
+    # Set when a deploy-stage leg got no answer (it raised, or the stage says
+    # a step's request got none), or a candidate tree's removal was not
+    # confirmed done, or a join's working folder's removal or the retained
+    # worktree's retirement got no answer back; never cleared. An ANSWER, of
+    # any outcome, does not set it (15 October 2026): a red or could-not-start
+    # candidate check, a removal or retirement answered "not done", have all
+    # finished. The final clean-up counts too: the hold is decided after it.
     a_leg_did_not_complete = False
+    # Set while a leg's answer says something it started is still standing
+    # (the candidate), and cleared when a teardown answers that it took it
+    # down. A candidate check that passed leaves its candidate standing on
+    # purpose for the promote, so that one answer does not set it.
+    something_is_left_standing = False
 
     # WHICH JUDGE FILES THE MERGE CHECKED WITH MAIN'S COPIES (15 October 2026,
     # the merge-check design, item 8): the build system's report names them,
@@ -1878,9 +1884,9 @@ async def execute_merge_deploy(
         return outcome
 
     async def _dispatch(leg: str, **extra: Any) -> Any:
-        nonlocal a_leg_did_not_complete
+        nonlocal a_leg_did_not_complete, something_is_left_standing
         before = a_leg_did_not_complete
-        # Until it reports complete; a raise leaves it set.
+        # Until it answers; a raise leaves it set.
         a_leg_did_not_complete = True
         result = await deps.deploy_dispatcher(
             repo=repo,
@@ -1895,16 +1901,25 @@ async def execute_merge_deploy(
             task_id=task_id,
             **extra,
         )
-        # Complete, or no stage at all (deploy switched off: nothing ran). A
-        # promote that went live but could not take its candidate down still
-        # says "complete", with the candidate "standing": not complete here.
-        # (The candidate check leaves its candidate standing on purpose.)
-        standing = (getattr(result, "detail", None) or {}).get("candidate") == "standing"
-        if result is None or (
-            getattr(result, "outcome", None) == "complete"
-            and not (standing and leg != "candidate_check")
-        ):
-            a_leg_did_not_complete = before
+        # AN ANSWER, WHATEVER IT SAYS, IS A LEG THAT HAS FINISHED (15 October
+        # 2026, the rule a986459c set for the retained worktree). An ordinary
+        # red candidate check, or one whose candidate could not start, kept
+        # the hold, and the release idle check then waited on a build with
+        # nothing running. ``None`` is no stage at all (deploy switched off:
+        # nothing ran). Two answers still keep the hold: one whose step's
+        # request got no answer (the stage says ``answer_lost``: the script
+        # may still be running in the sandbox), and one saying the candidate
+        # is still standing — until a teardown answers that it is down.
+        detail = (getattr(result, "detail", None) or {}) if result is not None else {}
+        if detail.get("answer_lost"):
+            return result
+        outcome_word = getattr(result, "outcome", None)
+        standing = detail.get("candidate") == "standing"
+        if leg == "candidate_down":
+            something_is_left_standing = not (outcome_word == "complete" and not standing)
+        elif standing and not (leg == "candidate_check" and outcome_word == "complete"):
+            something_is_left_standing = True
+        a_leg_did_not_complete = before
         return result
 
     def _refused_before_merge(
@@ -4396,11 +4411,15 @@ async def execute_merge_deploy(
                             "nothing_was_joined": True,
                         },
                     )
+                    # SETTLED (15 October 2026): no leg was sent, and a
+                    # working folder half made is a folder, not running work.
                     return _nothing_was_published(
-                        _cannot_join(
-                            f"{named} could not be joined onto {target_branch}: "
-                            f"{made.refusal}. Nothing was merged and the branch "
-                            "is kept."
+                        _settled(
+                            _cannot_join(
+                                f"{named} could not be joined onto {target_branch}: "
+                                f"{made.refusal}. Nothing was merged and the "
+                                "branch is kept."
+                            )
                         ),
                         store=store,
                         turn=turn,
@@ -5086,13 +5105,17 @@ async def execute_merge_deploy(
             ):
                 return _replaced_here()
 
+            # SETTLED (15 October 2026): a tree that could not be laid out
+            # sent no leg, and a candidate check that answered has finished.
+            # A leg with no answer, or a candidate still standing, keeps the
+            # hold through the two flags the hold is decided on.
             laid = await _lay_the_tree_out(str(j_commit))
             if laid is not None:
-                return _nothing_was_published(laid, store=store, turn=turn)
+                return _nothing_was_published(_settled(laid), store=store, turn=turn)
             checked_outcome = await _run_the_candidate_check(str(j_commit))
             if checked_outcome is not None:
                 return _nothing_was_published(
-                    checked_outcome, store=store, turn=turn
+                    _settled(checked_outcome), store=store, turn=turn
                 )
 
             what_was_checked = {
@@ -5573,6 +5596,7 @@ async def execute_merge_deploy(
         held_turn
         and press_settled
         and not a_leg_did_not_complete
+        and not something_is_left_standing
         and outcome.failed_step != "record"
     ):
         try:

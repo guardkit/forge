@@ -4548,17 +4548,18 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         [None, {"verdict": None, "failed_checks": []}],
         ids=["red-with-a-verdict", "no-verdict"],
     )
-    async def test_a_candidate_check_that_failed_keeps_it(
+    async def test_an_answered_red_candidate_check_puts_it_down(
         self,
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
         gate: dict[str, Any] | None,
     ) -> None:
-        """The coach's G1, 4 October 2026: a failed candidate check is a
-        deploy-stage leg that did not complete, and the stage may have torn
-        its candidate down (or not) on the way, so the hold is kept whatever
-        verdict came back."""
+        """15 October 2026, replacing the coach's G1 of 4 October: a red
+        candidate check that ANSWERED has finished, whatever verdict came
+        back, and the stage says its candidate was torn down — so the hold is
+        put down, as for a986459c's retained worktree. Keeping it made the
+        release idle check wait on builds with nothing running."""
         deps, _publisher, _gk, _dp = _deps(
             config, pool, guardkit=_JoinsForReal(),
             deploy=_FakeDeploy(candidate_outcome="failed", gate=gate),
@@ -4567,7 +4568,48 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         outcome = await _run_executor(deps, repo_root)
 
         assert outcome.result == "candidate-refused"
-        assert _the_hold(pool).lease_holder is not None
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert held.lease_holder is None
+        again = await _run_executor(deps, repo_root)
+        assert "another worker" not in again.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            # The stage's own words: a step's request got no answer.
+            {"reason": "candidate_deploy_failed", "answer_lost": True},
+            # The candidate's own teardown did not take it down.
+            {"reason": "candidate_failed", "candidate": "standing"},
+        ],
+        ids=["answer-lost", "candidate-still-standing"],
+    )
+    async def test_a_candidate_check_that_may_have_left_something_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        detail: dict[str, Any],
+    ) -> None:
+        class _ACheckThatSays(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                answer = await super().__call__(**kwargs)
+                if kwargs.get("leg") == "candidate_check":
+                    answer.detail = {**answer.detail, **detail}
+                return answer
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(),
+            deploy=_ACheckThatSays(candidate_outcome="failed"),
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert held.lease_holder is not None
         again = await _run_executor(deps, repo_root)
         assert "another worker" in again.detail
 
@@ -4593,23 +4635,27 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
         deploy: Any,
+        request: pytest.FixtureRequest,
     ) -> None:
         """15 October 2026, FEAT-0A2A: a press refused at its candidate check
         left its record with no result at all, so it read as work still in
         progress for good. Nothing was sent, so the record says publication
-        pending; the hold is kept exactly as before and lapses on its own."""
+        pending. The hold: a check that answered (red, or could not start)
+        has finished and puts it down; one that raised may still be running
+        and keeps it."""
         deps, _publisher, _gk, _dp = _deps(
             config, pool, guardkit=_JoinsForReal(), deploy=deploy()
         )
+        kept = request.node.callspec.id == "check-raised"
 
         outcome = await _run_executor(deps, repo_root)
 
         assert outcome.result == "candidate-refused", outcome.detail
         held = _the_hold(pool)
         assert held.result == "publication pending"
-        assert held.lease_holder is not None
+        assert (held.lease_holder is not None) is kept
         again = await _run_executor(deps, repo_root)
-        assert "another worker" in again.detail
+        assert ("another worker" in again.detail) is kept
 
     @pytest.mark.asyncio
     async def test_a_tree_that_cannot_be_laid_out_says_nothing_was_published(
@@ -4636,8 +4682,8 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert "candidate_check" not in _legs(dp)
         held = _the_hold(pool)
         assert held.result == "publication pending"
-        # The hold rule is unchanged: a candidate refusal never puts it down.
-        assert held.lease_holder is not None
+        # 15 October 2026: no leg was sent, so the hold is put down.
+        assert held.lease_holder is None
 
     @pytest.mark.asyncio
     async def test_a_merge_stopped_on_a_conflict_says_nothing_was_published(
@@ -4695,8 +4741,8 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The join's working folder could not be made: nothing was joined,
-        and the record says nothing was published. The hold rule is
-        unchanged: this ending is not a settled one, so the hold is kept."""
+        and the record says nothing was published. No leg was sent, so the
+        hold is put down (15 October 2026; it used to be kept)."""
         from forge.pipeline import merge_executor
         from forge.pipeline.merge_join import JoinOutcome
 
@@ -4712,7 +4758,7 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert "the disk is full" in outcome.detail
         held = _the_hold(pool)
         assert held.result == "publication pending"
-        assert held.lease_holder is not None
+        assert held.lease_holder is None
 
     @pytest.mark.asyncio
     async def test_a_conflict_whose_record_moved_on_stops_as_replaced(

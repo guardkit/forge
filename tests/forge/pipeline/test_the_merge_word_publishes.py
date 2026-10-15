@@ -2103,10 +2103,14 @@ class TestAPromoteWhoseOwnTeardownWasNotAnsweredKeepsTheHold:
     """Codex round 2, R1: the real promote goes live and its live check
     passes, so it says "complete" — but its own candidate teardown was not
     answered, and it says the candidate is still "standing". The final
-    clean-up then succeeds. The hold is kept and a second press is refused."""
+    clean-up's teardown then answers that the candidate is down.
+
+    Changed 15 October 2026: a candidate still standing keeps the hold only
+    until a teardown answers that it is down, so here the hold is put down
+    and a second press is not refused."""
 
     @pytest.mark.asyncio
-    async def test_the_hold_is_kept_and_a_second_press_is_refused(
+    async def test_the_clean_up_teardown_answering_puts_the_hold_down(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -2129,9 +2133,10 @@ class TestAPromoteWhoseOwnTeardownWasNotAnsweredKeepsTheHold:
             assert deploy.promoted.outcome == "complete"
             assert deploy.promoted.detail["candidate"] == "standing"
             assert sidecar.teardowns == 1
-            assert _record(pool).lease_holder is not None
+            assert [c.get("leg") for c in deploy.calls][-1] == "candidate_down"
+            assert _record(pool).lease_holder is None
             again = await _press(deps, repo_root)
-            assert "another worker" in again.detail
+            assert "another worker" not in again.detail
         finally:
             sidecar.close()
 
@@ -2370,3 +2375,57 @@ class TestEverySandboxCleanUpIsGuarded:
         assert removals == []
         assert _record(pool).result == RESULT_PUBLICATION_PENDING
         assert (_record(pool).lease_holder is not None) is kept
+
+
+class TestACandidateLeftStandingKeepsTheHoldUntilATeardownAnswers:
+    """15 October 2026: the promote says the candidate is still standing, and
+    the press's clean-up asks for it to come down. The hold follows what that
+    teardown answers: down puts it down; an answer that it is still standing,
+    or no answer at all, keeps it."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "teardown, kept",
+        [("down", False), ("still-standing", True), ("lost", True)],
+    )
+    async def test_the_teardown_decides(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        teardown: str,
+        kept: bool,
+    ) -> None:
+        from types import SimpleNamespace
+
+        class _APromoteThatLeavesItStanding(_ADeployStepThatSays):
+            async def __call__(self, **kwargs: Any) -> Any:
+                leg = kwargs.get("leg")
+                if leg == "candidate_down":
+                    self.calls.append(kwargs)
+                    if teardown == "lost":
+                        raise ConnectionResetError("the teardown's answer was lost")
+                    if teardown == "still-standing":
+                        return SimpleNamespace(
+                            outcome="failed", verdict=None,
+                            detail={"candidate": "standing"},
+                        )
+                answer = await super().__call__(**kwargs)
+                if leg == "promote":
+                    answer.detail = {**answer.detail, "candidate": "standing"}
+                return answer
+
+        deploy = _APromoteThatLeavesItStanding()
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=deploy,
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert [c.get("leg") for c in deploy.calls][-1] == "candidate_down"
+        assert (_record(pool).lease_holder is not None) is kept
+        assert ("another worker" in (await _press(deps, repo_root)).detail) is kept

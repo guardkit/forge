@@ -596,6 +596,116 @@ class TestCandidateCheck:
 # ---------------------------------------------------------------------------
 
 
+class _ASidecarThatAnswers:
+    """A loopback deploy sidecar for the REAL script runner (15 October 2026).
+
+    ``check`` and ``teardown`` say what the candidate's own steps and its
+    teardown get back: ``"ok"`` (exit 0), ``"red"`` (exit 1, in the script's
+    own words) or ``"lost"`` (the request is taken and the connection is
+    dropped without an answer)."""
+
+    def __init__(self, *, check: str, teardown: str) -> None:
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                body = json.loads(
+                    self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                )
+                down = (body.get("env") or {}).get("CANDIDATE_DOWN") == "1"
+                how = teardown if down else check
+                if how == "lost":
+                    self.close_connection = True
+                    return
+                answer = json.dumps(
+                    {
+                        "exit_code": 0 if how == "ok" else 1,
+                        "output_tail": "ok\n" if how == "ok" else "went red\n",
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        host, port = self.server.server_address[:2]
+        self.url = f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestAFailedCandidateSaysWhatIsLeft:
+    """15 October 2026: a failed candidate check says whether its candidate is
+    still standing and whether a step's request got no answer, so the merge
+    press keeps its hold for those alone and puts it down after an ordinary
+    red check."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "check, gate, teardown, candidate, lost",
+        [
+            ("ok", "fail", "ok", "torn-down", False),
+            ("red", "pass", "ok", "torn-down", False),
+            ("lost", "pass", "ok", "torn-down", True),
+            ("ok", "fail", "lost", "standing", False),
+        ],
+        ids=["red-gate", "red-deploy-step", "deploy-answer-lost", "teardown-lost"],
+    )
+    async def test_the_answer_names_what_is_left(
+        self,
+        repository,
+        runbook_publisher,
+        tmp_path,
+        check: str,
+        gate: str,
+        teardown: str,
+        candidate: str,
+        lost: bool,
+    ) -> None:
+        sidecar = _ASidecarThatAnswers(check=check, teardown=teardown)
+        try:
+            runner = DeployStageRunner(
+                repository=repository,
+                runbook_publisher=runbook_publisher,
+                deploy_publisher=RecordingDeployPublisher(),
+                reservation=InProcessReservationLease(),
+                live_gate_invoker=_Invoker(
+                    candidate=(gate, ALL_GREEN if gate == "pass" else TWO_RED)
+                ),
+                broker_inspector=DryRunBrokerInspector(),
+                config=DeployStageConfig(
+                    execution_surface="sidecar", sidecar_url=sidecar.url
+                ),
+                deploy_record_root=str(tmp_path / "state"),
+                dry_run=False,
+                target_repo="guardkit/api_test",
+                clock=lambda: FIXED,
+            )
+            result = await runner.candidate_check(
+                _profile(),
+                correlation_id="cl",
+                deploy_run_id="run-cl",
+                feature="FEAT-CL",
+                identity_env=WHICH_CANDIDATE,
+            )
+        finally:
+            sidecar.close()
+
+        assert result.outcome == "failed"
+        assert result.detail["candidate"] == candidate
+        assert bool(result.detail.get("answer_lost")) is lost
+
+
 class TestPromote:
     @pytest.mark.asyncio
     async def test_promote_retags_then_tears_down_then_gates_live(

@@ -148,7 +148,7 @@ from forge.deploy.runbook_builder import (
     build_read_only_runbook,
     build_revert_runbook,
 )
-from forge.deploy.sidecar_runner import SidecarScriptRunner
+from forge.deploy.sidecar_runner import SIDECAR_NO_ANSWER_OPENING, SidecarScriptRunner
 from forge.deploy.steps import SecretPresenceResolver, register_deploy_handlers
 from forge.executor.executor import RunbookExecutor, RunResult
 from forge.executor.registry import StepTypeRegistry
@@ -319,6 +319,16 @@ def sidecar_refusal(step: Step | None) -> str | None:
     if len(first_line) > SIDECAR_SENTENCE_CAP:
         return first_line[: SIDECAR_SENTENCE_CAP - 1].rstrip() + "…"
     return first_line
+
+
+def the_answer_was_lost(refusal: str | None) -> bool:
+    """Did the step's request get no answer at all (15 October 2026)?
+
+    Only then may the script still be running in the sandbox. A failed
+    result carries ``"answer_lost": True`` in its detail in that case, so
+    the merge press can keep its hold for that alone.
+    """
+    return bool(refusal) and str(refusal).startswith(SIDECAR_NO_ANSWER_OPENING)
 
 
 @dataclass(frozen=True, slots=True)
@@ -1997,7 +2007,7 @@ class DeployStageRunner:
             failed_step, refusal = self._stopped_at(
                 executed, run_result, default="candidate_deploy"
             )
-            await self._teardown_candidate(
+            torn = await self._teardown_candidate(
                 profile,
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
@@ -2023,6 +2033,8 @@ class DeployStageRunner:
                 failing_verdict=None,
                 events=events,
                 failure_detail=refusal,
+                torn_down=torn,
+                answer_lost=the_answer_was_lost(refusal),
             )
             return failed, summary
 
@@ -2053,7 +2065,7 @@ class DeployStageRunner:
                 "evidence_index_ref": gate.evidence_index_ref or None,
             }
             if verdict != "pass":
-                await self._teardown_candidate(
+                torn = await self._teardown_candidate(
                     profile,
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
@@ -2072,6 +2084,7 @@ class DeployStageRunner:
                     failing_verdict=verdict if verdict is not None else "instrument_fail",
                     events=events,
                     gate_summary_for_words=summary,
+                    torn_down=torn,
                 )
                 return failed, summary
         else:
@@ -2177,8 +2190,16 @@ class DeployStageRunner:
         events: list[str],
         failure_detail: str | None = None,
         gate_summary_for_words: dict[str, Any] | None = None,
+        torn_down: bool = True,
+        answer_lost: bool = False,
     ) -> DeployStageResult:
         """Publish DeployFailed for a candidate that failed its leg (LIVE intact).
+
+        ``torn_down`` is what the candidate's own teardown answered and
+        ``answer_lost`` whether the failed step got no answer at all; both go
+        into the detail (15 October 2026), so the merge press keeps its hold
+        only for a candidate still standing or a step that may still be
+        running.
 
         A loud, honest failure that names the candidate as the cause and records
         that the live name was untouched — recoverable (retry the deploy), never
@@ -2240,7 +2261,12 @@ class DeployStageRunner:
             events=tuple(events),
             deploy_runbook_id=f"deploy-cand-{deploy_run_id}",
             dry_run=self._dry_run,
-            detail={"reason": reason, "failing_verdict": failing_verdict},
+            detail={
+                "reason": reason,
+                "failing_verdict": failing_verdict,
+                "candidate": "torn-down" if torn_down else "standing",
+                **({"answer_lost": True} if answer_lost else {}),
+            },
         )
 
     def _emit_demotion_event(
@@ -2596,8 +2622,12 @@ class DeployStageRunner:
             # tell a deploy step which went red from one the executor refused
             # or STOPPED PART-WAY needs the same line — the executor's own
             # word rides in it — and withholding it leaves that caller
-            # guessing from an exit code.
-            detail={"deploy_output": deploy_step_output(executed)},
+            # guessing from an exit code. A step whose request got no answer
+            # may still be running, and says so (15 October 2026).
+            detail={
+                "deploy_output": deploy_step_output(executed),
+                **({"answer_lost": True} if the_answer_was_lost(refusal) else {}),
+            },
         )
 
     async def _fail_before_start(
