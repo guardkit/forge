@@ -565,15 +565,23 @@ def _remove_worktree(repo: Path, worktree: Path) -> tuple[int, bytes]:
     The record folder is walked from the very handle its back pointer was
     read through, so what was checked is what is changed.
     """
+    # FAIL CLOSED (Codex review, R3, round 5): if either the worktree or its
+    # record folder cannot be reached without following a link, Git is not
+    # asked to remove anything, because Git itself would follow that link.
+    top = _open_folder_strictly(worktree)
+    if top is None:
+        return 1, b"the worktree could not be reached without following a link"
+    os.close(top)
     record = _open_record_folder(repo, worktree)
+    if record is None:
+        return 1, b"its record folder could not be reached and checked without following a link"
     _make_owner_writable(worktree)
-    if record is not None:
-        try:
-            _widen_by_handle(record)
-        except (OSError, RecursionError):
-            pass
-        finally:
-            os.close(record)
+    try:
+        _widen_by_handle(record)
+    except (OSError, RecursionError):
+        pass
+    finally:
+        os.close(record)
     return _git(repo, "worktree", "remove", "--force", str(worktree))
 
 

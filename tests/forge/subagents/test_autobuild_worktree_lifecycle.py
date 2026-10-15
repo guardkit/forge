@@ -733,3 +733,52 @@ def test_gits_record_folders_swapped_for_a_link_to_the_users_own_copy_are_not_fo
         for root, _dirs, names in os.walk(outside)
         for name in names
     } == files
+
+
+def test_gits_record_folders_swapped_for_a_link_to_a_writable_copy_are_not_removed(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R3, round 5: the same swap as above, but the outside copy
+    is writable, so only refusing to call Git at all keeps it intact."""
+    import shutil
+
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    records = repo / ".git" / "worktrees"
+    outside = tmp_path / "outside-records"
+    shutil.copytree(records, outside, symlinks=True)
+    files = {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    }
+    real_inspect = lifecycle.inspect_autobuild_worktree
+
+    def inspect_then_swap(**kwargs: Any) -> dict[str, Any]:
+        answer = real_inspect(**kwargs)
+        records.rename(repo / ".git" / "worktrees-moved")
+        records.symlink_to(outside, target_is_directory=True)
+        return answer
+
+    monkeypatch.setattr(lifecycle, "inspect_autobuild_worktree", inspect_then_swap)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    # Refused before Git is asked: Git 2.43 happens to refuse too (exit 128),
+    # but the boundary must not depend on that.
+    assert "without following a link" in result["detail"], result
+    assert result["status"] == "kept", result
+    assert {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    } == files
+    assert inner.exists()
