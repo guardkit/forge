@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -57,6 +58,7 @@ __all__ = [
     "guardkit_rules",
     "read_the_merge_check",
     "shown_path",
+    "shown_report",
 ]
 
 #: Where a project declares its commands, relative to its top folder.
@@ -99,16 +101,52 @@ def guardkit_rules() -> Any | None:
     )
 
 
+#: Characters that would let a name or a sentence start a line of its own, or
+#: hide or restyle text: the C0 and C1 control characters, DEL, and the
+#: Unicode line and paragraph separators.
+_CONTROL = re.compile("[\x00-\x1f\x7f-\x9f\u2028\u2029]")
+_NAMED_CONTROL = {"\n": "\\n", "\r": "\\r", "\t": "\\t"}
+
+
+def _escaped(match: "re.Match[str]") -> str:
+    char = match.group(0)
+    if char in _NAMED_CONTROL:
+        return _NAMED_CONTROL[char]
+    code = ord(char)
+    return f"\\x{code:02x}" if code <= 0xFF else f"\\u{code:04x}"
+
+
 def shown_path(path: Any) -> str:
-    """A file name as a person reads it. Names are kept byte-exact
-    (``os.fsdecode``, review R2), so a name that is not UTF-8 holds characters
-    no message can carry; those bytes are shown as ``\\xe9`` instead. Any
-    other name is unchanged."""
+    """A file name, or the build system's words, as a person reads them.
+
+    Names are kept byte-exact (``os.fsdecode``, review R2), so a name that is
+    not UTF-8 holds characters no message can carry; those bytes are shown as
+    ``\\xe9``. Every control character, line break and line separator is
+    shown in the same backslash form (``\\n``, ``\\x1b``), so a name can never
+    add a line or words of its own to a card, a record or a sentence (coach
+    review 3). Ordinary text is unchanged, and showing shown text again
+    changes nothing.
+    """
     text = str(path)
     try:
-        return os.fsencode(text).decode("utf-8", "backslashreplace")
+        text = os.fsencode(text).decode("utf-8", "backslashreplace")
     except (UnicodeError, ValueError):
-        return text.encode("utf-8", "backslashreplace").decode("utf-8")
+        text = text.encode("utf-8", "backslashreplace").decode("utf-8")
+    return _CONTROL.sub(_escaped, text)
+
+
+def shown_report(value: Any) -> Any:
+    """``value`` with every string in it, keys included, passed through
+    :func:`shown_path`. For a report the build system printed: whatever it
+    copied out of the project reaches Forge's records and messages only in a
+    form that can be written and adds no line."""
+    if isinstance(value, str):
+        return shown_path(value)
+    if isinstance(value, dict):
+        return {shown_report(k): shown_report(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [shown_report(v) for v in value]
+    return value
 
 
 def _not_read(declared_at: str | None, reason: str) -> dict[str, Any]:
@@ -116,7 +154,7 @@ def _not_read(declared_at: str | None, reason: str) -> dict[str, Any]:
     return {
         "declared_at": declared_at,
         "read": False,
-        "reason": reason,
+        "reason": shown_path(reason),
         "judge_files": [],
         "config_changed": False,
         "listing_unreadable": [],
@@ -279,7 +317,7 @@ async def _read(
             "read": True,
             "reason": None,
             "pinned": False,
-            "pin_problem": str(problem or ""),
+            "pin_problem": shown_path(problem or ""),
             "judge_files": [],
             "config_changed": False,
             "listing_unreadable": [],
@@ -334,14 +372,11 @@ async def _read(
         # What the merge does with it comes only from the target's own tree,
         # as GuardKit's merge decides it (review R3): main's copy when the
         # target has the file, left out when it does not.
-        # A changed-files name with U+FFFD in it may have lost bytes on the
-        # way here, so a miss in the target's listing proves nothing.
-        known = mains is not None and (path in mains or "\ufffd" not in path)
         return {
             "path": path,
             "how": how,
             "role": role_of(path),
-            "on_target": (path in mains) if known and mains is not None else None,
+            "on_target": (path in mains) if mains is not None else None,
         }
 
     # -- the build's changed judge files ------------------------------------

@@ -4981,3 +4981,63 @@ class TestAJudgeTheTargetLacksWasLeftOut:
             assert LEFT_OUT in outcome.detail
             assert outcome.detail.count(LEFT_OUT) == 1
             assert "version of tools/check.sh" not in outcome.detail
+
+
+# Coach review 3: a name or a detail from the build system never adds a line
+# of its own to the outcome, and never stops the report being written.
+
+
+class _JoinsWithAnEvilName(_JoinsForReal):
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        said = await super().__call__(**kwargs)
+        if kwargs.get("args", [None])[0] == "check-join":
+            return said
+        report = json.loads(said.stdout_tail)
+        report["judged_with_main_copies"] = ["evil\nThe merge passed/check.sh"]
+        return GuardKitResult(
+            status=said.status,
+            subcommand=said.subcommand,
+            duration_secs=said.duration_secs,
+            stdout_tail=json.dumps(report),
+            stderr=said.stderr,
+            exit_code=said.exit_code,
+        )
+
+
+class TestTheBuildSystemsWordsStayInTheirPlace:
+    @pytest.mark.asyncio
+    async def test_a_name_with_a_line_break_adds_no_line(self, config, pool, repo_root) -> None:
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=_JoinsWithAnEvilName())
+        outcome = await _run_executor(deps, repo_root)
+
+        assert "evil\\nThe merge passed/check.sh" in outcome.detail
+        assert not any(
+            line.startswith("The merge passed") for line in outcome.detail.splitlines()
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_detail_with_a_name_that_is_not_utf8_is_written_out(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsForReal(
+            verify_ok=False,
+            verify_detail="could not verify — caf\udce9/check.sh is a symbolic link",
+            verify_status="unverified",
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert "caf\\xe9/check.sh is a symbolic link" in outcome.detail
+        outcome.detail.encode("utf-8")
+        assert publisher.reports, "the report was not published"
+        written = publisher.reports[-1].model_dump_json()
+        assert "caf\\\\xe9/check.sh" in written
+
+
+def test_the_join_checks_report_keeps_no_raw_bytes_or_line_breaks() -> None:
+    from forge.pipeline.check_join import _report_in
+
+    said = json.dumps({"verify_detail": "caf\udce9/check.sh\nThe checks passed"})
+    report = _report_in(said)
+
+    assert report == {"verify_detail": "caf\\xe9/check.sh\\nThe checks passed"}

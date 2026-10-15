@@ -536,7 +536,20 @@ class MergeExecutorDeps:
 
 
 def _parse_merge_report(result: Any) -> dict[str, Any] | None:
-    """Extract the merge verb's ``--json`` report from stdout_tail/artefacts."""
+    """Extract the merge verb's ``--json`` report from stdout_tail/artefacts.
+
+    Every string in it is shown as a person reads it (coach review 3, 15
+    October 2026): a file name the report carries may hold a line break, a
+    control character or a byte that is not UTF-8, and none of those may add
+    a line to the outcome or stop it being written.
+    """
+    from forge.pipeline.merge_check_reading import shown_report
+
+    parsed = _parse_merge_report_as_printed(result)
+    return shown_report(parsed) if parsed is not None else None
+
+
+def _parse_merge_report_as_printed(result: Any) -> dict[str, Any] | None:
     stdout_tail = getattr(result, "stdout_tail", "") or ""
     start = stdout_tail.find("{")
     end = stdout_tail.rfind("}")
@@ -601,10 +614,12 @@ def _last_sentence(text: str | None, limit: int = 300) -> str:
     """
     if not text:
         return ""
+    from forge.pipeline.merge_check_reading import shown_path
+
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     if not lines:
         return ""
-    last = lines[-1]
+    last = shown_path(lines[-1])
     if len(last) <= limit:
         return last
     cut = last[-limit:]
