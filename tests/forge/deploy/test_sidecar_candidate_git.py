@@ -131,6 +131,8 @@ class TestTheTwoHalvesOfTheSeamAgree:
         with pytest.raises(CandidateTreeError) as raised:
             await git.materialise_candidate_tree(FEATURE_ID, "b" * 40)
         assert "git archive" in str(raised.value)
+        # The sandbox refused it in its own words: an answer (15 October 2026).
+        assert raised.value.answered is True
 
     @pytest.mark.asyncio
     async def test_no_path_from_this_side_reaches_git_in_there(
@@ -264,7 +266,8 @@ class TestASidecarThatCannotBeReached:
         assert await git.rev_parse("main") is None
         assert await git.is_ancestor("main", "main") is None
         assert await git.ensure_candidate_trees_excluded() is None
-        assert await git.remove_candidate_tree(FEATURE_ID) is False
+        # No answer at all is None, not False (15 October 2026).
+        assert await git.remove_candidate_tree(FEATURE_ID) is None
         unread = await git.read_file_at_commit("main", "deploy/profile.yaml")
         assert unread.ok is False and "127.0.0.1:1" in str(unread.refusal)
 
@@ -305,6 +308,8 @@ class TestASidecarThatCannotBeReached:
         with pytest.raises(CandidateTreeError) as raised:
             await self._unreachable().materialise_candidate_tree(FEATURE_ID, "a" * 40)
         assert "127.0.0.1:1" in str(raised.value)
+        # No answer came back: the tree may still be being written.
+        assert raised.value.answered is False
 
     def test_it_refuses_to_be_built_without_the_repositorys_key(self) -> None:
         with pytest.raises(ValueError):
@@ -363,3 +368,95 @@ class TestRetainedAutobuildWorktreeLifecycle:
         assert answer["ok"] is False
         assert "configured autobuild worktree" in answer["detail"]
         assert (outside / "keep").is_file()
+
+
+
+class _ASidecarThatAnswersWith:
+    """A loopback server that answers every request with ``status`` and
+    ``body``, whatever was asked (15 October 2026, Codex R3)."""
+
+    def __init__(self, status: int, body: object) -> None:
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                answer = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        host, port = self.server.server_address[:2]
+        self.git = SidecarCandidateGit(f"http://{host}:{port}", repo=REPO)
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
+    """15 October 2026, Codex R3: a reply that is a JSON object but carries no
+    result of the operation (``{}`` on a 200, or a refusal with no sentence)
+    says nothing about whether the operation happened, so it is read as no
+    answer. A refusal in the sidecar's own words is still an answer."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, body",
+        [(200, {}), (200, {"status": "maybe"}), (400, {}), (200, [])],
+        ids=["empty-200", "unknown-status", "refusal-with-no-sentence", "not-an-object"],
+    )
+    async def test_malformed_replies(self, status: int, body: object) -> None:
+        sidecar = _ASidecarThatAnswersWith(status, body)
+        try:
+            git = sidecar.git
+            made = await git.add_working_folder(
+                "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+            )
+            assert made.ok is False and made.answered is False
+            assert await git.remove_working_folder("/x/integration-FEAT-SG1") is None
+            assert await git.remove_candidate_tree(FEATURE_ID) is None
+            with pytest.raises(CandidateTreeError) as raised:
+                await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
+            assert raised.value.answered is False
+        finally:
+            sidecar.close()
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_in_the_sidecars_own_words_is_an_answer(self) -> None:
+        sidecar = _ASidecarThatAnswersWith(400, {"error": "that branch already exists"})
+        try:
+            git = sidecar.git
+            made = await git.add_working_folder(
+                "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+            )
+            assert made.ok is False and made.answered is True
+            assert await git.remove_working_folder("/x/integration-FEAT-SG1") is False
+            assert await git.remove_candidate_tree(FEATURE_ID) is False
+            with pytest.raises(CandidateTreeError) as raised:
+                await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
+            assert raised.value.answered is True
+        finally:
+            sidecar.close()
+
+    @pytest.mark.asyncio
+    async def test_answered_operations_read_as_before(self) -> None:
+        sidecar = _ASidecarThatAnswersWith(200, {"status": "failed", "removed": False})
+        try:
+            git = sidecar.git
+            made = await git.add_working_folder(
+                "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+            )
+            assert made.ok is False and made.answered is True
+            assert await git.remove_working_folder("/x/integration-FEAT-SG1") is False
+            assert await git.remove_candidate_tree(FEATURE_ID) is False
+        finally:
+            sidecar.close()

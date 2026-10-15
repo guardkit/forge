@@ -116,7 +116,16 @@ CANDIDATE_TREES_EXCLUDE_LINE: str = ".forge-candidates/"
 
 
 class CandidateTreeError(RuntimeError):
-    """The candidate's tree could not be laid out, excluded, or read."""
+    """The candidate's tree could not be laid out, excluded, or read.
+
+    ``answered`` (15 October 2026) is False when the venue gave no answer at
+    all, so the tree may still be being written; the merge press keeps its
+    hold for that alone. A failure the venue reported is an answer.
+    """
+
+    def __init__(self, *args: object, answered: bool = True) -> None:
+        super().__init__(*args)
+        self.answered = answered
 
 
 def candidate_trees_root(repo_root: Path | str) -> Path:
@@ -1310,8 +1319,9 @@ class CandidateGit(Protocol):
 
     async def remove_candidate_tree(
         self, feature_id: str, path: str | None = None
-    ) -> bool:
-        """Remove the laid-out tree. Never raises; ``False`` when it could not."""
+    ) -> bool | None:
+        """Remove the laid-out tree. Never raises; ``False`` when the venue
+        answered that it could not, ``None`` when no answer came back."""
 
     async def add_working_folder(
         self, leaf: str, branch: str, base_ref: str

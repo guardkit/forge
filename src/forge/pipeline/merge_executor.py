@@ -2056,7 +2056,10 @@ async def execute_merge_deploy(
         removed: bool | None = None
         if tree_path is not None:
             removed = await git.remove_candidate_tree(feature_id, str(tree_path))
-            if not removed:
+            # Only a removal with no answer may still be running; one the
+            # venue answered "not removed" is a leftover folder (15 October
+            # 2026).
+            if removed is None:
                 a_leg_did_not_complete = True
             if removed:
                 logger.info(
@@ -2213,10 +2216,11 @@ async def execute_merge_deploy(
             if not gate["candidate_tree"]:
                 gate["candidate_tree"] = laid_out.tree
         except CandidateTreeError as exc:
-            # A lay-out whose answer was lost comes back as this error too, and
-            # it may still be writing the tree in the sandbox: keep the hold,
-            # as :func:`_the_scripts_at` does (15 October 2026).
-            a_leg_did_not_complete = True
+            # A lay-out whose answer was lost may still be writing the tree in
+            # the sandbox: keep the hold. One the venue refused in its own
+            # words has finished (15 October 2026).
+            if not exc.answered:
+                a_leg_did_not_complete = True
             _write_receipt(
                 "merge_deploy_candidate.json",
                 {
@@ -2260,9 +2264,10 @@ async def execute_merge_deploy(
             await git.ensure_candidate_trees_excluded()
             laid_out = await git.materialise_candidate_tree(feature_id, wanted)
         except CandidateTreeError as exc:
-            # A lay-out whose answer was lost comes back as this error too, and
-            # it may still be writing the tree in the sandbox: keep the hold.
-            a_leg_did_not_complete = True
+            # A lay-out whose answer was lost may still be writing the tree in
+            # the sandbox: keep the hold. A refusal has finished.
+            if not exc.answered:
+                a_leg_did_not_complete = True
             return None, (
                 f"the tree of {wanted[:10]} could not be laid out to run the "
                 f"project's own steps from ({exc})"
@@ -3836,7 +3841,7 @@ async def execute_merge_deploy(
         if candidate_standing:
             await _tear_down_candidate()
         if tree_path is not None:
-            if not await git.remove_candidate_tree(feature_id, str(tree_path)):
+            if await git.remove_candidate_tree(feature_id, str(tree_path)) is None:
                 a_leg_did_not_complete = True
             tree_path = None
             tree_commit = None

@@ -2178,7 +2178,8 @@ class _ASurfaceWhoseCleanUpsSay:
     """This container's git, except for the clean-up answers a test names:
     ``folder`` for a join's working-folder removal (``"false"`` or
     ``"raises"``), ``retired`` for the retained worktree's retirement status,
-    and ``tree_removals`` for the first candidate-tree removals, in order."""
+    and ``tree_removals`` for the first candidate-tree removals, in order
+    (``None`` is a removal whose answer was lost)."""
 
     def __new__(cls, repo_root: Path, **says: Any) -> Any:
         from forge.deploy.candidate_tree import InContainerCandidateGit
@@ -2210,7 +2211,7 @@ class _ASurfaceWhoseCleanUpsSay:
             async def remove_candidate_tree(
                 self, feature_id: str, path: str | None = None
             ) -> bool:
-                queued = says.get("tree_removals") or []
+                queued = says.get("tree_removals")
                 if queued:
                     return queued.pop(0)
                 return await super().remove_candidate_tree(feature_id, path)
@@ -2317,19 +2318,28 @@ class TestEverySandboxCleanUpIsGuarded:
         assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "removed, kept", [(None, True), (False, False)], ids=["lost", "answered"]
+    )
     async def test_a_tree_not_removed_before_another_attempt_keeps_the_hold(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
+        removed: bool | None,
+        kept: bool,
     ) -> None:
+        """Between attempts the laid-out tree is removed. With no answer it may
+        still be being removed, and the hold is kept; answered "not removed"
+        it is a leftover folder, and the hold is put down (15 October 2026,
+        Codex R1). The project names its candidate, so nothing else holds."""
         landed: list[str] = []
 
         def another_hand(_request: dict[str, Any]) -> None:
             if not landed:
                 landed.append(_somebody_else_lands_work(repo_root, "between"))
 
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on,
             pool,
             publisher=_APublisherThatSays(
@@ -2337,7 +2347,7 @@ class TestEverySandboxCleanUpIsGuarded:
                 before_answering=another_hand,
             ),
         )
-        removals = [False]
+        removals = [removed]
         deps = self._with_surface(
             deps, _ASurfaceWhoseCleanUpsSay(repo_root, tree_removals=removals)
         )
@@ -2345,20 +2355,22 @@ class TestEverySandboxCleanUpIsGuarded:
         outcome = await _press(deps, repo_root)
 
         assert outcome.result == "published-deployment-pending", outcome.detail
-        assert removals == []  # the between-attempts removal said False
-        assert _record(pool).lease_holder is not None
-        assert "another worker" in (await _press(deps, repo_root)).detail
+        assert removals == []  # the between-attempts removal was the one asked
+        assert (_record(pool).lease_holder is not None) is kept
+        assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "tree_removed, kept", [(False, True), (True, False)], ids=["lost", "answered"]
+        "tree_removed, kept",
+        [(None, True), (False, False), (True, False)],
+        ids=["lost", "answered-not-removed", "answered"],
     )
     async def test_main_moving_since_the_preview_keeps_the_hold_only_after_an_unconfirmed_clean_up(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
-        tree_removed: bool,
+        tree_removed: bool | None,
         kept: bool,
     ) -> None:
         """15 October 2026, FEAT-A9DA: the refusal for a main that moved since

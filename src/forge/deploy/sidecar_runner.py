@@ -39,6 +39,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from forge.deploy.candidate_tree import CANDIDATE_TREES_DIRNAME
+from forge.executor.shell_steps import TimedOut
 
 logger = logging.getLogger(__name__)
 
@@ -69,7 +70,9 @@ class NoAnswer(tuple):
 
 
 def no_answer_came_back(answer: object) -> bool:
-    """Is ``answer`` a runner's answer saying no answer came back?"""
+    """Is ``answer`` a runner's answer saying no answer came back — or that
+    the script was stopped at its time limit, which is read the same way
+    (:class:`forge.executor.shell_steps.TimedOut`)?"""
     return getattr(answer, "answer_lost", False) is True
 
 
@@ -230,13 +233,18 @@ class SidecarScriptRunner:
             return (SIDECAR_TRANSPORT_EXIT_CODE, f"[{word}] {sentence}")
         exit_code = parsed.get("exit_code")
         output = parsed.get("output_tail", "")
+        # The far side stopped the script at its time limit (15 October 2026).
+        timed_out = parsed.get("timed_out") is True
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):
             return NoAnswer(f"sidecar returned a non-integer exit_code: {exit_code!r}")
         not_honoured = candidate_tree_not_honoured(cwd, parsed)
         if not_honoured is not None:
             logger.error("sidecar script runner: %s", not_honoured)
             return (SIDECAR_TRANSPORT_EXIT_CODE, not_honoured)
-        return (exit_code, output if isinstance(output, str) else str(output))
+        output = output if isinstance(output, str) else str(output)
+        if timed_out:
+            return TimedOut(exit_code, output)
+        return (exit_code, output)
 
     @staticmethod
     def _read_error_body(exc: urllib.error.HTTPError) -> str:

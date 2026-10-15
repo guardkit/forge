@@ -46,6 +46,27 @@ _TIMEOUT_EXIT_CODE = 124
 _TRUNCATION_MARKER = "\n... [OUTPUT TRUNCATED] ...\n"
 
 
+class TimedOut(tuple):
+    """``(exit code, output)`` of a script stopped at its time limit.
+
+    15 October 2026. Only the script itself is stopped; anything it started
+    may still be running, which no exit code can say. So the answer says it
+    in a field of its own, read the way a request with no answer is read
+    (``answer_lost``): the merge press keeps its hold for it. It unpacks like
+    every runner's ``(exit_code, output)``, so a caller that does not ask is
+    unchanged.
+    """
+
+    answer_lost = True
+    timed_out = True
+
+    def __new__(cls, exit_code: int, output: str) -> "TimedOut":
+        return super().__new__(cls, (exit_code, output))
+
+    def __getnewargs__(self) -> tuple[int, str]:
+        return (self[0], self[1])
+
+
 # ---------------------------------------------------------------------------
 # Core runner
 # ---------------------------------------------------------------------------
@@ -184,6 +205,7 @@ def _run_script_step(
     # (TASK-FMDR-007).
     program = script if os.path.dirname(script) else os.path.join(os.curdir, script)
 
+    timed_out = False
     try:
         # Run the subprocess with combined output capture
         result = subprocess.run(
@@ -199,6 +221,7 @@ def _run_script_step(
 
     except subprocess.TimeoutExpired as e:
         # Script exceeded timeout — kill it and capture partial output
+        timed_out = True
         exit_code = _TIMEOUT_EXIT_CODE
         # TimeoutExpired.stdout/stderr may be None if process was killed early
         stdout_bytes = e.stdout if e.stdout else b""
@@ -251,6 +274,8 @@ def _run_script_step(
         )
         output = f"{output}\n{note}" if output else note
 
+    if timed_out:
+        return TimedOut(exit_code, output)
     return (exit_code, output)
 
 
@@ -480,6 +505,7 @@ def register_shell_handlers(registry: StepTypeRegistry) -> None:
 
 
 __all__ = [
+    "TimedOut",
     "_run_script_step",
     "ScriptRunner",
     "DEFAULT_TIMEOUT_SECONDS",

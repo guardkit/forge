@@ -533,8 +533,9 @@ class _ARunThatNotesLostAnswers:
     request that got no answer anywhere in the run — the leg's own steps, the
     candidate's teardown inside it, a revert, the read-only question — is
     noted in this one place, and every result the run returns says so
-    (``"answer_lost": True``). Only then may something it sent still be
-    running, so only then does the merge press keep its hold.
+    (``"answer_lost": True``). A script stopped at its time limit is noted
+    the same way. Only then may something it sent still be running, so only
+    then does the merge press keep its hold.
     """
 
     def __init__(self) -> None:
@@ -772,8 +773,12 @@ class DeployStageRunner:
     ) -> StepTypeRegistry:
         registry = StepTypeRegistry()
         # Every request goes through these two, so this run notes any that
-        # got no answer (15 October 2026).
-        script_runner = self._resolve_script_runner()
+        # got no answer, or whose script was stopped at its time limit (15
+        # October 2026). With no sidecar the scripts run here, through the
+        # shared subprocess core, and that is wrapped the same way.
+        from forge.executor import shell_steps
+
+        script_runner = self._resolve_script_runner() or shell_steps._run_script_step
         invoker = live_gate_invoker or self._live_gate_invoker
         register_deploy_handlers(
             registry,
@@ -783,11 +788,7 @@ class DeployStageRunner:
             ),
             broker_inspector=self._broker_inspector,
             presence_resolver=self._presence_resolver,
-            script_runner=(
-                self._this_run.runner(script_runner)
-                if script_runner is not None
-                else None
-            ),
+            script_runner=self._this_run.runner(script_runner),
         )
         return registry
 

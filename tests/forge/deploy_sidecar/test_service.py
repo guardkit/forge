@@ -191,6 +191,26 @@ def test_compose_script_allowed(repo: Path) -> None:
     assert runner.calls[0]["cwd"] == str(repo)  # cwd resolved to repo root
 
 
+def test_a_script_stopped_at_its_time_limit_says_so(repo: Path) -> None:
+    """15 October 2026, Codex R2: the caller counts it like no answer."""
+    from forge.executor.shell_steps import TimedOut
+
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner(result=TimedOut(124, "stopped"))
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert body == {
+        "exit_code": 124,
+        "output_tail": "stopped",
+        "cwd": str(repo),
+        "timed_out": True,
+    }
+
+
 def test_health_check_cmd_allowed(repo: Path) -> None:
     _write_profile(
         repo,

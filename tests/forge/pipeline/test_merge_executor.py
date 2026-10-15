@@ -4658,18 +4658,25 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert ("another worker" in again.detail) is kept
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("answered, kept", [(True, False), (False, True)])
     async def test_a_tree_that_cannot_be_laid_out_says_nothing_was_published(
         self,
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
         monkeypatch: pytest.MonkeyPatch,
+        answered: bool,
+        kept: bool,
     ) -> None:
+        """15 October 2026 (Codex R1): a lay-out the venue refused in its own
+        words has finished, so the hold is put down; one whose answer was
+        lost may still be writing the tree, so the hold is kept."""
         from forge.deploy import candidate_tree
 
         async def _cannot(repo_root: Any, feature_id: str, sha: str) -> Any:
             raise candidate_tree.CandidateTreeError(
-                f"git archive {sha} failed: the clone could not be read"
+                f"git archive {sha} failed: the clone could not be read",
+                answered=answered,
             )
 
         monkeypatch.setattr(candidate_tree, "materialise_candidate_tree", _cannot)
@@ -4682,9 +4689,7 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert "candidate_check" not in _legs(dp)
         held = _the_hold(pool)
         assert held.result == "publication pending"
-        # A lay-out whose answer was lost raises this same error and may still
-        # be writing the tree in the sandbox, so the hold is kept.
-        assert held.lease_holder is not None
+        assert (held.lease_holder is not None) is kept
 
     @pytest.mark.asyncio
     async def test_a_merge_stopped_on_a_conflict_says_nothing_was_published(
@@ -4820,6 +4825,80 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert outcome.result == "publication-pending", outcome.detail
         assert "candidate_down" not in _legs(dp)
         assert _the_hold(pool).lease_holder is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("check, kept", [("timed-out", True), ("red", False)])
+    async def test_a_check_script_that_ran_out_of_time_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        check: str,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R2: the candidate check runs through the REAL
+        deploy stage and script runner. Its script is stopped at its time
+        limit and its teardown answers that the candidate is down. What the
+        script started may still be running, so the hold is kept. A script
+        that went red in its own words, with the same teardown, puts it down."""
+        import sqlite3
+        from unittest.mock import AsyncMock
+
+        from forge.config.models import DeployStageConfig
+        from forge.deploy.live_gate import DryRunBrokerInspector
+        from forge.deploy.reservation import InProcessReservationLease
+        from forge.deploy.stage import DeployStageRunner
+        from forge.persistence.migrations.runbook import apply
+        from forge.persistence.repositories.runbook import RunbookRepository
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            RecordingDeployPublisher,
+            _ASidecarThatAnswers,
+            _Invoker,
+            _profile,
+        )
+
+        sidecar = _ASidecarThatAnswers(check=check, teardown="ok")
+        connection = sqlite3.connect(str(tmp_path / "runbooks.db"))
+        apply(connection)
+        stage = DeployStageRunner(
+            repository=RunbookRepository(connection=connection),
+            runbook_publisher=AsyncMock(),
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=_Invoker(),
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(execution_surface="sidecar", sidecar_url=sidecar.url),
+            deploy_record_root=str(tmp_path / "records"),
+            dry_run=False,
+            target_repo=REPO,
+        )
+
+        class _ACheckThroughTheRealStage(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") != "candidate_check":
+                    return await super().__call__(**kwargs)
+                self.calls.append(kwargs)
+                return await stage.candidate_check(
+                    _profile(),
+                    correlation_id=kwargs["correlation_id"],
+                    deploy_run_id=kwargs["deploy_run_id"],
+                    feature=kwargs["feature_id"],
+                    identity_env=kwargs.get("identity_env"),
+                )
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(), deploy=_ACheckThroughTheRealStage()
+        )
+        try:
+            outcome = await _run_executor(deps, repo_root)
+        finally:
+            sidecar.close()
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
 
     @pytest.mark.asyncio
     async def test_a_conflict_whose_record_moved_on_stops_as_replaced(
@@ -5046,7 +5125,7 @@ class TestALostSandboxCleanUpKeepsTheHold:
             outcome = await _run_executor(deps, repo_root)
 
             assert outcome.result == "publication-pending", outcome.detail
-            assert git.removals == [False]
+            assert git.removals == [None]  # no answer came back
             assert _the_hold(pool).lease_holder is not None
             again = await _run_executor(deps, repo_root)
             assert "another worker" in again.detail

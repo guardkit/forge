@@ -649,6 +649,20 @@ class _ASidecarThatAnswers:
                 if how == "lost":
                     self.close_connection = True
                     return
+                if how == "timed-out":
+                    stopped = json.dumps(
+                        {
+                            "exit_code": 124,
+                            "output_tail": "stopped at its time limit\n",
+                            "timed_out": True,
+                        }
+                    ).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(stopped)))
+                    self.end_headers()
+                    self.wfile.write(stopped)
+                    return
                 if how == "unreadable":
                     garbled = b"<html>bad gateway</html>"
                     self.send_response(200)
@@ -695,6 +709,9 @@ class TestAFailedCandidateSaysWhatIsLeft:
             ("red", "pass", "ok", "torn-down", False),
             ("lost", "pass", "ok", "torn-down", True),
             ("unreadable", "pass", "ok", "torn-down", True),
+            # Codex R2: the check's script was stopped at its time limit and
+            # its teardown answered "down" — what it started may still run.
+            ("timed-out", "pass", "ok", "torn-down", True),
             # The teardown's request got no answer: the run says so too.
             ("ok", "fail", "lost", "standing", True),
             ("ok", "lost", "ok", "torn-down", True),
@@ -704,6 +721,7 @@ class TestAFailedCandidateSaysWhatIsLeft:
             "red-deploy-step",
             "deploy-answer-lost",
             "deploy-answer-unreadable",
+            "deploy-script-timed-out",
             "teardown-lost",
             "gate-answer-lost",
         ],
@@ -1148,7 +1166,13 @@ class TestTheScriptRunnerSaysWhenNoAnswerCameBack:
 
     @pytest.mark.parametrize(
         "how, lost",
-        [("ok", False), ("red", False), ("lost", True), ("unreadable", True)],
+        [
+            ("ok", False),
+            ("red", False),
+            ("lost", True),
+            ("unreadable", True),
+            ("timed-out", True),
+        ],
     )
     def test_the_flag_follows_the_answer(self, how: str, lost: bool) -> None:
         from forge.deploy.sidecar_runner import no_answer_came_back
@@ -1289,3 +1313,68 @@ class TestEveryResultOfARunSaysIfAnAnswerWasLost:
         for again in (copy.deepcopy(answer), pickle.loads(pickle.dumps(answer))):
             assert tuple(again) == tuple(answer)
             assert no_answer_came_back(again)
+
+
+
+class TestAScriptStoppedAtItsTimeLimit:
+    """15 October 2026, Codex R2: a script stopped at its time limit may have
+    left what it started running, so it is counted like a request with no
+    answer — by the subprocess core, the sidecar's answer, and a stage run
+    with no sidecar at all."""
+
+    def test_the_subprocess_core_says_it_timed_out(self, tmp_path) -> None:
+        import pickle
+        import subprocess
+
+        from forge.executor.shell_steps import TimedOut, _run_script_step
+        from forge.deploy.sidecar_runner import no_answer_came_back
+
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        script = tmp_path / "slow.sh"
+        script.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        script.chmod(0o755)
+
+        answer = _run_script_step(
+            cwd=str(tmp_path), script="slow.sh", env_file=None, timeout=1
+        )
+
+        assert isinstance(answer, TimedOut)
+        exit_code, _output = answer
+        assert exit_code == 124
+        assert no_answer_came_back(answer)
+        assert no_answer_came_back(pickle.loads(pickle.dumps(answer)))
+
+    @pytest.mark.asyncio
+    async def test_a_stage_with_no_sidecar_notes_it(
+        self, repository, runbook_publisher, tmp_path, monkeypatch
+    ) -> None:
+        from forge.executor import shell_steps
+
+        def _a_check_that_runs_out_of_time(**kwargs: Any) -> Any:
+            if (kwargs.get("extra_env") or {}).get("CANDIDATE_DOWN") == "1":
+                return (0, "down\n")
+            return shell_steps.TimedOut(124, "stopped at its time limit\n")
+
+        monkeypatch.setattr(shell_steps, "_run_script_step", _a_check_that_runs_out_of_time)
+        runner = DeployStageRunner(
+            repository=repository,
+            runbook_publisher=runbook_publisher,
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=_Invoker(),
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(),
+            deploy_record_root=str(tmp_path / "state"),
+            dry_run=False,
+            clock=lambda: FIXED,
+        )
+        result = await runner.candidate_check(
+            _profile(),
+            correlation_id="lt",
+            deploy_run_id="run-lt",
+            feature="FEAT-LT",
+            identity_env=WHICH_CANDIDATE,
+        )
+        assert result.outcome == "failed"
+        assert result.detail["candidate"] == "torn-down"
+        assert result.detail.get("answer_lost") is True

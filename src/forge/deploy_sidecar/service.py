@@ -2499,6 +2499,13 @@ def process_run_request(
             "exit_code": answered.exit_code,
             "output_tail": _tail(answered.output) if answered.output else "",
             "cwd": str(cwd),
+            # A deploy stopped at its time limit (15 October 2026): the caller
+            # counts it like a request with no answer.
+            **(
+                {"timed_out": True}
+                if answered.word == "the-deploy-command-ran-out-of-time"
+                else {}
+            ),
         }
 
     # LAW 6 — execute through the shared subprocess core, no shell. The runner
@@ -2506,7 +2513,7 @@ def process_run_request(
     # cannot take the process down.
     issued_kwargs: dict[str, Any] = {"issued_env": issued} if issued is not None else {}
     try:
-        exit_code, output = script_runner(
+        ran = script_runner(
             **issued_kwargs,
             repository=str(repo_path),
             cwd=str(cwd),
@@ -2521,6 +2528,7 @@ def process_run_request(
             memory_project=launch_memory,
             launch_settings=launch_names,
         )
+        exit_code, output = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
@@ -2529,8 +2537,14 @@ def process_run_request(
         }
 
     # LAW 8, the other half: say where the script ran, so a caller that named
-    # a candidate tree can tell it was honoured.
-    return 200, {"exit_code": exit_code, "output_tail": _tail(output), "cwd": str(cwd)}
+    # a candidate tree can tell it was honoured. A script stopped at its time
+    # limit says so (15 October 2026): what it started may still be running.
+    return 200, {
+        "exit_code": exit_code,
+        "output_tail": _tail(output),
+        "cwd": str(cwd),
+        **({"timed_out": True} if getattr(ran, "timed_out", False) is True else {}),
+    }
 
 
 # ---------------------------------------------------------------------------
