@@ -430,10 +430,13 @@ class SidecarCandidateGit:
             timeout=self._layout_timeout_s,
         )
         if decoded is None:
+            # No answer: the retirement may still be running in the sandbox,
+            # so the press keeps its hold (``answered`` False says so).
             return {
                 "status": "kept",
                 "build_id": str(build_id),
                 "path": str(path),
                 "detail": str(why),
+                "answered": False,
             }
         return decoded

@@ -1545,9 +1545,11 @@ async def execute_merge_deploy(
     press_settled = False
     held_turn = 0
     # Set when a deploy-stage leg did not report complete, or a clean-up the
-    # press sent into the sandbox (a candidate tree, a join's working folder,
-    # the retained worktree) was not confirmed done; never cleared. The final
-    # clean-up counts too: the hold is decided after it.
+    # press sent into the sandbox (a candidate tree, a join's working folder)
+    # was not confirmed done, or the retained worktree's retirement got no
+    # answer back; never cleared. A retirement answered "kept" does not set
+    # it: that is a leftover folder, not running work. The final clean-up
+    # counts too: the hold is decided after it.
     a_leg_did_not_complete = False
 
     # WHICH JUDGE FILES THE MERGE CHECKED WITH MAIN'S COPIES (15 October 2026,
@@ -5497,8 +5499,15 @@ async def execute_merge_deploy(
             )
         _write_receipt("autobuild_worktree_cleanup.json", retired)
         if retired.get("status") != "removed":
-            # Gone already is done; anything else may not have finished.
-            if retired.get("status") != "already-gone":
+            # A retained worktree that was ANSWERED as not retired is a folder
+            # left behind, not work still running (15 October 2026, FEAT-6AC9:
+            # a read-only cache folder stopped Git's removal, the press kept
+            # its hold, and the release idle check then waited on a build that
+            # had finished). The receipt and the warning say it was kept; the
+            # next retirement retries it. Only a retirement whose answer was
+            # lost on the way back from the sandbox may still be running, so
+            # only that keeps the hold.
+            if retired.get("answered") is False:
                 a_leg_did_not_complete = True
             logger.warning(
                 "merge-executor: retained autobuild worktree for %s was kept: %s",

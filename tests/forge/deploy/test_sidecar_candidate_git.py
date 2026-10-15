@@ -207,6 +207,17 @@ class TestASidecarThatCannotBeReached:
         assert unread.ok is False and "127.0.0.1:1" in str(unread.refusal)
 
     @pytest.mark.asyncio
+    async def test_a_retirement_with_no_answer_says_it_had_none(self) -> None:
+        """15 October 2026: the press puts its hold down after a retirement
+        the sandbox answered "kept", but not after one with no answer, which
+        may still be running in there."""
+        retired = await self._unreachable().retire_autobuild_worktree(
+            "build-X", "/retained/worktree", {}
+        )
+        assert retired["status"] == "kept"
+        assert retired["answered"] is False
+
+    @pytest.mark.asyncio
     async def test_a_lay_out_raises_with_the_address_in_the_sentence(self) -> None:
         with pytest.raises(CandidateTreeError) as raised:
             await self._unreachable().materialise_candidate_tree(FEATURE_ID, "a" * 40)
