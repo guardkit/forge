@@ -318,6 +318,19 @@ nothing.
 `http://<gateway address>:<MODEL_DOOR_PORT>`, and the sandbox's network list
 must allow that address and port.
 
+## The sandbox's memory door
+
+Anything a build runs in the sandbox can reach the memory service, so since
+15 October 2026 the sandbox has its own narrow door: a second port of the same
+`memory` service (8006 inside, `FLEET_MEMORY_SANDBOX_PORT` at the gateway
+address, 31824 in the example). It offers the two searches and a write that
+takes only build outcomes which replace nothing, and never on the factory's or
+its agents' own shelves (a fixed list in the memory repository). The full door
+at `FLEET_MEMORY_PORT` is for this machine's own tools. The machine's guard
+must admit only the sandbox's machine to `FLEET_MEMORY_SANDBOX_PORT`, and no
+longer admit it to `FLEET_MEMORY_PORT`. In a sandbox, `FLEET_MEMORY_MCP_URL` is
+`http://<gateway address>:<FLEET_MEMORY_SANDBOX_PORT>/mcp`.
+
 ## The Slack front door, and the bus gateway
 
 **What they are.** `front-door` is where Rich approves a spec, taps a build
