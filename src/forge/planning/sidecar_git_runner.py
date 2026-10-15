@@ -54,6 +54,7 @@ from forge.adapters.git.models import GitOpResult
 from forge.deploy.candidate_tree import (
     FileAtCommit,
     RemoteStartPoint,
+    TreeListing,
     answered_as_ordinary,
     answered_as_raw,
     answered_for_branch,
@@ -778,6 +779,30 @@ class SidecarGitRunner:
             logger.warning("read_file_at_commit: %s", read.refusal)
         return read
 
+    async def list_tree_at_commit(self, repo_path: str, commit: str) -> TreeListing:
+        """Every leaf of one commit's tree in the clone inside the sandbox:
+        names, modes, types and object ids, never any file's content
+        (``/git/list-tree-at-commit``, 15 October 2026). Never raises."""
+        del repo_path  # the repository is this runner's own
+        answer = await self._call(
+            "/git/list-tree-at-commit",
+            {"repo": self._repo, "commit": commit},
+            timeout=self._read_timeout_s,
+        )
+        if isinstance(answer, Exception):
+            sentence = self._transport_sentence("/git/list-tree-at-commit", answer)
+            logger.error("list_tree_at_commit: %s", sentence)
+            return TreeListing(refusal=sentence)
+        status, decoded = answer
+        if status != 200 or not isinstance(decoded, dict):
+            sentence = self._refusal_sentence(status, decoded)
+            logger.error("list_tree_at_commit: %s", sentence)
+            return TreeListing(refusal=sentence)
+        listing = TreeListing.from_wire(decoded)
+        if not listing.ok:
+            logger.warning("list_tree_at_commit: %s", listing.refusal)
+        return listing
+
     async def prepare_branch_and_write(
         self,
         repo_path: str,
@@ -1094,6 +1119,10 @@ class RepoRoutedGitRunner:
         if branch:
             return await runner.fetch_remote_start_point(repo_path, branch)
         return await runner.fetch_remote_start_point(repo_path)
+
+    async def list_tree_at_commit(self, repo_path: str, commit: str) -> TreeListing:
+        """One commit's whole tree listing, routed exactly as the others are."""
+        return await self.runner_for_path(repo_path).list_tree_at_commit(repo_path, commit)
 
     async def read_file_at_commit(
         self,

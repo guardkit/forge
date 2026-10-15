@@ -77,7 +77,9 @@ from forge.adapters.git.operations import (
 from forge.deploy.candidate_tree import (
     FileAtCommit,
     RemoteStartPoint,
+    TreeListing,
     fetch_remote_start_point,
+    list_tree_at_commit,
     read_file_at_commit,
 )
 from forge.planning.handoff import PreCommitHook
@@ -269,6 +271,15 @@ class WorktreeGitRunner:
         return await read_file_at_commit(
             repo, commit, file_path, ordinary_file_only=ordinary_file_only
         )
+
+    async def list_tree_at_commit(self, repo_path: str, commit: str) -> TreeListing:
+        """Every leaf of one commit's tree in this copy: names, modes, types
+        and object ids, never any file's content (15 October 2026). Never
+        raises; a missing copy or commit is a refusal."""
+        repo = Path(repo_path)
+        if not repo.is_dir():
+            return TreeListing(refusal=f"there is no copy of this project at {repo_path}")
+        return await list_tree_at_commit(repo, commit)
 
     async def prepare_branch_and_write(
         self,
