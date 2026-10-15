@@ -193,6 +193,27 @@ def _deps(
     return deps, deploy, joins, bus
 
 
+def _deps_naming_the_candidate(
+    config: ForgeConfig, pool: SqliteLifecyclePersistence, **kwargs: Any  # noqa: F811
+) -> tuple[MergeExecutorDeps, _FakeDeploy, _JoinsForReal, _FakePublisher]:
+    """:func:`_deps` for a project that declares how its identity is handed
+    over, so the clean-up can name the candidate the check stood up and take
+    it down. A candidate left standing keeps the hold (15 October 2026), so a
+    test about the hold after a publisher's answer needs one that can be
+    taken down. The project cannot be asked what is running, so nothing is
+    deployed: the result words are the ones these tests are about."""
+    import dataclasses
+
+    deps, deploy, joins, bus = _deps(config, pool, **kwargs)
+    deps = dataclasses.replace(
+        deps,
+        deployment_target=lambda repo, root: (
+            "acme/widget-shop::live", _a_declaration(can_be_asked=False)
+        ),
+    )
+    return deps, deploy, joins, bus
+
+
 async def _press(
     deps: MergeExecutorDeps, repo_root: Path  # noqa: F811
 ) -> Any:
@@ -655,14 +676,14 @@ class TestPickingUpASendWhoseAnswerWasLost:
         publisher = _APublisherThatSays(
             [_published("f" * 40)], before_answering=send_for_real
         )
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
         first = await _press(deps, repo_root)
         assert first.result == "published-deployment-pending"
 
         again = _APublisherThatSays([_published("f" * 40)])
-        deps_two, deploy_two, joins_two, _bus_two = _deps(
+        deps_two, deploy_two, joins_two, _bus_two = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=again
         )
         second = await _press(deps_two, repo_root)
@@ -845,7 +866,7 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
     ) -> None:
-        deps, _deploy, _joins, _bus = _deps(config_with_publication_off, pool)
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(config_with_publication_off, pool)
         first = await _press(deps, repo_root)
         assert first.result == "publication-pending"
         assert "checked and ready to publish" in first.detail
@@ -853,7 +874,7 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         self._forget_which_commit_the_checks_ran_on(pool)
 
         publisher = _APublisherThatSays([_published("c" * 40)])
-        deps_two, _deploy_two, joins_two, _bus_two = _deps(
+        deps_two, _deploy_two, joins_two, _bus_two = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
         second = await _press(deps_two, repo_root)
@@ -879,12 +900,12 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         repo_root: Path,  # noqa: F811
     ) -> None:
         """The same two presses, with the line left alone: it is checked."""
-        deps, _deploy, _joins, _bus = _deps(config_with_publication_off, pool)
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(config_with_publication_off, pool)
         first = await _press(deps, repo_root)
         assert first.result == "publication-pending"
 
         publisher = _APublisherThatSays([_published("c" * 40)])
-        deps_two, _deploy_two, joins_two, _bus_two = _deps(
+        deps_two, _deploy_two, joins_two, _bus_two = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
         second = await _press(deps_two, repo_root)
@@ -1798,7 +1819,7 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         repo_root: Path,  # noqa: F811
     ) -> None:
         publisher = _APublisherThatSays([_published("c" * 40)])
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
 
@@ -1820,7 +1841,7 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         publisher = _APublisherThatSays(
             [_some_other_refusal("there-is-no-credential", "it holds none.")]
         )
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
 
@@ -1871,7 +1892,7 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         def send_for_real(request: dict[str, Any]) -> None:
             _git(repo_root, "push", "-q", "origin", f"{request['j_commit']}:main")
 
-        first_deps, _deploy, _joins, _bus = _deps(
+        first_deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on,
             pool,
             publisher=_APublisherThatSays(
@@ -1882,7 +1903,7 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         assert first.result == "published-deployment-pending"
 
         retry_publisher = _APublisherThatSays([_published("f" * 40)])
-        retry_deps, _deploy, _joins, _bus = _deps(
+        retry_deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=retry_publisher
         )
         retry = await _press(retry_deps, repo_root)
@@ -2001,10 +2022,11 @@ class TestAPromoteThatDidNotCompleteKeepsTheHold:
 class _ASidecarForTheRealPromote:
     """A loopback sidecar for the REAL deploy stage's promote (Codex round 2,
     R1, 4 October 2026). The deploy step answers with the identity it was
-    handed and the health check passes; the candidate teardown's request is
-    taken and never answered."""
+    handed and the health check passes. The candidate teardown's request is
+    answered "not done" (exit 1) when ``teardown`` is ``"not-done"``, or
+    taken and never answered when it is ``"lost"``."""
 
-    def __init__(self) -> None:
+    def __init__(self, teardown: str = "lost") -> None:
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -2016,15 +2038,20 @@ class _ASidecarForTheRealPromote:
                 body = json.loads(
                     self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 )
+                exit_code = 0
                 if (body.get("env") or {}).get("CANDIDATE_DOWN") == "1":
                     sidecar.teardowns += 1
-                    self.close_connection = True
-                    return
+                    if teardown == "lost":
+                        self.close_connection = True
+                        return
+                    exit_code = 1
                 deploy = body.get("deploy") or {}
                 said = (
                     f"DEPLOYED_IDENTITY={deploy.get('identity')}\n" if deploy else "ok\n"
                 )
-                answer = json.dumps({"exit_code": 0, "output_tail": said}).encode()
+                answer = json.dumps(
+                    {"exit_code": exit_code, "output_tail": said}
+                ).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(answer)))
@@ -2106,18 +2133,23 @@ class TestAPromoteWhoseOwnTeardownWasNotAnsweredKeepsTheHold:
     clean-up's teardown then answers that the candidate is down.
 
     Changed 15 October 2026: a candidate still standing keeps the hold only
-    until a teardown answers that it is down, so here the hold is put down
-    and a second press is not refused."""
+    until a teardown answers that it is down. When the promote's own teardown
+    was ANSWERED "not done", the clean-up's answer puts the hold down. When
+    its answer was LOST, the promote's result says so and the hold is kept:
+    that request may still be running in the sandbox."""
 
     @pytest.mark.asyncio
-    async def test_the_clean_up_teardown_answering_puts_the_hold_down(
+    @pytest.mark.parametrize("teardown, kept", [("not-done", False), ("lost", True)])
+    async def test_the_clean_up_teardown_decides_unless_an_answer_was_lost(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         tmp_path: Path,
+        teardown: str,
+        kept: bool,
     ) -> None:
-        sidecar = _ASidecarForTheRealPromote()
+        sidecar = _ASidecarForTheRealPromote(teardown)
         try:
             deploy = _APromoteThroughTheRealStage(sidecar, tmp_path)
             deps = _deps_that_can_deploy(
@@ -2132,11 +2164,12 @@ class TestAPromoteWhoseOwnTeardownWasNotAnsweredKeepsTheHold:
             assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
             assert deploy.promoted.outcome == "complete"
             assert deploy.promoted.detail["candidate"] == "standing"
+            assert bool(deploy.promoted.detail.get("answer_lost")) is kept
             assert sidecar.teardowns == 1
             assert [c.get("leg") for c in deploy.calls][-1] == "candidate_down"
-            assert _record(pool).lease_holder is None
+            assert (_record(pool).lease_holder is not None) is kept
             again = await _press(deps, repo_root)
-            assert "another worker" not in again.detail
+            assert ("another worker" in again.detail) is kept
         finally:
             sidecar.close()
 
@@ -2345,7 +2378,7 @@ class TestEverySandboxCleanUpIsGuarded:
             if not landed:
                 landed.append(_somebody_else_lands_work(repo_root, "between"))
 
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on,
             pool,
             publisher=_APublisherThatSays(

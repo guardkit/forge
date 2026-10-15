@@ -1262,6 +1262,8 @@ class WorkingFolder:
     base_ref: str | None = None
     reused: bool = False
     refusal: str | None = None
+    #: False when the venue gave no answer at all (15 October 2026).
+    answered: bool = True
 
 
 @runtime_checkable

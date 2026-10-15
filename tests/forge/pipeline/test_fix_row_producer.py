@@ -711,6 +711,9 @@ class TestTheRedMergeHook:
             MergeExecutorDeps,
             execute_merge_deploy,
         )
+        from tests.forge.pipeline.test_merge_executor import (
+            _a_project_that_declares_its_identity,
+        )
 
         # A real repository, made once: the executor checks the branch's tree
         # before the merge and compares tree ids after it (protect-main).
@@ -790,6 +793,12 @@ class TestTheRedMergeHook:
             guardkit_run=guardkit,
             deploy_dispatcher=deploy,
             receipts_root_fn=lambda: tmp_path / "merge-receipts",
+            # The project names its candidate, so the clean-up can take down
+            # the one the check stood up; a candidate left standing keeps the
+            # hold, and a second press would be refused (15 October 2026).
+            deployment_target=lambda repo, root: (
+                f"{repo}::live", _a_project_that_declares_its_identity()
+            ),
         )
         outcome = await execute_merge_deploy(
             deps=deps,

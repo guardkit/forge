@@ -367,7 +367,7 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
         issued["repository"] = checkout
 
     # Delegate to the runner (default = in-process subprocess core)
-    answer = runner(
+    exit_code, captured_output = runner(
         cwd=cwd,
         script=script,
         env_file=env_file,
@@ -383,7 +383,6 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
         deploy=dict(ownership) if isinstance(ownership, dict) else None,
         **issued,
     )
-    exit_code, captured_output = answer
 
     # Map exit status to verdict
     status = StepStatus.passed if exit_code == 0 else StepStatus.failed
@@ -393,10 +392,6 @@ def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> St
         "exit_code": exit_code,
         "captured_output": captured_output,
     }
-    # A request that got no answer at all says so (15 October 2026): the
-    # script may still be running where it was sent.
-    if getattr(answer, "answer_lost", False) is True:
-        result["answer_lost"] = True
 
     return StepOutcome(status=status, result=result)
 

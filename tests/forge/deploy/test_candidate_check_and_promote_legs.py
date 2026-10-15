@@ -629,7 +629,7 @@ class _ASidecarThatAnswers:
     dropped without an answer) or ``"unreadable"`` (an answer that is not
     the sidecar's JSON)."""
 
-    def __init__(self, *, check: str, teardown: str) -> None:
+    def __init__(self, *, check: str, teardown: str, revert: str = "ok") -> None:
         import json
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -639,8 +639,13 @@ class _ASidecarThatAnswers:
                 body = json.loads(
                     self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 )
-                down = (body.get("env") or {}).get("CANDIDATE_DOWN") == "1"
-                how = teardown if down else check
+                env = body.get("env") or {}
+                down = env.get("CANDIDATE_DOWN") == "1"
+                how = (
+                    revert
+                    if env.get("REVERT") == "1"
+                    else teardown if down else check
+                )
                 if how == "lost":
                     self.close_connection = True
                     return
@@ -690,7 +695,8 @@ class TestAFailedCandidateSaysWhatIsLeft:
             ("red", "pass", "ok", "torn-down", False),
             ("lost", "pass", "ok", "torn-down", True),
             ("unreadable", "pass", "ok", "torn-down", True),
-            ("ok", "fail", "lost", "standing", False),
+            # The teardown's request got no answer: the run says so too.
+            ("ok", "fail", "lost", "standing", True),
             ("ok", "lost", "ok", "torn-down", True),
         ],
         ids=[
@@ -1206,3 +1212,80 @@ class TestTheFailureLineSaysWhereTheCandidateIs:
         else:
             assert "was torn down" in line
         assert result.detail["candidate"] == ("torn-down" if teardown == "ok" else "standing")
+
+
+
+def _a_stage_through(sidecar: Any, repository, runbook_publisher, tmp_path, invoker) -> Any:
+    return DeployStageRunner(
+        repository=repository,
+        runbook_publisher=runbook_publisher,
+        deploy_publisher=RecordingDeployPublisher(),
+        reservation=InProcessReservationLease(),
+        live_gate_invoker=invoker,
+        broker_inspector=DryRunBrokerInspector(),
+        config=DeployStageConfig(execution_surface="sidecar", sidecar_url=sidecar.url),
+        deploy_record_root=str(tmp_path / "state"),
+        dry_run=False,
+        target_repo="guardkit/api_test",
+        clock=lambda: FIXED,
+    )
+
+
+class TestEveryResultOfARunSaysIfAnAnswerWasLost:
+    """15 October 2026, the coach's run-wide stamp: a request with no answer
+    ANYWHERE in a stage run marks every result that run returns."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("revert, lost", [("lost", True), ("ok", False)])
+    async def test_a_revert_whose_answer_was_lost(
+        self, repository, runbook_publisher, tmp_path, revert: str, lost: bool
+    ) -> None:
+        sidecar = _ASidecarThatAnswers(check="ok", teardown="ok", revert=revert)
+        try:
+            runner = _a_stage_through(
+                sidecar, repository, runbook_publisher, tmp_path,
+                _Invoker(live=("fail", TWO_RED)),
+            )
+            result = await runner.promote(
+                _profile(rollback="apitest:rollback"),
+                correlation_id="rv",
+                deploy_run_id="run-rv",
+                feature="FEAT-RV",
+                prior_events=("DeployQueued",),
+                identity_env=WHICH_CANDIDATE,
+            )
+        finally:
+            sidecar.close()
+        assert result.outcome in ("reverted", "failed"), result
+        assert bool(result.detail.get("answer_lost")) is lost
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("check, lost", [("lost", True), ("ok", False)])
+    async def test_the_read_only_question(
+        self, repository, runbook_publisher, tmp_path, check: str, lost: bool
+    ) -> None:
+        sidecar = _ASidecarThatAnswers(check=check, teardown="ok")
+        try:
+            runner = _a_stage_through(
+                sidecar, repository, runbook_publisher, tmp_path, _Invoker()
+            )
+            result = await runner.what_is_running(
+                _profile(),
+                correlation_id="wr",
+                deploy_run_id="run-wr",
+                ask_env={"RUNNING_IDENTITY": "1"},
+            )
+        finally:
+            sidecar.close()
+        assert bool(result.detail.get("answer_lost")) is lost
+
+    def test_no_answer_survives_a_copy_and_a_pickle(self) -> None:
+        import copy
+        import pickle
+
+        from forge.deploy.sidecar_runner import NoAnswer, no_answer_came_back
+
+        answer = NoAnswer("sidecar unreachable at http://x: timed out")
+        for again in (copy.deepcopy(answer), pickle.loads(pickle.dumps(answer))):
+            assert tuple(again) == tuple(answer)
+            assert no_answer_came_back(again)

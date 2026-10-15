@@ -104,6 +104,7 @@ candidate run, none from the tree.
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -148,7 +149,7 @@ from forge.deploy.runbook_builder import (
     build_read_only_runbook,
     build_revert_runbook,
 )
-from forge.deploy.sidecar_runner import SidecarScriptRunner
+from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
 from forge.deploy.steps import SecretPresenceResolver, register_deploy_handlers
 from forge.executor.executor import RunbookExecutor, RunResult
 from forge.executor.registry import StepTypeRegistry
@@ -321,32 +322,6 @@ def sidecar_refusal(step: Step | None) -> str | None:
     return first_line
 
 
-def step_answer_was_lost(step: Step | None) -> bool:
-    """Did this step's request get no answer at all (15 October 2026)?
-
-    Read from the flag the step recorded from its runner's answer
-    (:class:`forge.deploy.sidecar_runner.NoAnswer`), never from its words:
-    a ``deploy_compose`` step keeps it on its own result, a ``health_check``
-    step on its last script's entry. Only then may the script still be
-    running in the sandbox, so a failed result carries ``"answer_lost":
-    True`` and the merge press keeps its hold for that.
-    """
-    if step is None or step.result is None:
-        return False
-    payload = step.result.payload
-    if not isinstance(payload, dict):
-        return False
-    if payload.get("answer_lost") is True:
-        return True
-    ran = payload.get("ran")
-    return (
-        isinstance(ran, list)
-        and bool(ran)
-        and isinstance(ran[-1], dict)
-        and ran[-1].get("answer_lost") is True
-    )
-
-
 @dataclass(frozen=True, slots=True)
 class _LiveGateRun:
     """What one run of the live gate said, as the stage reads it back.
@@ -366,8 +341,6 @@ class _LiveGateRun:
     gate_ids: tuple[str, ...] = ()
     assertions: tuple[dict[str, Any], ...] = ()
     evidence_index_ref: str = ""
-    #: The gate's request got no answer (15 October 2026).
-    answer_lost: bool = False
 
 
 #: HOW MANY FAILED CHECKS RIDE ON EACH SURFACE (2026-09-12). A refusal that
@@ -551,6 +524,67 @@ def gate_summary(
     return summary
 
 
+class _ARunThatNotesLostAnswers:
+    """Where one stage run notes that some request in it got NO ANSWER.
+
+    15 October 2026. The stage is built for one leg at a time, and every
+    script and live-gate request of that leg goes through the runner and the
+    invoker it builds its step registry with. Both are wrapped here, so a
+    request that got no answer anywhere in the run — the leg's own steps, the
+    candidate's teardown inside it, a revert, the read-only question — is
+    noted in this one place, and every result the run returns says so
+    (``"answer_lost": True``). Only then may something it sent still be
+    running, so only then does the merge press keep its hold.
+    """
+
+    def __init__(self) -> None:
+        self.lost = False
+
+    def runner(self, inner: Any) -> Any:
+        def _run(**kwargs: Any) -> Any:
+            answer = inner(**kwargs)
+            if no_answer_came_back(answer):
+                self.lost = True
+            return answer
+
+        return _run
+
+    def invoker(self, inner: Any) -> Any:
+        return _AnInvokerThatNotesLostAnswers(inner, self)
+
+    def stamped(self, result: Any) -> Any:
+        if self.lost and isinstance(result, DeployStageResult):
+            return replace(result, detail={**result.detail, "answer_lost": True})
+        return result
+
+
+class _AnInvokerThatNotesLostAnswers:
+    """A live-gate invoker that notes an invocation with no answer."""
+
+    def __init__(self, inner: Any, run: _ARunThatNotesLostAnswers) -> None:
+        self._inner = inner
+        self._run = run
+
+    def invoke(self, **kwargs: Any) -> Any:
+        invocation = self._inner.invoke(**kwargs)
+        if getattr(invocation, "answer_lost", False) is True:
+            self._run.lost = True
+        return invocation
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _says_if_an_answer_was_lost(leg: Any) -> Any:
+    """Every result a leg returns says if any request in its run got no answer."""
+
+    @functools.wraps(leg)
+    async def _leg(self: "DeployStageRunner", *args: Any, **kwargs: Any) -> Any:
+        return self._this_run.stamped(await leg(self, *args, **kwargs))
+
+    return _leg
+
+
 class DeployStageRunner:
     """Drives the DEPLOY and LIVE_GATE stages for one feature.
 
@@ -599,6 +633,8 @@ class DeployStageRunner:
         self._deploy_publisher = deploy_publisher
         self._reservation = reservation
         self._live_gate_invoker = live_gate_invoker
+        # THIS RUN'S LOST ANSWERS, noted in one place (15 October 2026).
+        self._this_run = _ARunThatNotesLostAnswers()
         self._broker_inspector = broker_inspector
         self._config = config
         self._deploy_record_root = deploy_record_root
@@ -735,13 +771,23 @@ class DeployStageRunner:
         self, *, live_gate_invoker: LiveGateInvoker | None = None
     ) -> StepTypeRegistry:
         registry = StepTypeRegistry()
+        # Every request goes through these two, so this run notes any that
+        # got no answer (15 October 2026).
+        script_runner = self._resolve_script_runner()
+        invoker = live_gate_invoker or self._live_gate_invoker
         register_deploy_handlers(
             registry,
             dry_run=self._dry_run,
-            live_gate_invoker=live_gate_invoker or self._live_gate_invoker,
+            live_gate_invoker=(
+                self._this_run.invoker(invoker) if invoker is not None else None
+            ),
             broker_inspector=self._broker_inspector,
             presence_resolver=self._presence_resolver,
-            script_runner=self._resolve_script_runner(),
+            script_runner=(
+                self._this_run.runner(script_runner)
+                if script_runner is not None
+                else None
+            ),
         )
         return registry
 
@@ -752,6 +798,7 @@ class DeployStageRunner:
         except Exception as exc:  # noqa: BLE001 — event stream is derived
             logger.warning("deploy stage publish failed (continuing): %s", exc)
 
+    @_says_if_an_answer_was_lost
     async def run_deploy(
         self,
         profile: DeployProfile,
@@ -804,6 +851,7 @@ class DeployStageRunner:
             identity_env=identity_env,
         )
 
+    @_says_if_an_answer_was_lost
     async def candidate_check(
         self,
         profile: DeployProfile,
@@ -925,6 +973,7 @@ class DeployStageRunner:
             if handle is not None:
                 self._reservation.release(handle)
 
+    @_says_if_an_answer_was_lost
     async def candidate_down(
         self,
         profile: DeployProfile,
@@ -985,6 +1034,7 @@ class DeployStageRunner:
             detail={"candidate": "torn-down" if torn_down else "standing"},
         )
 
+    @_says_if_an_answer_was_lost
     async def preview_up(
         self,
         profile: DeployProfile,
@@ -1063,6 +1113,7 @@ class DeployStageRunner:
             detail={"deploy_output": deploy_step_output(executed)},
         )
 
+    @_says_if_an_answer_was_lost
     async def preview_journey(
         self,
         profile: DeployProfile,
@@ -1158,6 +1209,7 @@ class DeployStageRunner:
             detail={"journey": dict(payload)},
         )
 
+    @_says_if_an_answer_was_lost
     async def what_is_running(
         self,
         profile: DeployProfile,
@@ -1253,6 +1305,7 @@ class DeployStageRunner:
             detail={"deploy_output": said},
         )
 
+    @_says_if_an_answer_was_lost
     async def promote(
         self,
         profile: DeployProfile,
@@ -1493,7 +1546,6 @@ class DeployStageRunner:
             verdict: str | None = None
             live_gate_runbook_id: str | None = None
             failing_verdict_ref: str | None = None
-            gate_answer_lost = False
             if self._config.run_live_gate:
                 gate = await self._run_live_gate(
                     profile,
@@ -1508,7 +1560,6 @@ class DeployStageRunner:
                 verdict = gate.verdict
                 live_gate_runbook_id = gate.runbook_id
                 failing_verdict_ref = gate.failing_verdict_ref
-                gate_answer_lost = gate.answer_lost
 
             # --- [O-32] revert-on-gate-fail --------------------------------
             # A live-gate verdict that is not "pass" means the current build is
@@ -1534,28 +1585,23 @@ class DeployStageRunner:
                     failing_verdict_ref=failing_verdict_ref,
                     deploy_run_id=deploy_run_id,
                 )
-                reverted = await self._run_revert(
-                    profile,
-                    correlation_id=correlation_id,
-                    deploy_run_id=deploy_run_id,
-                    feat_id=feat_id,
-                    task_id=task_id,
-                    profile_ref=profile_ref,
-                    deployer=deployer,
-                    failing_verdict=verdict if verdict is not None else "instrument_fail",
-                    failing_verdict_ref=failing_verdict_ref,
-                    deploy_runbook_id=deploy_runbook.runbook_id,
-                    live_gate_runbook_id=live_gate_runbook_id,
-                    events=events,
-                    cwd=scripts_cwd,
-                )
-                if gate_answer_lost:
-                    # The gate's request got no answer: its driver may still
-                    # be running against the live app (15 October 2026).
-                    reverted = replace(
-                        reverted, detail={**reverted.detail, "answer_lost": True}
+                return _with_candidate(
+                    await self._run_revert(
+                        profile,
+                        correlation_id=correlation_id,
+                        deploy_run_id=deploy_run_id,
+                        feat_id=feat_id,
+                        task_id=task_id,
+                        profile_ref=profile_ref,
+                        deployer=deployer,
+                        failing_verdict=verdict if verdict is not None else "instrument_fail",
+                        failing_verdict_ref=failing_verdict_ref,
+                        deploy_runbook_id=deploy_runbook.runbook_id,
+                        live_gate_runbook_id=live_gate_runbook_id,
+                        events=events,
+                        cwd=scripts_cwd,
                     )
-                return _with_candidate(reverted)
+                )
 
             return DeployStageResult(
                 outcome="complete",
@@ -1611,16 +1657,6 @@ class DeployStageRunner:
             ),
         )
         events.append("DeployQueued")
-
-    @staticmethod
-    def _answer_lost_at(executed: Runbook | None, run_result: RunResult) -> bool:
-        """Did the step that stopped the runbook get no answer at all?"""
-        if executed is None or run_result.stopped_at_index is None:
-            return False
-        idx = run_result.stopped_at_index
-        if not (0 <= idx < len(executed.steps)):
-            return False
-        return step_answer_was_lost(executed.steps[idx])
 
     def _stopped_at(
         self, executed: Runbook | None, run_result: RunResult, *, default: str
@@ -1960,7 +1996,6 @@ class DeployStageRunner:
                 a for a in (payload.get("assertions", []) or []) if isinstance(a, dict)
             ),
             evidence_index_ref=str(common["evidence_index_ref"]),
-            answer_lost=payload.get("answer_lost") is True,
         )
 
     async def _run_candidate_leg(
@@ -2070,7 +2105,6 @@ class DeployStageRunner:
                 events=events,
                 failure_detail=refusal,
                 torn_down=torn,
-                answer_lost=self._answer_lost_at(executed, run_result),
             )
             return failed, summary
 
@@ -2121,7 +2155,6 @@ class DeployStageRunner:
                     events=events,
                     gate_summary_for_words=summary,
                     torn_down=torn,
-                    answer_lost=gate.answer_lost,
                 )
                 return failed, summary
         else:
@@ -2228,15 +2261,12 @@ class DeployStageRunner:
         failure_detail: str | None = None,
         gate_summary_for_words: dict[str, Any] | None = None,
         torn_down: bool = True,
-        answer_lost: bool = False,
     ) -> DeployStageResult:
         """Publish DeployFailed for a candidate that failed its leg (LIVE intact).
 
-        ``torn_down`` is what the candidate's own teardown answered and
-        ``answer_lost`` whether the failed step got no answer at all; both go
+        ``torn_down`` is what the candidate's own teardown answered; it goes
         into the detail (15 October 2026), so the merge press keeps its hold
-        only for a candidate still standing or a step that may still be
-        running.
+        for a candidate still standing.
 
         A loud, honest failure that names the candidate as the cause and records
         that the live name was untouched — recoverable (retry the deploy), never
@@ -2307,7 +2337,6 @@ class DeployStageRunner:
                 "reason": reason,
                 "failing_verdict": failing_verdict,
                 "candidate": "torn-down" if torn_down else "standing",
-                **({"answer_lost": True} if answer_lost else {}),
             },
         )
 
@@ -2664,16 +2693,8 @@ class DeployStageRunner:
             # tell a deploy step which went red from one the executor refused
             # or STOPPED PART-WAY needs the same line — the executor's own
             # word rides in it — and withholding it leaves that caller
-            # guessing from an exit code. A step whose request got no answer
-            # may still be running, and says so (15 October 2026).
-            detail={
-                "deploy_output": deploy_step_output(executed),
-                **(
-                    {"answer_lost": True}
-                    if self._answer_lost_at(executed, run_result)
-                    else {}
-                ),
-            },
+            # guessing from an exit code.
+            detail={"deploy_output": deploy_step_output(executed)},
         )
 
     async def _fail_before_start(

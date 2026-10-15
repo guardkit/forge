@@ -716,12 +716,14 @@ class RepoDriverLiveGateInvoker:
             )
         except subprocess.TimeoutExpired as exc:
             # A driver that never returns is an ENVIRONMENT problem — never a SUT
-            # fail (it never indicts the feature).
+            # fail (it never indicts the feature). Nor is it an answer
+            # (15 October 2026): what it started may still be running.
             return LiveGateInvocation(
                 verdict="environment_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
                 dry_run=False,
+                answer_lost=True,
                 detail={
                     "argv": argv,
                     "cwd": str(self._repo_path),

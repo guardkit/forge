@@ -2201,7 +2201,7 @@ async def execute_merge_deploy(
 
     async def _lay_the_tree_out(sha: str) -> MergeDeployOutcome | None:
         """Lay out the exact tree of ``sha`` for the live check. None = it is there."""
-        nonlocal tree_path, tree_commit
+        nonlocal tree_path, tree_commit, a_leg_did_not_complete
         excluded_now: bool | None = None
         try:
             excluded_now = await git.ensure_candidate_trees_excluded()
@@ -2213,6 +2213,10 @@ async def execute_merge_deploy(
             if not gate["candidate_tree"]:
                 gate["candidate_tree"] = laid_out.tree
         except CandidateTreeError as exc:
+            # A lay-out whose answer was lost comes back as this error too, and
+            # it may still be writing the tree in the sandbox: keep the hold,
+            # as :func:`_the_scripts_at` does (15 October 2026).
+            a_leg_did_not_complete = True
             _write_receipt(
                 "merge_deploy_candidate.json",
                 {
@@ -3860,6 +3864,7 @@ async def execute_merge_deploy(
 
     async def _press() -> MergeDeployOutcome:
         nonlocal tree_path, candidate_standing, gate_began, held_turn
+        nonlocal a_leg_did_not_complete
 
         # IS THIS A PICK-UP? A build whose record already holds a join that
         # was made is not being merged again; it is being carried on, and
@@ -4402,6 +4407,10 @@ async def execute_merge_deploy(
                     at_commit=g_commit,
                 )
                 if not made.ok:
+                    # A folder the sandbox never answered for may still be
+                    # being made in there: keep the hold (15 October 2026).
+                    if not made.answered:
+                        a_leg_did_not_complete = True
                     _write_receipt(
                         "merge_deploy_join.json",
                         {
@@ -4411,8 +4420,9 @@ async def execute_merge_deploy(
                             "nothing_was_joined": True,
                         },
                     )
-                    # SETTLED (15 October 2026): no leg was sent, and a
-                    # working folder half made is a folder, not running work.
+                    # SETTLED (15 October 2026): no leg was sent. A folder the
+                    # sandbox answered it could not make is not running work;
+                    # one with no answer keeps the hold through the flag above.
                     return _nothing_was_published(
                         _settled(
                             _cannot_join(
@@ -5597,6 +5607,9 @@ async def execute_merge_deploy(
         and press_settled
         and not a_leg_did_not_complete
         and not something_is_left_standing
+        # A candidate a passed check left standing for the promote, with no
+        # teardown that answered it is down (15 October 2026).
+        and not candidate_standing
         and outcome.failed_step != "record"
     ):
         try:

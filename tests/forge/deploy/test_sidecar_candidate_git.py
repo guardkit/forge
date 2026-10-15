@@ -210,6 +210,18 @@ class TestTheJoinsWorkingFolderIsRemovedInThere:
 
         assert await git.remove_working_folder(str(made.path)) is False
 
+    @pytest.mark.asyncio
+    async def test_a_folder_the_sandbox_refused_was_answered(
+        self, git: SidecarCandidateGit, clone: Path
+    ) -> None:
+        """A refusal in the sandbox's own words is an answer: nothing is
+        being made in there."""
+        made = await git.add_working_folder(
+            "integration/../escape", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok is False
+        assert made.answered is True
+
 
 class TestTheProjectsOwnFileIsReadInThere:
     """The press reads ``deploy/profile.yaml`` at a commit through this venue
@@ -255,6 +267,16 @@ class TestASidecarThatCannotBeReached:
         assert await git.remove_candidate_tree(FEATURE_ID) is False
         unread = await git.read_file_at_commit("main", "deploy/profile.yaml")
         assert unread.ok is False and "127.0.0.1:1" in str(unread.refusal)
+
+    @pytest.mark.asyncio
+    async def test_a_working_folder_with_no_answer_says_it_had_none(self) -> None:
+        """15 October 2026: the press keeps its hold when the join folder's
+        request got no answer, so the venue says so."""
+        made = await self._unreachable().add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok is False
+        assert made.answered is False
 
     @pytest.mark.asyncio
     async def test_a_working_folder_removal_with_no_answer_answers_none(self) -> None:

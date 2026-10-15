@@ -4682,8 +4682,9 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert "candidate_check" not in _legs(dp)
         held = _the_hold(pool)
         assert held.result == "publication pending"
-        # 15 October 2026: no leg was sent, so the hold is put down.
-        assert held.lease_holder is None
+        # A lay-out whose answer was lost raises this same error and may still
+        # be writing the tree in the sandbox, so the hold is kept.
+        assert held.lease_holder is not None
 
     @pytest.mark.asyncio
     async def test_a_merge_stopped_on_a_conflict_says_nothing_was_published(
@@ -4759,6 +4760,66 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         held = _the_hold(pool)
         assert held.result == "publication pending"
         assert held.lease_holder is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("answered, kept", [(True, False), (False, True)])
+    async def test_a_join_folder_with_no_answer_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        answered: bool,
+        kept: bool,
+    ) -> None:
+        """15 October 2026: the sandbox's venue says whether the join folder's
+        request got an answer. Refused in its own words, nothing is running
+        and the hold is put down; no answer, and the folder may still be
+        being made, so the hold is kept."""
+        import dataclasses
+
+        from forge.deploy.candidate_tree import WorkingFolder
+
+        class _AVenueThatSays(InContainerCandidateGit):
+            async def add_working_folder(self, leaf: str, branch: str, base_ref: str):
+                return WorkingFolder(
+                    ok=False,
+                    branch=branch,
+                    base_ref=base_ref,
+                    refusal="the sandbox sidecar could not be reached",
+                    answered=answered,
+                )
+
+        venue = _AVenueThatSays(repo_root, fetch_address=origin_of(repo_root), repo=REPO)
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal())
+        deps = dataclasses.replace(deps, git_surface=lambda _repo, _root: venue)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_left_standing_with_no_teardown_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> None:
+        """15 October 2026, the coach: a passed candidate check leaves its
+        candidate standing for the promote. When the press ends before the
+        promote and no teardown can be sent (this project names no
+        identity), that candidate is still up, so the hold is kept."""
+        deps, _publisher, _gk, dp = _deps(
+            config, pool, guardkit=_JoinsForReal(), declares_identity=False
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "publication-pending", outcome.detail
+        assert "candidate_down" not in _legs(dp)
+        assert _the_hold(pool).lease_holder is not None
 
     @pytest.mark.asyncio
     async def test_a_conflict_whose_record_moved_on_stops_as_replaced(

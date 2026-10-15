@@ -210,6 +210,9 @@ class JoinOutcome:
     branch: str | None = None
     reused: bool = False
     refusal: str | None = None
+    #: False when the venue gave no answer at all (15 October 2026): the
+    #: folder may still be being made, so the press keeps its hold.
+    answered: bool = True
 
 
 async def make_the_working_folder(
@@ -244,6 +247,7 @@ async def make_the_working_folder(
                 f"on {branch} at {str(at_commit)[:10]}: "
                 f"{made.refusal or 'no reason was given'}"
             ),
+            answered=getattr(made, "answered", True) is not False,
         )
     return JoinOutcome(
         ok=True,

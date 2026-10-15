@@ -63,6 +63,10 @@ class NoAnswer(tuple):
     def __new__(cls, sentence: str) -> "NoAnswer":
         return super().__new__(cls, (SIDECAR_TRANSPORT_EXIT_CODE, sentence))
 
+    def __getnewargs__(self) -> tuple[str]:
+        # So a copy or a pickle is made from the sentence, as ``__new__`` takes.
+        return (self[1],)
+
 
 def no_answer_came_back(answer: object) -> bool:
     """Is ``answer`` a runner's answer saying no answer came back?"""

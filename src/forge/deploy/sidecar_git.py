@@ -161,6 +161,22 @@ class SidecarCandidateGit:
             f"{route}: {error or decoded!s}"
         )
 
+    async def _ok_and_answered(
+        self, route: str, body: dict[str, Any], *, timeout: float
+    ) -> tuple[dict[str, Any] | None, str | None, bool]:
+        """:meth:`_ok`, and whether an answer came back at all (15 October
+        2026): a request that could not be sent, timed out or came back
+        unreadable is no answer; a refusal with the sidecar's words is one."""
+        answer = await self._call(route, body, timeout=timeout)
+        if isinstance(answer, Exception):
+            return None, self._sentence(route, answer), False
+        status, decoded = answer
+        if not isinstance(decoded, dict):
+            return None, self._sentence(route, answer), False
+        if status != 200:
+            return None, self._sentence(route, answer), True
+        return decoded, None, True
+
     async def _ok(
         self, route: str, body: dict[str, Any], *, timeout: float
     ) -> tuple[dict[str, Any] | None, str | None]:
@@ -345,7 +361,7 @@ class SidecarCandidateGit:
         repository lives, which for a sandboxed repository is a different
         path entirely, never reaches git.
         """
-        decoded, why = await self._ok(
+        decoded, why, answered = await self._ok_and_answered(
             "/git/worktree-add",
             {
                 "repo": self._repo,
@@ -361,6 +377,7 @@ class SidecarCandidateGit:
                 branch=str(branch),
                 base_ref=str(base_ref),
                 refusal=str(why),
+                answered=answered,
             )
         ok = str(decoded.get("status") or "") == "success"
         return WorkingFolder(
@@ -390,7 +407,7 @@ class SidecarCandidateGit:
         2026) and the folder stayed behind.
         """
         leaf = PurePath(str(path)).name
-        decoded, why = await self._ok(
+        decoded, why, answered = await self._ok_and_answered(
             "/git/worktree-remove",
             {"repo": self._repo, "leaf": leaf},
             timeout=self._read_timeout_s,
@@ -401,7 +418,7 @@ class SidecarCandidateGit:
                 path,
                 why,
             )
-            return None
+            return False if answered else None
         if str(decoded.get("status") or "") != "success":
             logger.warning(
                 "sandbox git: the working folder at %s was not removed: %s",
