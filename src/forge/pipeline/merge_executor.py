@@ -1530,12 +1530,33 @@ async def execute_merge_deploy(
     # clean-up counts too: the hold is decided after it.
     a_leg_did_not_complete = False
 
+    # WHICH JUDGE FILES THE MERGE CHECKED WITH MAIN'S COPIES (15 October 2026,
+    # the merge-check design, item 8): the build system's report names them,
+    # and the merge-checks record line keeps them, so a press that picks the
+    # join up can say the same. One sentence, added to every ending's detail
+    # in one place (``_settled``). A list of one, so a nested reader can set it.
+    _main_copies_said: list[str] = []
+
+    def _remember_main_copies(paths: Any) -> None:
+        names = [str(p) for p in (paths or []) if str(p or "").strip()]
+        if not names or _main_copies_said:
+            return
+        many = len(names) > 1
+        listed = names[0] if not many else ", ".join(names[:-1]) + " and " + names[-1]
+        _main_copies_said.append(
+            f"The merge used main's {'versions' if many else 'version'} of "
+            f"{listed} and did not run this build's changes to "
+            f"{'them' if many else 'it'}."
+        )
+
     def _settled(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         """Mark ``outcome`` as an ending where nothing this press started can
         still be running. A replaced worker's ending is never one."""
         nonlocal press_settled
         if outcome.failed_step != "record":
             press_settled = True
+        if _main_copies_said and _main_copies_said[0] not in (outcome.detail or ""):
+            outcome.detail = f"{outcome.detail} {_main_copies_said[0]}".strip()
         return outcome
     # THE COMMIT THIS BUILD STARTS FROM, off this coordinator's own record,
     # read once and kept (23 September 2026). It is what the project's own
@@ -4606,10 +4627,14 @@ async def execute_merge_deploy(
                         "verify_detail": (report or {}).get("verify_detail"),
                         "checks_passed": checks_passed,
                         "checks_total": checks_total,
+                        "judged_with_main_copies": list(
+                            (report or {}).get("judged_with_main_copies") or []
+                        ),
                     },
                 ):
                     return _replaced_here()
                 merge_checks_ran_here = True
+                _remember_main_copies((report or {}).get("judged_with_main_copies"))
 
                 # Advisory: does the joined tree keep the promises in the feature's
                 # spec digest? Deterministic and never blocking.
@@ -4685,6 +4710,16 @@ async def execute_merge_deploy(
             # says what happened, word for word as the press that ran them said
             # it, and it stays the result until a NEW attempt's checks pass.
             # ------------------------------------------------------------------
+            if not merge_checks_ran_here:
+                # A join an earlier press made: what it recorded about main's
+                # copies is said again, exactly as it was.
+                earlier = _the_recorded_line(STEP_MERGE_CHECKS)
+                if earlier is not None:
+                    _remember_main_copies(
+                        (getattr(earlier, "detail", None) or {}).get(
+                            "judged_with_main_copies"
+                        )
+                    )
             recorded_why = _why_the_recorded_step_failed(STEP_MERGE_CHECKS)
             if recorded_why is not None and not merge_checks_ran_here:
                 recorded_line = _the_recorded_line(STEP_MERGE_CHECKS)

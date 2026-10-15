@@ -4797,3 +4797,89 @@ class TestPermanentMergeRetirement:
         assert publisher.reports == []
         assert guardkit.calls == []
         assert deploy.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The merge used main's copy of a judge file (design "The merge check uses
+# main's copy of a check script the build changed", 15 October 2026, item 8
+# and test 11)
+# ---------------------------------------------------------------------------
+
+#: The one sentence the press adds to every ending when the merge report says
+#: which judge files were checked with main's copies.
+MAIN_COPIES = (
+    "The merge used main's version of scripts/check.sh and did not run this "
+    "build's changes to it."
+)
+
+
+class _JoinsWithMainCopies(_JoinsForReal):
+    """The merge command, reporting that main's copy of the check script was
+    used for the checks after the join."""
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        said = await super().__call__(**kwargs)
+        if kwargs.get("args", [None])[0] == "check-join":
+            return said
+        report = json.loads(said.stdout_tail)
+        report["judged_with_main_copies"] = ["scripts/check.sh"]
+        return GuardKitResult(
+            status=said.status,
+            subcommand=said.subcommand,
+            duration_secs=said.duration_secs,
+            stdout_tail=json.dumps(report),
+            stderr=said.stderr,
+            exit_code=said.exit_code,
+        )
+
+
+class TestTheMergeSaysItUsedMainsCopies:
+    @pytest.mark.asyncio
+    async def test_a_passing_report_puts_the_sentence_in_the_outcome(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=_JoinsWithMainCopies())
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.verify_status in (None, "passed")
+        assert MAIN_COPIES in outcome.detail
+        assert outcome.detail.count(MAIN_COPIES) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_report_keeps_the_sentence_and_still_files_a_repair(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithMainCopies(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.verify_status == "failed"
+        assert MAIN_COPIES in outcome.detail
+        assert len(_repair_rows(pool)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_join_reads_it_from_the_record_line(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithMainCopies(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        recorded = [
+            l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"
+        ]
+        assert recorded[-1]["detail"]["judged_with_main_copies"] == ["scripts/check.sh"]
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        assert MAIN_COPIES in first.detail
+        assert MAIN_COPIES in second.detail
+        assert second.detail.count(MAIN_COPIES) == 1
