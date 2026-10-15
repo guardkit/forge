@@ -4612,6 +4612,34 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert "another worker" in again.detail
 
     @pytest.mark.asyncio
+    async def test_a_tree_that_cannot_be_laid_out_says_nothing_was_published(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.deploy import candidate_tree
+
+        async def _cannot(repo_root: Any, feature_id: str, sha: str) -> Any:
+            raise candidate_tree.CandidateTreeError(
+                f"git archive {sha} failed: the clone could not be read"
+            )
+
+        monkeypatch.setattr(candidate_tree, "materialise_candidate_tree", _cannot)
+        deps, _publisher, _gk, dp = _deps(config, pool, guardkit=_JoinsForReal())
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        assert "could not be laid out" in outcome.detail
+        assert "candidate_check" not in _legs(dp)
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        # The hold rule is unchanged: a candidate refusal never puts it down.
+        assert held.lease_holder is not None
+
+    @pytest.mark.asyncio
     async def test_a_candidate_refusal_whose_record_moved_on_stops_as_replaced(
         self,
         config: ForgeConfig,
