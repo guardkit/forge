@@ -122,7 +122,7 @@ def test_a_file_under_a_declared_test_root_is_a_place_on_disk() -> None:
     assert review.findings == []
 
 
-@pytest.mark.parametrize("disk_path", ["/tmp/kcadm-", "/dev/null", "/var/log/app"])
+@pytest.mark.parametrize("disk_path", ["/tmp/kcadm-", "/dev/null", "/var/log/app", "/dev/tcp/keycloak/8080", "/opt/keycloak/bin/kcadm"])
 def test_an_operating_system_folder_is_a_place_on_disk(disk_path: str) -> None:
     # Found live on 15 October 2026: a Keycloak setup script in a task
     # document wrote its temporary files to /tmp/kcadm- and its noise to

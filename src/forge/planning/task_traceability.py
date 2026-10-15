@@ -196,6 +196,9 @@ _SYSTEM_FOLDERS: tuple[str, ...] = (
 _DEVICE_FILES: tuple[str, ...] = (
     "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/zero",
     "/dev/random", "/dev/urandom", "/dev/tty", "/dev/shm",
+    # bash's own network files: a readiness probe writing to /dev/tcp/host/port
+    # put "/dev/tcp" on FEAT-0A2A's merge card on 15 October 2026.
+    "/dev/tcp", "/dev/udp",
 )
 
 #: How many consecutive words of the request count as quoting it.
