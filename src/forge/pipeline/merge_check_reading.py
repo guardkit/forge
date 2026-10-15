@@ -323,7 +323,11 @@ async def _read(
             if path in listed_paths or path in links:
                 continue
             here, there = mains[path], joins.get(path)
-            if there is None or (here.mode, here.object) != (there.mode, there.object):
+            if there is None:
+                # On the target and gone from the joined tree: the build
+                # deleted it (coach review 2).
+                judges.append({"path": path, "how": "deleted", "role": role_of(path)})
+            elif (here.mode, here.object) != (there.mode, there.object):
                 judges.append({"path": path, "how": "changed", "role": role_of(path)})
 
     for path in links:

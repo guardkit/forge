@@ -1212,3 +1212,55 @@ def test_the_sandbox_lists_a_commits_tree_with_modes_and_no_content(tmp_path: Pa
     listing = asyncio.run(runner.list_tree_at_commit("/not/used", sha))
     assert listing.ok
     assert asked == [("http://127.0.0.1:1/git/list-tree-at-commit", {"repo": "o/boxed", "commit": sha})]
+
+
+# ---------------------------------------------------------------------------
+# Coach review 2: a judge gone from the joined tree, with the changes unread
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_judge_gone_from_the_joined_tree_is_said_to_be_deleted(config, pool, rules) -> None:
+    base = _project()
+    joined = dict(base)
+    del joined["scripts/check.sh"]
+    trees = Trees({PREVIEW_BASE: base, CANDIDATE_SHA: joined, JOINED: joined})
+    _insert_build(pool)
+    _record_start(pool)
+    recorder = _Recorder()
+    service = _service(
+        config, pool, recorder, trees=trees, rules=rules, git=_PreviewGit(), preview=_Preview()
+    )
+    service._scope_pass = lambda **_k: ScopeReport(read=False)  # noqa: SLF001
+
+    await service.maybe_offer(_event())
+    words = _approval_words(recorder)
+
+    assert "This build deletes scripts/check.sh" in words
+    assert "This build changes scripts/check.sh" not in words
+    assert next(
+        j for j in _reading(pool)["judge_files"] if j["path"] == "scripts/check.sh"
+    )["how"] == "deleted"
+
+
+@pytest.mark.asyncio
+async def test_real_a_file_name_that_is_not_utf8_does_not_stop_the_card(config, pool, rules, real) -> None:
+    import os
+
+    real.main = real.commit(MAIN_FILES, "main")
+    odd = os.path.join(os.fsencode(str(real.root)), b"src", b"caf\xe9-notes.txt")
+    with open(odd, "wb") as handle:
+        handle.write(b"a name that is not UTF-8\n")
+    _git_run(real.root, "add", "-A")
+    _git_run(real.root, "commit", "-q", "-m", "an odd name on main")
+    real.main = _git_run(real.root, "rev-parse", "HEAD")
+    _git_run(real.root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
+    real.candidate = real.commit({"scripts/check.sh": "#!/bin/sh\nmore checks\n"}, "the build")
+    _git_run(real.root, "checkout", "-q", "main")
+    real.name_status = "M\0scripts/check.sh\0"
+
+    words, reading = await _real_card(config, pool, rules, real, preview=True)
+
+    assert reading["read"] is True
+    assert "This build changes scripts/check.sh, which runs the project's checks." in words
+    assert "could not be listed" not in words
