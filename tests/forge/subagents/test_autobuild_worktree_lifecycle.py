@@ -677,3 +677,59 @@ def test_a_folder_above_the_tree_swapped_for_a_link_to_the_users_own_folders_is_
         for root, _dirs, names in os.walk(outside)
         for name in names
     } == files
+
+
+def test_gits_record_folders_swapped_for_a_link_to_the_users_own_copy_are_not_followed(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R3, round 4: ``.git/worktrees`` replaced by a link to a
+    copy the same user owns, record folders and back pointers and all. The
+    record folder's path is built by text alone and reached from / without
+    following any link, so the copy is never touched and the retirement
+    says "kept"."""
+    import shutil
+
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    records = repo / ".git" / "worktrees"
+    outside = tmp_path / "outside-records"
+    shutil.copytree(records, outside, symlinks=True)
+    _read_only_cache(outside / inner.name / "guardkit-scratch")
+    for root, dirs, _files in os.walk(outside, topdown=False):
+        for name in dirs:
+            (Path(root) / name).chmod(0o555)
+    outside.chmod(0o555)
+    folders = [Path(root) for root, _dirs, _files in os.walk(outside)]
+    before = {folder: folder.stat().st_mode for folder in folders}
+    files = {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    }
+    real_inspect = lifecycle.inspect_autobuild_worktree
+
+    def inspect_then_swap(**kwargs: Any) -> dict[str, Any]:
+        answer = real_inspect(**kwargs)
+        records.rename(repo / ".git" / "worktrees-moved")
+        records.symlink_to(outside, target_is_directory=True)
+        return answer
+
+    monkeypatch.setattr(lifecycle, "inspect_autobuild_worktree", inspect_then_swap)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert {folder: folder.stat().st_mode for folder in folders} == before
+    assert {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    } == files

@@ -476,66 +476,104 @@ def _make_owner_writable(top: Path) -> None:
 
 
 def _worktrees_record_root(repo: Path) -> Path | None:
-    """``<common git folder>/worktrees`` of ``repo``: where Git keeps the
-    record folder of every worktree registered on it."""
+    """``<repository's .git folder>/worktrees``: where Git keeps the record
+    folder of every worktree registered on ``repo``.
+
+    Built from the path Git gives, made absolute and tidied by text alone,
+    never by following links: a link anywhere on it must stay visible so
+    that :func:`_open_folder_strictly` can refuse it.
+    """
     code, raw = _git(repo, "rev-parse", "--git-common-dir")
     if code != 0:
         return None
     common = Path(os.fsdecode(raw.strip()))
     if not common.is_absolute():
         common = repo / common
-    return (common / "worktrees").resolve()
+    if not common.is_absolute():
+        return None
+    return Path(os.path.normpath(common / "worktrees"))
 
 
-def _points_at(record: Path, worktree: Path) -> bool:
-    """Does Git's record folder ``record`` belong to ``worktree``?"""
+def _read_small_file(folder: int, name: str) -> str | None:
+    """Read the regular file ``name`` inside the open folder ``folder``, never
+    through a link; ``None`` if it is anything else or cannot be read."""
     try:
-        pointer = Path(
-            (record / "gitdir").read_text(encoding="utf-8", errors="surrogateescape")
-            .strip()
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=folder
         )
     except OSError:
-        return False
-    if not pointer.is_absolute():
-        pointer = record / pointer
-    return pointer.resolve() == (worktree / ".git").resolve()
-
-
-def _record_folder(repo: Path, worktree: Path) -> Path | None:
-    """Git's own record folder for one worktree registered on ``repo``.
-
-    Read from the worktree's own ``.git`` file. It must be a direct child of
-    ``repo``'s own ``worktrees`` record folder and point back at exactly
-    ``worktree``; anything else is ``None`` and nothing is touched.
-    """
-    root = _worktrees_record_root(repo)
-    marker = worktree / ".git"
-    if root is None or not marker.is_file() or marker.is_symlink():
         return None
     try:
-        line = marker.read_text(encoding="utf-8", errors="surrogateescape")
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        return os.read(descriptor, 64 * 1024).decode("utf-8", errors="surrogateescape")
     except OSError:
         return None
-    key, _sep, value = line.strip().partition(":")
+    finally:
+        os.close(descriptor)
+
+
+def _open_record_folder(repo: Path, worktree: Path) -> int | None:
+    """An open handle on Git's own record folder for ``worktree``, or ``None``.
+
+    The worktree's ``.git`` file names the record folder. That name must be,
+    by text alone, exactly ``<repository's .git folder>/worktrees/<name>``;
+    the folder is reached from ``/`` without following a link at any step;
+    and its ``gitdir`` file, read through that same handle, must point back
+    at exactly ``worktree``. Anything else is ``None`` and nothing is
+    touched. The caller closes the handle.
+    """
+    root = _worktrees_record_root(repo)
+    worktree_folder = _open_folder_strictly(worktree)
+    if root is None or worktree_folder is None:
+        if worktree_folder is not None:
+            os.close(worktree_folder)
+        return None
+    try:
+        marker = _read_small_file(worktree_folder, ".git")
+    finally:
+        os.close(worktree_folder)
+    if marker is None:
+        return None
+    key, _sep, value = marker.strip().partition(":")
     if key != "gitdir" or not value.strip():
         return None
     named = Path(value.strip())
-    candidate = named if named.is_absolute() else worktree / named
-    if candidate.is_symlink():
+    if not named.is_absolute():
+        named = worktree / named
+    record = Path(os.path.normpath(named))
+    if record.parent != root or not record.name:
         return None
-    record = candidate.resolve()
-    if record.parent == root and record.is_dir() and _points_at(record, worktree):
-        return record
+    descriptor = _open_folder_strictly(record)
+    if descriptor is None:
+        return None
+    pointer_text = _read_small_file(descriptor, "gitdir")
+    if pointer_text is not None:
+        pointer = Path(pointer_text.strip())
+        if not pointer.is_absolute():
+            pointer = record / pointer
+        if os.path.normpath(pointer) == os.path.normpath(worktree / ".git"):
+            return descriptor
+    os.close(descriptor)
     return None
 
 
 def _remove_worktree(repo: Path, worktree: Path) -> tuple[int, bytes]:
     """``git worktree remove --force`` for one offer-pinned worktree, with its
-    folder and its record folder made owner-writable first."""
-    record = _record_folder(repo, worktree)
+    folder and its record folder made owner-writable first.
+
+    The record folder is walked from the very handle its back pointer was
+    read through, so what was checked is what is changed.
+    """
+    record = _open_record_folder(repo, worktree)
     _make_owner_writable(worktree)
     if record is not None:
-        _make_owner_writable(record)
+        try:
+            _widen_by_handle(record)
+        except (OSError, RecursionError):
+            pass
+        finally:
+            os.close(record)
     return _git(repo, "worktree", "remove", "--force", str(worktree))
 
 
