@@ -327,3 +327,174 @@ def test_a_failed_removal_puts_only_the_fixed_sentence_in_the_receipt(
     assert result["status"] == "kept", result
     assert result["detail"].endswith(": git branch stopped with exit code 1."), result
     assert "error:" not in result["detail"]
+
+
+# ---------------------------------------------------------------------------
+# READ-ONLY FOLDERS INSIDE A WORKTREE (15 October 2026, FEAT-6AC9). Tools such
+# as a language's module cache write their caches with folders the owner
+# cannot write. Git cannot delete inside such a folder, so `git worktree
+# remove --force` deleted the task's working folder, then stopped on Git's own
+# record folder for it (which held GuardKit's scratch area) with exit 255 and
+# left a "prunable" registration behind. The retirement now makes the
+# offer-pinned trees owner-writable first, never through a symbolic link, and
+# a retry clears a registration whose working folder is already gone.
+# ---------------------------------------------------------------------------
+
+
+def _record_folder(repo: Path, worktree: Path) -> Path:
+    for record in (repo / ".git" / "worktrees").iterdir():
+        pointer = (record / "gitdir").read_text().strip()
+        if Path(pointer).resolve() == (worktree / ".git").resolve():
+            return record
+    raise AssertionError(f"no record folder for {worktree}")
+
+
+def _read_only_cache(top: Path) -> list[Path]:
+    """A cache in the shape module caches take: read-only folders, all the
+    way down, with read-only files in them."""
+    deepest = top / "cache" / "mod" / "example.invalid" / "pkg@v1.0.0" / "sub"
+    deepest.mkdir(parents=True)
+    (deepest / "file.txt").write_text("cached\n")
+    (deepest / "file.txt").chmod(0o444)
+    folders = []
+    probe = deepest
+    while probe != top:
+        folders.append(probe)
+        probe = probe.parent
+    for folder in folders:  # deepest first, so each can still be reached
+        folder.chmod(0o555)
+    return folders
+
+
+@pytest.fixture
+def _writable_again(tmp_path: Path):
+    """Whatever a failing test leaves read-only is made writable again, so the
+    temporary folder can always be cleaned away."""
+    yield
+    for root, dirs, _files in os.walk(tmp_path):
+        for name in dirs:
+            full = Path(root) / name
+            if not full.is_symlink():
+                full.chmod(0o755)
+
+
+def test_read_only_folders_in_a_nested_worktree_and_its_record_are_removed(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    _read_only_cache(inner)
+    _read_only_cache(_record_folder(repo, inner) / "guardkit-scratch")
+    _read_only_cache(_record_folder(repo, outer) / "guardkit-scratch")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "removed", result
+    assert not outer.exists() and not inner.exists()
+    assert not (repo / ".git" / "worktrees").exists() or not list(
+        (repo / ".git" / "worktrees").iterdir()
+    )
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
+
+
+def test_a_registration_whose_folder_is_already_gone_is_cleared_on_retry(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    """Today's state, made the way it was made live: the earlier attempt's
+    `git worktree remove --force` deleted the working folder and stopped on the
+    read-only record folder, leaving a prunable registration."""
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    record = _record_folder(repo, inner)
+    _read_only_cache(record / "guardkit-scratch")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    failed = subprocess.run(
+        ["git", "worktree", "remove", "--force", str(inner)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert not inner.exists() and record.exists()
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain")
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "removed", result
+    assert result["cleared_registrations"] == [str(inner)]
+    assert not record.exists() and not outer.exists()
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
+
+
+def test_a_gone_folder_that_was_not_offered_is_not_cleared(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    """Only an offer-pinned path is ever cleared: a prunable registration the
+    offer did not name keeps its record folder, and the tree is kept."""
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    _git(repo, "branch", "unrelated")
+    unrelated = outer / ".guardkit/worktrees/TASK-OTHER-001"
+    _git(repo, "worktree", "add", str(unrelated), "unrelated")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    offered["cleanup_registrations"] = [
+        row for row in offered["nested_registrations"] if Path(row["path"]) == inner
+    ]
+    other_record = _record_folder(repo, unrelated)
+    import shutil
+
+    shutil.rmtree(unrelated)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert other_record.exists() and outer.is_dir() and inner.is_dir()
+    assert result.get("cleared_registrations", []) == []
+
+
+def test_a_symbolic_link_to_a_read_only_folder_outside_is_not_followed(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    outside = tmp_path / "outside"
+    outside_folders = _read_only_cache(outside)
+    outside.chmod(0o555)
+    before = {folder: folder.stat().st_mode for folder in [outside, *outside_folders]}
+    # Git refuses to pin a dirty link that leaves the tree, so the link sits
+    # in an ignored folder, where caches usually are; one in Git's own record
+    # folder for the worktree too.
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("ignored/\n")
+    (inner / "ignored").mkdir()
+    (inner / "ignored" / "link-out").symlink_to(outside, target_is_directory=True)
+    (_record_folder(repo, inner) / "link-out").symlink_to(
+        outside, target_is_directory=True
+    )
+    _read_only_cache(inner / "own")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "removed", result
+    assert {folder: folder.stat().st_mode for folder in before} == before
+    assert (outside_folders[0] / "file.txt").read_text() == "cached\n"

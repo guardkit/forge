@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import shutil
 import stat
 from pathlib import Path
 from typing import Any, Mapping
@@ -375,6 +376,177 @@ def inspect_autobuild_worktree(
     return answer
 
 
+# READ-ONLY FOLDERS (15 October 2026, FEAT-6AC9). Tools write caches with
+# folders their owner cannot write (a language's module cache is the usual
+# one), inside a worktree or inside the scratch area GuardKit keeps in Git's
+# own record folder for it. Git cannot delete inside such a folder: the live
+# `git worktree remove --force` deleted the task's working folder, stopped on
+# the record folder with exit 255 and left a "prunable" registration. So,
+# just before Git removes an offer-pinned worktree, its folder and its record
+# folder are made owner-writable. Only folders need it (deleting a file needs
+# a writable folder, not a writable file). Symbolic links are never followed:
+# a link is not a folder here, whatever it points at.
+
+
+def _make_owner_writable(top: Path) -> None:
+    """Give the owner full access to every folder under ``top``, links skipped.
+
+    Best effort: a folder that cannot be changed is left for Git to report,
+    and the receipt says so in the helper's fixed sentence.
+    """
+
+    def widen(name: str, dir_fd: int | None) -> None:
+        try:
+            mode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
+            if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) & 0o700 == 0o700:
+                return
+            # Checked without following links just above; chmod cannot be told
+            # not to follow one on Linux, and nothing else writes here.
+            os.chmod(name, stat.S_IMODE(mode) | 0o700, dir_fd=dir_fd)
+        except OSError:
+            return
+
+    widen(str(top), None)
+    try:
+        for _root, directories, _files, descriptor in os.fwalk(
+            str(top), topdown=True, follow_symlinks=False
+        ):
+            for name in directories:
+                widen(name, descriptor)
+    except OSError:
+        return
+
+
+def _worktrees_record_root(repo: Path) -> Path | None:
+    """``<common git folder>/worktrees`` of ``repo``: where Git keeps the
+    record folder of every worktree registered on it."""
+    code, raw = _git(repo, "rev-parse", "--git-common-dir")
+    if code != 0:
+        return None
+    common = Path(os.fsdecode(raw.strip()))
+    if not common.is_absolute():
+        common = repo / common
+    return (common / "worktrees").resolve()
+
+
+def _points_at(record: Path, worktree: Path) -> bool:
+    """Does Git's record folder ``record`` belong to ``worktree``?"""
+    try:
+        pointer = Path(
+            (record / "gitdir").read_text(encoding="utf-8", errors="surrogateescape")
+            .strip()
+        )
+    except OSError:
+        return False
+    if not pointer.is_absolute():
+        pointer = record / pointer
+    return pointer.resolve() == (worktree / ".git").resolve()
+
+
+def _record_folder(repo: Path, worktree: Path) -> Path | None:
+    """Git's own record folder for one worktree registered on ``repo``.
+
+    Read from the worktree's ``.git`` file while the folder is there, else
+    found among the record folders by its back pointer. Either way it must be
+    a direct child of ``repo``'s own ``worktrees`` record folder and point back
+    at exactly ``worktree``; anything else is ``None`` and nothing is touched.
+    """
+    root = _worktrees_record_root(repo)
+    if root is None or not root.is_dir():
+        return None
+    candidates: list[Path] = []
+    marker = worktree / ".git"
+    if marker.is_file() and not marker.is_symlink():
+        try:
+            line = marker.read_text(encoding="utf-8", errors="surrogateescape")
+        except OSError:
+            line = ""
+        key, _sep, value = line.strip().partition(":")
+        if key == "gitdir" and value.strip():
+            named = Path(value.strip())
+            candidates.append(named if named.is_absolute() else worktree / named)
+    else:
+        try:
+            candidates.extend(sorted(root.iterdir()))
+        except OSError:
+            return None
+    for candidate in candidates:
+        if candidate.is_symlink():
+            continue
+        record = candidate.resolve()
+        if record.parent == root and record.is_dir() and _points_at(record, worktree):
+            return record
+    return None
+
+
+def _clear_gone_registrations(
+    repo: Path, base: Path, build_id: str, path: Path, expected: Mapping[str, Any]
+) -> list[str]:
+    """Clear an offer-pinned registration whose working folder is already gone.
+
+    An earlier attempt can delete a worktree's folder and then stop on its
+    record folder, leaving a "prunable" registration that would keep the tree
+    forever. For each exact path the offer named for clean-up (and the outer
+    tree itself, once nothing else is registered below it) that Git still
+    lists as prunable with no folder on disk, its own record folder is made
+    writable and removed, which is what ``git worktree prune`` does for that
+    one entry and no other. Returns the paths cleared.
+    """
+    wanted, error = _owned_path(base, build_id, path)
+    if error or wanted is None or str(expected.get("path")) != str(wanted):
+        return []
+    cleanup = expected.get("cleanup_registrations")
+    if not isinstance(cleanup, list):
+        return []
+    inner_root = wanted / INNER_WORKTREES_REL
+    pinned: list[Path] = []
+    for selected in cleanup:
+        if not isinstance(selected, Mapping):
+            return []
+        nested = Path(str(selected.get("path") or ""))
+        if not _is_relative_to(nested, inner_root):
+            return []
+        pinned.append(nested)
+    cleared: list[str] = []
+
+    def clear(target: Path) -> bool:
+        rows, _error = _registrations(repo)
+        if rows is None:
+            return False
+        row = next((r for r in rows if r.get("path") == str(target)), None)
+        if row is None or "prunable" not in row or os.path.lexists(target):
+            return False
+        record = _record_folder(repo, target)
+        if record is None:
+            return False
+        _make_owner_writable(record)
+        try:
+            shutil.rmtree(record)
+        except OSError:
+            return False
+        cleared.append(str(target))
+        return True
+
+    for nested in sorted(pinned, key=lambda item: len(str(item)), reverse=True):
+        clear(nested)
+    rows, _error = _registrations(repo)
+    if rows is not None and not any(
+        _is_relative_to(Path(str(r.get("path"))), wanted) for r in rows
+    ):
+        clear(wanted)
+    return cleared
+
+
+def _remove_worktree(repo: Path, worktree: Path) -> tuple[int, bytes]:
+    """``git worktree remove --force`` for one offer-pinned worktree, with its
+    folder and its record folder made owner-writable first."""
+    record = _record_folder(repo, worktree)
+    _make_owner_writable(worktree)
+    if record is not None:
+        _make_owner_writable(record)
+    return _git(repo, "worktree", "remove", "--force", str(worktree))
+
+
 def retire_autobuild_worktree(
     *, repo: Path, base: Path, build_id: str, path: Path, expected: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -382,8 +554,15 @@ def retire_autobuild_worktree(
 
     A missing tree is idempotent success only when Git also has no registration
     for it.  Any mismatch from the offer-time registration/status identity
-    preserves the whole tree.
+    preserves the whole tree.  Each offer-pinned tree, and Git's record folder
+    for it, is made owner-writable just before Git removes it, and a pinned
+    registration whose folder an earlier attempt already deleted is cleared
+    first (15 October 2026, FEAT-6AC9).
     """
+    # A retry after an attempt that deleted a folder but not its record:
+    # clear exactly those offer-pinned registrations first, then read the
+    # identity as it is now.
+    cleared = _clear_gone_registrations(repo, base, build_id, path, expected)
     before = inspect_autobuild_worktree(
         repo=repo, base=base, build_id=build_id, path=path
     )
@@ -394,6 +573,8 @@ def retire_autobuild_worktree(
         "before": before,
         "removed_nested": [],
     }
+    if cleared:
+        report["cleared_registrations"] = cleared
     if not before.get("ok"):
         # Idempotent retry: exact owned path absent and no Git registration.
         wanted, ownership_error = _owned_path(base, build_id, path)
@@ -409,17 +590,48 @@ def retire_autobuild_worktree(
             return report
         report["detail"] = before.get("detail") or rows_error or "identity unreadable"
         return report
+    # A registration cleared above is gone from Git's list now, and Git's
+    # status of the tree that held it no longer shows it, so that tree's
+    # status digest cannot match its offer-time one. Its path, commit and
+    # branch must still match exactly, and every other row matches in full.
+    gone = set(cleared)
+    expected_registrations = expected.get("registrations")
+    current_registrations = before.get("registrations")
+    if gone and isinstance(expected_registrations, list):
+
+        def holds_a_cleared_tree(row: Any) -> bool:
+            return isinstance(row, Mapping) and any(
+                _is_relative_to(Path(g), Path(str(row.get("path")))) for g in gone
+            )
+
+        def without_status(rows: list[Any]) -> list[Any]:
+            return [
+                {k: v for k, v in row.items() if k != "status_sha256"}
+                if holds_a_cleared_tree(row)
+                else row
+                for row in rows
+            ]
+
+        expected_registrations = without_status(
+            [
+                row
+                for row in expected_registrations
+                if not (isinstance(row, Mapping) and row.get("path") in gone)
+            ]
+        )
+        if isinstance(current_registrations, list):
+            current_registrations = without_status(current_registrations)
     expected_identity = {
         "build_id": expected.get("build_id"),
         "path": expected.get("path"),
         "base": expected.get("base"),
-        "registrations": expected.get("registrations"),
+        "registrations": expected_registrations,
     }
     current_identity = {
         "build_id": before.get("build_id"),
         "path": before.get("path"),
         "base": before.get("base"),
-        "registrations": before.get("registrations"),
+        "registrations": current_registrations,
     }
     if current_identity != expected_identity:
         report["detail"] = (
@@ -439,6 +651,8 @@ def retire_autobuild_worktree(
         if not isinstance(selected, Mapping):
             report["detail"] = "cleanup registration identity is malformed"
             return report
+        if selected.get("path") in gone:
+            continue
         matches = [row for row in nested if row == dict(selected)]
         if len(matches) != 1:
             report["detail"] = (
@@ -454,7 +668,7 @@ def retire_autobuild_worktree(
         cleanup_rows, key=lambda item: len(str(item["path"])), reverse=True
     ):
         nested_path = str(row["path"])
-        code, raw = _git(repo, "worktree", "remove", "--force", nested_path)
+        code, raw = _remove_worktree(repo, Path(nested_path))
         if code != 0:
             report["detail"] = (
                 f"could not remove registered nested worktree {nested_path}: "
@@ -485,7 +699,7 @@ def retire_autobuild_worktree(
             + ", ".join(sorted(descendants))
         )
         return report
-    code, raw = _git(repo, "worktree", "remove", "--force", str(wanted))
+    code, raw = _remove_worktree(repo, wanted)
     if code != 0:
         report["detail"] = (
             f"could not remove outer worktree {wanted}: "
