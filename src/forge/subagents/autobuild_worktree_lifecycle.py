@@ -388,39 +388,59 @@ def inspect_autobuild_worktree(
 # a link is not a folder here, whatever it points at.
 
 
+def _subfolders(descriptor: int) -> list[str]:
+    """The names of the real folders (never links) in an open folder."""
+    with os.scandir(descriptor) as entries:
+        return [
+            entry.name for entry in entries if entry.is_dir(follow_symlinks=False)
+        ]
+
+
+_OPEN_FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _widen_folder(parent: int, name: str) -> None:
+    """Open ``name`` in ``parent`` as a folder, never through a link, give the
+    owner full access to it by its open handle, then do the same below it.
+
+    An entry that cannot be opened that way (a link, something that is not a
+    folder, a folder the owner cannot read) is skipped; Git then cannot
+    remove it and the retirement says "kept".
+    """
+    try:
+        descriptor = os.open(name, _OPEN_FOLDER, dir_fd=parent)
+    except OSError:
+        return
+    try:
+        mode = os.fstat(descriptor).st_mode
+        if not stat.S_ISDIR(mode):
+            return
+        if stat.S_IMODE(mode) & 0o700 != 0o700:
+            os.fchmod(descriptor, stat.S_IMODE(mode) | 0o700)
+        for child in _subfolders(descriptor):
+            _widen_folder(descriptor, child)
+    except (OSError, RecursionError):
+        return
+    finally:
+        os.close(descriptor)
+
+
 def _make_owner_writable(top: Path) -> None:
     """Give the owner full access to every folder under ``top``, links skipped.
 
-    Best effort: a folder that cannot be changed is left for Git to report,
-    and the receipt says so in the helper's fixed sentence.
+    Every folder is opened with ``O_NOFOLLOW`` from its parent's open handle
+    and changed through that handle, so a link put in a folder's place is
+    never followed, even one swapped in after the folder was listed. Best
+    effort: what cannot be changed is left for Git to report.
     """
-
-    def widen(name: str, dir_fd: int | None) -> None:
-        try:
-            mode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
-            if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) & 0o700 == 0o700:
-                return
-            wider = stat.S_IMODE(mode) | 0o700
-            try:
-                # Never through a link: on a link this refuses rather than
-                # changing what it points at.
-                os.chmod(name, wider, dir_fd=dir_fd, follow_symlinks=False)
-            except NotImplementedError:
-                # A platform that cannot say "do not follow": the entry was
-                # checked as a folder, not a link, just above.
-                os.chmod(name, wider, dir_fd=dir_fd)
-        except (OSError, ValueError):
-            return
-
-    widen(str(top), None)
     try:
-        for _root, directories, _files, descriptor in os.fwalk(
-            str(top), topdown=True, follow_symlinks=False
-        ):
-            for name in directories:
-                widen(name, descriptor)
+        parent = os.open(top.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
     except OSError:
         return
+    try:
+        _widen_folder(parent, top.name)
+    finally:
+        os.close(parent)
 
 
 def _worktrees_record_root(repo: Path) -> Path | None:
@@ -485,61 +505,122 @@ def _record_folder(repo: Path, worktree: Path) -> Path | None:
     return None
 
 
+def _same_registration(offered: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
+    """Is Git's current registration the one the offer pinned, on commit,
+    branch and detached state, and not locked?"""
+    return (
+        "locked" not in current
+        and all(
+            offered.get(key) == current.get(key)
+            for key in ("path", "head", "branch", "detached")
+        )
+    )
+
+
 def _clear_gone_registrations(
     repo: Path, base: Path, build_id: str, path: Path, expected: Mapping[str, Any]
-) -> list[str]:
+) -> tuple[list[str], str | None]:
     """Clear an offer-pinned registration whose working folder is already gone.
 
     An earlier attempt can delete a worktree's folder and then stop on its
-    record folder, leaving a "prunable" registration behind. For each exact path the offer named for clean-up (and the outer
-    tree itself, once nothing else is registered below it) that Git still
-    lists as prunable with no folder on disk, its own record folder is made
-    writable and removed, which is what ``git worktree prune`` does for that
-    one entry and no other. Returns the paths cleared.
+    record folder, leaving a "prunable" registration behind. For each exact
+    row the offer named for clean-up (and the outer tree's own row, once
+    nothing else is registered below it) that Git still lists as prunable
+    with no folder on disk, and that is still that very registration (same
+    commit, branch and detached state, not locked), its record folder is made
+    writable and removed: what ``git worktree prune`` does for that one entry
+    and no other. Every prunable pinned row is checked before any is cleared;
+    a mismatch clears nothing and comes back as the reason to keep the tree.
+    Returns ``(paths cleared, reason or None)``.
     """
     wanted, error = _owned_path(base, build_id, path)
     if error or wanted is None or str(expected.get("path")) != str(wanted):
-        return []
+        return [], None
     cleanup = expected.get("cleanup_registrations")
-    if not isinstance(cleanup, list):
-        return []
+    registrations = expected.get("registrations")
+    if not isinstance(cleanup, list) or not isinstance(registrations, list):
+        return [], None
     inner_root = wanted / INNER_WORKTREES_REL
-    pinned: list[Path] = []
+    pinned: list[Mapping[str, Any]] = []
     for selected in cleanup:
         if not isinstance(selected, Mapping):
-            return []
-        nested = Path(str(selected.get("path") or ""))
-        if not _is_relative_to(nested, inner_root):
-            return []
-        pinned.append(nested)
-    cleared: list[str] = []
+            return [], None
+        if not _is_relative_to(Path(str(selected.get("path") or "")), inner_root):
+            return [], None
+        pinned.append(selected)
+    outer_row = next(
+        (
+            row
+            for row in registrations
+            if isinstance(row, Mapping) and row.get("path") == str(wanted)
+        ),
+        None,
+    )
 
-    def clear(target: Path) -> bool:
-        rows, _error = _registrations(repo)
-        if rows is None:
-            return False
+    def gone_and_registered(
+        offered: Mapping[str, Any], rows: list[dict[str, str | None]]
+    ) -> tuple[Path | None, str | None]:
+        """``(record folder to clear, None)``, ``(None, reason)`` on a
+        mismatch, or ``(None, None)`` when there is nothing to clear here."""
+        target = Path(str(offered.get("path")))
         row = next((r for r in rows if r.get("path") == str(target)), None)
         if row is None or "prunable" not in row or os.path.lexists(target):
-            return False
+            return None, None
+        if not _same_registration(offered, row):
+            return None, (
+                f"the leftover registration at {target} is not the one the "
+                "offer pinned (its commit, branch or lock differs, or can no "
+                "longer be read); nothing was cleared"
+            )
         record = _record_folder(repo, target)
         if record is None:
-            return False
-        _make_owner_writable(record)
-        try:
-            shutil.rmtree(record)
-        except OSError:
-            return False
-        cleared.append(str(target))
-        return True
+            return None, (
+                f"Git's record folder for {target} could not be proved; "
+                "nothing was cleared"
+            )
+        return record, None
 
-    for nested in sorted(pinned, key=lambda item: len(str(item)), reverse=True):
-        clear(nested)
+    def clear(records: list[tuple[str, Path]]) -> str | None:
+        for target, record in records:
+            _make_owner_writable(record)
+            try:
+                shutil.rmtree(record)
+            except OSError as exc:
+                return (
+                    f"Git's record folder for {target} could not be removed: "
+                    f"{type(exc).__name__}"
+                )
+            cleared.append(target)
+        return None
+
+    cleared: list[str] = []
     rows, _error = _registrations(repo)
-    if rows is not None and not any(
-        _is_relative_to(Path(str(r.get("path"))), wanted) for r in rows
+    if rows is None:
+        return [], None
+    records: list[tuple[str, Path]] = []
+    for offered in sorted(pinned, key=lambda r: len(str(r.get("path"))), reverse=True):
+        record, reason = gone_and_registered(offered, rows)
+        if reason:
+            return [], reason
+        if record is not None:
+            records.append((str(offered.get("path")), record))
+    reason = clear(records)
+    if reason:
+        return cleared, reason
+    rows, _error = _registrations(repo)
+    if (
+        outer_row is not None
+        and rows is not None
+        and not any(_is_relative_to(Path(str(r.get("path"))), wanted) for r in rows)
     ):
-        clear(wanted)
-    return cleared
+        record, reason = gone_and_registered(outer_row, rows)
+        if reason:
+            return cleared, reason
+        if record is not None:
+            reason = clear([(str(wanted), record)])
+            if reason:
+                return cleared, reason
+    return cleared, None
 
 
 def _remove_worktree(repo: Path, worktree: Path) -> tuple[int, bytes]:
@@ -568,7 +649,9 @@ def retire_autobuild_worktree(
     # A retry after an attempt that deleted a folder but not its record:
     # clear exactly those offer-pinned registrations first, then read the
     # identity as it is now.
-    cleared = _clear_gone_registrations(repo, base, build_id, path, expected)
+    cleared, refusal = _clear_gone_registrations(
+        repo, base, build_id, path, expected
+    )
     before = inspect_autobuild_worktree(
         repo=repo, base=base, build_id=build_id, path=path
     )
@@ -581,6 +664,9 @@ def retire_autobuild_worktree(
     }
     if cleared:
         report["cleared_registrations"] = cleared
+    if refusal:
+        report["detail"] = refusal
+        return report
     if not before.get("ok"):
         # Idempotent retry: exact owned path absent and no Git registration.
         wanted, ownership_error = _owned_path(base, build_id, path)

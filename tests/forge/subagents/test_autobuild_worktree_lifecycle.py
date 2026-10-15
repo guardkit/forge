@@ -429,10 +429,42 @@ def _todays_state(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
     return repo, base, outer, inner, record, offered
 
 
+def test_a_registration_git_half_deleted_is_not_cleared_on_retry(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    """Git's failed removal also deleted part of the record folder, the
+    registration's commit file among them, so it can no longer be proved to
+    be the one the offer pinned (Codex review, R1). Nothing is cleared, and
+    the tree is kept with the reason; a kept retirement holds nothing up."""
+    repo, base, outer, inner, record, offered = _todays_state(tmp_path)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert "not the one the offer pinned" in result["detail"]
+    assert "cleared_registrations" not in result
+    assert record.exists() and outer.is_dir()
+
+
 def test_a_registration_whose_folder_is_already_gone_is_cleared_on_retry(
     tmp_path: Path, _writable_again: None
 ) -> None:
-    repo, base, outer, inner, record, offered = _todays_state(tmp_path)
+    """The working folder is gone, and Git's registration is still exactly the
+    one the offer pinned: it is cleared, then the outer tree is kept because
+    its offer-time fingerprint can no longer be proved."""
+    import shutil
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    record = _record_folder(repo, inner)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    shutil.rmtree(inner)
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain")
 
     result = retire_autobuild_worktree(
         repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
@@ -441,11 +473,54 @@ def test_a_registration_whose_folder_is_already_gone_is_cleared_on_retry(
     assert result["cleared_registrations"] == [str(inner)]
     assert not record.exists()
     assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
-    # The outer tree's offer-time fingerprint can no longer be proved, so it
-    # is kept, in plain words.
     assert result["status"] == "kept", result
     assert "can no longer be proved" in result["detail"]
     assert outer.is_dir()
+
+
+@pytest.mark.parametrize("change", ["other-branch", "other-commit", "locked"])
+def test_a_different_registration_at_the_same_missing_path_is_not_cleared(
+    tmp_path: Path, _writable_again: None, change: str
+) -> None:
+    """Codex review, R1: the path alone is not enough. A registration at the
+    pinned path on another branch or commit, or one that is locked, is not
+    the one the offer pinned, and nothing is cleared."""
+    import shutil
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    if change == "locked":
+        _git(repo, "worktree", "lock", str(inner))
+    else:
+        _git(repo, "worktree", "remove", "--force", str(inner))
+        if change == "other-branch":
+            _git(repo, "worktree", "add", "-q", "-b", "other", str(inner), "main")
+        else:
+            (repo / "second").write_text("second\n")
+            _git(repo, "add", "second")
+            _git(repo, "commit", "-q", "-m", "second")
+            _git(repo, "worktree", "add", "-q", str(inner), f"autobuild/{FEATURE}")
+            _git(inner, "reset", "-q", "--hard", "main")
+    record = _record_folder(repo, inner)
+    shutil.rmtree(inner)
+    # Git itself never calls a locked registration prunable.
+    listed = _git(repo, "worktree", "list", "--porcelain")
+    assert ("locked" if change == "locked" else "prunable") in listed
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    if change != "locked":
+        assert "not the one the offer pinned" in result["detail"]
+    assert "cleared_registrations" not in result
+    assert record.exists() and outer.is_dir()
+    assert str(inner) in _git(repo, "worktree", "list", "--porcelain")
 
 
 def test_on_retry_the_outer_trees_uncommitted_changes_are_kept(
@@ -528,3 +603,49 @@ def test_a_symbolic_link_to_a_read_only_folder_outside_is_not_followed(
     assert result["status"] == "removed", result
     assert {folder: folder.stat().st_mode for folder in before} == before
     assert (outside_folders[0] / "file.txt").read_text() == "cached\n"
+
+
+def test_a_folder_swapped_for_a_link_after_listing_is_not_followed(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R2: a folder replaced by a link to a read-only folder
+    outside, between being listed and being changed, is never followed: each
+    folder is opened without following links and changed by its handle."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    outside = tmp_path / "outside"
+    outside_folders = _read_only_cache(outside)
+    outside.chmod(0o555)
+    before = {folder: folder.stat().st_mode for folder in [outside, *outside_folders]}
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("ignored/\n")
+    swap = inner / "ignored" / "swap-me"
+    swap.mkdir(parents=True)
+    swap.chmod(0o555)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    real = lifecycle._subfolders
+    swapped: list[bool] = []
+
+    def listing_then_swap(descriptor: int) -> list[str]:
+        names = real(descriptor)
+        if "swap-me" in names and not swapped:
+            swap.rmdir()
+            swap.symlink_to(outside, target_is_directory=True)
+            swapped.append(True)
+        return names
+
+    monkeypatch.setattr(lifecycle, "_subfolders", listing_then_swap)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert swapped == [True]
+    assert {folder: folder.stat().st_mode for folder in before} == before
+    assert (outside_folders[0] / "file.txt").read_text() == "cached\n"
+    assert result["status"] == "removed", result
