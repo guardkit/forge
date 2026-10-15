@@ -1022,10 +1022,23 @@ class SidecarLiveGateInvoker:
                 answer = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
             # A refusal is an answer only in the sidecar's own words (15
-            # October 2026, Codex R5); anything else is no answer.
-            from forge.deploy.sidecar_runner import sidecar_refusal_sentence
+            # October 2026, Codex R5); anything else is no answer. A body that
+            # says the driver was stopped at its time limit is read first.
+            from forge.deploy.sidecar_runner import (
+                refusal_sentence_in,
+                says_it_timed_out,
+                sidecar_error_payload,
+            )
 
-            sentence = sidecar_refusal_sentence(exc)
+            payload = sidecar_error_payload(exc)
+            if says_it_timed_out(payload):
+                return _instrument(
+                    f"the deploy sidecar at {self._base_url} answered HTTP "
+                    f"{exc.code}: the live-gate driver was stopped at its "
+                    "time limit",
+                    answer_lost=True,
+                )
+            sentence = refusal_sentence_in(payload)
             if sentence is None:
                 return _instrument(
                     f"the deploy sidecar at {self._base_url} answered HTTP "
@@ -1046,6 +1059,31 @@ class SidecarLiveGateInvoker:
             # An unreadable answer is no answer: the driver may still be running.
             return _instrument(f"live-gate invocation error: {exc}", answer_lost=True)
 
+        # TIMEOUT FIRST (15 October 2026, Codex round 3): a reply that says
+        # the driver was stopped at its time limit is a lost answer whatever
+        # else is wrong with it — a missing or mismatched cwd included.
+        if isinstance(answer, dict) and answer.get("timed_out") is True:
+            return LiveGateInvocation(
+                verdict="environment_fail",
+                run_id=run_id_fallback,
+                gate_ids=gate_ids,
+                dry_run=False,
+                answer_lost=True,
+                detail={
+                    "argv": argv,
+                    "cwd": answer.get("cwd"),
+                    "sidecar": self._base_url,
+                    "exit_code": answer.get("exit_code"),
+                    "error": (
+                        f"the live-gate driver was stopped after "
+                        f"{self._timeout_seconds}s inside the sandbox"
+                    ),
+                    "stdout_tail": _bounded_tail(str(answer.get("stdout") or "")),
+                    "stderr_tail": _bounded_tail(
+                        str(answer.get("stderr_tail") or "")
+                    ),
+                },
+            )
         if not isinstance(answer, dict) or not isinstance(
             answer.get("exit_code"), int
         ) or isinstance(answer.get("exit_code"), bool):
@@ -1077,30 +1115,6 @@ class SidecarLiveGateInvoker:
                 f"the live gate was asked to run in {self._repo_path} and the "
                 f"deploy sidecar ran it in {ran_in!r}, so the tree that was "
                 "checked is not the tree that was asked about"
-            )
-        if answer.get("timed_out") is True:
-            # Stopped at its time limit in the sandbox: what the driver started
-            # may still be running (15 October 2026, Codex R4).
-            return LiveGateInvocation(
-                verdict="environment_fail",
-                run_id=run_id_fallback,
-                gate_ids=gate_ids,
-                dry_run=False,
-                answer_lost=True,
-                detail={
-                    "argv": argv,
-                    "cwd": ran_in,
-                    "sidecar": self._base_url,
-                    "exit_code": answer.get("exit_code"),
-                    "error": (
-                        f"the live-gate driver was stopped after "
-                        f"{self._timeout_seconds}s inside the sandbox"
-                    ),
-                    "stdout_tail": _bounded_tail(str(answer.get("stdout") or "")),
-                    "stderr_tail": _bounded_tail(
-                        str(answer.get("stderr_tail") or "")
-                    ),
-                },
             )
         invocation = project_driver_answer(
             argv=argv,

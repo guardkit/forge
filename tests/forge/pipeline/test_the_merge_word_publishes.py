@@ -892,6 +892,82 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         assert publisher.asked == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("publication", ["on", "off"])
+    @pytest.mark.parametrize("answer, kept", [("could-not-run", False), ("lost", True)])
+    async def test_a_reused_join_whose_checks_could_not_run(
+        self,
+        config_with_publication_off: ForgeConfig,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        publication: str,
+        answer: str,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R6 (settled by default): the second press
+        picks the join up and asks the build system to check it. When the
+        build system ANSWERS that its checks could not run, the press ends
+        GATED (publication off) or not wholly checked (publication on), its
+        candidate's teardown answers that it is down, and the hold is put
+        down. When the check-join's answer is lost (no report of its own),
+        the command may still be running, and the hold is kept."""
+        from forge.adapters.guardkit.models import GuardKitResult
+
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
+            config_with_publication_off, pool
+        )
+        first = await _press(deps, repo_root)
+        assert first.result == "publication-pending"
+        self._forget_which_commit_the_checks_ran_on(pool)
+
+        asked: list[list[str]] = []
+
+        async def _check_join(**kwargs: Any) -> GuardKitResult:
+            args = list(kwargs.get("args") or [])
+            asked.append(args)
+            if answer == "lost":
+                return GuardKitResult(
+                    status="failed",
+                    subcommand="autobuild",
+                    duration_secs=0.1,
+                    stdout_tail="",
+                    stderr="the deploy sidecar could not be reached",
+                    exit_code=1,
+                )
+            report = {
+                "outcome": "checked",
+                "joined_commit": args[args.index("--joined") + 1],
+                "verify_ran": False,
+                "verify_ok": False,
+                "verify_status": "unverified",
+                "verify_detail": "the install failed in the joined tree",
+            }
+            return GuardKitResult(
+                status="failed",
+                subcommand="autobuild",
+                duration_secs=0.1,
+                stdout_tail=json.dumps(report),
+                stderr=None,
+                exit_code=1,
+            )
+
+        import dataclasses
+
+        config_two = (
+            config_with_publication_on if publication == "on" else config_with_publication_off
+        )
+        deps_two, deploy_two, _joins_two, _bus_two = _deps_naming_the_candidate(
+            config_two, pool, publisher=_APublisherThatSays([_published("c" * 40)])
+        )
+        deps_two = dataclasses.replace(deps_two, guardkit_run=_check_join)
+        second = await _press(deps_two, repo_root)
+
+        assert [a[0] for a in asked] == ["check-join"]
+        assert second.result == "publication-pending", second.detail
+        assert "candidate_down" in _legs(deploy_two)
+        assert (_record(pool).lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
     async def test_a_done_line_naming_this_commit_still_counts(
         self,
         config_with_publication_off: ForgeConfig,
@@ -1961,17 +2037,25 @@ class _APromoteThatReverted(_AProjectWithATarget):
 
 
 class TestAPromoteThatDidNotCompleteKeepsTheHold:
-    """A promote that did not report complete — its answer lost, failed in
-    its own words, reverted (the coach's G2), or deployed something other
-    than what it was handed — may have left something running or changing
-    on the target, and the deployment lock is put down on every ending. So
-    the hold is kept and a second press is refused until it lapses."""
+    """A promote that did not report complete: its answer lost, failed in its
+    own words, reverted (the coach's G2), or deployed something other than
+    what it was handed.
+
+    Changed 15 October 2026 (settled by default): only the promote whose
+    answer was lost may have left something running, so only it keeps the
+    hold and has a second press refused. The others answered: the press has
+    finished, and the hold is put down."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "how",
-        ["answer-lost", "failed-in-its-own-words", "reverted", "revert-failed",
-         "reported-another-identity"],
+        "how, kept",
+        [
+            ("answer-lost", True),
+            ("failed-in-its-own-words", False),
+            ("reverted", False),
+            ("revert-failed", False),
+            ("reported-another-identity", False),
+        ],
     )
     async def test_the_hold_is_kept_and_a_second_press_is_refused(
         self,
@@ -1979,6 +2063,7 @@ class TestAPromoteThatDidNotCompleteKeepsTheHold:
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         how: str,
+        kept: bool,
     ) -> None:
         sidecar = ASidecarThat(
             None if how == "answer-lost"
@@ -2005,9 +2090,9 @@ class TestAPromoteThatDidNotCompleteKeepsTheHold:
 
             assert outcome.result == "merged-deploy-failed", outcome.detail
             assert [c.get("leg") for c in deploy.calls].count("promote") == 1
-            assert _record(pool).lease_holder is not None
+            assert (_record(pool).lease_holder is not None) is kept
             again = await _press(deps, repo_root)
-            assert "another worker" in again.detail
+            assert ("another worker" in again.detail) is kept
             # The send step's record the queue reads is as it always was.
             send = [
                 line for line in _record(pool).lines

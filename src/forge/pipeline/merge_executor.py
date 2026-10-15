@@ -1532,17 +1532,19 @@ async def execute_merge_deploy(
     # 2026). The lease used to be taken and never put down, so every press
     # held its build for the whole lease however it ended, and a retry of
     # FEAT-E592 at 15:15 was refused because of it. The turn number fences
-    # writes to the record, not a merge already sent into a sandbox. So the
-    # rule is simple: the hold is put down only when the press ended cleanly
-    # (an ending marked with ``_settled`` below) AND every deploy-stage leg it
-    # sent into the sandbox — the candidate check, the question about what is
-    # running, the promote with its revert, a teardown — reported complete.
-    # Any leg that failed, raised or was not answered may have left something
-    # running, so the hold is kept and lapses on its own, as it does after a
-    # cancellation, a merge with no answer, a send whose answer was lost, or
-    # a replaced worker.
+    # writes to the record, not a merge already sent into a sandbox.
+    #
+    # SETTLED BY DEFAULT (15 October 2026, after three review rounds of
+    # naming endings one at a time). Every ending the press RETURNS is a
+    # finished press, and the hold is put down — unless something it started
+    # may still be running: a leg or a step that raised, got no answer or was
+    # stopped at its time limit, or a merge command, check-join or send whose
+    # answer was lost (``a_leg_did_not_complete``); something left standing
+    # (``something_is_left_standing``, ``candidate_standing``); or a record
+    # this worker could no longer write (``failed_step == "record"``, a
+    # replaced worker). A cancellation or a crash never reaches the decision,
+    # so the hold is kept for those too. Whatever is kept lapses on its own.
     # ``held_turn`` is the turn this press took the lease on; 0 = none.
-    press_settled = False
     held_turn = 0
     # Set when a deploy-stage leg got no answer (it raised, or the stage says
     # a step's request got none), or a candidate tree's removal was not
@@ -1604,12 +1606,9 @@ async def execute_merge_deploy(
                 f"{'copies of them' if many else 'copy of it'}."
             )
 
-    def _settled(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
-        """Mark ``outcome`` as an ending where nothing this press started can
-        still be running. A replaced worker's ending is never one."""
-        nonlocal press_settled
-        if outcome.failed_step != "record":
-            press_settled = True
+    def _with_main_copies_said(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
+        """Every ending says which judge files the merge checked with main's
+        copies, when the merge said so (one place, for every ending)."""
         for said in _main_copies_said:
             if said not in (outcome.detail or ""):
                 outcome.detail = f"{outcome.detail} {said}".strip()
@@ -2548,7 +2547,7 @@ async def execute_merge_deploy(
         # complete (a question that went unanswered, a promote that was
         # stopped), that leg keeps the hold, not this mark.
         if already_running:
-            return _settled(MergeDeployOutcome(
+            return MergeDeployOutcome(
                 result=RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING,
                 # PASSED: nothing is waiting. The work is on the remote and a
                 # later result that contains it is already running, so there
@@ -2569,8 +2568,8 @@ async def execute_merge_deploy(
                 checks_total=checks_total,
                 deployed_in=None,
                 gate_before_merge=_gate_for_report() if gate_began else None,
-            ))
-        return _settled(MergeDeployOutcome(
+            )
+        return MergeDeployOutcome(
             result=RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING,
             # PASSED, AND WHY, because it is a fair question with the word
             # "pending" in the result. PASSED is what closes the build's row,
@@ -2599,7 +2598,7 @@ async def execute_merge_deploy(
             # says so by sending no block at all rather than a block of
             # nothings.
             gate_before_merge=_gate_for_report() if gate_began else None,
-        ))
+        )
 
     # -----------------------------------------------------------------------
     # THE DEPLOY: under the lock, only forwards, by an identity that cannot be
@@ -2878,7 +2877,7 @@ async def execute_merge_deploy(
         deployed AND the running thing reported back the very identity it was
         handed. Anything short of all three is one of the two words before it.
         """
-        return _settled(MergeDeployOutcome(
+        return MergeDeployOutcome(
             result=RESULT_WORD_MERGED_AND_RUNNING,
             status="PASSED",
             merged_sha=j_commit,
@@ -2896,7 +2895,7 @@ async def execute_merge_deploy(
             checks_total=checks_total,
             deployed_in=_deployed_in(),
             gate_before_merge=_gate_for_report() if gate_began else None,
-        ))
+        )
 
     async def _deploy_what_was_checked(
         *,
@@ -3623,6 +3622,7 @@ async def execute_merge_deploy(
         store: Any,
     ) -> MergeDeployOutcome:
         """It was checked and it was not sent. The reason is said; J is kept."""
+        nonlocal a_leg_did_not_complete
         if store is not None and not store.record(
             build_id=build_id,
             turn=turn,
@@ -3677,8 +3677,8 @@ async def execute_merge_deploy(
             "the-publisher-could-not-be-reached",
             "the-attempts-ran-out",
         ):
-            return pending
-        return _settled(pending)
+            a_leg_did_not_complete = True
+        return pending
 
     def _not_wholly_checked(
         *,
@@ -4429,13 +4429,11 @@ async def execute_merge_deploy(
                     # sandbox answered it could not make is not running work;
                     # one with no answer keeps the hold through the flag above.
                     return _nothing_was_published(
-                        _settled(
-                            _cannot_join(
+                        _cannot_join(
                                 f"{named} could not be joined onto {target_branch}: "
                                 f"{made.refusal}. Nothing was merged and the "
                                 "branch is kept."
-                            )
-                        ),
+                            ),
                         store=store,
                         turn=turn,
                     )
@@ -4674,13 +4672,14 @@ async def execute_merge_deploy(
                         failed_step="merge",
                         detail=sentence,
                     )
-                    # Settled only when the merge command printed its own
-                    # report. No report — killed, timed out, or an answer
-                    # lost on the way back from a sandbox — is an ending
-                    # whose outcome nobody knows, and the hold is kept.
-                    # Either way nothing was sent, and the record says so.
+                    # No report from the merge command — killed, timed out,
+                    # or an answer lost on the way back from a sandbox — is
+                    # an ending whose outcome nobody knows, and the hold is
+                    # kept. Either way nothing was sent, and the record says so.
+                    if report is None:
+                        a_leg_did_not_complete = True
                     return _nothing_was_published(
-                        _settled(refused) if report is not None else refused,
+                        refused,
                         store=store,
                         turn=turn,
                     )
@@ -4692,6 +4691,9 @@ async def execute_merge_deploy(
                 # kept under its own name, the record says the checks did not
                 # finish, and nothing is published.
                 if joined_but_unchecked:
+                    # Killed or died before it could say anything: what it
+                    # started may still be running, so the hold is kept.
+                    a_leg_did_not_complete = True
                     if store is not None:
                         store.done(
                             build_id=build_id,
@@ -4840,7 +4842,7 @@ async def execute_merge_deploy(
                             now=deps.clock(),
                             result=RESULT_PUBLICATION_PENDING,
                         )
-                    return _settled(MergeDeployOutcome(
+                    return MergeDeployOutcome(
                         result="merged-verify-failed",
                         status="FAILED",
                         merged_sha=j_commit,
@@ -4849,7 +4851,7 @@ async def execute_merge_deploy(
                         checks_passed=checks_passed,
                         checks_total=checks_total,
                         verify_status="unverified" if could_not_run else "failed",
-                    ))
+                    )
 
             # ------------------------------------------------------------------
             # A RED SET OF CHECKS STAYS RED. This press may have picked up a join
@@ -4916,7 +4918,7 @@ async def execute_merge_deploy(
                         now=deps.clock(),
                         result=RESULT_PUBLICATION_PENDING,
                     )
-                return _settled(MergeDeployOutcome(
+                return MergeDeployOutcome(
                     result="merged-verify-failed",
                     status="FAILED",
                     merged_sha=j_commit,
@@ -4935,7 +4937,7 @@ async def execute_merge_deploy(
                     verify_status=(
                         "unverified" if recorded_could_not_run else "failed"
                     ),
-                ))
+                )
 
             # ------------------------------------------------------------------
             # A JOIN THIS PRESS DID NOT MAKE: ASK THE BUILD SYSTEM TO CHECK IT.
@@ -4977,6 +4979,15 @@ async def execute_merge_deploy(
                 check_join_said = await ask_the_build_system_to_check_the_join(
                     deps.guardkit_run, **check_join_kwargs
                 )
+                # A check-join that printed no report of its own (killed, timed
+                # out, or its answer lost) may still be running: keep the hold.
+                # One that said its checks could not run has answered.
+                if (
+                    not check_join_said.ran
+                    and not check_join_said.not_installed
+                    and check_join_said.report is None
+                ):
+                    a_leg_did_not_complete = True
                 if check_join_said.ran:
                     checks_passed = check_join_said.checks_passed
                     checks_total = check_join_said.checks_total
@@ -5030,7 +5041,7 @@ async def execute_merge_deploy(
                             )
                         else:
                             said = check_join_said.sentence
-                        return _settled(MergeDeployOutcome(
+                        return MergeDeployOutcome(
                             result="merged-verify-failed",
                             status="FAILED",
                             merged_sha=j_commit,
@@ -5045,7 +5056,7 @@ async def execute_merge_deploy(
                             verify_status=(
                                 "unverified" if joined_could_not_run else "failed"
                             ),
-                        ))
+                        )
                     logger.info(
                         "merge-executor: the build system checked %s's reused "
                         "join (%s) and it passed, so both kinds of check have "
@@ -5096,12 +5107,10 @@ async def execute_merge_deploy(
                 # A leg whose answer was lost earlier still keeps the hold,
                 # through ``a_leg_did_not_complete``.
                 return _nothing_was_published(
-                    _settled(
-                        _could_not_check(
+                    _could_not_check(
                             "main moved since the preview: previewed tree "
                             f"{expected_preview_tree}, joined tree {j_tree}"
-                        )
-                    ),
+                        ),
                     store=store,
                     turn=turn,
                 )
@@ -5126,11 +5135,11 @@ async def execute_merge_deploy(
             # hold through the two flags the hold is decided on.
             laid = await _lay_the_tree_out(str(j_commit))
             if laid is not None:
-                return _nothing_was_published(_settled(laid), store=store, turn=turn)
+                return _nothing_was_published(laid, store=store, turn=turn)
             checked_outcome = await _run_the_candidate_check(str(j_commit))
             if checked_outcome is not None:
                 return _nothing_was_published(
-                    _settled(checked_outcome), store=store, turn=turn
+                    checked_outcome, store=store, turn=turn
                 )
 
             what_was_checked = {
@@ -5277,9 +5286,8 @@ async def execute_merge_deploy(
                     deployed_in=_deployed_in() if gate.get("ran") else None,
                     gate_before_merge=_gate_for_report(),
                 )
-                # Nothing was sent. Both kinds of check answered on J, so the
-                # press has finished; a GATED ending keeps the hold.
-                return _settled(switched_off) if both_kinds_ran else switched_off
+                # Nothing was sent, and the press has finished.
+                return switched_off
 
             # ------------------------------------------------------------------
             # NOTHING GOES TO THE REMOTE THAT WAS NOT WHOLLY CHECKED. A press
@@ -5607,9 +5615,9 @@ async def execute_merge_deploy(
     # Never on a cancellation or a crash (those do not reach here), never by a
     # replaced worker; a release that cannot be written is logged and lapses
     # on its own, like the deployment lock's.
+    outcome = _with_main_copies_said(outcome)
     if (
         held_turn
-        and press_settled
         and not a_leg_did_not_complete
         and not something_is_left_standing
         # A candidate a passed check left standing for the promote, with no

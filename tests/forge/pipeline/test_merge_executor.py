@@ -4465,20 +4465,26 @@ class ASidecarThat:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def run_the_leg(self, leg: str) -> Any:
-        """Send one script through the real runner; the stage's result shape."""
-        from forge.deploy.sidecar_runner import SidecarScriptRunner
+        """Send one script through the real runner; the stage's result shape,
+        with the stage's run-wide mark when no answer came back."""
+        from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
 
         host, port = self.server.server_address[:2]
         runner = SidecarScriptRunner(base_url=f"http://{host}:{port}", repo=REPO)
-        exit_code, output = runner(
+        answer = runner(
             cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=5
         )
+        exit_code, output = answer
         return SimpleNamespace(
             outcome="complete" if exit_code == 0 else "failed",
             verdict=None,
             failed_step=None if exit_code == 0 else leg,
             events=(),
-            detail={"deploy_output": output, "candidate": "torn-down"},
+            detail={
+                "deploy_output": output,
+                "candidate": "torn-down",
+                **({"answer_lost": True} if no_answer_came_back(answer) else {}),
+            },
         )
 
     def close(self) -> None:
@@ -4831,11 +4837,22 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         "check, gate, kept",
         [
             ("timed-out", None, True),
+            ("timed-out-wrong-cwd", None, True),
             ("red", None, False),
             ("html-error", None, True),
             ("ok", "timed-out", True),
+            ("ok", "timed-out-no-cwd", True),
+            ("ok", "timed-out-wrong-cwd", True),
         ],
-        ids=["script-timed-out", "script-red", "script-html-error", "gate-timed-out"],
+        ids=[
+            "script-timed-out-no-cwd",
+            "script-timed-out-wrong-cwd",
+            "script-red",
+            "script-html-error",
+            "gate-timed-out",
+            "gate-timed-out-no-cwd",
+            "gate-timed-out-wrong-cwd",
+        ],
     )
     async def test_a_check_script_that_ran_out_of_time_keeps_it(
         self,
@@ -4910,6 +4927,10 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
                     deploy_run_id=kwargs["deploy_run_id"],
                     feature=kwargs["feature_id"],
                     identity_env=kwargs.get("identity_env"),
+                    # The laid-out tree, as the press hands it, so the script
+                    # runner and the gate check where the sidecar says it ran
+                    # (Codex round 3).
+                    candidate_cwd=kwargs.get("candidate_cwd"),
                 )
 
         deps, _publisher, _gk, _dp = _deps(

@@ -653,16 +653,20 @@ class _ASidecarThatAnswers:
                 )
                 if "driver" in body:
                     how = gate
-                    if how == "timed-out":
-                        stopped = json.dumps(
-                            {
-                                "exit_code": 124,
-                                "stdout": "",
-                                "stderr_tail": "",
-                                "cwd": body.get("cwd"),
-                                "timed_out": True,
-                            }
-                        ).encode()
+                    if how.startswith("timed-out"):
+                        stopped_at: dict[str, Any] = {
+                            "exit_code": 124,
+                            "stdout": "",
+                            "stderr_tail": "",
+                            "timed_out": True,
+                        }
+                        # "timed-out-no-cwd" says no place; "-wrong-cwd" the
+                        # wrong one (Codex round 3).
+                        if how == "timed-out":
+                            stopped_at["cwd"] = body.get("cwd")
+                        elif how == "timed-out-wrong-cwd":
+                            stopped_at["cwd"] = "/somewhere/else"
+                        stopped = json.dumps(stopped_at).encode()
                         self.send_response(200)
                         self.send_header("Content-Type", "application/json")
                         self.send_header("Content-Length", str(len(stopped)))
@@ -680,14 +684,17 @@ class _ASidecarThatAnswers:
                 if how == "lost":
                     self.close_connection = True
                     return
-                if how == "timed-out":
-                    stopped = json.dumps(
-                        {
-                            "exit_code": 124,
-                            "output_tail": "stopped at its time limit\n",
-                            "timed_out": True,
-                        }
-                    ).encode()
+                if how.startswith("timed-out"):
+                    stopped_at = {
+                        "exit_code": 124,
+                        "output_tail": "stopped at its time limit\n",
+                        "timed_out": True,
+                    }
+                    # "timed-out" says no place it ran; "-wrong-cwd" the
+                    # wrong one (Codex round 3).
+                    if how == "timed-out-wrong-cwd":
+                        stopped_at["cwd"] = "/somewhere/else"
+                    stopped = json.dumps(stopped_at).encode()
                     self.send_response(200)
                     self.send_header("Content-Type", "application/json")
                     self.send_header("Content-Length", str(len(stopped)))
@@ -705,6 +712,8 @@ class _ASidecarThatAnswers:
                     {
                         "exit_code": 0 if how == "ok" else 1,
                         "output_tail": "ok\n" if how == "ok" else "went red\n",
+                        # Where it ran, as the real sidecar says.
+                        **({"cwd": body["cwd"]} if body.get("cwd") else {}),
                     }
                 ).encode()
                 self.send_response(200)
@@ -1547,3 +1556,64 @@ class TestASandboxGateStoppedAtItsTimeLimit:
         assert result.outcome == "failed"
         assert result.detail["candidate"] == "torn-down"
         assert result.detail.get("answer_lost") is True
+
+
+
+_A_TREE = "/sandbox/clone/.forge-candidates/FEAT-TF"
+
+
+class TestATimeoutIsReadFirst:
+    """15 October 2026, Codex round 3: a reply that says its program was
+    stopped at its time limit is a lost answer whatever else is wrong with it,
+    including a missing or wrong place it says it ran."""
+
+    @pytest.mark.parametrize(
+        "status, body",
+        [
+            (200, b'{"exit_code": 124, "timed_out": true}'),
+            (200, b'{"exit_code": 124, "timed_out": true, "cwd": "/somewhere/else"}'),
+            (200, b'{"timed_out": true}'),
+            (500, b'{"timed_out": true}'),
+        ],
+        ids=["no-cwd", "wrong-cwd", "no-exit-code", "http-error"],
+    )
+    def test_the_script_runner(self, status: int, body: bytes) -> None:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
+
+        sidecar = _ASidecarThatRefusesWith(status, body)
+        try:
+            answer = SidecarScriptRunner(base_url=sidecar.url, repo="guardkit/api_test")(
+                cwd=_A_TREE, script="deploy/deploy.sh", env_file=None, timeout=1
+            )
+        finally:
+            sidecar.close()
+        assert no_answer_came_back(answer)
+        assert getattr(answer, "timed_out", False) is True
+
+    @pytest.mark.parametrize(
+        "status, body",
+        [
+            (200, b'{"exit_code": 124, "timed_out": true}'),
+            (200, b'{"exit_code": 124, "timed_out": true, "cwd": "/somewhere/else"}'),
+            (200, b'{"timed_out": true}'),
+            (500, b'{"timed_out": true}'),
+        ],
+        ids=["no-cwd", "wrong-cwd", "no-exit-code", "http-error"],
+    )
+    def test_the_live_gate_invoker(self, tmp_path, status: int, body: bytes) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        tree = tmp_path / ".forge-candidates" / "FEAT-TF"
+        tree.mkdir(parents=True)
+        sidecar = _ASidecarThatRefusesWith(status, body)
+        try:
+            answer = SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo="guardkit/api_test",
+                repo_path=tree,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            ).invoke(feature="FEAT-TF", target="apitest-sbx")
+        finally:
+            sidecar.close()
+        assert answer.answer_lost is True

@@ -209,8 +209,16 @@ class SidecarScriptRunner:
             # an ANSWER only when it carries the sidecar's own refusal sentence
             # (15 October 2026, Codex R5); an empty, unreadable or HTML body,
             # or a JSON object with no sentence, says nothing about whether the
-            # script ran, so it is no answer.
-            detail = sidecar_refusal_sentence(exc)
+            # script ran, so it is no answer. A body that says the script was
+            # stopped at its time limit is read FIRST, whatever else it says.
+            payload = sidecar_error_payload(exc)
+            if says_it_timed_out(payload):
+                return TimedOut(
+                    SIDECAR_TRANSPORT_EXIT_CODE,
+                    f"sidecar answered HTTP {exc.code}: the script was stopped "
+                    "at its time limit",
+                )
+            detail = refusal_sentence_in(payload)
             if detail is None:
                 return NoAnswer(
                     f"sidecar answered HTTP {exc.code} with no refusal it "
@@ -228,6 +236,15 @@ class SidecarScriptRunner:
             logger.warning("sidecar script runner unexpected error: %s", exc)
             return NoAnswer(f"sidecar client error: {exc}")
 
+        # TIMEOUT FIRST (15 October 2026, Codex round 3): a reply that says the
+        # script was stopped at its time limit is a lost answer whatever else
+        # is wrong with it — a missing or wrong cwd, an odd exit code.
+        if says_it_timed_out(parsed):
+            code = parsed.get("exit_code")
+            if not isinstance(code, int) or isinstance(code, bool):
+                code = SIDECAR_TRANSPORT_EXIT_CODE
+            tail = parsed.get("output_tail", "")
+            return TimedOut(code, tail if isinstance(tail, str) else str(tail))
         if not isinstance(parsed, dict) or "exit_code" not in parsed:
             return NoAnswer(f"sidecar response missing exit_code: {parsed!r}")
         # A DEPLOY THE EXECUTOR REFUSED is not a script that went red and not a
@@ -241,38 +258,50 @@ class SidecarScriptRunner:
             return (SIDECAR_TRANSPORT_EXIT_CODE, f"[{word}] {sentence}")
         exit_code = parsed.get("exit_code")
         output = parsed.get("output_tail", "")
-        # The far side stopped the script at its time limit (15 October 2026).
-        timed_out = parsed.get("timed_out") is True
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):
             return NoAnswer(f"sidecar returned a non-integer exit_code: {exit_code!r}")
         not_honoured = candidate_tree_not_honoured(cwd, parsed)
         if not_honoured is not None:
             logger.error("sidecar script runner: %s", not_honoured)
             return (SIDECAR_TRANSPORT_EXIT_CODE, not_honoured)
-        output = output if isinstance(output, str) else str(output)
-        if timed_out:
-            return TimedOut(exit_code, output)
-        return (exit_code, output)
+        return (exit_code, output if isinstance(output, str) else str(output))
 
 
-def sidecar_refusal_sentence(exc: urllib.error.HTTPError) -> str | None:
-    """The sidecar's own refusal sentence inside an HTTP error, or ``None``.
+def says_it_timed_out(payload: object) -> bool:
+    """Does a sidecar reply say its program was stopped at its time limit?
 
-    15 October 2026 (Codex R5). Every sidecar refusal is a JSON object with a
-    plain ``error`` sentence. Only that is an answer; a body that cannot be
-    read, is not JSON, is not an object, or carries no sentence is ``None``,
-    and the caller treats it as no answer at all.
+    Read FIRST by every client (15 October 2026): such a reply is a lost
+    answer whatever else is wrong with it.
     """
+    return isinstance(payload, dict) and payload.get("timed_out") is True
+
+
+def sidecar_error_payload(exc: urllib.error.HTTPError) -> object:
+    """The decoded body of an HTTP error, or ``None`` when it cannot be read."""
     try:
-        payload = json.loads(exc.read().decode("utf-8"))
+        return json.loads(exc.read().decode("utf-8"))
     except Exception:  # noqa: BLE001 — an unreadable body is no answer
         return None
+
+
+def refusal_sentence_in(payload: object) -> str | None:
+    """The sidecar's own refusal sentence in a decoded error body, or ``None``.
+
+    15 October 2026 (Codex R5). Every sidecar refusal is a JSON object with a
+    plain ``error`` sentence. Only that is an answer; anything else is
+    ``None``, and the caller treats it as no answer at all.
+    """
     if not isinstance(payload, dict):
         return None
     error = payload.get("error")
     if not isinstance(error, str) or not error.strip():
         return None
     return error
+
+
+def sidecar_refusal_sentence(exc: urllib.error.HTTPError) -> str | None:
+    """:func:`refusal_sentence_in` the body of ``exc``."""
+    return refusal_sentence_in(sidecar_error_payload(exc))
 
 
 def names_a_candidate_tree(cwd: object) -> bool:
@@ -327,5 +356,8 @@ __all__ = [
     "no_answer_came_back",
     "candidate_tree_not_honoured",
     "names_a_candidate_tree",
+    "refusal_sentence_in",
+    "says_it_timed_out",
+    "sidecar_error_payload",
     "sidecar_refusal_sentence",
 ]
