@@ -41,7 +41,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -93,6 +93,7 @@ __all__ = [
     "MergeCardNotPublished",
     "EXISTING_FILES_NAMED_ON_THE_CARD",
     "card_line_about_files_that_already_existed",
+    "card_line_about_the_merge_check",
     "card_line_about_scope",
     "card_line_about_tests",
     "make_merge_card_publisher",
@@ -797,6 +798,118 @@ def card_line_about_scope(report: Any) -> str:
     return ""
 
 
+def _named(paths: Sequence[str]) -> str:
+    """``a``, ``a and b``, ``a, b and c``."""
+    items = [str(p) for p in paths]
+    if len(items) <= 1:
+        return "".join(items)
+    return ", ".join(items[:-1]) + " and " + items[-1]
+
+
+def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
+    """What the merge card says about the files that judge the merge, or ``""``.
+
+    Design "The merge check uses main's copy of a check script the build
+    changed" (15 October 2026), item 7. ``reading`` is the offer's
+    ``merge_check_reading`` record. The words say only what the merge WILL
+    run, and claim nothing about what ran anywhere else (review round 1,
+    R2): at most one sentence per case. No reading, or nothing to say, is
+    ``""``, and the card is byte for byte what it was.
+    """
+    if not isinstance(reading, Mapping):
+        return ""
+    if not reading.get("read"):
+        at = str(reading.get("declared_at") or "").strip()
+        where = f"main ({at[:10]})" if at else "main"
+        return (
+            f"Which files run the project's checks on {where} could not be read "
+            "here, so this card cannot say whether the merge will use main's "
+            "versions of any of them."
+        )
+    judges = [j for j in reading.get("judge_files") or [] if isinstance(j, Mapping)]
+
+    def paths(how: str, *roles: str) -> list[str]:
+        return [
+            str(j.get("path"))
+            for j in judges
+            if j.get("how") == how and (not roles or j.get("role") in roles)
+        ]
+
+    sentences: list[str] = []
+    checks = paths("changed", "check")
+    if checks:
+        many = len(checks) > 1
+        sentences.append(
+            f"This build changes {_named(checks)}, which "
+            f"{'run' if many else 'runs'} the project's checks. The merge will "
+            "check the joined code with main's "
+            f"{'versions of those files' if many else 'version of that file'} "
+            f"and will not run this build's changes to {'them' if many else 'it'}."
+        )
+    installs = paths("changed", "install")
+    if installs:
+        many = len(installs) > 1
+        sentences.append(
+            f"This build changes {_named(installs)}, which the project's install "
+            f"runs. The merge will install with main's "
+            f"{'versions of those files' if many else 'version of that file'} "
+            f"and will not run this build's changes to {'them' if many else 'it'}."
+        )
+    deleted = paths("deleted")
+    if deleted:
+        many = len(deleted) > 1
+        sentences.append(
+            f"This build deletes {_named(deleted)}, which the project's declared "
+            f"commands run. The merge uses main's "
+            f"{'versions of them' if many else 'version of it'}, and after the "
+            "merge main's declared commands will name "
+            f"{'files that are' if many else 'a file that is'} gone."
+        )
+    added = paths("added")
+    if added:
+        many = len(added) > 1
+        sentences.append(
+            f"This build adds {_named(added)}, which "
+            f"{'have' if many else 'has'} the same name as a file the project's "
+            f"declared commands run. The merge will run without "
+            f"{'them' if many else 'it'}."
+        )
+    lists = paths("changed", "install-list")
+    if lists:
+        many = len(lists) > 1
+        sentences.append(
+            f"This build changes {_named(lists)}, which the project's install "
+            f"names. The merge will install with main's "
+            f"{'versions of them' if many else 'version of it'}, so a dependency "
+            "this build adds will be missing in the merge check."
+        )
+    links = paths("link")
+    if links:
+        many = len(links) > 1
+        sentences.append(
+            f"{_named(links)} {'are symbolic links' if many else 'is a symbolic link'}, "
+            "so the merge will not be able to check this build. Approving will "
+            "join it but publish nothing."
+        )
+    for unread in reading.get("link_unreadable") or []:
+        if not isinstance(unread, Mapping):
+            continue
+        at = str(unread.get("at") or "")
+        shown = at[:10] if len(at) == 40 and all(c in "0123456789abcdef" for c in at) else at
+        sentences.append(
+            f"The factory could not read whether {unread.get('path')} is a "
+            f"symbolic link at {shown}, so the merge will not be able to check "
+            "this build."
+        )
+        break  # one sentence for this case
+    if reading.get("config_changed"):
+        sentences.append(
+            "This build also changes .guardkit/config.yaml, where the project "
+            "declares its commands. The merge uses main's declarations."
+        )
+    return "\n".join(sentences)
+
+
 def merge_card_words(
     *,
     feature_id: str,
@@ -1082,6 +1195,11 @@ def make_merge_card_publisher(
             extra_details=(
                 {"scope_report": scope.to_dict()}
                 if scope is not None and hasattr(scope, "to_dict")
+                else None
+            ),
+            changed_files=(
+                getattr(scope, "changes", None)
+                if scope is not None and getattr(scope, "read", False)
                 else None
             ),
         )

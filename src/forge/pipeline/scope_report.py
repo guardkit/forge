@@ -524,6 +524,11 @@ class ScopeReport:
     #: could not be read in time, so the files above were marked as tests by
     #: the usual test locations only. The list of files is complete either way.
     test_files_checked: bool = True
+    #: Every change the branch made, parsed from git's ``name_status``
+    #: (:class:`~forge.pipeline.merge_ready_checkpoint.BranchFileChange`), set
+    #: only when the branch was read. Not part of the receipt: the merge card
+    #: holds it against the files that judge the merge (15 October 2026).
+    changes: tuple[Any, ...] | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """The receipt, exactly as it is written to disk and put on the row."""

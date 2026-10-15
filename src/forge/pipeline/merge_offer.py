@@ -49,7 +49,7 @@ import threading
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Awaitable, Callable, Mapping
+from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from nats_core.envelope import EventType, MessageEnvelope
 from nats_core.events import (
@@ -1548,6 +1548,12 @@ def run_the_scope_pass(
         request_why_not=why_not,
     )
     report.compared_against = base
+    if report.read:
+        from forge.pipeline.merge_ready_checkpoint import parse_changed_files
+
+        report.changes = parse_changed_files(
+            str(getattr(reading, "name_status", "") or "")
+        )
     existing = list(report.files_that_already_existed)
     if report.read and existing:
         # Only now is it worth asking where this repository keeps its tests:
@@ -1711,6 +1717,8 @@ class MergeOfferService:
             [Any, Any], AfterDeployCheckSkip | None
         ] = read_after_deploy_check_skip,
         review_preview: Any | None = None,
+        commit_reader: Callable[[str, Path], Any] | None = None,
+        merge_check_rules: Any | None = None,
     ) -> None:
         self._config = config
         self._pool = pool
@@ -1724,7 +1732,14 @@ class MergeOfferService:
         self._clock = clock
         self._after_deploy_check_reader = after_deploy_check_reader
         self._review_preview = review_preview
-        # Builds whose offer is preparing a preview (see :meth:`offer`).
+        # ``(repo key, repo root) -> reader`` with ``read_file_at_commit``: the
+        # commit-based reader the card's merge-check reading uses (15 October
+        # 2026). ``None`` makes no reading, and the card is what it was.
+        self._commit_reader = commit_reader
+        # GuardKit's merge rules; ``None`` imports GuardKit's own at offer time.
+        self._merge_check_rules = merge_check_rules
+        # Builds whose offer is between its durable-record check and its
+        # durable record (see :meth:`offer`).
         self._preparing: set[str] = set()
 
     async def maybe_offer(self, event: Any) -> None:
@@ -1873,6 +1888,11 @@ class MergeOfferService:
             feature_id=event.feature_id,
             card_words=_words,
             extra_details=details,
+            changed_files=(
+                getattr(scope, "changes", None)
+                if scope is not None and getattr(scope, "read", False)
+                else None
+            ),
         )
 
     async def _read_what_was_checked(self, event: Any) -> WhatWasChecked:
@@ -2068,6 +2088,95 @@ class MergeOfferService:
                 exc,
             )
 
+    async def _read_the_merge_check(
+        self,
+        *,
+        row: Any,
+        repo_root: Path,
+        git: Any,
+        build_id: str,
+        candidate_sha: str,
+        review_evidence: Any,
+        preview_base_sha: str | None,
+        changed_files: Sequence[Any] | None,
+    ) -> dict[str, Any] | None:
+        """The offer's ``merge_check_reading``, or ``None`` with no reader.
+
+        Read where the merge will read it (review round 1, R3): the preview's
+        base commit when there is a preview, else the recorded target branch
+        fetched afresh with the merge press's own helper — never the clone's
+        local branch. Never raises: a reading that cannot be made is a
+        record that says why, and the card says so plainly.
+        """
+        if self._commit_reader is None:
+            return None
+        from forge.pipeline.merge_check_reading import (
+            guardkit_rules,
+            read_the_merge_check,
+        )
+
+        try:
+            declared_at: str | None = None
+            refusal: str | None = None
+            if review_evidence is not None:
+                declared_at = preview_base_sha
+                if not declared_at:
+                    refusal = "the preview names no commit it was joined onto"
+            else:
+                from forge.pipeline.merge_join import target_branch_now
+
+                start_point = self._pool.read_start_point(build_id)
+                where = await target_branch_now(
+                    git,
+                    recorded_branch=(
+                        getattr(start_point, "target_branch", None)
+                        if getattr(start_point, "recorded", False)
+                        else None
+                    ),
+                )
+                declared_at = where.commit if where.ok else None
+                refusal = None if where.ok else where.refusal
+            joined: str | None = None
+            joined_expected = (
+                review_evidence is not None
+                and getattr(review_evidence, "state", None) == "ready"
+            )
+            if joined_expected:
+                ask = getattr(self._review_preview, "joined_ref_for", None)
+                joined = ask(review_evidence) if callable(ask) else None
+            rules = (
+                self._merge_check_rules
+                if self._merge_check_rules is not None
+                else guardkit_rules()
+            )
+            return await read_the_merge_check(
+                reader=self._commit_reader(row.repo, repo_root),
+                rules=rules,
+                repo_path=str(repo_root),
+                declared_at=declared_at,
+                declared_at_refusal=refusal,
+                candidate=candidate_sha,
+                joined=joined,
+                joined_expected=joined_expected,
+                changes=changed_files,
+            )
+        except Exception as exc:  # noqa: BLE001 — a reading never stops a card
+            logger.warning(
+                "merge-offer: the merge-check reading for %s could not be made "
+                "(%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return {
+                "declared_at": None,
+                "read": False,
+                "reason": f"the reading could not be made ({type(exc).__name__})",
+                "judge_files": [],
+                "config_changed": False,
+                "link_unreadable": [],
+            }
+
     async def offer(
         self,
         *,
@@ -2075,6 +2184,7 @@ class MergeOfferService:
         feature_id: str,
         card_words: Callable[[str, str | None], str],
         extra_details: Mapping[str, Any] | None = None,
+        changed_files: Sequence[Any] | None = None,
     ) -> bool:
         """Latch the offer and put ONE merge card in front of the owner.
 
@@ -2105,6 +2215,9 @@ class MergeOfferService:
                 durable row and carried on the approval request. The press
                 reads none of it; it is there so the record says who offered
                 what.
+            changed_files: The build's changes as its scope pass read them
+                (``name_status``, parsed), held against the files that judge
+                the merge; ``None`` when they could not be read.
 
         Returns:
             ``True`` when the offer was latched and the card publish was
@@ -2281,23 +2394,25 @@ class MergeOfferService:
         # straight by and is byte for byte what it was. Whether a project has
         # a preview is read from its deploy profile, which can mean a git or
         # sidecar read, so it is asked off the event loop.
-        review_evidence: Any = None
-        preview_base_sha: str | None = None
-        if self._review_preview is not None:
-            # One offer per build while the preview is asked about and
-            # prepared (that can take minutes, and the latch is written only
-            # afterwards): a second offer for the same build in that window is
-            # refused, so a preview is never prepared twice and a card never
-            # offered twice. Nothing awaits between here and the latch write.
-            if build_id in self._preparing:
-                logger.info(
-                    "merge-offer: a preview for %s is already being prepared — "
-                    "not offering twice",
-                    build_id,
-                )
-                return False
-            self._preparing.add(build_id)
-            try:
+        # ONE OFFER PER BUILD from here until its durable record is written
+        # (review round 3 of the merge-check design, 15 October 2026). The
+        # preview's preparation can take minutes and the merge-check reading
+        # adds reads of its own, all before the latch: a second offer for the
+        # same build in that window is refused as a duplicate, so a preview is
+        # never prepared twice and a card never offered twice. Offers without
+        # a preview are held the same way. Released in ``finally``.
+        if build_id in self._preparing:
+            logger.info(
+                "merge-offer: an offer for %s is already being prepared — not "
+                "offering twice",
+                build_id,
+            )
+            return False
+        self._preparing.add(build_id)
+        try:
+            review_evidence: Any = None
+            preview_base_sha: str | None = None
+            if self._review_preview is not None:
                 prepared = await self._prepare_the_preview(
                     row=row,
                     git=git,
@@ -2309,44 +2424,62 @@ class MergeOfferService:
                     expect_main_sha=expect_main_sha,
                     target_branch=recorded_target or MERGE_BASE_REF,
                 )
-            finally:
-                self._preparing.discard(build_id)
-            if prepared is None:
-                return False
-            review_evidence, preview_base_sha = prepared
-            if review_evidence is not None:
-                details["review_evidence"] = review_evidence.model_dump(mode="json")
-                details["preview_tree"] = review_evidence.preview_tree
-                # Also on the record itself (nats-core's optional field);
-                # here beside preview_tree for the press and the receipts.
-                details["preview_base_sha"] = preview_base_sha
-        now = self._clock()
-        self._pool.record_stage(
-            StageLogEntry(
+                if prepared is None:
+                    return False
+                review_evidence, preview_base_sha = prepared
+                if review_evidence is not None:
+                    details["review_evidence"] = review_evidence.model_dump(mode="json")
+                    details["preview_tree"] = review_evidence.preview_tree
+                    # Also on the record itself (nats-core's optional field);
+                    # here beside preview_tree for the press and the receipts.
+                    details["preview_base_sha"] = preview_base_sha
+            merge_check_reading = await self._read_the_merge_check(
+                row=row,
+                repo_root=repo_root,
+                git=git,
                 build_id=build_id,
-                stage_label=MERGE_OFFER_STAGE_LABEL,
-                target_kind="local_tool",
-                target_identifier=MERGE_OFFER_TARGET_IDENTIFIER,
-                status="GATED",
-                gate_mode="MANDATORY_HUMAN_APPROVAL",
-                started_at=now,
-                completed_at=now,
-                duration_secs=0.0,
-                details={
-                    MERGE_OFFER_DETAILS_KEY: {
-                        "request_id": request_id,
-                        "correlation_id": row.correlation_id,
-                        "approval_subject": subject,
-                        **details,
-                    }
-                },
+                candidate_sha=candidate_sha,
+                review_evidence=review_evidence,
+                preview_base_sha=preview_base_sha,
+                changed_files=changed_files,
             )
-        )
+            if merge_check_reading is not None:
+                details["merge_check_reading"] = merge_check_reading
+            now = self._clock()
+            self._pool.record_stage(
+                StageLogEntry(
+                    build_id=build_id,
+                    stage_label=MERGE_OFFER_STAGE_LABEL,
+                    target_kind="local_tool",
+                    target_identifier=MERGE_OFFER_TARGET_IDENTIFIER,
+                    status="GATED",
+                    gate_mode="MANDATORY_HUMAN_APPROVAL",
+                    started_at=now,
+                    completed_at=now,
+                    duration_secs=0.0,
+                    details={
+                        MERGE_OFFER_DETAILS_KEY: {
+                            "request_id": request_id,
+                            "correlation_id": row.correlation_id,
+                            "approval_subject": subject,
+                            **details,
+                        }
+                    },
+                )
+            )
+        finally:
+            self._preparing.discard(build_id)
 
         # (d) ONE publish attempt ever — dual envelope, approval FIRST.
         rationale = card_words(branch, merge_branch)
         if review_evidence is not None:
             rationale = f"{rationale}\n{card_line_about_the_preview(review_evidence)}"
+        if merge_check_reading is not None:
+            from forge.cli._serve_gate_activation import card_line_about_the_merge_check
+
+            about_the_merge_check = card_line_about_the_merge_check(merge_check_reading)
+            if about_the_merge_check:
+                rationale = f"{rationale}\n{about_the_merge_check}"
         try:
             approval = ApprovalRequestPayload(
                 request_id=request_id,
