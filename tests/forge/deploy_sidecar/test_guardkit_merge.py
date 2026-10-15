@@ -1182,3 +1182,61 @@ def _tmp_path_is_a_checkout(tmp_path):
     _subprocess.run(
         ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
     )
+
+
+# ---------------------------------------------------------------------------
+# What the caller is told about a command that may still be running
+# (15 October 2026, Codex round 4)
+# ---------------------------------------------------------------------------
+
+
+def test_a_merge_stopped_at_its_time_limit_says_so(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    from forge.deploy_sidecar.service import StoppedAtItsTimeLimit
+
+    runner = _RecordingMergeRunner(
+        result=StoppedAtItsTimeLimit((MERGE_TIMEOUT_EXIT_CODE, '{"outcome": "refused"}', "stopped"))
+    )
+    status, body = process_guardkit_merge_request(
+        _payload(), config=_config({REPO_KEY: str(repo)}), merge_runner=runner
+    )
+    assert status == 200
+    assert body["timed_out"] is True
+    assert body["exit_code"] == MERGE_TIMEOUT_EXIT_CODE
+
+
+def test_an_ordinary_answer_does_not_say_it_timed_out(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    status, body = process_guardkit_merge_request(
+        _payload(),
+        config=_config({REPO_KEY: str(repo)}),
+        merge_runner=_RecordingMergeRunner(result=(1, '{"outcome": "refused"}', "")),
+    )
+    assert status == 200
+    assert "timed_out" not in body
+
+
+def test_an_error_while_running_says_it_may_have_started(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    def _raises(**_kwargs: Any) -> Any:
+        raise OSError("the pipe broke")
+
+    status, body = process_guardkit_merge_request(
+        _payload(), config=_config({REPO_KEY: str(repo)}), merge_runner=_raises
+    )
+    assert status == 500
+    assert body["may_have_started"] is True
+
+
+def test_the_collector_says_a_command_was_stopped(tmp_path: Path) -> None:
+    script = tmp_path / "slow.sh"
+    script.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    answer = run_merge_command(argv=[str(script)], cwd=str(tmp_path), timeout=1.0)
+
+    assert getattr(answer, "timed_out", False) is True
+    assert answer[0] == MERGE_TIMEOUT_EXIT_CODE

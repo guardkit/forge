@@ -657,6 +657,8 @@ async def run(
                 stderr=str(exc),
                 exit_code=-1,
                 warnings=warnings,
+                # The spawn itself was refused: nothing ran.
+                refused_before_running=True,
             )
 
         if output_surrendered:
@@ -731,6 +733,9 @@ async def run(
             stderr=f"{type(exc).__name__}: {exc}",
             exit_code=-1,
             warnings=warnings,
+            # Something went wrong around a command that may have started:
+            # nobody knows whether it is still running (15 October 2026).
+            answer_lost=True,
         )
 
 
@@ -802,6 +807,7 @@ def _binary_not_found_result(
                 },
             )
         ],
+        refused_before_running=True,
     )
 
 
@@ -829,6 +835,7 @@ def _refused_cwd_result(
                 },
             )
         ],
+        refused_before_running=True,
     )
 
 

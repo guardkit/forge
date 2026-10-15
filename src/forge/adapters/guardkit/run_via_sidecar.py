@@ -233,8 +233,13 @@ def _failed_result(
     duration_secs: float,
     warning_code: str,
     subcommand: str | None = None,
+    refused_before_running: bool = False,
+    answer_lost: bool = False,
 ) -> GuardKitResult:
-    """A failure this side of the wire, in the shape the executor reads."""
+    """A failure this side of the wire, in the shape the executor reads.
+
+    It says, in a field of its own, whether it is a refusal before anything
+    ran (an answer) or an answer that was lost (15 October 2026)."""
     return GuardKitResult(
         status="failed",
         subcommand=subcommand or f"{ALLOWED_SUBCOMMAND} {ALLOWED_VERB}",
@@ -243,6 +248,8 @@ def _failed_result(
         stderr=detail,
         exit_code=TRANSPORT_EXIT_CODE,
         warnings=[GuardKitWarning(code=warning_code, message=detail)],
+        refused_before_running=refused_before_running,
+        answer_lost=answer_lost,
     )
 
 
@@ -265,9 +272,10 @@ def _post(url: str, body: dict[str, Any], *, timeout: float) -> tuple[int, Any]:
     except urllib.error.HTTPError as exc:
         try:
             return exc.code, json.loads(exc.read().decode("utf-8"))
-        except Exception:  # noqa: BLE001 — best-effort detail
-            reason = exc.reason if isinstance(exc.reason, str) else "unknown"
-            return exc.code, {"error": reason}
+        except Exception:  # noqa: BLE001 — an unreadable body is no answer
+            # Never made into a sentence the sidecar did not say: the caller
+            # reads None as an answer that could not be read (15 October 2026).
+            return exc.code, None
 
 
 def build_sidecar_guardkit_run(
@@ -355,6 +363,8 @@ def build_sidecar_guardkit_run(
                 ),
                 duration_secs=time.monotonic() - started_at,
                 warning_code="sidecar_repo_not_configured",
+                # Refused here, before anything was sent.
+                refused_before_running=True,
             )
 
         body: dict[str, Any] = {
@@ -470,6 +480,7 @@ def build_sidecar_guardkit_run(
                 ),
                 duration_secs=time.monotonic() - started_at,
                 warning_code="sidecar_unreachable",
+                answer_lost=True,
             )
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             return _failed_result(
@@ -479,6 +490,7 @@ def build_sidecar_guardkit_run(
                 ),
                 duration_secs=time.monotonic() - started_at,
                 warning_code="sidecar_bad_answer",
+                answer_lost=True,
             )
         except Exception as exc:  # noqa: BLE001 — never raise past the boundary
             return _failed_result(
@@ -488,20 +500,51 @@ def build_sidecar_guardkit_run(
                 ),
                 duration_secs=time.monotonic() - started_at,
                 warning_code="sidecar_client_error",
+                answer_lost=True,
             )
 
         duration = time.monotonic() - started_at
+        # TIMEOUT FIRST (15 October 2026): an answer that says the command
+        # was stopped at its time limit is read as one whatever else it says,
+        # because what it started may still be running.
+        if isinstance(parsed, dict) and parsed.get("timed_out") is True:
+            code = parsed.get("exit_code")
+            stdout = parsed.get("stdout")
+            stderr = parsed.get("stderr_tail")
+            return GuardKitResult(
+                status="timeout",
+                subcommand=f"{ALLOWED_SUBCOMMAND} {ALLOWED_VERB}",
+                duration_secs=duration,
+                stdout_tail=stdout if isinstance(stdout, str) else "",
+                stderr=stderr if isinstance(stderr, str) else None,
+                exit_code=(
+                    code if isinstance(code, int) and not isinstance(code, bool)
+                    else TRANSPORT_EXIT_CODE
+                ),
+                answer_lost=True,
+            )
         if status != 200:
-            detail = ""
-            if isinstance(parsed, dict):
-                detail = str(parsed.get("error") or "")
+            # A REFUSAL IS AN ANSWER ONLY IN THE SIDECAR'S OWN WORDS, and only
+            # when it says nothing was started (15 October 2026, the rule the
+            # script runner and the live gate follow). Anything else — an
+            # unreadable or HTML body, {}, a blank sentence, or an error the
+            # sidecar met while the command may already have been running —
+            # is an answer nobody can read.
+            error = parsed.get("error") if isinstance(parsed, dict) else None
+            told = (
+                isinstance(error, str)
+                and bool(error.strip())
+                and not parsed.get("may_have_started")
+            )
             return _failed_result(
                 detail=(
                     f"the deploy sidecar refused to run the merge "
-                    f"(HTTP {status}): {detail or parsed!r}"
+                    f"(HTTP {status}): {error if told else repr(parsed)}"
                 ),
                 duration_secs=duration,
-                warning_code="sidecar_refused",
+                warning_code="sidecar_refused" if told else "sidecar_bad_answer",
+                refused_before_running=told,
+                answer_lost=not told,
             )
         if not isinstance(parsed, dict) or not isinstance(
             parsed.get("exit_code"), int
@@ -513,6 +556,7 @@ def build_sidecar_guardkit_run(
                 ),
                 duration_secs=duration,
                 warning_code="sidecar_bad_answer",
+                answer_lost=True,
             )
 
         exit_code = int(parsed["exit_code"])

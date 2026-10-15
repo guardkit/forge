@@ -2867,7 +2867,18 @@ def _start_and_collect(
             f"\n{what} was stopped after {timeout:g} seconds and "
             "everything it had started was stopped with it"
         )
+        return StoppedAtItsTimeLimit((exit_code, stdout, stderr))
     return exit_code, stdout, stderr
+
+
+class StoppedAtItsTimeLimit(tuple):
+    """``(exit code, stdout, stderr)`` of a command stopped at its time limit.
+
+    15 October 2026: it unpacks like every other answer, and says in a field
+    of its own that it was stopped, so the route can tell the caller.
+    """
+
+    timed_out = True
 
 
 def _tail_chars(text: str, limit: int) -> str:
@@ -3202,19 +3213,26 @@ def process_guardkit_merge_request(
             runner_kwargs["feature_routing_required"] = feature_routing_required
         if feature_routing_receipt is not None:
             runner_kwargs["feature_routing_receipt"] = feature_routing_receipt
-        exit_code, stdout, stderr = merge_runner(**runner_kwargs)
+        ran = merge_runner(**runner_kwargs)
+        exit_code, stdout, stderr = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
             "exit_code": 1,
             "stdout": "",
             "stderr_tail": "",
+            # The command may already have been started (15 October 2026):
+            # the caller reads this as an answer nobody can rely on.
+            "may_have_started": True,
         }
 
     return 200, {
         "exit_code": exit_code,
         "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
         "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        # Stopped at its time limit (15 October 2026): what it started may
+        # still be running, whatever its output says.
+        **({"timed_out": True} if getattr(ran, "timed_out", False) is True else {}),
     }
 
 

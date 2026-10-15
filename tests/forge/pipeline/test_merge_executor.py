@@ -4947,6 +4947,109 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert (held.lease_holder is not None) is kept
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, body, kept",
+        [
+            (400, b'{"error": "this host has no guardkit command to run"}', False),
+            (500, b"<html><body>502 Bad Gateway</body></html>", True),
+            (200, b"{}", True),
+            (
+                500,
+                b'{"error": "sidecar execution error: OSError: x", '
+                b'"may_have_started": true}',
+                True,
+            ),
+            (None, b"", True),
+        ],
+        ids=["refused-in-its-own-words", "html", "empty-object", "may-have-started", "unreachable"],
+    )
+    async def test_the_merge_command_through_the_sidecar(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        status: int | None,
+        body: bytes,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R7: the merge command goes through the REAL
+        sidecar merge client. A refusal in the sidecar's own words, before
+        anything ran, is an answer: nothing was joined and the hold is put
+        down. An unreadable reply, {}, an error met while the command may
+        already have been running, or no answer at all keeps it."""
+        import dataclasses
+
+        from forge.adapters.guardkit.run_via_sidecar import build_sidecar_guardkit_run
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            _ASidecarThatRefusesWith,
+        )
+
+        sidecar = _ASidecarThatRefusesWith(status or 200, body)
+        url = sidecar.url if status is not None else "http://127.0.0.1:1"
+        try:
+            deps, _publisher, _gk, _dp = _deps(config, pool)
+            deps = dataclasses.replace(
+                deps,
+                guardkit_run=build_sidecar_guardkit_run(
+                    base_url=url, repo_paths={REPO: str(repo_root)}
+                ),
+            )
+            outcome = await _run_executor(deps, repo_root)
+        finally:
+            sidecar.close()
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "how, kept",
+        [
+            ("timed-out-with-a-refusal-report", True),
+            ("timed-out-with-a-merged-report", True),
+            ("answered-refusal", False),
+        ],
+    )
+    async def test_a_merge_command_stopped_at_its_time_limit_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        how: str,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R8: a merge command stopped at its time
+        limit may still be running whatever report survived, so the hold is
+        kept — decided before the report is read. The same refusal report
+        from a command that finished is an answer, and puts it down."""
+
+        class _AMergeThatSays(_JoinsForReal):
+            async def __call__(self, **kwargs: Any) -> GuardKitResult:
+                if how == "timed-out-with-a-merged-report":
+                    joined = await super().__call__(**kwargs)
+                    return joined.model_copy(update={"status": "timeout"})
+                self.calls.append(kwargs)
+                report = {"outcome": "refused", "refusal_reason": "it conflicts"}
+                return GuardKitResult(
+                    status="timeout" if how.startswith("timed-out") else "failed",
+                    subcommand="autobuild merge",
+                    duration_secs=0.1,
+                    stdout_tail=json.dumps(report),
+                    stderr=None,
+                    exit_code=124 if how.startswith("timed-out") else 1,
+                )
+
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_AMergeThatSays())
+
+        outcome = await _run_executor(deps, repo_root)
+
+        held = _the_hold(pool)
+        assert held.result == "publication pending", outcome.detail
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
     async def test_a_conflict_whose_record_moved_on_stops_as_replaced(
         self,
         config: ForgeConfig,

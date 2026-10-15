@@ -4568,6 +4568,14 @@ async def execute_merge_deploy(
                     store.renew_lease(
                         build_id=build_id, turn=turn, now=deps.clock()
                     )
+                # TIMEOUT FIRST (15 October 2026): a merge command stopped at
+                # its time limit, or one whose answer was lost, may still be
+                # running whatever report survived, so the hold is kept —
+                # decided before any report is read.
+                if getattr(result, "status", None) == "timeout" or (
+                    getattr(result, "answer_lost", False) is True
+                ):
+                    a_leg_did_not_complete = True
                 report = _parse_merge_report(result)
                 merged_in_report = bool(report and report.get("outcome") == "merged")
                 refusal: str | None = None
@@ -4672,11 +4680,14 @@ async def execute_merge_deploy(
                         failed_step="merge",
                         detail=sentence,
                     )
-                    # No report from the merge command — killed, timed out,
-                    # or an answer lost on the way back from a sandbox — is
-                    # an ending whose outcome nobody knows, and the hold is
-                    # kept. Either way nothing was sent, and the record says so.
-                    if report is None:
+                    # No report from the merge command and no refusal before
+                    # it ran — killed, or an answer that could not be read —
+                    # is an ending whose outcome nobody knows, and the hold is
+                    # kept. A refusal before anything ran is an answer.
+                    # Either way nothing was sent, and the record says so.
+                    if report is None and not getattr(
+                        result, "refused_before_running", False
+                    ):
                         a_leg_did_not_complete = True
                     return _nothing_was_published(
                         refused,
@@ -4979,14 +4990,11 @@ async def execute_merge_deploy(
                 check_join_said = await ask_the_build_system_to_check_the_join(
                     deps.guardkit_run, **check_join_kwargs
                 )
-                # A check-join that printed no report of its own (killed, timed
-                # out, or its answer lost) may still be running: keep the hold.
-                # One that said its checks could not run has answered.
-                if (
-                    not check_join_said.ran
-                    and not check_join_said.not_installed
-                    and check_join_said.report is None
-                ):
+                # A check-join whose answer was lost, that raised after it may
+                # have been sent, or that timed out may still be running: keep
+                # the hold. One that answered (its checks could not run, or a
+                # refusal before running) has finished.
+                if check_join_said.answer_lost:
                     a_leg_did_not_complete = True
                 if check_join_said.ran:
                     checks_passed = check_join_said.checks_passed

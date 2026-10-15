@@ -231,6 +231,9 @@ class TestCwdAllowlistEnforcement:
         assert called["executed"] is False
         codes = [w.code for w in result.warnings]
         assert "cwd_outside_allowlist" in codes
+        # Refused before anything ran: an answer (15 October 2026).
+        assert result.refused_before_running is True
+        assert result.answer_lost is False
 
     @pytest.mark.asyncio()
     async def test_outside_allowlist_repo_path_is_refused(
@@ -865,3 +868,28 @@ class TestParallelCallIsolation:
         assert results[1].subcommand == "feature-plan"
         assert "feature-spec" in results[0].stdout_tail
         assert "feature-plan" in results[1].stdout_tail
+
+
+
+@pytest.mark.asyncio()
+async def test_an_internal_error_around_the_command_is_no_answer(
+    allowlist: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """15 October 2026: something went wrong around a command that may have
+    started, so the result says nobody knows whether it is still running."""
+
+    async def _breaks(**_: Any):
+        raise RuntimeError("the pipe broke")
+
+    monkeypatch.setattr(run_module, "_execute_subprocess", _breaks)
+
+    result = await run(
+        subcommand="feature-spec",
+        args=[],
+        repo_path=allowlist[0],
+        read_allowlist=allowlist,
+    )
+
+    assert result.status == "failed"
+    assert result.answer_lost is True
+    assert result.refused_before_running is False

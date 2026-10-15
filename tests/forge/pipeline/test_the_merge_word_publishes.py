@@ -893,7 +893,20 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("publication", ["on", "off"])
-    @pytest.mark.parametrize("answer, kept", [("could-not-run", False), ("lost", True)])
+    @pytest.mark.parametrize(
+        "answer, kept",
+        [
+            ("could-not-run", False),
+            ("lost", True),
+            # Codex R6, round 4: a call that raised after it may have been
+            # sent keeps the hold; the door's own refusal, raised before
+            # anything is sent, does not. A timeout keeps it whatever report
+            # survived.
+            ("raised", True),
+            ("refused-before-sending", False),
+            ("timed-out", True),
+        ],
+    )
     async def test_a_reused_join_whose_checks_could_not_run(
         self,
         config_with_publication_off: ForgeConfig,
@@ -923,8 +936,14 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         asked: list[list[str]] = []
 
         async def _check_join(**kwargs: Any) -> GuardKitResult:
+            from forge.adapters.guardkit.run_via_sidecar import MergeCallRefused
+
             args = list(kwargs.get("args") or [])
             asked.append(args)
+            if answer == "raised":
+                raise ConnectionResetError("the check-join's answer was lost")
+            if answer == "refused-before-sending":
+                raise MergeCallRefused("the door carries only the merge command")
             if answer == "lost":
                 return GuardKitResult(
                     status="failed",
@@ -943,12 +962,12 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
                 "verify_detail": "the install failed in the joined tree",
             }
             return GuardKitResult(
-                status="failed",
+                status="timeout" if answer == "timed-out" else "failed",
                 subcommand="autobuild",
                 duration_secs=0.1,
                 stdout_tail=json.dumps(report),
                 stderr=None,
-                exit_code=1,
+                exit_code=124 if answer == "timed-out" else 1,
             )
 
         import dataclasses
