@@ -400,10 +400,16 @@ def _make_owner_writable(top: Path) -> None:
             mode = os.stat(name, dir_fd=dir_fd, follow_symlinks=False).st_mode
             if not stat.S_ISDIR(mode) or stat.S_IMODE(mode) & 0o700 == 0o700:
                 return
-            # Checked without following links just above; chmod cannot be told
-            # not to follow one on Linux, and nothing else writes here.
-            os.chmod(name, stat.S_IMODE(mode) | 0o700, dir_fd=dir_fd)
-        except OSError:
+            wider = stat.S_IMODE(mode) | 0o700
+            try:
+                # Never through a link: on a link this refuses rather than
+                # changing what it points at.
+                os.chmod(name, wider, dir_fd=dir_fd, follow_symlinks=False)
+            except NotImplementedError:
+                # A platform that cannot say "do not follow": the entry was
+                # checked as a folder, not a link, just above.
+                os.chmod(name, wider, dir_fd=dir_fd)
+        except (OSError, ValueError):
             return
 
     widen(str(top), None)
@@ -485,8 +491,7 @@ def _clear_gone_registrations(
     """Clear an offer-pinned registration whose working folder is already gone.
 
     An earlier attempt can delete a worktree's folder and then stop on its
-    record folder, leaving a "prunable" registration that would keep the tree
-    forever. For each exact path the offer named for clean-up (and the outer
+    record folder, leaving a "prunable" registration behind. For each exact path the offer named for clean-up (and the outer
     tree itself, once nothing else is registered below it) that Git still
     lists as prunable with no folder on disk, its own record folder is made
     writable and removed, which is what ``git worktree prune`` does for that
@@ -555,9 +560,10 @@ def retire_autobuild_worktree(
     A missing tree is idempotent success only when Git also has no registration
     for it.  Any mismatch from the offer-time registration/status identity
     preserves the whole tree.  Each offer-pinned tree, and Git's record folder
-    for it, is made owner-writable just before Git removes it, and a pinned
-    registration whose folder an earlier attempt already deleted is cleared
-    first (15 October 2026, FEAT-6AC9).
+    for it, is made owner-writable just before Git removes it (15 October
+    2026, FEAT-6AC9). A pinned registration whose folder an earlier attempt
+    already deleted is cleared first; the outer tree is then kept, because
+    its offer-time fingerprint can no longer be proved.
     """
     # A retry after an attempt that deleted a folder but not its record:
     # clear exactly those offer-pinned registrations first, then read the
@@ -590,48 +596,29 @@ def retire_autobuild_worktree(
             return report
         report["detail"] = before.get("detail") or rows_error or "identity unreadable"
         return report
-    # A registration cleared above is gone from Git's list now, and Git's
-    # status of the tree that held it no longer shows it, so that tree's
-    # status digest cannot match its offer-time one. Its path, commit and
-    # branch must still match exactly, and every other row matches in full.
-    gone = set(cleared)
-    expected_registrations = expected.get("registrations")
-    current_registrations = before.get("registrations")
-    if gone and isinstance(expected_registrations, list):
-
-        def holds_a_cleared_tree(row: Any) -> bool:
-            return isinstance(row, Mapping) and any(
-                _is_relative_to(Path(g), Path(str(row.get("path")))) for g in gone
-            )
-
-        def without_status(rows: list[Any]) -> list[Any]:
-            return [
-                {k: v for k, v in row.items() if k != "status_sha256"}
-                if holds_a_cleared_tree(row)
-                else row
-                for row in rows
-            ]
-
-        expected_registrations = without_status(
-            [
-                row
-                for row in expected_registrations
-                if not (isinstance(row, Mapping) and row.get("path") in gone)
-            ]
+    if cleared:
+        # A registration cleared above is gone from Git's list, and Git's
+        # status of the tree that held it no longer shows it, so that tree's
+        # offer-time fingerprint can no longer be proved. The tree is kept: a
+        # kept retirement holds nothing, and a leftover folder is harmless,
+        # where removing a tree whose changes cannot be proved could lose work.
+        report["detail"] = (
+            "cleared the registration of a task worktree whose folder was "
+            "already gone; the outer worktree is kept because its offer-time "
+            "fingerprint can no longer be proved"
         )
-        if isinstance(current_registrations, list):
-            current_registrations = without_status(current_registrations)
+        return report
     expected_identity = {
         "build_id": expected.get("build_id"),
         "path": expected.get("path"),
         "base": expected.get("base"),
-        "registrations": expected_registrations,
+        "registrations": expected.get("registrations"),
     }
     current_identity = {
         "build_id": before.get("build_id"),
         "path": before.get("path"),
         "base": before.get("base"),
-        "registrations": current_registrations,
+        "registrations": before.get("registrations"),
     }
     if current_identity != expected_identity:
         report["detail"] = (
@@ -651,8 +638,6 @@ def retire_autobuild_worktree(
         if not isinstance(selected, Mapping):
             report["detail"] = "cleanup registration identity is malformed"
             return report
-        if selected.get("path") in gone:
-            continue
         matches = [row for row in nested if row == dict(selected)]
         if len(matches) != 1:
             report["detail"] = (

@@ -5503,8 +5503,10 @@ async def execute_merge_deploy(
             # left behind, not work still running (15 October 2026, FEAT-6AC9:
             # a read-only cache folder stopped Git's removal, the press kept
             # its hold, and the release idle check then waited on a build that
-            # had finished). The receipt and the warning say it was kept; the
-            # next retirement retries it. Only a retirement whose answer was
+            # had finished). The receipt and the warning say it was kept.
+            # Nothing retries it on its own: retirement runs once, after a
+            # successful merge, or when someone calls the sidecar's retire
+            # route by hand. Only a retirement whose answer was
             # lost on the way back from the sandbox may still be running, so
             # only that keeps the hold.
             if retired.get("answered") is False:

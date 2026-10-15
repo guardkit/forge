@@ -336,8 +336,10 @@ def test_a_failed_removal_puts_only_the_fixed_sentence_in_the_receipt(
 # remove --force` deleted the task's working folder, then stopped on Git's own
 # record folder for it (which held GuardKit's scratch area) with exit 255 and
 # left a "prunable" registration behind. The retirement now makes the
-# offer-pinned trees owner-writable first, never through a symbolic link, and
-# a retry clears a registration whose working folder is already gone.
+# offer-pinned trees owner-writable first, never through a symbolic link. A
+# retry clears a pinned registration whose working folder is already gone,
+# then keeps the outer tree: its offer-time fingerprint can no longer be
+# proved, and a kept tree holds nothing up.
 # ---------------------------------------------------------------------------
 
 
@@ -403,9 +405,7 @@ def test_read_only_folders_in_a_nested_worktree_and_its_record_are_removed(
     assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
 
 
-def test_a_registration_whose_folder_is_already_gone_is_cleared_on_retry(
-    tmp_path: Path, _writable_again: None
-) -> None:
+def _todays_state(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
     """Today's state, made the way it was made live: the earlier attempt's
     `git worktree remove --force` deleted the working folder and stopped on the
     read-only record folder, leaving a prunable registration."""
@@ -426,15 +426,45 @@ def test_a_registration_whose_folder_is_already_gone_is_cleared_on_retry(
     assert failed.returncode != 0
     assert not inner.exists() and record.exists()
     assert "prunable" in _git(repo, "worktree", "list", "--porcelain")
+    return repo, base, outer, inner, record, offered
+
+
+def test_a_registration_whose_folder_is_already_gone_is_cleared_on_retry(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    repo, base, outer, inner, record, offered = _todays_state(tmp_path)
 
     result = retire_autobuild_worktree(
         repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
     )
 
-    assert result["status"] == "removed", result
     assert result["cleared_registrations"] == [str(inner)]
-    assert not record.exists() and not outer.exists()
+    assert not record.exists()
     assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
+    # The outer tree's offer-time fingerprint can no longer be proved, so it
+    # is kept, in plain words.
+    assert result["status"] == "kept", result
+    assert "can no longer be proved" in result["detail"]
+    assert outer.is_dir()
+
+
+def test_on_retry_the_outer_trees_uncommitted_changes_are_kept(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    """The coach's reproduction: on retry, an edited tracked file and a new
+    file in the outer tree must survive."""
+    repo, base, outer, inner, _record, offered = _todays_state(tmp_path)
+    (outer / "README").write_text("edited after the offer\n")
+    (outer / "notes.txt").write_text("somebody's notes\n")
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert (outer / "README").read_text() == "edited after the offer\n"
+    assert (outer / "notes.txt").read_text() == "somebody's notes\n"
+    assert str(outer) in _git(repo, "worktree", "list", "--porcelain")
 
 
 def test_a_gone_folder_that_was_not_offered_is_not_cleared(
