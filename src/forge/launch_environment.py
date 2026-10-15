@@ -1046,11 +1046,17 @@ def build_project_command_env(
     # Step 4: overlay.
     from forge.deploy.review_preview import PREVIEW_ENV_KEYS
 
+    # Outside a preview, COMPOSE_PROJECT_NAME is the project's own setting: a
+    # profile names its candidate's compose project with it ("notes-live-cand"),
+    # and refusing it stopped every candidate check before a merge (FEAT-0A2A,
+    # 15 October 2026). In a preview it is issued, so issued_names still keeps
+    # the overlay from replacing it. The other preview names are refused always.
+    reserved = PREVIEW_ENV_KEYS - {"COMPOSE_PROJECT_NAME"}
     for name in overlay:
         refusal = declared_setting_refusal(name)
         if refusal is None and name in additions:
             refusal = f"{name!r} is set by the factory for this command"
-        if refusal is None and (name in PREVIEW_ENV_KEYS or name in issued_names):
+        if refusal is None and (name in reserved or name in issued_names):
             refusal = (
                 f"{name!r} is one of the review preview's own values, which "
                 f"travel only as values the preview issued"

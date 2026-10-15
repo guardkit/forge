@@ -195,11 +195,11 @@ def test_the_memory_door_address_reaches_both(sandbox):
     """Test 4. The memory door's address is handed to both containers by
     name, so the build system reads and writes memory without any key."""
     helper, runner = _the_two_starts(
-        sandbox, FLEET_MEMORY_MCP_URL="http://192.0.2.1:31822/mcp"
+        sandbox, FLEET_MEMORY_MCP_URL="http://192.0.2.1:31824/mcp"
     )
     for call in (helper, runner):
         assert "--env FLEET_MEMORY_MCP_URL" in call, call
-        assert "192.0.2.1:31822" not in call
+        assert "192.0.2.1:31824" not in call
 
 
 def test_the_stamp_check_uses_the_shared_model_address(sandbox):
@@ -428,9 +428,9 @@ def test_the_memory_door_address_is_on_the_launch_list():
     build in the sandbox reads and writes memory through it."""
     assert "FLEET_MEMORY_MCP_URL" in launch_setting_names()
     env = build_launch_env(
-        parent={"PATH": "/usr/bin", "FLEET_MEMORY_MCP_URL": "http://192.0.2.1:31822/mcp"}
+        parent={"PATH": "/usr/bin", "FLEET_MEMORY_MCP_URL": "http://192.0.2.1:31824/mcp"}
     )
-    assert env["FLEET_MEMORY_MCP_URL"] == "http://192.0.2.1:31822/mcp"
+    assert env["FLEET_MEMORY_MCP_URL"] == "http://192.0.2.1:31824/mcp"
 
 
 # ---------------------------------------------------------------------------
@@ -547,7 +547,7 @@ def test_a_value_carrying_a_credential_is_refused_by_name(script, value):
 
 @BOTH_SCRIPTS
 @pytest.mark.parametrize("value", [
-    "http://192.0.2.1:31822/mcp",
+    "http://192.0.2.1:31824/mcp",
     "http://192.0.2.1:9000/v1?model=an-embedding-model&dims=1024",
     "a-project@example.invalid",
     "an-ordinary-value-with=an-equals-sign",

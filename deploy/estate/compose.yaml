@@ -466,11 +466,17 @@ services:
       FLEET_MEMORY_MCP_TRANSPORT: http
       FLEET_MEMORY_MCP_HOST: 0.0.0.0
       FLEET_MEMORY_MCP_PORT: "8005"
+      # THE SANDBOX'S NARROW DOOR (15 October 2026), a second port of this same
+      # process over the same store. It offers the two searches and a write
+      # that takes only build outcomes which replace nothing, off the
+      # factory's own shelves. The sandbox reaches this port, not 8005.
+      FLEET_MEMORY_MCP_SANDBOX_PORT: "8006"
       # WHICH NAMES CALLERS MAY USE. The transport checks the Host header, so
       # every name this service is reached by has to be listed: the service
       # name on the factory network, and the gateway address a sandbox uses.
-      # The env file builds both out of names.
-      FLEET_MEMORY_MCP_ALLOWED_HOSTS: ${FLEET_MEMORY_ALLOWED_HOSTS:?name the host names the memory service answers to in the env file - its service name and the gateway address, both with their ports}
+      # The env file builds both out of names; the narrow door's address is
+      # added here.
+      FLEET_MEMORY_MCP_ALLOWED_HOSTS: ${FLEET_MEMORY_ALLOWED_HOSTS:?name the host names the memory service answers to in the env file - its service name and the gateway address, both with their ports},${FACTORY_GATEWAY_ADDRESS}:${FLEET_MEMORY_SANDBOX_PORT:?name the port the sandbox's narrow memory door is published on in the env file}
       # THE EMBEDDING SERVICE — an address, outside this estate.
       FLEET_MEMORY_EMBED_URL: ${FLEET_MEMORY_EMBED_URL:?name the embedding service's address in the env file}
       FLEET_MEMORY_EMBED_MODEL: ${FLEET_MEMORY_EMBED_MODEL:?name the embedding model in the env file}
@@ -482,8 +488,9 @@ services:
     networks:
       - factory
     ports:
-      # THE THIRD AND LAST PUBLISHED PORT IN THE ESTATE, and for the same
-      # reason as the other two: a sandbox is a separate small machine that
+      # THE THIRD PUBLISHED PORT IN THE ESTATE (and the fourth, the narrow
+      # door below, since 15 October 2026), for the same reason as the other
+      # two: a sandbox is a separate small machine that
       # cannot reach a service name, and section 7 of the design says a sandbox
       # reaches the memory service at the factory gateway address. Everything
       # inside the estate reaches it at the service name instead.
@@ -494,22 +501,27 @@ services:
       # precondition, and until it is, the gateway address must be a private
       # address of this machine.
       - "${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${FLEET_MEMORY_PORT:?name the port the memory service is published on in the env file}:8005"
+      # The sandbox's narrow door (15 October 2026). Since then the port above
+      # is for this machine's own tools; the machine's guard admits only the
+      # sandbox's machine to this one, and no longer to the one above.
+      - "${FACTORY_GATEWAY_ADDRESS}:${FLEET_MEMORY_SANDBOX_PORT}:8006"
     healthcheck:
       # Any HTTP answer proves the server is up; a refused connection is the
-      # failure. This is the memory repository's own probe, unchanged, and it
-      # uses the interpreter because the image has no curl.
+      # failure. This is the memory repository's own probe, asked of both
+      # doors, and it uses the interpreter because the image has no curl.
       test:
         - CMD
         - python
         - -c
         - |
           import urllib.request, urllib.error, sys
-          try:
-              urllib.request.urlopen("http://localhost:8005/mcp/", timeout=5)
-          except urllib.error.HTTPError:
-              pass
-          except Exception:
-              sys.exit(1)
+          for port in (8005, 8006):
+              try:
+                  urllib.request.urlopen(f"http://localhost:{port}/mcp/", timeout=5)
+              except urllib.error.HTTPError:
+                  pass
+              except Exception:
+                  sys.exit(1)
       interval: 30s
       timeout: 10s
       retries: 3

@@ -177,6 +177,30 @@ _ALL_CAPABILITIES: tuple[tuple[str, re.Pattern[str]], ...] = (
 _DEFAULT_TEST_ROOTS: tuple[str, ...] = ("tests", "test", "spec", "specs")
 _DOC_FOLDERS: tuple[str, ...] = ("docs", "doc", "documentation")
 
+#: Top-level folders of the operating system's own disk. A slash-led path that
+#: starts with one of these is a file, never a web address: a Keycloak setup
+#: script writing ``/tmp/kcadm-`` and ``/dev/null`` put "TASK-xxx answers at
+#: /tmp/kcadm-" on an approval card on 15 October 2026. A blunt list on
+#: purpose. Names a web application might really use as its own address are
+#: left off it: ``home``, ``users``, ``private``, ``root``, ``run``, ``sys``
+#: (``/sys/user`` in an admin console) and ``dev`` (``/dev/seed``, the
+#: unrequested extra a card exists to catch) — so ``/users/created-per-day``
+#: is still read as the web address it is.
+_SYSTEM_FOLDERS: tuple[str, ...] = (
+    "tmp", "proc", "etc", "var", "usr", "opt",
+    "bin", "sbin", "lib", "lib64", "mnt", "srv", "nix", "boot",
+)
+
+#: The device files a script really writes to or reads from. Only these, and
+#: anything under them, count as places on disk inside ``/dev``.
+_DEVICE_FILES: tuple[str, ...] = (
+    "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/zero",
+    "/dev/random", "/dev/urandom", "/dev/tty", "/dev/shm",
+    # bash's own network files: a readiness probe writing to /dev/tcp/host/port
+    # put "/dev/tcp" on FEAT-0A2A's merge card on 15 October 2026.
+    "/dev/tcp", "/dev/udp",
+)
+
 #: How many consecutive words of the request count as quoting it.
 _QUOTE_WINDOW = 3
 
@@ -492,12 +516,14 @@ def _without(document: str, routes: Sequence[str]) -> str:
 
 
 def _is_a_place_on_disk(path: str, test_roots: Sequence[str]) -> bool:
-    """True when this slash-led string is a file under a test root or a
-    documentation folder, which is a place on disk and not a web address.
+    """True when this slash-led string is a file under a test root, a
+    documentation folder or one of the operating system's own folders, which
+    is a place on disk and not a web address.
 
     The repository declares its test roots as folders — ``tests/health``,
     ``tests/users`` — so the folder they all sit in is what a path is compared
     against: ``/tests/users/test_analytics.py`` is a file, not an endpoint.
+    ``/tmp/kcadm-`` and ``/dev/null`` in a setup script are files too.
     """
     first = path.lstrip("/").split("/", 1)[0].lower()
     roots = {
@@ -505,7 +531,13 @@ def _is_a_place_on_disk(path: str, test_roots: Sequence[str]) -> bool:
         for root in test_roots
         if str(root).strip("/ ")
     }
-    return first in roots or first in _DOC_FOLDERS
+    if first in roots or first in _DOC_FOLDERS or first in _SYSTEM_FOLDERS:
+        return True
+    lowered = "/" + path.strip("/").lower()
+    return any(
+        lowered == device or lowered.startswith(device + "/")
+        for device in _DEVICE_FILES
+    )
 
 
 def review_task_traceability(

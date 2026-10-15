@@ -508,17 +508,55 @@ class TestWhatTheEstatePromises:
         )
         assert on_the_host == ["model-door"], on_the_host
 
-    def test_three_published_ports_and_only_three(self, rendered: str) -> None:
+    def test_four_published_ports_and_only_four(self, rendered: str) -> None:
         """Every crossing of the sandbox boundary goes through the factory
-        gateway address, and there are exactly three of them in this bundle:
-        the read-only answer service, the bus, and the memory service — the
-        three things section 7 of the design says a sandbox reaches.
-        Everything else talks by service name, and the memory RELAY publishes
-        nothing at all, because nothing calls it."""
-        assert rendered.count("mode: ingress") == 3
+        gateway address, and there are exactly four of them in this bundle:
+        the read-only answer service, the bus, and the memory service's two
+        doors — the full one for this machine's own tools and, since 15
+        October 2026, the sandbox's narrow one. Everything else talks by
+        service name, and the memory RELAY publishes nothing at all, because
+        nothing calls it."""
+        assert rendered.count("mode: ingress") == 4
         assert "target: 8126" in rendered, "the answer service is not published"
         assert "target: 4222" in rendered, "the bus is not published"
         assert "target: 8005" in rendered, "the memory service is not published"
+        assert "target: 8006" in rendered, "the sandbox's memory door is not published"
+
+    def test_the_memory_service_publishes_its_two_doors_at_the_gateway(
+        self, rendered: str
+    ) -> None:
+        """15 October 2026: the full door (8005) for this machine's own tools,
+        and the sandbox's narrow door (8006), both at the gateway address and
+        nowhere else, so the machine's guard can tell them apart by port."""
+        import yaml
+
+        memory = yaml.safe_load(rendered)["services"]["memory"]
+        published = sorted(
+            (port["host_ip"], int(port["published"]), port["target"])
+            for port in memory["ports"]
+        )
+        assert published == [("192.0.2.1", 8005, 8005), ("192.0.2.1", 31824, 8006)], published
+
+    def test_the_memory_service_opens_the_sandboxs_narrow_door(
+        self, rendered: str
+    ) -> None:
+        """Without the setting the memory process opens no narrow door, and the
+        published port would lead nowhere. Its gateway address is one of the
+        names the service answers to."""
+        import yaml
+
+        environment = yaml.safe_load(rendered)["services"]["memory"]["environment"]
+        assert environment["FLEET_MEMORY_MCP_SANDBOX_PORT"] == "8006"
+        assert "192.0.2.1:31824" in environment["FLEET_MEMORY_MCP_ALLOWED_HOSTS"].split(",")
+
+    def test_the_memory_health_check_asks_both_doors(self, rendered: str) -> None:
+        """Both doors run in one process; if either stops, the process ends.
+        The probe asks both, so a door that never opened shows as unhealthy."""
+        import yaml
+
+        probe = yaml.safe_load(rendered)["services"]["memory"]["healthcheck"]["test"][-1]
+        assert "for port in (8005, 8006)" in probe, probe
+        assert "localhost:{port}/mcp/" in probe, probe
 
     def test_the_memory_relay_publishes_nothing(self, rendered: str) -> None:
         relay = _service_block(rendered, "memory-relay")

@@ -8,7 +8,8 @@ remote_ref, remote_name, declared_remote, declaration_files, release_image,
 expected_sbx_version, legacy_dropins, legacy_command_markers, forbidden_values}.
 Routes come ONLY from the explicit env file: FACTORY_GATEWAY_ADDRESS,
 FORGE_TARGET_OWNER_URL, FORGE_SANDBOX_SIDECAR_URL, FORGE_SANDBOX_RUNNER_URL,
-FLEET_MEMORY_PORT (the memory MCP's gateway publish port, as compose.yaml uses it),
+FLEET_MEMORY_SANDBOX_PORT (the sandbox's narrow memory door's gateway publish
+port, as compose.yaml uses it; FLEET_MEMORY_PORT is the Dell's own tools' door),
 MODEL_DOOR_PORT (the model door's gateway port, as compose.yaml uses it).
 The producer profile retains all choices except gateway publish addresses,
 explicit allow-rule replacements, receipts_path and cwd. sandbox.allow_replacements
@@ -288,12 +289,15 @@ class Rollout:
                     f'{key} does not use its declared host with an explicit port; fix the env route')
         owner = urlsplit(self.values['FORGE_TARGET_OWNER_URL'])
         self.answer = f'{gateway}:{owner.port}'
-        # Same published port compose.yaml binds at the gateway for the memory MCP.
-        memory_port = self.values.get('FLEET_MEMORY_PORT','')
+        # Same published port compose.yaml binds at the gateway for the
+        # sandbox's narrow memory door (15 October 2026). The full door at
+        # FLEET_MEMORY_PORT is for the Dell's own tools and is never routed.
+        memory_port = self.values.get('FLEET_MEMORY_SANDBOX_PORT','')
         require(re.fullmatch(r'[1-9][0-9]{0,4}',memory_port) and int(memory_port) < 65536,
-                'FLEET_MEMORY_PORT is missing or not a port number; name the memory MCP gateway publish port in the env file')
+                'FLEET_MEMORY_SANDBOX_PORT is missing or not a port number; name the sandbox memory door gateway publish port in the env file')
         self.memory_mcp = f'{gateway}:{int(memory_port)}'
-        require(self.memory_mcp != self.answer, 'FLEET_MEMORY_PORT equals the answer-service port; give the memory MCP its own gateway port')
+        other_doors = {self.answer} | {f'{gateway}:{int(v)}' for v in (self.values.get(k,'') for k in ('FLEET_MEMORY_PORT','MODEL_DOOR_PORT')) if re.fullmatch(r'[1-9][0-9]{0,4}',v)}
+        require(self.memory_mcp not in other_doors, "FLEET_MEMORY_SANDBOX_PORT equals the answer-service, model door or full memory door's port; give the sandbox's memory door its own gateway port")
         # The model door (14 October 2026): a sandbox holds no model key and
         # calls the models through the door at this one gateway port.
         door_port = self.values.get('MODEL_DOOR_PORT','')
