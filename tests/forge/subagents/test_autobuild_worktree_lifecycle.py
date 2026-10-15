@@ -336,10 +336,9 @@ def test_a_failed_removal_puts_only_the_fixed_sentence_in_the_receipt(
 # remove --force` deleted the task's working folder, then stopped on Git's own
 # record folder for it (which held GuardKit's scratch area) with exit 255 and
 # left a "prunable" registration behind. The retirement now makes the
-# offer-pinned trees owner-writable first, never through a symbolic link. A
-# retry clears a pinned registration whose working folder is already gone,
-# then keeps the outer tree: its offer-time fingerprint can no longer be
-# proved, and a kept tree holds nothing up.
+# offer-pinned trees owner-writable first, never through a symbolic link.
+# Nothing is ever cleared on a retry: a leftover registration stays, and so
+# does its tree ("kept"), which holds nothing up.
 # ---------------------------------------------------------------------------
 
 
@@ -429,98 +428,38 @@ def _todays_state(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
     return repo, base, outer, inner, record, offered
 
 
-def test_a_registration_git_half_deleted_is_not_cleared_on_retry(
-    tmp_path: Path, _writable_again: None
+@pytest.mark.parametrize("left_by", ["git-stopped-part-way", "folder-deleted"])
+def test_a_retry_clears_nothing_and_keeps_the_tree(
+    tmp_path: Path, _writable_again: None, left_by: str
 ) -> None:
-    """Git's failed removal also deleted part of the record folder, the
-    registration's commit file among them, so it can no longer be proved to
-    be the one the offer pinned (Codex review, R1). Nothing is cleared, and
-    the tree is kept with the reason; a kept retirement holds nothing up."""
-    repo, base, outer, inner, record, offered = _todays_state(tmp_path)
-
-    result = retire_autobuild_worktree(
-        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
-    )
-
-    assert result["status"] == "kept", result
-    assert "not the one the offer pinned" in result["detail"]
-    assert "cleared_registrations" not in result
-    assert record.exists() and outer.is_dir()
-
-
-def test_a_registration_whose_folder_is_already_gone_is_cleared_on_retry(
-    tmp_path: Path, _writable_again: None
-) -> None:
-    """The working folder is gone, and Git's registration is still exactly the
-    one the offer pinned: it is cleared, then the outer tree is kept because
-    its offer-time fingerprint can no longer be proved."""
+    """A registration whose working folder is gone, whether Git's own failed
+    removal left it half-deleted or somebody deleted only the folder, is
+    never cleared: its record folder stays, Git still lists it, and the
+    tree is kept with the reason."""
     import shutil
 
-    repo, base, outer, inner = _repo_with_nested(tmp_path)
-    record = _record_folder(repo, inner)
-    offered = inspect_autobuild_worktree(
-        repo=repo, base=base, build_id=BUILD_ID, path=outer
-    )
-    assert offered["ok"] is True, offered
-    offered["cleanup_registrations"] = offered["nested_registrations"]
-    shutil.rmtree(inner)
-    assert "prunable" in _git(repo, "worktree", "list", "--porcelain")
-
-    result = retire_autobuild_worktree(
-        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
-    )
-
-    assert result["cleared_registrations"] == [str(inner)]
-    assert not record.exists()
-    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
-    assert result["status"] == "kept", result
-    assert "can no longer be proved" in result["detail"]
-    assert outer.is_dir()
-
-
-@pytest.mark.parametrize("change", ["other-branch", "other-commit", "locked"])
-def test_a_different_registration_at_the_same_missing_path_is_not_cleared(
-    tmp_path: Path, _writable_again: None, change: str
-) -> None:
-    """Codex review, R1: the path alone is not enough. A registration at the
-    pinned path on another branch or commit, or one that is locked, is not
-    the one the offer pinned, and nothing is cleared."""
-    import shutil
-
-    repo, base, outer, inner = _repo_with_nested(tmp_path)
-    offered = inspect_autobuild_worktree(
-        repo=repo, base=base, build_id=BUILD_ID, path=outer
-    )
-    assert offered["ok"] is True, offered
-    offered["cleanup_registrations"] = offered["nested_registrations"]
-    if change == "locked":
-        _git(repo, "worktree", "lock", str(inner))
+    if left_by == "git-stopped-part-way":
+        repo, base, outer, inner, record, offered = _todays_state(tmp_path)
     else:
-        _git(repo, "worktree", "remove", "--force", str(inner))
-        if change == "other-branch":
-            _git(repo, "worktree", "add", "-q", "-b", "other", str(inner), "main")
-        else:
-            (repo / "second").write_text("second\n")
-            _git(repo, "add", "second")
-            _git(repo, "commit", "-q", "-m", "second")
-            _git(repo, "worktree", "add", "-q", str(inner), f"autobuild/{FEATURE}")
-            _git(inner, "reset", "-q", "--hard", "main")
-    record = _record_folder(repo, inner)
-    shutil.rmtree(inner)
-    # Git itself never calls a locked registration prunable.
-    listed = _git(repo, "worktree", "list", "--porcelain")
-    assert ("locked" if change == "locked" else "prunable") in listed
+        repo, base, outer, inner = _repo_with_nested(tmp_path)
+        record = _record_folder(repo, inner)
+        offered = inspect_autobuild_worktree(
+            repo=repo, base=base, build_id=BUILD_ID, path=outer
+        )
+        assert offered["ok"] is True, offered
+        offered["cleanup_registrations"] = offered["nested_registrations"]
+        shutil.rmtree(inner)
 
     result = retire_autobuild_worktree(
         repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
     )
 
     assert result["status"] == "kept", result
-    if change != "locked":
-        assert "not the one the offer pinned" in result["detail"]
+    assert result["detail"]
     assert "cleared_registrations" not in result
     assert record.exists() and outer.is_dir()
-    assert str(inner) in _git(repo, "worktree", "list", "--porcelain")
+    listed = _git(repo, "worktree", "list", "--porcelain")
+    assert str(inner) in listed and "prunable" in listed
 
 
 def test_on_retry_the_outer_trees_uncommitted_changes_are_kept(
@@ -649,3 +588,39 @@ def test_a_folder_swapped_for_a_link_after_listing_is_not_followed(
     assert {folder: folder.stat().st_mode for folder in before} == before
     assert (outside_folders[0] / "file.txt").read_text() == "cached\n"
     assert result["status"] == "removed", result
+
+
+def test_a_walk_redirected_to_folders_owned_by_someone_else_changes_nothing(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R3: a folder above the tree can be a link, and opening the
+    tree's top follows it. The walk changes only folders the cleaning user
+    owns, so a walk redirected to folders owned by anyone else changes
+    nothing there. Another owner is simulated: tests cannot chown."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    outside = tmp_path / "outside"
+    outside_folders = _read_only_cache(outside)
+    outside.chmod(0o555)
+    before = {folder: folder.stat().st_mode for folder in [outside, *outside_folders]}
+    owned_elsewhere = {
+        (folder.stat().st_dev, folder.stat().st_ino)
+        for folder in [outside, *outside_folders]
+    }
+    redirected = tmp_path / "worktrees-link"
+    redirected.symlink_to(tmp_path, target_is_directory=True)
+    real_fstat = os.fstat
+
+    def someone_elses(descriptor: int) -> os.stat_result:
+        found = real_fstat(descriptor)
+        if (found.st_dev, found.st_ino) in owned_elsewhere:
+            fields = list(found)
+            fields[4] = os.geteuid() + 1  # st_uid
+            return os.stat_result(fields)
+        return found
+
+    monkeypatch.setattr(lifecycle.os, "fstat", someone_elses)
+    lifecycle._make_owner_writable(redirected / "outside")
+    lifecycle._make_owner_writable(redirected / "outside" / "cache")
+
+    assert {folder: folder.stat().st_mode for folder in before} == before

@@ -24,7 +24,6 @@ from __future__ import annotations
 import hashlib
 import os
 import re
-import shutil
 import stat
 from pathlib import Path
 from typing import Any, Mapping
@@ -399,48 +398,50 @@ def _subfolders(descriptor: int) -> list[str]:
 _OPEN_FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
-def _widen_folder(parent: int, name: str) -> None:
-    """Open ``name`` in ``parent`` as a folder, never through a link, give the
-    owner full access to it by its open handle, then do the same below it.
+def _widen_by_handle(descriptor: int) -> None:
+    """Give the owner full access to the open folder ``descriptor`` and to
+    every real folder below it, each opened without following links.
 
-    An entry that cannot be opened that way (a link, something that is not a
-    folder, a folder the owner cannot read) is skipped; Git then cannot
-    remove it and the retirement says "kept".
+    The walk only adds owner access to folders the cleaning user already
+    owns, which that user could change anyway, so a walk redirected
+    elsewhere gains nothing. A folder owned by anyone else is skipped with
+    everything below it, and so is anything that cannot be opened as a folder
+    without following a link; Git's removal then says "kept".
     """
-    try:
-        descriptor = os.open(name, _OPEN_FOLDER, dir_fd=parent)
-    except OSError:
+    mode = os.fstat(descriptor)
+    if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.geteuid():
         return
-    try:
-        mode = os.fstat(descriptor).st_mode
-        if not stat.S_ISDIR(mode):
-            return
-        if stat.S_IMODE(mode) & 0o700 != 0o700:
-            os.fchmod(descriptor, stat.S_IMODE(mode) | 0o700)
-        for child in _subfolders(descriptor):
-            _widen_folder(descriptor, child)
-    except (OSError, RecursionError):
-        return
-    finally:
-        os.close(descriptor)
+    if stat.S_IMODE(mode.st_mode) & 0o700 != 0o700:
+        os.fchmod(descriptor, stat.S_IMODE(mode.st_mode) | 0o700)
+    for child in _subfolders(descriptor):
+        try:
+            opened = os.open(child, _OPEN_FOLDER, dir_fd=descriptor)
+        except OSError:
+            continue
+        try:
+            _widen_by_handle(opened)
+        finally:
+            os.close(opened)
 
 
 def _make_owner_writable(top: Path) -> None:
     """Give the owner full access to every folder under ``top``, links skipped.
 
-    Every folder is opened with ``O_NOFOLLOW`` from its parent's open handle
-    and changed through that handle, so a link put in a folder's place is
+    ``top`` itself is opened without following a link, and every folder below
+    it from its parent's open handle, so a link put in a folder's place is
     never followed, even one swapped in after the folder was listed. Best
     effort: what cannot be changed is left for Git to report.
     """
     try:
-        parent = os.open(top.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+        descriptor = os.open(top, _OPEN_FOLDER)
     except OSError:
         return
     try:
-        _widen_folder(parent, top.name)
+        _widen_by_handle(descriptor)
+    except (OSError, RecursionError):
+        return
     finally:
-        os.close(parent)
+        os.close(descriptor)
 
 
 def _worktrees_record_root(repo: Path) -> Path | None:
@@ -472,155 +473,29 @@ def _points_at(record: Path, worktree: Path) -> bool:
 def _record_folder(repo: Path, worktree: Path) -> Path | None:
     """Git's own record folder for one worktree registered on ``repo``.
 
-    Read from the worktree's ``.git`` file while the folder is there, else
-    found among the record folders by its back pointer. Either way it must be
-    a direct child of ``repo``'s own ``worktrees`` record folder and point back
-    at exactly ``worktree``; anything else is ``None`` and nothing is touched.
+    Read from the worktree's own ``.git`` file. It must be a direct child of
+    ``repo``'s own ``worktrees`` record folder and point back at exactly
+    ``worktree``; anything else is ``None`` and nothing is touched.
     """
     root = _worktrees_record_root(repo)
-    if root is None or not root.is_dir():
-        return None
-    candidates: list[Path] = []
     marker = worktree / ".git"
-    if marker.is_file() and not marker.is_symlink():
-        try:
-            line = marker.read_text(encoding="utf-8", errors="surrogateescape")
-        except OSError:
-            line = ""
-        key, _sep, value = line.strip().partition(":")
-        if key == "gitdir" and value.strip():
-            named = Path(value.strip())
-            candidates.append(named if named.is_absolute() else worktree / named)
-    else:
-        try:
-            candidates.extend(sorted(root.iterdir()))
-        except OSError:
-            return None
-    for candidate in candidates:
-        if candidate.is_symlink():
-            continue
-        record = candidate.resolve()
-        if record.parent == root and record.is_dir() and _points_at(record, worktree):
-            return record
-    return None
-
-
-def _same_registration(offered: Mapping[str, Any], current: Mapping[str, Any]) -> bool:
-    """Is Git's current registration the one the offer pinned, on commit,
-    branch and detached state, and not locked?"""
-    return (
-        "locked" not in current
-        and all(
-            offered.get(key) == current.get(key)
-            for key in ("path", "head", "branch", "detached")
-        )
-    )
-
-
-def _clear_gone_registrations(
-    repo: Path, base: Path, build_id: str, path: Path, expected: Mapping[str, Any]
-) -> tuple[list[str], str | None]:
-    """Clear an offer-pinned registration whose working folder is already gone.
-
-    An earlier attempt can delete a worktree's folder and then stop on its
-    record folder, leaving a "prunable" registration behind. For each exact
-    row the offer named for clean-up (and the outer tree's own row, once
-    nothing else is registered below it) that Git still lists as prunable
-    with no folder on disk, and that is still that very registration (same
-    commit, branch and detached state, not locked), its record folder is made
-    writable and removed: what ``git worktree prune`` does for that one entry
-    and no other. Every prunable pinned row is checked before any is cleared;
-    a mismatch clears nothing and comes back as the reason to keep the tree.
-    Returns ``(paths cleared, reason or None)``.
-    """
-    wanted, error = _owned_path(base, build_id, path)
-    if error or wanted is None or str(expected.get("path")) != str(wanted):
-        return [], None
-    cleanup = expected.get("cleanup_registrations")
-    registrations = expected.get("registrations")
-    if not isinstance(cleanup, list) or not isinstance(registrations, list):
-        return [], None
-    inner_root = wanted / INNER_WORKTREES_REL
-    pinned: list[Mapping[str, Any]] = []
-    for selected in cleanup:
-        if not isinstance(selected, Mapping):
-            return [], None
-        if not _is_relative_to(Path(str(selected.get("path") or "")), inner_root):
-            return [], None
-        pinned.append(selected)
-    outer_row = next(
-        (
-            row
-            for row in registrations
-            if isinstance(row, Mapping) and row.get("path") == str(wanted)
-        ),
-        None,
-    )
-
-    def gone_and_registered(
-        offered: Mapping[str, Any], rows: list[dict[str, str | None]]
-    ) -> tuple[Path | None, str | None]:
-        """``(record folder to clear, None)``, ``(None, reason)`` on a
-        mismatch, or ``(None, None)`` when there is nothing to clear here."""
-        target = Path(str(offered.get("path")))
-        row = next((r for r in rows if r.get("path") == str(target)), None)
-        if row is None or "prunable" not in row or os.path.lexists(target):
-            return None, None
-        if not _same_registration(offered, row):
-            return None, (
-                f"the leftover registration at {target} is not the one the "
-                "offer pinned (its commit, branch or lock differs, or can no "
-                "longer be read); nothing was cleared"
-            )
-        record = _record_folder(repo, target)
-        if record is None:
-            return None, (
-                f"Git's record folder for {target} could not be proved; "
-                "nothing was cleared"
-            )
-        return record, None
-
-    def clear(records: list[tuple[str, Path]]) -> str | None:
-        for target, record in records:
-            _make_owner_writable(record)
-            try:
-                shutil.rmtree(record)
-            except OSError as exc:
-                return (
-                    f"Git's record folder for {target} could not be removed: "
-                    f"{type(exc).__name__}"
-                )
-            cleared.append(target)
+    if root is None or not marker.is_file() or marker.is_symlink():
         return None
-
-    cleared: list[str] = []
-    rows, _error = _registrations(repo)
-    if rows is None:
-        return [], None
-    records: list[tuple[str, Path]] = []
-    for offered in sorted(pinned, key=lambda r: len(str(r.get("path"))), reverse=True):
-        record, reason = gone_and_registered(offered, rows)
-        if reason:
-            return [], reason
-        if record is not None:
-            records.append((str(offered.get("path")), record))
-    reason = clear(records)
-    if reason:
-        return cleared, reason
-    rows, _error = _registrations(repo)
-    if (
-        outer_row is not None
-        and rows is not None
-        and not any(_is_relative_to(Path(str(r.get("path"))), wanted) for r in rows)
-    ):
-        record, reason = gone_and_registered(outer_row, rows)
-        if reason:
-            return cleared, reason
-        if record is not None:
-            reason = clear([(str(wanted), record)])
-            if reason:
-                return cleared, reason
-    return cleared, None
+    try:
+        line = marker.read_text(encoding="utf-8", errors="surrogateescape")
+    except OSError:
+        return None
+    key, _sep, value = line.strip().partition(":")
+    if key != "gitdir" or not value.strip():
+        return None
+    named = Path(value.strip())
+    candidate = named if named.is_absolute() else worktree / named
+    if candidate.is_symlink():
+        return None
+    record = candidate.resolve()
+    if record.parent == root and record.is_dir() and _points_at(record, worktree):
+        return record
+    return None
 
 
 def _remove_worktree(repo: Path, worktree: Path) -> tuple[int, bytes]:
@@ -642,16 +517,9 @@ def retire_autobuild_worktree(
     for it.  Any mismatch from the offer-time registration/status identity
     preserves the whole tree.  Each offer-pinned tree, and Git's record folder
     for it, is made owner-writable just before Git removes it (15 October
-    2026, FEAT-6AC9). A pinned registration whose folder an earlier attempt
-    already deleted is cleared first; the outer tree is then kept, because
-    its offer-time fingerprint can no longer be proved.
+    2026, FEAT-6AC9). Nothing else is ever cleared: a registration an
+    earlier attempt left behind stays, and so does its tree ("kept").
     """
-    # A retry after an attempt that deleted a folder but not its record:
-    # clear exactly those offer-pinned registrations first, then read the
-    # identity as it is now.
-    cleared, refusal = _clear_gone_registrations(
-        repo, base, build_id, path, expected
-    )
     before = inspect_autobuild_worktree(
         repo=repo, base=base, build_id=build_id, path=path
     )
@@ -662,11 +530,6 @@ def retire_autobuild_worktree(
         "before": before,
         "removed_nested": [],
     }
-    if cleared:
-        report["cleared_registrations"] = cleared
-    if refusal:
-        report["detail"] = refusal
-        return report
     if not before.get("ok"):
         # Idempotent retry: exact owned path absent and no Git registration.
         wanted, ownership_error = _owned_path(base, build_id, path)
@@ -681,18 +544,6 @@ def retire_autobuild_worktree(
             report.update(status="already-gone", detail="owned worktree already gone")
             return report
         report["detail"] = before.get("detail") or rows_error or "identity unreadable"
-        return report
-    if cleared:
-        # A registration cleared above is gone from Git's list, and Git's
-        # status of the tree that held it no longer shows it, so that tree's
-        # offer-time fingerprint can no longer be proved. The tree is kept: a
-        # kept retirement holds nothing, and a leftover folder is harmless,
-        # where removing a tree whose changes cannot be proved could lose work.
-        report["detail"] = (
-            "cleared the registration of a task worktree whose folder was "
-            "already gone; the outer worktree is kept because its offer-time "
-            "fingerprint can no longer be proved"
-        )
         return report
     expected_identity = {
         "build_id": expected.get("build_id"),
