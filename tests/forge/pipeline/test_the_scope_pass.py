@@ -476,6 +476,32 @@ class TestWhatCountsAsDeclaringACapability:
         assert report.why_not is not None
         assert "could not be read whole" in report.why_not
 
+    def test_a_script_s_files_on_disk_are_not_web_addresses(self) -> None:
+        """Found live on 15 October 2026: a setup script's ``/tmp`` file and
+        its ``/dev/null`` were read as web addresses. They are files; a route
+        the build added under ``/dev`` is still named."""
+
+        class ScriptAndRouter:
+            error = None
+            name_status = "A\x00scripts/setup.sh\x00M\x00cmd/server/routes.go\x00"
+            added_by_file = {
+                "scripts/setup.sh": (
+                    "kcadm.sh get realms > /tmp/x\n"
+                    "curl -s http://localhost:8080 > /dev/null\n"
+                ),
+                "cmd/server/routes.go": 'r.Post("/dev/seed", seedHandler)\n',
+            }
+            added_lines_read_whole = True
+
+        report = scope_of_the_build(reading=ScriptAndRouter(), request=REQUEST)
+
+        assert report.routes_read is True
+        for on_disk in ("/tmp/x", "/dev/null"):
+            assert on_disk not in report.routes_the_branch_declares
+            assert on_disk not in report.routes_the_request_did_not_name
+        assert "/dev/seed" in report.routes_the_branch_declares
+        assert "/dev/seed" in report.routes_the_request_did_not_name
+
     def test_what_is_read_and_what_is_left_out(self) -> None:
         declared = what_the_branch_declares(
             {

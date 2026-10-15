@@ -181,12 +181,21 @@ _DOC_FOLDERS: tuple[str, ...] = ("docs", "doc", "documentation")
 #: starts with one of these is a file, never a web address: a Keycloak setup
 #: script writing ``/tmp/kcadm-`` and ``/dev/null`` put "TASK-xxx answers at
 #: /tmp/kcadm-" on an approval card on 15 October 2026. A blunt list on
-#: purpose. Names a web application might really use as its own address —
-#: ``home``, ``users``, ``private``, ``root``, ``run`` — are left off it, so
-#: ``/users/created-per-day`` is still read as the web address it is.
+#: purpose. Names a web application might really use as its own address are
+#: left off it: ``home``, ``users``, ``private``, ``root``, ``run``, ``sys``
+#: (``/sys/user`` in an admin console) and ``dev`` (``/dev/seed``, the
+#: unrequested extra a card exists to catch) — so ``/users/created-per-day``
+#: is still read as the web address it is.
 _SYSTEM_FOLDERS: tuple[str, ...] = (
-    "tmp", "dev", "proc", "sys", "etc", "var", "usr", "opt",
+    "tmp", "proc", "etc", "var", "usr", "opt",
     "bin", "sbin", "lib", "lib64", "mnt", "srv", "nix", "boot",
+)
+
+#: The device files a script really writes to or reads from. Only these, and
+#: anything under them, count as places on disk inside ``/dev``.
+_DEVICE_FILES: tuple[str, ...] = (
+    "/dev/null", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/zero",
+    "/dev/random", "/dev/urandom", "/dev/tty", "/dev/shm",
 )
 
 #: How many consecutive words of the request count as quoting it.
@@ -519,7 +528,13 @@ def _is_a_place_on_disk(path: str, test_roots: Sequence[str]) -> bool:
         for root in test_roots
         if str(root).strip("/ ")
     }
-    return first in roots or first in _DOC_FOLDERS or first in _SYSTEM_FOLDERS
+    if first in roots or first in _DOC_FOLDERS or first in _SYSTEM_FOLDERS:
+        return True
+    lowered = "/" + path.strip("/").lower()
+    return any(
+        lowered == device or lowered.startswith(device + "/")
+        for device in _DEVICE_FILES
+    )
 
 
 def review_task_traceability(

@@ -137,6 +137,25 @@ def test_an_operating_system_folder_is_a_place_on_disk(disk_path: str) -> None:
     assert [f.what for f in review.findings if f.flag == CONTRADICTED_PATH] == []
 
 
+@pytest.mark.parametrize("route", ["/dev/seed", "/sys/user"])
+def test_a_web_address_under_a_system_sounding_folder_is_still_named(
+    route: str,
+) -> None:
+    # ``/dev`` and ``/sys`` are real places on disk, but applications also
+    # answer at ``/dev/seed`` and ``/sys/user``. Only the well-known device
+    # files are skipped inside ``/dev``, and ``/sys`` is not skipped at all.
+    files = _task(
+        "# Add a helper endpoint\n\n"
+        "## Implementation Notes\n\n"
+        f"- Add POST {route} for local development\n"
+    )
+    review = review_task_traceability(files, request_text=REQUEST)
+
+    assert [f.what for f in review.findings if f.flag == CONTRADICTED_PATH] == [
+        route
+    ]
+
+
 def test_an_unnamed_web_address_beside_a_disk_path_is_still_named() -> None:
     files = _task(
         "# Set up the identity server\n\n"
