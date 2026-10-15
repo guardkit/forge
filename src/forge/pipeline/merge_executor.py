@@ -156,6 +156,7 @@ from forge.pipeline.merge_offer import (
     branch_to_merge,
 )
 from forge.pipeline.digest_conformance import run_digest_conformance
+from forge.pipeline.merge_check_reading import names_for_record, names_from_record
 from forge.pipeline.merge_join import (
     integration_branch,
     join_inputs,
@@ -634,7 +635,11 @@ def _conflict_sentence(report: dict[str, Any]) -> str | None:
         "conflict_files"
     ):
         return None
-    files = [str(f) for f in (report.get("conflict_files") or []) if str(f).strip()]
+    from forge.pipeline.merge_check_reading import shown_path
+
+    files = [
+        shown_path(f) for f in (report.get("conflict_files") or []) if str(f).strip()
+    ]
     if files:
         shown = ", ".join(files[:6]) + (f" and {len(files) - 6} more" if len(files) > 6 else "")
         return (
@@ -4670,11 +4675,16 @@ async def execute_merge_deploy(
                         "verify_detail": (report or {}).get("verify_detail"),
                         "checks_passed": checks_passed,
                         "checks_total": checks_total,
-                        "judged_with_main_copies": list(
-                            (report or {}).get("judged_with_main_copies") or []
+                        # Shown names for a person, and each name exactly
+                        # (review R5), so a resumed press decides as this
+                        # one did.
+                        **names_for_record(
+                            "judged_with_main_copies",
+                            (report or {}).get("judged_with_main_copies") or [],
                         ),
-                        "judge_files_not_on_target": list(
-                            (report or {}).get("judge_files_not_on_target") or []
+                        **names_for_record(
+                            "judge_files_not_on_target",
+                            (report or {}).get("judge_files_not_on_target") or [],
                         ),
                     },
                 ):
@@ -4765,10 +4775,9 @@ async def execute_merge_deploy(
                 earlier = _the_recorded_line(STEP_MERGE_CHECKS)
                 if earlier is not None:
                     said = getattr(earlier, "detail", None)
-                    said = said if isinstance(said, dict) else {}
                     _remember_main_copies(
-                        said.get("judged_with_main_copies"),
-                        said.get("judge_files_not_on_target"),
+                        names_from_record(said, "judged_with_main_copies"),
+                        names_from_record(said, "judge_files_not_on_target"),
                     )
             recorded_why = _why_the_recorded_step_failed(STEP_MERGE_CHECKS)
             if recorded_why is not None and not merge_checks_ran_here:

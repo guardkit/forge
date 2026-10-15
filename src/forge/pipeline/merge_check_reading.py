@@ -43,7 +43,9 @@ the declared commands name.
 
 from __future__ import annotations
 
+import base64
 import logging
+import os
 import re
 import tempfile
 import unicodedata
@@ -57,7 +59,10 @@ __all__ = [
     "CONFIG_PATH",
     "guardkit_rules",
     "read_the_merge_check",
+    "EXACT_SUFFIX",
     "REPORT_NAME_LISTS",
+    "names_for_record",
+    "names_from_record",
     "shown_path",
     "shown_report",
     "shown_sentence",
@@ -163,21 +168,71 @@ def shown_sentence(text: Any) -> str:
 
 
 def shown_report(value: Any, *, key: str | None = None) -> Any:
-    """A report the build system printed, with every string in it shown as a
-    person reads it (coach review 3): the names in :data:`REPORT_NAME_LISTS`
-    as :func:`shown_path` shows them, every other string as one line
-    (:func:`shown_sentence`), keys as names. Whatever the report copied out of
-    the project then reaches Forge's records and messages in a form that can
-    be written and adds no line."""
+    """A report the build system printed, with every sentence in it shown as
+    one line a person reads (:func:`shown_sentence`, coach review 3), so
+    whatever it copied out of the project adds no line and no byte that
+    cannot be written.
+
+    The lists of file names in :data:`REPORT_NAME_LISTS` are structured data
+    and are kept EXACTLY as reported (review R5): two different names may
+    look alike once escaped, so they are compared and recorded as they are
+    (:func:`names_for_record`) and escaped only when a sentence names them.
+    """
+    if key in REPORT_NAME_LISTS:
+        return value
     if isinstance(value, str):
-        return shown_path(value) if key in REPORT_NAME_LISTS else shown_sentence(value)
+        return shown_sentence(value)
     if isinstance(value, dict):
-        return {
-            shown_path(k): shown_report(v, key=str(k)) for k, v in value.items()
-        }
+        return {k: shown_report(v, key=str(k)) for k, v in value.items()}
     if isinstance(value, list):
         return [shown_report(v, key=key) for v in value]
     return value
+
+
+#: The suffix of a record field that keeps a list of names exactly.
+EXACT_SUFFIX = "_exact"
+
+
+def _name_bytes(name: str) -> bytes:
+    try:
+        return os.fsencode(name)
+    except UnicodeError:
+        return name.encode("utf-8", "surrogatepass")
+
+
+def names_for_record(key: str, names: Any) -> dict[str, list[str]]:
+    """The record fields for one list of file names (review R5): ``key`` holds
+    the names as a person reads them, and ``key`` + ``_exact`` holds each
+    name exactly, as base64 of its bytes, so a record written as strict UTF-8
+    JSON gives back the same names, never two that look alike."""
+    exact = [str(n) for n in (names if isinstance(names, (list, tuple)) else [])]
+    return {
+        key: [shown_path(n) for n in exact],
+        key + EXACT_SUFFIX: [
+            base64.b64encode(_name_bytes(n)).decode("ascii") for n in exact
+        ],
+    }
+
+
+def names_from_record(detail: Any, key: str) -> list[str]:
+    """The exact names :func:`names_for_record` wrote for ``key``. A record
+    written before exact names were kept (no ``_exact`` field, or one that
+    cannot be read) gives back its plain list as it is."""
+    if not isinstance(detail, dict):
+        return []
+    carried = detail.get(key + EXACT_SUFFIX)
+    if isinstance(carried, list) and all(isinstance(c, str) for c in carried):
+        try:
+            return [
+                os.fsdecode(base64.b64decode(c.encode("ascii"), validate=True))
+                for c in carried
+            ]
+        except (ValueError, UnicodeError):
+            pass
+    plain = detail.get(key)
+    if not isinstance(plain, (list, tuple)):
+        return []
+    return [str(n) for n in plain]
 
 
 def _not_read(declared_at: str | None, reason: str) -> dict[str, Any]:

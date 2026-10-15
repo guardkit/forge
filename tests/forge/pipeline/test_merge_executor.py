@@ -5045,8 +5045,119 @@ def test_the_join_checks_report_keeps_no_raw_bytes_or_line_breaks() -> None:
     )
     report = _report_in(said)
 
-    # A sentence stays one line; a name keeps the backslash form.
+    # A sentence stays one line and is shown as a person reads it. A list of
+    # file names is structured data: its names stay exactly as reported
+    # (review R5), and are escaped only when a sentence names them.
     assert report == {
         "verify_detail": "caf\\xe9/check.sh The checks passed",
-        "judged_with_main_copies": ["evil\\nThe checks passed/check.sh"],
+        "judged_with_main_copies": ["evil\nThe checks passed/check.sh"],
     }
+
+
+# Review R5: names are classified exactly; escaping is only for sentences.
+
+#: A folder whose name holds a line break, and one named with a literal
+#: backslash and n. Escaped for a sentence, both read the same.
+WITH_A_BREAK = "x\n/check.sh"
+WITH_A_BACKSLASH = "x\\n/check.sh"
+
+
+class _JoinsWithLookalikeNames(_JoinsForReal):
+    """One judge restored from main (the line-break name) and one the target
+    does not have (the backslash name), which was left out."""
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        said = await super().__call__(**kwargs)
+        if kwargs.get("args", [None])[0] == "check-join":
+            return said
+        report = json.loads(said.stdout_tail)
+        report["judged_with_main_copies"] = [WITH_A_BREAK, WITH_A_BACKSLASH]
+        report["judge_files_not_on_target"] = [WITH_A_BACKSLASH]
+        return GuardKitResult(
+            status=said.status,
+            subcommand=said.subcommand,
+            duration_secs=said.duration_secs,
+            stdout_tail=json.dumps(report),
+            stderr=said.stderr,
+            exit_code=said.exit_code,
+        )
+
+
+USED_ONE = (
+    "The merge used main's version of x\\n/check.sh and did not run this "
+    "build's changes to it."
+)
+LEFT_ONE = (
+    "The merge left out x\\n/check.sh, which main does not have, and did not "
+    "run this build's copy of it."
+)
+
+
+def _merge_checks_line(pool: Any) -> dict[str, Any]:
+    lines = json.loads(
+        pool.connection.execute(
+            "SELECT lines_json FROM publication_records WHERE build_id = ?",
+            (BUILD_ID,),
+        ).fetchone()[0]
+    )
+    done = [l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"]
+    return done[-1]["detail"]
+
+
+class TestLookalikeNamesAreClassifiedExactly:
+    @pytest.mark.asyncio
+    async def test_the_first_and_the_resumed_press_keep_one_of_each(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithLookalikeNames(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        assert USED_ONE in first.detail
+        assert LEFT_ONE in first.detail
+
+        from forge.pipeline.merge_check_reading import names_from_record
+
+        recorded = _merge_checks_line(pool)
+        assert names_from_record(recorded, "judged_with_main_copies") == [
+            WITH_A_BREAK,
+            WITH_A_BACKSLASH,
+        ]
+        assert names_from_record(recorded, "judge_files_not_on_target") == [WITH_A_BACKSLASH]
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        for outcome in (first, second):
+            assert USED_ONE in outcome.detail
+            assert LEFT_ONE in outcome.detail
+            outcome.detail.encode("utf-8")
+
+    @pytest.mark.asyncio
+    async def test_a_record_written_before_exact_names_still_resumes(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithOneLeftOut(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        await _run_executor(deps, repo_root)
+        row = pool.connection.execute(
+            "SELECT lines_json FROM publication_records WHERE build_id = ?", (BUILD_ID,)
+        ).fetchone()[0]
+        lines = json.loads(row)
+        for line in lines:
+            detail = line.get("detail")
+            if isinstance(detail, dict):
+                for key in [k for k in detail if k.endswith("_exact")]:
+                    del detail[key]
+        pool.connection.execute(
+            "UPDATE publication_records SET lines_json = ? WHERE build_id = ?",
+            (json.dumps(lines), BUILD_ID),
+        )
+        pool.connection.commit()
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        assert MAIN_COPIES in second.detail
+        assert LEFT_OUT in second.detail

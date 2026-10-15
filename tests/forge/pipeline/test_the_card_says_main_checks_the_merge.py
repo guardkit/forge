@@ -1586,3 +1586,26 @@ async def test_a_right_to_left_override_in_a_name_is_shown_not_obeyed(
     assert "\u202e" not in words
     assert "This build adds tools/\\u202ehs.kcehc/check.sh" in words
     assert [j["path"] for j in reading["judge_files"]] == ["tools/\\u202ehs.kcehc/check.sh"]
+
+
+# ---------------------------------------------------------------------------
+# Review R5: names are decided on exactly, and escaped only for the words
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_lookalike_names_are_decided_on_exactly(config, pool, rules) -> None:
+    on_main = "x\n/check.sh"
+    not_on_main = "x\\n/check.sh"
+    target = _project(**{on_main: ("100755", "main's copy\n")})
+    candidate = dict(target, **{not_on_main: ("100755", "the build's copy\n")})
+
+    words, reading = await _routine_card(
+        config, pool, trees=_trees(target, candidate), rules=rules,
+        name_status=f"A\0{on_main}\0A\0{not_on_main}\0",
+    )
+
+    fates = sorted((j["path"], j["on_target"]) for j in reading["judge_files"])
+    assert fates == [("x\\n/check.sh", False), ("x\\n/check.sh", True)]
+    assert "Main has its own copy, so the merge will use main's version of it" in words
+    assert "The merge will run without it." in words
