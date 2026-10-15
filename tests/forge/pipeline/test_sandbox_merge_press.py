@@ -1190,6 +1190,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         started_at: str,
         monkeypatch: pytest.MonkeyPatch,
         publisher: Any = None,
+        joins: Any = None,
     ) -> Any:
         """The whole press, with the real dispatcher and stage beneath it.
 
@@ -1219,7 +1220,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
             config=config,
             pool=pool,
             pipeline_publisher=_FakePublisher(),
-            guardkit_run=_JoinsForReal(feature_id=FEATURE_ID),
+            guardkit_run=joins or _JoinsForReal(feature_id=FEATURE_ID),
             deploy_dispatcher=build_in_daemon_deploy_dispatcher(
                 config=config, nats_client=_Bus(), db_path=tmp_path / "forge.db"
             ),
@@ -1324,9 +1325,10 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         # Every leg is there: the check with its health check and live gate,
         # the question, the promote with its health check, the candidate's
         # teardown and the live gate on what is now live — which PASSED and
-        # was read as a pass, so nothing was rolled back. (The press's own
-        # cleanup asks for the teardown once more under the same run, and the
-        # stage turns that repeat away before any step runs.)
+        # was read as a pass, so nothing was rolled back. (The promote took
+        # the candidate down itself, so the press's own clean-up does not ask
+        # for it again: since 15 October 2026, FEAT-D267, that repeat is not
+        # sent, because the stage turned it away and the hold was kept.)
         assert self._which_ran(log, clone) == [
             "candidate",
             "health",
@@ -1352,6 +1354,84 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         assert list(records.rglob("deploy-record-*.md")), (
             "the deploy record was not written to the coordinator's own folder"
         )
+
+    @pytest.mark.asyncio
+    async def test_the_join_folder_goes_where_the_join_ran_and_the_hold_is_put_down(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """15 October 2026, FEAT-D267: a merge that went live kept its hold
+        because the join's working folder was not removed. The project's
+        checks had run in that folder and left a Go module cache — folders
+        nobody may write — in GuardKit's scratch area inside Git's record
+        folder for it, and in the folder itself, so Git stopped half way.
+
+        Here the join leaves exactly that behind, in the sandbox's clone. The
+        folder is removed there, the receipt names the path the join really
+        used (the sandbox's, not the coordinator's, which holds nothing), and
+        the hold is put down."""
+        from forge.pipeline.merge_join import integration_branch
+        from forge.pipeline.publication_record import PublicationRecordStore
+        from tests.forge.pipeline.test_merge_executor import _JoinsForReal
+
+        class _JoinsAndLeavesAReadOnlyCache(_JoinsForReal):
+            async def __call__(self, **kwargs: Any) -> Any:
+                answer = await super().__call__(**kwargs)
+                args = list(kwargs["args"])
+                folder = Path(args[args.index("--in-worktree") + 1])
+                record = Path(
+                    (folder / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+                )
+                for top in (
+                    record / "guardkit-scratch" / "toolchain" / "HOME" / "go" / "pkg",
+                    folder / ".cache" / "go-build",
+                ):
+                    module = top / "mod" / "example.com" / "m@v1.0.0"
+                    module.mkdir(parents=True)
+                    (module / "go.mod").write_text("module m\n", encoding="utf-8")
+                    for each in (module, module.parent, module.parent.parent):
+                        each.chmod(0o555)
+                return answer
+
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config,
+            pool,
+            clone,
+            on_this_side,
+            tmp_path,
+            started_at,
+            monkeypatch,
+            joins=_JoinsAndLeavesAReadOnlyCache(feature_id=FEATURE_ID),
+        )
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        where_it_ran = clone / ".forge" / "worktrees" / f"integration-{FEATURE_ID}"
+        receipt = json.loads(
+            next(_receipts_env.rglob("merge_deploy_join_folders.json")).read_text()
+        )
+        assert receipt["folders"] == [
+            {
+                "attempt": 1,
+                "folder": str(where_it_ran),
+                "removed": True,
+                "answered": True,
+                "branch_kept": integration_branch(FEATURE_ID, 1),
+            }
+        ], receipt
+        assert not where_it_ran.exists()
+        assert "integration-" not in _git(clone, "worktree", "list", "--porcelain")
+        assert not on_this_side.exists()
+        assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder is None
 
     @pytest.mark.asyncio
     async def test_a_press_that_picks_up_a_published_join_lays_its_tree_out_again(

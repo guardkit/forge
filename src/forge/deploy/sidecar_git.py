@@ -374,8 +374,13 @@ class SidecarCandidateGit:
             ),
         )
 
-    async def remove_working_folder(self, path: str) -> bool:
+    async def remove_working_folder(self, path: str) -> bool | None:
         """Remove the join's working folder in the sandbox. Never raises.
+
+        ``True`` removed (or already gone), ``False`` the sandbox answered
+        that it was not removed, ``None`` no answer came back: only that may
+        still be running in there, so only that keeps the merge's hold
+        (15 October 2026, FEAT-D267).
 
         Only the folder's NAME goes over the wire, as for
         :meth:`add_working_folder`. ``path`` is whatever the caller has for
@@ -396,8 +401,15 @@ class SidecarCandidateGit:
                 path,
                 why,
             )
+            return None
+        if str(decoded.get("status") or "") != "success":
+            logger.warning(
+                "sandbox git: the working folder at %s was not removed: %s",
+                path,
+                decoded.get("detail"),
+            )
             return False
-        return str(decoded.get("status") or "") == "success"
+        return True
 
     async def inspect_autobuild_worktree(
         self, build_id: str, path: str

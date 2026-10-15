@@ -7,7 +7,8 @@ REAL service on a real ephemeral loopback port, against a real git repository,
 so what is proved is the two halves agreeing — not a mock's idea of them.
 
 The failure half matters as much: a sidecar that cannot be reached must never
-crash a press. Every read answers ``None``, a removal answers ``False``, and
+crash a press. Every read answers ``None``, a tree's removal answers
+``False`` (a working folder's answers ``None``: no answer came back), and
 only laying a tree out raises — which is the one place the press already
 expects a raise and turns into a plain refusal before the merge.
 """
@@ -160,6 +161,55 @@ class TestTheJoinsWorkingFolderIsRemovedInThere:
         assert await git.remove_working_folder(coordinator_side) is True
         assert not Path(made.path).exists()
 
+    @staticmethod
+    def _a_read_only_module_cache_in(folder: Path) -> None:
+        """What the project's Go checks leave behind (FEAT-D267, 15 October
+        2026): a module cache of read-only folders in GuardKit's scratch area
+        inside Git's record folder for the working folder."""
+        record = Path(
+            (folder / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+        )
+        module = record / "guardkit-scratch" / "HOME" / "go" / "pkg" / "mod" / "m@v1"
+        module.mkdir(parents=True)
+        (module / "go.mod").write_text("module m\n", encoding="utf-8")
+        module.chmod(0o555)
+        module.parent.chmod(0o555)
+
+    @pytest.mark.asyncio
+    async def test_a_read_only_module_cache_does_not_stop_the_removal(
+        self, git: SidecarCandidateGit, clone: Path
+    ) -> None:
+        made = await git.add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok, made.refusal
+        self._a_read_only_module_cache_in(Path(made.path))
+
+        assert await git.remove_working_folder(str(made.path)) is True
+        assert not Path(made.path).exists()
+        assert "integration-" not in _git(clone, "worktree", "list", "--porcelain")
+
+    @pytest.mark.asyncio
+    async def test_a_removal_the_sandbox_answered_it_could_not_do_is_false(
+        self,
+        git: SidecarCandidateGit,
+        clone: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ANSWERED "not removed" is ``False``; only a lost answer is
+        ``None`` (the press keeps its hold for that alone)."""
+        import forge.subagents.autobuild_worktree_lifecycle as lifecycle
+
+        made = await git.add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok, made.refusal
+        self._a_read_only_module_cache_in(Path(made.path))
+        # As before the fix: nothing makes the cache's folders writable first.
+        monkeypatch.setattr(lifecycle, "make_worktree_removable", lambda _path: None)
+
+        assert await git.remove_working_folder(str(made.path)) is False
+
 
 class TestTheProjectsOwnFileIsReadInThere:
     """The press reads ``deploy/profile.yaml`` at a commit through this venue
@@ -205,6 +255,17 @@ class TestASidecarThatCannotBeReached:
         assert await git.remove_candidate_tree(FEATURE_ID) is False
         unread = await git.read_file_at_commit("main", "deploy/profile.yaml")
         assert unread.ok is False and "127.0.0.1:1" in str(unread.refusal)
+
+    @pytest.mark.asyncio
+    async def test_a_working_folder_removal_with_no_answer_answers_none(self) -> None:
+        """15 October 2026, FEAT-D267: no answer is ``None``, not ``False``,
+        so the press can tell it from a removal the sandbox refused."""
+        assert (
+            await self._unreachable().remove_working_folder(
+                "/x/.forge/worktrees/integration-FEAT-SG1"
+            )
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_a_retirement_with_no_answer_says_it_had_none(self) -> None:

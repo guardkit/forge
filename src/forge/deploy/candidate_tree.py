@@ -1327,8 +1327,12 @@ class CandidateGit(Protocol):
         can go wrong comes back as ``ok=False`` with a plain sentence.
         """
 
-    async def remove_working_folder(self, path: str) -> bool:
-        """Remove a working folder. A path already gone is a success."""
+    async def remove_working_folder(self, path: str) -> bool | None:
+        """Remove a working folder. A path already gone is a success.
+
+        ``False`` when the venue answered that it was not removed; ``None``
+        when no answer came back (a sandbox venue only).
+        """
 
     async def inspect_autobuild_worktree(
         self, build_id: str, path: str

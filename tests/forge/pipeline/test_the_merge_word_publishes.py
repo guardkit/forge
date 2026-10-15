@@ -1167,10 +1167,12 @@ class TestTheDeployPutsLiveExactlyWhatWasChecked:
 
         assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
         legs = [call.get("leg") for call in deploy.calls]
-        assert legs == ["candidate_check", "what_is_running", "promote", "candidate_down"]
+        # The promote said it took the candidate down itself, so the press's
+        # clean-up does not ask again (15 October 2026, FEAT-D267: the stage
+        # turned that repeat away, and the hold was kept after a live merge).
+        assert legs == ["candidate_check", "what_is_running", "promote"]
         assert [("candidate_cwd" in call) for call in deploy.calls] == [
             True,
-            False,
             False,
             False,
         ]
@@ -2144,11 +2146,14 @@ class _ASurfaceWhoseCleanUpsSay:
         from forge.deploy.candidate_tree import InContainerCandidateGit
 
         class _Surface(InContainerCandidateGit):
-            async def remove_working_folder(self, path: str) -> bool:
+            async def remove_working_folder(self, path: str) -> bool | None:
                 if says.get("folder") == "raises":
                     raise ConnectionResetError("the removal's answer was lost")
                 if says.get("folder") == "false":
                     return False
+                if says.get("folder") == "no-answer":
+                    # The sandbox venue's own words when no answer came back.
+                    return None
                 return await super().remove_working_folder(path)
 
             async def retire_autobuild_worktree(
@@ -2187,13 +2192,24 @@ class TestEverySandboxCleanUpIsGuarded:
         return dataclasses.replace(deps, git_surface=lambda _repo, _root: surface)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("folder", ["false", "raises"])
-    async def test_a_join_folder_that_was_not_removed_keeps_the_hold(
+    @pytest.mark.parametrize(
+        "folder, kept",
+        [
+            # 15 October 2026, FEAT-D267: a join folder the venue answered it
+            # did not remove is a leftover folder, not running work, so the
+            # hold is put down; only a removal with no answer keeps it.
+            ("false", False),
+            ("no-answer", True),
+            ("raises", True),
+        ],
+    )
+    async def test_a_join_folder_whose_removal_was_not_answered_keeps_the_hold(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         folder: str,
+        kept: bool,
     ) -> None:
         deps = self._with_surface(
             _deps_that_can_deploy(
@@ -2208,8 +2224,8 @@ class TestEverySandboxCleanUpIsGuarded:
         outcome = await _press(deps, repo_root)
 
         assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
-        assert _record(pool).lease_holder is not None
-        assert "another worker" in (await _press(deps, repo_root)).detail
+        assert (_record(pool).lease_holder is not None) is kept
+        assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2294,3 +2310,63 @@ class TestEverySandboxCleanUpIsGuarded:
         assert removals == []  # the between-attempts removal said False
         assert _record(pool).lease_holder is not None
         assert "another worker" in (await _press(deps, repo_root)).detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tree_removed, kept", [(False, True), (True, False)], ids=["lost", "answered"]
+    )
+    async def test_main_moving_since_the_preview_keeps_the_hold_only_after_an_unconfirmed_clean_up(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        tree_removed: bool,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, FEAT-A9DA: the refusal for a main that moved since
+        the preview is a settled ending, so the hold is put down — unless a
+        clean-up the press sent earlier was not confirmed, which keeps it.
+
+        The first attempt joins the tree that was previewed; the publisher
+        answers that the remote moved, and the next attempt joins a different
+        tree, which is refused. Between the attempts the candidate tree's
+        removal says ``tree_removed``."""
+        previewed = _git(
+            repo_root, "merge-tree", "--write-tree", "main", f"autobuild/{FEATURE_ID}"
+        )
+        landed: list[str] = []
+
+        def another_hand(_request: dict[str, Any]) -> None:
+            if not landed:
+                landed.append(_somebody_else_lands_work(repo_root, "between"))
+
+        deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays(
+                [_the_remote_moved()], before_answering=another_hand
+            ),
+        )
+        removals = [tree_removed]
+        deps = self._with_surface(
+            deps, _ASurfaceWhoseCleanUpsSay(repo_root, tree_removals=removals)
+        )
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            repo=REPO,
+            repo_root=repo_root,
+            expect_main_sha=MAIN_SHA,
+            correlation_id=CORRELATION,
+            decided_by="rich",
+            expected_preview_tree=previewed,
+        )
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        assert "main moved since the preview" in outcome.detail
+        assert removals == []
+        assert _record(pool).result == RESULT_PUBLICATION_PENDING
+        assert (_record(pool).lease_holder is not None) is kept

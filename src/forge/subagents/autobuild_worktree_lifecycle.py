@@ -558,6 +558,32 @@ def _open_record_folder(repo: Path, worktree: Path) -> int | None:
     return None
 
 
+def make_worktree_removable(worktree: Path) -> None:
+    """Make a linked worktree's folder and Git's record folder for it
+    owner-writable, just before Git is asked to remove it. Best effort.
+
+    15 October 2026, FEAT-D267: the merge's join folder held a Go module
+    cache (read-only folders) in GuardKit's scratch area inside its record
+    folder, so ``git worktree remove --force`` deleted the folder and then
+    stopped with exit 255, exactly as the retained worktree did for
+    FEAT-6AC9. The same two walks are used here, and nothing else: the
+    record folder is found from the worktree itself and must point back at
+    exactly it, and no link is followed. Anything that cannot be reached
+    that way is left alone, and Git reports what it could not remove.
+    """
+    try:
+        _make_owner_writable(worktree)
+        record = _open_record_folder(worktree, worktree)
+        if record is None:
+            return
+        try:
+            _widen_by_handle(record)
+        finally:
+            os.close(record)
+    except (OSError, RecursionError):
+        return
+
+
 def _remove_worktree(repo: Path, worktree: Path) -> tuple[int, bytes]:
     """``git worktree remove --force`` for one offer-pinned worktree, with its
     folder and its record folder made owner-writable first.

@@ -653,10 +653,14 @@ async def remove_journey_worktree(
     second call is safe.
     """
     from forge.adapters.git.operations import _default_execute, cleanup_worktree
+    from forge.subagents.autobuild_worktree_lifecycle import make_worktree_removable
 
     target = Path(_normalise(worktree))
     if not target.exists():
         return WorktreeCut(ok=True, path=str(target))
+    # Read-only folders a tool's cache left inside it, or inside Git's record
+    # folder for it, would stop Git half way (FEAT-D267, 15 October 2026).
+    make_worktree_removable(target)
     try:
         result = await cleanup_worktree(
             build_id or target.name,

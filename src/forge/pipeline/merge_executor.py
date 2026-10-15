@@ -1544,12 +1544,12 @@ async def execute_merge_deploy(
     # ``held_turn`` is the turn this press took the lease on; 0 = none.
     press_settled = False
     held_turn = 0
-    # Set when a deploy-stage leg did not report complete, or a clean-up the
-    # press sent into the sandbox (a candidate tree, a join's working folder)
-    # was not confirmed done, or the retained worktree's retirement got no
-    # answer back; never cleared. A retirement answered "kept" does not set
-    # it: that is a leftover folder, not running work. The final clean-up
-    # counts too: the hold is decided after it.
+    # Set when a deploy-stage leg did not report complete, or a candidate
+    # tree's removal was not confirmed done, or a join's working folder's
+    # removal or the retained worktree's retirement got no answer back; never
+    # cleared. A removal or retirement ANSWERED "not done" does not set it:
+    # that is a leftover folder, not running work. The final clean-up counts
+    # too: the hold is decided after it.
     a_leg_did_not_complete = False
 
     # WHICH JUDGE FILES THE MERGE CHECKED WITH MAIN'S COPIES (15 October 2026,
@@ -2913,6 +2913,7 @@ async def execute_merge_deploy(
            with the one it was handed, AS TEXT. A mismatch is a FAILED deploy;
         7. record R and release the lock.
         """
+        nonlocal candidate_standing
         lock = _deployment_lock_store()
         if lock is None:
             return _published_deployment_pending(
@@ -3307,6 +3308,13 @@ async def execute_merge_deploy(
 
             outcome_word = getattr(deployed, "outcome", None)
             detail = getattr(deployed, "detail", None) or {}
+            # THE PROMOTE TOOK THE CANDIDATE DOWN ITSELF (15 October 2026,
+            # FEAT-D267): then there is nothing left for the press's clean-up
+            # to tear down. Asking again under the same run is turned away by
+            # the stage, reads as a teardown that did not complete, and kept
+            # the hold after a merge that went live.
+            if detail.get("candidate") in ("torn-down", "absent"):
+                candidate_standing = False
             said = str(detail.get("deploy_output") or "")
             reported = identity_reported_by(said, marker=declaration.marker)
             # A COMMAND A TAKEOVER STOPPED IS NOT A FAILED DEPLOY. It is NO
@@ -5047,10 +5055,18 @@ async def execute_merge_deploy(
                     expected_preview_tree,
                     j_tree,
                 )
+                # SETTLED (15 October 2026, FEAT-A9DA): this refusal comes
+                # after a join that answered and before any leg is sent, so
+                # nothing this press started can still be running. Unsettled,
+                # it kept the hold and the release idle check waited on it.
+                # A leg whose answer was lost earlier still keeps the hold,
+                # through ``a_leg_did_not_complete``.
                 return _nothing_was_published(
-                    _could_not_check(
-                        "main moved since the preview: previewed tree "
-                        f"{expected_preview_tree}, joined tree {j_tree}"
+                    _settled(
+                        _could_not_check(
+                            "main moved since the preview: previewed tree "
+                            f"{expected_preview_tree}, joined tree {j_tree}"
+                        )
                     ),
                     store=store,
                     turn=turn,
@@ -5419,12 +5435,22 @@ async def execute_merge_deploy(
         nonlocal a_leg_did_not_complete
         retired: list[dict[str, Any]] = []
         highest = int(getattr(record, "attempt", 0) or 0) if record is not None else 0
+        # WHERE EACH JOIN'S FOLDER REALLY IS (15 October 2026, FEAT-D267): the
+        # join's "done" line carries the path the venue answered with, which
+        # for a sandboxed repository is the sandbox's own path. That is the
+        # folder retired and the one the receipt names. An attempt with no
+        # such line falls back to this side's path. Either way the sandbox
+        # venue sends only the folder's own name, and the sandbox builds its
+        # own path from it (8 October 2026).
+        joined_at: dict[int, str] = {}
+        for line in getattr(record, "lines", ()) or ():
+            where = str((line.detail or {}).get("working_folder") or "").strip()
+            if line.kind == LINE_DONE and line.step == STEP_JOIN and where:
+                joined_at[int(line.attempt)] = where
         for attempt_number in range(1, max(highest, 1) + 1):
-            # This side's path, for the record and for a repository with no
-            # sandbox. The sandbox venue sends only the folder's own name and
-            # the sandbox builds its own path from it (8 October 2026: sending
-            # this path to the sandbox was refused, and every folder stayed).
-            folder = working_folder_path(repo_root, feature_id, attempt_number)
+            folder = joined_at.get(attempt_number) or working_folder_path(
+                repo_root, feature_id, attempt_number
+            )
             try:
                 removed = await git.remove_working_folder(folder)
             except Exception as exc:  # noqa: BLE001 — never costs a result
@@ -5434,17 +5460,23 @@ async def execute_merge_deploy(
                         "attempt": attempt_number,
                         "folder": folder,
                         "removed": False,
+                        "answered": False,
                         "detail": f"{type(exc).__name__}: {exc}",
                     }
                 )
                 continue
-            if not removed:
+            # A folder the venue ANSWERED it did not remove is a folder left
+            # behind, not work still running: the receipt says so and the
+            # hold is put down, as for the retained worktree (a986459c). Only
+            # a removal whose answer was lost (``None``) keeps the hold.
+            if removed is None:
                 a_leg_did_not_complete = True
             retired.append(
                 {
                     "attempt": attempt_number,
                     "folder": folder,
                     "removed": bool(removed),
+                    "answered": removed is not None,
                     "branch_kept": integration_branch(feature_id, attempt_number),
                 }
             )
