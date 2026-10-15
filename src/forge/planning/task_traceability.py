@@ -490,9 +490,16 @@ def _quotes_three_consecutive_words(document: str, request_words: Sequence[str])
 
 def _route_shaped(text: str) -> list[str]:
     """Every route-shaped string in ``text``, by the route reader's own rule:
-    a slash-led path longer than three characters with a letter in it."""
+    a slash-led path longer than three characters with a letter in it.
+
+    A closing markup tag (``</span>``, ``</time>``) is not one: the slash right
+    after ``<`` put "/span" and "/time" on FEAT-7F19's card (15 October 2026)."""
     found: list[str] = []
-    for match in _ROUTE_PATH.findall(str(text or "")):
+    source = str(text or "")
+    for hit in _ROUTE_PATH.finditer(source):
+        match = hit.group(0)
+        if hit.start() > 0 and source[hit.start() - 1] == "<":
+            continue
         if len(match) > 3 and re.search(r"[A-Za-z]", match) and match not in found:
             found.append(match)
     return found
@@ -525,7 +532,10 @@ def _is_a_place_on_disk(path: str, test_roots: Sequence[str]) -> bool:
     against: ``/tests/users/test_analytics.py`` is a file, not an endpoint.
     ``/tmp/kcadm-`` and ``/dev/null`` in a setup script are files too.
     """
-    first = path.lstrip("/").split("/", 1)[0].lower()
+    # A shell default such as ``${TMPDIR:-/tmp}/kc-readiness-XXXXXX`` arrives
+    # as ``/tmp}/...``: the closing brace is shell syntax, not part of the
+    # folder name (FEAT-6AC9's card, 15 October 2026).
+    first = path.lstrip("/").split("/", 1)[0].lower().rstrip("}")
     roots = {
         str(root).strip("/ ").lower().split("/", 1)[0]
         for root in test_roots

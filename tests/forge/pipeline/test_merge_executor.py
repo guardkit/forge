@@ -4640,6 +4640,114 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert held.lease_holder is not None
 
     @pytest.mark.asyncio
+    async def test_a_merge_stopped_on_a_conflict_says_nothing_was_published(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> None:
+        """FEAT-7F19, 15 October 2026: the merge command refused the join on a
+        conflict and the record's result was left empty, which the release
+        idle check reads as work still running. It now says nothing was
+        published; the hold rule is unchanged (a refusal with the command's
+        own report puts it down)."""
+        guardkit = _FakeGuardKit(
+            status="failed",
+            report={
+                "outcome": "refused",
+                "refusal_reason": "the merge stopped on a conflict in app.py",
+            },
+        )
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=guardkit)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert held.lease_holder is None
+
+    @pytest.mark.asyncio
+    async def test_a_refused_merge_with_no_answer_says_nothing_was_published(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> None:
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_no_answer_came_back("timeout")
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        # Unchanged: no report means nobody knows, so the hold is kept.
+        assert held.lease_holder is not None
+
+    @pytest.mark.asyncio
+    async def test_a_join_that_could_not_start_says_nothing_was_published(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The join's working folder could not be made: nothing was joined,
+        and the record says nothing was published. The hold rule is
+        unchanged: this ending is not a settled one, so the hold is kept."""
+        from forge.pipeline import merge_executor
+        from forge.pipeline.merge_join import JoinOutcome
+
+        async def _no_folder(*_args: Any, **_kwargs: Any) -> JoinOutcome:
+            return JoinOutcome(ok=False, refusal="the disk is full")
+
+        monkeypatch.setattr(merge_executor, "make_the_working_folder", _no_folder)
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal())
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused", outcome.detail
+        assert "the disk is full" in outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert held.lease_holder is not None
+
+    @pytest.mark.asyncio
+    async def test_a_conflict_whose_record_moved_on_stops_as_replaced(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        real_record = PublicationRecordStore.record
+
+        def _refused_when_writing_the_result(self: Any, **kwargs: Any) -> bool:
+            if kwargs.get("result") == "publication pending":
+                return False
+            return real_record(self, **kwargs)
+
+        monkeypatch.setattr(
+            PublicationRecordStore, "record", _refused_when_writing_the_result
+        )
+        guardkit = _FakeGuardKit(
+            status="failed",
+            report={"outcome": "refused", "refusal_reason": "a conflict"},
+        )
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=guardkit)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.failed_step == "record", outcome.detail
+        assert "replaced" in outcome.detail
+        # A replaced worker never puts the hold down.
+        assert _the_hold(pool).lease_holder is not None
+
+    @pytest.mark.asyncio
     async def test_a_candidate_refusal_whose_record_moved_on_stops_as_replaced(
         self,
         config: ForgeConfig,

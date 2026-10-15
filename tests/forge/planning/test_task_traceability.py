@@ -122,7 +122,7 @@ def test_a_file_under_a_declared_test_root_is_a_place_on_disk() -> None:
     assert review.findings == []
 
 
-@pytest.mark.parametrize("disk_path", ["/tmp/kcadm-", "/dev/null", "/var/log/app", "/dev/tcp/keycloak/8080", "/opt/keycloak/bin/kcadm"])
+@pytest.mark.parametrize("disk_path", ["/tmp/kcadm-", "/dev/null", "/var/log/app", "/dev/tcp/keycloak/8080", "/opt/keycloak/bin/kcadm", "/tmp}/kc-readiness-XXXXXX"])
 def test_an_operating_system_folder_is_a_place_on_disk(disk_path: str) -> None:
     # Found live on 15 October 2026: a Keycloak setup script in a task
     # document wrote its temporary files to /tmp/kcadm- and its noise to
@@ -699,3 +699,11 @@ def test_the_guard_agrees_with_the_twelve_plan_retrospective() -> None:
     # plans draw a flag, and nine of the twelve draw one that can stop a run.
     assert flagged_plans == 11
     assert plans_that_can_stop_a_run == 9
+
+
+def test_a_closing_markup_tag_is_not_a_web_address() -> None:
+    from forge.planning.task_traceability import _route_shaped
+
+    found = _route_shaped('<span className="date">{created}</span> <time>{t}</time> GET /api/notes')
+    assert "/span" not in found and "/time" not in found
+    assert "/api/notes" in found

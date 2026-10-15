@@ -375,6 +375,216 @@ def inspect_autobuild_worktree(
     return answer
 
 
+# READ-ONLY FOLDERS (15 October 2026, FEAT-6AC9). Tools write caches with
+# folders their owner cannot write (a language's module cache is the usual
+# one), inside a worktree or inside the scratch area GuardKit keeps in Git's
+# own record folder for it. Git cannot delete inside such a folder: the live
+# `git worktree remove --force` deleted the task's working folder, stopped on
+# the record folder with exit 255 and left a "prunable" registration. So,
+# just before Git removes an offer-pinned worktree, its folder and its record
+# folder are made owner-writable. Only folders need it (deleting a file needs
+# a writable folder, not a writable file). Symbolic links are never followed:
+# a link is not a folder here, whatever it points at.
+
+
+def _subfolders(descriptor: int) -> list[str]:
+    """The names of the real folders (never links) in an open folder."""
+    with os.scandir(descriptor) as entries:
+        return [
+            entry.name for entry in entries if entry.is_dir(follow_symlinks=False)
+        ]
+
+
+_OPEN_FOLDER = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+
+
+def _widen_by_handle(descriptor: int) -> None:
+    """Give the owner full access to the open folder ``descriptor`` and to
+    every real folder below it, each opened without following links.
+
+    The walk only adds owner access to folders the cleaning user already
+    owns, which that user could change anyway, so a walk redirected
+    elsewhere gains nothing. A folder owned by anyone else is skipped with
+    everything below it, and so is anything that cannot be opened as a folder
+    without following a link; Git's removal then says "kept".
+    """
+    mode = os.fstat(descriptor)
+    if not stat.S_ISDIR(mode.st_mode) or mode.st_uid != os.geteuid():
+        return
+    if stat.S_IMODE(mode.st_mode) & 0o700 != 0o700:
+        os.fchmod(descriptor, stat.S_IMODE(mode.st_mode) | 0o700)
+    for child in _subfolders(descriptor):
+        try:
+            opened = os.open(child, _OPEN_FOLDER, dir_fd=descriptor)
+        except OSError:
+            continue
+        try:
+            _widen_by_handle(opened)
+        finally:
+            os.close(opened)
+
+
+# Passing through a folder needs only search access, so the folders on the
+# way down are opened as paths (Linux), and only the last one for reading.
+_PASS_THROUGH = (
+    getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+
+
+def _open_folder_strictly(path: Path) -> int | None:
+    """Open the folder at absolute ``path`` one name at a time from ``/``,
+    never following a link at any step; ``None`` if any step is a link, is
+    not a folder, or cannot be opened. The caller closes the handle."""
+    parts = path.parts
+    if not path.is_absolute() or any(part in {"", ".", ".."} for part in parts[1:]):
+        return None
+    try:
+        current = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return None
+    for index, part in enumerate(parts[1:], start=2):
+        flags = _OPEN_FOLDER if index == len(parts) else _PASS_THROUGH
+        try:
+            following = os.open(part, flags, dir_fd=current)
+        except OSError:
+            os.close(current)
+            return None
+        os.close(current)
+        current = following
+    return current
+
+
+def _make_owner_writable(top: Path) -> None:
+    """Give the owner full access to every folder under ``top``, links skipped.
+
+    ``top`` is reached one name at a time from ``/`` without following a link
+    at any step, and every folder below it is opened from its parent's open
+    handle the same way, so a link put in any folder's place, above the tree
+    or inside it, is never followed. If ``top`` cannot be reached that way,
+    nothing is changed. Best effort: what cannot be changed is left for Git
+    to report ("kept").
+    """
+    descriptor = _open_folder_strictly(top)
+    if descriptor is None:
+        return
+    try:
+        _widen_by_handle(descriptor)
+    except (OSError, RecursionError):
+        return
+    finally:
+        os.close(descriptor)
+
+
+def _worktrees_record_root(repo: Path) -> Path | None:
+    """``<repository's .git folder>/worktrees``: where Git keeps the record
+    folder of every worktree registered on ``repo``.
+
+    Built from the path Git gives, made absolute and tidied by text alone,
+    never by following links: a link anywhere on it must stay visible so
+    that :func:`_open_folder_strictly` can refuse it.
+    """
+    code, raw = _git(repo, "rev-parse", "--git-common-dir")
+    if code != 0:
+        return None
+    common = Path(os.fsdecode(raw.strip()))
+    if not common.is_absolute():
+        common = repo / common
+    if not common.is_absolute():
+        return None
+    return Path(os.path.normpath(common / "worktrees"))
+
+
+def _read_small_file(folder: int, name: str) -> str | None:
+    """Read the regular file ``name`` inside the open folder ``folder``, never
+    through a link; ``None`` if it is anything else or cannot be read."""
+    try:
+        descriptor = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC, dir_fd=folder
+        )
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        return os.read(descriptor, 64 * 1024).decode("utf-8", errors="surrogateescape")
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def _open_record_folder(repo: Path, worktree: Path) -> int | None:
+    """An open handle on Git's own record folder for ``worktree``, or ``None``.
+
+    The worktree's ``.git`` file names the record folder. That name must be,
+    by text alone, exactly ``<repository's .git folder>/worktrees/<name>``;
+    the folder is reached from ``/`` without following a link at any step;
+    and its ``gitdir`` file, read through that same handle, must point back
+    at exactly ``worktree``. Anything else is ``None`` and nothing is
+    touched. The caller closes the handle.
+    """
+    root = _worktrees_record_root(repo)
+    worktree_folder = _open_folder_strictly(worktree)
+    if root is None or worktree_folder is None:
+        if worktree_folder is not None:
+            os.close(worktree_folder)
+        return None
+    try:
+        marker = _read_small_file(worktree_folder, ".git")
+    finally:
+        os.close(worktree_folder)
+    if marker is None:
+        return None
+    key, _sep, value = marker.strip().partition(":")
+    if key != "gitdir" or not value.strip():
+        return None
+    named = Path(value.strip())
+    if not named.is_absolute():
+        named = worktree / named
+    record = Path(os.path.normpath(named))
+    if record.parent != root or not record.name:
+        return None
+    descriptor = _open_folder_strictly(record)
+    if descriptor is None:
+        return None
+    pointer_text = _read_small_file(descriptor, "gitdir")
+    if pointer_text is not None:
+        pointer = Path(pointer_text.strip())
+        if not pointer.is_absolute():
+            pointer = record / pointer
+        if os.path.normpath(pointer) == os.path.normpath(worktree / ".git"):
+            return descriptor
+    os.close(descriptor)
+    return None
+
+
+def _remove_worktree(repo: Path, worktree: Path) -> tuple[int, bytes]:
+    """``git worktree remove --force`` for one offer-pinned worktree, with its
+    folder and its record folder made owner-writable first.
+
+    The record folder is walked from the very handle its back pointer was
+    read through, so what was checked is what is changed.
+    """
+    # FAIL CLOSED (Codex review, R3, round 5): if either the worktree or its
+    # record folder cannot be reached without following a link, Git is not
+    # asked to remove anything, because Git itself would follow that link.
+    top = _open_folder_strictly(worktree)
+    if top is None:
+        return 1, b"the worktree could not be reached without following a link"
+    os.close(top)
+    record = _open_record_folder(repo, worktree)
+    if record is None:
+        return 1, b"its record folder could not be reached and checked without following a link"
+    _make_owner_writable(worktree)
+    try:
+        _widen_by_handle(record)
+    except (OSError, RecursionError):
+        pass
+    finally:
+        os.close(record)
+    return _git(repo, "worktree", "remove", "--force", str(worktree))
+
+
 def retire_autobuild_worktree(
     *, repo: Path, base: Path, build_id: str, path: Path, expected: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -382,7 +592,10 @@ def retire_autobuild_worktree(
 
     A missing tree is idempotent success only when Git also has no registration
     for it.  Any mismatch from the offer-time registration/status identity
-    preserves the whole tree.
+    preserves the whole tree.  Each offer-pinned tree, and Git's record folder
+    for it, is made owner-writable just before Git removes it (15 October
+    2026, FEAT-6AC9). Nothing else is ever cleared: a registration an
+    earlier attempt left behind stays, and so does its tree ("kept").
     """
     before = inspect_autobuild_worktree(
         repo=repo, base=base, build_id=build_id, path=path
@@ -454,7 +667,7 @@ def retire_autobuild_worktree(
         cleanup_rows, key=lambda item: len(str(item["path"])), reverse=True
     ):
         nested_path = str(row["path"])
-        code, raw = _git(repo, "worktree", "remove", "--force", nested_path)
+        code, raw = _remove_worktree(repo, Path(nested_path))
         if code != 0:
             report["detail"] = (
                 f"could not remove registered nested worktree {nested_path}: "
@@ -485,7 +698,7 @@ def retire_autobuild_worktree(
             + ", ".join(sorted(descendants))
         )
         return report
-    code, raw = _git(repo, "worktree", "remove", "--force", str(wanted))
+    code, raw = _remove_worktree(repo, wanted)
     if code != 0:
         report["detail"] = (
             f"could not remove outer worktree {wanted}: "

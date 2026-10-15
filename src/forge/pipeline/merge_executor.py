@@ -1545,9 +1545,11 @@ async def execute_merge_deploy(
     press_settled = False
     held_turn = 0
     # Set when a deploy-stage leg did not report complete, or a clean-up the
-    # press sent into the sandbox (a candidate tree, a join's working folder,
-    # the retained worktree) was not confirmed done; never cleared. The final
-    # clean-up counts too: the hold is decided after it.
+    # press sent into the sandbox (a candidate tree, a join's working folder)
+    # was not confirmed done, or the retained worktree's retirement got no
+    # answer back; never cleared. A retirement answered "kept" does not set
+    # it: that is a leftover folder, not running work. The final clean-up
+    # counts too: the hold is decided after it.
     a_leg_did_not_complete = False
 
     # WHICH JUDGE FILES THE MERGE CHECKED WITH MAIN'S COPIES (15 October 2026,
@@ -3543,7 +3545,13 @@ async def execute_merge_deploy(
     def _nothing_was_published(
         refused: MergeDeployOutcome, *, store: Any, turn: int
     ) -> MergeDeployOutcome:
-        """The join was refused at its candidate check: the record says so.
+        """The press stopped after taking the hold and before anything was
+        sent: the record says so.
+
+        Used for the refusals at the candidate check and, since FEAT-7F19
+        (15 October 2026: a merge that stopped on a conflict left its record's
+        result empty, and the release idle check then waited on it), for a
+        join that could not start and a join the merge command refused.
 
         THE RECORD GETS ITS RESULT (15 October 2026). A press that took the
         lease and then stopped at the candidate check used to return without
@@ -4380,9 +4388,14 @@ async def execute_merge_deploy(
                             "nothing_was_joined": True,
                         },
                     )
-                    return _cannot_join(
-                        f"{named} could not be joined onto {target_branch}: "
-                        f"{made.refusal}. Nothing was merged and the branch is kept."
+                    return _nothing_was_published(
+                        _cannot_join(
+                            f"{named} could not be joined onto {target_branch}: "
+                            f"{made.refusal}. Nothing was merged and the branch "
+                            "is kept."
+                        ),
+                        store=store,
+                        turn=turn,
                     )
                 folder = str(made.path)
                 join_branch = str(made.branch)
@@ -4623,7 +4636,12 @@ async def execute_merge_deploy(
                     # report. No report — killed, timed out, or an answer
                     # lost on the way back from a sandbox — is an ending
                     # whose outcome nobody knows, and the hold is kept.
-                    return _settled(refused) if report is not None else refused
+                    # Either way nothing was sent, and the record says so.
+                    return _nothing_was_published(
+                        _settled(refused) if report is not None else refused,
+                        store=store,
+                        turn=turn,
+                    )
 
                 # THE JOIN WAS MADE BUT ITS CHECKS NEVER FINISHED. The command
                 # was killed, or died before it could say anything: the joined
@@ -5497,8 +5515,17 @@ async def execute_merge_deploy(
             )
         _write_receipt("autobuild_worktree_cleanup.json", retired)
         if retired.get("status") != "removed":
-            # Gone already is done; anything else may not have finished.
-            if retired.get("status") != "already-gone":
+            # A retained worktree that was ANSWERED as not retired is a folder
+            # left behind, not work still running (15 October 2026, FEAT-6AC9:
+            # a read-only cache folder stopped Git's removal, the press kept
+            # its hold, and the release idle check then waited on a build that
+            # had finished). The receipt and the warning say it was kept.
+            # Nothing retries it on its own: retirement runs once, after a
+            # successful merge, or when someone calls the sidecar's retire
+            # route by hand. Only a retirement whose answer was
+            # lost on the way back from the sandbox may still be running, so
+            # only that keeps the hold.
+            if retired.get("answered") is False:
                 a_leg_did_not_complete = True
             logger.warning(
                 "merge-executor: retained autobuild worktree for %s was kept: %s",

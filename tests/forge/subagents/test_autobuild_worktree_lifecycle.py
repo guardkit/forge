@@ -7,6 +7,7 @@ import socket
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -327,3 +328,457 @@ def test_a_failed_removal_puts_only_the_fixed_sentence_in_the_receipt(
     assert result["status"] == "kept", result
     assert result["detail"].endswith(": git branch stopped with exit code 1."), result
     assert "error:" not in result["detail"]
+
+
+# ---------------------------------------------------------------------------
+# READ-ONLY FOLDERS INSIDE A WORKTREE (15 October 2026, FEAT-6AC9). Tools such
+# as a language's module cache write their caches with folders the owner
+# cannot write. Git cannot delete inside such a folder, so `git worktree
+# remove --force` deleted the task's working folder, then stopped on Git's own
+# record folder for it (which held GuardKit's scratch area) with exit 255 and
+# left a "prunable" registration behind. The retirement now makes the
+# offer-pinned trees owner-writable first, never through a symbolic link.
+# Nothing is ever cleared on a retry: a leftover registration stays, and so
+# does its tree ("kept"), which holds nothing up.
+# ---------------------------------------------------------------------------
+
+
+def _record_folder(repo: Path, worktree: Path) -> Path:
+    for record in (repo / ".git" / "worktrees").iterdir():
+        pointer = (record / "gitdir").read_text().strip()
+        if Path(pointer).resolve() == (worktree / ".git").resolve():
+            return record
+    raise AssertionError(f"no record folder for {worktree}")
+
+
+def _read_only_cache(top: Path) -> list[Path]:
+    """A cache in the shape module caches take: read-only folders, all the
+    way down, with read-only files in them."""
+    deepest = top / "cache" / "mod" / "example.invalid" / "pkg@v1.0.0" / "sub"
+    deepest.mkdir(parents=True)
+    (deepest / "file.txt").write_text("cached\n")
+    (deepest / "file.txt").chmod(0o444)
+    folders = []
+    probe = deepest
+    while probe != top:
+        folders.append(probe)
+        probe = probe.parent
+    for folder in folders:  # deepest first, so each can still be reached
+        folder.chmod(0o555)
+    return folders
+
+
+@pytest.fixture
+def _writable_again(tmp_path: Path):
+    """Whatever a failing test leaves read-only is made writable again, so the
+    temporary folder can always be cleaned away."""
+    yield
+    for root, dirs, _files in os.walk(tmp_path):
+        for name in dirs:
+            full = Path(root) / name
+            if not full.is_symlink():
+                full.chmod(0o755)
+
+
+def test_read_only_folders_in_a_nested_worktree_and_its_record_are_removed(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    _read_only_cache(inner)
+    _read_only_cache(_record_folder(repo, inner) / "guardkit-scratch")
+    _read_only_cache(_record_folder(repo, outer) / "guardkit-scratch")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "removed", result
+    assert not outer.exists() and not inner.exists()
+    assert not (repo / ".git" / "worktrees").exists() or not list(
+        (repo / ".git" / "worktrees").iterdir()
+    )
+    assert "prunable" not in _git(repo, "worktree", "list", "--porcelain")
+
+
+def _todays_state(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
+    """Today's state, made the way it was made live: the earlier attempt's
+    `git worktree remove --force` deleted the working folder and stopped on the
+    read-only record folder, leaving a prunable registration."""
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    record = _record_folder(repo, inner)
+    _read_only_cache(record / "guardkit-scratch")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    failed = subprocess.run(
+        ["git", "worktree", "remove", "--force", str(inner)],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    assert failed.returncode != 0
+    assert not inner.exists() and record.exists()
+    assert "prunable" in _git(repo, "worktree", "list", "--porcelain")
+    return repo, base, outer, inner, record, offered
+
+
+@pytest.mark.parametrize("left_by", ["git-stopped-part-way", "folder-deleted"])
+def test_a_retry_clears_nothing_and_keeps_the_tree(
+    tmp_path: Path, _writable_again: None, left_by: str
+) -> None:
+    """A registration whose working folder is gone, whether Git's own failed
+    removal left it half-deleted or somebody deleted only the folder, is
+    never cleared: its record folder stays, Git still lists it, and the
+    tree is kept with the reason."""
+    import shutil
+
+    if left_by == "git-stopped-part-way":
+        repo, base, outer, inner, record, offered = _todays_state(tmp_path)
+    else:
+        repo, base, outer, inner = _repo_with_nested(tmp_path)
+        record = _record_folder(repo, inner)
+        offered = inspect_autobuild_worktree(
+            repo=repo, base=base, build_id=BUILD_ID, path=outer
+        )
+        assert offered["ok"] is True, offered
+        offered["cleanup_registrations"] = offered["nested_registrations"]
+        shutil.rmtree(inner)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert result["detail"]
+    assert "cleared_registrations" not in result
+    assert record.exists() and outer.is_dir()
+    listed = _git(repo, "worktree", "list", "--porcelain")
+    assert str(inner) in listed and "prunable" in listed
+
+
+def test_on_retry_the_outer_trees_uncommitted_changes_are_kept(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    """The coach's reproduction: on retry, an edited tracked file and a new
+    file in the outer tree must survive."""
+    repo, base, outer, inner, _record, offered = _todays_state(tmp_path)
+    (outer / "README").write_text("edited after the offer\n")
+    (outer / "notes.txt").write_text("somebody's notes\n")
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert (outer / "README").read_text() == "edited after the offer\n"
+    assert (outer / "notes.txt").read_text() == "somebody's notes\n"
+    assert str(outer) in _git(repo, "worktree", "list", "--porcelain")
+
+
+def test_a_gone_folder_that_was_not_offered_is_not_cleared(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    """Only an offer-pinned path is ever cleared: a prunable registration the
+    offer did not name keeps its record folder, and the tree is kept."""
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    _git(repo, "branch", "unrelated")
+    unrelated = outer / ".guardkit/worktrees/TASK-OTHER-001"
+    _git(repo, "worktree", "add", str(unrelated), "unrelated")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    offered["cleanup_registrations"] = [
+        row for row in offered["nested_registrations"] if Path(row["path"]) == inner
+    ]
+    other_record = _record_folder(repo, unrelated)
+    import shutil
+
+    shutil.rmtree(unrelated)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert other_record.exists() and outer.is_dir() and inner.is_dir()
+    assert result.get("cleared_registrations", []) == []
+
+
+def test_a_symbolic_link_to_a_read_only_folder_outside_is_not_followed(
+    tmp_path: Path, _writable_again: None
+) -> None:
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    outside = tmp_path / "outside"
+    outside_folders = _read_only_cache(outside)
+    outside.chmod(0o555)
+    before = {folder: folder.stat().st_mode for folder in [outside, *outside_folders]}
+    # Git refuses to pin a dirty link that leaves the tree, so the link sits
+    # in an ignored folder, where caches usually are; one in Git's own record
+    # folder for the worktree too.
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("ignored/\n")
+    (inner / "ignored").mkdir()
+    (inner / "ignored" / "link-out").symlink_to(outside, target_is_directory=True)
+    (_record_folder(repo, inner) / "link-out").symlink_to(
+        outside, target_is_directory=True
+    )
+    _read_only_cache(inner / "own")
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "removed", result
+    assert {folder: folder.stat().st_mode for folder in before} == before
+    assert (outside_folders[0] / "file.txt").read_text() == "cached\n"
+
+
+def test_a_folder_swapped_for_a_link_after_listing_is_not_followed(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R2: a folder replaced by a link to a read-only folder
+    outside, between being listed and being changed, is never followed: each
+    folder is opened without following links and changed by its handle."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    outside = tmp_path / "outside"
+    outside_folders = _read_only_cache(outside)
+    outside.chmod(0o555)
+    before = {folder: folder.stat().st_mode for folder in [outside, *outside_folders]}
+    (repo / ".git" / "info").mkdir(exist_ok=True)
+    (repo / ".git" / "info" / "exclude").write_text("ignored/\n")
+    swap = inner / "ignored" / "swap-me"
+    swap.mkdir(parents=True)
+    swap.chmod(0o555)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    real = lifecycle._subfolders
+    swapped: list[bool] = []
+
+    def listing_then_swap(descriptor: int) -> list[str]:
+        names = real(descriptor)
+        if "swap-me" in names and not swapped:
+            swap.rmdir()
+            swap.symlink_to(outside, target_is_directory=True)
+            swapped.append(True)
+        return names
+
+    monkeypatch.setattr(lifecycle, "_subfolders", listing_then_swap)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert swapped == [True]
+    assert {folder: folder.stat().st_mode for folder in before} == before
+    assert (outside_folders[0] / "file.txt").read_text() == "cached\n"
+    assert result["status"] == "removed", result
+
+
+def test_a_walk_redirected_to_folders_owned_by_someone_else_changes_nothing(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R3: a folder above the tree can be a link, and opening the
+    tree's top follows it. The walk changes only folders the cleaning user
+    owns, so a walk redirected to folders owned by anyone else changes
+    nothing there. Another owner is simulated: tests cannot chown."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    outside = tmp_path / "outside"
+    outside_folders = _read_only_cache(outside)
+    outside.chmod(0o555)
+    before = {folder: folder.stat().st_mode for folder in [outside, *outside_folders]}
+    owned_elsewhere = {
+        (folder.stat().st_dev, folder.stat().st_ino)
+        for folder in [outside, *outside_folders]
+    }
+    redirected = tmp_path / "worktrees-link"
+    redirected.symlink_to(tmp_path, target_is_directory=True)
+    real_fstat = os.fstat
+
+    def someone_elses(descriptor: int) -> os.stat_result:
+        found = real_fstat(descriptor)
+        if (found.st_dev, found.st_ino) in owned_elsewhere:
+            fields = list(found)
+            fields[4] = os.geteuid() + 1  # st_uid
+            return os.stat_result(fields)
+        return found
+
+    monkeypatch.setattr(lifecycle.os, "fstat", someone_elses)
+    lifecycle._make_owner_writable(redirected / "outside")
+    lifecycle._make_owner_writable(redirected / "outside" / "cache")
+
+    assert {folder: folder.stat().st_mode for folder in before} == before
+
+
+def test_a_folder_above_the_tree_swapped_for_a_link_to_the_users_own_folders_is_not_followed(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R3, round 3: a folder ABOVE the tree replaced by a link
+    to a tree the same user owns. The walk's top is reached one name at a
+    time from / without following any link, so the walk does not start,
+    nothing outside changes, and the retirement says "kept"."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    # The same user's own tree, laid out like .guardkit, read-only throughout.
+    outside = tmp_path / "outside-guardkit"
+    mirror = outside / "worktrees" / inner.name
+    _read_only_cache(mirror)
+    for folder in (mirror, mirror.parent, outside):
+        folder.chmod(0o555)
+    folders = [Path(root) for root, _dirs, _files in os.walk(outside)]
+    before = {folder: folder.stat().st_mode for folder in folders}
+    files = {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    }
+    real_inspect = lifecycle.inspect_autobuild_worktree
+
+    def inspect_then_swap(**kwargs: Any) -> dict[str, Any]:
+        answer = real_inspect(**kwargs)
+        guardkit = outer / ".guardkit"
+        guardkit.rename(outer / ".guardkit-moved")
+        guardkit.symlink_to(outside, target_is_directory=True)
+        return answer
+
+    monkeypatch.setattr(lifecycle, "inspect_autobuild_worktree", inspect_then_swap)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert {folder: folder.stat().st_mode for folder in folders} == before
+    assert {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    } == files
+
+
+def test_gits_record_folders_swapped_for_a_link_to_the_users_own_copy_are_not_followed(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R3, round 4: ``.git/worktrees`` replaced by a link to a
+    copy the same user owns, record folders and back pointers and all. The
+    record folder's path is built by text alone and reached from / without
+    following any link, so the copy is never touched and the retirement
+    says "kept"."""
+    import shutil
+
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    records = repo / ".git" / "worktrees"
+    outside = tmp_path / "outside-records"
+    shutil.copytree(records, outside, symlinks=True)
+    _read_only_cache(outside / inner.name / "guardkit-scratch")
+    for root, dirs, _files in os.walk(outside, topdown=False):
+        for name in dirs:
+            (Path(root) / name).chmod(0o555)
+    outside.chmod(0o555)
+    folders = [Path(root) for root, _dirs, _files in os.walk(outside)]
+    before = {folder: folder.stat().st_mode for folder in folders}
+    files = {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    }
+    real_inspect = lifecycle.inspect_autobuild_worktree
+
+    def inspect_then_swap(**kwargs: Any) -> dict[str, Any]:
+        answer = real_inspect(**kwargs)
+        records.rename(repo / ".git" / "worktrees-moved")
+        records.symlink_to(outside, target_is_directory=True)
+        return answer
+
+    monkeypatch.setattr(lifecycle, "inspect_autobuild_worktree", inspect_then_swap)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert {folder: folder.stat().st_mode for folder in folders} == before
+    assert {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    } == files
+
+
+def test_gits_record_folders_swapped_for_a_link_to_a_writable_copy_are_not_removed(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R3, round 5: the same swap as above, but the outside copy
+    is writable, so only refusing to call Git at all keeps it intact."""
+    import shutil
+
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    records = repo / ".git" / "worktrees"
+    outside = tmp_path / "outside-records"
+    shutil.copytree(records, outside, symlinks=True)
+    files = {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    }
+    real_inspect = lifecycle.inspect_autobuild_worktree
+
+    def inspect_then_swap(**kwargs: Any) -> dict[str, Any]:
+        answer = real_inspect(**kwargs)
+        records.rename(repo / ".git" / "worktrees-moved")
+        records.symlink_to(outside, target_is_directory=True)
+        return answer
+
+    monkeypatch.setattr(lifecycle, "inspect_autobuild_worktree", inspect_then_swap)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    # Refused before Git is asked: Git 2.43 happens to refuse too (exit 128),
+    # but the boundary must not depend on that.
+    assert "without following a link" in result["detail"], result
+    assert result["status"] == "kept", result
+    assert {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    } == files
+    assert inner.exists()

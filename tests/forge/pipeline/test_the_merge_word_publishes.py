@@ -2154,6 +2154,14 @@ class _ASurfaceWhoseCleanUpsSay:
             async def retire_autobuild_worktree(
                 self, build_id: str, path: str, expected: dict[str, Any]
             ) -> dict[str, Any]:
+                if says.get("retired") == "no-answer":
+                    # The sandbox venue's own words when no answer came back.
+                    return {
+                        "status": "kept",
+                        "path": path,
+                        "detail": "the sandbox could not be reached",
+                        "answered": False,
+                    }
                 return {"status": says.get("retired") or "removed", "path": path}
 
             async def remove_candidate_tree(
@@ -2206,7 +2214,15 @@ class TestEverySandboxCleanUpIsGuarded:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "status, kept",
-        [("kept", True), ("already-gone", False), ("removed", False)],
+        [
+            # 15 October 2026, FEAT-6AC9: a worktree the sandbox answered it
+            # could not retire is a leftover folder, not running work, so the
+            # hold is put down; only a retirement with no answer keeps it.
+            ("kept", False),
+            ("no-answer", True),
+            ("already-gone", False),
+            ("removed", False),
+        ],
     )
     async def test_the_retained_worktree_decides_whether_the_hold_is_put_down(
         self,
