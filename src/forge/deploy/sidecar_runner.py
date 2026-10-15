@@ -47,10 +47,26 @@ logger = logging.getLogger(__name__)
 #: relays verbatim) so a transport failure is not mistaken for a script failure.
 SIDECAR_TRANSPORT_EXIT_CODE = 1
 
-#: How the step's line begins when the request got NO ANSWER at all (could not
-#: be sent, timed out, or the connection was dropped): the script may still be
-#: running in the sandbox. Every other sidecar sentence is an answer.
-SIDECAR_NO_ANSWER_OPENING = "sidecar unreachable at "
+
+class NoAnswer(tuple):
+    """``(exit code, sentence)`` for a request that got NO ANSWER at all.
+
+    15 October 2026. The request could not be sent, timed out, had its
+    connection dropped, or came back unreadable: the script may still be
+    running in the sandbox, which no exit code can say. It unpacks exactly
+    like every runner's ``(exit_code, output)``, so a caller that does not
+    ask is unchanged; one that asks reads :func:`no_answer_came_back`.
+    """
+
+    answer_lost = True
+
+    def __new__(cls, sentence: str) -> "NoAnswer":
+        return super().__new__(cls, (SIDECAR_TRANSPORT_EXIT_CODE, sentence))
+
+
+def no_answer_came_back(answer: object) -> bool:
+    """Is ``answer`` a runner's answer saying no answer came back?"""
+    return getattr(answer, "answer_lost", False) is True
 
 
 class SidecarScriptRunner:
@@ -190,24 +206,15 @@ class SidecarScriptRunner:
                 f"sidecar refused (HTTP {exc.code}): {detail}",
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"{SIDECAR_NO_ANSWER_OPENING}{self._base_url}: {exc}",
-            )
+            return NoAnswer(f"sidecar unreachable at {self._base_url}: {exc}")
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar returned a non-JSON response: {exc}",
-            )
+            return NoAnswer(f"sidecar returned a non-JSON response: {exc}")
         except Exception as exc:  # noqa: BLE001 — never raise past the boundary
             logger.warning("sidecar script runner unexpected error: %s", exc)
-            return (SIDECAR_TRANSPORT_EXIT_CODE, f"sidecar client error: {exc}")
+            return NoAnswer(f"sidecar client error: {exc}")
 
         if not isinstance(parsed, dict) or "exit_code" not in parsed:
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar response missing exit_code: {parsed!r}",
-            )
+            return NoAnswer(f"sidecar response missing exit_code: {parsed!r}")
         # A DEPLOY THE EXECUTOR REFUSED is not a script that went red and not a
         # transport failure: nothing ran. It comes back as a non-zero exit with
         # the executor's own plain sentence, which is what the step records and
@@ -220,10 +227,7 @@ class SidecarScriptRunner:
         exit_code = parsed.get("exit_code")
         output = parsed.get("output_tail", "")
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar returned a non-integer exit_code: {exit_code!r}",
-            )
+            return NoAnswer(f"sidecar returned a non-integer exit_code: {exit_code!r}")
         not_honoured = candidate_tree_not_honoured(cwd, parsed)
         if not_honoured is not None:
             logger.error("sidecar script runner: %s", not_honoured)
@@ -288,8 +292,9 @@ def candidate_tree_not_honoured(sent_cwd: object, answer: dict[str, object]) -> 
 
 __all__ = [
     "SidecarScriptRunner",
-    "SIDECAR_NO_ANSWER_OPENING",
+    "NoAnswer",
     "SIDECAR_TRANSPORT_EXIT_CODE",
+    "no_answer_came_back",
     "candidate_tree_not_honoured",
     "names_a_candidate_tree",
 ]

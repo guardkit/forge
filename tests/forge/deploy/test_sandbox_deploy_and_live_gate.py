@@ -650,6 +650,9 @@ class TestTheLiveGateRunsInsideTheSandbox:
         # system under test.
         assert answer.verdict == "instrument_fail"
         assert "could not be reached" in answer.detail["error"]
+        # No answer came back, and the invocation says so in a field of its
+        # own (15 October 2026): the merge press keeps its hold for it.
+        assert answer.answer_lost is True
 
     def test_a_driver_the_profile_does_not_declare_is_refused_not_run(
         self, clone: Path, sidecar: Any
@@ -667,6 +670,8 @@ class TestTheLiveGateRunsInsideTheSandbox:
         assert answer.verdict == "instrument_fail"
         assert "refused the live gate" in answer.detail["error"]
         assert "deploy/profile.yaml declares" in answer.detail["error"]
+        # A refusal is an answer.
+        assert answer.answer_lost is False
 
 
 class TestAPassingGateIsReadWhereverTheHelperRanIt:

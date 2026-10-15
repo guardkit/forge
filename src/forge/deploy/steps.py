@@ -159,7 +159,7 @@ def _run_scripts(
             # The setting names the project declared: its scripts' environment
             # is built from nothing, so without them it would get none.
             issued["launch_settings"] = tuple(launch_settings)
-        exit_code, output = runner(
+        answer = runner(
             cwd=cwd,
             script=script,
             env_file=env_file,
@@ -168,8 +168,19 @@ def _run_scripts(
             extra_env=extra_env,
             **issued,
         )
+        exit_code, output = answer
         ran.append(
-            {"script": script, "exit_code": exit_code, "captured_output": output}
+            {
+                "script": script,
+                "exit_code": exit_code,
+                "captured_output": output,
+                # No answer at all (15 October 2026): it may still be running.
+                **(
+                    {"answer_lost": True}
+                    if getattr(answer, "answer_lost", False) is True
+                    else {}
+                ),
+            }
         )
         if exit_code != 0:
             return StepOutcome(status=StepStatus.failed, result={"ran": ran})
@@ -626,6 +637,9 @@ def make_run_live_gate_handler(*, live_gate_invoker: LiveGateInvoker):
                 "attempts_ledger_ref": invocation.attempts_ledger_ref,
                 "leak_sweep_findings": invocation.leak_sweep_findings,
                 "dry_run": invocation.dry_run,
+                # The gate's request got no answer (15 October 2026): its
+                # driver may still be running where it was sent.
+                **({"answer_lost": True} if invocation.answer_lost else {}),
                 # The journey's own evidence (web readiness W7), only when the
                 # review preview's journey read some: every other gate's
                 # result is byte for byte what it was.

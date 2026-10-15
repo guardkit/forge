@@ -596,13 +596,38 @@ class TestCandidateCheck:
 # ---------------------------------------------------------------------------
 
 
+class _AGateWhoseAnswerWasLost:
+    """A live-gate invoker whose request got no answer, in the words the
+    sidecar invoker uses (15 October 2026)."""
+
+    def _lost(self, feature: str) -> LiveGateInvocation:
+        return LiveGateInvocation(
+            verdict="instrument_fail",
+            run_id=f"run-{feature}",
+            gate_ids=EIGHT_GATES,
+            dry_run=False,
+            answer_lost=True,
+            detail={"error": "the deploy sidecar could not be reached"},
+        )
+
+    def invoke(self, *, feature: str, target: str, gates: tuple[str, ...] = ()):
+        return self._lost(feature)
+
+    def with_repo_path(self, repo_path) -> "_AGateWhoseAnswerWasLost":
+        return self
+
+    def with_extra_env(self, overlay: dict[str, str]) -> "_AGateWhoseAnswerWasLost":
+        return self
+
+
 class _ASidecarThatAnswers:
     """A loopback deploy sidecar for the REAL script runner (15 October 2026).
 
     ``check`` and ``teardown`` say what the candidate's own steps and its
     teardown get back: ``"ok"`` (exit 0), ``"red"`` (exit 1, in the script's
-    own words) or ``"lost"`` (the request is taken and the connection is
-    dropped without an answer)."""
+    own words), ``"lost"`` (the request is taken and the connection is
+    dropped without an answer) or ``"unreadable"`` (an answer that is not
+    the sidecar's JSON)."""
 
     def __init__(self, *, check: str, teardown: str) -> None:
         import json
@@ -618,6 +643,13 @@ class _ASidecarThatAnswers:
                 how = teardown if down else check
                 if how == "lost":
                     self.close_connection = True
+                    return
+                if how == "unreadable":
+                    garbled = b"<html>bad gateway</html>"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(garbled)))
+                    self.end_headers()
+                    self.wfile.write(garbled)
                     return
                 answer = json.dumps(
                     {
@@ -657,9 +689,18 @@ class TestAFailedCandidateSaysWhatIsLeft:
             ("ok", "fail", "ok", "torn-down", False),
             ("red", "pass", "ok", "torn-down", False),
             ("lost", "pass", "ok", "torn-down", True),
+            ("unreadable", "pass", "ok", "torn-down", True),
             ("ok", "fail", "lost", "standing", False),
+            ("ok", "lost", "ok", "torn-down", True),
         ],
-        ids=["red-gate", "red-deploy-step", "deploy-answer-lost", "teardown-lost"],
+        ids=[
+            "red-gate",
+            "red-deploy-step",
+            "deploy-answer-lost",
+            "deploy-answer-unreadable",
+            "teardown-lost",
+            "gate-answer-lost",
+        ],
     )
     async def test_the_answer_names_what_is_left(
         self,
@@ -679,8 +720,12 @@ class TestAFailedCandidateSaysWhatIsLeft:
                 runbook_publisher=runbook_publisher,
                 deploy_publisher=RecordingDeployPublisher(),
                 reservation=InProcessReservationLease(),
-                live_gate_invoker=_Invoker(
-                    candidate=(gate, ALL_GREEN if gate == "pass" else TWO_RED)
+                live_gate_invoker=(
+                    _AGateWhoseAnswerWasLost()
+                    if gate == "lost"
+                    else _Invoker(
+                        candidate=(gate, ALL_GREEN if gate == "pass" else TWO_RED)
+                    )
                 ),
                 broker_inspector=DryRunBrokerInspector(),
                 config=DeployStageConfig(
@@ -703,6 +748,33 @@ class TestAFailedCandidateSaysWhatIsLeft:
 
         assert result.outcome == "failed"
         assert result.detail["candidate"] == candidate
+        assert bool(result.detail.get("answer_lost")) is lost
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("lost", [True, False], ids=["gate-lost", "gate-red"])
+    async def test_a_promote_whose_live_gate_got_no_answer_says_so(
+        self, repository, runbook_publisher, tmp_path, lost: bool
+    ) -> None:
+        """The promote's live gate got no answer: the deploy is reverted as
+        before, and the result says the gate's driver may still be running."""
+        runner = _runner(
+            repository,
+            runbook_publisher,
+            RecordingDeployPublisher(),
+            tmp_path,
+            live_gate_invoker=(
+                _AGateWhoseAnswerWasLost() if lost else _Invoker(live=("fail", TWO_RED))
+            ),
+        )
+        result = await runner.promote(
+            _profile(rollback="apitest:rollback"),
+            correlation_id="pl",
+            deploy_run_id="run-pl",
+            feature="FEAT-PL",
+            prior_events=("DeployQueued",),
+            identity_env=WHICH_CANDIDATE,
+        )
+        assert result.outcome == "reverted", result
         assert bool(result.detail.get("answer_lost")) is lost
 
 
@@ -1053,3 +1125,84 @@ class TestGateSummary:
         summary = gate_summary(verdict="fail", gate_ids=(), assertions=TWO_RED)
         assert summary["checks_total"] == 8
         assert summary["failed_checks"] == ["users_count", "etag"]
+
+
+class TestTheScriptRunnerSaysWhenNoAnswerCameBack:
+    """15 October 2026: "no answer came back" is a flag on the runner's own
+    answer, never read from its words."""
+
+    @staticmethod
+    def _run(base_url: str) -> Any:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner
+
+        runner = SidecarScriptRunner(
+            base_url=base_url, repo="guardkit/api_test", http_timeout_margin=2.0
+        )
+        return runner(cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=1)
+
+    @pytest.mark.parametrize(
+        "how, lost",
+        [("ok", False), ("red", False), ("lost", True), ("unreadable", True)],
+    )
+    def test_the_flag_follows_the_answer(self, how: str, lost: bool) -> None:
+        from forge.deploy.sidecar_runner import no_answer_came_back
+
+        sidecar = _ASidecarThatAnswers(check=how, teardown=how)
+        try:
+            answer = self._run(sidecar.url)
+        finally:
+            sidecar.close()
+        exit_code, _output = answer
+        assert no_answer_came_back(answer) is lost
+        assert (exit_code == 0) is (how == "ok")
+
+    def test_a_sidecar_that_cannot_be_reached_is_no_answer(self) -> None:
+        from forge.deploy.sidecar_runner import no_answer_came_back
+
+        assert no_answer_came_back(self._run("http://127.0.0.1:9")) is True
+
+
+class TestTheFailureLineSaysWhereTheCandidateIs:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("teardown", ["ok", "lost"])
+    async def test_the_line_matches_the_detail(
+        self, repository, runbook_publisher, tmp_path, caplog, teardown: str
+    ) -> None:
+        import logging
+
+        sidecar = _ASidecarThatAnswers(check="ok", teardown=teardown)
+        try:
+            runner = DeployStageRunner(
+                repository=repository,
+                runbook_publisher=runbook_publisher,
+                deploy_publisher=RecordingDeployPublisher(),
+                reservation=InProcessReservationLease(),
+                live_gate_invoker=_Invoker(candidate=("fail", TWO_RED)),
+                broker_inspector=DryRunBrokerInspector(),
+                config=DeployStageConfig(
+                    execution_surface="sidecar", sidecar_url=sidecar.url
+                ),
+                deploy_record_root=str(tmp_path / "state"),
+                dry_run=False,
+                target_repo="guardkit/api_test",
+                clock=lambda: FIXED,
+            )
+            with caplog.at_level(logging.ERROR, logger="forge.deploy.stage"):
+                result = await runner.candidate_check(
+                    _profile(),
+                    correlation_id="cw",
+                    deploy_run_id="run-cw",
+                    feature="FEAT-CW",
+                    identity_env=WHICH_CANDIDATE,
+                )
+        finally:
+            sidecar.close()
+
+        line = next(
+            r.getMessage() for r in caplog.records if "gate refused promote" in r.getMessage()
+        )
+        if result.detail["candidate"] == "standing":
+            assert "is still standing" in line and "was torn down" not in line
+        else:
+            assert "was torn down" in line
+        assert result.detail["candidate"] == ("torn-down" if teardown == "ok" else "standing")

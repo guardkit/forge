@@ -127,6 +127,10 @@ class LiveGateInvocation:
     media_refs: tuple[str, ...] = ()
     report_ref: str | None = None
     outcome: dict[str, int | None] | None = None
+    #: The request got no answer at all (15 October 2026): it could not be
+    #: sent, timed out, was dropped or came back unreadable, so the driver may
+    #: still be running. A gate that answered, with any verdict, is False.
+    answer_lost: bool = False
 
     def __post_init__(self) -> None:
         if self.verdict not in _VALID_VERDICTS:
@@ -986,12 +990,13 @@ class SidecarLiveGateInvoker:
             # the copy it has, and refuses one that says nothing at all.
             body["by_hand"] = True
 
-        def _instrument(error: str) -> LiveGateInvocation:
+        def _instrument(error: str, *, answer_lost: bool = False) -> LiveGateInvocation:
             return LiveGateInvocation(
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
                 dry_run=False,
+                answer_lost=answer_lost,
                 detail={
                     "argv": argv,
                     "cwd": str(self._repo_path),
@@ -1021,17 +1026,20 @@ class SidecarLiveGateInvoker:
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             return _instrument(
                 f"the deploy sidecar at {self._base_url} could not be reached "
-                f"to run the live gate: {exc}"
+                f"to run the live gate: {exc}",
+                answer_lost=True,
             )
         except Exception as exc:  # noqa: BLE001 — NEVER raise past invoke()
-            return _instrument(f"live-gate invocation error: {exc}")
+            # An unreadable answer is no answer: the driver may still be running.
+            return _instrument(f"live-gate invocation error: {exc}", answer_lost=True)
 
         if not isinstance(answer, dict) or not isinstance(
             answer.get("exit_code"), int
         ) or isinstance(answer.get("exit_code"), bool):
             return _instrument(
                 "the deploy sidecar answered something that is not a live-gate "
-                f"result: {answer!r}"
+                f"result: {answer!r}",
+                answer_lost=True,
             )
         ran_in = answer.get("cwd")
         # WHERE IT RAN IS THE HELPER'S TO SAY, unless a tree was asked for (3
