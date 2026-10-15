@@ -1264,3 +1264,252 @@ async def test_real_a_file_name_that_is_not_utf8_does_not_stop_the_card(config, 
     assert reading["read"] is True
     assert "This build changes scripts/check.sh, which runs the project's checks." in words
     assert "could not be listed" not in words
+
+
+# ---------------------------------------------------------------------------
+# Review R2: file names are kept byte-exact, so two names never become one
+# ---------------------------------------------------------------------------
+
+#: A link whose folder name is the single byte 0xE9 (not UTF-8) ...
+ODD_LINK = b"vendor/\xe9/check.sh"
+#: ... and an ordinary file whose folder name is the UTF-8 bytes of U+FFFD,
+#: the character a lossy decoding turns 0xE9 into. git lists it second.
+LOOKALIKE = b"vendor/\xef\xbf\xbd/check.sh"
+
+
+def _commit_lookalike_names(project: RealProject) -> None:
+    """Main with a link and an ordinary file whose names decode alike when
+    decoding is lossy; the build changes only an unrelated file."""
+    import os
+
+    project.write(MAIN_FILES)
+    root = os.fsencode(str(project.root))
+    for name in (ODD_LINK, LOOKALIKE):
+        os.makedirs(os.path.dirname(os.path.join(root, name)), exist_ok=True)
+    os.symlink(b"../../scripts/check.sh", os.path.join(root, ODD_LINK))
+    with open(os.path.join(root, LOOKALIKE), "wb") as handle:
+        handle.write(b"#!/bin/sh\nnot a link\n")
+    _git_run(project.root, "add", "-A")
+    _git_run(project.root, "commit", "-q", "-m", "main")
+    project.main = _git_run(project.root, "rev-parse", "HEAD")
+    _git_run(project.root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
+    project.candidate = project.commit({"src/app.txt": "changed\n"}, "the build")
+    _git_run(project.root, "checkout", "-q", "main")
+    project.name_status = "M\0src/app.txt\0"
+
+
+def _guardkits_links(project: RealProject, commit: str) -> list[str] | None:
+    """The links GuardKit's merge would refuse on at ``commit``, by its own
+    tree reading and link rule, or ``None`` when GuardKit is not importable."""
+    try:
+        from guardkit.orchestrator.merge_environment import judge_links
+    except Exception:  # noqa: BLE001
+        return None
+    words = ("bash", "scripts/check.sh", "bash", "scripts/install.sh")
+    return judge_links(project.root, commit, words)
+
+
+def _sidecar_reader(project: RealProject, tmp_path: Path) -> Any:
+    """The sandbox runner, answered by the sandbox's own routes through a real
+    JSON round trip, exactly as the HTTP transport carries them."""
+    from forge.config.models import ForgeConfig
+    from forge.deploy_sidecar.service import (
+        process_git_list_tree_at_commit_request,
+        process_git_read_file_at_commit_request,
+    )
+    from forge.planning.sidecar_git_runner import SidecarGitRunner
+
+    sidecar_config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": [str(tmp_path), str(project.root)]}},
+            "planning": {"target_repo_paths": {REPO: str(project.root)}},
+        }
+    )
+    routes = {
+        "/git/list-tree-at-commit": process_git_list_tree_at_commit_request,
+        "/git/read-file-at-commit": process_git_read_file_at_commit_request,
+    }
+
+    def post(url: str, body: Any, timeout: float) -> tuple[int, Any]:
+        route = next(r for r in routes if url.endswith(r))
+        status, answer = routes[route](json.loads(json.dumps(body)), config=sidecar_config)
+        return status, json.loads(json.dumps(answer).encode("utf-8").decode("utf-8"))
+
+    return SidecarGitRunner("http://127.0.0.1:1", repo=REPO, post=post)
+
+
+@pytest.mark.parametrize("venue", ["local copy", "sandbox route"])
+@pytest.mark.asyncio
+async def test_real_names_that_decode_alike_stay_two_files(
+    config, pool, rules, real, tmp_path, venue
+) -> None:
+    import os
+
+    _commit_lookalike_names(real)
+    reader = None if venue == "local copy" else _sidecar_reader(real, tmp_path)
+
+    if reader is None:
+        words, reading = await _real_card(config, pool, rules, real)
+    else:
+        _insert_build(pool)
+        _record_start(pool)
+        recorder = _Recorder()
+        service = _service(
+            config, pool, recorder, trees=None, rules=rules,
+            name_status=real.name_status, git=RealGit(real),
+        )
+        service._commit_reader = lambda _repo, _root: reader  # noqa: SLF001
+        await service.maybe_offer(_event())
+        words, reading = _approval_words(recorder), _reading(pool)
+
+    from forge.pipeline.merge_check_reading import shown_path
+
+    # The record and the card name the link as a person reads it; the
+    # decision was made on the exact name (the listing test below proves the
+    # two names arrive apart).
+    card_links = [j["path"] for j in reading["judge_files"] if j["how"] == "link"]
+    assert card_links == ["vendor/\\xe9/check.sh"]
+    assert "vendor/\\xe9/check.sh is a symbolic link" in words
+    assert "could not be listed" not in words
+    guardkit = _guardkits_links(real, real.main)
+    if guardkit is not None:
+        assert guardkit == [os.fsdecode(ODD_LINK)]
+        assert card_links == [shown_path(path) for path in guardkit]
+
+
+def test_the_sandbox_route_keeps_names_that_are_not_utf8_through_json(tmp_path: Path) -> None:
+    import os
+
+    from forge.config.models import ForgeConfig
+    from forge.deploy.candidate_tree import TreeListing, list_tree_at_commit_sync
+    from forge.deploy_sidecar.service import process_git_list_tree_at_commit_request
+
+    (tmp_path / "clone").mkdir()
+    project = RealProject(tmp_path / "clone")
+    _commit_lookalike_names(project)
+    sidecar_config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+            "planning": {"target_repo_paths": {"o/boxed": str(project.root)}},
+        }
+    )
+
+    status, body = process_git_list_tree_at_commit_request(
+        {"repo": "o/boxed", "commit": project.main}, config=sidecar_config
+    )
+    assert status == 200
+    carried = TreeListing.from_wire(json.loads(json.dumps(body, ensure_ascii=False).encode("utf-8")))
+    local = list_tree_at_commit_sync(project.root, project.main)
+
+    assert carried.ok and local.ok
+    assert carried.entries == local.entries
+    modes = {e.path: e.mode for e in carried.entries}
+    assert modes[os.fsdecode(ODD_LINK)] == "120000"
+    assert modes[os.fsdecode(LOOKALIKE)] == "100644"
+    assert {os.fsencode(e.path) for e in carried.entries} >= {ODD_LINK, LOOKALIKE}
+
+
+# ---------------------------------------------------------------------------
+# Review R3: what the merge does with each judge comes only from the target's
+# own tree, the same listing GuardKit reads
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("card", sorted(CARDS))
+@pytest.mark.asyncio
+async def test_a_judge_both_branches_added_uses_mains_copy(config, pool, rules, card: str) -> None:
+    same = ("100755", "#!/bin/sh\nthe same new check\n")
+    target = _project(**{"tools/check.sh": same})
+
+    words, reading = await CARDS[card](
+        config, pool, trees=_trees(target), rules=rules, name_status="A\0tools/check.sh\0"
+    )
+
+    assert "The merge will run without it." not in words
+    assert (
+        "This build adds tools/check.sh, which has the same name as a file the "
+        "project's declared commands run. Main has its own copy, so the merge will "
+        "use main's version of it and will not run this build's copy."
+    ) in words
+    judge = next(j for j in reading["judge_files"] if j["path"] == "tools/check.sh")
+    assert judge["how"] == "added"
+    assert judge["on_target"] is True
+
+
+@pytest.mark.asyncio
+async def test_real_a_judge_both_branches_added_uses_mains_copy(config, pool, rules, real) -> None:
+    start = real.commit(MAIN_FILES, "start")
+    _git_run(real.root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
+    real.candidate = real.commit({"tools/check.sh": "#!/bin/sh\nthe same new check\n"}, "the build")
+    real.name_status = _git_run(
+        real.root, "diff", "--name-status", "-z", "--no-renames", start, real.candidate
+    ) + "\0"
+    _git_run(real.root, "checkout", "-q", "main")
+    real.main = real.commit(
+        {"tools/check.sh": "#!/bin/sh\nthe same new check\n", "src/app.txt": "main moved\n"},
+        "main adds the same file",
+    )
+
+    words, reading = await _real_card(config, pool, rules, real, preview=True)
+
+    assert "The merge will run without it." not in words
+    assert "Main has its own copy, so the merge will use main's version of it" in words
+    assert next(j for j in reading["judge_files"] if j["path"] == "tools/check.sh")["on_target"] is True
+
+
+@pytest.mark.asyncio
+async def test_a_changed_judge_main_no_longer_has_is_left_out(config, pool, rules) -> None:
+    target = _project()  # no tools/check.sh: main removed it after the build started
+    candidate = _project(**{"tools/check.sh": ("100755", "#!/bin/sh\nedited\n")})
+
+    words, reading = await _routine_card(
+        config, pool, trees=_trees(target, candidate), rules=rules,
+        name_status="M\0tools/check.sh\0",
+    )
+
+    assert "main's version of that file" not in words
+    assert (
+        "This build changes tools/check.sh, which has the same name as a file the "
+        "project's declared commands run. Main does not have it, so the merge will "
+        "run without it."
+    ) in words
+    assert next(j for j in reading["judge_files"] if j["path"] == "tools/check.sh")["on_target"] is False
+
+
+@pytest.mark.asyncio
+async def test_a_judge_only_the_joined_tree_has_is_left_out(config, pool, rules) -> None:
+    base = _project()
+    joined = _project(**{"tools/check.sh": ("100755", "#!/bin/sh\nnew\n")})
+    trees = Trees({PREVIEW_BASE: base, CANDIDATE_SHA: joined, JOINED: joined})
+    _insert_build(pool)
+    _record_start(pool)
+    recorder = _Recorder()
+    service = _service(
+        config, pool, recorder, trees=trees, rules=rules, git=_PreviewGit(), preview=_Preview()
+    )
+    service._scope_pass = lambda **_k: ScopeReport(read=False)  # noqa: SLF001
+
+    await service.maybe_offer(_event())
+    words = _approval_words(recorder)
+
+    assert "This build adds tools/check.sh" in words
+    assert "The merge will run without it." in words
+
+
+@pytest.mark.asyncio
+async def test_with_mains_listing_unreadable_the_card_does_not_guess(config, pool, rules) -> None:
+    trees = _trees(_project())
+    trees.refuse_listing_at.add(TARGET)
+
+    words, reading = await _routine_card(
+        config, pool, trees=trees, rules=rules, name_status="A\0tools/check.sh\0"
+    )
+
+    assert "The merge will run without it." not in words
+    assert (
+        "This build adds tools/check.sh, which has the same name as a file the "
+        "project's declared commands run. Main's files could not be listed here, "
+        "so this card cannot say whether the merge will use main's version of it "
+        "or run without it."
+    ) in words
+    assert next(j for j in reading["judge_files"] if j["path"] == "tools/check.sh")["on_target"] is None

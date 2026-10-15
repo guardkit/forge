@@ -20,7 +20,14 @@ before anyone approves:
 * **the changed judge files** are GuardKit's ``judge_files`` applied to every
   path the build's ``name_status`` names, added, deleted and renamed ones
   included. With a preview, a judge file the target renamed is also listed
-  when the joined tree's copy of it differs from the target's;
+  when the joined tree's copy of it differs from the target's, and a judge
+  file only the joined tree has is listed as added;
+* **what the merge does with each one** comes only from the target commit's
+  whole-tree listing, the same thing GuardKit's merge reads (review R3):
+  on the target means the merge uses main's copy (``on_target`` true), not
+  on the target means the merge leaves it out (``on_target`` false), and an
+  unreadable listing means the card cannot say (``on_target`` ``None``).
+  What the build did to the file (``how``) is only why the line appears;
 * **links** are found on their own, with GuardKit's exact merge rule on the
   same inputs (coach review 1, 15 October 2026): the whole tree of the target
   commit, the candidate commit and the preview's joined commit is listed
@@ -37,6 +44,7 @@ the declared commands name.
 from __future__ import annotations
 
 import logging
+import os
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -48,6 +56,7 @@ __all__ = [
     "CONFIG_PATH",
     "guardkit_rules",
     "read_the_merge_check",
+    "shown_path",
 ]
 
 #: Where a project declares its commands, relative to its top folder.
@@ -88,6 +97,18 @@ def guardkit_rules() -> Any | None:
         judge_files=judge_files,
         links_on_judge_paths=links_on_judge_paths,
     )
+
+
+def shown_path(path: Any) -> str:
+    """A file name as a person reads it. Names are kept byte-exact
+    (``os.fsdecode``, review R2), so a name that is not UTF-8 holds characters
+    no message can carry; those bytes are shown as ``\\xe9`` instead. Any
+    other name is unchanged."""
+    text = str(path)
+    try:
+        return os.fsencode(text).decode("utf-8", "backslashreplace")
+    except (UnicodeError, ValueError):
+        return text.encode("utf-8", "backslashreplace").decode("utf-8")
 
 
 def _not_read(declared_at: str | None, reason: str) -> dict[str, Any]:
@@ -307,16 +328,31 @@ async def _read(
                     links.append(path)
 
     judges: list[dict[str, Any]] = []
+    mains, joins = listed.get(declared_at), listed.get(joined or "")
+
+    def judge(path: str, how: str) -> dict[str, Any]:
+        # What the merge does with it comes only from the target's own tree,
+        # as GuardKit's merge decides it (review R3): main's copy when the
+        # target has the file, left out when it does not.
+        # A changed-files name with U+FFFD in it may have lost bytes on the
+        # way here, so a miss in the target's listing proves nothing.
+        known = mains is not None and (path in mains or "\ufffd" not in path)
+        return {
+            "path": path,
+            "how": how,
+            "role": role_of(path),
+            "on_target": (path in mains) if known and mains is not None else None,
+        }
 
     # -- the build's changed judge files ------------------------------------
     paths = _paths_of(changes) if changes is not None else []
     for path in rules.judge_files(paths, words) if (paths and words) else []:
-        judges.append({"path": path, "how": _how(changes or (), path), "role": role_of(path)})
+        judges.append(judge(path, _how(changes or (), path)))
 
-    # -- a judge the target renamed, whose joined copy differs ---------------
+    # -- the preview's joined tree, against the target's ---------------------
     # The merge restores every file the target's commands name; one whose
     # joined copy is not the target's carries the build's edits (round 4).
-    mains, joins = listed.get(declared_at), listed.get(joined or "")
+    # A judge file only the joined tree has is one the merge leaves out.
     if words and mains is not None and joins is not None:
         listed_paths = {j["path"] for j in judges}
         for path in rules.judge_files(sorted(mains), words):
@@ -326,13 +362,22 @@ async def _read(
             if there is None:
                 # On the target and gone from the joined tree: the build
                 # deleted it (coach review 2).
-                judges.append({"path": path, "how": "deleted", "role": role_of(path)})
+                judges.append(judge(path, "deleted"))
             elif (here.mode, here.object) != (there.mode, there.object):
-                judges.append({"path": path, "how": "changed", "role": role_of(path)})
+                judges.append(judge(path, "changed"))
+        for path in rules.judge_files(sorted(set(joins) - set(mains)), words):
+            if path not in listed_paths and path not in links:
+                judges.append(judge(path, "added"))
 
     for path in links:
         judges = [j for j in judges if j["path"] != path]
         judges.append({"path": path, "how": "link", "role": "link"})
+
+    # Every decision above was made on the exact names. The record and the
+    # card carry them as a person reads them, since a name that is not UTF-8
+    # cannot travel in a message as it is.
+    for entry in judges:
+        entry["path"] = shown_path(entry["path"])
 
     return {
         "declared_at": declared_at,

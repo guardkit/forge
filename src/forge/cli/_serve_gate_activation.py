@@ -799,8 +799,10 @@ def card_line_about_scope(report: Any) -> str:
 
 
 def _named(paths: Sequence[str]) -> str:
-    """``a``, ``a and b``, ``a, b and c``."""
-    items = [str(p) for p in paths]
+    """``a``, ``a and b``, ``a, b and c``, each name as a person reads it."""
+    from forge.pipeline.merge_check_reading import shown_path
+
+    items = [shown_path(p) for p in paths]
     if len(items) <= 1:
         return "".join(items)
     return ", ".join(items[:-1]) + " and " + items[-1]
@@ -828,11 +830,23 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
         )
     judges = [j for j in reading.get("judge_files") or [] if isinstance(j, Mapping)]
 
-    def paths(how: str, *roles: str) -> list[str]:
+    # What the merge does with a judge file comes only from the target's own
+    # tree (review R3): main's copy when it has the file, left out when it
+    # does not. A record from before that carries no ``on_target`` reads as
+    # the build's own change implies: added means left out.
+    def on_target(j: Mapping[str, Any]) -> bool | None:
+        if "on_target" in j:
+            value = j.get("on_target")
+            return None if value is None else bool(value)
+        return j.get("how") != "added"
+
+    def paths(how: str, *roles: str, target: bool | None = True) -> list[str]:
         return [
             str(j.get("path"))
             for j in judges
-            if j.get("how") == how and (not roles or j.get("role") in roles)
+            if j.get("how") == how
+            and (not roles or j.get("role") in roles)
+            and (j.get("how") == "link" or on_target(j) is target)
         ]
 
     sentences: list[str] = []
@@ -875,7 +889,7 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
             "merge main's declared commands will name "
             f"{'files that are' if many else 'a file that is'} gone."
         )
-    added = paths("added")
+    added = paths("added", target=False)
     if added:
         many = len(added) > 1
         sentences.append(
@@ -903,6 +917,41 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
             f"{'versions of them' if many else 'version of it'}, so a dependency "
             "this build adds will be missing in the merge check."
         )
+    both_added = paths("added", target=True)
+    if both_added:
+        many = len(both_added) > 1
+        sentences.append(
+            f"This build adds {_named(both_added)}, which "
+            f"{'have' if many else 'has'} the same name as a file the project's "
+            f"declared commands run. Main has its own "
+            f"{'copies' if many else 'copy'}, so the merge will use main's "
+            f"{'versions of them' if many else 'version of it'} and will not run "
+            f"this build's {'copies' if many else 'copy'}."
+        )
+    verbs = (("changed", "changes"), ("deleted", "deletes"))
+    for how, verb in verbs:
+        gone = paths(how, target=False)
+        if gone:
+            many = len(gone) > 1
+            sentences.append(
+                f"This build {verb} {_named(gone)}, which "
+                f"{'have' if many else 'has'} the same name as a file the "
+                f"project's declared commands run. Main does not have "
+                f"{'them' if many else 'it'}, so the merge will run without "
+                f"{'them' if many else 'it'}."
+            )
+    for how, verb in (("added", "adds"), *verbs):
+        unknown = paths(how, target=None)
+        if unknown:
+            many = len(unknown) > 1
+            sentences.append(
+                f"This build {verb} {_named(unknown)}, which "
+                f"{'have' if many else 'has'} the same name as a file the "
+                f"project's declared commands run. Main's files could not be "
+                "listed here, so this card cannot say whether the merge will "
+                f"use main's {'versions of them' if many else 'version of it'} "
+                f"or run without {'them' if many else 'it'}."
+            )
     links = paths("link")
     if links:
         many = len(links) > 1

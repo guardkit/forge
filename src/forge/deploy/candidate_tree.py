@@ -55,6 +55,7 @@ about the other.
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import os
 import re
@@ -878,7 +879,9 @@ MAX_TREE_ENTRIES: int = 200_000
 
 @dataclass(frozen=True)
 class TreeEntry:
-    """One leaf of a commit's tree, as ``git ls-tree -r`` prints it."""
+    """One leaf of a commit's tree, as ``git ls-tree -r`` prints it. ``path``
+    keeps git's exact bytes through ``os.fsdecode``, as GuardKit's merge does,
+    so a name that is not UTF-8 is still its own path."""
 
     path: str
     mode: str
@@ -898,12 +901,25 @@ class TreeListing:
         return self.refusal is None and self.entries is not None
 
     def to_wire(self) -> dict[str, Any]:
+        """The JSON answer. Each name travels as base64 of its raw bytes
+        (review R2, 15 October 2026): a name git stores that is not valid
+        UTF-8 is carried exactly, so two different names can never arrive as
+        one. ``names`` says so, and a reader refuses an answer without it."""
         return {
             "entries": (
-                [[e.mode, e.kind, e.object, e.path] for e in self.entries]
+                [
+                    [
+                        e.mode,
+                        e.kind,
+                        e.object,
+                        base64.b64encode(os.fsencode(e.path)).decode("ascii"),
+                    ]
+                    for e in self.entries
+                ]
                 if self.entries is not None
                 else None
             ),
+            "names": "base64",
             "refusal": self.refusal,
         }
 
@@ -916,12 +932,26 @@ class TreeListing:
         raw = decoded.get("entries")
         if not isinstance(raw, list):
             return cls(refusal="the listing came back with no entries field")
+        if decoded.get("names") != "base64":
+            return cls(
+                refusal=(
+                    "the listing came back without its file names carried "
+                    "exactly; the sandbox's helper service may be older than "
+                    "this factory"
+                )
+            )
         entries: list[TreeEntry] = []
         for item in raw:
             if not (isinstance(item, list) and len(item) == 4 and all(isinstance(x, str) for x in item)):
                 return cls(refusal="the listing came back with an entry the factory does not read")
-            mode, kind, obj, path = item
-            entries.append(TreeEntry(path=path, mode=mode, kind=kind, object=obj))
+            mode, kind, obj, carried = item
+            try:
+                name = base64.b64decode(carried.encode("ascii"), validate=True)
+            except (ValueError, UnicodeEncodeError):
+                return cls(refusal="the listing came back with a file name the factory does not read")
+            if not name:
+                return cls(refusal="the listing came back with an empty file name")
+            entries.append(TreeEntry(path=os.fsdecode(name), mode=mode, kind=kind, object=obj))
         return cls(entries=tuple(entries))
 
 
@@ -946,13 +976,20 @@ def list_tree_at_commit_sync(repo_root: Path, commit: str) -> TreeListing:
                     f"commit {commit}, so its files cannot be listed"
                 )
             )
-        done = _run_git(
-            repo_root,
-            "ls-tree",
-            "-r",
-            "-z",
-            "--full-tree",
-            f"{commit}^{{commit}}",
+        # Read as bytes (review R2): a name is kept byte-exact with
+        # ``os.fsdecode``, as GuardKit's merge keeps it, so two different
+        # names never become one.
+        done = run_git(
+            [
+                "-C",
+                where,
+                "ls-tree",
+                "-r",
+                "-z",
+                "--full-tree",
+                f"{commit}^{{commit}}",
+            ],
+            text=False,
             timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
         )
     except subprocess.TimeoutExpired:
@@ -967,14 +1004,21 @@ def list_tree_at_commit_sync(repo_root: Path, commit: str) -> TreeListing:
     if done.returncode != 0:
         return TreeListing(refusal=f"git could not list the files at {commit} (exit {done.returncode})")
     entries: list[TreeEntry] = []
-    for record in (done.stdout or "").split("\0"):
+    for record in (done.stdout or b"").split(b"\0"):
         if not record:
             continue
-        meta, _tab, path = record.partition("\t")
+        meta, _tab, path = record.partition(b"\t")
         parts = meta.split()
         if len(parts) != 3 or not path:
             return TreeListing(refusal=f"git listed the files at {commit} in a shape the factory does not read")
-        entries.append(TreeEntry(path=path, mode=parts[0], kind=parts[1], object=parts[2]))
+        entries.append(
+            TreeEntry(
+                path=os.fsdecode(path),
+                mode=os.fsdecode(parts[0]),
+                kind=os.fsdecode(parts[1]),
+                object=os.fsdecode(parts[2]),
+            )
+        )
         if len(entries) > MAX_TREE_ENTRIES:
             return TreeListing(
                 refusal=f"the commit {commit} has more than {MAX_TREE_ENTRIES} files, too many to list here"

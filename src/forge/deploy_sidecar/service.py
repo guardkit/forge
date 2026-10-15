@@ -34,7 +34,8 @@ The narrow contract:
     POST /git/read-file-at-commit {repo, commit, file_path, ordinary_file_only?, raw?, mode_only?}
               -> {content|null, found, refusal|null, ordinary?}
     POST /git/list-tree-at-commit {repo, commit}
-              -> {entries: [[mode, type, object, path]]|null, refusal|null}
+              -> {entries: [[mode, type, object, base64 of the path's bytes]]|null,
+                  names: "base64", refusal|null}
     POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
     POST /git/candidate-tree {repo, feature_id, sha}
               -> {path, tree, exclude_written}
@@ -3247,6 +3248,8 @@ GIT_REMOTE_START_POINT_ROUTE: str = "/git/remote-start-point"
 GIT_READ_FILE_AT_COMMIT_ROUTE: str = "/git/read-file-at-commit"
 #: Every leaf of one commit's tree: names, modes, types and object ids, never
 #: any file's content (15 October 2026, the merge-check design). Read-only.
+#: Each name is sent as base64 of its exact bytes, so a name that is not UTF-8
+#: arrives as itself and never as another file's name.
 GIT_LIST_TREE_AT_COMMIT_ROUTE: str = "/git/list-tree-at-commit"
 
 #: The files ON A BRANCH under one folder (3 October 2026). ``/code/list-files``
