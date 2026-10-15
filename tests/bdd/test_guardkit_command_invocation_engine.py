@@ -771,7 +771,17 @@ def _given_args_with_shell_metacharacters(gci_world: dict[str, Any]) -> None:
     gci_world["worktree"] = Path("/var/forge/builds/build-meta-bdd")
     gci_world["execute"] = _GCI006FakeExecute(
         responses=[
+            # The index is prepared first (14 October 2026, 6df5804b): the add
+            # with the factory's records left out, no moves of records,
+            # nothing staged outside the records to compare, no staged
+            # records, and "is anything staged?" answering yes
+            # (``git diff --cached --quiet`` exits 1) — the same answers as
+            # ``_PREPARED_WITH_SOMETHING_STAGED`` in the unit tests.
             GitExecuteResult(exit_code=0, stdout="", stderr=""),  # git add -A
+            GitExecuteResult(exit_code=0, stdout="", stderr=""),
+            GitExecuteResult(exit_code=0, stdout="", stderr=""),
+            GitExecuteResult(exit_code=0, stdout="", stderr=""),
+            GitExecuteResult(exit_code=1, stdout="", stderr=""),
             GitExecuteResult(  # git commit -m
                 exit_code=0,
                 stdout="[main deadbee] " + gci_world["nasty_message"] + "\n",
@@ -800,10 +810,13 @@ def _when_adapter_launches_subprocess(gci_world: dict[str, Any]) -> None:
 def _then_each_arg_literal_token(gci_world: dict[str, Any]) -> None:
     fake: _GCI006FakeExecute = gci_world["execute"]
     nasty: str = gci_world["nasty_message"]
-    # The ``commit`` invocation is the second of the three; isolate it
-    # and assert the message lives in a single argv slot identity-equal
-    # to the input — no shell-expansion, no splitting, no escaping.
-    commit_call = fake.calls[1]
+    # Isolate the one ``commit`` invocation (it follows the index
+    # preparation) and assert the message lives in a single argv slot
+    # identity-equal to the input — no shell-expansion, no splitting, no
+    # escaping.
+    commit_calls = [c for c in fake.calls if c["command"][:2] == ["git", "commit"]]
+    assert len(commit_calls) == 1
+    commit_call = commit_calls[0]
     assert commit_call["command"][:3] == ["git", "commit", "-m"]
     assert commit_call["command"][3] is nasty
     # The total argv length is exactly 4 — there is no extra token from

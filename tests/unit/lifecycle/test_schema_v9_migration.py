@@ -131,7 +131,10 @@ def test_v9_is_additive_leaves_other_tables_unchanged(tmp_path: Path) -> None:
         stage_log_v8 = _table_schema(cx, "stage_log")
         planning_runs_v8 = _table_schema(cx, "planning_runs")
 
-        migrations.apply_at_boot(cx)
+        # Only this migration: later ones (v12's start_commit and onwards)
+        # legitimately add columns to planning_runs, which is not what this
+        # test is about.
+        _migrate_to(cx, 9)
         assert _table_schema(cx, "stage_log") == stage_log_v8
         assert _table_schema(cx, "planning_runs") == planning_runs_v8
     finally:

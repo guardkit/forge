@@ -856,9 +856,11 @@ async def test_a_refused_example_in_the_sandbox_fires_the_machines_round_before_
     assert receipt["refused_titles"] == list(REFUSED_TITLES)
     for title in REFUSED_TITLES:
         assert title in receipt["note"]
+    # The card line's words since 9 October 2026 (407734a4), the same as the
+    # container-side tests in test_driver_target_terminal.py.
     assert (
-        "The machine rewrote 2 of the worked examples so they can be proven"
-        in _digest_card_text(h)
+        "The machine rewrote 2 of the worked examples after their provability "
+        "check." in _digest_card_text(h)
     )
 
 

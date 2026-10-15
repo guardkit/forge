@@ -15,6 +15,23 @@ from forge.lifecycle.merge_retirement_cleanup import MergeRetirementCleanupError
 from tests.forge.lifecycle.test_merge_retirement import _real_shaped_history
 
 
+@pytest.fixture(autouse=True)
+def _ledger_at_schema_18(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Build the test ledgers at schema 18, the only version this one-off
+    script accepts (it refuses anything else by design). Release ledgers have
+    moved on to 19 (12 October 2026, 1445de97: preview leases), so without
+    this every test here stopped at that refusal instead of reaching the
+    behaviour it names."""
+    from forge.lifecycle import migrations
+
+    monkeypatch.setattr(
+        migrations,
+        "_MIGRATIONS",
+        tuple(m for m in migrations._MIGRATIONS if m[0] <= 18),
+    )
+    monkeypatch.setattr(migrations, "_SCHEMA_VERSION", 18)
+
+
 def _script() -> ModuleType:
     path = Path(__file__).parents[2] / "scripts" / "retire_legacy_merge_history.py"
     spec = importlib.util.spec_from_file_location("retire_legacy_merge_history", path)

@@ -267,8 +267,10 @@ class TestBootLogEmitsAppliedCount:
         # commit and by the identity the running thing reported; schema_v17.sql
         # added on 4 October 2026 for the builds.source_commit column — the
         # exact commit a feature planned elsewhere was admitted at;
-        # schema_v18.sql adds the coordinator's durable seed-once authority).
-        assert "applied 18" in applied_lines[0], applied_lines[0]
+        # schema_v18.sql adds the coordinator's durable seed-once authority;
+        # schema_v19.sql added on 12 October 2026 for the preview_leases
+        # table — one live review-preview lease per port).
+        assert "applied 19" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------

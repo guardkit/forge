@@ -353,7 +353,11 @@ async def test_a_planned_build_keeps_its_planning_runs_facts_and_launch(
         "repo",
         "memory_project",
         "launch_settings",
+        # Durable feature routing (9 October 2026, 42554fb9): the build
+        # carries its planning run's correlation id as its routing key.
+        "feature_routing_id",
     }
+    assert context["feature_routing_id"] == CID
     assert _no_planning_capability == []
 
 
