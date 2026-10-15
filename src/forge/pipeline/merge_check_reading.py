@@ -57,8 +57,10 @@ __all__ = [
     "CONFIG_PATH",
     "guardkit_rules",
     "read_the_merge_check",
+    "REPORT_NAME_LISTS",
     "shown_path",
     "shown_report",
+    "shown_sentence",
 ]
 
 #: Where a project declares its commands, relative to its top folder.
@@ -135,17 +137,39 @@ def shown_path(path: Any) -> str:
     return _CONTROL.sub(_escaped, text)
 
 
-def shown_report(value: Any) -> Any:
-    """``value`` with every string in it, keys included, passed through
-    :func:`shown_path`. For a report the build system printed: whatever it
-    copied out of the project reaches Forge's records and messages only in a
-    form that can be written and adds no line."""
+#: Line breaks of every kind. In a sentence the build system wrote they are
+#: read as the spaces they stand for, so its words stay one line.
+_LINE_BREAKS = re.compile("[\n\r\t\x0b\x0c\x85\u2028\u2029]+")
+
+#: The fields of the build system's reports that are lists of file names.
+#: Their names keep the backslash form; every other string is a sentence.
+REPORT_NAME_LISTS = frozenset(
+    {"judged_with_main_copies", "judge_files_not_on_target", "conflict_files"}
+)
+
+
+def shown_sentence(text: Any) -> str:
+    """A sentence the build system wrote, as one line a person reads: its
+    line breaks become spaces, and everything else is shown as
+    :func:`shown_path` shows it."""
+    return shown_path(_LINE_BREAKS.sub(" ", str(text)))
+
+
+def shown_report(value: Any, *, key: str | None = None) -> Any:
+    """A report the build system printed, with every string in it shown as a
+    person reads it (coach review 3): the names in :data:`REPORT_NAME_LISTS`
+    as :func:`shown_path` shows them, every other string as one line
+    (:func:`shown_sentence`), keys as names. Whatever the report copied out of
+    the project then reaches Forge's records and messages in a form that can
+    be written and adds no line."""
     if isinstance(value, str):
-        return shown_path(value)
+        return shown_path(value) if key in REPORT_NAME_LISTS else shown_sentence(value)
     if isinstance(value, dict):
-        return {shown_report(k): shown_report(v) for k, v in value.items()}
+        return {
+            shown_path(k): shown_report(v, key=str(k)) for k, v in value.items()
+        }
     if isinstance(value, list):
-        return [shown_report(v) for v in value]
+        return [shown_report(v, key=key) for v in value]
     return value
 
 
