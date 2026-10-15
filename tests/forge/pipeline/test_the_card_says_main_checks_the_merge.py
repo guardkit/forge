@@ -158,6 +158,21 @@ class StandInGuardKit:
         return sorted(named)
 
 
+@pytest.fixture(params=["stand-in rules", "GuardKit's own rules"])
+def rules(request: pytest.FixtureRequest) -> Any:
+    """The rules the card's reading is judged by: the stand-in, and GuardKit's
+    own when GuardKit is importable here (skipped otherwise), so the card is
+    proved against the real link and judge rule too."""
+    if request.param == "stand-in rules":
+        return StandInGuardKit()
+    from forge.pipeline.merge_check_reading import guardkit_rules
+
+    real = guardkit_rules()
+    if real is None:
+        pytest.skip("GuardKit is not importable in this interpreter")
+    return real
+
+
 # ---------------------------------------------------------------------------
 # Trees at commits, read the way the commit reader reads them
 # ---------------------------------------------------------------------------
@@ -456,14 +471,14 @@ CASES: dict[str, dict[str, Any]] = {
 @pytest.mark.parametrize("case", sorted(CASES))
 @pytest.mark.asyncio
 async def test_9_each_case_puts_its_one_sentence_on_both_cards(
-    config, pool, card: str, case: str
+    config, pool, rules, card: str, case: str
 ) -> None:
     spec = CASES[case]
     words, reading = await CARDS[card](
         config,
         pool,
         trees=_trees(spec["target"]),
-        rules=StandInGuardKit(),
+        rules=rules,
         name_status=spec["name_status"],
     )
 
@@ -477,12 +492,12 @@ async def test_9_each_case_puts_its_one_sentence_on_both_cards(
 
 @pytest.mark.parametrize("card", sorted(CARDS))
 @pytest.mark.asyncio
-async def test_9_the_not_readable_case_says_so_with_the_commit(config, pool, card: str) -> None:
+async def test_9_the_not_readable_case_says_so_with_the_commit(config, pool, rules, card: str) -> None:
     trees = _trees(_project())
     trees.refuse.add(TARGET)
 
     words, reading = await CARDS[card](
-        config, pool, trees=trees, rules=StandInGuardKit(), name_status="M\0scripts/check.sh\0"
+        config, pool, trees=trees, rules=rules, name_status="M\0scripts/check.sh\0"
     )
 
     assert (
@@ -497,10 +512,10 @@ async def test_9_the_not_readable_case_says_so_with_the_commit(config, pool, car
 @pytest.mark.parametrize("card", sorted(CARDS))
 @pytest.mark.asyncio
 async def test_9_with_no_judge_file_the_card_is_byte_for_byte_as_before(
-    config, pool, tmp_path: Path, card: str
+    config, pool, rules, tmp_path: Path, card: str
 ) -> None:
     with_reading, reading = await CARDS[card](
-        config, pool, trees=_trees(_project()), rules=StandInGuardKit(),
+        config, pool, trees=_trees(_project()), rules=rules,
         name_status="M\0src/app.txt\0",
     )
     assert reading["judge_files"] == []
@@ -549,7 +564,7 @@ async def test_10_the_reading_uses_guardkits_rule(config, pool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_10_a_stale_local_main_is_never_read(config, pool) -> None:
+async def test_10_a_stale_local_main_is_never_read(config, pool, rules) -> None:
     trees = Trees(
         {
             LOCAL_MAIN: _project("toolchain:\n  test: bash scripts/check.sh\n"),
@@ -565,7 +580,7 @@ async def test_10_a_stale_local_main_is_never_read(config, pool) -> None:
     )
 
     words, reading = await _routine_card(
-        config, pool, trees=trees, rules=StandInGuardKit(), name_status="M\0qa/run.sh\0"
+        config, pool, trees=trees, rules=rules, name_status="M\0qa/run.sh\0"
     )
 
     assert "This build changes qa/run.sh" in words
@@ -578,12 +593,12 @@ async def test_10_a_stale_local_main_is_never_read(config, pool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_10_with_a_preview_it_reads_at_the_previews_base(config, pool) -> None:
+async def test_10_with_a_preview_it_reads_at_the_previews_base(config, pool, rules) -> None:
     project = _project()
     trees = Trees({PREVIEW_BASE: project, CANDIDATE_SHA: project, JOINED: project})
 
     _words, reading = await _routine_card(
-        config, pool, trees=trees, rules=StandInGuardKit(),
+        config, pool, trees=trees, rules=rules,
         name_status="M\0scripts/check.sh\0", git=_PreviewGit(), preview=_Preview(),
     )
 
@@ -614,12 +629,12 @@ LINK_SENTENCE = "is a symbolic link, so the merge will not be able to check this
 
 @pytest.mark.parametrize("judge", ["scripts/check.sh", "scripts/install.sh"])
 @pytest.mark.asyncio
-async def test_an_unchanged_judge_link_whose_referent_changed_is_shown(config, pool, judge) -> None:
+async def test_an_unchanged_judge_link_whose_referent_changed_is_shown(config, pool, rules, judge) -> None:
     target = _project(**{judge: ("120000", "../tools/real.sh"), "tools/real.sh": ("100755", "real\n")})
     candidate = dict(target, **{"tools/real.sh": ("100755", "exit 0\n")})
 
     words, reading = await _routine_card(
-        config, pool, trees=_trees(target, candidate), rules=StandInGuardKit(),
+        config, pool, trees=_trees(target, candidate), rules=rules,
         name_status="M\0tools/real.sh\0",
     )
 
@@ -631,7 +646,7 @@ async def test_an_unchanged_judge_link_whose_referent_changed_is_shown(config, p
 
 @pytest.mark.parametrize("judge", ["scripts/check.sh", "scripts/install.sh"])
 @pytest.mark.asyncio
-async def test_a_judge_under_a_linked_folder_is_shown(config, pool, judge) -> None:
+async def test_a_judge_under_a_linked_folder_is_shown(config, pool, rules, judge) -> None:
     target = {
         ".guardkit/config.yaml": ("100644", CHECK_AND_INSTALL),
         "scripts": ("120000", "tools"),
@@ -640,7 +655,7 @@ async def test_a_judge_under_a_linked_folder_is_shown(config, pool, judge) -> No
     }
 
     words, _reading = await _routine_card(
-        config, pool, trees=_trees(target), rules=StandInGuardKit(), name_status="M\0src/x.txt\0"
+        config, pool, trees=_trees(target), rules=rules, name_status="M\0src/x.txt\0"
     )
 
     assert f"scripts {LINK_SENTENCE}" in words
@@ -648,12 +663,12 @@ async def test_a_judge_under_a_linked_folder_is_shown(config, pool, judge) -> No
 
 @pytest.mark.parametrize("judge", ["scripts/check.sh", "scripts/install.sh"])
 @pytest.mark.asyncio
-async def test_a_link_the_build_created_is_shown(config, pool, judge) -> None:
+async def test_a_link_the_build_created_is_shown(config, pool, rules, judge) -> None:
     target = _project()
     candidate = dict(target, **{judge: ("120000", "../tools/weak.sh")})
 
     words, _reading = await _routine_card(
-        config, pool, trees=_trees(target, candidate), rules=StandInGuardKit(),
+        config, pool, trees=_trees(target, candidate), rules=rules,
         name_status=f"T\0{judge}\0",
     )
 
@@ -661,12 +676,12 @@ async def test_a_link_the_build_created_is_shown(config, pool, judge) -> None:
 
 
 @pytest.mark.asyncio
-async def test_unreadable_link_evidence_is_said_plainly(config, pool) -> None:
+async def test_unreadable_link_evidence_is_said_plainly(config, pool, rules) -> None:
     trees = _trees(_project())
     trees.refuse_modes_at.add(CANDIDATE_SHA)
 
     words, reading = await _routine_card(
-        config, pool, trees=trees, rules=StandInGuardKit(), name_status="M\0src/app.txt\0"
+        config, pool, trees=trees, rules=rules, name_status="M\0src/app.txt\0"
     )
 
     assert (
@@ -682,7 +697,7 @@ async def test_unreadable_link_evidence_is_said_plainly(config, pool) -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_judge_the_target_renamed_is_listed_when_the_joined_version_differs(config, pool) -> None:
+async def test_a_judge_the_target_renamed_is_listed_when_the_joined_version_differs(config, pool, rules) -> None:
     renamed = "toolchain:\n  test: bash scripts/verify.sh\n"
     base = _project(renamed, **{"scripts/verify.sh": ("100755", "main's checks\n")})
     del base["scripts/check.sh"]
@@ -691,7 +706,7 @@ async def test_a_judge_the_target_renamed_is_listed_when_the_joined_version_diff
     trees = Trees({PREVIEW_BASE: base, CANDIDATE_SHA: candidate, JOINED: joined})
 
     words, reading = await _routine_card(
-        config, pool, trees=trees, rules=StandInGuardKit(),
+        config, pool, trees=trees, rules=rules,
         name_status="M\0scripts/check.sh\0", git=_PreviewGit(), preview=_Preview(),
     )
 
@@ -707,7 +722,7 @@ async def test_a_judge_the_target_renamed_is_listed_when_the_joined_version_diff
 @pytest.mark.parametrize("with_preview", [False, True], ids=["no preview", "preview"])
 @pytest.mark.asyncio
 async def test_a_second_offer_while_the_reader_is_suspended_makes_nothing(
-    config, pool, with_preview: bool
+    config, pool, rules, with_preview: bool
 ) -> None:
     project = _project()
     trees = Trees({TARGET: project, PREVIEW_BASE: project, CANDIDATE_SHA: project, JOINED: project})
@@ -717,7 +732,7 @@ async def test_a_second_offer_while_the_reader_is_suspended_makes_nothing(
     _record_start(pool)
     recorder = _Recorder()
     service = _service(
-        config, pool, recorder, trees=trees, rules=StandInGuardKit(),
+        config, pool, recorder, trees=trees, rules=rules,
         name_status="M\0scripts/check.sh\0",
         git=_PreviewGit() if with_preview else TargetGit(), preview=preview,
     )
