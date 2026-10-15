@@ -21,12 +21,14 @@ before anyone approves:
   path the build's ``name_status`` names, added, deleted and renamed ones
   included. With a preview, a judge file the target renamed is also listed
   when the joined tree's copy of it differs from the target's;
-* **links** are found on their own: GuardKit's ``judge_link_paths`` names every
-  file the declared commands name and every folder on its path, and each is
-  looked up, component by component, with the reader's mode answer in the
-  target tree, the candidate tree and the preview's joined tree. A link
-  anywhere there means the merge will not verify; a tree that cannot be read
-  is said plainly.
+* **links** are found on their own: every path a declared command's words
+  could name, and every folder on its path, is looked up component by
+  component with the reader's mode answer in the target tree, the candidate
+  tree and the preview's joined tree, and GuardKit's own link rule
+  (``links_on_judge_paths``) decides which of those entries is a link on a
+  judge's path. A link anywhere there means the merge will not verify; a tree
+  that cannot be read is said plainly. Which paths are looked up is a
+  generous list worked out here; whether one counts is GuardKit's answer.
 
 Nothing here names a language or a stack: the paths are whatever git lists and
 the declared commands name.
@@ -53,7 +55,6 @@ CONFIG_PATH = ".guardkit/config.yaml"
 
 #: The modes a commit's tree gives a file whose content can be compared.
 _BLOB_MODES = frozenset({"100644", "100755"})
-_LINK_MODE = "120000"
 _EXECUTABLE_MODE = "100755"
 
 #: The check time limit handed to GuardKit's pin. It only caps the install's
@@ -70,8 +71,8 @@ def guardkit_rules() -> Any | None:
     try:
         from guardkit.orchestrator.merge_environment import (  # type: ignore[import-not-found]
             judge_files,
-            judge_link_paths,
             judge_words,
+            links_on_judge_paths,
             pin_merge_environment,
             read_merge_declarations,
         )
@@ -88,7 +89,7 @@ def guardkit_rules() -> Any | None:
         pin_merge_environment=pin_merge_environment,
         judge_words=judge_words,
         judge_files=judge_files,
-        judge_link_paths=judge_link_paths,
+        links_on_judge_paths=links_on_judge_paths,
     )
 
 
@@ -102,6 +103,37 @@ def _not_read(declared_at: str | None, reason: str) -> dict[str, Any]:
         "config_changed": False,
         "link_unreadable": [],
     }
+
+
+def _paths_to_look_up(words: Sequence[str]) -> list[str]:
+    """Every path a command word could name, and every folder on its path.
+
+    A generous list: each word, the part after its first ``=``, and the
+    pieces of both split on ``,`` and ``:``, each without a leading ``./``.
+    It only decides what is looked up; GuardKit's link rule decides whether
+    an entry found there counts."""
+    keys: list[str] = []
+    for word in words:
+        whole = [str(word)]
+        if "=" in whole[0]:
+            whole.append(whole[0].split("=", 1)[1])
+        pieces = list(whole)
+        for key in whole:
+            pieces.extend(p for p in key.replace(":", ",").split(",") if p)
+        for key in pieces:
+            while key.startswith("./"):
+                key = key[2:]
+            key = key.strip("/")
+            if key and key not in keys:
+                keys.append(key)
+    paths: list[str] = []
+    for key in keys:
+        parts = [part for part in key.split("/") if part]
+        for end in range(1, len(parts) + 1):
+            path = "/".join(parts[:end])
+            if path not in paths:
+                paths.append(path)
+    return paths
 
 
 def _paths_of(changes: Iterable[Any]) -> list[str]:
@@ -256,18 +288,22 @@ async def _read(
     trees: list[tuple[str, str]] = [(declared_at, declared_at), (candidate, candidate)]
     if joined:
         trees.append((joined, "the preview's joined commit"))
-    link_paths = list(rules.judge_link_paths(words)) if words else []
+    link_paths = _paths_to_look_up(words) if words else []
     if joined_expected and not joined and link_paths:
         unreadable.append({"path": link_paths[-1], "at": "the preview's joined commit"})
     links: list[str] = []
     for commit, shown in trees:
+        entries: dict[str, str] = {}
         for path in link_paths:
             mode, refusal = await _mode(reader, repo_path, commit, path)
             if refusal is not None:
                 if not any(u["path"] == path for u in unreadable):
                     unreadable.append({"path": path, "at": shown})
                 continue
-            if mode == _LINK_MODE and path not in links:
+            if mode:
+                entries[path] = mode
+        for path in rules.links_on_judge_paths(entries, words) if entries else []:
+            if path not in links:
                 links.append(path)
     for path in links:
         judges = [j for j in judges if j["path"] != path]

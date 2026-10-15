@@ -93,7 +93,7 @@ def _match_keys(word: str) -> list[str]:
 
 class StandInGuardKit:
     """``read_merge_declarations``, ``pin_merge_environment``, ``judge_words``,
-    ``judge_files`` and ``judge_link_paths``, with GuardKit's matching rule,
+    ``judge_files`` and ``links_on_judge_paths``, with GuardKit's matching rule,
     and a record of every call so a test can prove Forge asked GuardKit."""
 
     def __init__(self) -> None:
@@ -145,17 +145,17 @@ class StandInGuardKit:
                 hits.append(path)
         return hits
 
-    def judge_link_paths(self, words: Sequence[str]) -> list[str]:
-        self.calls.append(("judge_link_paths", tuple(words)))
-        found: list[str] = []
-        for word in words:
-            for key in _match_keys(word):
-                parts = key.split("/")
-                for end in range(1, len(parts) + 1):
-                    path = "/".join(parts[:end])
-                    if path and path not in found:
-                        found.append(path)
-        return found
+    def links_on_judge_paths(self, entries: Mapping[str, str], words: Sequence[str]) -> list[str]:
+        """GuardKit's link rule: a link the judge-file rule names, or a link
+        that is a leading folder of a word that names a path."""
+        self.calls.append(("links_on_judge_paths", dict(entries)))
+        keys = {key for word in words for key in _match_keys(word)}
+        links = sorted(path for path, mode in entries.items() if mode == "120000")
+        named = set(self.judge_files(links, words))
+        for path in links:
+            if any(key.startswith(path + "/") or ("/" + path + "/") in key for key in keys):
+                named.add(path)
+        return sorted(named)
 
 
 # ---------------------------------------------------------------------------
@@ -543,7 +543,7 @@ async def test_10_the_reading_uses_guardkits_rule(config, pool) -> None:
     assert [j["path"] for j in reading["judge_files"]] == ["scripts/check.sh"]
     assert reading["judge_files"][0]["how"] == "changed"
     asked = [name for name, _ in rules.calls]
-    for name in ("read_merge_declarations", "pin_merge_environment", "judge_files", "judge_link_paths"):
+    for name in ("read_merge_declarations", "pin_merge_environment", "judge_files", "links_on_judge_paths"):
         assert name in asked, name
     assert ("judge_files", ("scripts/check.sh",)) in rules.calls
 
