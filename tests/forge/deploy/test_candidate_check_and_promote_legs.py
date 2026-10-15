@@ -626,10 +626,15 @@ class _ASidecarThatAnswers:
     ``check`` and ``teardown`` say what the candidate's own steps and its
     teardown get back: ``"ok"`` (exit 0), ``"red"`` (exit 1, in the script's
     own words), ``"lost"`` (the request is taken and the connection is
-    dropped without an answer) or ``"unreadable"`` (an answer that is not
-    the sidecar's JSON)."""
+    dropped without an answer), ``"unreadable"`` (an answer that is not
+    the sidecar's JSON), ``"timed-out"`` (stopped at its time limit) or
+    ``"html-error"`` (an HTTP 502 whose body is a proxy's HTML page).
+    ``gate`` is what a live-gate driver request gets: ``"timed-out"`` or
+    ``"html-error"``."""
 
-    def __init__(self, *, check: str, teardown: str, revert: str = "ok") -> None:
+    def __init__(
+        self, *, check: str, teardown: str, revert: str = "ok", gate: str = "timed-out"
+    ) -> None:
         import json
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -646,6 +651,32 @@ class _ASidecarThatAnswers:
                     if env.get("REVERT") == "1"
                     else teardown if down else check
                 )
+                if "driver" in body:
+                    how = gate
+                    if how == "timed-out":
+                        stopped = json.dumps(
+                            {
+                                "exit_code": 124,
+                                "stdout": "",
+                                "stderr_tail": "",
+                                "cwd": body.get("cwd"),
+                                "timed_out": True,
+                            }
+                        ).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(stopped)))
+                        self.end_headers()
+                        self.wfile.write(stopped)
+                        return
+                if how == "html-error":
+                    page = b"<html><body>502 Bad Gateway</body></html>"
+                    self.send_response(502)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    self.wfile.write(page)
+                    return
                 if how == "lost":
                     self.close_connection = True
                     return
@@ -1375,6 +1406,144 @@ class TestAScriptStoppedAtItsTimeLimit:
             feature="FEAT-LT",
             identity_env=WHICH_CANDIDATE,
         )
+        assert result.outcome == "failed"
+        assert result.detail["candidate"] == "torn-down"
+        assert result.detail.get("answer_lost") is True
+
+
+
+class _ASidecarThatRefusesWith:
+    """A loopback server answering every request with HTTP ``status`` and the
+    raw ``body`` bytes (15 October 2026, Codex R5)."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        host, port = self.server.server_address[:2]
+        self.url = f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+_REFUSALS = [
+    (502, b"<html><body>502 Bad Gateway</body></html>", True),
+    (500, b"", True),
+    (400, b"{}", True),
+    (400, b'{"error": ""}', True),
+    (400, b'{"error": "script deploy/evil.sh is not one the profile names"}', False),
+]
+_REFUSAL_IDS = ["html", "empty", "empty-object", "blank-sentence", "sidecars-own-words"]
+
+
+class TestAnHttpErrorIsAnAnswerOnlyInTheSidecarsOwnWords:
+    """15 October 2026, Codex R5: the script runner and the live-gate invoker
+    read an HTTP error as an answered refusal only when it carries the
+    sidecar's own refusal sentence. Anything else is no answer."""
+
+    @pytest.mark.parametrize("status, body, lost", _REFUSALS, ids=_REFUSAL_IDS)
+    def test_the_script_runner(self, status: int, body: bytes, lost: bool) -> None:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
+
+        sidecar = _ASidecarThatRefusesWith(status, body)
+        try:
+            answer = SidecarScriptRunner(base_url=sidecar.url, repo="guardkit/api_test")(
+                cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=1
+            )
+        finally:
+            sidecar.close()
+        assert no_answer_came_back(answer) is lost
+        exit_code, _output = answer
+        assert exit_code != 0
+
+    @pytest.mark.parametrize("status, body, lost", _REFUSALS, ids=_REFUSAL_IDS)
+    def test_the_live_gate_invoker(
+        self, tmp_path, status: int, body: bytes, lost: bool
+    ) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        sidecar = _ASidecarThatRefusesWith(status, body)
+        try:
+            answer = SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo="guardkit/api_test",
+                repo_path=tmp_path,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            ).invoke(feature="FEAT-R5", target="apitest-sbx")
+        finally:
+            sidecar.close()
+        assert answer.verdict == "instrument_fail"
+        assert answer.answer_lost is lost
+
+
+class TestASandboxGateStoppedAtItsTimeLimit:
+    """15 October 2026, Codex R4: the sandbox's live-gate driver was stopped
+    at its time limit. The invoker says no answer came back, and a candidate
+    check whose gate it was says so even after its teardown answered."""
+
+    def test_the_invoker_says_so(self, tmp_path) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        sidecar = _ASidecarThatAnswers(check="ok", teardown="ok", gate="timed-out")
+        try:
+            answer = SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo="guardkit/api_test",
+                repo_path=tmp_path,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            ).invoke(feature="FEAT-R4", target="apitest-sbx")
+        finally:
+            sidecar.close()
+        assert answer.verdict == "environment_fail"
+        assert answer.answer_lost is True
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_check_says_so_after_its_teardown(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        sidecar = _ASidecarThatAnswers(check="ok", teardown="ok", gate="timed-out")
+        try:
+            runner = _a_stage_through(
+                sidecar,
+                repository,
+                runbook_publisher,
+                tmp_path,
+                SidecarLiveGateInvoker(
+                    base_url=sidecar.url,
+                    repo="guardkit/api_test",
+                    repo_path=tmp_path,
+                    driver_argv=["python3", "qa/gate.py"],
+                    timeout_seconds=1,
+                ),
+            )
+            result = await runner.candidate_check(
+                _profile(),
+                correlation_id="gt",
+                deploy_run_id="run-gt",
+                feature="FEAT-GT",
+                identity_env=WHICH_CANDIDATE,
+            )
+        finally:
+            sidecar.close()
         assert result.outcome == "failed"
         assert result.detail["candidate"] == "torn-down"
         assert result.detail.get("answer_lost") is True

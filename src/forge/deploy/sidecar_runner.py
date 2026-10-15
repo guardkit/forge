@@ -205,9 +205,17 @@ class SidecarScriptRunner:
                 raw = resp.read()
                 parsed = json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            # A 4xx/5xx from the sidecar (e.g. a deny-by-default refusal). Read
-            # the error body so the refusal message is on the record.
-            detail = self._read_error_body(exc)
+            # A 4xx/5xx from the sidecar (e.g. a deny-by-default refusal). It is
+            # an ANSWER only when it carries the sidecar's own refusal sentence
+            # (15 October 2026, Codex R5); an empty, unreadable or HTML body,
+            # or a JSON object with no sentence, says nothing about whether the
+            # script ran, so it is no answer.
+            detail = sidecar_refusal_sentence(exc)
+            if detail is None:
+                return NoAnswer(
+                    f"sidecar answered HTTP {exc.code} with no refusal it "
+                    "could be read as"
+                )
             return (
                 SIDECAR_TRANSPORT_EXIT_CODE,
                 f"sidecar refused (HTTP {exc.code}): {detail}",
@@ -246,15 +254,25 @@ class SidecarScriptRunner:
             return TimedOut(exit_code, output)
         return (exit_code, output)
 
-    @staticmethod
-    def _read_error_body(exc: urllib.error.HTTPError) -> str:
-        try:
-            payload = json.loads(exc.read().decode("utf-8"))
-            if isinstance(payload, dict) and "error" in payload:
-                return str(payload["error"])
-            return str(payload)
-        except Exception:  # noqa: BLE001 — best-effort detail
-            return exc.reason if isinstance(exc.reason, str) else "unknown"
+
+def sidecar_refusal_sentence(exc: urllib.error.HTTPError) -> str | None:
+    """The sidecar's own refusal sentence inside an HTTP error, or ``None``.
+
+    15 October 2026 (Codex R5). Every sidecar refusal is a JSON object with a
+    plain ``error`` sentence. Only that is an answer; a body that cannot be
+    read, is not JSON, is not an object, or carries no sentence is ``None``,
+    and the caller treats it as no answer at all.
+    """
+    try:
+        payload = json.loads(exc.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 — an unreadable body is no answer
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, str) or not error.strip():
+        return None
+    return error
 
 
 def names_a_candidate_tree(cwd: object) -> bool:
@@ -309,4 +327,5 @@ __all__ = [
     "no_answer_came_back",
     "candidate_tree_not_honoured",
     "names_a_candidate_tree",
+    "sidecar_refusal_sentence",
 ]

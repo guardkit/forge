@@ -465,7 +465,7 @@ class SidecarCandidateGit:
     async def retire_autobuild_worktree(
         self, build_id: str, path: str, expected: dict[str, Any]
     ) -> dict[str, Any]:
-        decoded, why = await self._ok(
+        decoded, why, answered = await self._ok_and_answered(
             "/git/autobuild-worktree-retire",
             {
                 "repo": self._repo,
@@ -474,15 +474,18 @@ class SidecarCandidateGit:
                 "expected": expected,
             },
             timeout=self._layout_timeout_s,
+            # The retirement's own answer (15 October 2026, the R3 rule).
+            valid=lambda d: d.get("status") in ("removed", "kept", "already-gone"),
         )
         if decoded is None:
             # No answer: the retirement may still be running in the sandbox,
-            # so the press keeps its hold (``answered`` False says so).
+            # so the press keeps its hold (``answered`` False says so). A
+            # refusal in the sandbox's own words is an answer: nothing ran.
             return {
                 "status": "kept",
                 "build_id": str(build_id),
                 "path": str(path),
                 "detail": str(why),
-                "answered": False,
+                "answered": answered,
             }
         return decoded

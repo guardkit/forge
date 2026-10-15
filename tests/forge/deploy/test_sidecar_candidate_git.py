@@ -427,6 +427,8 @@ class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
             with pytest.raises(CandidateTreeError) as raised:
                 await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
             assert raised.value.answered is False
+            retired = await git.retire_autobuild_worktree("build-X", "/retained", {})
+            assert retired["status"] == "kept" and retired["answered"] is False
         finally:
             sidecar.close()
 
@@ -444,6 +446,8 @@ class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
             with pytest.raises(CandidateTreeError) as raised:
                 await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
             assert raised.value.answered is True
+            retired = await git.retire_autobuild_worktree("build-X", "/retained", {})
+            assert retired["status"] == "kept" and retired["answered"] is True
         finally:
             sidecar.close()
 

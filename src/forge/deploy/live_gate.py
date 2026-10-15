@@ -1021,9 +1021,20 @@ class SidecarLiveGateInvoker:
             with urllib.request.urlopen(request, timeout=http_timeout) as resp:
                 answer = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            # A refusal is an answer only in the sidecar's own words (15
+            # October 2026, Codex R5); anything else is no answer.
+            from forge.deploy.sidecar_runner import sidecar_refusal_sentence
+
+            sentence = sidecar_refusal_sentence(exc)
+            if sentence is None:
+                return _instrument(
+                    f"the deploy sidecar at {self._base_url} answered HTTP "
+                    f"{exc.code} with no refusal it could be read as",
+                    answer_lost=True,
+                )
             return _instrument(
                 f"the deploy sidecar at {self._base_url} refused the live gate "
-                f"(HTTP {exc.code}): {_error_body(exc)}"
+                f"(HTTP {exc.code}): {sentence}"
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             return _instrument(
@@ -1068,11 +1079,14 @@ class SidecarLiveGateInvoker:
                 "checked is not the tree that was asked about"
             )
         if answer.get("timed_out") is True:
+            # Stopped at its time limit in the sandbox: what the driver started
+            # may still be running (15 October 2026, Codex R4).
             return LiveGateInvocation(
                 verdict="environment_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
                 dry_run=False,
+                answer_lost=True,
                 detail={
                     "argv": argv,
                     "cwd": ran_in,
@@ -1102,20 +1116,6 @@ class SidecarLiveGateInvoker:
             invocation,
             detail={**invocation.detail, "sidecar": self._base_url},
         )
-
-
-def _error_body(exc: Any) -> str:
-    """The plain sentence inside a sidecar refusal, best effort."""
-    import json
-
-    try:
-        payload = json.loads(exc.read().decode("utf-8"))
-    except Exception:  # noqa: BLE001 — best-effort detail
-        reason = getattr(exc, "reason", None)
-        return reason if isinstance(reason, str) else "unknown"
-    if isinstance(payload, dict) and "error" in payload:
-        return str(payload["error"])
-    return str(payload)
 
 
 def _same_place(sent: str, answered: str) -> bool:

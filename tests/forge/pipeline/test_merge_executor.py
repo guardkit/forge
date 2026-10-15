@@ -4827,7 +4827,16 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert _the_hold(pool).lease_holder is not None
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("check, kept", [("timed-out", True), ("red", False)])
+    @pytest.mark.parametrize(
+        "check, gate, kept",
+        [
+            ("timed-out", None, True),
+            ("red", None, False),
+            ("html-error", None, True),
+            ("ok", "timed-out", True),
+        ],
+        ids=["script-timed-out", "script-red", "script-html-error", "gate-timed-out"],
+    )
     async def test_a_check_script_that_ran_out_of_time_keeps_it(
         self,
         config: ForgeConfig,
@@ -4835,13 +4844,16 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         repo_root: Path,
         tmp_path: Path,
         check: str,
+        gate: str | None,
         kept: bool,
     ) -> None:
-        """15 October 2026, Codex R2: the candidate check runs through the REAL
-        deploy stage and script runner. Its script is stopped at its time
-        limit and its teardown answers that the candidate is down. What the
-        script started may still be running, so the hold is kept. A script
-        that went red in its own words, with the same teardown, puts it down."""
+        """15 October 2026, Codex R2, R4 and R5: the candidate check runs
+        through the REAL deploy stage, script runner and (for ``gate``) the
+        sandbox live-gate invoker, and its teardown always answers that the
+        candidate is down. A script stopped at its time limit, a script whose
+        request came back as a proxy's HTML error page, or a gate driver
+        stopped at its limit may have left something running, so the hold is
+        kept. A script that went red in its own words puts it down."""
         import sqlite3
         from unittest.mock import AsyncMock
 
@@ -4858,7 +4870,20 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
             _profile,
         )
 
-        sidecar = _ASidecarThatAnswers(check=check, teardown="ok")
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        sidecar = _ASidecarThatAnswers(check=check, teardown="ok", gate=gate or "timed-out")
+        invoker = (
+            SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo=REPO,
+                repo_path=tmp_path,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            )
+            if gate
+            else _Invoker()
+        )
         connection = sqlite3.connect(str(tmp_path / "runbooks.db"))
         apply(connection)
         stage = DeployStageRunner(
@@ -4866,7 +4891,7 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
             runbook_publisher=AsyncMock(),
             deploy_publisher=RecordingDeployPublisher(),
             reservation=InProcessReservationLease(),
-            live_gate_invoker=_Invoker(),
+            live_gate_invoker=invoker,
             broker_inspector=DryRunBrokerInspector(),
             config=DeployStageConfig(execution_surface="sidecar", sidecar_url=sidecar.url),
             deploy_record_root=str(tmp_path / "records"),
