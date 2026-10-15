@@ -7,6 +7,7 @@ import socket
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -624,3 +625,55 @@ def test_a_walk_redirected_to_folders_owned_by_someone_else_changes_nothing(
     lifecycle._make_owner_writable(redirected / "outside" / "cache")
 
     assert {folder: folder.stat().st_mode for folder in before} == before
+
+
+def test_a_folder_above_the_tree_swapped_for_a_link_to_the_users_own_folders_is_not_followed(
+    tmp_path: Path, _writable_again: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex review, R3, round 3: a folder ABOVE the tree replaced by a link
+    to a tree the same user owns. The walk's top is reached one name at a
+    time from / without following any link, so the walk does not start,
+    nothing outside changes, and the retirement says "kept"."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    assert offered["ok"] is True, offered
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    # The same user's own tree, laid out like .guardkit, read-only throughout.
+    outside = tmp_path / "outside-guardkit"
+    mirror = outside / "worktrees" / inner.name
+    _read_only_cache(mirror)
+    for folder in (mirror, mirror.parent, outside):
+        folder.chmod(0o555)
+    folders = [Path(root) for root, _dirs, _files in os.walk(outside)]
+    before = {folder: folder.stat().st_mode for folder in folders}
+    files = {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    }
+    real_inspect = lifecycle.inspect_autobuild_worktree
+
+    def inspect_then_swap(**kwargs: Any) -> dict[str, Any]:
+        answer = real_inspect(**kwargs)
+        guardkit = outer / ".guardkit"
+        guardkit.rename(outer / ".guardkit-moved")
+        guardkit.symlink_to(outside, target_is_directory=True)
+        return answer
+
+    monkeypatch.setattr(lifecycle, "inspect_autobuild_worktree", inspect_then_swap)
+
+    result = retire_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer, expected=offered
+    )
+
+    assert result["status"] == "kept", result
+    assert {folder: folder.stat().st_mode for folder in folders} == before
+    assert {
+        Path(root) / name: (Path(root) / name).read_bytes()
+        for root, _dirs, names in os.walk(outside)
+        for name in names
+    } == files

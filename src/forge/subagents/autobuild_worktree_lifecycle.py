@@ -424,17 +424,48 @@ def _widen_by_handle(descriptor: int) -> None:
             os.close(opened)
 
 
+# Passing through a folder needs only search access, so the folders on the
+# way down are opened as paths (Linux), and only the last one for reading.
+_PASS_THROUGH = (
+    getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
+)
+
+
+def _open_folder_strictly(path: Path) -> int | None:
+    """Open the folder at absolute ``path`` one name at a time from ``/``,
+    never following a link at any step; ``None`` if any step is a link, is
+    not a folder, or cannot be opened. The caller closes the handle."""
+    parts = path.parts
+    if not path.is_absolute() or any(part in {"", ".", ".."} for part in parts[1:]):
+        return None
+    try:
+        current = os.open(parts[0], os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        return None
+    for index, part in enumerate(parts[1:], start=2):
+        flags = _OPEN_FOLDER if index == len(parts) else _PASS_THROUGH
+        try:
+            following = os.open(part, flags, dir_fd=current)
+        except OSError:
+            os.close(current)
+            return None
+        os.close(current)
+        current = following
+    return current
+
+
 def _make_owner_writable(top: Path) -> None:
     """Give the owner full access to every folder under ``top``, links skipped.
 
-    ``top`` itself is opened without following a link, and every folder below
-    it from its parent's open handle, so a link put in a folder's place is
-    never followed, even one swapped in after the folder was listed. Best
-    effort: what cannot be changed is left for Git to report.
+    ``top`` is reached one name at a time from ``/`` without following a link
+    at any step, and every folder below it is opened from its parent's open
+    handle the same way, so a link put in any folder's place, above the tree
+    or inside it, is never followed. If ``top`` cannot be reached that way,
+    nothing is changed. Best effort: what cannot be changed is left for Git
+    to report ("kept").
     """
-    try:
-        descriptor = os.open(top, _OPEN_FOLDER)
-    except OSError:
+    descriptor = _open_folder_strictly(top)
+    if descriptor is None:
         return
     try:
         _widen_by_handle(descriptor)
