@@ -179,6 +179,9 @@ class TestApprovalYamlRoundTrip:
                 "progress_interval_seconds": 90,
                 "build_queue_subject": "pipeline.build-queued.team-a",
                 "approved_originators": ["terminal", "slack"],
+                # How many builds may hold a place at once (default 1); the
+                # unfiltered dump always includes it.
+                "max_concurrent_builds": 1,
             },
             "approval": {
                 "default_wait_seconds": 300,
@@ -260,6 +263,12 @@ class TestApprovalYamlRoundTrip:
                 # their own sandbox); the unfiltered dump always includes both.
                 "rewrite_on_refusal": True,
                 "sandboxes": {},
+                # Added 7, 12 and 14 October 2026 (the "nothing to build"
+                # switch, the ranked source switch, the per-repository fetch
+                # addresses); the unfiltered dump always includes them.
+                "fetch_addresses": {},
+                "nothing_to_build": {"enabled": False},
+                "ranked_source": {"enabled": False},
             },
             # ``deploy`` was added by WS2-B8 (output-side stages); the unfiltered
             # round-trip dump always includes it with default values.
@@ -303,6 +312,9 @@ class TestApprovalYamlRoundTrip:
             # always includes it and this exhaustive fixture must declare it.
             "routine": {
                 "seat": None,
+                # The routine build's time-limit multiplier (14 September
+                # 2026); unset by default, and always present in the dump.
+                "timeout_multiplier": None,
             },
             # ``conductor`` — the fix journey's activation flag (the conductor
             # revival) plus its SEAT (the local model every fix-journey leg
@@ -339,6 +351,26 @@ class TestApprovalYamlRoundTrip:
             # unfiltered round-trip dump always includes it, so this
             # exhaustive fixture must declare it.
             "autobuild_gate": {"approval_max_wait_seconds": 0},
+            # ``publication`` (handing finished builds to the publisher,
+            # September 2026) and ``review_preview`` (the review preview
+            # before a merge offer, 12 October 2026) — both off by default and
+            # always present in the unfiltered dump, so this exhaustive
+            # fixture declares them.
+            "publication": {
+                "enabled": False,
+                "publisher_url": None,
+                "request_timeout_seconds": 300,
+                "send_attempts": 3,
+                "builds_may_run_inside_the_coordinator": True,
+                "publisher_credential_file": None,
+                "publisher_route_keys_dir": None,
+            },
+            "review_preview": {
+                "enabled": False,
+                "evidence_root": None,
+                "evidence_base_url": None,
+                "public_host": None,
+            },
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

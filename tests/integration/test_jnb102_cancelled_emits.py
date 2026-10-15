@@ -124,6 +124,10 @@ class TestMaxWaitEmitsCancelled:
                 default_wait_seconds=0,
                 max_wait_seconds=3600,
                 expected_approver=RICH,
+                # Opt back into a bounded wait: since 26 August 2026 the build
+                # gate waits indefinitely by default, under which this
+                # scenario would never expire (as in test_jnb101).
+                autobuild_gate_max_wait_seconds=3600,
             ),
         )
 
@@ -152,7 +156,14 @@ class TestDeferTimeoutEmitsCancelled:
         # defer delivery to land in the first wait, short enough that
         # the recursive second wait (no refresh publisher) times out
         # and drives the defer-branch cancel.
-        deps = _production_deps(nats, repo, state_machine)
+        deps = _production_deps(
+            nats,
+            repo,
+            state_machine,
+            # A bounded wait, as above: the default since 26 August 2026 is to
+            # wait for an answer indefinitely.
+            forge_config=_forge_config(autobuild_gate_max_wait_seconds=3600),
+        )
         deps.per_attempt_wait_seconds = 1
 
         gate_task = _start_gate(deps)
@@ -284,6 +295,10 @@ class TestDdr007BestEffort:
                 default_wait_seconds=0,
                 max_wait_seconds=3600,
                 expected_approver=RICH,
+                # Opt back into a bounded wait: since 26 August 2026 the build
+                # gate waits indefinitely by default, under which this
+                # scenario would never expire (as in test_jnb101).
+                autobuild_gate_max_wait_seconds=3600,
             ),
         )
 

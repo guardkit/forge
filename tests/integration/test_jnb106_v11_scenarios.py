@@ -135,6 +135,10 @@ class TestAfterWindowReplyNotApplied:
                 default_wait_seconds=0,
                 max_wait_seconds=3600,
                 expected_approver=RICH,
+                # Opt back into a bounded wait: since 26 August 2026 the build
+                # gate waits indefinitely by default, under which this
+                # scenario would never expire (as in test_jnb101).
+                autobuild_gate_max_wait_seconds=3600,
             ),
         )
 
@@ -361,6 +365,10 @@ class TestApproveVsExpiryRace:
                 default_wait_seconds=0,
                 max_wait_seconds=3600,
                 expected_approver=RICH,
+                # Opt back into a bounded wait: since 26 August 2026 the build
+                # gate waits indefinitely by default, under which this
+                # scenario would never expire (as in test_jnb101).
+                autobuild_gate_max_wait_seconds=3600,
             ),
         )
         outcome, _ = await asyncio.wait_for(_start_gate(deps), timeout=5.0)

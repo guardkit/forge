@@ -98,6 +98,10 @@ STAGE_PLAIN_NAMES: dict[str, str] = {
     "feature-spec-draft": "writing the spec",
     "feature-spec-digest-review": "reading the spec digest",
     "build-queued": "handing to the build system",
+    # Durable feature routing (9 October 2026): the feature is pinned to the
+    # model machine its calls go to; a routing failure is settled under this
+    # label (planning/driver.py, _settle_routing_failure).
+    "feature-routing": "choosing which machine runs the feature's models",
     # HISTORICAL — old ledger rows only. The W1-S2 DCL leg was struck on
     # 2026-08-15 (guardkit deleted the `.dcl` spec track outright), so no run
     # records this label any more; the entry stays so ledgers written before

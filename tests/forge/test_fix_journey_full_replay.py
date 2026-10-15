@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from datetime import datetime, timezone
 import sqlite3
 import subprocess
 from pathlib import Path
@@ -227,6 +228,11 @@ def _init_worktree_with_a_fix_commit(worktree: Path) -> None:
     run("git", "commit", "-m", "the fix")
 
 
+# Queued and started now: the fix-journey profile's wall-clock budget is
+# measured from ``started_at``.
+_NOW = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 @pytest.fixture
 def rig(tmp_path: Path):
     worktree = tmp_path / "worktree"
@@ -238,15 +244,23 @@ def rig(tmp_path: Path):
 
     cx: sqlite3.Connection = sqlite_connect.connect_writer(tmp_path / "forge.db")
     migrations.apply_at_boot(cx)
+    # The row as a fix journey is queued today: on the branch its journey is
+    # cut from (``main``; Part M rule 56, so the commit probe counts
+    # ``main..HEAD`` and finds the fix), under the ``fix-journey`` budget
+    # profile it is queued with (so a red checkpoint with no review cycle left
+    # ends the journey instead of looping until the turn cap; 07b8b3b1,
+    # 8 September 2026).
     cx.execute(
         "INSERT INTO builds (build_id, feature_id, repo, branch, "
         "feature_yaml_path, status, triggered_by, correlation_id, queued_at, "
-        "started_at, worktree_path, mode, task_id) VALUES (?, 'FEAT-DRF', 'r', "
-        "'fix/FEAT-DRF', ?, 'RUNNING', 'cli', 'corr-fix-1', "
-        "'2026-07-31T00:00:00Z', '2026-07-31T00:00:00Z', ?, 'mode-c', ?)",
+        "started_at, worktree_path, mode, task_id, profile) VALUES (?, "
+        "'FEAT-DRF', 'r', 'main', ?, 'RUNNING', 'cli', 'corr-fix-1', "
+        "?, ?, ?, 'mode-c', ?, 'fix-journey')",
         (
             BUILD_ID,
             str(worktree / "tasks" / "fix-task.yaml"),
+            _NOW,
+            _NOW,
             str(worktree),
             TASK_ID,
         ),
@@ -502,7 +516,10 @@ class TestARedGateNeverPublishes:
             (rig.receipts_root / BUILD_ID / "failure-manifest.json").read_text()
         )
         assert manifest["outcome"] == ConductorRunOutcome.RED_GATE_STOP.value
-        assert "gates red" in manifest["reason"] or "gates" in manifest["reason"]
+        # Since 8 September 2026 (07b8b3b1) the red checkpoint's own words.
+        assert manifest["reason"].startswith(
+            "the merge-ready checks stayed red and no review cycle is left"
+        )
         assert "wait" not in manifest["reason"].lower()
 
     def test_a_red_gate_journey_leaves_its_own_failure_pack(self, rig) -> None:

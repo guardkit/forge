@@ -112,9 +112,28 @@ def published(
 
 
 @pytest.fixture
-def repo_dir(tmp_path: Path) -> Path:
+def repo_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A real checkout on ``main``: since Part L (2026-09-07, 50b04426) a fix
+    journey rides a ``repair/<task id>`` branch cut from ``--branch``, carrying
+    the task file the review leg loads, so ``--mode c`` needs a branch to cut
+    from. The same fixture ``tests/forge/test_mode_c_cap_law.py`` got then."""
+    import os
+    import subprocess
+
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", os.devnull)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     repo = tmp_path / "checkout"
     repo.mkdir()
+
+    def git(*args: str) -> None:
+        subprocess.run(["git", *args], cwd=str(repo), check=True, capture_output=True)
+
+    git("init", "-q", "-b", "main")
+    git("config", "user.email", "tests@example.com")
+    git("config", "user.name", "the tests")
+    (repo / "README.md").write_text("the feature, merged\n", encoding="utf-8")
+    git("add", "-A")
+    git("commit", "-q", "-m", "the feature, merged")
     return repo
 
 
@@ -456,9 +475,11 @@ class TestPlanningHandoffPostMigrationValidation:
 
         assert result.exit_code == 0, result.output
         assert len(opened) == 1
+        # Migrated all the way to the version this release ships (19 since
+        # the preview leases of 12 October 2026).
         assert opened[0].execute("SELECT max(version) FROM schema_version").fetchone()[
             0
-        ] == 18
+        ] == 19
         assert opened[0].execute("SELECT count(*) FROM builds").fetchone()[0] == 1
         assert len(published) == 1
         opened[0].close()

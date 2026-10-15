@@ -121,7 +121,14 @@ def test_v7_is_additive_leaves_other_tables_unchanged(tmp_path: Path) -> None:
         finally:
             migrations._MIGRATIONS = original
 
-        migrations.apply_at_boot(cx)
+        # Only this migration: later ones (v12's start_commit and onwards)
+        # legitimately add columns to planning_runs, which is not what this
+        # test is about.
+        migrations._MIGRATIONS = tuple(m for m in original if m[0] <= 7)
+        try:
+            migrations.apply_at_boot(cx)
+        finally:
+            migrations._MIGRATIONS = original
         assert _table_schema(cx, "stage_log") == stage_log_v6
         assert _table_schema(cx, "planning_runs") == planning_runs_v6
     finally:

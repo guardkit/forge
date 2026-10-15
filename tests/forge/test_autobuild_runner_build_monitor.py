@@ -676,14 +676,27 @@ class TestHonestCountsOnSuccess:
             await asyncio.sleep(0.05)
             proc.finish(0)
 
+        # Since 18 September 2026 (d975bda2) the success path removes a
+        # worktree only once its Git ownership is proved, and keeps one that
+        # still holds GuardKit worktrees for the merge offer. This tree is a
+        # plain folder, so the proof is given here: owned, nothing nested.
+        def _owned(**kwargs: Any) -> dict[str, Any]:
+            return {
+                "ok": True,
+                "build_id": kwargs["build_id"],
+                "path": str(kwargs["path"]),
+                "nested_registrations": [],
+            }
+
         finisher = asyncio.ensure_future(_finish_later())
-        result = await _run_node(
-            _launch_state(),
-            proc=proc,
-            worktree=worktree,
-            repo=repo,
-            remove_worktree=_really_remove,
-        )
+        with patch.object(ar, "inspect_autobuild_worktree", side_effect=_owned):
+            result = await _run_node(
+                _launch_state(),
+                proc=proc,
+                worktree=worktree,
+                repo=repo,
+                remove_worktree=_really_remove,
+            )
         await finisher
 
         snap = result["async_tasks"][FEATURE_ID]

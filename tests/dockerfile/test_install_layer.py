@@ -885,13 +885,19 @@ class TestHealthcheckDirective:
     def test_healthcheck_command_literal_match(
         self, dockerfile_text: str
     ) -> None:
-        # ASSUM-005 / Contract B: HEALTHCHECK probes the fixed port 8080.
-        # The literal-match is checked here so a future port change
+        # ASSUM-005 / Contract B: HEALTHCHECK probes the port forge serves
+        # on, read from FORGE_HEALTHZ_PORT at probe time, falling back to
+        # 8080 (since 30 August 2026, c8a9276c: a hardcoded 8080 left the
+        # live container "unhealthy" for two days while it served on another
+        # port). The literal-match is checked here so a future port change
         # forces the consumer (this Dockerfile) and the producer
         # (forge.cli.serve.DEFAULT_HEALTHZ_PORT) to be updated together.
-        assert "curl -fs http://localhost:8080/healthz" in dockerfile_text, (
+        assert (
+            "curl -fs http://localhost:${FORGE_HEALTHZ_PORT:-8080}/healthz"
+            in dockerfile_text
+        ), (
             "HEALTHCHECK must invoke "
-            "``curl -fs http://localhost:8080/healthz``"
+            "``curl -fs http://localhost:${FORGE_HEALTHZ_PORT:-8080}/healthz``"
         )
 
     def test_healthcheck_directive_in_runtime_stage(
@@ -909,7 +915,8 @@ class TestHealthcheckDirective:
         # non-zero rather than relying on Docker's implicit exit-code
         # handling — clearer in container logs.
         assert re.search(
-            r"curl\s+-fs\s+http://localhost:8080/healthz\s*\|\|\s*exit\s+1",
+            r"curl\s+-fs\s+http://localhost:\$\{FORGE_HEALTHZ_PORT:-8080\}/healthz"
+            r"\s*\|\|\s*exit\s+1",
             dockerfile_text,
         ), "HEALTHCHECK must use ``curl -fs ... || exit 1``"
 
@@ -996,9 +1003,11 @@ def test_healthz_port_dockerfile_match() -> None:
         f"DEFAULT_HEALTHZ_PORT={DEFAULT_HEALTHZ_PORT}"
     )
 
-    # HEALTHCHECK must hit the same port.
+    # HEALTHCHECK must hit the same port: the variable the ENV above sets,
+    # with the same port as its fallback.
     assert (
-        f"http://localhost:{DEFAULT_HEALTHZ_PORT}/healthz" in dockerfile
+        "http://localhost:${FORGE_HEALTHZ_PORT:-"
+        f"{DEFAULT_HEALTHZ_PORT}}}/healthz" in dockerfile
     ), "Dockerfile HEALTHCHECK must use the same port as DEFAULT_HEALTHZ_PORT"
 
 
