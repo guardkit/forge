@@ -1871,7 +1871,10 @@ class MergeOfferService:
                 "checks; the branch is kept either way. Reject = nothing "
                 "changes."
             )
-            return "\n".join(lines)
+            # Each line one line, whatever it carried (review R7).
+            from forge.pipeline.merge_check_reading import shown_sentence
+
+            return "\n".join(shown_sentence(line) for line in lines)
 
         details: dict[str, Any] = {
             "tasks_completed": event.tasks_completed,
@@ -2472,14 +2475,22 @@ class MergeOfferService:
 
         # (d) ONE publish attempt ever — dual envelope, approval FIRST.
         rationale = card_words(branch, merge_branch)
+        from forge.pipeline.merge_check_reading import card_body, shown_sentence
+
         if review_evidence is not None:
-            rationale = f"{rationale}\n{card_line_about_the_preview(review_evidence)}"
+            rationale = (
+                f"{rationale}\n{shown_sentence(card_line_about_the_preview(review_evidence))}"
+            )
         if merge_check_reading is not None:
             from forge.cli._serve_gate_activation import card_line_about_the_merge_check
 
             about_the_merge_check = card_line_about_the_merge_check(merge_check_reading)
             if about_the_merge_check:
                 rationale = f"{rationale}\n{about_the_merge_check}"
+        # THE LAST GUARD (review R7, 15 October 2026): nothing of Unicode
+        # categories Cc, Cf, Zl or Zp is left on the card but its own line
+        # breaks, whichever line a file name or a project's words reached.
+        rationale = card_body(rationale)
         try:
             approval = ApprovalRequestPayload(
                 request_id=request_id,

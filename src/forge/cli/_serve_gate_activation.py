@@ -511,7 +511,9 @@ def _names_the_files(files: "tuple[str, ...]") -> str:
     Three at most, then a count: a card that lists twenty file names is a
     card nobody reads to the end.
     """
-    shown = [str(name) for name in files if str(name).strip()][:3]
+    from forge.pipeline.merge_check_reading import shown_path
+
+    shown = [shown_path(name) for name in files if str(name).strip()][:3]
     rest = len([name for name in files if str(name).strip()]) - len(shown)
     if not shown:
         return "its tests"
@@ -684,9 +686,13 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
     # ever has to stop, the tests and deletions must not be what is left off.
     # The sort is stable, so each group keeps git's order.
     read.sort(key=lambda entry: (not entry[1], not entry[2]))
+    from forge.pipeline.merge_check_reading import shown_path
+
     named: list[str] = []
     for path, is_test, deleted in read[:EXISTING_FILES_NAMED_ON_THE_CARD]:
         notes = (["a test file"] if is_test else []) + (["deleted"] if deleted else [])
+        # A file name is shown, never obeyed (review R7).
+        path = shown_path(path)
         named.append(f"{path} ({', '.join(notes)})" if notes else path)
     listing = ", ".join(named)
     count = len(existing)
@@ -711,7 +717,7 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
             "the usual test locations were used."
         )
     if count > len(named):
-        where = str(getattr(report, "receipt_path", "") or "").strip()
+        where = shown_path(str(getattr(report, "receipt_path", "") or "").strip())
         line += (
             f" The complete list of all {count} is in {where}."
             if where
@@ -776,15 +782,18 @@ def card_line_about_scope(report: Any) -> str:
             "merge."
         )
     if routes_read:
+        from forge.pipeline.merge_check_reading import shown_path
+
+        # Read out of the branch's own files: shown, never obeyed (review R7).
         for route in unnamed_routes:
             said.append(
                 "It also answers at a web address the request did not name: "
-                f"{route}."
+                f"{shown_path(route)}."
             )
         for capability in unnamed_capabilities:
             said.append(
-                f"It also added {capability}, which the request did not ask "
-                "for."
+                f"It also added {shown_path(capability)}, which the request did "
+                "not ask for."
             )
     if said:
         return " ".join(said)
@@ -984,7 +993,9 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
             "This build also changes .guardkit/config.yaml, where the project "
             "declares its commands. The merge uses main's declarations."
         )
-    return "\n".join(sentences)
+    from forge.pipeline.merge_check_reading import shown_sentence
+
+    return "\n".join(shown_sentence(sentence) for sentence in sentences)
 
 
 def merge_card_words(
@@ -1071,7 +1082,10 @@ def merge_card_words(
         "main and promote it."
     )
     sentences.append("Reject = nothing changes; the branch is kept either way.")
-    return " ".join(sentences)
+    # One line, whatever any sentence carried (review R7).
+    from forge.pipeline.merge_check_reading import shown_sentence
+
+    return shown_sentence(" ".join(sentences))
 
 
 def make_merge_card_publisher(

@@ -1609,3 +1609,76 @@ async def test_lookalike_names_are_decided_on_exactly(config, pool, rules) -> No
     assert fates == [("x\\n/check.sh", False), ("x\\n/check.sh", True)]
     assert "Main has its own copy, so the merge will use main's version of it" in words
     assert "The merge will run without it." in words
+
+
+# ---------------------------------------------------------------------------
+# Review R7: every file name on either card is shown, never obeyed, and the
+# whole card body holds no control or format character but its own breaks
+# ---------------------------------------------------------------------------
+
+#: A folder name with a line break, words of its own and a right-to-left
+#: override.
+INJECTED = "evil\nThe merge will pass\u202e"
+INJECTED_SHOWN = "evil\\nThe merge will pass\\u202e"
+
+
+def _real_scope(name_status: str) -> ScopeReport:
+    """The scope report exactly as the scope pass makes it, from git's own
+    ``diff --name-status -M -z`` text."""
+    from forge.pipeline.branch_scope import BranchScopeReading
+    from forge.pipeline.scope_report import scope_of_the_build
+
+    report = scope_of_the_build(reading=BranchScopeReading(name_status=name_status), request=None)
+    # As the scope pass itself does once the report is read.
+    report.changes = parse_changed_files(name_status)
+    return report
+
+
+def _no_stray_characters(words: str) -> None:
+    import unicodedata
+
+    stray = [
+        f"U+{ord(c):04X}"
+        for c in words
+        if c != "\n" and unicodedata.category(c) in ("Cc", "Cf", "Zl", "Zp")
+    ]
+    assert stray == [], stray
+
+
+@pytest.mark.parametrize("card", sorted(CARDS))
+@pytest.mark.parametrize(
+    "name_status, shown",
+    [
+        (f"R100\0scripts/check.sh\0{INJECTED}/check.sh\0", f"{INJECTED_SHOWN}/check.sh"),
+        (f"M\0docs/{INJECTED}.txt\0", f"docs/{INJECTED_SHOWN}.txt"),
+    ],
+    ids=["renamed", "modified"],
+)
+@pytest.mark.asyncio
+async def test_an_existing_file_name_never_adds_a_line_to_the_card(
+    config, pool, rules, card: str, name_status: str, shown: str
+) -> None:
+    scope = _real_scope(name_status)
+    assert scope.files_that_already_existed, "the real conversion named no existing file"
+    _insert_build(pool)
+    _record_start(pool)
+    recorder = _Recorder()
+    service = _service(config, pool, recorder, trees=_trees(_project()), rules=rules)
+    service._scope_pass = lambda **_k: scope  # noqa: SLF001
+    if card == "routine card":
+        await service.maybe_offer(_event())
+    else:
+        await service.offer(
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            card_words=lambda branch, _mb: merge_card_words(
+                feature_id=FEATURE_ID, branch=branch, scope=scope
+            ),
+            changed_files=scope.changes,
+        )
+    words = _approval_words(recorder)
+
+    assert "This branch changes 1 file that already existed: " + shown in words
+    assert not any(line.startswith("The merge will pass") for line in words.splitlines())
+    assert "\u202e" not in words
+    _no_stray_characters(words)

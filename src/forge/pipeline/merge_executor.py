@@ -1766,6 +1766,11 @@ async def execute_merge_deploy(
         if gate_began and outcome.gate_before_merge is None:
             outcome.gate_before_merge = _gate_for_report()
         outcome.branch = branch
+        # THE LAST GUARD (review R7): the report's words keep their own line
+        # breaks and nothing else of Unicode categories Cc, Cf, Zl or Zp.
+        from forge.pipeline.merge_check_reading import card_body
+
+        outcome.detail = card_body(outcome.detail)
         payload = StageCompletePayload(
             feature_id=feature_id,
             build_id=build_id,

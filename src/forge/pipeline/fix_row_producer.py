@@ -378,7 +378,10 @@ def candidate_refused_sentence(
     plain words the caller has — "could not be started (the candidate deploy
     stopped at health_check)" — and the two ends stay the same.
     """
-    names = [str(n).strip() for n in (failing_checks or []) if str(n).strip()]
+    from forge.pipeline.merge_check_reading import shown_path
+
+    # A check's name comes from the project: shown, never obeyed (review R7).
+    names = [shown_path(str(n).strip()) for n in (failing_checks or []) if str(n).strip()]
     if checks_failed is not None and checks_total is not None and names:
         middle = (
             f"failed {checks_failed} of {checks_total} checks ({', '.join(names)})"

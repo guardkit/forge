@@ -61,6 +61,7 @@ __all__ = [
     "read_the_merge_check",
     "EXACT_SUFFIX",
     "REPORT_NAME_LISTS",
+    "card_body",
     "names_for_record",
     "names_from_record",
     "shown_path",
@@ -165,6 +166,17 @@ def shown_sentence(text: Any) -> str:
     line breaks become spaces, and everything else is shown as
     :func:`shown_path` shows it."""
     return shown_path(_LINE_BREAKS.sub(" ", str(text)))
+
+
+def card_body(text: Any) -> str:
+    """The last guard on a whole card or press text (review R7, 15 October
+    2026). The text keeps its own line breaks, and every line of it is shown
+    as :func:`shown_path` shows it, so nothing else of Unicode categories Cc,
+    Cf, Zl or Zp is left anywhere in it. It cannot tell a line break a name
+    smuggled in from one the text meant: every line is therefore first made
+    one line where it is written (:func:`shown_sentence`), and every file name
+    escaped where a sentence names it (:func:`shown_path`)."""
+    return "\n".join(shown_path(part) for part in str(text).split("\n"))
 
 
 def shown_report(value: Any, *, key: str | None = None) -> Any:

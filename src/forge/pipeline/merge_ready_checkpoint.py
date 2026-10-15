@@ -364,17 +364,21 @@ class BranchFileChange:
         return (self.path, self.old_path) if self.old_path else (self.path,)
 
     def says_what_happened(self) -> str:
-        """One plain phrase: what the branch did to this file."""
+        """One plain phrase: what the branch did to this file. The names are
+        shown, never obeyed (review R7)."""
+        from forge.pipeline.merge_check_reading import shown_path
+
+        path, old_path = shown_path(self.path), shown_path(self.old_path)
         letter = (self.status or "").upper()[:1]
         if letter == "R" and self.old_path:
-            return f"{self.old_path} (renamed to {self.path})"
+            return f"{old_path} (renamed to {path})"
         if letter == "C" and self.old_path:
-            return f"{self.path} (copied from {self.old_path})"
+            return f"{path} (copied from {old_path})"
         if letter == "A":
-            return f"{self.path} (added)"
+            return f"{path} (added)"
         if letter == "D":
-            return f"{self.path} (deleted)"
-        return f"{self.path} (changed)"
+            return f"{path} (deleted)"
+        return f"{path} (changed)"
 
 
 @dataclass(frozen=True, slots=True)
@@ -671,8 +675,11 @@ def judge_branch_changes(
                 if line.path == path and line.owner
             )
         )
-        named = " and ".join(owners)
-        where = path or "a file the diff did not name"
+        from forge.pipeline.merge_check_reading import shown_path
+
+        # Read out of the branch: shown, never obeyed (review R7).
+        named = " and ".join(shown_path(owner) for owner in owners)
+        where = shown_path(path) if path else "a file the diff did not name"
         approval_files.append(
             f"{where} (the line recording {named}'s approval)"
             if named
