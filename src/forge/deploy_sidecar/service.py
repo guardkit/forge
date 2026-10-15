@@ -33,6 +33,9 @@ The narrow contract:
               -> {branch|null, commit|null, refusal|null, branch_commit?}
     POST /git/read-file-at-commit {repo, commit, file_path, ordinary_file_only?, raw?, mode_only?}
               -> {content|null, found, refusal|null, ordinary?}
+    POST /git/list-tree-at-commit {repo, commit}
+              -> {entries: [[mode, type, object, base64 of the path's bytes]]|null,
+                  names: "base64", refusal|null}
     POST /git/is-ancestor {repo, ancestor, descendant} -> {is_ancestor|null}
     POST /git/candidate-tree {repo, feature_id, sha}
               -> {path, tree, exclude_written}
@@ -3243,6 +3246,11 @@ GIT_REMOTE_START_POINT_ROUTE: str = "/git/remote-start-point"
 #: the sentence a person is shown turns on the difference. It writes nothing,
 #: changes no checked-out branch and touches no working folder.
 GIT_READ_FILE_AT_COMMIT_ROUTE: str = "/git/read-file-at-commit"
+#: Every leaf of one commit's tree: names, modes, types and object ids, never
+#: any file's content (15 October 2026, the merge-check design). Read-only.
+#: Each name is sent as base64 of its exact bytes, so a name that is not UTF-8
+#: arrives as itself and never as another file's name.
+GIT_LIST_TREE_AT_COMMIT_ROUTE: str = "/git/list-tree-at-commit"
 
 #: The files ON A BRANCH under one folder (3 October 2026). ``/code/list-files``
 #: lists the clone's checked-out tree, which is not the branch a repair is cut
@@ -4321,6 +4329,39 @@ def process_git_read_file_at_commit_request(
         ),
     )
     return 200, answer.to_wire()
+
+
+def process_git_list_tree_at_commit_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, commit}`` → ``{entries, refusal}``: every leaf of one commit's
+    tree in the clone inside the sandbox, with its mode, type and object id,
+    through the same code the in-container venue runs
+    (:func:`forge.deploy.candidate_tree.list_tree_at_commit_sync`). Nothing is
+    read out of any file, and nothing is written. Never raises.
+    """
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    commit = payload.get("commit")
+    error = _ref_error(commit, what="commit")
+    if error:
+        return 400, {"error": error}
+    from forge.deploy.candidate_tree import list_tree_at_commit_sync
+
+    try:
+        listing = list_tree_at_commit_sync(Path(repo_path), str(commit))
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
+    logger.info(
+        "forge-deploy-sidecar: listed %s in %s: %s",
+        commit,
+        repo_path,
+        f"{len(listing.entries or ())} entries" if listing.ok else listing.refusal,
+    )
+    return 200, listing.to_wire()
 
 
 # ---------------------------------------------------------------------------
@@ -8130,6 +8171,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_LIST_FILES_ON_BRANCH_ROUTE,
                 GIT_REMOTE_START_POINT_ROUTE,
                 GIT_READ_FILE_AT_COMMIT_ROUTE,
+                GIT_LIST_TREE_AT_COMMIT_ROUTE,
                 GIT_IS_ANCESTOR_ROUTE,
                 GIT_CANDIDATE_TREE_ROUTE,
                 GIT_CANDIDATE_TREE_REMOVE_ROUTE,
@@ -8195,6 +8237,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_READ_FILE_AT_COMMIT_ROUTE:
                 status, body = process_git_read_file_at_commit_request(
+                    payload, config=config
+                )
+            elif route == GIT_LIST_TREE_AT_COMMIT_ROUTE:
+                status, body = process_git_list_tree_at_commit_request(
                     payload, config=config
                 )
             elif route == GIT_IS_ANCESTOR_ROUTE:
@@ -8432,6 +8478,7 @@ __all__ = [
     "GIT_WRITE_TREE_ROUTE",
     "GIT_READ_FILE_ROUTE",
     "GIT_READ_FILE_AT_COMMIT_ROUTE",
+    "GIT_LIST_TREE_AT_COMMIT_ROUTE",
     "GIT_REMOTE_START_POINT_ROUTE",
     "GIT_REV_PARSE_ROUTE",
     "GIT_LIST_FILES_ON_BRANCH_ROUTE",
@@ -8453,6 +8500,7 @@ __all__ = [
     "process_git_list_files_on_branch_request",
     "process_git_remote_start_point_request",
     "process_git_read_file_at_commit_request",
+    "process_git_list_tree_at_commit_request",
     "process_git_autobuild_worktree_inspect_request",
     "process_git_autobuild_worktree_retire_request",
     "GIT_WORKTREE_ADD_ROUTE",

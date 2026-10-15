@@ -120,7 +120,11 @@ def _report_in(said: str) -> dict[str, Any] | None:
             except ValueError:
                 decoded = None
             if isinstance(decoded, dict):
-                return decoded
+                # Shown as a person reads it (coach review 3): a name in the
+                # report adds no line and no byte that cannot be written.
+                from forge.pipeline.merge_check_reading import shown_report
+
+                return shown_report(decoded)
         start = said.find("{", start + 1)
     return None
 

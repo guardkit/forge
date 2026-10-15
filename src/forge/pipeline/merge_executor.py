@@ -156,6 +156,7 @@ from forge.pipeline.merge_offer import (
     branch_to_merge,
 )
 from forge.pipeline.digest_conformance import run_digest_conformance
+from forge.pipeline.merge_check_reading import names_for_record, names_from_record
 from forge.pipeline.merge_join import (
     integration_branch,
     join_inputs,
@@ -536,7 +537,20 @@ class MergeExecutorDeps:
 
 
 def _parse_merge_report(result: Any) -> dict[str, Any] | None:
-    """Extract the merge verb's ``--json`` report from stdout_tail/artefacts."""
+    """Extract the merge verb's ``--json`` report from stdout_tail/artefacts.
+
+    Every string in it is shown as a person reads it (coach review 3, 15
+    October 2026): a file name the report carries may hold a line break, a
+    control character or a byte that is not UTF-8, and none of those may add
+    a line to the outcome or stop it being written.
+    """
+    from forge.pipeline.merge_check_reading import shown_report
+
+    parsed = _parse_merge_report_as_printed(result)
+    return shown_report(parsed) if parsed is not None else None
+
+
+def _parse_merge_report_as_printed(result: Any) -> dict[str, Any] | None:
     stdout_tail = getattr(result, "stdout_tail", "") or ""
     start = stdout_tail.find("{")
     end = stdout_tail.rfind("}")
@@ -601,10 +615,12 @@ def _last_sentence(text: str | None, limit: int = 300) -> str:
     """
     if not text:
         return ""
+    from forge.pipeline.merge_check_reading import shown_path
+
     lines = [line.strip() for line in str(text).splitlines() if line.strip()]
     if not lines:
         return ""
-    last = lines[-1]
+    last = shown_path(lines[-1])
     if len(last) <= limit:
         return last
     cut = last[-limit:]
@@ -619,7 +635,11 @@ def _conflict_sentence(report: dict[str, Any]) -> str | None:
         "conflict_files"
     ):
         return None
-    files = [str(f) for f in (report.get("conflict_files") or []) if str(f).strip()]
+    from forge.pipeline.merge_check_reading import shown_path
+
+    files = [
+        shown_path(f) for f in (report.get("conflict_files") or []) if str(f).strip()
+    ]
     if files:
         shown = ", ".join(files[:6]) + (f" and {len(files) - 6} more" if len(files) > 6 else "")
         return (
@@ -1530,12 +1550,61 @@ async def execute_merge_deploy(
     # clean-up counts too: the hold is decided after it.
     a_leg_did_not_complete = False
 
+    # WHICH JUDGE FILES THE MERGE CHECKED WITH MAIN'S COPIES (15 October 2026,
+    # the merge-check design, item 8): the build system's report names them,
+    # and the merge-checks record line keeps them, so a press that picks the
+    # join up can say the same. Those the target does not have
+    # (``judge_files_not_on_target``) were left out, not checked with main's
+    # version, and are said so (review R4), as the build system's own receipt
+    # says it. At most two sentences, added to every ending's detail in one
+    # place (``_settled``). A list, so a nested reader can set it.
+    _main_copies_said: list[str] = []
+
+    def _remember_main_copies(paths: Any, not_on_target: Any = None) -> None:
+        from forge.pipeline.merge_check_reading import shown_path
+
+        if _main_copies_said:
+            return
+
+        def names_of(values: Any) -> list[str]:
+            if not isinstance(values, (list, tuple)):
+                return []
+            return [str(p) for p in values if str(p or "").strip()]
+
+        def listed(names: list[str]) -> str:
+            shown = [shown_path(n) for n in names]
+            if len(shown) == 1:
+                return shown[0]
+            return ", ".join(shown[:-1]) + " and " + shown[-1]
+
+        absent = set(names_of(not_on_target))
+        every = names_of(paths)
+        kept = [n for n in every if n not in absent]
+        left_out = [n for n in every if n in absent]
+        if kept:
+            many = len(kept) > 1
+            _main_copies_said.append(
+                f"The merge used main's {'versions' if many else 'version'} of "
+                f"{listed(kept)} and did not run this build's changes to "
+                f"{'them' if many else 'it'}."
+            )
+        if left_out:
+            many = len(left_out) > 1
+            _main_copies_said.append(
+                f"The merge left out {listed(left_out)}, which main does not "
+                f"have, and did not run this build's "
+                f"{'copies of them' if many else 'copy of it'}."
+            )
+
     def _settled(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         """Mark ``outcome`` as an ending where nothing this press started can
         still be running. A replaced worker's ending is never one."""
         nonlocal press_settled
         if outcome.failed_step != "record":
             press_settled = True
+        for said in _main_copies_said:
+            if said not in (outcome.detail or ""):
+                outcome.detail = f"{outcome.detail} {said}".strip()
         return outcome
     # THE COMMIT THIS BUILD STARTS FROM, off this coordinator's own record,
     # read once and kept (23 September 2026). It is what the project's own
@@ -1697,6 +1766,11 @@ async def execute_merge_deploy(
         if gate_began and outcome.gate_before_merge is None:
             outcome.gate_before_merge = _gate_for_report()
         outcome.branch = branch
+        # THE LAST GUARD (review R7): the report's words keep their own line
+        # breaks and nothing else of Unicode categories Cc, Cf, Zl or Zp.
+        from forge.pipeline.merge_check_reading import card_body
+
+        outcome.detail = card_body(outcome.detail)
         payload = StageCompletePayload(
             feature_id=feature_id,
             build_id=build_id,
@@ -4606,10 +4680,25 @@ async def execute_merge_deploy(
                         "verify_detail": (report or {}).get("verify_detail"),
                         "checks_passed": checks_passed,
                         "checks_total": checks_total,
+                        # Shown names for a person, and each name exactly
+                        # (review R5), so a resumed press decides as this
+                        # one did.
+                        **names_for_record(
+                            "judged_with_main_copies",
+                            (report or {}).get("judged_with_main_copies") or [],
+                        ),
+                        **names_for_record(
+                            "judge_files_not_on_target",
+                            (report or {}).get("judge_files_not_on_target") or [],
+                        ),
                     },
                 ):
                     return _replaced_here()
                 merge_checks_ran_here = True
+                _remember_main_copies(
+                    (report or {}).get("judged_with_main_copies"),
+                    (report or {}).get("judge_files_not_on_target"),
+                )
 
                 # Advisory: does the joined tree keep the promises in the feature's
                 # spec digest? Deterministic and never blocking.
@@ -4685,6 +4774,16 @@ async def execute_merge_deploy(
             # says what happened, word for word as the press that ran them said
             # it, and it stays the result until a NEW attempt's checks pass.
             # ------------------------------------------------------------------
+            if not merge_checks_ran_here:
+                # A join an earlier press made: what it recorded about main's
+                # copies is said again, exactly as it was.
+                earlier = _the_recorded_line(STEP_MERGE_CHECKS)
+                if earlier is not None:
+                    said = getattr(earlier, "detail", None)
+                    _remember_main_copies(
+                        names_from_record(said, "judged_with_main_copies"),
+                        names_from_record(said, "judge_files_not_on_target"),
+                    )
             recorded_why = _why_the_recorded_step_failed(STEP_MERGE_CHECKS)
             if recorded_why is not None and not merge_checks_ran_here:
                 recorded_line = _the_recorded_line(STEP_MERGE_CHECKS)

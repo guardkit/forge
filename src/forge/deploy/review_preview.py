@@ -1588,6 +1588,23 @@ class ReviewPreviewService:
         _profile, preview, unreadable = self._preview_of(project)
         return preview is not None or unreadable is not None
 
+    def joined_ref_for(self, evidence: Any) -> str | None:
+        """The ref the preview's joined commit is kept under, or ``None``.
+
+        Read by the merge card's merge-check reading (15 October 2026), which
+        looks for links in the joined tree and compares the joined copies of
+        the files that judge the merge. Only a live lease with a joined tree
+        has one; anything else is ``None``, and the card says that evidence
+        could not be read.
+        """
+        run_id = str(getattr(evidence, "run_id", "") or "")
+        if not run_id:
+            return None
+        lease = self._store.for_run(run_id)
+        if lease is None or not lease.live or not lease.preview_tree:
+            return None
+        return f"{PREVIEW_REF_PREFIX}{lease.lease_id}"
+
     # -- preparing ------------------------------------------------------------
 
     async def prepare(self, req: PreviewRequest) -> "ReviewEvidence":

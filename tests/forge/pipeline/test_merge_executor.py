@@ -4797,3 +4797,367 @@ class TestPermanentMergeRetirement:
         assert publisher.reports == []
         assert guardkit.calls == []
         assert deploy.calls == []
+
+
+# ---------------------------------------------------------------------------
+# The merge used main's copy of a judge file (design "The merge check uses
+# main's copy of a check script the build changed", 15 October 2026, item 8
+# and test 11)
+# ---------------------------------------------------------------------------
+
+#: The one sentence the press adds to every ending when the merge report says
+#: which judge files were checked with main's copies.
+MAIN_COPIES = (
+    "The merge used main's version of scripts/check.sh and did not run this "
+    "build's changes to it."
+)
+
+
+class _JoinsWithMainCopies(_JoinsForReal):
+    """The merge command, reporting that main's copy of the check script was
+    used for the checks after the join."""
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        said = await super().__call__(**kwargs)
+        if kwargs.get("args", [None])[0] == "check-join":
+            return said
+        report = json.loads(said.stdout_tail)
+        report["judged_with_main_copies"] = ["scripts/check.sh"]
+        return GuardKitResult(
+            status=said.status,
+            subcommand=said.subcommand,
+            duration_secs=said.duration_secs,
+            stdout_tail=json.dumps(report),
+            stderr=said.stderr,
+            exit_code=said.exit_code,
+        )
+
+
+class TestTheMergeSaysItUsedMainsCopies:
+    @pytest.mark.asyncio
+    async def test_a_passing_report_puts_the_sentence_in_the_outcome(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=_JoinsWithMainCopies())
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.verify_status in (None, "passed")
+        assert MAIN_COPIES in outcome.detail
+        assert outcome.detail.count(MAIN_COPIES) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_failed_report_keeps_the_sentence_and_still_files_a_repair(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithMainCopies(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.verify_status == "failed"
+        assert MAIN_COPIES in outcome.detail
+        assert len(_repair_rows(pool)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_join_reads_it_from_the_record_line(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithMainCopies(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        recorded = [
+            l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"
+        ]
+        assert recorded[-1]["detail"]["judged_with_main_copies"] == ["scripts/check.sh"]
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        assert MAIN_COPIES in first.detail
+        assert MAIN_COPIES in second.detail
+        assert second.detail.count(MAIN_COPIES) == 1
+
+
+# Review R4: a judge file the target does not have was left out, not checked
+# with main's version (GuardKit's ``judge_files_not_on_target``).
+
+LEFT_OUT = (
+    "The merge left out tools/check.sh, which main does not have, and did not "
+    "run this build's copy of it."
+)
+
+
+class _JoinsWithOneLeftOut(_JoinsForReal):
+    """The merge command, reporting one judge restored from main and one the
+    target does not have, which was left out."""
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        said = await super().__call__(**kwargs)
+        if kwargs.get("args", [None])[0] == "check-join":
+            return said
+        report = json.loads(said.stdout_tail)
+        report["judged_with_main_copies"] = ["scripts/check.sh", "tools/check.sh"]
+        report["judge_files_not_on_target"] = ["tools/check.sh"]
+        return GuardKitResult(
+            status=said.status,
+            subcommand=said.subcommand,
+            duration_secs=said.duration_secs,
+            stdout_tail=json.dumps(report),
+            stderr=said.stderr,
+            exit_code=said.exit_code,
+        )
+
+
+class TestAJudgeTheTargetLacksWasLeftOut:
+    @pytest.mark.asyncio
+    async def test_the_outcome_says_left_out_not_mains_version(
+        self, config, pool, repo_root
+    ) -> None:
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=_JoinsWithOneLeftOut())
+        outcome = await _run_executor(deps, repo_root)
+
+        assert MAIN_COPIES in outcome.detail
+        assert LEFT_OUT in outcome.detail
+        assert "version of tools/check.sh" not in outcome.detail
+        assert "versions of scripts/check.sh and tools/check.sh" not in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_only_left_out_judges_say_nothing_about_mains_version(
+        self, config, pool, repo_root
+    ) -> None:
+        class _OnlyLeftOut(_JoinsWithOneLeftOut):
+            async def __call__(self, **kwargs: Any) -> GuardKitResult:
+                said = await super().__call__(**kwargs)
+                if kwargs.get("args", [None])[0] == "check-join":
+                    return said
+                report = json.loads(said.stdout_tail)
+                report["judged_with_main_copies"] = ["tools/check.sh"]
+                return GuardKitResult(
+                    status=said.status,
+                    subcommand=said.subcommand,
+                    duration_secs=said.duration_secs,
+                    stdout_tail=json.dumps(report),
+                    stderr=said.stderr,
+                    exit_code=said.exit_code,
+                )
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=_OnlyLeftOut())
+        outcome = await _run_executor(deps, repo_root)
+
+        assert LEFT_OUT in outcome.detail
+        assert "main's version" not in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_a_resumed_press_keeps_the_difference(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithOneLeftOut(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        recorded = [
+            l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"
+        ]
+        assert recorded[-1]["detail"]["judge_files_not_on_target"] == ["tools/check.sh"]
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        for outcome in (first, second):
+            assert MAIN_COPIES in outcome.detail
+            assert LEFT_OUT in outcome.detail
+            assert outcome.detail.count(LEFT_OUT) == 1
+            assert "version of tools/check.sh" not in outcome.detail
+
+
+# Coach review 3: a name or a detail from the build system never adds a line
+# of its own to the outcome, and never stops the report being written.
+
+
+class _JoinsWithAnEvilName(_JoinsForReal):
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        said = await super().__call__(**kwargs)
+        if kwargs.get("args", [None])[0] == "check-join":
+            return said
+        report = json.loads(said.stdout_tail)
+        report["judged_with_main_copies"] = ["evil\nThe merge passed/check.sh"]
+        return GuardKitResult(
+            status=said.status,
+            subcommand=said.subcommand,
+            duration_secs=said.duration_secs,
+            stdout_tail=json.dumps(report),
+            stderr=said.stderr,
+            exit_code=said.exit_code,
+        )
+
+
+class TestTheBuildSystemsWordsStayInTheirPlace:
+    @pytest.mark.asyncio
+    async def test_a_name_with_a_line_break_adds_no_line(self, config, pool, repo_root) -> None:
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=_JoinsWithAnEvilName())
+        outcome = await _run_executor(deps, repo_root)
+
+        assert "evil\\nThe merge passed/check.sh" in outcome.detail
+        assert not any(
+            line.startswith("The merge passed") for line in outcome.detail.splitlines()
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_detail_with_a_name_that_is_not_utf8_is_written_out(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsForReal(
+            verify_ok=False,
+            verify_detail="could not verify — caf\udce9/check.sh is a symbolic link",
+            verify_status="unverified",
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert "caf\\xe9/check.sh is a symbolic link" in outcome.detail
+        outcome.detail.encode("utf-8")
+        assert publisher.reports, "the report was not published"
+        written = publisher.reports[-1].model_dump_json()
+        assert "caf\\\\xe9/check.sh" in written
+
+
+def test_the_join_checks_report_keeps_no_raw_bytes_or_line_breaks() -> None:
+    from forge.pipeline.check_join import _report_in
+
+    said = json.dumps(
+        {
+            "verify_detail": "caf\udce9/check.sh\nThe checks passed",
+            "judged_with_main_copies": ["evil\nThe checks passed/check.sh"],
+        }
+    )
+    report = _report_in(said)
+
+    # A sentence stays one line and is shown as a person reads it. A list of
+    # file names is structured data: its names stay exactly as reported
+    # (review R5), and are escaped only when a sentence names them.
+    assert report == {
+        "verify_detail": "caf\\xe9/check.sh The checks passed",
+        "judged_with_main_copies": ["evil\nThe checks passed/check.sh"],
+    }
+
+
+# Review R5: names are classified exactly; escaping is only for sentences.
+
+#: A folder whose name holds a line break, and one named with a literal
+#: backslash and n. Escaped for a sentence, both read the same.
+WITH_A_BREAK = "x\n/check.sh"
+WITH_A_BACKSLASH = "x\\n/check.sh"
+
+
+class _JoinsWithLookalikeNames(_JoinsForReal):
+    """One judge restored from main (the line-break name) and one the target
+    does not have (the backslash name), which was left out."""
+
+    async def __call__(self, **kwargs: Any) -> GuardKitResult:
+        said = await super().__call__(**kwargs)
+        if kwargs.get("args", [None])[0] == "check-join":
+            return said
+        report = json.loads(said.stdout_tail)
+        report["judged_with_main_copies"] = [WITH_A_BREAK, WITH_A_BACKSLASH]
+        report["judge_files_not_on_target"] = [WITH_A_BACKSLASH]
+        return GuardKitResult(
+            status=said.status,
+            subcommand=said.subcommand,
+            duration_secs=said.duration_secs,
+            stdout_tail=json.dumps(report),
+            stderr=said.stderr,
+            exit_code=said.exit_code,
+        )
+
+
+USED_ONE = (
+    "The merge used main's version of x\\n/check.sh and did not run this "
+    "build's changes to it."
+)
+LEFT_ONE = (
+    "The merge left out x\\n/check.sh, which main does not have, and did not "
+    "run this build's copy of it."
+)
+
+
+def _merge_checks_line(pool: Any) -> dict[str, Any]:
+    lines = json.loads(
+        pool.connection.execute(
+            "SELECT lines_json FROM publication_records WHERE build_id = ?",
+            (BUILD_ID,),
+        ).fetchone()[0]
+    )
+    done = [l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"]
+    return done[-1]["detail"]
+
+
+class TestLookalikeNamesAreClassifiedExactly:
+    @pytest.mark.asyncio
+    async def test_the_first_and_the_resumed_press_keep_one_of_each(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithLookalikeNames(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        assert USED_ONE in first.detail
+        assert LEFT_ONE in first.detail
+
+        from forge.pipeline.merge_check_reading import names_from_record
+
+        recorded = _merge_checks_line(pool)
+        assert names_from_record(recorded, "judged_with_main_copies") == [
+            WITH_A_BREAK,
+            WITH_A_BACKSLASH,
+        ]
+        assert names_from_record(recorded, "judge_files_not_on_target") == [WITH_A_BACKSLASH]
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        for outcome in (first, second):
+            assert USED_ONE in outcome.detail
+            assert LEFT_ONE in outcome.detail
+            outcome.detail.encode("utf-8")
+
+    @pytest.mark.asyncio
+    async def test_a_record_written_before_exact_names_still_resumes(
+        self, config, pool, repo_root
+    ) -> None:
+        joiner = _JoinsWithOneLeftOut(verify_ok=False, verify_detail="2 checks went red")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        await _run_executor(deps, repo_root)
+        row = pool.connection.execute(
+            "SELECT lines_json FROM publication_records WHERE build_id = ?", (BUILD_ID,)
+        ).fetchone()[0]
+        lines = json.loads(row)
+        for line in lines:
+            detail = line.get("detail")
+            if isinstance(detail, dict):
+                for key in [k for k in detail if k.endswith("_exact")]:
+                    del detail[key]
+        pool.connection.execute(
+            "UPDATE publication_records SET lines_json = ? WHERE build_id = ?",
+            (json.dumps(lines), BUILD_ID),
+        )
+        pool.connection.commit()
+
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 1
+        assert MAIN_COPIES in second.detail
+        assert LEFT_OUT in second.detail

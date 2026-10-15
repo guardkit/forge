@@ -497,6 +497,40 @@ def compose_merge_git_surface(forge_config: Any) -> Any | None:
     return surface_for
 
 
+def compose_merge_check_reader(forge_config: Any) -> Any:
+    """``(repo, repo_root) -> reader`` for the merge card's merge-check reading.
+
+    Design "The merge check uses main's copy of a check script the build
+    changed" (15 October 2026), item 6: the declaration and the judge files
+    are read at a commit through the existing commit-based reader — the
+    sandbox's planning git (``/git/read-file-at-commit``) for a repository
+    with a sandbox, this container's planning git for every other one. Never
+    a branch name, and never the working folder.
+    """
+    from forge.adapters.git.planning_runner import WorktreeGitRunner
+    from forge.config.sandboxes import sandbox_for
+    from forge.planning.sidecar_git_runner import SidecarGitRunner
+
+    planning = forge_config.planning
+    addresses = dict(getattr(planning, "fetch_addresses", None) or {})
+    here = WorktreeGitRunner(
+        target_repo_paths=planning.target_repo_paths, fetch_addresses=addresses
+    )
+    per_repo: dict[str, Any] = {}
+
+    def reader_for(repo: str, _repo_root: Path) -> Any:
+        entry = sandbox_for(forge_config, repo)
+        if entry is None:
+            return here
+        if repo not in per_repo:
+            per_repo[repo] = SidecarGitRunner(
+                str(entry.sidecar_url), repo=str(repo), fetch_address=addresses.get(str(repo))
+            )
+        return per_repo[repo]
+
+    return reader_for
+
+
 def compose_merge_executor_deps(
     *,
     forge_config: Any,
@@ -760,6 +794,9 @@ def bind_production_dispatch_chain(
                     _offer_kwargs["git_surface"] = _offer_git_surface
                 if review_preview is not None:
                     _offer_kwargs["review_preview"] = review_preview
+                # The card reads which files judge the merge where the merge
+                # will read them (15 October 2026).
+                _offer_kwargs["commit_reader"] = compose_merge_check_reader(forge_config)
                 merge_offer_service = MergeOfferService(
                     config=forge_config,
                     pool=sqlite_pool,
