@@ -589,7 +589,7 @@ def scope_of_the_build(
         files_that_already_existed,
         parse_changed_files,
     )
-    from forge.planning.task_traceability import (
+    from forge.pipeline.addresses_and_capabilities import (
         _ALL_CAPABILITIES,
         _is_a_place_on_disk,
         _route_shaped,
