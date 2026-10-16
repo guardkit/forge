@@ -978,6 +978,8 @@ class _AnExecutorThatRecords:
 
         self.handed.append(request)
         return SimpleNamespace(
+            # The command ran and its group was confirmed gone (15 October 2026).
+            confirmed=True,
             accepted=True,
             word="the-deploy-ran",
             sentence="the deploy step ran and ended with 0.",

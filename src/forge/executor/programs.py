@@ -36,6 +36,7 @@ from dataclasses import dataclass
 from typing import Any, Sequence
 
 __all__ = [
+    "Finished",
     "ProgramOutcome",
     "ProgramRefused",
     "RaisedWhileRunning",
@@ -66,6 +67,10 @@ class _Marked(tuple):
     refused_before_running = False
     timed_out = False
     answer_lost = False
+    #: True only for a complete answer (15 October 2026): the program ran to
+    #: an end, or was refused before it started. Every other result — and any
+    #: result a caller built without saying — is unconfirmed.
+    confirmed = False
 
     def __new__(cls, *items: Any) -> "_Marked":
         if len(items) == 1 and isinstance(items[0], tuple):
@@ -80,6 +85,14 @@ class RefusedBeforeStart(_Marked):
     """The program was never started: an answer, nothing is running."""
 
     refused_before_running = True
+    confirmed = True
+
+
+class Finished(_Marked):
+    """The program ran to an end and said how (or a request was refused in
+    words before anything ran): a complete answer."""
+
+    confirmed = True
 
 
 class TimedOut(_Marked):

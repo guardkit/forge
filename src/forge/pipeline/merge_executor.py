@@ -1910,7 +1910,12 @@ async def execute_merge_deploy(
         # may still be running in the sandbox), and one saying the candidate
         # is still standing — until a teardown answers that it is down.
         detail = (getattr(result, "detail", None) or {}) if result is not None else {}
-        if detail.get("answer_lost"):
+        # CONFIRMED OR NOT (15 October 2026): a leg answer the stage did not
+        # confirm as complete keeps the hold, whatever else it says. ``None``
+        # is no stage at all: nothing ran.
+        if detail.get("answer_lost") or (
+            result is not None and getattr(result, "confirmed", False) is not True
+        ):
             return result
         outcome_word = getattr(result, "outcome", None)
         standing = detail.get("candidate") == "standing"
@@ -2208,6 +2213,10 @@ async def execute_merge_deploy(
         try:
             excluded_now = await git.ensure_candidate_trees_excluded()
             laid_out = await git.materialise_candidate_tree(feature_id, str(sha))
+            # A tree the venue did not confirm laid out in full (15 October
+            # 2026) may still be being written: keep the hold.
+            if getattr(laid_out, "confirmed", False) is not True:
+                a_leg_did_not_complete = True
             tree_path = Path(laid_out.path)
             tree_commit = str(sha)
             if excluded_now is None:
@@ -2218,7 +2227,7 @@ async def execute_merge_deploy(
             # A lay-out whose answer was lost may still be writing the tree in
             # the sandbox: keep the hold. One the venue refused in its own
             # words has finished (15 October 2026).
-            if not exc.answered:
+            if not exc.confirmed:
                 a_leg_did_not_complete = True
             _write_receipt(
                 "merge_deploy_candidate.json",
@@ -2265,12 +2274,14 @@ async def execute_merge_deploy(
         except CandidateTreeError as exc:
             # A lay-out whose answer was lost may still be writing the tree in
             # the sandbox: keep the hold. A refusal has finished.
-            if not exc.answered:
+            if not exc.confirmed:
                 a_leg_did_not_complete = True
             return None, (
                 f"the tree of {wanted[:10]} could not be laid out to run the "
                 f"project's own steps from ({exc})"
             )
+        if getattr(laid_out, "confirmed", False) is not True:
+            a_leg_did_not_complete = True
         tree_path = Path(laid_out.path)
         tree_commit = wanted
         return str(tree_path), None
@@ -4411,11 +4422,12 @@ async def execute_merge_deploy(
                     attempt=attempt,
                     at_commit=g_commit,
                 )
+                # CONFIRMED OR NOT (15 October 2026): a folder whose making was
+                # not confirmed — made or refused, in a complete answer — may
+                # still be being made: keep the hold.
+                if not made.confirmed:
+                    a_leg_did_not_complete = True
                 if not made.ok:
-                    # A folder the sandbox never answered for may still be
-                    # being made in there: keep the hold (15 October 2026).
-                    if not made.answered:
-                        a_leg_did_not_complete = True
                     _write_receipt(
                         "merge_deploy_join.json",
                         {
@@ -4572,8 +4584,12 @@ async def execute_merge_deploy(
                 # its time limit, or one whose answer was lost, may still be
                 # running whatever report survived, so the hold is kept —
                 # decided before any report is read.
-                if getattr(result, "status", None) == "timeout" or (
-                    getattr(result, "answer_lost", False) is True
+                if (
+                    getattr(result, "status", None) == "timeout"
+                    or getattr(result, "answer_lost", False) is True
+                    # CONFIRMED OR NOT (15 October 2026): only a complete
+                    # answer from the merge command lets the hold go down.
+                    or getattr(result, "confirmed", False) is not True
                 ):
                     a_leg_did_not_complete = True
                 report = _parse_merge_report(result)
@@ -4994,7 +5010,7 @@ async def execute_merge_deploy(
                 # have been sent, or that timed out may still be running: keep
                 # the hold. One that answered (its checks could not run, or a
                 # refusal before running) has finished.
-                if check_join_said.answer_lost:
+                if check_join_said.answer_lost or not check_join_said.confirmed:
                     a_leg_did_not_complete = True
                 if check_join_said.ran:
                     checks_passed = check_join_said.checks_passed
@@ -5592,6 +5608,8 @@ async def execute_merge_deploy(
                 "current_candidate_sha": current_sha,
                 "offered_candidate_tree": expected_candidate_tree,
                 "current_candidate_tree": current_tree,
+                # Decided here, without touching anything: an answer.
+                "confirmed": True,
             }
         else:
             retired = await git.retire_autobuild_worktree(
@@ -5600,6 +5618,9 @@ async def execute_merge_deploy(
                 worktree_retention,
             )
         _write_receipt("autobuild_worktree_cleanup.json", retired)
+        # CONFIRMED OR NOT, whatever the status says (15 October 2026).
+        if retired.get("confirmed") is not True:
+            a_leg_did_not_complete = True
         if retired.get("status") != "removed":
             # A retained worktree that was ANSWERED as not retired is a folder
             # left behind, not work still running (15 October 2026, FEAT-6AC9:
@@ -5608,11 +5629,9 @@ async def execute_merge_deploy(
             # had finished). The receipt and the warning say it was kept.
             # Nothing retries it on its own: retirement runs once, after a
             # successful merge, or when someone calls the sidecar's retire
-            # route by hand. Only a retirement whose answer was
-            # lost on the way back from the sandbox may still be running, so
-            # only that keeps the hold.
-            if retired.get("answered") is False:
-                a_leg_did_not_complete = True
+            # route by hand. Only a retirement whose answer was not
+            # confirmed may still be running, so only that keeps the hold
+            # (decided just above).
             logger.warning(
                 "merge-executor: retained autobuild worktree for %s was kept: %s",
                 build_id,

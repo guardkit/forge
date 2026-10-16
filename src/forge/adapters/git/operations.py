@@ -286,6 +286,8 @@ async def prepare_worktree(
                 "than guessing."
             ),
             exit_code=-1,
+            # Refused before git was started: an answer.
+            confirmed=True,
         )
     if create_branch:
         command = ["git", "worktree", "add", "-b", branch, str(worktree_path)]
@@ -301,12 +303,14 @@ async def prepare_worktree(
                 operation=operation,
                 worktree_path=str(worktree_path),
                 exit_code=0,
+                confirmed=True,
             )
         return GitOpResult(
             status="failed",
             operation=operation,
             stderr=_failure_stderr(result.stderr, result.stdout),
             exit_code=result.exit_code,
+            confirmed=True,
         )
     except Exception as exc:  # noqa: BLE001 — adapter boundary, ADR-ARCH-025
         logger.exception(
@@ -809,6 +813,7 @@ async def cleanup_worktree(
                 status="success",
                 operation=operation,
                 exit_code=0,
+                confirmed=True,
             )
         # Best-effort: log + return failed without raising.
         stderr = _failure_stderr(result.stderr, result.stdout)
@@ -825,6 +830,7 @@ async def cleanup_worktree(
             operation=operation,
             stderr=stderr,
             exit_code=result.exit_code,
+            confirmed=True,
         )
     except Exception as exc:  # noqa: BLE001
         logger.exception(

@@ -134,6 +134,7 @@ from forge.deploy.deploy_record import (
 from forge.deploy.live_gate import (
     BrokerInspector,
     LiveGateInvoker,
+    LiveGateSeamError,
     RefusingLiveGateInvoker,
 )
 from forge.deploy.profile import DeployProfile, wrapper_inner_script
@@ -149,7 +150,7 @@ from forge.deploy.runbook_builder import (
     build_read_only_runbook,
     build_revert_runbook,
 )
-from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
+from forge.deploy.sidecar_runner import SidecarScriptRunner
 from forge.deploy.steps import SecretPresenceResolver, register_deploy_handlers
 from forge.executor.executor import RunbookExecutor, RunResult
 from forge.executor.registry import StepTypeRegistry
@@ -272,6 +273,11 @@ class DeployStageResult:
     live_gate_runbook_id: str | None = None
     dry_run: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
+    #: True only when every answer in the leg's run was complete (15 October
+    #: 2026), set at one place: the leg's own return. Anything else — a
+    #: result built elsewhere, or a run with an answer that was not
+    #: confirmed — is unconfirmed, and the merge press keeps its hold for it.
+    confirmed: bool = False
 
 
 #: How the deploy sidecar's own answers begin. When the sidecar refuses a
@@ -550,7 +556,9 @@ class _ARunThatNotesLostAnswers:
                 # the executor turns it into an ordinary failed step.
                 self.lost = True
                 raise
-            if no_answer_came_back(answer):
+            # CONFIRMED OR NOT (15 October 2026): only an answer the runner
+            # vouched for as complete counts; anything else is noted.
+            if getattr(answer, "confirmed", False) is not True:
                 self.lost = True
             return answer
 
@@ -560,9 +568,17 @@ class _ARunThatNotesLostAnswers:
         return _AnInvokerThatNotesLostAnswers(inner, self)
 
     def stamped(self, result: Any) -> Any:
-        if self.lost and isinstance(result, DeployStageResult):
-            return replace(result, detail={**result.detail, "answer_lost": True})
-        return result
+        """The leg's result, saying whether every answer in its run was
+        complete: ``confirmed`` when so, ``answer_lost`` when not."""
+        if not isinstance(result, DeployStageResult):
+            return result
+        if self.lost:
+            return replace(
+                result,
+                confirmed=False,
+                detail={**result.detail, "answer_lost": True},
+            )
+        return replace(result, confirmed=True)
 
 
 class _AnInvokerThatNotesLostAnswers:
@@ -575,11 +591,16 @@ class _AnInvokerThatNotesLostAnswers:
     def invoke(self, **kwargs: Any) -> Any:
         try:
             invocation = self._inner.invoke(**kwargs)
+        except LiveGateSeamError:
+            # A gate that refuses to run says so by raising this, before any
+            # driver is started: a refusal, not a lost answer.
+            raise
         except BaseException:
             # Raised while the driver may have been running (15 October 2026).
             self._run.lost = True
             raise
-        if getattr(invocation, "answer_lost", False) is True:
+        # CONFIRMED OR NOT (15 October 2026): only a complete gate answer.
+        if getattr(invocation, "confirmed", False) is not True:
             self._run.lost = True
         return invocation
 

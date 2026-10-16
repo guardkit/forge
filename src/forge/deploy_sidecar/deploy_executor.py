@@ -522,6 +522,13 @@ class ExecutorAnswer:
     #: The command was stopped at its time limit (15 October 2026). Carried
     #: apart from the word, so a takeover that met a timeout still says so.
     timed_out: bool = False
+    #: True only where this answer is complete (15 October 2026): the request
+    #: was refused before anything was started, or the command ran and every
+    #: process of its group was confirmed gone, or a takeover that confirmed
+    #: it gone stopped it. Anything else — a timeout, an error while it ran,
+    #: a group that could not be confirmed stopped, a command started and then
+    #: killed without confirmation — leaves it False.
+    confirmed: bool = False
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -1207,6 +1214,7 @@ class DeployExecutor:
         if not target:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-request-names-no-target",
                 sentence=(
                     "a deploy request has to name the deployment target it "
@@ -1216,6 +1224,7 @@ class DeployExecutor:
         if not str(request.build or "").strip():
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-request-names-no-build",
                 sentence=(
                     f"a deploy request for {target} has to name the build the "
@@ -1230,6 +1239,7 @@ class DeployExecutor:
         if counter < 1:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-request-carries-no-counter",
                 sentence=(
                     f"a deploy request for {target} has to carry the target's "
@@ -1266,6 +1276,7 @@ class DeployExecutor:
         if self._folder_problem:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-executors-notes-folder-cannot-be-used",
                 sentence=f"{self._folder_problem}. Nothing was deployed.",
             )
@@ -1273,6 +1284,7 @@ class DeployExecutor:
         if refused:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=f"{refused} Nothing was deployed.",
             )
@@ -1294,6 +1306,7 @@ class DeployExecutor:
         if counter < highest:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-counter-has-moved-on",
                 sentence=(
                     f"this deploy request carries {target}'s counter {counter} "
@@ -1312,6 +1325,7 @@ class DeployExecutor:
             if granted_to and granted_to != build:
                 return ExecutorAnswer(
                     accepted=False,
+                    confirmed=True,  # refused before anything was started
                     word="that-counter-belongs-to-another-build",
                     sentence=(
                         f"this deploy request carries {target}'s counter "
@@ -1335,6 +1349,7 @@ class DeployExecutor:
             )
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=(
                     f"whether the deploy command already recorded for {target} "
@@ -1353,6 +1368,7 @@ class DeployExecutor:
             # There is nothing to stop by group, so nothing new starts.
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-is-occupied",
                 sentence=(
                     f"a deploy command for {target} was being started when this "
@@ -1365,6 +1381,7 @@ class DeployExecutor:
         if counter == note.counter and build == note.build:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="a-command-is-already-running",
                 sentence=(
                     f"a deploy command for {target} from this same build is "
@@ -1379,6 +1396,7 @@ class DeployExecutor:
         if superseded is None:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=(
                     f"the note for {target} changed while this request was "
@@ -1391,6 +1409,7 @@ class DeployExecutor:
         if not stopped:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-old-command-could-not-be-confirmed-stopped",
                 sentence=f"{why}. The result stays published, deployment pending.",
                 marker=note.marker,
@@ -1427,6 +1446,7 @@ class DeployExecutor:
             )
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=(
                     f"whether anything is still deploying to {target} could not "
@@ -1437,6 +1457,7 @@ class DeployExecutor:
         if anything is True:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-is-occupied",
                 sentence=(
                     f"this executor's note for {target} has no live command on "
@@ -1495,6 +1516,7 @@ class DeployExecutor:
             )
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=(
                     f"{why}, and whether anything is still deploying to "
@@ -1505,6 +1527,7 @@ class DeployExecutor:
         if anything is True:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-is-occupied",
                 sentence=(
                     f"{why}, and a process carrying a deploy marker for "
@@ -1536,6 +1559,7 @@ class DeployExecutor:
         if self._ask is None:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="nobody-can-be-asked-who-owns-it",
                 sentence=(
                     f"{opening}, and it has no way to ask the coordinator who "
@@ -1558,6 +1582,7 @@ class DeployExecutor:
         if not isinstance(answer, Mapping):
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="nobody-can-be-asked-who-owns-it",
                 sentence=(
                     f"{opening}, and the coordinator did not say who owns the "
@@ -1572,6 +1597,7 @@ class DeployExecutor:
         if says_counter != counter or says_build != str(build).strip():
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-coordinator-says-somebody-else-owns-it",
                 sentence=(
                     f"{opening}, so it asked the coordinator who owns the "
@@ -1743,6 +1769,7 @@ class DeployExecutor:
         except (OSError, ValueError) as exc:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-environment-was-refused",
                 sentence=(
                     f"the deploy step for {target} was not started, because "
@@ -1774,6 +1801,7 @@ class DeployExecutor:
         if not claimed:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-is-occupied",
                 sentence=(
                     f"the slot for {target} was taken between this request "
@@ -1797,6 +1825,7 @@ class DeployExecutor:
             self._clear_if_it_is_still_mine(provisional)
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-deploy-command-would-not-start",
                 sentence=(
                     f"the deploy step for {target} would not start "
@@ -1821,13 +1850,17 @@ class DeployExecutor:
             # cannot account for.
             self._kill_now(int(group))
             self._clear_if_it_is_still_mine(provisional)
-            return self._the_note_would_not_be_written(target, marker, str(exc))
+            return self._the_note_would_not_be_written(
+                target, marker, str(exc), started=True
+            )
         if not completed:
             # Somebody else's note is on disk already, which means this
             # command's slot is not this command's any more. It is stopped
             # rather than left running beside whatever now holds the target.
             self._kill_now(int(group))
             return ExecutorAnswer(
+                # Started, then killed without confirmation: not confirmed.
+                confirmed=False,
                 accepted=False,
                 word="the-slot-is-occupied",
                 sentence=(
@@ -1841,9 +1874,12 @@ class DeployExecutor:
 
     @staticmethod
     def _the_note_would_not_be_written(
-        target: str, marker: str, why: str
+        target: str, marker: str, why: str, *, started: bool = False
     ) -> ExecutorAnswer:
         return ExecutorAnswer(
+            # Before anything was started: an answer. After the command was
+            # started and killed without confirmation: not confirmed.
+            confirmed=not started,
             accepted=False,
             word="the-note-could-not-be-written",
             sentence=(
@@ -1967,6 +2003,9 @@ class DeployExecutor:
             )
         code = process.returncode if process.returncode is not None else 1
         return ExecutorAnswer(
+            # R14 (15 October 2026): complete only when every process of the
+            # command's group was confirmed gone.
+            confirmed=gone,
             accepted=True,
             word="the-deploy-command-ran",
             sentence=(
@@ -2027,6 +2066,9 @@ class DeployExecutor:
             # or broke while it ran (15 October 2026).
             timed_out=timed_out,
             raised_while_running=raised_while_running,
+            # The holder that took over confirmed this command gone before it
+            # wrote its own note: complete, unless it also timed out or broke.
+            confirmed=not (timed_out or raised_while_running),
         )
 
 

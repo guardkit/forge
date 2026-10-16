@@ -962,6 +962,8 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
                 "verify_detail": "the install failed in the joined tree",
             }
             return GuardKitResult(
+                # A complete answer from the build system (15 October 2026).
+                confirmed=answer != "timed-out",
                 status="timeout" if answer == "timed-out" else "failed",
                 subcommand="autobuild",
                 duration_secs=0.1,
@@ -1082,6 +1084,7 @@ class _AProjectWithATarget:
                 else "[the project] checked it, and said nothing about what\n"
             )
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete",
                 verdict="pass",
                 failed_step=None,
@@ -1090,12 +1093,14 @@ class _AProjectWithATarget:
             )
         if leg == "candidate_down":
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
             )
         if leg == "what_is_running":
             self.asked_what_is_running += 1
             if self.the_read_only_answer is not None:
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome=(
                         "complete" if self.the_read_only_step_finished else "failed"
                     ),
@@ -1104,12 +1109,14 @@ class _AProjectWithATarget:
                 )
             if not self.answers_what_is_running:
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome="failed", verdict=None, detail={"deploy_output": ""}
                 )
             # "Nothing is running here" is the WORD ``none`` (25 September
             # 2026): an empty value is what a step prints when its own query
             # failed, so it cannot also mean the target is free.
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete",
                 verdict=None,
                 detail={
@@ -1125,6 +1132,7 @@ class _AProjectWithATarget:
         # press's read-only question gets the answer a real one would.
         self.on_the_target = running
         return SimpleNamespace(
+            confirmed=True,  # a complete leg answer (15 October 2026)
             outcome="complete",
             verdict="pass",
             deploy_record_ref="docs/state/x.md",
@@ -1387,6 +1395,7 @@ class _ADeployTheExecutorStopped:
             summary = dict(GREEN_GATE)
             summary["candidate_output"] = "CHECKED_ARTIFACT=the-checked-thing\n"
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete",
                 verdict="pass",
                 failed_step=None,
@@ -1395,17 +1404,20 @@ class _ADeployTheExecutorStopped:
             )
         if leg == "candidate_down":
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
             )
         if leg == "what_is_running":
             # Nothing is running on the target: the word ``none``, which is the
             # only way a project says that.
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete", verdict=None,
                 detail={"deploy_output": "RUNNING_IDENTITY=none\n"},
             )
         owns = dict(kwargs.get("deploy_ownership") or {})
         return SimpleNamespace(
+            confirmed=True,  # a complete leg answer (15 October 2026)
             outcome="failed",
             verdict=None,
             failed_step="deploy_compose",
@@ -1535,6 +1547,8 @@ class _ABuildSystemWithCheckJoin:
             "checks_total": 3,
         }
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status="success" if self.verify_ok else "failed",
             subcommand="autobuild",
             duration_secs=0.1,
@@ -2040,11 +2054,13 @@ class _APromoteThatReverted(_AProjectWithATarget):
             self.calls.append(kwargs)
             if self.revert_worked:
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome="reverted", verdict="fail", failed_step=None,
                     events=("DeployReverted",),
                     detail={"rollback_image_ref": "x:rollback-1", "candidate": "torn-down"},
                 )
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="failed", verdict="fail", failed_step="revert", events=(),
                 detail={
                     "reason": "revert_failed",
@@ -2309,8 +2325,13 @@ class _ASurfaceWhoseCleanUpsSay:
                         "path": path,
                         "detail": "the sandbox could not be reached",
                         "answered": False,
+                        "confirmed": False,
                     }
-                return {"status": says.get("retired") or "removed", "path": path}
+                return {
+                    "status": says.get("retired") or "removed",
+                    "path": path,
+                    "confirmed": True,
+                }
 
             async def remove_candidate_tree(
                 self, feature_id: str, path: str | None = None
@@ -2556,6 +2577,7 @@ class TestACandidateLeftStandingKeepsTheHoldUntilATeardownAnswers:
                         raise ConnectionResetError("the teardown's answer was lost")
                     if teardown == "still-standing":
                         return SimpleNamespace(
+                            confirmed=True,  # a complete leg answer (15 October 2026)
                             outcome="failed", verdict=None,
                             detail={"candidate": "standing"},
                         )
@@ -2578,3 +2600,82 @@ class TestACandidateLeftStandingKeepsTheHoldUntilATeardownAnswers:
         assert [c.get("leg") for c in deploy.calls][-1] == "candidate_down"
         assert (_record(pool).lease_holder is not None) is kept
         assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
+
+
+def _git_worktree_commands_that(monkeypatch: pytest.MonkeyPatch, verb: str, how: str) -> None:
+    """The REAL git adapter, except that ``git worktree <verb>`` raises after
+    it was sent (``how="raises"``) or answers a non-zero exit (``"refused"``).
+    Every other git command runs for real."""
+    from forge.adapters.git import operations
+
+    real = operations._default_execute
+
+    async def _execute(*, command, cwd=None, timeout=None):  # type: ignore[no-untyped-def]
+        if list(command[:3]) == ["git", "worktree", verb]:
+            if how == "raises":
+                raise OSError(f"the pipe to git worktree {verb} broke")
+            return operations.ExecuteResult(
+                exit_code=128, stdout="", stderr=f"git worktree {verb} refused it"
+            )
+        return await real(command=command, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(operations, "_default_execute", _execute)
+
+
+class TestOnlyAConfirmedGitAnswerPutsTheHoldDown:
+    """15 October 2026, Codex R13, through the REAL in-container git adapter:
+    a ``git worktree`` command that raised after it was sent gives no answer
+    anybody can rely on, so the hold is kept; one git answered with an exit
+    code is a complete answer, and the hold goes down."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how, kept", [("raises", True), ("refused", False)])
+    async def test_the_join_folders_removal(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+        how: str,
+        kept: bool,
+    ) -> None:
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=_ADeployStepThatSays(),
+        )
+        # The join folder is made for real first; only its removal at the
+        # record's end meets the broken (or refusing) git.
+        _git_worktree_commands_that(monkeypatch, "remove", how)
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert (_record(pool).lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how, kept", [("raises", True), ("refused", False)])
+    async def test_the_join_folders_creation(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+        how: str,
+        kept: bool,
+    ) -> None:
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=_ADeployStepThatSays(),
+        )
+        _git_worktree_commands_that(monkeypatch, "add", how)
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _record(pool)
+        assert held.result == RESULT_PUBLICATION_PENDING
+        assert (held.lease_holder is not None) is kept

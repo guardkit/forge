@@ -1161,6 +1161,27 @@ class TestATakeoverKeepsWhatElseHappened:
         assert answer.raised_while_running is raised
 
 
+class TestARanAnswerIsConfirmedOnlyWhenItsGroupIsGone:
+    """15 October 2026, Codex R14: a deploy command that returned is a
+    complete answer only when every process of its group was confirmed gone;
+    one whose group could not be confirmed stopped is not confirmed."""
+
+    @pytest.mark.parametrize("gone", [True, False])
+    def test_the_answer_says_it(self, notes, workshop, TARGET, monkeypatch, gone) -> None:
+        from forge.deploy_sidecar import deploy_executor as module
+
+        if not gone:
+            monkeypatch.setattr(
+                module.DeployExecutor,
+                "_stop_and_confirm",
+                lambda self, note: (False, "a process of the group is still alive"),
+            )
+        executor = _executor(notes, command_seconds=30.0, stop_confirm_seconds=20.0)
+        answer = executor.run(_ask(TARGET, _quick(workshop), 1, "build-a", workshop))
+        assert answer.word == "the-deploy-command-ran"
+        assert answer.confirmed is gone
+
+
 # ---------------------------------------------------------------------------
 # (h) the environment door
 # ---------------------------------------------------------------------------

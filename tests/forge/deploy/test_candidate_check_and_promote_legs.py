@@ -145,6 +145,7 @@ class _Invoker:
     def _invocation(shape, feature: str) -> LiveGateInvocation:
         verdict, assertions = shape
         return LiveGateInvocation(
+            confirmed=True,  # a verdict the driver reported (15 October 2026)
             verdict=verdict,
             run_id=f"run-{feature}",
             gate_ids=EIGHT_GATES,

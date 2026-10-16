@@ -330,11 +330,13 @@ class SidecarCandidateGit:
         )
         if decoded is None:
             # No answer: the tree may still be being written in there.
-            raise CandidateTreeError(str(why), answered=answered)
+            raise CandidateTreeError(str(why), confirmed=answered)
         path = decoded["path"]
         tree = decoded.get("tree")
         excluded = decoded.get("exclude_written")
         return CandidateTreeLayout(
+            # A reply that passed the lay-out's own check: complete.
+            confirmed=True,
             path=path,
             tree=str(tree) if isinstance(tree, str) and tree else None,
             exclude_written=None if excluded is None else bool(excluded),
@@ -396,10 +398,12 @@ class SidecarCandidateGit:
                 branch=str(branch),
                 base_ref=str(base_ref),
                 refusal=str(why),
-                answered=answered,
+                confirmed=answered,
             )
         ok = str(decoded.get("status") or "") == "success"
         return WorkingFolder(
+            # A reply that passed the operation's own check: an answer.
+            confirmed=True,
             ok=ok,
             path=decoded.get("path"),
             branch=str(decoded.get("branch") or branch),
@@ -490,5 +494,7 @@ class SidecarCandidateGit:
                 "path": str(path),
                 "detail": str(why),
                 "answered": answered,
+                "confirmed": answered,
             }
-        return decoded
+        # A reply that passed the retirement's own check: an answer.
+        return {**decoded, "confirmed": True}

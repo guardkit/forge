@@ -159,6 +159,9 @@ def parse_guardkit_output(
         stderr=stderr if stderr else None,
         exit_code=exit_code,
         warnings=warnings,
+        # The command ran to an exit code and was read: complete, unless it
+        # was stopped at its time limit (15 October 2026).
+        confirmed=status != "timeout",
     )
 
 

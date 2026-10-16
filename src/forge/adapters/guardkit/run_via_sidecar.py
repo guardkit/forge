@@ -250,6 +250,8 @@ def _failed_result(
         warnings=[GuardKitWarning(code=warning_code, message=detail)],
         refused_before_running=refused_before_running,
         answer_lost=answer_lost,
+        # Only a refusal before anything ran is a complete answer here.
+        confirmed=refused_before_running,
     )
 
 
@@ -567,6 +569,8 @@ def build_sidecar_guardkit_run(
             stdout_tail=stdout if isinstance(stdout, str) else "",
             stderr=stderr if isinstance(stderr, str) else None,
             exit_code=exit_code,
+            # A reply that passed every check: a complete answer.
+            confirmed=True,
         )
 
     return run_merge_via_sidecar

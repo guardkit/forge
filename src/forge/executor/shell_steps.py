@@ -49,6 +49,7 @@ _TRUNCATION_MARKER = "\n... [OUTPUT TRUNCATED] ...\n"
 # place that starts programs for the merge press's legs (15 October 2026).
 # Kept importable from here, where the script runner's callers found them.
 from forge.executor.programs import (  # noqa: E402
+    Finished,
     RaisedWhileRunning,
     RefusedBeforeStart,
     TimedOut,
@@ -134,7 +135,7 @@ def _run_script_step(
     # exactly the ungated deploy the design's fourth revision H removes, so it
     # is refused in plain words rather than run.
     if deploy:
-        return (
+        return Finished(
             1,
             "this deploy owns a deployment target, and it was sent to the "
             "plain subprocess runner, which cannot hold one command per "
@@ -161,7 +162,7 @@ def _run_script_step(
         from forge.deploy.review_preview import IssuedPreviewValues
 
         if not isinstance(issued_env, IssuedPreviewValues):
-            return (
+            return Finished(
                 1,
                 "this script was handed values as issued by the review "
                 "preview, and a preview runs only in the repository's sandbox, "
@@ -183,7 +184,7 @@ def _run_script_step(
             repository=repository,
         )
     except (OSError, ValueError) as exc:
-        return (1, f"the script was not run: {exc}")
+        return Finished(1, f"the script was not run: {exc}")
 
     # Resolve a bare script name (no directory component) relative to cwd.
     # subprocess resolves an executable containing a path separator relative
@@ -256,7 +257,8 @@ def _run_script_step(
 
     if timed_out:
         return TimedOut(exit_code, output)
-    return (exit_code, output)
+    # Ran to an end and said how: a complete answer (15 October 2026).
+    return Finished(exit_code, output)
 
 
 def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> StepOutcome:
@@ -485,6 +487,7 @@ def register_shell_handlers(registry: StepTypeRegistry) -> None:
 
 
 __all__ = [
+    "Finished",
     "RaisedWhileRunning",
     "RefusedBeforeStart",
     "TimedOut",

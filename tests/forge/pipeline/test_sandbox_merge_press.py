@@ -339,6 +339,7 @@ class _FakeDeploy:
                 ),
             }
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete",
                 verdict="pass",
                 failed_step=None,
@@ -354,6 +355,7 @@ class _FakeDeploy:
                 },
             )
         return SimpleNamespace(
+            confirmed=True,  # a complete leg answer (15 October 2026)
             outcome="complete",
             verdict="pass",
             failed_step=None,
@@ -375,6 +377,8 @@ class _FakeMergeCommand:
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status="success",
             subcommand=kwargs.get("subcommand", "autobuild"),
             duration_secs=0.1,
@@ -1512,6 +1516,52 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
             assert "stopped part-way by a later holder" in outcome.detail
             assert held is None
         else:
+            assert held is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gone", [True, False])
+    async def test_a_deploy_whose_group_could_not_be_confirmed_stopped(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+        gone: bool,
+    ) -> None:
+        """15 October 2026, Codex R14, through the REAL owned deploy executor:
+        the deploy command returned, but something of its process group could
+        not be confirmed stopped. The sidecar answers a 5xx, the press keeps
+        its hold although the candidate's teardown answered "down". With the
+        group confirmed gone the merge goes live and the hold goes down."""
+        from forge.deploy_sidecar import deploy_executor as module
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        if not gone:
+            real_stop = module.DeployExecutor._stop_and_confirm
+
+            def _not_confirmed(self, note):  # type: ignore[no-untyped-def]
+                real_stop(self, note)
+                return False, "a process of the group is still alive"
+
+            monkeypatch.setattr(module.DeployExecutor, "_stop_and_confirm", _not_confirmed)
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        held = PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
+        assert "down" in self._which_ran(log, clone)
+        if gone:
+            assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+            assert held is None
+        else:
+            assert outcome.result != "merged-into-the-remote-and-running", outcome.detail
             assert held is not None
 
     @pytest.mark.asyncio

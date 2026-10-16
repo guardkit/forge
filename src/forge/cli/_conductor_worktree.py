@@ -200,6 +200,10 @@ class WorktreeCut:
     base_ref: str = JOURNEY_BASE_REF
     reused: bool = False
     reason: str = ""
+    #: 15 October 2026: True only where a complete answer was read — git ran
+    #: to an exit code, or the request was refused before anything was
+    #: changed. An exception around a git command leaves it False.
+    confirmed: bool = False
 
 
 def short_build_id(build_id: str) -> str:
@@ -501,8 +505,13 @@ async def cut_worktree_in_checkout(
     builds_root = forge_dir / _WORKTREES_DIR
     target = builds_root / build_id
 
-    def _no(reason: str) -> WorktreeCut:
-        return WorktreeCut(ok=False, branch=branch, base_ref=base_ref, reason=reason)
+    def _no(reason: str, *, confirmed: bool = True) -> WorktreeCut:
+        # Every refusal before the tree is cut is an answer: nothing was
+        # changed. Only the cut itself can leave it unknown.
+        return WorktreeCut(
+            ok=False, branch=branch, base_ref=base_ref, reason=reason,
+            confirmed=confirmed,
+        )
 
     # 4 — the reuse arm.
     try:
@@ -560,6 +569,7 @@ async def cut_worktree_in_checkout(
                 branch=branch,
                 base_ref=base_ref,
                 reused=True,
+                confirmed=True,
             )
         if same_path:
             return _no(
@@ -630,10 +640,12 @@ async def cut_worktree_in_checkout(
         detail = (result.stderr or "").strip() or "no diagnostic was captured"
         return _no(
             f"materialising build_id={build_id}'s worktree at {target} on "
-            f"branch {branch} off {base_ref} FAILED: {detail}"
+            f"branch {branch} off {base_ref} FAILED: {detail}",
+            confirmed=result.confirmed,
         )
     return WorktreeCut(
-        ok=True, path=result.worktree_path, branch=branch, base_ref=base_ref
+        ok=True, path=result.worktree_path, branch=branch, base_ref=base_ref,
+        confirmed=result.confirmed,
     )
 
 
@@ -657,7 +669,7 @@ async def remove_journey_worktree(
 
     target = Path(_normalise(worktree))
     if not target.exists():
-        return WorktreeCut(ok=True, path=str(target))
+        return WorktreeCut(ok=True, path=str(target), confirmed=True)
     # Read-only folders a tool's cache left inside it, or inside Git's record
     # folder for it, would stop Git half way (FEAT-D267, 15 October 2026).
     make_worktree_removable(target)
@@ -677,12 +689,14 @@ async def remove_journey_worktree(
             ),
         )
     if result.status == "success":
-        return WorktreeCut(ok=True, path=str(target))
+        return WorktreeCut(ok=True, path=str(target), confirmed=result.confirmed)
     detail = (result.stderr or "").strip() or "no diagnostic was captured"
     return WorktreeCut(
         ok=False,
         path=str(target),
         reason=f"removing the worktree at {target} FAILED: {detail}",
+        # Git answered with an exit code, or the call raised (False).
+        confirmed=result.confirmed,
     )
 
 

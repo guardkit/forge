@@ -131,6 +131,12 @@ class LiveGateInvocation:
     #: sent, timed out, was dropped or came back unreadable, so the driver may
     #: still be running. A gate that answered, with any verdict, is False.
     answer_lost: bool = False
+    #: True only for a complete answer (15 October 2026): a verdict the
+    #: driver reported, a dry run, or a refusal before the driver started.
+    #: Anything else — a timeout, an error after the start, an answer that
+    #: could not be read, or an invocation built without saying — is
+    #: unconfirmed, and the merge press keeps its hold for it.
+    confirmed: bool = False
 
     def __post_init__(self) -> None:
         if self.verdict not in _VALID_VERDICTS:
@@ -233,6 +239,7 @@ class DryRunLiveGateInvoker:
             planned += ["--gates", ",".join(gate_args)]
         logger.info("dry-run live-gate: would invoke %s", " ".join(planned))
         return LiveGateInvocation(
+            confirmed=True,  # a dry run says what it would do: complete (15 October 2026)
             verdict="pass",
             run_id=f"dryrun-{feature}-{target}",
             gate_ids=tuple(gate_args),
@@ -297,6 +304,11 @@ class GuardkitSeamLiveGateInvoker:
         result = self._call_seam(args)
         verdict = self._verdict_from_result(result)
         return LiveGateInvocation(
+            # As complete as the build system's own answer (15 October 2026).
+            confirmed=(
+                getattr(result, "confirmed", False) is True
+                and getattr(result, "status", None) != "timeout"
+            ),
             verdict=verdict,
             run_id=f"{feature}-{target}",
             gate_ids=tuple(gates),
@@ -477,6 +489,7 @@ def project_driver_answer(
                 if isinstance(g, dict) and g.get("gate_id")
             )
             return LiveGateInvocation(
+                confirmed=True,  # the driver ran to an end: complete (15 October 2026)
                 verdict=str(verdict),
                 run_id=str(envelope.get("run_id") or run_id_fallback),
                 gate_ids=gate_ids_env or gate_ids,
@@ -504,6 +517,7 @@ def project_driver_answer(
         detail["envelope_verdict"] = verdict
 
     return LiveGateInvocation(
+        confirmed=True,  # the driver ran to an end: complete (15 October 2026)
         verdict=_DRIVER_EXIT_VERDICT.get(exit_code, "fail"),
         run_id=run_id_fallback,
         gate_ids=gate_ids,
@@ -690,6 +704,7 @@ class RepoDriverLiveGateInvoker:
             # private home): the gate could not be run, which is an
             # INSTRUMENT problem, never a SUT fail.
             return LiveGateInvocation(
+                confirmed=True,  # refused before the driver started: complete (15 October 2026)
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
@@ -724,6 +739,7 @@ class RepoDriverLiveGateInvoker:
             # A driver that never returns is an ENVIRONMENT problem — never a
             # SUT fail (it never indicts the feature). Nor is it an answer.
             return LiveGateInvocation(
+                confirmed=False,  # stopped at its limit: not confirmed (15 October 2026)
                 verdict="environment_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
@@ -745,6 +761,7 @@ class RepoDriverLiveGateInvoker:
             # Spawn failure — missing interpreter / script / not executable. An
             # INSTRUMENT problem (the gate could not be run), never a SUT fail.
             return LiveGateInvocation(
+                confirmed=True,  # never started: complete (15 October 2026)
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
@@ -761,6 +778,7 @@ class RepoDriverLiveGateInvoker:
         if ran.raised_while_running:
             # After the driver started: nobody knows whether it is running.
             return LiveGateInvocation(
+                confirmed=False,  # raised after it started: not confirmed (15 October 2026)
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
@@ -997,6 +1015,7 @@ class SidecarLiveGateInvoker:
 
         def _instrument(error: str, *, answer_lost: bool = False) -> LiveGateInvocation:
             return LiveGateInvocation(
+                confirmed=not answer_lost,  # a refusal or answer read in full, unless no answer came back (15 October 2026)
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
@@ -1068,6 +1087,7 @@ class SidecarLiveGateInvoker:
         # else is wrong with it — a missing or mismatched cwd included.
         if isinstance(answer, dict) and answer.get("timed_out") is True:
             return LiveGateInvocation(
+                confirmed=False,  # stopped at its limit: not confirmed (15 October 2026)
                 verdict="environment_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,

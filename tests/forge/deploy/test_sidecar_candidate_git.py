@@ -132,7 +132,7 @@ class TestTheTwoHalvesOfTheSeamAgree:
             await git.materialise_candidate_tree(FEATURE_ID, "b" * 40)
         assert "git archive" in str(raised.value)
         # The sandbox refused it in its own words: an answer (15 October 2026).
-        assert raised.value.answered is True
+        assert raised.value.confirmed is True
 
     @pytest.mark.asyncio
     async def test_no_path_from_this_side_reaches_git_in_there(
@@ -222,7 +222,7 @@ class TestTheJoinsWorkingFolderIsRemovedInThere:
             "integration/../escape", "factory-integration/FEAT-SG1", "main"
         )
         assert made.ok is False
-        assert made.answered is True
+        assert made.confirmed is True
 
 
 class TestTheProjectsOwnFileIsReadInThere:
@@ -279,7 +279,7 @@ class TestASidecarThatCannotBeReached:
             "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
         )
         assert made.ok is False
-        assert made.answered is False
+        assert made.confirmed is False
 
     @pytest.mark.asyncio
     async def test_a_working_folder_removal_with_no_answer_answers_none(self) -> None:
@@ -309,7 +309,7 @@ class TestASidecarThatCannotBeReached:
             await self._unreachable().materialise_candidate_tree(FEATURE_ID, "a" * 40)
         assert "127.0.0.1:1" in str(raised.value)
         # No answer came back: the tree may still be being written.
-        assert raised.value.answered is False
+        assert raised.value.confirmed is False
 
     def test_it_refuses_to_be_built_without_the_repositorys_key(self) -> None:
         with pytest.raises(ValueError):
@@ -435,12 +435,12 @@ class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
             made = await git.add_working_folder(
                 "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
             )
-            assert made.ok is False and made.answered is False
+            assert made.ok is False and made.confirmed is False
             assert await git.remove_working_folder("/x/integration-FEAT-SG1") is None
             assert await git.remove_candidate_tree(FEATURE_ID) is None
             with pytest.raises(CandidateTreeError) as raised:
                 await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
-            assert raised.value.answered is False
+            assert raised.value.confirmed is False
             retired = await git.retire_autobuild_worktree("build-X", "/retained", {})
             assert retired["status"] == "kept" and retired["answered"] is False
         finally:
@@ -454,12 +454,12 @@ class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
             made = await git.add_working_folder(
                 "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
             )
-            assert made.ok is False and made.answered is True
+            assert made.ok is False and made.confirmed is True
             assert await git.remove_working_folder("/x/integration-FEAT-SG1") is False
             assert await git.remove_candidate_tree(FEATURE_ID) is False
             with pytest.raises(CandidateTreeError) as raised:
                 await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
-            assert raised.value.answered is True
+            assert raised.value.confirmed is True
             retired = await git.retire_autobuild_worktree("build-X", "/retained", {})
             assert retired["status"] == "kept" and retired["answered"] is True
         finally:
@@ -473,8 +473,47 @@ class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
             made = await git.add_working_folder(
                 "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
             )
-            assert made.ok is False and made.answered is True
+            assert made.ok is False and made.confirmed is True
             assert await git.remove_working_folder("/x/integration-FEAT-SG1") is False
             assert await git.remove_candidate_tree(FEATURE_ID) is False
         finally:
             sidecar.close()
+
+
+
+class TestTheSandboxSaysWhetherGitAnswered:
+    """15 October 2026, Codex R13, through the REAL sidecar route: a
+    ``git worktree`` command that raised after it was sent is a 5xx — no
+    answer — and one git answered with an exit code is an answer."""
+
+    @staticmethod
+    def _git_worktree(monkeypatch: pytest.MonkeyPatch, verb: str, how: str) -> None:
+        from tests.forge.pipeline.test_the_merge_word_publishes import (
+            _git_worktree_commands_that,
+        )
+
+        _git_worktree_commands_that(monkeypatch, verb, how)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how, expected", [("raises", None), ("refused", False)])
+    async def test_the_removal(
+        self, git: SidecarCandidateGit, monkeypatch: pytest.MonkeyPatch, how, expected
+    ) -> None:
+        made = await git.add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok and made.confirmed
+        self._git_worktree(monkeypatch, "remove", how)
+        assert await git.remove_working_folder(str(made.path)) is expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how, confirmed", [("raises", False), ("refused", True)])
+    async def test_the_creation(
+        self, git: SidecarCandidateGit, monkeypatch: pytest.MonkeyPatch, how, confirmed
+    ) -> None:
+        self._git_worktree(monkeypatch, "add", how)
+        made = await git.add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok is False
+        assert made.confirmed is confirmed

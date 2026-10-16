@@ -73,6 +73,11 @@ class GuardKitResult(BaseModel):
     #: may have started and may still be running. A ``status="timeout"``
     #: result is read the same way.
     answer_lost: bool = False
+    #: True only for a complete answer (15 October 2026): the command ran to
+    #: an exit code and was read, or was refused in words before anything
+    #: ran. Every other result — and any result built without saying — is
+    #: unconfirmed, and the merge press keeps its hold for it.
+    confirmed: bool = False
 
 
 __all__ = [

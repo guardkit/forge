@@ -288,6 +288,8 @@ def a_build_system_without_check_join(kwargs: dict[str, Any]) -> GuardKitResult 
     if not args or args[0] != "check-join":
         return None
     return GuardKitResult(
+        # A complete answer from the build system (15 October 2026).
+        confirmed=True,
         status="failed",
         subcommand=str(kwargs.get("subcommand", "autobuild")),
         duration_secs=0.01,
@@ -330,6 +332,8 @@ class _FakeGuardKit:
         if not_there is not None:
             return not_there
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status=self.status,  # type: ignore[arg-type]
             subcommand=kwargs.get("subcommand", "autobuild"),
             duration_secs=0.1,
@@ -440,6 +444,8 @@ class _JoinsForReal:
             "checks_total": self.checks_total,
         }
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status="success",
             subcommand=kwargs.get("subcommand", "autobuild"),
             duration_secs=0.1,
@@ -530,6 +536,7 @@ class _FakeDeploy:
             if self.candidate_outcome == "complete":
                 gate = self.gate if self.gate is not None else dict(GREEN_GATE)
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome="complete",
                     verdict=self.candidate_verdict,
                     failed_step=None,
@@ -539,6 +546,7 @@ class _FakeDeploy:
             gate = self.gate if self.gate is not None else dict(RED_GATE)
             reason = self.candidate_reason or "candidate_failed"
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="failed",
                 verdict=self.candidate_verdict,
                 failed_step=self.candidate_failed_step or "candidate_gate",
@@ -547,11 +555,13 @@ class _FakeDeploy:
             )
         if leg == "candidate_down":
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
             )
         if self.raises is not None:
             raise self.raises
         return SimpleNamespace(
+            confirmed=True,  # a complete leg answer (15 October 2026)
             outcome=self.outcome,
             verdict=self.verdict,
             deploy_record_ref="docs/state/x.md",
@@ -2029,6 +2039,8 @@ class _ACheckJoinThatCouldNotRunTheChecks:
             report["verify_ran"] = True
         exits_zero = self.shape == "silent"
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status="success" if exits_zero else "failed",
             subcommand="autobuild",
             duration_secs=0.1,
@@ -4476,6 +4488,8 @@ class ASidecarThat:
         )
         exit_code, output = answer
         return SimpleNamespace(
+            # As the stage would: complete only when the runner vouched for it.
+            confirmed=getattr(answer, "confirmed", False) is True,
             outcome="complete" if exit_code == 0 else "failed",
             verdict=None,
             failed_step=None if exit_code == 0 else leg,
@@ -4682,7 +4696,7 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         async def _cannot(repo_root: Any, feature_id: str, sha: str) -> Any:
             raise candidate_tree.CandidateTreeError(
                 f"git archive {sha} failed: the clone could not be read",
-                answered=answered,
+                confirmed=answered,
             )
 
         monkeypatch.setattr(candidate_tree, "materialise_candidate_tree", _cannot)
@@ -4759,7 +4773,8 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         from forge.pipeline.merge_join import JoinOutcome
 
         async def _no_folder(*_args: Any, **_kwargs: Any) -> JoinOutcome:
-            return JoinOutcome(ok=False, refusal="the disk is full")
+            # The venue's refusal, in its own words: a complete answer.
+            return JoinOutcome(ok=False, refusal="the disk is full", confirmed=True)
 
         monkeypatch.setattr(merge_executor, "make_the_working_folder", _no_folder)
         deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal())
@@ -4797,7 +4812,7 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
                     branch=branch,
                     base_ref=base_ref,
                     refusal="the sandbox sidecar could not be reached",
-                    answered=answered,
+                    confirmed=answered,
                 )
 
         venue = _AVenueThatSays(repo_root, fetch_address=origin_of(repo_root), repo=REPO)
@@ -5057,6 +5072,8 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
                 self.calls.append(kwargs)
                 report = {"outcome": "refused", "refusal_reason": "it conflicts"}
                 return GuardKitResult(
+                    # A complete answer from the build system (15 October 2026).
+                    confirmed=not how.startswith("timed-out"),
                     status="timeout" if how.startswith("timed-out") else "failed",
                     subcommand="autobuild merge",
                     duration_secs=0.1,
@@ -5607,6 +5624,8 @@ class _JoinsWithMainCopies(_JoinsForReal):
         report = json.loads(said.stdout_tail)
         report["judged_with_main_copies"] = ["scripts/check.sh"]
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=said.confirmed,
             status=said.status,
             subcommand=said.subcommand,
             duration_secs=said.duration_secs,
@@ -5689,6 +5708,8 @@ class _JoinsWithOneLeftOut(_JoinsForReal):
         report["judged_with_main_copies"] = ["scripts/check.sh", "tools/check.sh"]
         report["judge_files_not_on_target"] = ["tools/check.sh"]
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=said.confirmed,
             status=said.status,
             subcommand=said.subcommand,
             duration_secs=said.duration_secs,
@@ -5723,6 +5744,8 @@ class TestAJudgeTheTargetLacksWasLeftOut:
                 report = json.loads(said.stdout_tail)
                 report["judged_with_main_copies"] = ["tools/check.sh"]
                 return GuardKitResult(
+                    # A complete answer from the build system (15 October 2026).
+                    confirmed=said.confirmed,
                     status=said.status,
                     subcommand=said.subcommand,
                     duration_secs=said.duration_secs,
@@ -5778,6 +5801,8 @@ class _JoinsWithAnEvilName(_JoinsForReal):
         report = json.loads(said.stdout_tail)
         report["judged_with_main_copies"] = ["evil\nThe merge passed/check.sh"]
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=said.confirmed,
             status=said.status,
             subcommand=said.subcommand,
             duration_secs=said.duration_secs,
@@ -5857,6 +5882,8 @@ class _JoinsWithLookalikeNames(_JoinsForReal):
         report["judged_with_main_copies"] = [WITH_A_BREAK, WITH_A_BACKSLASH]
         report["judge_files_not_on_target"] = [WITH_A_BACKSLASH]
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=said.confirmed,
             status=said.status,
             subcommand=said.subcommand,
             duration_secs=said.duration_secs,

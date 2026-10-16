@@ -751,6 +751,8 @@ class TestTheRedMergeHook:
 
         async def guardkit(**kwargs: Any) -> GuardKitResult:
             return GuardKitResult(
+                # A complete answer from the build system (15 October 2026).
+                confirmed=True,
                 status="success",
                 subcommand=kwargs.get("subcommand", "merge"),
                 duration_secs=0.1,
@@ -767,6 +769,7 @@ class TestTheRedMergeHook:
             leg = kwargs.get("leg", "deploy")
             if leg == "candidate_check":
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome="complete",
                     verdict="pass",
                     failed_step=None,
@@ -778,8 +781,11 @@ class TestTheRedMergeHook:
                     },
                 )
             if leg == "candidate_down":
-                return SimpleNamespace(outcome="complete", detail={"candidate": "torn-down"})
+                return SimpleNamespace(
+                    outcome="complete", detail={"candidate": "torn-down"}, confirmed=True
+                )
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome=deploy_outcome,
                 verdict="fail",
                 deploy_record_ref="docs/state/x.md",

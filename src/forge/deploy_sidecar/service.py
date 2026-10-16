@@ -2502,7 +2502,17 @@ def process_run_request(
             }
         # RAISED WHILE THE COMMAND WAS RUNNING (15 October 2026): a 5xx, which
         # every caller reads as no answer, whatever the executor then did.
-        if getattr(answered, "raised_while_running", False) is True:
+        answer_timed_out = (
+            answered.word == "the-deploy-command-ran-out-of-time"
+            or getattr(answered, "timed_out", False) is True
+        )
+        if getattr(answered, "raised_while_running", False) is True or (
+            # NOT CONFIRMED (15 October 2026, R14): a command that returned
+            # but whose group could not be confirmed stopped, or one started
+            # and killed without confirmation — a 5xx, which every caller
+            # reads as no answer. A timeout is said as one, below.
+            getattr(answered, "confirmed", False) is not True and not answer_timed_out
+        ):
             return 500, {
                 "error": f"sidecar deploy error: {answered.sentence}",
                 "exit_code": answered.exit_code,
@@ -2523,12 +2533,7 @@ def process_run_request(
             "cwd": str(cwd),
             # A deploy stopped at its time limit (15 October 2026): the caller
             # counts it like a request with no answer.
-            **(
-                {"timed_out": True}
-                if answered.word == "the-deploy-command-ran-out-of-time"
-                or getattr(answered, "timed_out", False) is True
-                else {}
-            ),
+            **({"timed_out": True} if answer_timed_out else {}),
         }
 
     # LAW 6 — execute through the shared subprocess core, no shell. The runner
@@ -4906,6 +4911,15 @@ def process_git_worktree_add_request(
             "reused": False,
             "detail": "",
         }
+    # GIT GAVE NO ANSWER THAT COULD BE READ (15 October 2026): a 5xx, which
+    # every caller reads as no answer — never an answered "failed".
+    if not cut.ok and not cut.confirmed:
+        return 500, {
+            "error": f"sidecar git error: {cut.reason}",
+            "status": "failed",
+            "path": cut.path or None,
+            "reused": False,
+        }
     return 200, {
         "status": "success" if cut.ok else "failed",
         "path": cut.path or None,
@@ -4968,6 +4982,14 @@ def process_git_worktree_remove_request(
             "status": "failed",
             "path": worktree,
             "detail": "",
+        }
+    # GIT GAVE NO ANSWER THAT COULD BE READ (15 October 2026): a 5xx.
+    if not removed.ok and not removed.confirmed:
+        return 500, {
+            "error": f"sidecar git error: {removed.reason}",
+            "status": "failed",
+            "path": removed.path,
+            "detail": removed.reason,
         }
     return 200, {
         "status": "success" if removed.ok else "failed",

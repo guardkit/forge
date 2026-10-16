@@ -39,7 +39,7 @@ from collections.abc import Sequence
 from pathlib import Path
 
 from forge.deploy.candidate_tree import CANDIDATE_TREES_DIRNAME
-from forge.executor.shell_steps import TimedOut
+from forge.executor.shell_steps import Finished, TimedOut
 
 logger = logging.getLogger(__name__)
 
@@ -60,6 +60,7 @@ class NoAnswer(tuple):
     """
 
     answer_lost = True
+    confirmed = False
 
     def __new__(cls, sentence: str) -> "NoAnswer":
         return super().__new__(cls, (SIDECAR_TRANSPORT_EXIT_CODE, sentence))
@@ -226,7 +227,8 @@ class SidecarScriptRunner:
                     f"sidecar answered HTTP {exc.code} with no refusal it "
                     "could be read as"
                 )
-            return (
+            # A 4xx in the sidecar's own words: refused before running.
+            return Finished(
                 SIDECAR_TRANSPORT_EXIT_CODE,
                 f"sidecar refused (HTTP {exc.code}): {detail}",
             )
@@ -257,7 +259,7 @@ class SidecarScriptRunner:
         if parsed.get("accepted") is False:
             word = str(parsed.get("word") or "the-deploy-was-refused")
             sentence = str(parsed.get("sentence") or "the deploy was refused")
-            return (SIDECAR_TRANSPORT_EXIT_CODE, f"[{word}] {sentence}")
+            return Finished(SIDECAR_TRANSPORT_EXIT_CODE, f"[{word}] {sentence}")
         exit_code = parsed.get("exit_code")
         output = parsed.get("output_tail", "")
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):
@@ -265,8 +267,9 @@ class SidecarScriptRunner:
         not_honoured = candidate_tree_not_honoured(cwd, parsed)
         if not_honoured is not None:
             logger.error("sidecar script runner: %s", not_honoured)
-            return (SIDECAR_TRANSPORT_EXIT_CODE, not_honoured)
-        return (exit_code, output if isinstance(output, str) else str(output))
+            return Finished(SIDECAR_TRANSPORT_EXIT_CODE, not_honoured)
+        # A reply that passed every check: a complete answer (15 October 2026).
+        return Finished(exit_code, output if isinstance(output, str) else str(output))
 
 
 def says_it_timed_out(payload: object) -> bool:

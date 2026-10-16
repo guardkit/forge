@@ -100,6 +100,11 @@ class CheckJoinAnswer:
     #: of its own and no refusal before running. The command may still be
     #: running, so the merge press keeps its hold.
     answer_lost: bool = False
+    #: True only for a complete answer (15 October 2026): the build system
+    #: ran the command to an end and it was read, or the door refused it
+    #: before anything was sent. Anything else is unconfirmed, and the merge
+    #: press keeps its hold for it.
+    confirmed: bool = False
 
 
 def the_sub_command_is_not_there(
@@ -215,7 +220,11 @@ async def ask_the_build_system_to_check_the_join(
                 feature_id, j_commit, f"{type(exc).__name__}: {exc}"
             )
         )
-        return gated if refused_first else replace(gated, answer_lost=True)
+        return (
+            replace(gated, confirmed=True)
+            if refused_first
+            else replace(gated, answer_lost=True)
+        )
 
     # TIMEOUT FIRST, and an answer that could not be read (15 October 2026):
     # read before any report, because what the command started may still be
@@ -244,8 +253,12 @@ async def ask_the_build_system_to_check_the_join(
         )
         if part
     )
+    # As complete as the command's own answer (15 October 2026).
+    read_in_full = getattr(result, "confirmed", False) is True
     if the_sub_command_is_not_there(exit_code=exit_code, said=said):
-        return _gated(the_gated_sentence(feature_id, j_commit))
+        return replace(
+            _gated(the_gated_sentence(feature_id, j_commit)), confirmed=read_in_full
+        )
 
     report = _report_in(said) or {}
     status = getattr(result, "status", "failed")
@@ -262,6 +275,7 @@ async def ask_the_build_system_to_check_the_join(
         )
         return CheckJoinAnswer(
             answer_lost=not answered,
+            confirmed=answered and read_in_full,
             ran=False,
             passed=False,
             sentence=(
@@ -284,6 +298,7 @@ async def ask_the_build_system_to_check_the_join(
     counted = report.get("checks_passed")
     total = report.get("checks_total")
     return CheckJoinAnswer(
+        confirmed=read_in_full,
         ran=True,
         passed=bool(passed),
         sentence=(

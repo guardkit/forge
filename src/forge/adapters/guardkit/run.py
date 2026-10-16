@@ -671,6 +671,7 @@ async def run(
                 warnings=warnings,
                 refused_before_running=refused_first,
                 answer_lost=not refused_first,
+                confirmed=refused_first,
             )
 
         if output_surrendered:
@@ -820,6 +821,7 @@ def _binary_not_found_result(
             )
         ],
         refused_before_running=True,
+        confirmed=True,
     )
 
 
@@ -848,6 +850,7 @@ def _refused_cwd_result(
             )
         ],
         refused_before_running=True,
+        confirmed=True,
     )
 
 
