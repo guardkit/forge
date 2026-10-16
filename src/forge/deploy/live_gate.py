@@ -127,6 +127,16 @@ class LiveGateInvocation:
     media_refs: tuple[str, ...] = ()
     report_ref: str | None = None
     outcome: dict[str, int | None] | None = None
+    #: The request got no answer at all (15 October 2026): it could not be
+    #: sent, timed out, was dropped or came back unreadable, so the driver may
+    #: still be running. A gate that answered, with any verdict, is False.
+    answer_lost: bool = False
+    #: True only for a complete answer (15 October 2026): a verdict the
+    #: driver reported, a dry run, or a refusal before the driver started.
+    #: Anything else — a timeout, an error after the start, an answer that
+    #: could not be read, or an invocation built without saying — is
+    #: unconfirmed, and the merge press keeps its hold for it.
+    confirmed: bool = False
 
     def __post_init__(self) -> None:
         if self.verdict not in _VALID_VERDICTS:
@@ -229,6 +239,7 @@ class DryRunLiveGateInvoker:
             planned += ["--gates", ",".join(gate_args)]
         logger.info("dry-run live-gate: would invoke %s", " ".join(planned))
         return LiveGateInvocation(
+            confirmed=True,  # a dry run says what it would do: complete (15 October 2026)
             verdict="pass",
             run_id=f"dryrun-{feature}-{target}",
             gate_ids=tuple(gate_args),
@@ -293,6 +304,11 @@ class GuardkitSeamLiveGateInvoker:
         result = self._call_seam(args)
         verdict = self._verdict_from_result(result)
         return LiveGateInvocation(
+            # As complete as the build system's own answer (15 October 2026).
+            confirmed=(
+                getattr(result, "confirmed", False) is True
+                and getattr(result, "status", None) != "timeout"
+            ),
             verdict=verdict,
             run_id=f"{feature}-{target}",
             gate_ids=tuple(gates),
@@ -473,6 +489,7 @@ def project_driver_answer(
                 if isinstance(g, dict) and g.get("gate_id")
             )
             return LiveGateInvocation(
+                confirmed=True,  # the driver ran to an end: complete (15 October 2026)
                 verdict=str(verdict),
                 run_id=str(envelope.get("run_id") or run_id_fallback),
                 gate_ids=gate_ids_env or gate_ids,
@@ -500,6 +517,7 @@ def project_driver_answer(
         detail["envelope_verdict"] = verdict
 
     return LiveGateInvocation(
+        confirmed=True,  # the driver ran to an end: complete (15 October 2026)
         verdict=_DRIVER_EXIT_VERDICT.get(exit_code, "fail"),
         run_id=run_id_fallback,
         gate_ids=gate_ids,
@@ -661,7 +679,6 @@ class RepoDriverLiveGateInvoker:
     ) -> LiveGateInvocation:
         # Imported inside the method to keep this module's import surface small
         # (the seam-boundary precedent above).
-        import subprocess
 
         from forge.launch_environment import (
             build_project_command_env,
@@ -687,6 +704,7 @@ class RepoDriverLiveGateInvoker:
             # private home): the gate could not be run, which is an
             # INSTRUMENT problem, never a SUT fail.
             return LiveGateInvocation(
+                confirmed=True,  # refused before the driver started: complete (15 October 2026)
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
@@ -700,44 +718,50 @@ class RepoDriverLiveGateInvoker:
                     "stderr_tail": "",
                 },
             )
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=str(self._repo_path),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            # A driver that never returns is an ENVIRONMENT problem — never a SUT
-            # fail (it never indicts the feature).
+        # THROUGH THE ONE PLACE PROGRAMS ARE STARTED (15 October 2026): the
+        # spawn's own error means the gate could not be run (an answer);
+        # anything raised once the driver had started, or a driver stopped at
+        # its limit, means what it started may still be running.
+        from forge.executor.programs import run_program
+
+        ran = run_program(
+            argv,
+            cwd=str(self._repo_path),
+            env=env,
+            timeout=float(self._timeout_seconds),
+            new_session=False,
+            stdin=None,
+            post_kill_read_seconds=1.0,
+        )
+        stdout = ran.stdout.decode("utf-8", errors="replace")
+        stderr = ran.stderr.decode("utf-8", errors="replace")
+        if ran.timed_out:
+            # A driver that never returns is an ENVIRONMENT problem — never a
+            # SUT fail (it never indicts the feature). Nor is it an answer.
             return LiveGateInvocation(
+                confirmed=False,  # stopped at its limit: not confirmed (15 October 2026)
                 verdict="environment_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
                 dry_run=False,
+                answer_lost=True,
                 detail={
                     "argv": argv,
                     "cwd": str(self._repo_path),
                     "exit_code": None,
                     "error": f"driver timed out after {self._timeout_seconds}s",
-                    "stdout_tail": _bounded_tail(
-                        exc.stdout if isinstance(exc.stdout, str) else None
-                    ),
-                    "stderr_tail": _bounded_tail(
-                        exc.stderr if isinstance(exc.stderr, str) else None
-                    ),
+                    "stdout_tail": _bounded_tail(stdout),
+                    "stderr_tail": _bounded_tail(stderr),
                     "environment_note": project_program_note(
                         declared=self._launch_settings, overlay=self._extra_env
                     ),
                 },
             )
-        except OSError as exc:
+        if ran.refused_before_start:
             # Spawn failure — missing interpreter / script / not executable. An
             # INSTRUMENT problem (the gate could not be run), never a SUT fail.
             return LiveGateInvocation(
+                confirmed=True,  # never started: complete (15 October 2026)
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
@@ -746,31 +770,34 @@ class RepoDriverLiveGateInvoker:
                     "argv": argv,
                     "cwd": str(self._repo_path),
                     "exit_code": None,
-                    "error": f"could not spawn driver: {exc}",
+                    "error": f"could not spawn driver: {ran.error}",
                     "stdout_tail": "",
                     "stderr_tail": "",
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — NEVER raise past invoke()
+        if ran.raised_while_running:
+            # After the driver started: nobody knows whether it is running.
             return LiveGateInvocation(
+                confirmed=False,  # raised after it started: not confirmed (15 October 2026)
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
                 dry_run=False,
+                answer_lost=True,
                 detail={
                     "argv": argv,
                     "cwd": str(self._repo_path),
                     "exit_code": None,
-                    "error": f"driver invocation error: {exc}",
+                    "error": f"driver invocation error: {ran.error}",
                 },
             )
 
         answer = project_driver_answer(
             argv=argv,
             cwd=str(self._repo_path),
-            exit_code=proc.returncode,
-            stdout=proc.stdout or "",
-            stderr=proc.stderr or "",
+            exit_code=int(ran.exit_code if ran.exit_code is not None else 1),
+            stdout=stdout,
+            stderr=stderr,
             gate_ids=gate_ids,
             run_id_fallback=run_id_fallback,
             journey_evidence=self._journey_evidence,
@@ -986,12 +1013,14 @@ class SidecarLiveGateInvoker:
             # the copy it has, and refuses one that says nothing at all.
             body["by_hand"] = True
 
-        def _instrument(error: str) -> LiveGateInvocation:
+        def _instrument(error: str, *, answer_lost: bool = False) -> LiveGateInvocation:
             return LiveGateInvocation(
+                confirmed=not answer_lost,  # a refusal or answer read in full, unless no answer came back (15 October 2026)
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
                 dry_run=False,
+                answer_lost=answer_lost,
                 detail={
                     "argv": argv,
                     "cwd": str(self._repo_path),
@@ -1014,24 +1043,78 @@ class SidecarLiveGateInvoker:
             with urllib.request.urlopen(request, timeout=http_timeout) as resp:
                 answer = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError as exc:
+            # A refusal is an answer only in the sidecar's own words (15
+            # October 2026, Codex R5); anything else is no answer. A body that
+            # says the driver was stopped at its time limit is read first.
+            from forge.deploy.sidecar_runner import (
+                refusal_sentence_in,
+                says_it_timed_out,
+                sidecar_error_payload,
+            )
+
+            payload = sidecar_error_payload(exc)
+            if says_it_timed_out(payload):
+                return _instrument(
+                    f"the deploy sidecar at {self._base_url} answered HTTP "
+                    f"{exc.code}: the live-gate driver was stopped at its "
+                    "time limit",
+                    answer_lost=True,
+                )
+            # Only a 4xx is a refusal before running; any 5xx is no answer.
+            sentence = refusal_sentence_in(payload) if 400 <= exc.code < 500 else None
+            if sentence is None:
+                return _instrument(
+                    f"the deploy sidecar at {self._base_url} answered HTTP "
+                    f"{exc.code} with no refusal it could be read as",
+                    answer_lost=True,
+                )
             return _instrument(
                 f"the deploy sidecar at {self._base_url} refused the live gate "
-                f"(HTTP {exc.code}): {_error_body(exc)}"
+                f"(HTTP {exc.code}): {sentence}"
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             return _instrument(
                 f"the deploy sidecar at {self._base_url} could not be reached "
-                f"to run the live gate: {exc}"
+                f"to run the live gate: {exc}",
+                answer_lost=True,
             )
         except Exception as exc:  # noqa: BLE001 — NEVER raise past invoke()
-            return _instrument(f"live-gate invocation error: {exc}")
+            # An unreadable answer is no answer: the driver may still be running.
+            return _instrument(f"live-gate invocation error: {exc}", answer_lost=True)
 
+        # TIMEOUT FIRST (15 October 2026, Codex round 3): a reply that says
+        # the driver was stopped at its time limit is a lost answer whatever
+        # else is wrong with it — a missing or mismatched cwd included.
+        if isinstance(answer, dict) and answer.get("timed_out") is True:
+            return LiveGateInvocation(
+                confirmed=False,  # stopped at its limit: not confirmed (15 October 2026)
+                verdict="environment_fail",
+                run_id=run_id_fallback,
+                gate_ids=gate_ids,
+                dry_run=False,
+                answer_lost=True,
+                detail={
+                    "argv": argv,
+                    "cwd": answer.get("cwd"),
+                    "sidecar": self._base_url,
+                    "exit_code": answer.get("exit_code"),
+                    "error": (
+                        f"the live-gate driver was stopped after "
+                        f"{self._timeout_seconds}s inside the sandbox"
+                    ),
+                    "stdout_tail": _bounded_tail(str(answer.get("stdout") or "")),
+                    "stderr_tail": _bounded_tail(
+                        str(answer.get("stderr_tail") or "")
+                    ),
+                },
+            )
         if not isinstance(answer, dict) or not isinstance(
             answer.get("exit_code"), int
         ) or isinstance(answer.get("exit_code"), bool):
             return _instrument(
                 "the deploy sidecar answered something that is not a live-gate "
-                f"result: {answer!r}"
+                f"result: {answer!r}",
+                answer_lost=True,
             )
         ran_in = answer.get("cwd")
         # WHERE IT RAN IS THE HELPER'S TO SAY, unless a tree was asked for (3
@@ -1057,27 +1140,6 @@ class SidecarLiveGateInvoker:
                 f"deploy sidecar ran it in {ran_in!r}, so the tree that was "
                 "checked is not the tree that was asked about"
             )
-        if answer.get("timed_out") is True:
-            return LiveGateInvocation(
-                verdict="environment_fail",
-                run_id=run_id_fallback,
-                gate_ids=gate_ids,
-                dry_run=False,
-                detail={
-                    "argv": argv,
-                    "cwd": ran_in,
-                    "sidecar": self._base_url,
-                    "exit_code": answer.get("exit_code"),
-                    "error": (
-                        f"the live-gate driver was stopped after "
-                        f"{self._timeout_seconds}s inside the sandbox"
-                    ),
-                    "stdout_tail": _bounded_tail(str(answer.get("stdout") or "")),
-                    "stderr_tail": _bounded_tail(
-                        str(answer.get("stderr_tail") or "")
-                    ),
-                },
-            )
         invocation = project_driver_answer(
             argv=argv,
             cwd=ran_in,
@@ -1092,20 +1154,6 @@ class SidecarLiveGateInvoker:
             invocation,
             detail={**invocation.detail, "sidecar": self._base_url},
         )
-
-
-def _error_body(exc: Any) -> str:
-    """The plain sentence inside a sidecar refusal, best effort."""
-    import json
-
-    try:
-        payload = json.loads(exc.read().decode("utf-8"))
-    except Exception:  # noqa: BLE001 — best-effort detail
-        reason = getattr(exc, "reason", None)
-        return reason if isinstance(reason, str) else "unknown"
-    if isinstance(payload, dict) and "error" in payload:
-        return str(payload["error"])
-    return str(payload)
 
 
 def _same_place(sent: str, answered: str) -> bool:

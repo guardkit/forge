@@ -33,12 +33,14 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 
 from forge.deploy.candidate_tree import CANDIDATE_TREES_DIRNAME
+from forge.executor.shell_steps import Finished, TimedOut
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +48,37 @@ logger = logging.getLogger(__name__)
 #: malformed data. Distinct from a script's own exit code (which the sidecar
 #: relays verbatim) so a transport failure is not mistaken for a script failure.
 SIDECAR_TRANSPORT_EXIT_CODE = 1
+
+#: The owned deploy executor's result words: lowercase words joined by dashes.
+_EXECUTOR_WORD = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+class NoAnswer(tuple):
+    """``(exit code, sentence)`` for a request that got NO ANSWER at all.
+
+    15 October 2026. The request could not be sent, timed out, had its
+    connection dropped, or came back unreadable: the script may still be
+    running in the sandbox, which no exit code can say. It unpacks exactly
+    like every runner's ``(exit_code, output)``, so a caller that does not
+    ask is unchanged; one that asks reads :func:`no_answer_came_back`.
+    """
+
+    answer_lost = True
+    confirmed = False
+
+    def __new__(cls, sentence: str) -> "NoAnswer":
+        return super().__new__(cls, (SIDECAR_TRANSPORT_EXIT_CODE, sentence))
+
+    def __getnewargs__(self) -> tuple[str]:
+        # So a copy or a pickle is made from the sentence, as ``__new__`` takes.
+        return (self[1],)
+
+
+def no_answer_came_back(answer: object) -> bool:
+    """Is ``answer`` a runner's answer saying no answer came back — or that
+    the script was stopped at its time limit, which is read the same way
+    (:class:`forge.executor.shell_steps.TimedOut`)?"""
+    return getattr(answer, "answer_lost", False) is True
 
 
 class SidecarScriptRunner:
@@ -177,63 +210,123 @@ class SidecarScriptRunner:
                 raw = resp.read()
                 parsed = json.loads(raw.decode("utf-8"))
         except urllib.error.HTTPError as exc:
-            # A 4xx/5xx from the sidecar (e.g. a deny-by-default refusal). Read
-            # the error body so the refusal message is on the record.
-            detail = self._read_error_body(exc)
-            return (
+            # A 4xx/5xx from the sidecar (e.g. a deny-by-default refusal). It is
+            # an ANSWER only when it carries the sidecar's own refusal sentence
+            # (15 October 2026, Codex R5); an empty, unreadable or HTML body,
+            # or a JSON object with no sentence, says nothing about whether the
+            # script ran, so it is no answer. A body that says the script was
+            # stopped at its time limit is read FIRST, whatever else it says.
+            payload = sidecar_error_payload(exc)
+            if says_it_timed_out(payload):
+                return TimedOut(
+                    SIDECAR_TRANSPORT_EXIT_CODE,
+                    f"sidecar answered HTTP {exc.code}: the script was stopped "
+                    "at its time limit",
+                )
+            # Only a refusal BEFORE running is an answer, and only a 4xx is
+            # one: any 5xx, whatever its body, is no answer (15 October 2026).
+            detail = refusal_sentence_in(payload) if 400 <= exc.code < 500 else None
+            if detail is None:
+                return NoAnswer(
+                    f"sidecar answered HTTP {exc.code} with no refusal it "
+                    "could be read as"
+                )
+            # A 4xx in the sidecar's own words: refused before running.
+            return Finished(
                 SIDECAR_TRANSPORT_EXIT_CODE,
                 f"sidecar refused (HTTP {exc.code}): {detail}",
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar unreachable at {self._base_url}: {exc}",
-            )
+            return NoAnswer(f"sidecar unreachable at {self._base_url}: {exc}")
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar returned a non-JSON response: {exc}",
-            )
+            return NoAnswer(f"sidecar returned a non-JSON response: {exc}")
         except Exception as exc:  # noqa: BLE001 — never raise past the boundary
             logger.warning("sidecar script runner unexpected error: %s", exc)
-            return (SIDECAR_TRANSPORT_EXIT_CODE, f"sidecar client error: {exc}")
+            return NoAnswer(f"sidecar client error: {exc}")
 
+        # TIMEOUT FIRST (15 October 2026, Codex round 3): a reply that says the
+        # script was stopped at its time limit is a lost answer whatever else
+        # is wrong with it — a missing or wrong cwd, an odd exit code.
+        if says_it_timed_out(parsed):
+            code = parsed.get("exit_code")
+            if not isinstance(code, int) or isinstance(code, bool):
+                code = SIDECAR_TRANSPORT_EXIT_CODE
+            tail = parsed.get("output_tail", "")
+            return TimedOut(code, tail if isinstance(tail, str) else str(tail))
         if not isinstance(parsed, dict) or "exit_code" not in parsed:
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar response missing exit_code: {parsed!r}",
-            )
+            return NoAnswer(f"sidecar response missing exit_code: {parsed!r}")
         # A DEPLOY THE EXECUTOR REFUSED is not a script that went red and not a
         # transport failure: nothing ran. It comes back as a non-zero exit with
         # the executor's own plain sentence, which is what the step records and
         # what a person reads, and the word beside it so a caller can tell the
         # refusals apart without reading English.
         if parsed.get("accepted") is False:
-            word = str(parsed.get("word") or "the-deploy-was-refused")
-            sentence = str(parsed.get("sentence") or "the deploy was refused")
-            return (SIDECAR_TRANSPORT_EXIT_CODE, f"[{word}] {sentence}")
+            # A REFUSAL IS CONFIRMED ONLY IN THE EXECUTOR'S OWN SHAPE (15
+            # October 2026, Codex R16): a result word, a sentence, and an exit
+            # code that is an integer or the executor's own "none" (nothing
+            # ran). Anything less was not an answer anybody can rely on.
+            word = parsed.get("word")
+            sentence = parsed.get("sentence")
+            refused_code = parsed.get("exit_code")
+            if not (
+                isinstance(word, str)
+                and _EXECUTOR_WORD.match(word)
+                and isinstance(sentence, str)
+                and sentence.strip()
+                and (
+                    refused_code is None
+                    or (isinstance(refused_code, int) and not isinstance(refused_code, bool))
+                )
+            ):
+                return NoAnswer(f"sidecar answered a refusal of no known shape: {parsed!r}")
+            return Finished(SIDECAR_TRANSPORT_EXIT_CODE, f"[{word}] {sentence}")
         exit_code = parsed.get("exit_code")
         output = parsed.get("output_tail", "")
         if not isinstance(exit_code, int) or isinstance(exit_code, bool):
-            return (
-                SIDECAR_TRANSPORT_EXIT_CODE,
-                f"sidecar returned a non-integer exit_code: {exit_code!r}",
-            )
+            return NoAnswer(f"sidecar returned a non-integer exit_code: {exit_code!r}")
         not_honoured = candidate_tree_not_honoured(cwd, parsed)
         if not_honoured is not None:
             logger.error("sidecar script runner: %s", not_honoured)
-            return (SIDECAR_TRANSPORT_EXIT_CODE, not_honoured)
-        return (exit_code, output if isinstance(output, str) else str(output))
+            return Finished(SIDECAR_TRANSPORT_EXIT_CODE, not_honoured)
+        # A reply that passed every check: a complete answer (15 October 2026).
+        return Finished(exit_code, output if isinstance(output, str) else str(output))
 
-    @staticmethod
-    def _read_error_body(exc: urllib.error.HTTPError) -> str:
-        try:
-            payload = json.loads(exc.read().decode("utf-8"))
-            if isinstance(payload, dict) and "error" in payload:
-                return str(payload["error"])
-            return str(payload)
-        except Exception:  # noqa: BLE001 — best-effort detail
-            return exc.reason if isinstance(exc.reason, str) else "unknown"
+
+def says_it_timed_out(payload: object) -> bool:
+    """Does a sidecar reply say its program was stopped at its time limit?
+
+    Read FIRST by every client (15 October 2026): such a reply is a lost
+    answer whatever else is wrong with it.
+    """
+    return isinstance(payload, dict) and payload.get("timed_out") is True
+
+
+def sidecar_error_payload(exc: urllib.error.HTTPError) -> object:
+    """The decoded body of an HTTP error, or ``None`` when it cannot be read."""
+    try:
+        return json.loads(exc.read().decode("utf-8"))
+    except Exception:  # noqa: BLE001 — an unreadable body is no answer
+        return None
+
+
+def refusal_sentence_in(payload: object) -> str | None:
+    """The sidecar's own refusal sentence in a decoded error body, or ``None``.
+
+    15 October 2026 (Codex R5). Every sidecar refusal is a JSON object with a
+    plain ``error`` sentence. Only that is an answer; anything else is
+    ``None``, and the caller treats it as no answer at all.
+    """
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, str) or not error.strip():
+        return None
+    return error
+
+
+def sidecar_refusal_sentence(exc: urllib.error.HTTPError) -> str | None:
+    """:func:`refusal_sentence_in` the body of ``exc``."""
+    return refusal_sentence_in(sidecar_error_payload(exc))
 
 
 def names_a_candidate_tree(cwd: object) -> bool:
@@ -283,7 +376,13 @@ def candidate_tree_not_honoured(sent_cwd: object, answer: dict[str, object]) -> 
 
 __all__ = [
     "SidecarScriptRunner",
+    "NoAnswer",
     "SIDECAR_TRANSPORT_EXIT_CODE",
+    "no_answer_came_back",
     "candidate_tree_not_honoured",
     "names_a_candidate_tree",
+    "refusal_sentence_in",
+    "says_it_timed_out",
+    "sidecar_error_payload",
+    "sidecar_refusal_sentence",
 ]

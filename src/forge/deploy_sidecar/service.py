@@ -231,6 +231,12 @@ from forge.deploy_sidecar.deploy_executor import (
     DeployExecutor,
     request_from as deploy_request_from,
 )
+from forge.executor.programs import (
+    RaisedWhileRunning,
+    RefusedBeforeStart,
+    TimedOut,
+    run_program,
+)
 from forge.executor.shell_steps import _run_script_step
 from forge.launch_environment import (
     build_launch_env,
@@ -2020,7 +2026,7 @@ def process_live_gate_run(
     # are some, so a runner written before them is called exactly as before.
     issued_kwargs: dict[str, Any] = {"issued": issued} if issued is not None else {}
     try:
-        exit_code, stdout, stderr = command_runner(
+        ran = command_runner(
             argv=argv,
             cwd=str(cwd),
             timeout=timeout,
@@ -2033,6 +2039,7 @@ def process_live_gate_run(
             repository=str(repo_path),
             **issued_kwargs,
         )
+        exit_code, stdout, stderr = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
@@ -2040,6 +2047,9 @@ def process_live_gate_run(
             "stdout": "",
             "stderr_tail": "",
         }
+    ended = _a_program_that_did_not_finish(ran)
+    if ended is not None:
+        return ended
     return 200, {
         "exit_code": exit_code,
         "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
@@ -2122,7 +2132,7 @@ def process_declared_test_run(
         timeout,
     )
     try:
-        exit_code, stdout, stderr = command_runner(
+        ran = command_runner(
             argv=["/bin/sh", "-c", declared],
             cwd=cwd,
             timeout=timeout,
@@ -2131,6 +2141,7 @@ def process_declared_test_run(
             launch_settings=launch_settings,
             repository=str(repo_path),
         )
+        exit_code, stdout, stderr = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
@@ -2138,6 +2149,9 @@ def process_declared_test_run(
             "stdout": "",
             "stderr_tail": "",
         }
+    ended = _a_program_that_did_not_finish(ran)
+    if ended is not None:
+        return ended
     return 200, {
         "exit_code": exit_code,
         "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
@@ -2486,6 +2500,24 @@ def process_run_request(
                 "exit_code": 1,
                 "output_tail": "",
             }
+        # RAISED WHILE THE COMMAND WAS RUNNING (15 October 2026): a 5xx, which
+        # every caller reads as no answer, whatever the executor then did.
+        answer_timed_out = (
+            answered.word == "the-deploy-command-ran-out-of-time"
+            or getattr(answered, "timed_out", False) is True
+        )
+        if getattr(answered, "raised_while_running", False) is True or (
+            # NOT CONFIRMED (15 October 2026, R14): a command that returned
+            # but whose group could not be confirmed stopped, or one started
+            # and killed without confirmation — a 5xx, which every caller
+            # reads as no answer. A timeout is said as one, below.
+            getattr(answered, "confirmed", False) is not True and not answer_timed_out
+        ):
+            return 500, {
+                "error": f"sidecar deploy error: {answered.sentence}",
+                "exit_code": answered.exit_code,
+                "output_tail": "",
+            }
         # A REFUSAL IS NOT A TRANSPORT FAILURE and it is not a script that went
         # red: it is the executor saying this request may not run. Either way
         # the answer is a 200 carrying ``accepted``, the machine-readable word
@@ -2499,6 +2531,9 @@ def process_run_request(
             "exit_code": answered.exit_code,
             "output_tail": _tail(answered.output) if answered.output else "",
             "cwd": str(cwd),
+            # A deploy stopped at its time limit (15 October 2026): the caller
+            # counts it like a request with no answer.
+            **({"timed_out": True} if answer_timed_out else {}),
         }
 
     # LAW 6 — execute through the shared subprocess core, no shell. The runner
@@ -2506,7 +2541,7 @@ def process_run_request(
     # cannot take the process down.
     issued_kwargs: dict[str, Any] = {"issued_env": issued} if issued is not None else {}
     try:
-        exit_code, output = script_runner(
+        ran = script_runner(
             **issued_kwargs,
             repository=str(repo_path),
             cwd=str(cwd),
@@ -2521,16 +2556,43 @@ def process_run_request(
             memory_project=launch_memory,
             launch_settings=launch_names,
         )
+        exit_code, output = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
             "exit_code": 1,
             "output_tail": "",
         }
+    # The script was never started: a 4xx in the sidecar's own words, an
+    # answer (15 October 2026). It raised after it may have started: a 5xx,
+    # which every caller reads as no answer.
+    if getattr(ran, "refused_before_running", False) is True:
+        return 400, {
+            "error": (
+                output.strip()
+                or f"the script {script} could not be started (exit {exit_code})"
+            ),
+            "exit_code": exit_code,
+            "output_tail": "",
+        }
+    if getattr(ran, "answer_lost", False) is True and not getattr(
+        ran, "timed_out", False
+    ):
+        return 500, {
+            "error": f"sidecar execution error: {output}",
+            "exit_code": exit_code,
+            "output_tail": _tail(output),
+        }
 
     # LAW 8, the other half: say where the script ran, so a caller that named
-    # a candidate tree can tell it was honoured.
-    return 200, {"exit_code": exit_code, "output_tail": _tail(output), "cwd": str(cwd)}
+    # a candidate tree can tell it was honoured. A script stopped at its time
+    # limit says so (15 October 2026): what it started may still be running.
+    return 200, {
+        "exit_code": exit_code,
+        "output_tail": _tail(output),
+        "cwd": str(cwd),
+        **({"timed_out": True} if getattr(ran, "timed_out", False) is True else {}),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -2776,9 +2838,8 @@ def run_project_program(
         )
     except (OSError, ValueError) as exc:
         return (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} was not started: {exc}")
-    exit_code, stdout, stderr = _start_and_collect(
-        argv=argv, cwd=cwd, env=env, timeout=timeout, what=what
-    )
+    ran = _start_and_collect(argv=argv, cwd=cwd, env=env, timeout=timeout, what=what)
+    exit_code, stdout, stderr = ran
     if exit_code != 0:
         note = project_program_note(
             declared=launch_settings or (),
@@ -2787,7 +2848,12 @@ def run_project_program(
             run_owner=run_owner,
         )
         stderr = f"{stderr}\n{note}" if stderr else note
-    return exit_code, stdout, stderr
+    # The same kind of result, with the note added (15 October 2026).
+    return type(ran)((exit_code, stdout, stderr)) if type(ran) is not tuple else (
+        exit_code,
+        stdout,
+        stderr,
+    )
 
 
 def _start_and_collect(
@@ -2805,55 +2871,81 @@ def _start_and_collect(
     credential scrub. Which environment the child gets is decided by the
     caller and only by the caller. Never raises.
     """
-    try:
-        process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-            argv,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+    # THROUGH THE ONE PLACE PROGRAMS ARE STARTED (15 October 2026): the
+    # spawn's own error is a refusal (nothing ran); anything raised once the
+    # program had started is RaisedWhileRunning; a timeout stops the whole
+    # group and is TimedOut.
+    ran = run_program(
+        argv,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        new_session=True,
+        kill_grace_seconds=MERGE_KILL_GRACE_SECONDS,
+        post_kill_read_seconds=MERGE_POST_KILL_READ_SECONDS,
+    )
+    if ran.refused_before_start:
+        error = ran.error
+        if isinstance(error, (FileNotFoundError, NotADirectoryError)):
+            code = MERGE_NOT_STARTED_EXIT_CODE
+            said = f"{what} could not be started: {error}"
+        elif isinstance(error, PermissionError):
+            code, said = 126, f"{what} could not be run: {error}"
+        else:
+            code, said = 1, f"{what} could not be started: {error}"
+        return RefusedBeforeStart(code, "", said)
+    stdout = scrub_process_output(ran.stdout.decode("utf-8", errors="replace"))
+    stderr = scrub_process_output(ran.stderr.decode("utf-8", errors="replace"))
+    if ran.raised_while_running:
+        error = ran.error
+        return RaisedWhileRunning(
+            1,
+            stdout,
+            f"{stderr}\n{what} raised while it was running: "
+            f"{type(error).__name__}: {error}".strip(),
         )
-    except FileNotFoundError as exc:
-        return (
-            MERGE_NOT_STARTED_EXIT_CODE,
-            "",
-            f"{what} could not be started: {exc}",
-        )
-    except NotADirectoryError as exc:
-        return (
-            MERGE_NOT_STARTED_EXIT_CODE,
-            "",
-            f"{what} could not be started: {exc}",
-        )
-    except PermissionError as exc:
-        return (126, "", f"{what} could not be run: {exc}")
-    except OSError as exc:
-        return (1, "", f"{what} could not be started: {exc}")
-
-    timed_out = False
-    try:
-        raw_out, raw_err = process.communicate(timeout=timeout)
-        exit_code = process.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_process_group(process)
-        try:
-            raw_out, raw_err = process.communicate(
-                timeout=MERGE_POST_KILL_READ_SECONDS
-            )
-        except subprocess.TimeoutExpired:
-            raw_out, raw_err = b"", b""
-        exit_code = MERGE_TIMEOUT_EXIT_CODE
-
-    stdout = scrub_process_output((raw_out or b"").decode("utf-8", errors="replace"))
-    stderr = scrub_process_output((raw_err or b"").decode("utf-8", errors="replace"))
-    if timed_out:
+    if ran.timed_out:
         stderr += (
             f"\n{what} was stopped after {timeout:g} seconds and "
             "everything it had started was stopped with it"
         )
+        return StoppedAtItsTimeLimit(MERGE_TIMEOUT_EXIT_CODE, stdout, stderr)
+    exit_code = ran.exit_code if ran.exit_code is not None else 1
     return exit_code, stdout, stderr
+
+
+#: The results the process collector answers with, from the one place
+#: programs are started (15 October 2026). The old name for a timeout is kept.
+StoppedAtItsTimeLimit = TimedOut
+
+
+def _a_program_that_did_not_finish(
+    ran: Any, *, stdout_key: str = "stdout"
+) -> tuple[int, dict[str, Any]] | None:
+    """The reply for a program that never started or raised while running.
+
+    15 October 2026, the one rule every route follows: a program the system
+    refused to start is a 4xx in the sidecar's own words (nothing ran: an
+    answer); one that raised once it had started is a 5xx (nobody knows
+    whether it is still running: every caller reads it as no answer).
+    ``None`` for a program that ran to an end or was stopped at its limit,
+    which the route answers as it always has.
+    """
+    if getattr(ran, "refused_before_running", False) is True:
+        exit_code, _out, said = ran
+        return 400, {
+            "error": str(said or "").strip() or "the program could not be started",
+            "exit_code": exit_code,
+            stdout_key: "",
+        }
+    if getattr(ran, "answer_lost", False) is True and not getattr(ran, "timed_out", False):
+        exit_code, _out, said = ran
+        return 500, {
+            "error": f"sidecar execution error: {said}",
+            "exit_code": exit_code,
+            stdout_key: "",
+        }
+    return None
 
 
 def _tail_chars(text: str, limit: int) -> str:
@@ -3105,7 +3197,10 @@ def process_guardkit_merge_request(
 
     command = command_resolver()
     if not command:
-        return 500, {
+        # A refusal BEFORE anything runs is a 4xx (15 October 2026): only that
+        # is an answer; every 5xx is read as an answer that cannot be relied
+        # on.
+        return 400, {
             "error": (
                 "this host has no guardkit command to run — set "
                 f"{GUARDKIT_PATH_ENV} to its path, or put {GUARDKIT_BINARY_NAME} "
@@ -3153,7 +3248,8 @@ def process_guardkit_merge_request(
                 encoding="utf-8",
             )
         except OSError as exc:
-            return 500, {
+            # Before the command is started: a refusal, so a 4xx.
+            return 400, {
                 "error": (
                     "the sidecar could not write the list of tests that were "
                     f"already failing to {baseline_path}: {exc}"
@@ -3188,8 +3284,11 @@ def process_guardkit_merge_request(
             runner_kwargs["feature_routing_required"] = feature_routing_required
         if feature_routing_receipt is not None:
             runner_kwargs["feature_routing_receipt"] = feature_routing_receipt
-        exit_code, stdout, stderr = merge_runner(**runner_kwargs)
+        ran = merge_runner(**runner_kwargs)
+        exit_code, stdout, stderr = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        # Raised while the command may already have been running: a 5xx,
+        # which every caller reads as no answer (15 October 2026).
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
             "exit_code": 1,
@@ -3197,10 +3296,19 @@ def process_guardkit_merge_request(
             "stderr_tail": "",
         }
 
+    # NEVER STARTED, or RAISED WHILE RUNNING (15 October 2026): a 4xx and a
+    # 5xx, as every route answers them.
+    ended = _a_program_that_did_not_finish(ran)
+    if ended is not None:
+        return ended
+
     return 200, {
         "exit_code": exit_code,
         "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
         "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+        # Stopped at its time limit (15 October 2026): what it started may
+        # still be running, whatever its output says.
+        **({"timed_out": True} if getattr(ran, "timed_out", False) is True else {}),
     }
 
 
@@ -4648,13 +4756,21 @@ def _autobuild_worktree_request(
     expected = payload.get("expected")
     if not isinstance(expected, dict):
         return 400, {"error": "'expected' retained worktree identity is required"}
-    return 200, retire_autobuild_worktree(
+    retired = retire_autobuild_worktree(
         repo=repo_path,
         base=base,
         build_id=build_id,
         path=Path(path),
         expected=expected,
     )
+    # A git command in it raised instead of answering (15 October 2026): a
+    # 5xx, which every caller reads as no answer.
+    if retired.get("git_raised"):
+        return 500, {
+            "error": "sidecar git error: a git command raised during the retirement",
+            **retired,
+        }
+    return 200, retired
 
 
 def process_git_autobuild_worktree_inspect_request(
@@ -4803,6 +4919,15 @@ def process_git_worktree_add_request(
             "reused": False,
             "detail": "",
         }
+    # GIT GAVE NO ANSWER THAT COULD BE READ (15 October 2026): a 5xx, which
+    # every caller reads as no answer — never an answered "failed".
+    if not cut.ok and not cut.confirmed:
+        return 500, {
+            "error": f"sidecar git error: {cut.reason}",
+            "status": "failed",
+            "path": cut.path or None,
+            "reused": False,
+        }
     return 200, {
         "status": "success" if cut.ok else "failed",
         "path": cut.path or None,
@@ -4865,6 +4990,14 @@ def process_git_worktree_remove_request(
             "status": "failed",
             "path": worktree,
             "detail": "",
+        }
+    # GIT GAVE NO ANSWER THAT COULD BE READ (15 October 2026): a 5xx.
+    if not removed.ok and not removed.confirmed:
+        return 500, {
+            "error": f"sidecar git error: {removed.reason}",
+            "status": "failed",
+            "path": removed.path,
+            "detail": removed.reason,
         }
     return 200, {
         "status": "success" if removed.ok else "failed",

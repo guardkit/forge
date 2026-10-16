@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import json
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
@@ -95,6 +95,16 @@ class CheckJoinAnswer:
     checks_total: int | None = None
     verify_status: str | None = None
     report: dict[str, Any] | None = None
+    #: No answer that could be read came back (15 October 2026): the call
+    #: raised after it may have been sent, timed out, or returned no report
+    #: of its own and no refusal before running. The command may still be
+    #: running, so the merge press keeps its hold.
+    answer_lost: bool = False
+    #: True only for a complete answer (15 October 2026): the build system
+    #: ran the command to an end and it was read, or the door refused it
+    #: before anything was sent. Anything else is unconfirmed, and the merge
+    #: press keeps its hold for it.
+    confirmed: bool = False
 
 
 def the_sub_command_is_not_there(
@@ -190,9 +200,14 @@ async def ask_the_build_system_to_check_the_join(
     except Exception as exc:  # noqa: BLE001 — a GATED ending, never a crash
         # The door the factory runs the build system through carries exactly
         # the commands it was built to carry and refuses anything else, and
-        # that refusal arrives here as an exception. It is the same fact as
-        # "the installed build system does not have it": this factory cannot
-        # get that question answered where the build happens.
+        # that refusal arrives here as an exception, raised before anything is
+        # sent. It is the same fact as "the installed build system does not
+        # have it": this factory cannot get that question answered where the
+        # build happens. ANY OTHER exception (15 October 2026) may have come
+        # after the command was sent, so nobody knows whether it is running.
+        from forge.adapters.guardkit.run_via_sidecar import MergeCallRefused
+
+        refused_first = isinstance(exc, MergeCallRefused)
         logger.info(
             "merge-executor: the build system could not be asked to check the "
             "join for %s (%s: %s) — the build stays gated and says so",
@@ -200,10 +215,33 @@ async def ask_the_build_system_to_check_the_join(
             type(exc).__name__,
             exc,
         )
-        return _gated(
+        gated = _gated(
             the_gated_sentence(
                 feature_id, j_commit, f"{type(exc).__name__}: {exc}"
             )
+        )
+        return (
+            replace(gated, confirmed=True)
+            if refused_first
+            else replace(gated, answer_lost=True)
+        )
+
+    # TIMEOUT FIRST, and an answer that could not be read (15 October 2026):
+    # read before any report, because what the command started may still be
+    # running whatever it printed.
+    if getattr(result, "status", None) == "timeout" or (
+        getattr(result, "answer_lost", False) is True
+    ):
+        return CheckJoinAnswer(
+            ran=False,
+            passed=False,
+            sentence=(
+                f"the build system's own checks on the joined result "
+                f"{j_commit[:10]} gave no answer that could be relied on "
+                f"(the check-join command {getattr(result, 'status', 'failed')})"
+            ),
+            verify_status="unverified",
+            answer_lost=True,
         )
 
     exit_code = getattr(result, "exit_code", None)
@@ -215,8 +253,12 @@ async def ask_the_build_system_to_check_the_join(
         )
         if part
     )
+    # As complete as the command's own answer (15 October 2026).
+    read_in_full = getattr(result, "confirmed", False) is True
     if the_sub_command_is_not_there(exit_code=exit_code, said=said):
-        return _gated(the_gated_sentence(feature_id, j_commit))
+        return replace(
+            _gated(the_gated_sentence(feature_id, j_commit)), confirmed=read_in_full
+        )
 
     report = _report_in(said) or {}
     status = getattr(result, "status", "failed")
@@ -225,8 +267,15 @@ async def ask_the_build_system_to_check_the_join(
         ran = False
     if not ran:
         # It exists, and it could not run the checks. That is "unverified",
-        # not a pass and not a red set of checks.
+        # not a pass and not a red set of checks. With no report of its own
+        # and no refusal before running, nobody knows what it did, and the
+        # answer is a lost one (15 October 2026).
+        answered = bool(report) or bool(
+            getattr(result, "refused_before_running", False)
+        )
         return CheckJoinAnswer(
+            answer_lost=not answered,
+            confirmed=answered and read_in_full,
             ran=False,
             passed=False,
             sentence=(
@@ -249,6 +298,7 @@ async def ask_the_build_system_to_check_the_join(
     counted = report.get("checks_passed")
     total = report.get("checks_total")
     return CheckJoinAnswer(
+        confirmed=read_in_full,
         ran=True,
         passed=bool(passed),
         sentence=(

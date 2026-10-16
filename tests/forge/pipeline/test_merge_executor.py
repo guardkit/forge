@@ -288,6 +288,8 @@ def a_build_system_without_check_join(kwargs: dict[str, Any]) -> GuardKitResult 
     if not args or args[0] != "check-join":
         return None
     return GuardKitResult(
+        # A complete answer from the build system (15 October 2026).
+        confirmed=True,
         status="failed",
         subcommand=str(kwargs.get("subcommand", "autobuild")),
         duration_secs=0.01,
@@ -330,6 +332,8 @@ class _FakeGuardKit:
         if not_there is not None:
             return not_there
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status=self.status,  # type: ignore[arg-type]
             subcommand=kwargs.get("subcommand", "autobuild"),
             duration_secs=0.1,
@@ -440,6 +444,8 @@ class _JoinsForReal:
             "checks_total": self.checks_total,
         }
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status="success",
             subcommand=kwargs.get("subcommand", "autobuild"),
             duration_secs=0.1,
@@ -530,6 +536,7 @@ class _FakeDeploy:
             if self.candidate_outcome == "complete":
                 gate = self.gate if self.gate is not None else dict(GREEN_GATE)
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome="complete",
                     verdict=self.candidate_verdict,
                     failed_step=None,
@@ -539,6 +546,7 @@ class _FakeDeploy:
             gate = self.gate if self.gate is not None else dict(RED_GATE)
             reason = self.candidate_reason or "candidate_failed"
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="failed",
                 verdict=self.candidate_verdict,
                 failed_step=self.candidate_failed_step or "candidate_gate",
@@ -547,11 +555,13 @@ class _FakeDeploy:
             )
         if leg == "candidate_down":
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
             )
         if self.raises is not None:
             raise self.raises
         return SimpleNamespace(
+            confirmed=True,  # a complete leg answer (15 October 2026)
             outcome=self.outcome,
             verdict=self.verdict,
             deploy_record_ref="docs/state/x.md",
@@ -2029,6 +2039,8 @@ class _ACheckJoinThatCouldNotRunTheChecks:
             report["verify_ran"] = True
         exits_zero = self.shape == "silent"
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status="success" if exits_zero else "failed",
             subcommand="autobuild",
             duration_secs=0.1,
@@ -4465,20 +4477,28 @@ class ASidecarThat:
         threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def run_the_leg(self, leg: str) -> Any:
-        """Send one script through the real runner; the stage's result shape."""
-        from forge.deploy.sidecar_runner import SidecarScriptRunner
+        """Send one script through the real runner; the stage's result shape,
+        with the stage's run-wide mark when no answer came back."""
+        from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
 
         host, port = self.server.server_address[:2]
         runner = SidecarScriptRunner(base_url=f"http://{host}:{port}", repo=REPO)
-        exit_code, output = runner(
+        answer = runner(
             cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=5
         )
+        exit_code, output = answer
         return SimpleNamespace(
+            # As the stage would: complete only when the runner vouched for it.
+            confirmed=getattr(answer, "confirmed", False) is True,
             outcome="complete" if exit_code == 0 else "failed",
             verdict=None,
             failed_step=None if exit_code == 0 else leg,
             events=(),
-            detail={"deploy_output": output, "candidate": "torn-down"},
+            detail={
+                "deploy_output": output,
+                "candidate": "torn-down",
+                **({"answer_lost": True} if no_answer_came_back(answer) else {}),
+            },
         )
 
     def close(self) -> None:
@@ -4548,17 +4568,18 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         [None, {"verdict": None, "failed_checks": []}],
         ids=["red-with-a-verdict", "no-verdict"],
     )
-    async def test_a_candidate_check_that_failed_keeps_it(
+    async def test_an_answered_red_candidate_check_puts_it_down(
         self,
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
         gate: dict[str, Any] | None,
     ) -> None:
-        """The coach's G1, 4 October 2026: a failed candidate check is a
-        deploy-stage leg that did not complete, and the stage may have torn
-        its candidate down (or not) on the way, so the hold is kept whatever
-        verdict came back."""
+        """15 October 2026, replacing the coach's G1 of 4 October: a red
+        candidate check that ANSWERED has finished, whatever verdict came
+        back, and the stage says its candidate was torn down — so the hold is
+        put down, as for a986459c's retained worktree. Keeping it made the
+        release idle check wait on builds with nothing running."""
         deps, _publisher, _gk, _dp = _deps(
             config, pool, guardkit=_JoinsForReal(),
             deploy=_FakeDeploy(candidate_outcome="failed", gate=gate),
@@ -4567,7 +4588,48 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         outcome = await _run_executor(deps, repo_root)
 
         assert outcome.result == "candidate-refused"
-        assert _the_hold(pool).lease_holder is not None
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert held.lease_holder is None
+        again = await _run_executor(deps, repo_root)
+        assert "another worker" not in again.detail
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "detail",
+        [
+            # The stage's own words: a step's request got no answer.
+            {"reason": "candidate_deploy_failed", "answer_lost": True},
+            # The candidate's own teardown did not take it down.
+            {"reason": "candidate_failed", "candidate": "standing"},
+        ],
+        ids=["answer-lost", "candidate-still-standing"],
+    )
+    async def test_a_candidate_check_that_may_have_left_something_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        detail: dict[str, Any],
+    ) -> None:
+        class _ACheckThatSays(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                answer = await super().__call__(**kwargs)
+                if kwargs.get("leg") == "candidate_check":
+                    answer.detail = {**answer.detail, **detail}
+                return answer
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(),
+            deploy=_ACheckThatSays(candidate_outcome="failed"),
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused"
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert held.lease_holder is not None
         again = await _run_executor(deps, repo_root)
         assert "another worker" in again.detail
 
@@ -4593,37 +4655,48 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
         deploy: Any,
+        request: pytest.FixtureRequest,
     ) -> None:
         """15 October 2026, FEAT-0A2A: a press refused at its candidate check
         left its record with no result at all, so it read as work still in
         progress for good. Nothing was sent, so the record says publication
-        pending; the hold is kept exactly as before and lapses on its own."""
+        pending. The hold: a check that answered (red, or could not start)
+        has finished and puts it down; one that raised may still be running
+        and keeps it."""
         deps, _publisher, _gk, _dp = _deps(
             config, pool, guardkit=_JoinsForReal(), deploy=deploy()
         )
+        kept = request.node.callspec.id == "check-raised"
 
         outcome = await _run_executor(deps, repo_root)
 
         assert outcome.result == "candidate-refused", outcome.detail
         held = _the_hold(pool)
         assert held.result == "publication pending"
-        assert held.lease_holder is not None
+        assert (held.lease_holder is not None) is kept
         again = await _run_executor(deps, repo_root)
-        assert "another worker" in again.detail
+        assert ("another worker" in again.detail) is kept
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("answered, kept", [(True, False), (False, True)])
     async def test_a_tree_that_cannot_be_laid_out_says_nothing_was_published(
         self,
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
         repo_root: Path,
         monkeypatch: pytest.MonkeyPatch,
+        answered: bool,
+        kept: bool,
     ) -> None:
+        """15 October 2026 (Codex R1): a lay-out the venue refused in its own
+        words has finished, so the hold is put down; one whose answer was
+        lost may still be writing the tree, so the hold is kept."""
         from forge.deploy import candidate_tree
 
         async def _cannot(repo_root: Any, feature_id: str, sha: str) -> Any:
             raise candidate_tree.CandidateTreeError(
-                f"git archive {sha} failed: the clone could not be read"
+                f"git archive {sha} failed: the clone could not be read",
+                confirmed=answered,
             )
 
         monkeypatch.setattr(candidate_tree, "materialise_candidate_tree", _cannot)
@@ -4636,8 +4709,7 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert "candidate_check" not in _legs(dp)
         held = _the_hold(pool)
         assert held.result == "publication pending"
-        # The hold rule is unchanged: a candidate refusal never puts it down.
-        assert held.lease_holder is not None
+        assert (held.lease_holder is not None) is kept
 
     @pytest.mark.asyncio
     async def test_a_merge_stopped_on_a_conflict_says_nothing_was_published(
@@ -4695,13 +4767,14 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         """The join's working folder could not be made: nothing was joined,
-        and the record says nothing was published. The hold rule is
-        unchanged: this ending is not a settled one, so the hold is kept."""
+        and the record says nothing was published. No leg was sent, so the
+        hold is put down (15 October 2026; it used to be kept)."""
         from forge.pipeline import merge_executor
         from forge.pipeline.merge_join import JoinOutcome
 
         async def _no_folder(*_args: Any, **_kwargs: Any) -> JoinOutcome:
-            return JoinOutcome(ok=False, refusal="the disk is full")
+            # The venue's refusal, in its own words: a complete answer.
+            return JoinOutcome(ok=False, refusal="the disk is full", confirmed=True)
 
         monkeypatch.setattr(merge_executor, "make_the_working_folder", _no_folder)
         deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal())
@@ -4712,7 +4785,573 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert "the disk is full" in outcome.detail
         held = _the_hold(pool)
         assert held.result == "publication pending"
+        assert held.lease_holder is None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("answered, kept", [(True, False), (False, True)])
+    async def test_a_join_folder_with_no_answer_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        answered: bool,
+        kept: bool,
+    ) -> None:
+        """15 October 2026: the sandbox's venue says whether the join folder's
+        request got an answer. Refused in its own words, nothing is running
+        and the hold is put down; no answer, and the folder may still be
+        being made, so the hold is kept."""
+        import dataclasses
+
+        from forge.deploy.candidate_tree import WorkingFolder
+
+        class _AVenueThatSays(InContainerCandidateGit):
+            async def add_working_folder(self, leaf: str, branch: str, base_ref: str):
+                return WorkingFolder(
+                    ok=False,
+                    branch=branch,
+                    base_ref=base_ref,
+                    refusal="the sandbox sidecar could not be reached",
+                    confirmed=answered,
+                )
+
+        venue = _AVenueThatSays(repo_root, fetch_address=origin_of(repo_root), repo=REPO)
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal())
+        deps = dataclasses.replace(deps, git_surface=lambda _repo, _root: venue)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    async def test_a_candidate_left_standing_with_no_teardown_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+    ) -> None:
+        """15 October 2026, the coach: a passed candidate check leaves its
+        candidate standing for the promote. When the press ends before the
+        promote and no teardown can be sent (this project names no
+        identity), that candidate is still up, so the hold is kept."""
+        deps, _publisher, _gk, dp = _deps(
+            config, pool, guardkit=_JoinsForReal(), declares_identity=False
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "publication-pending", outcome.detail
+        assert "candidate_down" not in _legs(dp)
+        assert _the_hold(pool).lease_holder is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "check, gate, kept",
+        [
+            ("timed-out", None, True),
+            ("timed-out-wrong-cwd", None, True),
+            ("red", None, False),
+            ("html-error", None, True),
+            ("ok", "timed-out", True),
+            ("ok", "timed-out-no-cwd", True),
+            ("ok", "timed-out-wrong-cwd", True),
+            # Codex R9: the sidecar's run raised (a 5xx) for the script or the
+            # gate; a refusal before running (a 4xx) is an answer.
+            ("exec-error", None, True),
+            ("ok", "exec-error", True),
+            ("refused-400", None, False),
+            # Codex round 9, R16: an owned-deploy refusal of no known shape is
+            # no answer; the executor's own refusal is one.
+            ("bad-refusal", None, True),
+            ("good-refusal", None, False),
+        ],
+        ids=[
+            "script-timed-out-no-cwd",
+            "script-timed-out-wrong-cwd",
+            "script-red",
+            "script-html-error",
+            "gate-timed-out",
+            "gate-timed-out-no-cwd",
+            "gate-timed-out-wrong-cwd",
+            "script-5xx",
+            "gate-5xx",
+            "script-refused-4xx",
+            "refusal-of-no-known-shape",
+            "the-executors-own-refusal",
+        ],
+    )
+    async def test_a_check_script_that_ran_out_of_time_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        check: str,
+        gate: str | None,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R2, R4 and R5: the candidate check runs
+        through the REAL deploy stage, script runner and (for ``gate``) the
+        sandbox live-gate invoker, and its teardown always answers that the
+        candidate is down. A script stopped at its time limit, a script whose
+        request came back as a proxy's HTML error page, or a gate driver
+        stopped at its limit may have left something running, so the hold is
+        kept. A script that went red in its own words puts it down."""
+        import sqlite3
+        from unittest.mock import AsyncMock
+
+        from forge.config.models import DeployStageConfig
+        from forge.deploy.live_gate import DryRunBrokerInspector
+        from forge.deploy.reservation import InProcessReservationLease
+        from forge.deploy.stage import DeployStageRunner
+        from forge.persistence.migrations.runbook import apply
+        from forge.persistence.repositories.runbook import RunbookRepository
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            RecordingDeployPublisher,
+            _ASidecarThatAnswers,
+            _Invoker,
+            _profile,
+        )
+
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        sidecar = _ASidecarThatAnswers(check=check, teardown="ok", gate=gate or "timed-out")
+        invoker = (
+            SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo=REPO,
+                repo_path=tmp_path,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            )
+            if gate
+            else _Invoker()
+        )
+        connection = sqlite3.connect(str(tmp_path / "runbooks.db"))
+        apply(connection)
+        stage = DeployStageRunner(
+            repository=RunbookRepository(connection=connection),
+            runbook_publisher=AsyncMock(),
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=invoker,
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(execution_surface="sidecar", sidecar_url=sidecar.url),
+            deploy_record_root=str(tmp_path / "records"),
+            dry_run=False,
+            target_repo=REPO,
+        )
+
+        class _ACheckThroughTheRealStage(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") != "candidate_check":
+                    return await super().__call__(**kwargs)
+                self.calls.append(kwargs)
+                return await stage.candidate_check(
+                    _profile(),
+                    correlation_id=kwargs["correlation_id"],
+                    deploy_run_id=kwargs["deploy_run_id"],
+                    feature=kwargs["feature_id"],
+                    identity_env=kwargs.get("identity_env"),
+                    # The laid-out tree, as the press hands it, so the script
+                    # runner and the gate check where the sidecar says it ran
+                    # (Codex round 3).
+                    candidate_cwd=kwargs.get("candidate_cwd"),
+                )
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(), deploy=_ACheckThroughTheRealStage()
+        )
+        try:
+            outcome = await _run_executor(deps, repo_root)
+        finally:
+            sidecar.close()
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, body, kept",
+        [
+            (400, b'{"error": "this host has no guardkit command to run"}', False),
+            # Codex R10: the route's own answer when the operating system
+            # refused to start the merge command — nothing ran.
+            (
+                400,
+                b'{"error": "the merge command could not be started: [Errno 2] '
+                b'No such file or directory", "exit_code": 127, "stdout": "", '
+                b'"stderr_tail": ""}',
+                False,
+            ),
+            (500, b"<html><body>502 Bad Gateway</body></html>", True),
+            (200, b"{}", True),
+            (
+                500,
+                b'{"error": "sidecar execution error: OSError: x", '
+                b'"may_have_started": true}',
+                True,
+            ),
+            (None, b"", True),
+        ],
+        ids=[
+            "refused-in-its-own-words",
+            "spawn-refused",
+            "html",
+            "empty-object",
+            "5xx-while-running",
+            "unreachable",
+        ],
+    )
+    async def test_the_merge_command_through_the_sidecar(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        status: int | None,
+        body: bytes,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R7: the merge command goes through the REAL
+        sidecar merge client. A refusal in the sidecar's own words, before
+        anything ran, is an answer: nothing was joined and the hold is put
+        down. An unreadable reply, {}, an error met while the command may
+        already have been running, or no answer at all keeps it."""
+        import dataclasses
+
+        from forge.adapters.guardkit.run_via_sidecar import build_sidecar_guardkit_run
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            _ASidecarThatRefusesWith,
+        )
+
+        sidecar = _ASidecarThatRefusesWith(status or 200, body)
+        url = sidecar.url if status is not None else "http://127.0.0.1:1"
+        try:
+            deps, _publisher, _gk, _dp = _deps(config, pool)
+            deps = dataclasses.replace(
+                deps,
+                guardkit_run=build_sidecar_guardkit_run(
+                    base_url=url, repo_paths={REPO: str(repo_root)}
+                ),
+            )
+            outcome = await _run_executor(deps, repo_root)
+        finally:
+            sidecar.close()
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "how, kept",
+        [
+            ("timed-out-with-a-refusal-report", True),
+            ("timed-out-with-a-merged-report", True),
+            ("answered-refusal", False),
+        ],
+    )
+    async def test_a_merge_command_stopped_at_its_time_limit_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        how: str,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R8: a merge command stopped at its time
+        limit may still be running whatever report survived, so the hold is
+        kept — decided before the report is read. The same refusal report
+        from a command that finished is an answer, and puts it down."""
+
+        class _AMergeThatSays(_JoinsForReal):
+            async def __call__(self, **kwargs: Any) -> GuardKitResult:
+                if how == "timed-out-with-a-merged-report":
+                    joined = await super().__call__(**kwargs)
+                    return joined.model_copy(update={"status": "timeout"})
+                self.calls.append(kwargs)
+                report = {"outcome": "refused", "refusal_reason": "it conflicts"}
+                return GuardKitResult(
+                    # A complete answer from the build system (15 October 2026).
+                    confirmed=not how.startswith("timed-out"),
+                    status="timeout" if how.startswith("timed-out") else "failed",
+                    subcommand="autobuild merge",
+                    duration_secs=0.1,
+                    stdout_tail=json.dumps(report),
+                    stderr=None,
+                    exit_code=124 if how.startswith("timed-out") else 1,
+                )
+
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_AMergeThatSays())
+
+        outcome = await _run_executor(deps, repo_root)
+
+        held = _the_hold(pool)
+        assert held.result == "publication pending", outcome.detail
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("what", ["script", "gate"])
+    async def test_a_local_run_that_raised_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        what: str,
+    ) -> None:
+        """15 October 2026, Codex R9, with NO sidecar: the candidate check's
+        script, or its live gate, raised while it may have been running. The
+        stage notes it before the executor turns it into a failed step, the
+        teardown answers "down", and the hold is kept."""
+        import sqlite3
+        from unittest.mock import AsyncMock
+
+        from forge.config.models import DeployStageConfig
+        from forge.deploy.live_gate import DryRunBrokerInspector
+        from forge.deploy.reservation import InProcessReservationLease
+        from forge.deploy.stage import DeployStageRunner
+        from forge.executor import shell_steps
+        from forge.persistence.migrations.runbook import apply
+        from forge.persistence.repositories.runbook import RunbookRepository
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            RecordingDeployPublisher,
+            _Invoker,
+            _profile,
+        )
+
+        def _local_scripts(**kwargs: Any) -> Any:
+            down = (kwargs.get("extra_env") or {}).get("CANDIDATE_DOWN") == "1"
+            if what == "script" and not down:
+                raise OSError("the pipe broke while the script ran")
+            return (0, "ok\n")
+
+        class _AGateThatRaises(_Invoker):
+            def with_extra_env(self, overlay: dict[str, str]) -> Any:
+                outer = self
+
+                class _Raises:
+                    def with_repo_path(self, _path: Any) -> Any:
+                        return self
+
+                    def with_extra_env(self, _overlay: dict[str, str]) -> Any:
+                        return self
+
+                    def invoke(self, **_kwargs: Any) -> Any:
+                        raise OSError("the driver's pipe broke")
+
+                return _Raises() if what == "gate" else _Invoker.with_extra_env(outer, overlay)
+
+        monkeypatch.setattr(shell_steps, "_run_script_step", _local_scripts)
+        connection = sqlite3.connect(str(tmp_path / "runbooks.db"))
+        apply(connection)
+        stage = DeployStageRunner(
+            repository=RunbookRepository(connection=connection),
+            runbook_publisher=AsyncMock(),
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=_AGateThatRaises(),
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(),
+            deploy_record_root=str(tmp_path / "records"),
+            dry_run=False,
+        )
+
+        class _ACheckThroughTheRealStage(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") != "candidate_check":
+                    return await super().__call__(**kwargs)
+                self.calls.append(kwargs)
+                return await stage.candidate_check(
+                    _profile(),
+                    correlation_id=kwargs["correlation_id"],
+                    deploy_run_id=kwargs["deploy_run_id"],
+                    feature=kwargs["feature_id"],
+                    identity_env=kwargs.get("identity_env"),
+                )
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(), deploy=_ACheckThroughTheRealStage()
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
         assert held.lease_holder is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "how, kept",
+        [("ENOEXEC", False), ("ENOTDIR", False), ("repo-driver-raised", True)],
+    )
+    async def test_the_real_local_backends(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        how: str,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R9 and R11, with no sidecar and the REAL
+        backends. The candidate's script goes through the real script runner:
+        one the system would not start (an exec format error, a path through a
+        file) was never started, its teardown answers "down", and the hold is
+        put down. The live gate goes through the real repo-driver invoker: a
+        driver whose output read breaks after it started may still be running,
+        and the hold is kept."""
+        import sqlite3
+        import subprocess
+        import sys
+        from unittest.mock import AsyncMock
+
+        from forge.config.models import DeployStageConfig
+        from forge.deploy.live_gate import DryRunBrokerInspector, RepoDriverLiveGateInvoker
+        from forge.deploy.reservation import InProcessReservationLease
+        from forge.deploy.stage import DeployStageRunner
+        from forge.executor import shell_steps
+        from forge.persistence.migrations.runbook import apply
+        from forge.persistence.repositories.runbook import RunbookRepository
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            RecordingDeployPublisher,
+            _Invoker,
+            _profile,
+        )
+
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        # A real checkout: a project program's private home is made in its
+        # git directory.
+        subprocess.run(["git", "init", "-q", str(scripts)], check=True)
+        good = scripts / "ok.sh"
+        good.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+        good.chmod(0o755)
+        bad = scripts / "no-format.sh"
+        bad.write_text("this is not a program\n", encoding="utf-8")
+        bad.chmod(0o755)
+        (scripts / "a-file").write_text("not a folder\n", encoding="utf-8")
+        real_runner = shell_steps._run_script_step
+
+        def _the_real_runner(**kwargs: Any) -> Any:
+            # The REAL script runner, on a real script: the candidate's own
+            # step is the one the system will not start; its teardown is fine.
+            down = (kwargs.get("extra_env") or {}).get("CANDIDATE_DOWN") == "1"
+            kwargs = dict(kwargs, cwd=str(scripts))
+            if down or how == "repo-driver-raised":
+                kwargs["script"] = "./ok.sh"
+            elif how == "ENOEXEC":
+                kwargs["script"] = "./no-format.sh"
+            else:
+                kwargs["script"] = "./a-file/deploy.sh"
+            return real_runner(**kwargs)
+
+        monkeypatch.setattr(shell_steps, "_run_script_step", _the_real_runner)
+        marker = "the-repo-driver-that-breaks"
+        if how == "repo-driver-raised":
+            real_read = subprocess.Popen.communicate
+
+            def _the_read_breaks(self: Any, *args: Any, **kwargs: Any) -> Any:
+                if marker in " ".join(str(a) for a in (self.args or [])):
+                    raise OSError("the driver's pipe broke")
+                return real_read(self, *args, **kwargs)
+
+            monkeypatch.setattr(subprocess.Popen, "communicate", _the_read_breaks)
+            invoker: Any = RepoDriverLiveGateInvoker(
+                repo_path=repo_root,
+                driver_argv=[sys.executable, "-c", "import time; time.sleep(30)", marker],
+                timeout_seconds=20,
+            )
+        else:
+            invoker = _Invoker()
+        connection = sqlite3.connect(str(tmp_path / "runbooks.db"))
+        apply(connection)
+        stage = DeployStageRunner(
+            repository=RunbookRepository(connection=connection),
+            runbook_publisher=AsyncMock(),
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=invoker,
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(),
+            deploy_record_root=str(tmp_path / "records"),
+            dry_run=False,
+        )
+
+        class _ACheckThroughTheRealStage(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") != "candidate_check":
+                    return await super().__call__(**kwargs)
+                self.calls.append(kwargs)
+                return await stage.candidate_check(
+                    _profile(),
+                    correlation_id=kwargs["correlation_id"],
+                    deploy_run_id=kwargs["deploy_run_id"],
+                    feature=kwargs["feature_id"],
+                    identity_env=kwargs.get("identity_env"),
+                )
+
+        deploy = _ACheckThroughTheRealStage()
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal(), deploy=deploy)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timed_out, kept", [(True, True), (False, False)])
+    async def test_a_join_folder_reply_that_says_it_timed_out_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        timed_out: bool,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex round 9, R17: the join folder is asked for
+        through the REAL sandbox git client; the sandbox answers "failed".
+        When the reply also says the operation timed out, it is no answer
+        and the hold is kept; without that, it is an answered refusal and
+        the hold goes down."""
+        import dataclasses
+
+        from tests.forge.deploy.test_sidecar_candidate_git import _ASidecarThatAnswersWith
+
+        body: dict[str, Any] = {"status": "failed", "detail": "the folder was not made"}
+        if timed_out:
+            body["timed_out"] = True
+        sidecar = _ASidecarThatAnswersWith(200, body)
+
+        class _AFolderMadeInTheSandbox(InContainerCandidateGit):
+            async def add_working_folder(self, leaf: str, branch: str, base_ref: str):
+                return await sidecar.git.add_working_folder(leaf, branch, base_ref)
+
+        venue = _AFolderMadeInTheSandbox(
+            repo_root, fetch_address=origin_of(repo_root), repo=REPO
+        )
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal())
+        deps = dataclasses.replace(deps, git_surface=lambda _repo, _root: venue)
+        try:
+            outcome = await _run_executor(deps, repo_root)
+        finally:
+            sidecar.close()
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
 
     @pytest.mark.asyncio
     async def test_a_conflict_whose_record_moved_on_stops_as_replaced(
@@ -4939,7 +5578,7 @@ class TestALostSandboxCleanUpKeepsTheHold:
             outcome = await _run_executor(deps, repo_root)
 
             assert outcome.result == "publication-pending", outcome.detail
-            assert git.removals == [False]
+            assert git.removals == [None]  # no answer came back
             assert _the_hold(pool).lease_holder is not None
             again = await _run_executor(deps, repo_root)
             assert "another worker" in again.detail
@@ -5034,6 +5673,8 @@ class _JoinsWithMainCopies(_JoinsForReal):
         report = json.loads(said.stdout_tail)
         report["judged_with_main_copies"] = ["scripts/check.sh"]
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=said.confirmed,
             status=said.status,
             subcommand=said.subcommand,
             duration_secs=said.duration_secs,
@@ -5116,6 +5757,8 @@ class _JoinsWithOneLeftOut(_JoinsForReal):
         report["judged_with_main_copies"] = ["scripts/check.sh", "tools/check.sh"]
         report["judge_files_not_on_target"] = ["tools/check.sh"]
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=said.confirmed,
             status=said.status,
             subcommand=said.subcommand,
             duration_secs=said.duration_secs,
@@ -5150,6 +5793,8 @@ class TestAJudgeTheTargetLacksWasLeftOut:
                 report = json.loads(said.stdout_tail)
                 report["judged_with_main_copies"] = ["tools/check.sh"]
                 return GuardKitResult(
+                    # A complete answer from the build system (15 October 2026).
+                    confirmed=said.confirmed,
                     status=said.status,
                     subcommand=said.subcommand,
                     duration_secs=said.duration_secs,
@@ -5205,6 +5850,8 @@ class _JoinsWithAnEvilName(_JoinsForReal):
         report = json.loads(said.stdout_tail)
         report["judged_with_main_copies"] = ["evil\nThe merge passed/check.sh"]
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=said.confirmed,
             status=said.status,
             subcommand=said.subcommand,
             duration_secs=said.duration_secs,
@@ -5284,6 +5931,8 @@ class _JoinsWithLookalikeNames(_JoinsForReal):
         report["judged_with_main_copies"] = [WITH_A_BREAK, WITH_A_BACKSLASH]
         report["judge_files_not_on_target"] = [WITH_A_BACKSLASH]
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=said.confirmed,
             status=said.status,
             subcommand=said.subcommand,
             duration_secs=said.duration_secs,

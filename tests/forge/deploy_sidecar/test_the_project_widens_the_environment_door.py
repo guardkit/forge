@@ -978,6 +978,8 @@ class _AnExecutorThatRecords:
 
         self.handed.append(request)
         return SimpleNamespace(
+            # The command ran and its group was confirmed gone (15 October 2026).
+            confirmed=True,
             accepted=True,
             word="the-deploy-ran",
             sentence="the deploy step ran and ended with 0.",
@@ -988,10 +990,10 @@ class _AnExecutorThatRecords:
 
 
 def _ask_to_deploy(
-    project: Path, body: dict[str, Any]
+    project: Path, body: dict[str, Any], executor: Any = None
 ) -> tuple[int, dict[str, Any], _AnExecutorThatRecords]:
     """POST a request that OWNS a deployment target, through the real route."""
-    executor = _AnExecutorThatRecords()
+    executor = executor if executor is not None else _AnExecutorThatRecords()
     server = build_server(
         port=0, config_loader=lambda: _config(project), deploy_executor=executor
     )
@@ -1108,6 +1110,42 @@ class TestTheDeployBlocksNamesAreCommittedLinesToo:
         handed = executor.handed[0]
         assert handed.identity_setting == self.COMMITTED["setting"]
         assert handed.artifact_setting == self.COMMITTED["artifact"]
+
+    def test_a_deploy_that_raised_while_running_is_a_5xx(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """15 October 2026, Codex R9: the executor met an error after the
+        deploy command had started, so nobody knows whether it is still
+        running. The route says so with a 5xx, which every caller reads as no
+        answer, rather than an ordinary 200."""
+        from types import SimpleNamespace
+
+        class _AnExecutorWhoseCommandBroke(_AnExecutorThatRecords):
+            def run(self, request: Any) -> Any:
+                self.handed.append(request)
+                return SimpleNamespace(
+                    accepted=True,
+                    word="the-deploy-command-ended-badly",
+                    sentence="the deploy step ended in an error (OSError: x).",
+                    marker=None,
+                    exit_code=1,
+                    output="",
+                    raised_while_running=True,
+                )
+
+        project, head = self._a_project_that_declares_one_and_has_another_on_disk(
+            tmp_path
+        )
+        with _a_coordinator_that_recorded({THE_BUILD: head}, monkeypatch):
+            status, body, _executor = _ask_to_deploy(
+                project,
+                self._owning(
+                    self.COMMITTED["setting"], self.COMMITTED["artifact"], head
+                ),
+                executor=_AnExecutorWhoseCommandBroke(),
+            )
+        assert status == 500, body
+        assert "ended in an error" in body["error"]
 
     def test_bound_to_an_older_commit_the_same_committed_name_is_refused(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

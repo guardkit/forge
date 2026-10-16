@@ -104,6 +104,7 @@ candidate run, none from the tree.
 
 from __future__ import annotations
 
+import functools
 import logging
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -133,6 +134,7 @@ from forge.deploy.deploy_record import (
 from forge.deploy.live_gate import (
     BrokerInspector,
     LiveGateInvoker,
+    LiveGateSeamError,
     RefusingLiveGateInvoker,
 )
 from forge.deploy.profile import DeployProfile, wrapper_inner_script
@@ -271,6 +273,11 @@ class DeployStageResult:
     live_gate_runbook_id: str | None = None
     dry_run: bool = False
     detail: dict[str, Any] = field(default_factory=dict)
+    #: True only when every answer in the leg's run was complete (15 October
+    #: 2026), set at one place: the leg's own return. Anything else — a
+    #: result built elsewhere, or a run with an answer that was not
+    #: confirmed — is unconfirmed, and the merge press keeps its hold for it.
+    confirmed: bool = False
 
 
 #: How the deploy sidecar's own answers begin. When the sidecar refuses a
@@ -523,6 +530,94 @@ def gate_summary(
     return summary
 
 
+class _ARunThatNotesLostAnswers:
+    """Where one stage run notes that some request in it got NO ANSWER.
+
+    15 October 2026. The stage is built for one leg at a time, and every
+    script and live-gate request of that leg goes through the runner and the
+    invoker it builds its step registry with. Both are wrapped here, so a
+    request that got no answer anywhere in the run — the leg's own steps, the
+    candidate's teardown inside it, a revert, the read-only question — is
+    noted in this one place, and every result the run returns says so
+    (``"answer_lost": True``). A script stopped at its time limit is noted
+    the same way. Only then may something it sent still be running, so only
+    then does the merge press keep its hold.
+    """
+
+    def __init__(self) -> None:
+        self.lost = False
+
+    def runner(self, inner: Any) -> Any:
+        def _run(**kwargs: Any) -> Any:
+            try:
+                answer = inner(**kwargs)
+            except BaseException:
+                # Raised while the script may have been running: noted before
+                # the executor turns it into an ordinary failed step.
+                self.lost = True
+                raise
+            # CONFIRMED OR NOT (15 October 2026): only an answer the runner
+            # vouched for as complete counts; anything else is noted.
+            if getattr(answer, "confirmed", False) is not True:
+                self.lost = True
+            return answer
+
+        return _run
+
+    def invoker(self, inner: Any) -> Any:
+        return _AnInvokerThatNotesLostAnswers(inner, self)
+
+    def stamped(self, result: Any) -> Any:
+        """The leg's result, saying whether every answer in its run was
+        complete: ``confirmed`` when so, ``answer_lost`` when not."""
+        if not isinstance(result, DeployStageResult):
+            return result
+        if self.lost:
+            return replace(
+                result,
+                confirmed=False,
+                detail={**result.detail, "answer_lost": True},
+            )
+        return replace(result, confirmed=True)
+
+
+class _AnInvokerThatNotesLostAnswers:
+    """A live-gate invoker that notes an invocation with no answer."""
+
+    def __init__(self, inner: Any, run: _ARunThatNotesLostAnswers) -> None:
+        self._inner = inner
+        self._run = run
+
+    def invoke(self, **kwargs: Any) -> Any:
+        try:
+            invocation = self._inner.invoke(**kwargs)
+        except LiveGateSeamError:
+            # A gate that refuses to run says so by raising this, before any
+            # driver is started: a refusal, not a lost answer.
+            raise
+        except BaseException:
+            # Raised while the driver may have been running (15 October 2026).
+            self._run.lost = True
+            raise
+        # CONFIRMED OR NOT (15 October 2026): only a complete gate answer.
+        if getattr(invocation, "confirmed", False) is not True:
+            self._run.lost = True
+        return invocation
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+
+def _says_if_an_answer_was_lost(leg: Any) -> Any:
+    """Every result a leg returns says if any request in its run got no answer."""
+
+    @functools.wraps(leg)
+    async def _leg(self: "DeployStageRunner", *args: Any, **kwargs: Any) -> Any:
+        return self._this_run.stamped(await leg(self, *args, **kwargs))
+
+    return _leg
+
+
 class DeployStageRunner:
     """Drives the DEPLOY and LIVE_GATE stages for one feature.
 
@@ -571,6 +666,8 @@ class DeployStageRunner:
         self._deploy_publisher = deploy_publisher
         self._reservation = reservation
         self._live_gate_invoker = live_gate_invoker
+        # THIS RUN'S LOST ANSWERS, noted in one place (15 October 2026).
+        self._this_run = _ARunThatNotesLostAnswers()
         self._broker_inspector = broker_inspector
         self._config = config
         self._deploy_record_root = deploy_record_root
@@ -707,13 +804,23 @@ class DeployStageRunner:
         self, *, live_gate_invoker: LiveGateInvoker | None = None
     ) -> StepTypeRegistry:
         registry = StepTypeRegistry()
+        # Every request goes through these two, so this run notes any that
+        # got no answer, or whose script was stopped at its time limit (15
+        # October 2026). With no sidecar the scripts run here, through the
+        # shared subprocess core, and that is wrapped the same way.
+        from forge.executor import shell_steps
+
+        script_runner = self._resolve_script_runner() or shell_steps._run_script_step
+        invoker = live_gate_invoker or self._live_gate_invoker
         register_deploy_handlers(
             registry,
             dry_run=self._dry_run,
-            live_gate_invoker=live_gate_invoker or self._live_gate_invoker,
+            live_gate_invoker=(
+                self._this_run.invoker(invoker) if invoker is not None else None
+            ),
             broker_inspector=self._broker_inspector,
             presence_resolver=self._presence_resolver,
-            script_runner=self._resolve_script_runner(),
+            script_runner=self._this_run.runner(script_runner),
         )
         return registry
 
@@ -724,6 +831,7 @@ class DeployStageRunner:
         except Exception as exc:  # noqa: BLE001 — event stream is derived
             logger.warning("deploy stage publish failed (continuing): %s", exc)
 
+    @_says_if_an_answer_was_lost
     async def run_deploy(
         self,
         profile: DeployProfile,
@@ -776,6 +884,7 @@ class DeployStageRunner:
             identity_env=identity_env,
         )
 
+    @_says_if_an_answer_was_lost
     async def candidate_check(
         self,
         profile: DeployProfile,
@@ -897,6 +1006,7 @@ class DeployStageRunner:
             if handle is not None:
                 self._reservation.release(handle)
 
+    @_says_if_an_answer_was_lost
     async def candidate_down(
         self,
         profile: DeployProfile,
@@ -957,6 +1067,7 @@ class DeployStageRunner:
             detail={"candidate": "torn-down" if torn_down else "standing"},
         )
 
+    @_says_if_an_answer_was_lost
     async def preview_up(
         self,
         profile: DeployProfile,
@@ -1035,6 +1146,7 @@ class DeployStageRunner:
             detail={"deploy_output": deploy_step_output(executed)},
         )
 
+    @_says_if_an_answer_was_lost
     async def preview_journey(
         self,
         profile: DeployProfile,
@@ -1130,6 +1242,7 @@ class DeployStageRunner:
             detail={"journey": dict(payload)},
         )
 
+    @_says_if_an_answer_was_lost
     async def what_is_running(
         self,
         profile: DeployProfile,
@@ -1225,6 +1338,7 @@ class DeployStageRunner:
             detail={"deploy_output": said},
         )
 
+    @_says_if_an_answer_was_lost
     async def promote(
         self,
         profile: DeployProfile,
@@ -1997,7 +2111,7 @@ class DeployStageRunner:
             failed_step, refusal = self._stopped_at(
                 executed, run_result, default="candidate_deploy"
             )
-            await self._teardown_candidate(
+            torn = await self._teardown_candidate(
                 profile,
                 correlation_id=correlation_id,
                 deploy_run_id=deploy_run_id,
@@ -2023,6 +2137,7 @@ class DeployStageRunner:
                 failing_verdict=None,
                 events=events,
                 failure_detail=refusal,
+                torn_down=torn,
             )
             return failed, summary
 
@@ -2053,7 +2168,7 @@ class DeployStageRunner:
                 "evidence_index_ref": gate.evidence_index_ref or None,
             }
             if verdict != "pass":
-                await self._teardown_candidate(
+                torn = await self._teardown_candidate(
                     profile,
                     correlation_id=correlation_id,
                     deploy_run_id=deploy_run_id,
@@ -2072,6 +2187,7 @@ class DeployStageRunner:
                     failing_verdict=verdict if verdict is not None else "instrument_fail",
                     events=events,
                     gate_summary_for_words=summary,
+                    torn_down=torn,
                 )
                 return failed, summary
         else:
@@ -2177,8 +2293,13 @@ class DeployStageRunner:
         events: list[str],
         failure_detail: str | None = None,
         gate_summary_for_words: dict[str, Any] | None = None,
+        torn_down: bool = True,
     ) -> DeployStageResult:
         """Publish DeployFailed for a candidate that failed its leg (LIVE intact).
+
+        ``torn_down`` is what the candidate's own teardown answered; it goes
+        into the detail (15 October 2026), so the merge press keeps its hold
+        for a candidate still standing.
 
         A loud, honest failure that names the candidate as the cause and records
         that the live name was untouched — recoverable (retry the deploy), never
@@ -2205,10 +2326,15 @@ class DeployStageRunner:
         detail_clause = f" — {failure_detail}" if failure_detail else ""
         saw = refusal_assertion_clause(gate_summary_for_words)
         saw_clause = f" — {saw}" if saw else ""
+        where_it_is = (
+            "was torn down"
+            if torn_down
+            else "is still standing (its teardown did not complete)"
+        )
         failure_reason = (
             f"candidate leg failed at {failed_step!r}{detail_verdict}"
             f"{detail_clause}{saw_clause}; the "
-            f"candidate ('{profile.env_id}-cand') was torn down and the LIVE "
+            f"candidate ('{profile.env_id}-cand') {where_it_is} and the LIVE "
             f"name '{profile.env_id}' was never touched (no promote, no revert)"
         )
         logger.error("candidate-then-promote gate refused promote: %s", failure_reason)
@@ -2240,7 +2366,11 @@ class DeployStageRunner:
             events=tuple(events),
             deploy_runbook_id=f"deploy-cand-{deploy_run_id}",
             dry_run=self._dry_run,
-            detail={"reason": reason, "failing_verdict": failing_verdict},
+            detail={
+                "reason": reason,
+                "failing_verdict": failing_verdict,
+                "candidate": "torn-down" if torn_down else "standing",
+            },
         )
 
     def _emit_demotion_event(

@@ -515,6 +515,20 @@ class ExecutorAnswer:
     exit_code: int | None = None
     output: str = ""
     marker: str | None = None
+    #: Something raised after the command had started (15 October 2026):
+    #: nobody knows whether what it started is still running, so the route
+    #: answers a 5xx and every caller reads it as no answer.
+    raised_while_running: bool = False
+    #: The command was stopped at its time limit (15 October 2026). Carried
+    #: apart from the word, so a takeover that met a timeout still says so.
+    timed_out: bool = False
+    #: True only where this answer is complete (15 October 2026): the request
+    #: was refused before anything was started, or the command ran and every
+    #: process of its group was confirmed gone, or a takeover that confirmed
+    #: it gone stopped it. Anything else — a timeout, an error while it ran,
+    #: a group that could not be confirmed stopped, a command started and then
+    #: killed without confirmation — leaves it False.
+    confirmed: bool = False
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -1200,6 +1214,7 @@ class DeployExecutor:
         if not target:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-request-names-no-target",
                 sentence=(
                     "a deploy request has to name the deployment target it "
@@ -1209,6 +1224,7 @@ class DeployExecutor:
         if not str(request.build or "").strip():
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-request-names-no-build",
                 sentence=(
                     f"a deploy request for {target} has to name the build the "
@@ -1223,6 +1239,7 @@ class DeployExecutor:
         if counter < 1:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-request-carries-no-counter",
                 sentence=(
                     f"a deploy request for {target} has to carry the target's "
@@ -1259,6 +1276,7 @@ class DeployExecutor:
         if self._folder_problem:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-executors-notes-folder-cannot-be-used",
                 sentence=f"{self._folder_problem}. Nothing was deployed.",
             )
@@ -1266,6 +1284,7 @@ class DeployExecutor:
         if refused:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=f"{refused} Nothing was deployed.",
             )
@@ -1287,6 +1306,7 @@ class DeployExecutor:
         if counter < highest:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-counter-has-moved-on",
                 sentence=(
                     f"this deploy request carries {target}'s counter {counter} "
@@ -1305,6 +1325,7 @@ class DeployExecutor:
             if granted_to and granted_to != build:
                 return ExecutorAnswer(
                     accepted=False,
+                    confirmed=True,  # refused before anything was started
                     word="that-counter-belongs-to-another-build",
                     sentence=(
                         f"this deploy request carries {target}'s counter "
@@ -1328,6 +1349,7 @@ class DeployExecutor:
             )
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=(
                     f"whether the deploy command already recorded for {target} "
@@ -1346,6 +1368,7 @@ class DeployExecutor:
             # There is nothing to stop by group, so nothing new starts.
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-is-occupied",
                 sentence=(
                     f"a deploy command for {target} was being started when this "
@@ -1358,6 +1381,7 @@ class DeployExecutor:
         if counter == note.counter and build == note.build:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="a-command-is-already-running",
                 sentence=(
                     f"a deploy command for {target} from this same build is "
@@ -1372,6 +1396,7 @@ class DeployExecutor:
         if superseded is None:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=(
                     f"the note for {target} changed while this request was "
@@ -1384,6 +1409,7 @@ class DeployExecutor:
         if not stopped:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-old-command-could-not-be-confirmed-stopped",
                 sentence=f"{why}. The result stays published, deployment pending.",
                 marker=note.marker,
@@ -1420,6 +1446,7 @@ class DeployExecutor:
             )
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=(
                     f"whether anything is still deploying to {target} could not "
@@ -1430,6 +1457,7 @@ class DeployExecutor:
         if anything is True:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-is-occupied",
                 sentence=(
                     f"this executor's note for {target} has no live command on "
@@ -1488,6 +1516,7 @@ class DeployExecutor:
             )
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-cannot-be-settled",
                 sentence=(
                     f"{why}, and whether anything is still deploying to "
@@ -1498,6 +1527,7 @@ class DeployExecutor:
         if anything is True:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-is-occupied",
                 sentence=(
                     f"{why}, and a process carrying a deploy marker for "
@@ -1529,6 +1559,7 @@ class DeployExecutor:
         if self._ask is None:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="nobody-can-be-asked-who-owns-it",
                 sentence=(
                     f"{opening}, and it has no way to ask the coordinator who "
@@ -1551,6 +1582,7 @@ class DeployExecutor:
         if not isinstance(answer, Mapping):
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="nobody-can-be-asked-who-owns-it",
                 sentence=(
                     f"{opening}, and the coordinator did not say who owns the "
@@ -1565,6 +1597,7 @@ class DeployExecutor:
         if says_counter != counter or says_build != str(build).strip():
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-coordinator-says-somebody-else-owns-it",
                 sentence=(
                     f"{opening}, so it asked the coordinator who owns the "
@@ -1593,7 +1626,13 @@ class DeployExecutor:
 
     @staticmethod
     def _default_spawn(**kwargs: Any) -> "subprocess.Popen[bytes]":
-        return subprocess.Popen(**kwargs)  # noqa: S603 — a fixed argument list
+        # Through the one place programs are started (15 October 2026): the
+        # spawn's own error is a ProgramRefused (an OSError), which the caller
+        # answers as "would not start" — nothing ran.
+        from forge.executor.programs import start_program
+
+        argv = kwargs.pop("args")
+        return start_program(argv, **kwargs)
 
     def _child_environment(self, request: DeployRequest) -> dict[str, str]:
         """RULE (h): built, never a copy of this process's own.
@@ -1730,6 +1769,7 @@ class DeployExecutor:
         except (OSError, ValueError) as exc:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-environment-was-refused",
                 sentence=(
                     f"the deploy step for {target} was not started, because "
@@ -1761,6 +1801,7 @@ class DeployExecutor:
         if not claimed:
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-slot-is-occupied",
                 sentence=(
                     f"the slot for {target} was taken between this request "
@@ -1784,6 +1825,7 @@ class DeployExecutor:
             self._clear_if_it_is_still_mine(provisional)
             return ExecutorAnswer(
                 accepted=False,
+                confirmed=True,  # refused before anything was started
                 word="the-deploy-command-would-not-start",
                 sentence=(
                     f"the deploy step for {target} would not start "
@@ -1808,13 +1850,17 @@ class DeployExecutor:
             # cannot account for.
             self._kill_now(int(group))
             self._clear_if_it_is_still_mine(provisional)
-            return self._the_note_would_not_be_written(target, marker, str(exc))
+            return self._the_note_would_not_be_written(
+                target, marker, str(exc), started=True
+            )
         if not completed:
             # Somebody else's note is on disk already, which means this
             # command's slot is not this command's any more. It is stopped
             # rather than left running beside whatever now holds the target.
             self._kill_now(int(group))
             return ExecutorAnswer(
+                # Started, then killed without confirmation: not confirmed.
+                confirmed=False,
                 accepted=False,
                 word="the-slot-is-occupied",
                 sentence=(
@@ -1828,9 +1874,12 @@ class DeployExecutor:
 
     @staticmethod
     def _the_note_would_not_be_written(
-        target: str, marker: str, why: str
+        target: str, marker: str, why: str, *, started: bool = False
     ) -> ExecutorAnswer:
         return ExecutorAnswer(
+            # Before anything was started: an answer. After the command was
+            # started and killed without confirmation: not confirmed.
+            confirmed=not started,
             accepted=False,
             word="the-note-could-not-be-written",
             sentence=(
@@ -1874,7 +1923,9 @@ class DeployExecutor:
         except subprocess.TimeoutExpired:
             timed_out = True
             if not self._the_note_is_still_mine(note):
-                return self._stopped_by_a_takeover(note)
+                # Taken over AND stopped at its limit: the takeover's word,
+                # with the timeout carried (15 October 2026, Codex R9).
+                return self._stopped_by_a_takeover(note, timed_out=True)
             self._stop_and_confirm(note)
             try:
                 output_bytes, _ = process.communicate(timeout=5.0)
@@ -1882,11 +1933,14 @@ class DeployExecutor:
                 output_bytes = b""
         except Exception as exc:  # noqa: BLE001 — never raise past the boundary
             if not self._the_note_is_still_mine(note):
-                return self._stopped_by_a_takeover(note)
+                # Taken over AND the read raised once it had started: nobody
+                # knows whether it is still running (15 October 2026).
+                return self._stopped_by_a_takeover(note, raised_while_running=True)
             self._stop_and_confirm(note)
             self._clear_if_it_is_still_mine(note)
             return ExecutorAnswer(
                 accepted=True,
+                raised_while_running=True,
                 word="the-deploy-command-ended-badly",
                 sentence=(
                     f"the deploy step for {note.target} ended in an error "
@@ -1898,13 +1952,22 @@ class DeployExecutor:
         output = (output_bytes or b"").decode("utf-8", errors="replace")
         # HAS THIS COMMAND BEEN TAKEN OVER? Asked before anything is stopped,
         # cleared or answered. A takeover stops this command's whole process
-        # group and CONFIRMS every process of it gone before it writes its own
-        # note, so a note that is no longer this one's means this command was
-        # stopped and there is nothing of it left to stop. It writes nothing —
-        # the note on disk belongs to the command that holds the target now —
-        # and it answers in its own word.
+        # group and confirms every process of it gone before it writes its own
+        # note — but it marks this note superseded first, so a note that is no
+        # longer this one's does not by itself prove the group gone. This
+        # waiter writes nothing (the note on disk belongs to the command that
+        # holds the target now) and answers in its own word, confirmed only
+        # when it has seen its own group gone.
         if not self._the_note_is_still_mine(note):
-            return self._stopped_by_a_takeover(note, output=output)
+            # A CHANGED NOTE IS NOT A STOPPED GROUP (15 October 2026, Codex
+            # round 9): the holder that took over marks the note superseded
+            # BEFORE it confirms the stop, and that confirmation can fail. So
+            # this waiter looks for itself: its answer is complete only when
+            # its own command's group is confirmed gone.
+            stopped, _why = self._stop_and_confirm(note)
+            return self._stopped_by_a_takeover(
+                note, output=output, timed_out=timed_out, stop_confirmed=stopped
+            )
         # RULE (d): the note is cleared only after every process of the command
         # is confirmed gone — not when the one we spawned returned.
         #
@@ -1934,6 +1997,7 @@ class DeployExecutor:
         if timed_out:
             return ExecutorAnswer(
                 accepted=True,
+                timed_out=True,
                 word="the-deploy-command-ran-out-of-time",
                 sentence=(
                     f"the deploy step for {note.target} was given "
@@ -1946,6 +2010,9 @@ class DeployExecutor:
             )
         code = process.returncode if process.returncode is not None else 1
         return ExecutorAnswer(
+            # R14 (15 October 2026): complete only when every process of the
+            # command's group was confirmed gone.
+            confirmed=gone,
             accepted=True,
             word="the-deploy-command-ran",
             sentence=(
@@ -1970,7 +2037,14 @@ class DeployExecutor:
         )
 
     @staticmethod
-    def _stopped_by_a_takeover(note: _Note, *, output: str = "") -> ExecutorAnswer:
+    def _stopped_by_a_takeover(
+        note: _Note,
+        *,
+        output: str = "",
+        timed_out: bool = False,
+        raised_while_running: bool = False,
+        stop_confirmed: bool = False,
+    ) -> ExecutorAnswer:
         """A command a later holder of the target stopped. IT IS NOT A DEPLOY.
 
         It gets its own word because it is its own thing. The command did not
@@ -1995,6 +2069,14 @@ class DeployExecutor:
             ),
             output=output,
             marker=note.marker,
+            # Whatever else happened to it is carried apart from the word: a
+            # takeover is not an answer about a command that also timed out
+            # or broke while it ran (15 October 2026).
+            timed_out=timed_out,
+            raised_while_running=raised_while_running,
+            # Complete only when THIS command's group was confirmed gone, and
+            # it neither timed out nor broke while it ran.
+            confirmed=stop_confirmed and not (timed_out or raised_while_running),
         )
 
 

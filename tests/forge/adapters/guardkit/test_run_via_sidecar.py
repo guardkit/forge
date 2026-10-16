@@ -656,3 +656,132 @@ async def test_a_branch_flag_with_no_name_is_a_mistake_to_fix(
             with_nats_streaming=False,
         )
     assert "--branch needs the name of the branch" in str(caught.value)
+
+
+# ---------------------------------------------------------------------------
+# An answer, a refusal, or no answer at all (15 October 2026, Codex round 4)
+# ---------------------------------------------------------------------------
+
+
+class _ASidecarThatSays:
+    """A loopback server answering every request with ``status`` and ``body``."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        host, port = self.server.server_address[:2]
+        self.url = f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "status, body, expected",
+    [
+        (400, b'{"error": "this host has no guardkit command to run"}', "refused"),
+        (500, b'{"error": "sidecar execution error: x", "may_have_started": true}', "lost"),
+        (502, b"<html>Bad Gateway</html>", "lost"),
+        (500, b"", "lost"),
+        (400, b"{}", "lost"),
+        (200, b"{}", "lost"),
+        (200, b'{"exit_code": 124, "stdout": "{\\"outcome\\": \\"refused\\"}", "timed_out": true}', "timeout"),
+        (200, b'{"timed_out": true}', "timeout"),
+        (200, b'{"exit_code": 1, "stdout": "{\\"outcome\\": \\"refused\\"}"}', "answered"),
+        # Codex round 10, R18: only a 4xx is a refusal; a 3xx with a sentence is not.
+        (302, b'{"error": "request redirected"}', "lost"),
+    ],
+    ids=[
+        "refusal-in-its-own-words",
+        "may-have-started",
+        "html",
+        "empty",
+        "refusal-with-no-sentence",
+        "empty-200",
+        "timed-out-with-a-report",
+        "timed-out-with-nothing-else",
+        "an-ordinary-red-answer",
+        "3xx-with-a-sentence",
+    ],
+)
+async def test_the_merge_client_says_what_kind_of_answer_it_was(
+    repo: Path, status: int, body: bytes, expected: str
+) -> None:
+    sidecar = _ASidecarThatSays(status, body)
+    try:
+        run = build_sidecar_guardkit_run(
+            base_url=sidecar.url, repo_paths={REPO_KEY: str(repo)}
+        )
+        result = await run(
+            subcommand="autobuild",
+            args=_executor_args(),
+            repo_path=repo,
+            read_allowlist=[repo],
+            timeout_seconds=5,
+            with_nats_streaming=False,
+        )
+    finally:
+        sidecar.close()
+    assert result.refused_before_running is (expected == "refused")
+    assert result.answer_lost is (expected in ("lost", "timeout"))
+    assert (result.status == "timeout") is (expected == "timeout")
+
+
+@pytest.mark.asyncio
+async def test_a_sidecar_that_cannot_be_reached_is_no_answer(repo: Path) -> None:
+    run = build_sidecar_guardkit_run(
+        base_url="http://127.0.0.1:1", repo_paths={REPO_KEY: str(repo)}
+    )
+    result = await run(
+        subcommand="autobuild",
+        args=_executor_args(),
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=5,
+        with_nats_streaming=False,
+    )
+    assert result.answer_lost is True
+    assert result.refused_before_running is False
+
+
+@pytest.mark.asyncio
+async def test_a_guardkit_the_system_will_not_start_is_refused_before_running(
+    sidecar: str, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """15 October 2026, Codex R10, through the REAL sidecar: a guardkit whose
+    interpreter is missing passes the command lookup, and the operating system
+    refuses to start it. Nothing ran, so it comes back refused before running."""
+    binary = tmp_path / "bin" / "guardkit"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/no/such/interpreter\n", encoding="utf-8")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv(GUARDKIT_PATH_ENV, str(binary))
+
+    result = await _run(sidecar, repo)(
+        subcommand="autobuild",
+        args=_executor_args(),
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=30,
+        with_nats_streaming=False,
+    )
+
+    assert result.status == "failed"
+    assert result.refused_before_running is True
+    assert result.answer_lost is False
+    assert "could not be started" in (result.stderr or "")

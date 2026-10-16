@@ -12,7 +12,6 @@ on top of this mechanics-only foundation.
 from __future__ import annotations
 
 import os
-import subprocess
 from typing import Any, Callable, Sequence
 
 from forge.executor.registry import StepOutcome, StepTypeRegistry
@@ -44,6 +43,18 @@ _TIMEOUT_EXIT_CODE = 124
 
 #: Truncation marker appended when output exceeds the cap.
 _TRUNCATION_MARKER = "\n... [OUTPUT TRUNCATED] ...\n"
+
+
+# The three results every program-starting backend answers with, from the one
+# place that starts programs for the merge press's legs (15 October 2026).
+# Kept importable from here, where the script runner's callers found them.
+from forge.executor.programs import (  # noqa: E402
+    Finished,
+    RaisedWhileRunning,
+    RefusedBeforeStart,
+    TimedOut,
+    run_program,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -124,7 +135,7 @@ def _run_script_step(
     # exactly the ungated deploy the design's fourth revision H removes, so it
     # is refused in plain words rather than run.
     if deploy:
-        return (
+        return Finished(
             1,
             "this deploy owns a deployment target, and it was sent to the "
             "plain subprocess runner, which cannot hold one command per "
@@ -151,7 +162,7 @@ def _run_script_step(
         from forge.deploy.review_preview import IssuedPreviewValues
 
         if not isinstance(issued_env, IssuedPreviewValues):
-            return (
+            return Finished(
                 1,
                 "this script was handed values as issued by the review "
                 "preview, and a preview runs only in the repository's sandbox, "
@@ -173,7 +184,7 @@ def _run_script_step(
             repository=repository,
         )
     except (OSError, ValueError) as exc:
-        return (1, f"the script was not run: {exc}")
+        return Finished(1, f"the script was not run: {exc}")
 
     # Resolve a bare script name (no directory component) relative to cwd.
     # subprocess resolves an executable containing a path separator relative
@@ -184,39 +195,32 @@ def _run_script_step(
     # (TASK-FMDR-007).
     program = script if os.path.dirname(script) else os.path.join(os.curdir, script)
 
-    try:
-        # Run the subprocess with combined output capture
-        result = subprocess.run(
-            [program],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=False,  # Capture as bytes for accurate size limiting
-            timeout=timeout,
-        )
-        exit_code = result.returncode
-        raw_output = result.stdout + result.stderr
-
-    except subprocess.TimeoutExpired as e:
-        # Script exceeded timeout — kill it and capture partial output
-        exit_code = _TIMEOUT_EXIT_CODE
-        # TimeoutExpired.stdout/stderr may be None if process was killed early
-        stdout_bytes = e.stdout if e.stdout else b""
-        stderr_bytes = e.stderr if e.stderr else b""
-        raw_output = stdout_bytes + stderr_bytes
-
-    except FileNotFoundError:
-        # Script doesn't exist or is not executable
-        return (127, "")  # 127 = command not found (shell convention)
-
-    except PermissionError:
-        # Script exists but is not executable
-        return (126, "")  # 126 = command not executable (shell convention)
-
-    except Exception as exc:
-        # Any other error — return generic failure with error message
-        error_msg = f"Unexpected error running script: {type(exc).__name__}: {exc}"
-        return (1, error_msg)
+    # THROUGH THE ONE PLACE PROGRAMS ARE STARTED (15 October 2026): an error
+    # from the spawn itself means nothing ran; anything raised once the script
+    # had started means nobody knows whether it is still running. The script
+    # is stopped alone at its limit, as before (it leads no group of its own).
+    ran = run_program(
+        [program],
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        new_session=False,
+        stdin=None,
+        post_kill_read_seconds=1.0,
+    )
+    if ran.refused_before_start:
+        # The script could not be started (shell conventions: 127 not found,
+        # 126 found but could not be executed — a bad format, not a folder,
+        # no permission). Nothing ran: an answer.
+        code = 127 if isinstance(ran.error, FileNotFoundError) else 126
+        return RefusedBeforeStart(code, "")
+    if ran.raised_while_running:
+        error = ran.error
+        error_msg = f"Unexpected error running script: {type(error).__name__}: {error}"
+        return RaisedWhileRunning(1, error_msg)
+    timed_out = ran.timed_out
+    exit_code = _TIMEOUT_EXIT_CODE if timed_out else int(ran.exit_code or 0)
+    raw_output = ran.stdout + ran.stderr
 
     # Truncate to output_cap bytes BEFORE decoding and scrubbing
     if len(raw_output) > output_cap:
@@ -251,7 +255,10 @@ def _run_script_step(
         )
         output = f"{output}\n{note}" if output else note
 
-    return (exit_code, output)
+    if timed_out:
+        return TimedOut(exit_code, output)
+    # Ran to an end and said how: a complete answer (15 October 2026).
+    return Finished(exit_code, output)
 
 
 def deploy_compose(step: Step, *, runner: ScriptRunner = _run_script_step) -> StepOutcome:
@@ -480,6 +487,10 @@ def register_shell_handlers(registry: StepTypeRegistry) -> None:
 
 
 __all__ = [
+    "Finished",
+    "RaisedWhileRunning",
+    "RefusedBeforeStart",
+    "TimedOut",
     "_run_script_step",
     "ScriptRunner",
     "DEFAULT_TIMEOUT_SECONDS",

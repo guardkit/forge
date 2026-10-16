@@ -75,6 +75,7 @@ from forge.launch_environment import build_launch_env
 from forge.adapters.guardkit.models import GuardKitResult, GuardKitWarning
 from forge.adapters.guardkit.parser import parse_guardkit_output
 from forge.build_processes import signal_process_group
+from forge.executor.programs import ProgramRefused
 
 logger = logging.getLogger(__name__)
 
@@ -359,7 +360,11 @@ async def _execute_subprocess(
     # The environment is built HERE rather than passed in because this function
     # is the stubbable seam the tests replace: a seam that spawns nothing has
     # no environment to be given.
-    proc = await asyncio.create_subprocess_exec(
+    # Through the one place programs are started (15 October 2026): an error
+    # from the spawn itself is a ProgramRefused — nothing ran.
+    from forge.executor.programs import start_program_async
+
+    proc = await start_program_async(
         *command,
         cwd=cwd,
         env=build_launch_env(
@@ -633,9 +638,16 @@ async def run(
                 *_surrender,
             ) = await _execute_subprocess(**execute_kwargs)
             output_surrendered = bool(_surrender[0]) if _surrender else False
-        except PermissionError as exc:
-            # Binary not in DeepAgents' shell allowlist — convert to a
-            # structured failed result with the canonical warning code.
+        except (PermissionError, ProgramRefused) as exc:
+            # Binary not in DeepAgents' shell allowlist, or a program the
+            # operating system would not start — convert to a structured
+            # failed result with the canonical warning code. ONLY a
+            # ProgramRefused, raised at the spawn boundary itself, is a refusal
+            # before anything ran (15 October 2026, Codex R12). Any other error
+            # from the start-and-collect call, a raw PermissionError included,
+            # may have come after the command started: nobody knows whether it
+            # is still running.
+            refused_first = isinstance(exc, ProgramRefused)
             warnings.append(
                 GuardKitWarning(
                     code="permissions_refused",
@@ -657,6 +669,9 @@ async def run(
                 stderr=str(exc),
                 exit_code=-1,
                 warnings=warnings,
+                refused_before_running=refused_first,
+                answer_lost=not refused_first,
+                confirmed=refused_first,
             )
 
         if output_surrendered:
@@ -731,6 +746,9 @@ async def run(
             stderr=f"{type(exc).__name__}: {exc}",
             exit_code=-1,
             warnings=warnings,
+            # Something went wrong around a command that may have started:
+            # nobody knows whether it is still running (15 October 2026).
+            answer_lost=True,
         )
 
 
@@ -802,6 +820,8 @@ def _binary_not_found_result(
                 },
             )
         ],
+        refused_before_running=True,
+        confirmed=True,
     )
 
 
@@ -829,6 +849,8 @@ def _refused_cwd_result(
                 },
             )
         ],
+        refused_before_running=True,
+        confirmed=True,
     )
 
 

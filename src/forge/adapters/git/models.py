@@ -71,6 +71,15 @@ class GitOpResult(BaseModel):
         ...,
         description="Subprocess exit code (0 on success, non-zero on failure).",
     )
+    confirmed: bool = Field(
+        default=False,
+        description=(
+            "15 October 2026: True only where a complete answer was read — git "
+            "ran to an exit code, or the operation was refused before git was "
+            "started. An exception around the command leaves it False: nobody "
+            "knows what git did."
+        ),
+    )
 
 
 class PRResult(BaseModel):

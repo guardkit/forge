@@ -116,7 +116,18 @@ CANDIDATE_TREES_EXCLUDE_LINE: str = ".forge-candidates/"
 
 
 class CandidateTreeError(RuntimeError):
-    """The candidate's tree could not be laid out, excluded, or read."""
+    """The candidate's tree could not be laid out, excluded, or read.
+
+    ``confirmed`` (15 October 2026) is True only where the failure is a
+    complete answer — git ran to an exit code, or the request was refused
+    before anything was written. It defaults to False: an error nobody
+    vouched for may have left the tree half written, and the merge press keeps
+    its hold for it.
+    """
+
+    def __init__(self, *args: object, confirmed: bool = False) -> None:
+        super().__init__(*args)
+        self.confirmed = confirmed
 
 
 def candidate_trees_root(repo_root: Path | str) -> Path:
@@ -130,7 +141,8 @@ def candidate_tree_path(repo_root: Path | str, feature_id: str) -> Path:
     if not feature or "/" in feature or "\\" in feature or feature in {".", ".."}:
         raise CandidateTreeError(
             f"a candidate tree needs a feature id that is one plain path "
-            f"segment, not {feature_id!r}"
+            f"segment, not {feature_id!r}",
+            confirmed=True,
         )
     return candidate_trees_root(repo_root) / feature
 
@@ -161,11 +173,13 @@ def _git(repo_root: Path, *args: str) -> str:
         done = run_git(list(args), cwd=repo_root)
     except OSError as exc:
         raise CandidateTreeError(
-            f"git could not be run in {repo_root} ({type(exc).__name__})"
+            f"git could not be run in {repo_root} ({type(exc).__name__})",
+            confirmed=True,
         ) from exc
     if done.returncode != 0:
         raise CandidateTreeError(
-            done.stderr or failure_sentence(args[0] if args else "git", done.returncode)
+            done.stderr or failure_sentence(args[0] if args else "git", done.returncode),
+            confirmed=True,
         )
     return done.stdout.strip()
 
@@ -1087,7 +1101,8 @@ def _extract_archive_into(repo_root: Path, dest: Path, sha: str) -> None:
         proc = open_git(["archive", "--format=tar", sha], cwd=repo_root)
     except OSError as exc:
         raise CandidateTreeError(
-            f"git archive could not be run in {repo_root}: {exc}"
+            f"git archive could not be run in {repo_root}: {exc}",
+            confirmed=True,
         ) from exc
     assert proc.stdout is not None
     extract_error: Exception | None = None
@@ -1101,11 +1116,13 @@ def _extract_archive_into(repo_root: Path, dest: Path, sha: str) -> None:
         returncode = proc.wait()
     if returncode != 0:
         raise CandidateTreeError(
-            f"git archive {sha} failed: {failure_sentence('archive', returncode)}"
+            f"git archive {sha} failed: {failure_sentence('archive', returncode)}",
+            confirmed=True,
         )
     if extract_error is not None:
         raise CandidateTreeError(
-            f"the archive of {sha} could not be extracted into {dest}: {extract_error}"
+            f"the archive of {sha} could not be extracted into {dest}: {extract_error}",
+            confirmed=True,
         )
 
 
@@ -1120,7 +1137,7 @@ async def materialise_candidate_tree(
     root = Path(repo_root)
     dest = candidate_tree_path(root, feature_id)
     if not sha or not str(sha).strip():
-        raise CandidateTreeError("no commit was named for the candidate tree")
+        raise CandidateTreeError("no commit was named for the candidate tree", confirmed=True)
     await asyncio.to_thread(_materialise_sync, root, dest, str(sha).strip())
     return dest
 
@@ -1163,7 +1180,8 @@ def _ensure_excluded_sync(repo_root: Path) -> bool:
         return True
     except OSError as exc:
         raise CandidateTreeError(
-            f"could not write {CANDIDATE_TREES_EXCLUDE_LINE!r} into {exclude}: {exc}"
+            f"could not write {CANDIDATE_TREES_EXCLUDE_LINE!r} into {exclude}: {exc}",
+            confirmed=True,
         ) from exc
 
 
@@ -1239,6 +1257,9 @@ class CandidateTreeLayout:
     path: str
     tree: str | None = None
     exclude_written: bool | None = None
+    #: True only for a tree the venue confirmed laid out in full (15 October
+    #: 2026). A layout built without saying is unconfirmed.
+    confirmed: bool = False
 
 
 @dataclass(frozen=True)
@@ -1262,6 +1283,11 @@ class WorkingFolder:
     base_ref: str | None = None
     reused: bool = False
     refusal: str | None = None
+    #: False when the venue gave no answer at all (15 October 2026).
+    #: True only where a complete answer was read (15 October 2026): the
+    #: folder was made, or the venue refused in its own words. A request
+    #: whose answer was lost or unreadable leaves it False.
+    confirmed: bool = False
 
 
 @runtime_checkable
@@ -1308,8 +1334,9 @@ class CandidateGit(Protocol):
 
     async def remove_candidate_tree(
         self, feature_id: str, path: str | None = None
-    ) -> bool:
-        """Remove the laid-out tree. Never raises; ``False`` when it could not."""
+    ) -> bool | None:
+        """Remove the laid-out tree. Never raises; ``False`` when the venue
+        answered that it could not, ``None`` when no answer came back."""
 
     async def add_working_folder(
         self, leaf: str, branch: str, base_ref: str
@@ -1327,8 +1354,12 @@ class CandidateGit(Protocol):
         can go wrong comes back as ``ok=False`` with a plain sentence.
         """
 
-    async def remove_working_folder(self, path: str) -> bool:
-        """Remove a working folder. A path already gone is a success."""
+    async def remove_working_folder(self, path: str) -> bool | None:
+        """Remove a working folder. A path already gone is a success.
+
+        ``False`` when the venue answered that it was not removed; ``None``
+        when no answer came back (a sandbox venue only).
+        """
 
     async def inspect_autobuild_worktree(
         self, build_id: str, path: str
@@ -1392,7 +1423,8 @@ class InContainerCandidateGit:
         self, feature_id: str, sha: str
     ) -> CandidateTreeLayout:
         path = await materialise_candidate_tree(self._repo_root, feature_id, sha)
-        return CandidateTreeLayout(path=str(path))
+        # Laid out here, to the end: complete (15 October 2026).
+        return CandidateTreeLayout(path=str(path), confirmed=True)
 
     async def remove_candidate_tree(
         self, feature_id: str, path: str | None = None
@@ -1442,9 +1474,11 @@ class InContainerCandidateGit:
             base_ref=cut.base_ref,
             reused=bool(cut.reused),
             refusal=None if cut.ok else (cut.reason or "the folder was not made"),
+            # As git answered, or not (15 October 2026).
+            confirmed=cut.confirmed,
         )
 
-    async def remove_working_folder(self, path: str) -> bool:
+    async def remove_working_folder(self, path: str) -> bool | None:
         from forge.cli._conductor_worktree import remove_journey_worktree
 
         try:
@@ -1456,12 +1490,14 @@ class InContainerCandidateGit:
                 type(exc).__name__,
                 exc,
             )
-            return False
+            return None
         if not removed.ok:
             logger.warning(
                 "working folder: %s could not be removed (%s)", path, removed.reason
             )
-        return bool(removed.ok)
+            # Git answered "not removed", or nobody knows what it did (None).
+            return False if removed.confirmed else None
+        return True if removed.confirmed else None
 
     @staticmethod
     def _autobuild_base() -> Path:
@@ -1497,7 +1533,7 @@ class InContainerCandidateGit:
             retire_autobuild_worktree,
         )
 
-        return await asyncio.to_thread(
+        retired = await asyncio.to_thread(
             retire_autobuild_worktree,
             repo=self._repo_root,
             base=self._autobuild_base(),
@@ -1505,3 +1541,9 @@ class InContainerCandidateGit:
             path=Path(path),
             expected=expected,
         )
+        # The retirement ran here to its end and every git command in it
+        # answered: a complete answer (15 October 2026). One that met a git
+        # command that raised is not. A raise goes past, and keeps the hold.
+        if retired.get("git_raised"):
+            return {**retired, "confirmed": False}
+        return {**retired, "confirmed": True}

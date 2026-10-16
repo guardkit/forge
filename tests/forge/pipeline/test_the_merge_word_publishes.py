@@ -193,6 +193,27 @@ def _deps(
     return deps, deploy, joins, bus
 
 
+def _deps_naming_the_candidate(
+    config: ForgeConfig, pool: SqliteLifecyclePersistence, **kwargs: Any  # noqa: F811
+) -> tuple[MergeExecutorDeps, _FakeDeploy, _JoinsForReal, _FakePublisher]:
+    """:func:`_deps` for a project that declares how its identity is handed
+    over, so the clean-up can name the candidate the check stood up and take
+    it down. A candidate left standing keeps the hold (15 October 2026), so a
+    test about the hold after a publisher's answer needs one that can be
+    taken down. The project cannot be asked what is running, so nothing is
+    deployed: the result words are the ones these tests are about."""
+    import dataclasses
+
+    deps, deploy, joins, bus = _deps(config, pool, **kwargs)
+    deps = dataclasses.replace(
+        deps,
+        deployment_target=lambda repo, root: (
+            "acme/widget-shop::live", _a_declaration(can_be_asked=False)
+        ),
+    )
+    return deps, deploy, joins, bus
+
+
 async def _press(
     deps: MergeExecutorDeps, repo_root: Path  # noqa: F811
 ) -> Any:
@@ -655,14 +676,14 @@ class TestPickingUpASendWhoseAnswerWasLost:
         publisher = _APublisherThatSays(
             [_published("f" * 40)], before_answering=send_for_real
         )
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
         first = await _press(deps, repo_root)
         assert first.result == "published-deployment-pending"
 
         again = _APublisherThatSays([_published("f" * 40)])
-        deps_two, deploy_two, joins_two, _bus_two = _deps(
+        deps_two, deploy_two, joins_two, _bus_two = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=again
         )
         second = await _press(deps_two, repo_root)
@@ -845,7 +866,7 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
     ) -> None:
-        deps, _deploy, _joins, _bus = _deps(config_with_publication_off, pool)
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(config_with_publication_off, pool)
         first = await _press(deps, repo_root)
         assert first.result == "publication-pending"
         assert "checked and ready to publish" in first.detail
@@ -853,7 +874,7 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         self._forget_which_commit_the_checks_ran_on(pool)
 
         publisher = _APublisherThatSays([_published("c" * 40)])
-        deps_two, _deploy_two, joins_two, _bus_two = _deps(
+        deps_two, _deploy_two, joins_two, _bus_two = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
         second = await _press(deps_two, repo_root)
@@ -871,6 +892,103 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         assert publisher.asked == []
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("publication", ["on", "off"])
+    @pytest.mark.parametrize(
+        "answer, kept",
+        [
+            ("could-not-run", False),
+            ("lost", True),
+            # Codex R6, round 4: a call that raised after it may have been
+            # sent keeps the hold; the door's own refusal, raised before
+            # anything is sent, does not. A timeout keeps it whatever report
+            # survived.
+            ("raised", True),
+            ("refused-before-sending", False),
+            ("timed-out", True),
+        ],
+    )
+    async def test_a_reused_join_whose_checks_could_not_run(
+        self,
+        config_with_publication_off: ForgeConfig,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        publication: str,
+        answer: str,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R6 (settled by default): the second press
+        picks the join up and asks the build system to check it. When the
+        build system ANSWERS that its checks could not run, the press ends
+        GATED (publication off) or not wholly checked (publication on), its
+        candidate's teardown answers that it is down, and the hold is put
+        down. When the check-join's answer is lost (no report of its own),
+        the command may still be running, and the hold is kept."""
+        from forge.adapters.guardkit.models import GuardKitResult
+
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
+            config_with_publication_off, pool
+        )
+        first = await _press(deps, repo_root)
+        assert first.result == "publication-pending"
+        self._forget_which_commit_the_checks_ran_on(pool)
+
+        asked: list[list[str]] = []
+
+        async def _check_join(**kwargs: Any) -> GuardKitResult:
+            from forge.adapters.guardkit.run_via_sidecar import MergeCallRefused
+
+            args = list(kwargs.get("args") or [])
+            asked.append(args)
+            if answer == "raised":
+                raise ConnectionResetError("the check-join's answer was lost")
+            if answer == "refused-before-sending":
+                raise MergeCallRefused("the door carries only the merge command")
+            if answer == "lost":
+                return GuardKitResult(
+                    status="failed",
+                    subcommand="autobuild",
+                    duration_secs=0.1,
+                    stdout_tail="",
+                    stderr="the deploy sidecar could not be reached",
+                    exit_code=1,
+                )
+            report = {
+                "outcome": "checked",
+                "joined_commit": args[args.index("--joined") + 1],
+                "verify_ran": False,
+                "verify_ok": False,
+                "verify_status": "unverified",
+                "verify_detail": "the install failed in the joined tree",
+            }
+            return GuardKitResult(
+                # A complete answer from the build system (15 October 2026).
+                confirmed=answer != "timed-out",
+                status="timeout" if answer == "timed-out" else "failed",
+                subcommand="autobuild",
+                duration_secs=0.1,
+                stdout_tail=json.dumps(report),
+                stderr=None,
+                exit_code=124 if answer == "timed-out" else 1,
+            )
+
+        import dataclasses
+
+        config_two = (
+            config_with_publication_on if publication == "on" else config_with_publication_off
+        )
+        deps_two, deploy_two, _joins_two, _bus_two = _deps_naming_the_candidate(
+            config_two, pool, publisher=_APublisherThatSays([_published("c" * 40)])
+        )
+        deps_two = dataclasses.replace(deps_two, guardkit_run=_check_join)
+        second = await _press(deps_two, repo_root)
+
+        assert [a[0] for a in asked] == ["check-join"]
+        assert second.result == "publication-pending", second.detail
+        assert "candidate_down" in _legs(deploy_two)
+        assert (_record(pool).lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
     async def test_a_done_line_naming_this_commit_still_counts(
         self,
         config_with_publication_off: ForgeConfig,
@@ -879,12 +997,12 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         repo_root: Path,  # noqa: F811
     ) -> None:
         """The same two presses, with the line left alone: it is checked."""
-        deps, _deploy, _joins, _bus = _deps(config_with_publication_off, pool)
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(config_with_publication_off, pool)
         first = await _press(deps, repo_root)
         assert first.result == "publication-pending"
 
         publisher = _APublisherThatSays([_published("c" * 40)])
-        deps_two, _deploy_two, joins_two, _bus_two = _deps(
+        deps_two, _deploy_two, joins_two, _bus_two = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
         second = await _press(deps_two, repo_root)
@@ -966,6 +1084,7 @@ class _AProjectWithATarget:
                 else "[the project] checked it, and said nothing about what\n"
             )
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete",
                 verdict="pass",
                 failed_step=None,
@@ -974,12 +1093,14 @@ class _AProjectWithATarget:
             )
         if leg == "candidate_down":
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
             )
         if leg == "what_is_running":
             self.asked_what_is_running += 1
             if self.the_read_only_answer is not None:
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome=(
                         "complete" if self.the_read_only_step_finished else "failed"
                     ),
@@ -988,12 +1109,14 @@ class _AProjectWithATarget:
                 )
             if not self.answers_what_is_running:
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome="failed", verdict=None, detail={"deploy_output": ""}
                 )
             # "Nothing is running here" is the WORD ``none`` (25 September
             # 2026): an empty value is what a step prints when its own query
             # failed, so it cannot also mean the target is free.
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete",
                 verdict=None,
                 detail={
@@ -1009,6 +1132,7 @@ class _AProjectWithATarget:
         # press's read-only question gets the answer a real one would.
         self.on_the_target = running
         return SimpleNamespace(
+            confirmed=True,  # a complete leg answer (15 October 2026)
             outcome="complete",
             verdict="pass",
             deploy_record_ref="docs/state/x.md",
@@ -1167,10 +1291,12 @@ class TestTheDeployPutsLiveExactlyWhatWasChecked:
 
         assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
         legs = [call.get("leg") for call in deploy.calls]
-        assert legs == ["candidate_check", "what_is_running", "promote", "candidate_down"]
+        # The promote said it took the candidate down itself, so the press's
+        # clean-up does not ask again (15 October 2026, FEAT-D267: the stage
+        # turned that repeat away, and the hold was kept after a live merge).
+        assert legs == ["candidate_check", "what_is_running", "promote"]
         assert [("candidate_cwd" in call) for call in deploy.calls] == [
             True,
-            False,
             False,
             False,
         ]
@@ -1269,6 +1395,7 @@ class _ADeployTheExecutorStopped:
             summary = dict(GREEN_GATE)
             summary["candidate_output"] = "CHECKED_ARTIFACT=the-checked-thing\n"
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete",
                 verdict="pass",
                 failed_step=None,
@@ -1277,17 +1404,20 @@ class _ADeployTheExecutorStopped:
             )
         if leg == "candidate_down":
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete", verdict=None, detail={"candidate": "torn-down"}
             )
         if leg == "what_is_running":
             # Nothing is running on the target: the word ``none``, which is the
             # only way a project says that.
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete", verdict=None,
                 detail={"deploy_output": "RUNNING_IDENTITY=none\n"},
             )
         owns = dict(kwargs.get("deploy_ownership") or {})
         return SimpleNamespace(
+            confirmed=True,  # a complete leg answer (15 October 2026)
             outcome="failed",
             verdict=None,
             failed_step="deploy_compose",
@@ -1417,6 +1547,8 @@ class _ABuildSystemWithCheckJoin:
             "checks_total": 3,
         }
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status="success" if self.verify_ok else "failed",
             subcommand="autobuild",
             duration_secs=0.1,
@@ -1796,7 +1928,7 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         repo_root: Path,  # noqa: F811
     ) -> None:
         publisher = _APublisherThatSays([_published("c" * 40)])
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
 
@@ -1818,7 +1950,7 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         publisher = _APublisherThatSays(
             [_some_other_refusal("there-is-no-credential", "it holds none.")]
         )
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=publisher
         )
 
@@ -1869,7 +2001,7 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         def send_for_real(request: dict[str, Any]) -> None:
             _git(repo_root, "push", "-q", "origin", f"{request['j_commit']}:main")
 
-        first_deps, _deploy, _joins, _bus = _deps(
+        first_deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on,
             pool,
             publisher=_APublisherThatSays(
@@ -1880,7 +2012,7 @@ class TestTheHoldIsPutDownWhenThePublishedPressHasFinished:
         assert first.result == "published-deployment-pending"
 
         retry_publisher = _APublisherThatSays([_published("f" * 40)])
-        retry_deps, _deploy, _joins, _bus = _deps(
+        retry_deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on, pool, publisher=retry_publisher
         )
         retry = await _press(retry_deps, repo_root)
@@ -1922,11 +2054,13 @@ class _APromoteThatReverted(_AProjectWithATarget):
             self.calls.append(kwargs)
             if self.revert_worked:
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome="reverted", verdict="fail", failed_step=None,
                     events=("DeployReverted",),
                     detail={"rollback_image_ref": "x:rollback-1", "candidate": "torn-down"},
                 )
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="failed", verdict="fail", failed_step="revert", events=(),
                 detail={
                     "reason": "revert_failed",
@@ -1938,17 +2072,25 @@ class _APromoteThatReverted(_AProjectWithATarget):
 
 
 class TestAPromoteThatDidNotCompleteKeepsTheHold:
-    """A promote that did not report complete — its answer lost, failed in
-    its own words, reverted (the coach's G2), or deployed something other
-    than what it was handed — may have left something running or changing
-    on the target, and the deployment lock is put down on every ending. So
-    the hold is kept and a second press is refused until it lapses."""
+    """A promote that did not report complete: its answer lost, failed in its
+    own words, reverted (the coach's G2), or deployed something other than
+    what it was handed.
+
+    Changed 15 October 2026 (settled by default): only the promote whose
+    answer was lost may have left something running, so only it keeps the
+    hold and has a second press refused. The others answered: the press has
+    finished, and the hold is put down."""
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
-        "how",
-        ["answer-lost", "failed-in-its-own-words", "reverted", "revert-failed",
-         "reported-another-identity"],
+        "how, kept",
+        [
+            ("answer-lost", True),
+            ("failed-in-its-own-words", False),
+            ("reverted", False),
+            ("revert-failed", False),
+            ("reported-another-identity", False),
+        ],
     )
     async def test_the_hold_is_kept_and_a_second_press_is_refused(
         self,
@@ -1956,6 +2098,7 @@ class TestAPromoteThatDidNotCompleteKeepsTheHold:
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         how: str,
+        kept: bool,
     ) -> None:
         sidecar = ASidecarThat(
             None if how == "answer-lost"
@@ -1982,9 +2125,9 @@ class TestAPromoteThatDidNotCompleteKeepsTheHold:
 
             assert outcome.result == "merged-deploy-failed", outcome.detail
             assert [c.get("leg") for c in deploy.calls].count("promote") == 1
-            assert _record(pool).lease_holder is not None
+            assert (_record(pool).lease_holder is not None) is kept
             again = await _press(deps, repo_root)
-            assert "another worker" in again.detail
+            assert ("another worker" in again.detail) is kept
             # The send step's record the queue reads is as it always was.
             send = [
                 line for line in _record(pool).lines
@@ -1999,10 +2142,11 @@ class TestAPromoteThatDidNotCompleteKeepsTheHold:
 class _ASidecarForTheRealPromote:
     """A loopback sidecar for the REAL deploy stage's promote (Codex round 2,
     R1, 4 October 2026). The deploy step answers with the identity it was
-    handed and the health check passes; the candidate teardown's request is
-    taken and never answered."""
+    handed and the health check passes. The candidate teardown's request is
+    answered "not done" (exit 1) when ``teardown`` is ``"not-done"``, or
+    taken and never answered when it is ``"lost"``."""
 
-    def __init__(self) -> None:
+    def __init__(self, teardown: str = "lost") -> None:
         import threading
         from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -2014,15 +2158,20 @@ class _ASidecarForTheRealPromote:
                 body = json.loads(
                     self.rfile.read(int(self.headers.get("Content-Length") or 0))
                 )
+                exit_code = 0
                 if (body.get("env") or {}).get("CANDIDATE_DOWN") == "1":
                     sidecar.teardowns += 1
-                    self.close_connection = True
-                    return
+                    if teardown == "lost":
+                        self.close_connection = True
+                        return
+                    exit_code = 1
                 deploy = body.get("deploy") or {}
                 said = (
                     f"DEPLOYED_IDENTITY={deploy.get('identity')}\n" if deploy else "ok\n"
                 )
-                answer = json.dumps({"exit_code": 0, "output_tail": said}).encode()
+                answer = json.dumps(
+                    {"exit_code": exit_code, "output_tail": said}
+                ).encode()
                 self.send_response(200)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(answer)))
@@ -2101,17 +2250,26 @@ class TestAPromoteWhoseOwnTeardownWasNotAnsweredKeepsTheHold:
     """Codex round 2, R1: the real promote goes live and its live check
     passes, so it says "complete" — but its own candidate teardown was not
     answered, and it says the candidate is still "standing". The final
-    clean-up then succeeds. The hold is kept and a second press is refused."""
+    clean-up's teardown then answers that the candidate is down.
+
+    Changed 15 October 2026: a candidate still standing keeps the hold only
+    until a teardown answers that it is down. When the promote's own teardown
+    was ANSWERED "not done", the clean-up's answer puts the hold down. When
+    its answer was LOST, the promote's result says so and the hold is kept:
+    that request may still be running in the sandbox."""
 
     @pytest.mark.asyncio
-    async def test_the_hold_is_kept_and_a_second_press_is_refused(
+    @pytest.mark.parametrize("teardown, kept", [("not-done", False), ("lost", True)])
+    async def test_the_clean_up_teardown_decides_unless_an_answer_was_lost(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         tmp_path: Path,
+        teardown: str,
+        kept: bool,
     ) -> None:
-        sidecar = _ASidecarForTheRealPromote()
+        sidecar = _ASidecarForTheRealPromote(teardown)
         try:
             deploy = _APromoteThroughTheRealStage(sidecar, tmp_path)
             deps = _deps_that_can_deploy(
@@ -2126,10 +2284,12 @@ class TestAPromoteWhoseOwnTeardownWasNotAnsweredKeepsTheHold:
             assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
             assert deploy.promoted.outcome == "complete"
             assert deploy.promoted.detail["candidate"] == "standing"
+            assert bool(deploy.promoted.detail.get("answer_lost")) is kept
             assert sidecar.teardowns == 1
-            assert _record(pool).lease_holder is not None
+            assert [c.get("leg") for c in deploy.calls][-1] == "candidate_down"
+            assert (_record(pool).lease_holder is not None) is kept
             again = await _press(deps, repo_root)
-            assert "another worker" in again.detail
+            assert ("another worker" in again.detail) is kept
         finally:
             sidecar.close()
 
@@ -2138,17 +2298,21 @@ class _ASurfaceWhoseCleanUpsSay:
     """This container's git, except for the clean-up answers a test names:
     ``folder`` for a join's working-folder removal (``"false"`` or
     ``"raises"``), ``retired`` for the retained worktree's retirement status,
-    and ``tree_removals`` for the first candidate-tree removals, in order."""
+    and ``tree_removals`` for the first candidate-tree removals, in order
+    (``None`` is a removal whose answer was lost)."""
 
     def __new__(cls, repo_root: Path, **says: Any) -> Any:
         from forge.deploy.candidate_tree import InContainerCandidateGit
 
         class _Surface(InContainerCandidateGit):
-            async def remove_working_folder(self, path: str) -> bool:
+            async def remove_working_folder(self, path: str) -> bool | None:
                 if says.get("folder") == "raises":
                     raise ConnectionResetError("the removal's answer was lost")
                 if says.get("folder") == "false":
                     return False
+                if says.get("folder") == "no-answer":
+                    # The sandbox venue's own words when no answer came back.
+                    return None
                 return await super().remove_working_folder(path)
 
             async def retire_autobuild_worktree(
@@ -2161,13 +2325,18 @@ class _ASurfaceWhoseCleanUpsSay:
                         "path": path,
                         "detail": "the sandbox could not be reached",
                         "answered": False,
+                        "confirmed": False,
                     }
-                return {"status": says.get("retired") or "removed", "path": path}
+                return {
+                    "status": says.get("retired") or "removed",
+                    "path": path,
+                    "confirmed": True,
+                }
 
             async def remove_candidate_tree(
                 self, feature_id: str, path: str | None = None
             ) -> bool:
-                queued = says.get("tree_removals") or []
+                queued = says.get("tree_removals")
                 if queued:
                     return queued.pop(0)
                 return await super().remove_candidate_tree(feature_id, path)
@@ -2187,13 +2356,24 @@ class TestEverySandboxCleanUpIsGuarded:
         return dataclasses.replace(deps, git_surface=lambda _repo, _root: surface)
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("folder", ["false", "raises"])
-    async def test_a_join_folder_that_was_not_removed_keeps_the_hold(
+    @pytest.mark.parametrize(
+        "folder, kept",
+        [
+            # 15 October 2026, FEAT-D267: a join folder the venue answered it
+            # did not remove is a leftover folder, not running work, so the
+            # hold is put down; only a removal with no answer keeps it.
+            ("false", False),
+            ("no-answer", True),
+            ("raises", True),
+        ],
+    )
+    async def test_a_join_folder_whose_removal_was_not_answered_keeps_the_hold(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         folder: str,
+        kept: bool,
     ) -> None:
         deps = self._with_surface(
             _deps_that_can_deploy(
@@ -2208,8 +2388,8 @@ class TestEverySandboxCleanUpIsGuarded:
         outcome = await _press(deps, repo_root)
 
         assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
-        assert _record(pool).lease_holder is not None
-        assert "another worker" in (await _press(deps, repo_root)).detail
+        assert (_record(pool).lease_holder is not None) is kept
+        assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -2263,19 +2443,28 @@ class TestEverySandboxCleanUpIsGuarded:
         assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "removed, kept", [(None, True), (False, False)], ids=["lost", "answered"]
+    )
     async def test_a_tree_not_removed_before_another_attempt_keeps_the_hold(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
+        removed: bool | None,
+        kept: bool,
     ) -> None:
+        """Between attempts the laid-out tree is removed. With no answer it may
+        still be being removed, and the hold is kept; answered "not removed"
+        it is a leftover folder, and the hold is put down (15 October 2026,
+        Codex R1). The project names its candidate, so nothing else holds."""
         landed: list[str] = []
 
         def another_hand(_request: dict[str, Any]) -> None:
             if not landed:
                 landed.append(_somebody_else_lands_work(repo_root, "between"))
 
-        deps, _deploy, _joins, _bus = _deps(
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
             config_with_publication_on,
             pool,
             publisher=_APublisherThatSays(
@@ -2283,7 +2472,7 @@ class TestEverySandboxCleanUpIsGuarded:
                 before_answering=another_hand,
             ),
         )
-        removals = [False]
+        removals = [removed]
         deps = self._with_surface(
             deps, _ASurfaceWhoseCleanUpsSay(repo_root, tree_removals=removals)
         )
@@ -2291,6 +2480,202 @@ class TestEverySandboxCleanUpIsGuarded:
         outcome = await _press(deps, repo_root)
 
         assert outcome.result == "published-deployment-pending", outcome.detail
-        assert removals == []  # the between-attempts removal said False
-        assert _record(pool).lease_holder is not None
-        assert "another worker" in (await _press(deps, repo_root)).detail
+        assert removals == []  # the between-attempts removal was the one asked
+        assert (_record(pool).lease_holder is not None) is kept
+        assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "tree_removed, kept",
+        [(None, True), (False, False), (True, False)],
+        ids=["lost", "answered-not-removed", "answered"],
+    )
+    async def test_main_moving_since_the_preview_keeps_the_hold_only_after_an_unconfirmed_clean_up(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        tree_removed: bool | None,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, FEAT-A9DA: the refusal for a main that moved since
+        the preview is a settled ending, so the hold is put down — unless a
+        clean-up the press sent earlier was not confirmed, which keeps it.
+
+        The first attempt joins the tree that was previewed; the publisher
+        answers that the remote moved, and the next attempt joins a different
+        tree, which is refused. Between the attempts the candidate tree's
+        removal says ``tree_removed``."""
+        previewed = _git(
+            repo_root, "merge-tree", "--write-tree", "main", f"autobuild/{FEATURE_ID}"
+        )
+        landed: list[str] = []
+
+        def another_hand(_request: dict[str, Any]) -> None:
+            if not landed:
+                landed.append(_somebody_else_lands_work(repo_root, "between"))
+
+        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays(
+                [_the_remote_moved()], before_answering=another_hand
+            ),
+        )
+        removals = [tree_removed]
+        deps = self._with_surface(
+            deps, _ASurfaceWhoseCleanUpsSay(repo_root, tree_removals=removals)
+        )
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            repo=REPO,
+            repo_root=repo_root,
+            expect_main_sha=MAIN_SHA,
+            correlation_id=CORRELATION,
+            decided_by="rich",
+            expected_preview_tree=previewed,
+        )
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        assert "main moved since the preview" in outcome.detail
+        assert removals == []
+        assert _record(pool).result == RESULT_PUBLICATION_PENDING
+        assert (_record(pool).lease_holder is not None) is kept
+
+
+class TestACandidateLeftStandingKeepsTheHoldUntilATeardownAnswers:
+    """15 October 2026: the promote says the candidate is still standing, and
+    the press's clean-up asks for it to come down. The hold follows what that
+    teardown answers: down puts it down; an answer that it is still standing,
+    or no answer at all, keeps it."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "teardown, kept",
+        [("down", False), ("still-standing", True), ("lost", True)],
+    )
+    async def test_the_teardown_decides(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        teardown: str,
+        kept: bool,
+    ) -> None:
+        from types import SimpleNamespace
+
+        class _APromoteThatLeavesItStanding(_ADeployStepThatSays):
+            async def __call__(self, **kwargs: Any) -> Any:
+                leg = kwargs.get("leg")
+                if leg == "candidate_down":
+                    self.calls.append(kwargs)
+                    if teardown == "lost":
+                        raise ConnectionResetError("the teardown's answer was lost")
+                    if teardown == "still-standing":
+                        return SimpleNamespace(
+                            confirmed=True,  # a complete leg answer (15 October 2026)
+                            outcome="failed", verdict=None,
+                            detail={"candidate": "standing"},
+                        )
+                answer = await super().__call__(**kwargs)
+                if leg == "promote":
+                    answer.detail = {**answer.detail, "candidate": "standing"}
+                return answer
+
+        deploy = _APromoteThatLeavesItStanding()
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=deploy,
+        )
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert [c.get("leg") for c in deploy.calls][-1] == "candidate_down"
+        assert (_record(pool).lease_holder is not None) is kept
+        assert ("another worker" in (await _press(deps, repo_root)).detail) is kept
+
+
+def _git_worktree_commands_that(monkeypatch: pytest.MonkeyPatch, verb: str, how: str) -> None:
+    """The REAL git adapter, except that ``git worktree <verb>`` raises after
+    it was sent (``how="raises"``) or answers a non-zero exit (``"refused"``).
+    Every other git command runs for real."""
+    from forge.adapters.git import operations
+
+    real = operations._default_execute
+
+    async def _execute(*, command, cwd=None, timeout=None):  # type: ignore[no-untyped-def]
+        if list(command[:3]) == ["git", "worktree", verb]:
+            if how == "raises":
+                raise OSError(f"the pipe to git worktree {verb} broke")
+            return operations.ExecuteResult(
+                exit_code=128, stdout="", stderr=f"git worktree {verb} refused it"
+            )
+        return await real(command=command, cwd=cwd, timeout=timeout)
+
+    monkeypatch.setattr(operations, "_default_execute", _execute)
+
+
+class TestOnlyAConfirmedGitAnswerPutsTheHoldDown:
+    """15 October 2026, Codex R13, through the REAL in-container git adapter:
+    a ``git worktree`` command that raised after it was sent gives no answer
+    anybody can rely on, so the hold is kept; one git answered with an exit
+    code is a complete answer, and the hold goes down."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how, kept", [("raises", True), ("refused", False)])
+    async def test_the_join_folders_removal(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+        how: str,
+        kept: bool,
+    ) -> None:
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=_ADeployStepThatSays(),
+        )
+        # The join folder is made for real first; only its removal at the
+        # record's end meets the broken (or refusing) git.
+        _git_worktree_commands_that(monkeypatch, "remove", how)
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert (_record(pool).lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how, kept", [("raises", True), ("refused", False)])
+    async def test_the_join_folders_creation(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+        how: str,
+        kept: bool,
+    ) -> None:
+        deps = _deps_that_can_deploy(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=_ADeployStepThatSays(),
+        )
+        _git_worktree_commands_that(monkeypatch, "add", how)
+
+        outcome = await _press(deps, repo_root)
+
+        assert outcome.result == "merge-refused", outcome.detail
+        held = _record(pool)
+        assert held.result == RESULT_PUBLICATION_PENDING
+        assert (held.lease_holder is not None) is kept

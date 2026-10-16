@@ -191,6 +191,68 @@ def test_compose_script_allowed(repo: Path) -> None:
     assert runner.calls[0]["cwd"] == str(repo)  # cwd resolved to repo root
 
 
+def test_a_script_stopped_at_its_time_limit_says_so(repo: Path) -> None:
+    """15 October 2026, Codex R2: the caller counts it like no answer."""
+    from forge.executor.shell_steps import TimedOut
+
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner(result=TimedOut(124, "stopped"))
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 200
+    assert body == {
+        "exit_code": 124,
+        "output_tail": "stopped",
+        "cwd": str(repo),
+        "timed_out": True,
+    }
+
+
+def test_a_script_whose_run_raised_is_a_5xx(repo: Path) -> None:
+    """15 October 2026, Codex R9: the run raised after the script may have
+    started, so the answer is a 5xx, which every caller reads as no answer."""
+    from forge.executor.shell_steps import RaisedWhileRunning
+
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner(
+        result=RaisedWhileRunning(1, "Unexpected error running script: OSError: x")
+    )
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 500
+    assert "Unexpected error running script" in body["error"]
+
+
+@pytest.mark.parametrize("how", ["ENOEXEC", "ENOTDIR"])
+def test_a_script_the_system_would_not_start_is_a_4xx(repo: Path, how: str) -> None:
+    """15 October 2026, Codex R11, through the REAL script runner: the system
+    refused to start the script (an exec format error, or a path through a
+    file), so nothing ran — a 4xx in the sidecar's own words, an answer."""
+    if how == "ENOEXEC":
+        script = "deploy.sh"
+        (repo / "deploy.sh").write_text("this is not a program\n", encoding="utf-8")
+        (repo / "deploy.sh").chmod(0o755)
+    else:
+        script = "notadir/deploy.sh"
+        (repo / "notadir").write_text("a file, not a folder\n", encoding="utf-8")
+        _write_profile(
+            repo,
+            {"env_id": "staging", "compose": {"file": "compose.yaml", "script": script}},
+        )
+    cfg = _config({"appmilla/api_test": str(repo)})
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": script}, config=cfg
+    )
+    assert status == 400, body
+    assert body["error"]
+
+
 def test_health_check_cmd_allowed(repo: Path) -> None:
     _write_profile(
         repo,

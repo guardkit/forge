@@ -91,11 +91,19 @@ def test_an_ordinary_gate_reads_exactly_what_cbd1fc48_read() -> None:
     # The step result — what the stage forwards into its QA verdict and
     # live-gate result events — is byte for byte the old one.
     assert json.dumps(read["step_result"]) == json.dumps(golden["step_result"])
-    # The invocation is the old one plus three new fields, all left empty.
+    # The invocation is the old one plus five new fields (15 October 2026:
+    # ``answer_lost`` False and ``confirmed`` True for a gate that answered).
     added = {
-        key: read["invocation"].pop(key) for key in ("media_refs", "report_ref", "outcome")
+        key: read["invocation"].pop(key)
+        for key in ("media_refs", "report_ref", "outcome", "answer_lost", "confirmed")
     }
-    assert added == {"media_refs": [], "report_ref": None, "outcome": None}
+    assert added == {
+        "media_refs": [],
+        "report_ref": None,
+        "outcome": None,
+        "answer_lost": False,
+        "confirmed": True,
+    }
     assert read["invocation"] == golden["invocation"]
 
 

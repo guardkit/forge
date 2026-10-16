@@ -1906,6 +1906,14 @@ ALLOWED: dict[tuple[str, str], str] = {
         "any of them carrying a value of the factory's own settings"
     ),
     ("deploy_sidecar/service.py", "_start_and_collect"): "generic runner; every call to it is checked below",
+    ("executor/programs.py", "start_program"): (
+        "the one place the merge press's legs start a program (15 October "
+        "2026); generic runner, every call to it is checked below"
+    ),
+    ("executor/programs.py", "start_program_async"): (
+        "start_program for an asyncio caller; generic runner, every call to it "
+        "is checked below"
+    ),
     ("deploy_sidecar/service.py", "run_merge_command"): "starts GuardKit (merge, legs, checks) with the factory's launch list",
     ("network_git.py", "run_network_git"): (
         "the network boundary's one git launch: an environment built from "
@@ -1955,6 +1963,18 @@ GENERIC_RUNNERS: dict[tuple[str, str], dict[str, Any]] = {
     ("deploy_sidecar/service.py", "_start_and_collect"): {
         "dotted": {"forge.deploy_sidecar.service._start_and_collect"},
         "names": {"_start_and_collect"},
+    },
+    # The one place the merge press's legs start a program (15 October 2026):
+    # its three bodies start it, and every call to any of them is judged as a
+    # launch of its own.
+    ("executor/programs.py", "start_program"): {
+        "dotted": {
+            "forge.executor.programs.start_program",
+            "forge.executor.programs.start_program_async",
+            "forge.executor.programs.run_program",
+        },
+        "names": {"start_program", "start_program_async", "run_program"},
+        "bodies": {"start_program", "start_program_async", "run_program"},
     },
 }
 

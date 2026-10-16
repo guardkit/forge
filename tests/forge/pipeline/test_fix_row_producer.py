@@ -711,6 +711,9 @@ class TestTheRedMergeHook:
             MergeExecutorDeps,
             execute_merge_deploy,
         )
+        from tests.forge.pipeline.test_merge_executor import (
+            _a_project_that_declares_its_identity,
+        )
 
         # A real repository, made once: the executor checks the branch's tree
         # before the merge and compares tree ids after it (protect-main).
@@ -748,6 +751,8 @@ class TestTheRedMergeHook:
 
         async def guardkit(**kwargs: Any) -> GuardKitResult:
             return GuardKitResult(
+                # A complete answer from the build system (15 October 2026).
+                confirmed=True,
                 status="success",
                 subcommand=kwargs.get("subcommand", "merge"),
                 duration_secs=0.1,
@@ -764,6 +769,7 @@ class TestTheRedMergeHook:
             leg = kwargs.get("leg", "deploy")
             if leg == "candidate_check":
                 return SimpleNamespace(
+                    confirmed=True,  # a complete leg answer (15 October 2026)
                     outcome="complete",
                     verdict="pass",
                     failed_step=None,
@@ -775,8 +781,11 @@ class TestTheRedMergeHook:
                     },
                 )
             if leg == "candidate_down":
-                return SimpleNamespace(outcome="complete", detail={"candidate": "torn-down"})
+                return SimpleNamespace(
+                    outcome="complete", detail={"candidate": "torn-down"}, confirmed=True
+                )
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome=deploy_outcome,
                 verdict="fail",
                 deploy_record_ref="docs/state/x.md",
@@ -790,6 +799,12 @@ class TestTheRedMergeHook:
             guardkit_run=guardkit,
             deploy_dispatcher=deploy,
             receipts_root_fn=lambda: tmp_path / "merge-receipts",
+            # The project names its candidate, so the clean-up can take down
+            # the one the check stood up; a candidate left standing keeps the
+            # hold, and a second press would be refused (15 October 2026).
+            deployment_target=lambda repo, root: (
+                f"{repo}::live", _a_project_that_declares_its_identity()
+            ),
         )
         outcome = await execute_merge_deploy(
             deps=deps,

@@ -7,7 +7,8 @@ REAL service on a real ephemeral loopback port, against a real git repository,
 so what is proved is the two halves agreeing — not a mock's idea of them.
 
 The failure half matters as much: a sidecar that cannot be reached must never
-crash a press. Every read answers ``None``, a removal answers ``False``, and
+crash a press. Every read answers ``None``, a tree's removal answers
+``False`` (a working folder's answers ``None``: no answer came back), and
 only laying a tree out raises — which is the one place the press already
 expects a raise and turns into a plain refusal before the merge.
 """
@@ -130,6 +131,8 @@ class TestTheTwoHalvesOfTheSeamAgree:
         with pytest.raises(CandidateTreeError) as raised:
             await git.materialise_candidate_tree(FEATURE_ID, "b" * 40)
         assert "git archive" in str(raised.value)
+        # The sandbox refused it in its own words: an answer (15 October 2026).
+        assert raised.value.confirmed is True
 
     @pytest.mark.asyncio
     async def test_no_path_from_this_side_reaches_git_in_there(
@@ -159,6 +162,67 @@ class TestTheJoinsWorkingFolderIsRemovedInThere:
         coordinator_side = "/var/lib/forge/projects/api_test/.forge/worktrees/integration-FEAT-SG1"
         assert await git.remove_working_folder(coordinator_side) is True
         assert not Path(made.path).exists()
+
+    @staticmethod
+    def _a_read_only_module_cache_in(folder: Path) -> None:
+        """What the project's Go checks leave behind (FEAT-D267, 15 October
+        2026): a module cache of read-only folders in GuardKit's scratch area
+        inside Git's record folder for the working folder."""
+        record = Path(
+            (folder / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+        )
+        module = record / "guardkit-scratch" / "HOME" / "go" / "pkg" / "mod" / "m@v1"
+        module.mkdir(parents=True)
+        (module / "go.mod").write_text("module m\n", encoding="utf-8")
+        module.chmod(0o555)
+        module.parent.chmod(0o555)
+
+    @pytest.mark.asyncio
+    async def test_a_read_only_module_cache_does_not_stop_the_removal(
+        self, git: SidecarCandidateGit, clone: Path
+    ) -> None:
+        made = await git.add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok, made.refusal
+        self._a_read_only_module_cache_in(Path(made.path))
+
+        assert await git.remove_working_folder(str(made.path)) is True
+        assert not Path(made.path).exists()
+        assert "integration-" not in _git(clone, "worktree", "list", "--porcelain")
+
+    @pytest.mark.asyncio
+    async def test_a_removal_the_sandbox_answered_it_could_not_do_is_false(
+        self,
+        git: SidecarCandidateGit,
+        clone: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """An ANSWERED "not removed" is ``False``; only a lost answer is
+        ``None`` (the press keeps its hold for that alone)."""
+        import forge.subagents.autobuild_worktree_lifecycle as lifecycle
+
+        made = await git.add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok, made.refusal
+        self._a_read_only_module_cache_in(Path(made.path))
+        # As before the fix: nothing makes the cache's folders writable first.
+        monkeypatch.setattr(lifecycle, "make_worktree_removable", lambda _path: None)
+
+        assert await git.remove_working_folder(str(made.path)) is False
+
+    @pytest.mark.asyncio
+    async def test_a_folder_the_sandbox_refused_was_answered(
+        self, git: SidecarCandidateGit, clone: Path
+    ) -> None:
+        """A refusal in the sandbox's own words is an answer: nothing is
+        being made in there."""
+        made = await git.add_working_folder(
+            "integration/../escape", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok is False
+        assert made.confirmed is True
 
 
 class TestTheProjectsOwnFileIsReadInThere:
@@ -202,9 +266,31 @@ class TestASidecarThatCannotBeReached:
         assert await git.rev_parse("main") is None
         assert await git.is_ancestor("main", "main") is None
         assert await git.ensure_candidate_trees_excluded() is None
-        assert await git.remove_candidate_tree(FEATURE_ID) is False
+        # No answer at all is None, not False (15 October 2026).
+        assert await git.remove_candidate_tree(FEATURE_ID) is None
         unread = await git.read_file_at_commit("main", "deploy/profile.yaml")
         assert unread.ok is False and "127.0.0.1:1" in str(unread.refusal)
+
+    @pytest.mark.asyncio
+    async def test_a_working_folder_with_no_answer_says_it_had_none(self) -> None:
+        """15 October 2026: the press keeps its hold when the join folder's
+        request got no answer, so the venue says so."""
+        made = await self._unreachable().add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok is False
+        assert made.confirmed is False
+
+    @pytest.mark.asyncio
+    async def test_a_working_folder_removal_with_no_answer_answers_none(self) -> None:
+        """15 October 2026, FEAT-D267: no answer is ``None``, not ``False``,
+        so the press can tell it from a removal the sandbox refused."""
+        assert (
+            await self._unreachable().remove_working_folder(
+                "/x/.forge/worktrees/integration-FEAT-SG1"
+            )
+            is None
+        )
 
     @pytest.mark.asyncio
     async def test_a_retirement_with_no_answer_says_it_had_none(self) -> None:
@@ -222,6 +308,8 @@ class TestASidecarThatCannotBeReached:
         with pytest.raises(CandidateTreeError) as raised:
             await self._unreachable().materialise_candidate_tree(FEATURE_ID, "a" * 40)
         assert "127.0.0.1:1" in str(raised.value)
+        # No answer came back: the tree may still be being written.
+        assert raised.value.confirmed is False
 
     def test_it_refuses_to_be_built_without_the_repositorys_key(self) -> None:
         with pytest.raises(ValueError):
@@ -280,3 +368,189 @@ class TestRetainedAutobuildWorktreeLifecycle:
         assert answer["ok"] is False
         assert "configured autobuild worktree" in answer["detail"]
         assert (outside / "keep").is_file()
+
+
+
+class _ASidecarThatAnswersWith:
+    """A loopback server that answers every request with ``status`` and
+    ``body``, whatever was asked (15 October 2026, Codex R3)."""
+
+    def __init__(self, status: int, body: object) -> None:
+        import json
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                answer = json.dumps(body).encode()
+                self.send_response(status)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, *_args: object) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        host, port = self.server.server_address[:2]
+        self.git = SidecarCandidateGit(f"http://{host}:{port}", repo=REPO)
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
+    """15 October 2026, Codex R3: a reply that is a JSON object but carries no
+    result of the operation (``{}`` on a 200, or a refusal with no sentence)
+    says nothing about whether the operation happened, so it is read as no
+    answer. A refusal in the sidecar's own words is still an answer."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, body",
+        [
+            (200, {}),
+            (200, {"status": "maybe"}),
+            (400, {}),
+            (200, []),
+            # Codex R9: a 5xx is an error met while the operation may have
+            # been under way, whatever its sentence.
+            (500, {"error": "sidecar git error: OSError: the disk went away"}),
+            # Codex round 10, R18: only a 4xx is a refusal.
+            (302, {"error": "request redirected"}),
+        ],
+        ids=[
+            "empty-200",
+            "unknown-status",
+            "refusal-with-no-sentence",
+            "not-an-object",
+            "5xx-with-a-sentence",
+            "3xx-with-a-sentence",
+        ],
+    )
+    async def test_malformed_replies(self, status: int, body: object) -> None:
+        sidecar = _ASidecarThatAnswersWith(status, body)
+        try:
+            git = sidecar.git
+            made = await git.add_working_folder(
+                "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+            )
+            assert made.ok is False and made.confirmed is False
+            assert await git.remove_working_folder("/x/integration-FEAT-SG1") is None
+            assert await git.remove_candidate_tree(FEATURE_ID) is None
+            with pytest.raises(CandidateTreeError) as raised:
+                await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
+            assert raised.value.confirmed is False
+            retired = await git.retire_autobuild_worktree("build-X", "/retained", {})
+            assert retired["status"] == "kept" and retired["answered"] is False
+        finally:
+            sidecar.close()
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_in_the_sidecars_own_words_is_an_answer(self) -> None:
+        sidecar = _ASidecarThatAnswersWith(400, {"error": "that branch already exists"})
+        try:
+            git = sidecar.git
+            made = await git.add_working_folder(
+                "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+            )
+            assert made.ok is False and made.confirmed is True
+            assert await git.remove_working_folder("/x/integration-FEAT-SG1") is False
+            assert await git.remove_candidate_tree(FEATURE_ID) is False
+            with pytest.raises(CandidateTreeError) as raised:
+                await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
+            assert raised.value.confirmed is True
+            retired = await git.retire_autobuild_worktree("build-X", "/retained", {})
+            assert retired["status"] == "kept" and retired["answered"] is True
+        finally:
+            sidecar.close()
+
+    @pytest.mark.asyncio
+    async def test_answered_operations_read_as_before(self) -> None:
+        sidecar = _ASidecarThatAnswersWith(200, {"status": "failed", "removed": False})
+        try:
+            git = sidecar.git
+            made = await git.add_working_folder(
+                "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+            )
+            assert made.ok is False and made.confirmed is True
+            assert await git.remove_working_folder("/x/integration-FEAT-SG1") is False
+            assert await git.remove_candidate_tree(FEATURE_ID) is False
+        finally:
+            sidecar.close()
+
+
+
+class TestTheSandboxSaysWhetherGitAnswered:
+    """15 October 2026, Codex R13, through the REAL sidecar route: a
+    ``git worktree`` command that raised after it was sent is a 5xx — no
+    answer — and one git answered with an exit code is an answer."""
+
+    @staticmethod
+    def _git_worktree(monkeypatch: pytest.MonkeyPatch, verb: str, how: str) -> None:
+        from tests.forge.pipeline.test_the_merge_word_publishes import (
+            _git_worktree_commands_that,
+        )
+
+        _git_worktree_commands_that(monkeypatch, verb, how)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how, expected", [("raises", None), ("refused", False)])
+    async def test_the_removal(
+        self, git: SidecarCandidateGit, monkeypatch: pytest.MonkeyPatch, how, expected
+    ) -> None:
+        made = await git.add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok and made.confirmed
+        self._git_worktree(monkeypatch, "remove", how)
+        assert await git.remove_working_folder(str(made.path)) is expected
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how, confirmed", [("raises", False), ("refused", True)])
+    async def test_the_creation(
+        self, git: SidecarCandidateGit, monkeypatch: pytest.MonkeyPatch, how, confirmed
+    ) -> None:
+        self._git_worktree(monkeypatch, "add", how)
+        made = await git.add_working_folder(
+            "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+        )
+        assert made.ok is False
+        assert made.confirmed is confirmed
+
+
+class TestATimeoutIsReadFirstInEveryGitReply:
+    """15 October 2026, Codex round 9, R17: a reply that says the operation
+    was stopped at its time limit is no answer, however complete the rest of
+    it looks."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, body",
+        [
+            (200, {"status": "success", "path": "/x/integration-FEAT-SG1", "removed": True, "timed_out": True}),
+            (200, {"status": "failed", "removed": False, "timed_out": True}),
+            (400, {"error": "stopped at its limit", "timed_out": True}),
+        ],
+        ids=["success", "failure", "refusal"],
+    )
+    async def test_every_operation(self, status: int, body: dict) -> None:
+        sidecar = _ASidecarThatAnswersWith(status, body)
+        try:
+            git = sidecar.git
+            made = await git.add_working_folder(
+                "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+            )
+            assert made.confirmed is False
+            assert await git.remove_working_folder("/x/integration-FEAT-SG1") is None
+            assert await git.remove_candidate_tree(FEATURE_ID) is None
+            with pytest.raises(CandidateTreeError) as raised:
+                await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
+            assert raised.value.confirmed is False
+            retired = await git.retire_autobuild_worktree("build-X", "/retained", {})
+            assert retired["confirmed"] is False
+        finally:
+            sidecar.close()

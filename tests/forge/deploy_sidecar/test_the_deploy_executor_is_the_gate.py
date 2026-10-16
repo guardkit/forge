@@ -1069,6 +1069,142 @@ class TestTheTimeLimit:
         assert answer.word == "the-deploy-command-ran-out-of-time"
 
 
+class TestACommandThatDidNotFinish:
+    """15 October 2026, Codex R9 and R11: the executor starts its command
+    through the one place programs are started. An error after the command
+    started is raised_while_running (the route answers it with a 5xx); a
+    command the system would not start was never started (nothing ran)."""
+
+    def test_an_error_after_the_start_is_raised_while_running(
+        self, notes, workshop, TARGET, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess
+
+        def _broken_read(self, *args, **kwargs):
+            raise OSError("the pipe broke")
+
+        monkeypatch.setattr(subprocess.Popen, "communicate", _broken_read)
+        executor = _executor(notes, command_seconds=30.0, stop_confirm_seconds=20.0)
+        answer = executor.run(_ask(TARGET, _slow(workshop, 30), 1, "build-a", workshop))
+        assert answer.word == "the-deploy-command-ended-badly"
+        assert answer.raised_while_running is True
+
+    def test_a_command_the_system_would_not_start_was_never_started(
+        self, notes, workshop, TARGET, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The system refuses the spawn itself (here, an exec format error):
+        nothing ran, so the answer is the executor's own "would not start"."""
+        import errno
+        import subprocess
+
+        def _refused(self, *args, **kwargs):
+            raise OSError(errno.ENOEXEC, "Exec format error")
+
+        monkeypatch.setattr(subprocess.Popen, "__init__", _refused)
+        executor = _executor(notes, command_seconds=30.0, stop_confirm_seconds=20.0)
+        answer = executor.run(_ask(TARGET, _quick(workshop), 1, "build-a", workshop))
+        assert answer.accepted is False
+        assert answer.word == "the-deploy-command-would-not-start"
+        assert answer.raised_while_running is False
+
+
+def _taken_over_while_it_ran(monkeypatch: pytest.MonkeyPatch, how: str) -> None:
+    """While the deploy command's output is read, a later holder takes the
+    target over; the read itself times out, breaks, or finishes (``how``)."""
+    import subprocess
+
+    from forge.deploy_sidecar import deploy_executor as module
+
+    taken = {"over": False}
+    real_mine = module.DeployExecutor._the_note_is_still_mine
+    real_read = subprocess.Popen.communicate
+
+    def _mine(self, note):  # type: ignore[no-untyped-def]
+        return False if taken["over"] else real_mine(self, note)
+
+    def _read(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if module._RUNNER_SOURCE not in [str(a) for a in (self.args or [])]:
+            return real_read(self, *args, **kwargs)
+        if how == "finished":
+            answer = real_read(self, *args, **kwargs)
+            taken["over"] = True
+            return answer
+        taken["over"] = True
+        if how == "timed-out":
+            raise subprocess.TimeoutExpired(self.args, 1.0)
+        raise OSError("the deploy command's pipe broke")
+
+    monkeypatch.setattr(module.DeployExecutor, "_the_note_is_still_mine", _mine)
+    monkeypatch.setattr(subprocess.Popen, "communicate", _read)
+
+
+class TestATakeoverKeepsWhatElseHappened:
+    """15 October 2026, Codex R9: a takeover is answered in its own word, and
+    a timeout or an error after the start that came with it is carried apart
+    from the word, so it still reads as an answer that was lost."""
+
+    @pytest.mark.parametrize(
+        "how, timed_out, raised",
+        [("timed-out", True, False), ("raised", False, True), ("finished", False, False)],
+    )
+    def test_the_takeover_carries_it(
+        self, notes, workshop, TARGET, monkeypatch, how, timed_out, raised
+    ) -> None:
+        from forge.deploy_sidecar.deploy_executor import STOPPED_BY_A_TAKEOVER
+
+        _taken_over_while_it_ran(monkeypatch, how)
+        executor = _executor(notes, command_seconds=30.0, stop_confirm_seconds=20.0)
+        answer = executor.run(_ask(TARGET, _quick(workshop), 1, "build-a", workshop))
+        assert answer.word == STOPPED_BY_A_TAKEOVER
+        assert answer.accepted is False
+        assert answer.timed_out is timed_out
+        assert answer.raised_while_running is raised
+
+
+class TestATakeoverIsConfirmedOnlyWhenItsOwnGroupIsGone:
+    """15 October 2026, Codex round 9, R14: the holder that took over marks
+    the note superseded before it confirms the stop, so a changed note proves
+    nothing about the group. The takeover answer is confirmed only when this
+    waiter has itself seen its own group gone."""
+
+    @pytest.mark.parametrize("gone", [True, False])
+    def test_the_answer_says_it(self, notes, workshop, TARGET, monkeypatch, gone) -> None:
+        from forge.deploy_sidecar import deploy_executor as module
+
+        _taken_over_while_it_ran(monkeypatch, "finished")
+        if not gone:
+            monkeypatch.setattr(
+                module.DeployExecutor,
+                "_stop_and_confirm",
+                lambda self, note: (False, "a process of the group is still alive"),
+            )
+        executor = _executor(notes, command_seconds=30.0, stop_confirm_seconds=20.0)
+        answer = executor.run(_ask(TARGET, _quick(workshop), 1, "build-a", workshop))
+        assert answer.word == module.STOPPED_BY_A_TAKEOVER
+        assert answer.confirmed is gone
+
+
+class TestARanAnswerIsConfirmedOnlyWhenItsGroupIsGone:
+    """15 October 2026, Codex R14: a deploy command that returned is a
+    complete answer only when every process of its group was confirmed gone;
+    one whose group could not be confirmed stopped is not confirmed."""
+
+    @pytest.mark.parametrize("gone", [True, False])
+    def test_the_answer_says_it(self, notes, workshop, TARGET, monkeypatch, gone) -> None:
+        from forge.deploy_sidecar import deploy_executor as module
+
+        if not gone:
+            monkeypatch.setattr(
+                module.DeployExecutor,
+                "_stop_and_confirm",
+                lambda self, note: (False, "a process of the group is still alive"),
+            )
+        executor = _executor(notes, command_seconds=30.0, stop_confirm_seconds=20.0)
+        answer = executor.run(_ask(TARGET, _quick(workshop), 1, "build-a", workshop))
+        assert answer.word == "the-deploy-command-ran"
+        assert answer.confirmed is gone
+
+
 # ---------------------------------------------------------------------------
 # (h) the environment door
 # ---------------------------------------------------------------------------

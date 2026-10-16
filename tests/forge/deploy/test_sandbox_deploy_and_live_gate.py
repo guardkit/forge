@@ -650,6 +650,9 @@ class TestTheLiveGateRunsInsideTheSandbox:
         # system under test.
         assert answer.verdict == "instrument_fail"
         assert "could not be reached" in answer.detail["error"]
+        # No answer came back, and the invocation says so in a field of its
+        # own (15 October 2026): the merge press keeps its hold for it.
+        assert answer.answer_lost is True
 
     def test_a_driver_the_profile_does_not_declare_is_refused_not_run(
         self, clone: Path, sidecar: Any
@@ -667,6 +670,8 @@ class TestTheLiveGateRunsInsideTheSandbox:
         assert answer.verdict == "instrument_fail"
         assert "refused the live gate" in answer.detail["error"]
         assert "deploy/profile.yaml declares" in answer.detail["error"]
+        # A refusal is an answer.
+        assert answer.answer_lost is False
 
 
 class TestAPassingGateIsReadWhereverTheHelperRanIt:
@@ -961,3 +966,26 @@ class TestTheHostWrapperIsStillServed:
         assert exit_code != 0
         assert "sidecar refused (HTTP 400)" in output
         assert key in output
+
+
+def test_a_local_driver_that_timed_out_got_no_answer(tmp_path: Path) -> None:
+    """15 October 2026: a driver killed at its time limit may have left what it
+    started running, so its invocation says no answer came back."""
+    import sys
+
+    from forge.deploy.live_gate import RepoDriverLiveGateInvoker
+
+    import subprocess
+
+    # A real checkout: the driver's private HOME is made in its git directory.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    driver = tmp_path / "slow.py"
+    driver.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    invoker = RepoDriverLiveGateInvoker(
+        repo_path=tmp_path, driver_argv=[sys.executable, str(driver)], timeout_seconds=1
+    )
+
+    answer = invoker.invoke(feature="FEAT-T", target="apitest-sbx")
+
+    assert answer.verdict == "environment_fail"
+    assert answer.answer_lost is True

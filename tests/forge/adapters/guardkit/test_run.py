@@ -231,6 +231,9 @@ class TestCwdAllowlistEnforcement:
         assert called["executed"] is False
         codes = [w.code for w in result.warnings]
         assert "cwd_outside_allowlist" in codes
+        # Refused before anything ran: an answer (15 October 2026).
+        assert result.refused_before_running is True
+        assert result.answer_lost is False
 
     @pytest.mark.asyncio()
     async def test_outside_allowlist_repo_path_is_refused(
@@ -865,3 +868,138 @@ class TestParallelCallIsolation:
         assert results[1].subcommand == "feature-plan"
         assert "feature-spec" in results[0].stdout_tail
         assert "feature-plan" in results[1].stdout_tail
+
+
+
+@pytest.mark.asyncio()
+async def test_an_internal_error_around_the_command_is_no_answer(
+    allowlist: list[Path], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """15 October 2026: something went wrong around a command that may have
+    started, so the result says nobody knows whether it is still running."""
+
+    async def _breaks(**_: Any):
+        raise RuntimeError("the pipe broke")
+
+    monkeypatch.setattr(run_module, "_execute_subprocess", _breaks)
+
+    result = await run(
+        subcommand="feature-spec",
+        args=[],
+        repo_path=allowlist[0],
+        read_allowlist=allowlist,
+    )
+
+    assert result.status == "failed"
+    assert result.answer_lost is True
+    assert result.refused_before_running is False
+
+
+class TestOnlyTheSpawnBoundaryRefuses:
+    """15 October 2026, Codex R12: only a ProgramRefused, raised where the
+    program is started, is a refusal before running. The same error types
+    raised once the program has started are an answer that was lost."""
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize(
+        "error", [PermissionError, FileNotFoundError, NotADirectoryError]
+    )
+    async def test_an_error_after_the_start_is_lost(
+        self,
+        worktree: Path,
+        allowlist: list[Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        error: type[OSError],
+    ) -> None:
+        """The REAL start, then the started program's read raises."""
+        import asyncio.subprocess as aio_subprocess
+
+        monkeypatch.setattr(
+            run_module, "resolve_context_flags", lambda *a, **kw: _empty_resolved()
+        )
+        program = tmp_path / "guardkit"
+        program.write_text("#!/bin/sh\nsleep 5\n", encoding="utf-8")
+        program.chmod(0o755)
+        monkeypatch.setattr(
+            run_module, "_resolve_guardkit_binary", lambda: (str(program), [])
+        )
+
+        async def _read_breaks(self, *args: Any, **kwargs: Any):
+            raise error("raised after the program had started")
+
+        monkeypatch.setattr(aio_subprocess.Process, "communicate", _read_breaks)
+
+        result = await run(
+            subcommand="feature-spec",
+            args=[],
+            repo_path=worktree,
+            read_allowlist=allowlist,
+        )
+
+        assert result.status == "failed"
+        assert result.answer_lost is True
+        assert result.refused_before_running is False
+
+    @pytest.mark.asyncio()
+    @pytest.mark.parametrize(
+        "body", ["this is not a program\n", "#!/no/such/interpreter\n"],
+        ids=["ENOEXEC", "missing-interpreter"],
+    )
+    async def test_a_spawn_the_system_refuses_is_refused_before_running(
+        self,
+        worktree: Path,
+        allowlist: list[Path],
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        body: str,
+    ) -> None:
+        monkeypatch.setattr(
+            run_module, "resolve_context_flags", lambda *a, **kw: _empty_resolved()
+        )
+        program = tmp_path / "guardkit"
+        program.write_text(body, encoding="utf-8")
+        program.chmod(0o755)
+        monkeypatch.setattr(
+            run_module, "_resolve_guardkit_binary", lambda: (str(program), [])
+        )
+
+        result = await run(
+            subcommand="feature-spec",
+            args=[],
+            repo_path=worktree,
+            read_allowlist=allowlist,
+        )
+
+        assert result.status == "failed"
+        assert result.refused_before_running is True
+        assert result.answer_lost is False
+
+    @pytest.mark.asyncio()
+    async def test_a_raw_permission_error_from_the_seam_is_not_a_refusal(
+        self,
+        worktree: Path,
+        allowlist: list[Path],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """AC-011's warning stays; the error is no longer read as a refusal
+        before running, because it did not come from the spawn boundary."""
+        monkeypatch.setattr(
+            run_module, "resolve_context_flags", lambda *a, **kw: _empty_resolved()
+        )
+
+        async def _refuse(**_: Any):
+            raise PermissionError("binary not in shell allowlist")
+
+        monkeypatch.setattr(run_module, "_execute_subprocess", _refuse)
+
+        result = await run(
+            subcommand="feature-spec",
+            args=[],
+            repo_path=worktree,
+            read_allowlist=allowlist,
+        )
+
+        assert any(w.code == "permissions_refused" for w in result.warnings)
+        assert result.refused_before_running is False
+        assert result.answer_lost is True

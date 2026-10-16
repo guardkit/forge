@@ -64,7 +64,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from pathlib import PurePath
-from typing import Any
+from typing import Any, Callable
 
 from forge.deploy.candidate_tree import (
     CandidateTreeError,
@@ -160,6 +160,44 @@ class SidecarCandidateGit:
             f"the sandbox sidecar at {self._base_url} answered {status} for "
             f"{route}: {error or decoded!s}"
         )
+
+    async def _ok_and_answered(
+        self,
+        route: str,
+        body: dict[str, Any],
+        *,
+        timeout: float,
+        valid: Callable[[dict[str, Any]], bool],
+    ) -> tuple[dict[str, Any] | None, str | None, bool]:
+        """:meth:`_ok`, and whether an answer came back at all (15 October
+        2026). A request that could not be sent, timed out, or came back as
+        anything but the operation's own answer is NO answer: a 200 must pass
+        ``valid``, and a refusal must carry the sidecar's own ``error``
+        sentence. Only those two are answers."""
+        answer = await self._call(route, body, timeout=timeout)
+        if isinstance(answer, Exception):
+            return None, self._sentence(route, answer), False
+        status, decoded = answer
+        if not isinstance(decoded, dict):
+            return None, self._sentence(route, answer), False
+        # TIMEOUT FIRST (15 October 2026, Codex R17): a reply that says the
+        # operation was stopped at its time limit is no answer, whatever else
+        # it carries.
+        if decoded.get("timed_out") is True:
+            return None, self._sentence(route, answer), False
+        if status != 200:
+            # Only a 4xx refusal in the sidecar's own words is an answer; any
+            # 5xx is an error met while the operation may have been under way
+            # (15 October 2026).
+            error = decoded.get("error")
+            told = 400 <= status < 500 and isinstance(error, str) and bool(error.strip())
+            return None, self._sentence(route, answer), told
+        if not valid(decoded):
+            return None, (
+                f"the sandbox sidecar at {self._base_url} answered {route} "
+                f"with no result it could be read as: {decoded!r}"
+            ), False
+        return decoded, None, True
 
     async def _ok(
         self, route: str, body: dict[str, Any], *, timeout: float
@@ -289,22 +327,21 @@ class SidecarCandidateGit:
         which already run in that sandbox, are given as their working
         directory.
         """
-        decoded, why = await self._ok(
+        decoded, why, answered = await self._ok_and_answered(
             "/git/candidate-tree",
             {"repo": self._repo, "feature_id": str(feature_id), "sha": str(sha)},
             timeout=self._layout_timeout_s,
+            valid=lambda d: isinstance(d.get("path"), str) and bool(d["path"].strip()),
         )
         if decoded is None:
-            raise CandidateTreeError(str(why))
-        path = decoded.get("path")
-        if not isinstance(path, str) or not path.strip():
-            raise CandidateTreeError(
-                f"the sandbox sidecar at {self._base_url} laid no tree out for "
-                f"{feature_id}: its answer named no path"
-            )
+            # No answer: the tree may still be being written in there.
+            raise CandidateTreeError(str(why), confirmed=answered)
+        path = decoded["path"]
         tree = decoded.get("tree")
         excluded = decoded.get("exclude_written")
         return CandidateTreeLayout(
+            # A reply that passed the lay-out's own check: complete.
+            confirmed=True,
             path=path,
             tree=str(tree) if isinstance(tree, str) and tree else None,
             exclude_written=None if excluded is None else bool(excluded),
@@ -312,17 +349,21 @@ class SidecarCandidateGit:
 
     async def remove_candidate_tree(
         self, feature_id: str, path: str | None = None
-    ) -> bool:
+    ) -> bool | None:
         """Remove the laid-out tree in the sandbox. Never raises.
+
+        ``True`` removed, ``False`` the sandbox answered that it was not (a
+        leftover folder), ``None`` no answer came back (15 October 2026).
 
         ``path`` is accepted for the surface's sake and deliberately not sent:
         the route derives the tree's place from the repository it is named,
         so no path from this side can reach git in there.
         """
-        decoded, why = await self._ok(
+        decoded, why, answered = await self._ok_and_answered(
             "/git/candidate-tree-remove",
             {"repo": self._repo, "feature_id": str(feature_id)},
             timeout=self._read_timeout_s,
+            valid=lambda d: isinstance(d.get("removed"), bool),
         )
         if decoded is None:
             logger.warning(
@@ -330,8 +371,8 @@ class SidecarCandidateGit:
                 feature_id,
                 why,
             )
-            return False
-        return bool(decoded.get("removed"))
+            return False if answered else None
+        return decoded["removed"]
 
     async def add_working_folder(
         self, leaf: str, branch: str, base_ref: str
@@ -345,7 +386,7 @@ class SidecarCandidateGit:
         repository lives, which for a sandboxed repository is a different
         path entirely, never reaches git.
         """
-        decoded, why = await self._ok(
+        decoded, why, answered = await self._ok_and_answered(
             "/git/worktree-add",
             {
                 "repo": self._repo,
@@ -354,6 +395,7 @@ class SidecarCandidateGit:
                 "base_ref": str(base_ref),
             },
             timeout=self._read_timeout_s,
+            valid=lambda d: d.get("status") in ("success", "failed"),
         )
         if decoded is None:
             return WorkingFolder(
@@ -361,9 +403,12 @@ class SidecarCandidateGit:
                 branch=str(branch),
                 base_ref=str(base_ref),
                 refusal=str(why),
+                confirmed=answered,
             )
         ok = str(decoded.get("status") or "") == "success"
         return WorkingFolder(
+            # A reply that passed the operation's own check: an answer.
+            confirmed=True,
             ok=ok,
             path=decoded.get("path"),
             branch=str(decoded.get("branch") or branch),
@@ -374,8 +419,13 @@ class SidecarCandidateGit:
             ),
         )
 
-    async def remove_working_folder(self, path: str) -> bool:
+    async def remove_working_folder(self, path: str) -> bool | None:
         """Remove the join's working folder in the sandbox. Never raises.
+
+        ``True`` removed (or already gone), ``False`` the sandbox answered
+        that it was not removed, ``None`` no answer came back: only that may
+        still be running in there, so only that keeps the merge's hold
+        (15 October 2026, FEAT-D267).
 
         Only the folder's NAME goes over the wire, as for
         :meth:`add_working_folder`. ``path`` is whatever the caller has for
@@ -385,10 +435,11 @@ class SidecarCandidateGit:
         2026) and the folder stayed behind.
         """
         leaf = PurePath(str(path)).name
-        decoded, why = await self._ok(
+        decoded, why, answered = await self._ok_and_answered(
             "/git/worktree-remove",
             {"repo": self._repo, "leaf": leaf},
             timeout=self._read_timeout_s,
+            valid=lambda d: d.get("status") in ("success", "failed"),
         )
         if decoded is None:
             logger.warning(
@@ -396,8 +447,15 @@ class SidecarCandidateGit:
                 path,
                 why,
             )
+            return False if answered else None
+        if str(decoded.get("status") or "") != "success":
+            logger.warning(
+                "sandbox git: the working folder at %s was not removed: %s",
+                path,
+                decoded.get("detail"),
+            )
             return False
-        return str(decoded.get("status") or "") == "success"
+        return True
 
     async def inspect_autobuild_worktree(
         self, build_id: str, path: str
@@ -419,7 +477,7 @@ class SidecarCandidateGit:
     async def retire_autobuild_worktree(
         self, build_id: str, path: str, expected: dict[str, Any]
     ) -> dict[str, Any]:
-        decoded, why = await self._ok(
+        decoded, why, answered = await self._ok_and_answered(
             "/git/autobuild-worktree-retire",
             {
                 "repo": self._repo,
@@ -428,15 +486,25 @@ class SidecarCandidateGit:
                 "expected": expected,
             },
             timeout=self._layout_timeout_s,
+            # The retirement's own answer (15 October 2026, the R3 rule).
+            valid=lambda d: (
+                d.get("status") in ("removed", "kept", "already-gone")
+                # A retirement that met a git command that raised is not an
+                # answer (15 October 2026, Codex R15).
+                and not d.get("git_raised")
+            ),
         )
         if decoded is None:
             # No answer: the retirement may still be running in the sandbox,
-            # so the press keeps its hold (``answered`` False says so).
+            # so the press keeps its hold (``answered`` False says so). A
+            # refusal in the sandbox's own words is an answer: nothing ran.
             return {
                 "status": "kept",
                 "build_id": str(build_id),
                 "path": str(path),
                 "detail": str(why),
-                "answered": False,
+                "answered": answered,
+                "confirmed": answered,
             }
-        return decoded
+        # A reply that passed the retirement's own check: an answer.
+        return {**decoded, "confirmed": True}

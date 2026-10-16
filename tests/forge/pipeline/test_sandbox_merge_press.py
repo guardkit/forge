@@ -339,6 +339,7 @@ class _FakeDeploy:
                 ),
             }
             return SimpleNamespace(
+                confirmed=True,  # a complete leg answer (15 October 2026)
                 outcome="complete",
                 verdict="pass",
                 failed_step=None,
@@ -354,6 +355,7 @@ class _FakeDeploy:
                 },
             )
         return SimpleNamespace(
+            confirmed=True,  # a complete leg answer (15 October 2026)
             outcome="complete",
             verdict="pass",
             failed_step=None,
@@ -375,6 +377,8 @@ class _FakeMergeCommand:
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
         return GuardKitResult(
+            # A complete answer from the build system (15 October 2026).
+            confirmed=True,
             status="success",
             subcommand=kwargs.get("subcommand", "autobuild"),
             duration_secs=0.1,
@@ -1190,6 +1194,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         started_at: str,
         monkeypatch: pytest.MonkeyPatch,
         publisher: Any = None,
+        joins: Any = None,
     ) -> Any:
         """The whole press, with the real dispatcher and stage beneath it.
 
@@ -1219,7 +1224,7 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
             config=config,
             pool=pool,
             pipeline_publisher=_FakePublisher(),
-            guardkit_run=_JoinsForReal(feature_id=FEATURE_ID),
+            guardkit_run=joins or _JoinsForReal(feature_id=FEATURE_ID),
             deploy_dispatcher=build_in_daemon_deploy_dispatcher(
                 config=config, nats_client=_Bus(), db_path=tmp_path / "forge.db"
             ),
@@ -1324,9 +1329,10 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         # Every leg is there: the check with its health check and live gate,
         # the question, the promote with its health check, the candidate's
         # teardown and the live gate on what is now live — which PASSED and
-        # was read as a pass, so nothing was rolled back. (The press's own
-        # cleanup asks for the teardown once more under the same run, and the
-        # stage turns that repeat away before any step runs.)
+        # was read as a pass, so nothing was rolled back. (The promote took
+        # the candidate down itself, so the press's own clean-up does not ask
+        # for it again: since 15 October 2026, FEAT-D267, that repeat is not
+        # sent, because the stage turned it away and the hold was kept.)
         assert self._which_ran(log, clone) == [
             "candidate",
             "health",
@@ -1352,6 +1358,253 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         assert list(records.rglob("deploy-record-*.md")), (
             "the deploy record was not written to the coordinator's own folder"
         )
+
+    @pytest.mark.asyncio
+    async def test_the_join_folder_goes_where_the_join_ran_and_the_hold_is_put_down(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """15 October 2026, FEAT-D267: a merge that went live kept its hold
+        because the join's working folder was not removed. The project's
+        checks had run in that folder and left a Go module cache — folders
+        nobody may write — in GuardKit's scratch area inside Git's record
+        folder for it, and in the folder itself, so Git stopped half way.
+
+        Here the join leaves exactly that behind, in the sandbox's clone. The
+        folder is removed there, the receipt names the path the join really
+        used (the sandbox's, not the coordinator's, which holds nothing), and
+        the hold is put down."""
+        from forge.pipeline.merge_join import integration_branch
+        from forge.pipeline.publication_record import PublicationRecordStore
+        from tests.forge.pipeline.test_merge_executor import _JoinsForReal
+
+        class _JoinsAndLeavesAReadOnlyCache(_JoinsForReal):
+            async def __call__(self, **kwargs: Any) -> Any:
+                answer = await super().__call__(**kwargs)
+                args = list(kwargs["args"])
+                folder = Path(args[args.index("--in-worktree") + 1])
+                record = Path(
+                    (folder / ".git").read_text(encoding="utf-8").split(":", 1)[1].strip()
+                )
+                for top in (
+                    record / "guardkit-scratch" / "toolchain" / "HOME" / "go" / "pkg",
+                    folder / ".cache" / "go-build",
+                ):
+                    module = top / "mod" / "example.com" / "m@v1.0.0"
+                    module.mkdir(parents=True)
+                    (module / "go.mod").write_text("module m\n", encoding="utf-8")
+                    for each in (module, module.parent, module.parent.parent):
+                        each.chmod(0o555)
+                return answer
+
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config,
+            pool,
+            clone,
+            on_this_side,
+            tmp_path,
+            started_at,
+            monkeypatch,
+            joins=_JoinsAndLeavesAReadOnlyCache(feature_id=FEATURE_ID),
+        )
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        where_it_ran = clone / ".forge" / "worktrees" / f"integration-{FEATURE_ID}"
+        receipt = json.loads(
+            next(_receipts_env.rglob("merge_deploy_join_folders.json")).read_text()
+        )
+        assert receipt["folders"] == [
+            {
+                "attempt": 1,
+                "folder": str(where_it_ran),
+                "removed": True,
+                "answered": True,
+                "branch_kept": integration_branch(FEATURE_ID, 1),
+            }
+        ], receipt
+        assert not where_it_ran.exists()
+        assert "integration-" not in _git(clone, "worktree", "list", "--porcelain")
+        assert not on_this_side.exists()
+        assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder is None
+
+    @pytest.mark.asyncio
+    async def test_a_deploy_whose_command_broke_after_it_started_keeps_the_hold(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """15 October 2026, Codex R9, through the REAL owned deploy executor:
+        the deploy command started and reading its output then broke. Nobody
+        knows whether it is still running, so the sidecar answers a 5xx, the
+        promote says no answer came back, and the hold is kept — although the
+        candidate's own teardown answered that it is down."""
+        from forge.deploy_sidecar.deploy_executor import _RUNNER_SOURCE
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        real_read = subprocess.Popen.communicate
+
+        def _the_deploy_read_breaks(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if _RUNNER_SOURCE in [str(a) for a in (self.args or [])]:
+                raise OSError("the deploy command's pipe broke")
+            return real_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess.Popen, "communicate", _the_deploy_read_breaks)
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert outcome.result != "merged-into-the-remote-and-running", outcome.detail
+        assert "down" in self._which_ran(log, clone)
+        assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", ["timed-out", "raised", "finished"])
+    async def test_a_deploy_taken_over_while_it_ran(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+        how: str,
+    ) -> None:
+        """15 October 2026, Codex R9, through the REAL owned deploy executor:
+        a later holder takes the target over while the deploy command runs.
+        When the command also timed out, or its read broke after it started,
+        nobody knows whether it is still running: the hold is kept, although
+        the candidate's teardown answered that it is down. An ordinary
+        takeover is answered as before."""
+        from forge.pipeline.publication_record import PublicationRecordStore
+        from tests.forge.deploy_sidecar.test_the_deploy_executor_is_the_gate import (
+            _taken_over_while_it_ran,
+        )
+
+        _taken_over_while_it_ran(monkeypatch, how)
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert outcome.result != "merged-into-the-remote-and-running", outcome.detail
+        held = PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
+        if how == "finished":
+            assert outcome.result == "published-deployment-pending", outcome.detail
+            assert "stopped part-way by a later holder" in outcome.detail
+            assert held is None
+        else:
+            assert held is not None
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gone", [True, False])
+    async def test_a_deploy_whose_group_could_not_be_confirmed_stopped(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+        gone: bool,
+    ) -> None:
+        """15 October 2026, Codex R14, through the REAL owned deploy executor:
+        the deploy command returned, but something of its process group could
+        not be confirmed stopped. The sidecar answers a 5xx, the press keeps
+        its hold although the candidate's teardown answered "down". With the
+        group confirmed gone the merge goes live and the hold goes down."""
+        from forge.deploy_sidecar import deploy_executor as module
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        if not gone:
+            real_stop = module.DeployExecutor._stop_and_confirm
+
+            def _not_confirmed(self, note):  # type: ignore[no-untyped-def]
+                real_stop(self, note)
+                return False, "a process of the group is still alive"
+
+            monkeypatch.setattr(module.DeployExecutor, "_stop_and_confirm", _not_confirmed)
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        held = PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
+        assert "down" in self._which_ran(log, clone)
+        if gone:
+            assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+            assert held is None
+        else:
+            assert outcome.result != "merged-into-the-remote-and-running", outcome.detail
+            assert held is not None
+
+    @pytest.mark.asyncio
+    async def test_a_takeover_whose_old_group_could_not_be_confirmed_stopped(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """15 October 2026, Codex round 9, R14, through the REAL executor: a
+        later holder takes the target over while the deploy runs; the deploy
+        command returns, but its own group cannot be confirmed stopped. The
+        takeover answer is not confirmed, so the hold is kept although the
+        candidate's teardown answered "down". (The ordinary takeover, whose
+        group is confirmed gone, puts the hold down:
+        ``test_a_deploy_taken_over_while_it_ran[finished]``.)"""
+        from forge.deploy_sidecar import deploy_executor as module
+        from forge.pipeline.publication_record import PublicationRecordStore
+        from tests.forge.deploy_sidecar.test_the_deploy_executor_is_the_gate import (
+            _taken_over_while_it_ran,
+        )
+
+        _taken_over_while_it_ran(monkeypatch, "finished")
+        monkeypatch.setattr(
+            module.DeployExecutor,
+            "_stop_and_confirm",
+            lambda self, note: (False, "a process of the group is still alive"),
+        )
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert outcome.result != "merged-into-the-remote-and-running", outcome.detail
+        assert "down" in self._which_ran(log, clone)
+        assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
 
     @pytest.mark.asyncio
     async def test_a_press_that_picks_up_a_published_join_lays_its_tree_out_again(

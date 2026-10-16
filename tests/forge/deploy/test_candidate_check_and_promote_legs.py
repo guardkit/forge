@@ -145,6 +145,7 @@ class _Invoker:
     def _invocation(shape, feature: str) -> LiveGateInvocation:
         verdict, assertions = shape
         return LiveGateInvocation(
+            confirmed=True,  # a verdict the driver reported (15 October 2026)
             verdict=verdict,
             run_id=f"run-{feature}",
             gate_ids=EIGHT_GATES,
@@ -596,6 +597,286 @@ class TestCandidateCheck:
 # ---------------------------------------------------------------------------
 
 
+class _AGateWhoseAnswerWasLost:
+    """A live-gate invoker whose request got no answer, in the words the
+    sidecar invoker uses (15 October 2026)."""
+
+    def _lost(self, feature: str) -> LiveGateInvocation:
+        return LiveGateInvocation(
+            verdict="instrument_fail",
+            run_id=f"run-{feature}",
+            gate_ids=EIGHT_GATES,
+            dry_run=False,
+            answer_lost=True,
+            detail={"error": "the deploy sidecar could not be reached"},
+        )
+
+    def invoke(self, *, feature: str, target: str, gates: tuple[str, ...] = ()):
+        return self._lost(feature)
+
+    def with_repo_path(self, repo_path) -> "_AGateWhoseAnswerWasLost":
+        return self
+
+    def with_extra_env(self, overlay: dict[str, str]) -> "_AGateWhoseAnswerWasLost":
+        return self
+
+
+class _ASidecarThatAnswers:
+    """A loopback deploy sidecar for the REAL script runner (15 October 2026).
+
+    ``check`` and ``teardown`` say what the candidate's own steps and its
+    teardown get back: ``"ok"`` (exit 0), ``"red"`` (exit 1, in the script's
+    own words), ``"lost"`` (the request is taken and the connection is
+    dropped without an answer), ``"unreadable"`` (an answer that is not
+    the sidecar's JSON), ``"timed-out"`` (stopped at its time limit) or
+    ``"html-error"`` (an HTTP 502 whose body is a proxy's HTML page).
+    ``gate`` is what a live-gate driver request gets: ``"timed-out"`` or
+    ``"html-error"``."""
+
+    def __init__(
+        self, *, check: str, teardown: str, revert: str = "ok", gate: str = "timed-out"
+    ) -> None:
+        import json
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                body = json.loads(
+                    self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                )
+                env = body.get("env") or {}
+                down = env.get("CANDIDATE_DOWN") == "1"
+                how = (
+                    revert
+                    if env.get("REVERT") == "1"
+                    else teardown if down else check
+                )
+                if "driver" in body:
+                    how = gate
+                    if how.startswith("timed-out"):
+                        stopped_at: dict[str, Any] = {
+                            "exit_code": 124,
+                            "stdout": "",
+                            "stderr_tail": "",
+                            "timed_out": True,
+                        }
+                        # "timed-out-no-cwd" says no place; "-wrong-cwd" the
+                        # wrong one (Codex round 3).
+                        if how == "timed-out":
+                            stopped_at["cwd"] = body.get("cwd")
+                        elif how == "timed-out-wrong-cwd":
+                            stopped_at["cwd"] = "/somewhere/else"
+                        stopped = json.dumps(stopped_at).encode()
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Content-Length", str(len(stopped)))
+                        self.end_headers()
+                        self.wfile.write(stopped)
+                        return
+                if how in ("bad-refusal", "good-refusal"):
+                    # An owned-deploy refusal: of no known shape, or the
+                    # executor's own (Codex round 9, R16).
+                    body_out: dict[str, Any] = {"accepted": False, "exit_code": None}
+                    if how == "good-refusal":
+                        body_out.update(
+                            word="the-slot-is-occupied",
+                            sentence="the slot is held by another build, so nothing ran.",
+                        )
+                    said = json.dumps(body_out).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(said)))
+                    self.end_headers()
+                    self.wfile.write(said)
+                    return
+                if how in ("exec-error", "refused-400"):
+                    # A 5xx: the sidecar's run raised while running. A 4xx:
+                    # refused before anything ran (Codex R9).
+                    said = json.dumps(
+                        {
+                            "error": (
+                                "sidecar execution error: OSError: the pipe broke"
+                                if how == "exec-error"
+                                else "script deploy/evil.sh is not one the profile names"
+                            )
+                        }
+                    ).encode()
+                    self.send_response(500 if how == "exec-error" else 400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(said)))
+                    self.end_headers()
+                    self.wfile.write(said)
+                    return
+                if how == "html-error":
+                    page = b"<html><body>502 Bad Gateway</body></html>"
+                    self.send_response(502)
+                    self.send_header("Content-Type", "text/html")
+                    self.send_header("Content-Length", str(len(page)))
+                    self.end_headers()
+                    self.wfile.write(page)
+                    return
+                if how == "lost":
+                    self.close_connection = True
+                    return
+                if how.startswith("timed-out"):
+                    stopped_at = {
+                        "exit_code": 124,
+                        "output_tail": "stopped at its time limit\n",
+                        "timed_out": True,
+                    }
+                    # "timed-out" says no place it ran; "-wrong-cwd" the
+                    # wrong one (Codex round 3).
+                    if how == "timed-out-wrong-cwd":
+                        stopped_at["cwd"] = "/somewhere/else"
+                    stopped = json.dumps(stopped_at).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(stopped)))
+                    self.end_headers()
+                    self.wfile.write(stopped)
+                    return
+                if how == "unreadable":
+                    garbled = b"<html>bad gateway</html>"
+                    self.send_response(200)
+                    self.send_header("Content-Length", str(len(garbled)))
+                    self.end_headers()
+                    self.wfile.write(garbled)
+                    return
+                answer = json.dumps(
+                    {
+                        "exit_code": 0 if how == "ok" else 1,
+                        "output_tail": "ok\n" if how == "ok" else "went red\n",
+                        # Where it ran, as the real sidecar says.
+                        **({"cwd": body["cwd"]} if body.get("cwd") else {}),
+                    }
+                ).encode()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(answer)))
+                self.end_headers()
+                self.wfile.write(answer)
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        host, port = self.server.server_address[:2]
+        self.url = f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class TestAFailedCandidateSaysWhatIsLeft:
+    """15 October 2026: a failed candidate check says whether its candidate is
+    still standing and whether a step's request got no answer, so the merge
+    press keeps its hold for those alone and puts it down after an ordinary
+    red check."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "check, gate, teardown, candidate, lost",
+        [
+            ("ok", "fail", "ok", "torn-down", False),
+            ("red", "pass", "ok", "torn-down", False),
+            ("lost", "pass", "ok", "torn-down", True),
+            ("unreadable", "pass", "ok", "torn-down", True),
+            # Codex R2: the check's script was stopped at its time limit and
+            # its teardown answered "down" — what it started may still run.
+            ("timed-out", "pass", "ok", "torn-down", True),
+            # The teardown's request got no answer: the run says so too.
+            ("ok", "fail", "lost", "standing", True),
+            ("ok", "lost", "ok", "torn-down", True),
+        ],
+        ids=[
+            "red-gate",
+            "red-deploy-step",
+            "deploy-answer-lost",
+            "deploy-answer-unreadable",
+            "deploy-script-timed-out",
+            "teardown-lost",
+            "gate-answer-lost",
+        ],
+    )
+    async def test_the_answer_names_what_is_left(
+        self,
+        repository,
+        runbook_publisher,
+        tmp_path,
+        check: str,
+        gate: str,
+        teardown: str,
+        candidate: str,
+        lost: bool,
+    ) -> None:
+        sidecar = _ASidecarThatAnswers(check=check, teardown=teardown)
+        try:
+            runner = DeployStageRunner(
+                repository=repository,
+                runbook_publisher=runbook_publisher,
+                deploy_publisher=RecordingDeployPublisher(),
+                reservation=InProcessReservationLease(),
+                live_gate_invoker=(
+                    _AGateWhoseAnswerWasLost()
+                    if gate == "lost"
+                    else _Invoker(
+                        candidate=(gate, ALL_GREEN if gate == "pass" else TWO_RED)
+                    )
+                ),
+                broker_inspector=DryRunBrokerInspector(),
+                config=DeployStageConfig(
+                    execution_surface="sidecar", sidecar_url=sidecar.url
+                ),
+                deploy_record_root=str(tmp_path / "state"),
+                dry_run=False,
+                target_repo="guardkit/api_test",
+                clock=lambda: FIXED,
+            )
+            result = await runner.candidate_check(
+                _profile(),
+                correlation_id="cl",
+                deploy_run_id="run-cl",
+                feature="FEAT-CL",
+                identity_env=WHICH_CANDIDATE,
+            )
+        finally:
+            sidecar.close()
+
+        assert result.outcome == "failed"
+        assert result.detail["candidate"] == candidate
+        assert bool(result.detail.get("answer_lost")) is lost
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("lost", [True, False], ids=["gate-lost", "gate-red"])
+    async def test_a_promote_whose_live_gate_got_no_answer_says_so(
+        self, repository, runbook_publisher, tmp_path, lost: bool
+    ) -> None:
+        """The promote's live gate got no answer: the deploy is reverted as
+        before, and the result says the gate's driver may still be running."""
+        runner = _runner(
+            repository,
+            runbook_publisher,
+            RecordingDeployPublisher(),
+            tmp_path,
+            live_gate_invoker=(
+                _AGateWhoseAnswerWasLost() if lost else _Invoker(live=("fail", TWO_RED))
+            ),
+        )
+        result = await runner.promote(
+            _profile(rollback="apitest:rollback"),
+            correlation_id="pl",
+            deploy_run_id="run-pl",
+            feature="FEAT-PL",
+            prior_events=("DeployQueued",),
+            identity_env=WHICH_CANDIDATE,
+        )
+        assert result.outcome == "reverted", result
+        assert bool(result.detail.get("answer_lost")) is lost
+
+
 class TestPromote:
     @pytest.mark.asyncio
     async def test_promote_retags_then_tears_down_then_gates_live(
@@ -943,3 +1224,510 @@ class TestGateSummary:
         summary = gate_summary(verdict="fail", gate_ids=(), assertions=TWO_RED)
         assert summary["checks_total"] == 8
         assert summary["failed_checks"] == ["users_count", "etag"]
+
+
+class TestTheScriptRunnerSaysWhenNoAnswerCameBack:
+    """15 October 2026: "no answer came back" is a flag on the runner's own
+    answer, never read from its words."""
+
+    @staticmethod
+    def _run(base_url: str) -> Any:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner
+
+        runner = SidecarScriptRunner(
+            base_url=base_url, repo="guardkit/api_test", http_timeout_margin=2.0
+        )
+        return runner(cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=1)
+
+    @pytest.mark.parametrize(
+        "how, lost",
+        [
+            ("ok", False),
+            ("red", False),
+            ("lost", True),
+            ("unreadable", True),
+            ("timed-out", True),
+        ],
+    )
+    def test_the_flag_follows_the_answer(self, how: str, lost: bool) -> None:
+        from forge.deploy.sidecar_runner import no_answer_came_back
+
+        sidecar = _ASidecarThatAnswers(check=how, teardown=how)
+        try:
+            answer = self._run(sidecar.url)
+        finally:
+            sidecar.close()
+        exit_code, _output = answer
+        assert no_answer_came_back(answer) is lost
+        assert (exit_code == 0) is (how == "ok")
+
+    def test_a_sidecar_that_cannot_be_reached_is_no_answer(self) -> None:
+        from forge.deploy.sidecar_runner import no_answer_came_back
+
+        assert no_answer_came_back(self._run("http://127.0.0.1:9")) is True
+
+
+class TestTheFailureLineSaysWhereTheCandidateIs:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("teardown", ["ok", "lost"])
+    async def test_the_line_matches_the_detail(
+        self, repository, runbook_publisher, tmp_path, caplog, teardown: str
+    ) -> None:
+        import logging
+
+        sidecar = _ASidecarThatAnswers(check="ok", teardown=teardown)
+        try:
+            runner = DeployStageRunner(
+                repository=repository,
+                runbook_publisher=runbook_publisher,
+                deploy_publisher=RecordingDeployPublisher(),
+                reservation=InProcessReservationLease(),
+                live_gate_invoker=_Invoker(candidate=("fail", TWO_RED)),
+                broker_inspector=DryRunBrokerInspector(),
+                config=DeployStageConfig(
+                    execution_surface="sidecar", sidecar_url=sidecar.url
+                ),
+                deploy_record_root=str(tmp_path / "state"),
+                dry_run=False,
+                target_repo="guardkit/api_test",
+                clock=lambda: FIXED,
+            )
+            with caplog.at_level(logging.ERROR, logger="forge.deploy.stage"):
+                result = await runner.candidate_check(
+                    _profile(),
+                    correlation_id="cw",
+                    deploy_run_id="run-cw",
+                    feature="FEAT-CW",
+                    identity_env=WHICH_CANDIDATE,
+                )
+        finally:
+            sidecar.close()
+
+        line = next(
+            r.getMessage() for r in caplog.records if "gate refused promote" in r.getMessage()
+        )
+        if result.detail["candidate"] == "standing":
+            assert "is still standing" in line and "was torn down" not in line
+        else:
+            assert "was torn down" in line
+        assert result.detail["candidate"] == ("torn-down" if teardown == "ok" else "standing")
+
+
+
+def _a_stage_through(sidecar: Any, repository, runbook_publisher, tmp_path, invoker) -> Any:
+    return DeployStageRunner(
+        repository=repository,
+        runbook_publisher=runbook_publisher,
+        deploy_publisher=RecordingDeployPublisher(),
+        reservation=InProcessReservationLease(),
+        live_gate_invoker=invoker,
+        broker_inspector=DryRunBrokerInspector(),
+        config=DeployStageConfig(execution_surface="sidecar", sidecar_url=sidecar.url),
+        deploy_record_root=str(tmp_path / "state"),
+        dry_run=False,
+        target_repo="guardkit/api_test",
+        clock=lambda: FIXED,
+    )
+
+
+class TestEveryResultOfARunSaysIfAnAnswerWasLost:
+    """15 October 2026, the coach's run-wide stamp: a request with no answer
+    ANYWHERE in a stage run marks every result that run returns."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("revert, lost", [("lost", True), ("ok", False)])
+    async def test_a_revert_whose_answer_was_lost(
+        self, repository, runbook_publisher, tmp_path, revert: str, lost: bool
+    ) -> None:
+        sidecar = _ASidecarThatAnswers(check="ok", teardown="ok", revert=revert)
+        try:
+            runner = _a_stage_through(
+                sidecar, repository, runbook_publisher, tmp_path,
+                _Invoker(live=("fail", TWO_RED)),
+            )
+            result = await runner.promote(
+                _profile(rollback="apitest:rollback"),
+                correlation_id="rv",
+                deploy_run_id="run-rv",
+                feature="FEAT-RV",
+                prior_events=("DeployQueued",),
+                identity_env=WHICH_CANDIDATE,
+            )
+        finally:
+            sidecar.close()
+        assert result.outcome in ("reverted", "failed"), result
+        assert bool(result.detail.get("answer_lost")) is lost
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("check, lost", [("lost", True), ("ok", False)])
+    async def test_the_read_only_question(
+        self, repository, runbook_publisher, tmp_path, check: str, lost: bool
+    ) -> None:
+        sidecar = _ASidecarThatAnswers(check=check, teardown="ok")
+        try:
+            runner = _a_stage_through(
+                sidecar, repository, runbook_publisher, tmp_path, _Invoker()
+            )
+            result = await runner.what_is_running(
+                _profile(),
+                correlation_id="wr",
+                deploy_run_id="run-wr",
+                ask_env={"RUNNING_IDENTITY": "1"},
+            )
+        finally:
+            sidecar.close()
+        assert bool(result.detail.get("answer_lost")) is lost
+
+    def test_no_answer_survives_a_copy_and_a_pickle(self) -> None:
+        import copy
+        import pickle
+
+        from forge.deploy.sidecar_runner import NoAnswer, no_answer_came_back
+
+        answer = NoAnswer("sidecar unreachable at http://x: timed out")
+        for again in (copy.deepcopy(answer), pickle.loads(pickle.dumps(answer))):
+            assert tuple(again) == tuple(answer)
+            assert no_answer_came_back(again)
+
+
+
+class TestAScriptStoppedAtItsTimeLimit:
+    """15 October 2026, Codex R2: a script stopped at its time limit may have
+    left what it started running, so it is counted like a request with no
+    answer — by the subprocess core, the sidecar's answer, and a stage run
+    with no sidecar at all."""
+
+    def test_the_subprocess_core_says_it_timed_out(self, tmp_path) -> None:
+        import pickle
+        import subprocess
+
+        from forge.executor.shell_steps import TimedOut, _run_script_step
+        from forge.deploy.sidecar_runner import no_answer_came_back
+
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        script = tmp_path / "slow.sh"
+        script.write_text("#!/bin/sh\nsleep 30\n", encoding="utf-8")
+        script.chmod(0o755)
+
+        answer = _run_script_step(
+            cwd=str(tmp_path), script="slow.sh", env_file=None, timeout=1
+        )
+
+        assert isinstance(answer, TimedOut)
+        exit_code, _output = answer
+        assert exit_code == 124
+        assert no_answer_came_back(answer)
+        assert no_answer_came_back(pickle.loads(pickle.dumps(answer)))
+
+    @pytest.mark.asyncio
+    async def test_a_stage_with_no_sidecar_notes_it(
+        self, repository, runbook_publisher, tmp_path, monkeypatch
+    ) -> None:
+        from forge.executor import shell_steps
+
+        def _a_check_that_runs_out_of_time(**kwargs: Any) -> Any:
+            if (kwargs.get("extra_env") or {}).get("CANDIDATE_DOWN") == "1":
+                return (0, "down\n")
+            return shell_steps.TimedOut(124, "stopped at its time limit\n")
+
+        monkeypatch.setattr(shell_steps, "_run_script_step", _a_check_that_runs_out_of_time)
+        runner = DeployStageRunner(
+            repository=repository,
+            runbook_publisher=runbook_publisher,
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=_Invoker(),
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(),
+            deploy_record_root=str(tmp_path / "state"),
+            dry_run=False,
+            clock=lambda: FIXED,
+        )
+        result = await runner.candidate_check(
+            _profile(),
+            correlation_id="lt",
+            deploy_run_id="run-lt",
+            feature="FEAT-LT",
+            identity_env=WHICH_CANDIDATE,
+        )
+        assert result.outcome == "failed"
+        assert result.detail["candidate"] == "torn-down"
+        assert result.detail.get("answer_lost") is True
+
+
+
+class _ASidecarThatRefusesWith:
+    """A loopback server answering every request with HTTP ``status`` and the
+    raw ``body`` bytes (15 October 2026, Codex R5)."""
+
+    def __init__(self, status: int, body: bytes) -> None:
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        class _Handler(BaseHTTPRequestHandler):
+            def do_POST(self) -> None:  # noqa: N802 — the stdlib's name
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args: Any) -> None:
+                return
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+        host, port = self.server.server_address[:2]
+        self.url = f"http://{host}:{port}"
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+_REFUSALS = [
+    (502, b"<html><body>502 Bad Gateway</body></html>", True),
+    (500, b"", True),
+    (400, b"{}", True),
+    (400, b'{"error": ""}', True),
+    (400, b'{"error": "script deploy/evil.sh is not one the profile names"}', False),
+    # Codex R9: a 5xx is an error met while running, whatever its sentence.
+    (500, b'{"error": "sidecar execution error: OSError: the pipe broke"}', True),
+]
+_REFUSAL_IDS = [
+    "html",
+    "empty",
+    "empty-object",
+    "blank-sentence",
+    "sidecars-own-words",
+    "5xx-with-a-sentence",
+]
+
+
+class TestAnHttpErrorIsAnAnswerOnlyInTheSidecarsOwnWords:
+    """15 October 2026, Codex R5: the script runner and the live-gate invoker
+    read an HTTP error as an answered refusal only when it carries the
+    sidecar's own refusal sentence. Anything else is no answer."""
+
+    @pytest.mark.parametrize("status, body, lost", _REFUSALS, ids=_REFUSAL_IDS)
+    def test_the_script_runner(self, status: int, body: bytes, lost: bool) -> None:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
+
+        sidecar = _ASidecarThatRefusesWith(status, body)
+        try:
+            answer = SidecarScriptRunner(base_url=sidecar.url, repo="guardkit/api_test")(
+                cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=1
+            )
+        finally:
+            sidecar.close()
+        assert no_answer_came_back(answer) is lost
+        exit_code, _output = answer
+        assert exit_code != 0
+
+    @pytest.mark.parametrize("status, body, lost", _REFUSALS, ids=_REFUSAL_IDS)
+    def test_the_live_gate_invoker(
+        self, tmp_path, status: int, body: bytes, lost: bool
+    ) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        sidecar = _ASidecarThatRefusesWith(status, body)
+        try:
+            answer = SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo="guardkit/api_test",
+                repo_path=tmp_path,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            ).invoke(feature="FEAT-R5", target="apitest-sbx")
+        finally:
+            sidecar.close()
+        assert answer.verdict == "instrument_fail"
+        assert answer.answer_lost is lost
+
+
+class TestASandboxGateStoppedAtItsTimeLimit:
+    """15 October 2026, Codex R4: the sandbox's live-gate driver was stopped
+    at its time limit. The invoker says no answer came back, and a candidate
+    check whose gate it was says so even after its teardown answered."""
+
+    def test_the_invoker_says_so(self, tmp_path) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        sidecar = _ASidecarThatAnswers(check="ok", teardown="ok", gate="timed-out")
+        try:
+            answer = SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo="guardkit/api_test",
+                repo_path=tmp_path,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            ).invoke(feature="FEAT-R4", target="apitest-sbx")
+        finally:
+            sidecar.close()
+        assert answer.verdict == "environment_fail"
+        assert answer.answer_lost is True
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_check_says_so_after_its_teardown(
+        self, repository, runbook_publisher, tmp_path
+    ) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        sidecar = _ASidecarThatAnswers(check="ok", teardown="ok", gate="timed-out")
+        try:
+            runner = _a_stage_through(
+                sidecar,
+                repository,
+                runbook_publisher,
+                tmp_path,
+                SidecarLiveGateInvoker(
+                    base_url=sidecar.url,
+                    repo="guardkit/api_test",
+                    repo_path=tmp_path,
+                    driver_argv=["python3", "qa/gate.py"],
+                    timeout_seconds=1,
+                ),
+            )
+            result = await runner.candidate_check(
+                _profile(),
+                correlation_id="gt",
+                deploy_run_id="run-gt",
+                feature="FEAT-GT",
+                identity_env=WHICH_CANDIDATE,
+            )
+        finally:
+            sidecar.close()
+        assert result.outcome == "failed"
+        assert result.detail["candidate"] == "torn-down"
+        assert result.detail.get("answer_lost") is True
+
+
+
+_A_TREE = "/sandbox/clone/.forge-candidates/FEAT-TF"
+
+
+class TestATimeoutIsReadFirst:
+    """15 October 2026, Codex round 3: a reply that says its program was
+    stopped at its time limit is a lost answer whatever else is wrong with it,
+    including a missing or wrong place it says it ran."""
+
+    @pytest.mark.parametrize(
+        "status, body",
+        [
+            (200, b'{"exit_code": 124, "timed_out": true}'),
+            (200, b'{"exit_code": 124, "timed_out": true, "cwd": "/somewhere/else"}'),
+            (200, b'{"timed_out": true}'),
+            (500, b'{"timed_out": true}'),
+        ],
+        ids=["no-cwd", "wrong-cwd", "no-exit-code", "http-error"],
+    )
+    def test_the_script_runner(self, status: int, body: bytes) -> None:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
+
+        sidecar = _ASidecarThatRefusesWith(status, body)
+        try:
+            answer = SidecarScriptRunner(base_url=sidecar.url, repo="guardkit/api_test")(
+                cwd=_A_TREE, script="deploy/deploy.sh", env_file=None, timeout=1
+            )
+        finally:
+            sidecar.close()
+        assert no_answer_came_back(answer)
+        assert getattr(answer, "timed_out", False) is True
+
+    @pytest.mark.parametrize(
+        "status, body",
+        [
+            (200, b'{"exit_code": 124, "timed_out": true}'),
+            (200, b'{"exit_code": 124, "timed_out": true, "cwd": "/somewhere/else"}'),
+            (200, b'{"timed_out": true}'),
+            (500, b'{"timed_out": true}'),
+        ],
+        ids=["no-cwd", "wrong-cwd", "no-exit-code", "http-error"],
+    )
+    def test_the_live_gate_invoker(self, tmp_path, status: int, body: bytes) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        tree = tmp_path / ".forge-candidates" / "FEAT-TF"
+        tree.mkdir(parents=True)
+        sidecar = _ASidecarThatRefusesWith(status, body)
+        try:
+            answer = SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo="guardkit/api_test",
+                repo_path=tree,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            ).invoke(feature="FEAT-TF", target="apitest-sbx")
+        finally:
+            sidecar.close()
+        assert answer.answer_lost is True
+
+
+
+class TestAnOwnedDeployRefusalIsConfirmedOnlyInItsOwnShape:
+    """15 October 2026, Codex round 9, R16: an ``accepted: false`` reply is a
+    confirmed refusal only with the executor's result word, a sentence and an
+    exit code that is an integer or the executor's "none"."""
+
+    @pytest.mark.parametrize(
+        "body, confirmed",
+        [
+            (b'{"accepted": false, "exit_code": null}', False),
+            (b'{"accepted": false, "word": "", "sentence": "x", "exit_code": null}', False),
+            (b'{"accepted": false, "word": "Not A Word", "sentence": "x", "exit_code": 1}', False),
+            (b'{"accepted": false, "word": "the-slot-is-occupied", "sentence": "", "exit_code": 1}', False),
+            (b'{"accepted": false, "word": "the-slot-is-occupied", "sentence": "s", "exit_code": "1"}', False),
+            (b'{"accepted": false, "word": "the-slot-is-occupied", "sentence": "s", "exit_code": null}', True),
+            (b'{"accepted": false, "word": "the-slot-is-occupied", "sentence": "s", "exit_code": 1}', True),
+        ],
+        ids=["no-word", "blank-word", "odd-word", "blank-sentence", "text-code", "none-code", "int-code"],
+    )
+    def test_the_refusal(self, body: bytes, confirmed: bool) -> None:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner
+
+        sidecar = _ASidecarThatRefusesWith(200, body)
+        try:
+            answer = SidecarScriptRunner(base_url=sidecar.url, repo="guardkit/api_test")(
+                cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=1
+            )
+        finally:
+            sidecar.close()
+        assert getattr(answer, "confirmed", False) is confirmed
+
+
+class TestOnlyA4xxIsARefusal:
+    """15 October 2026, Codex round 10, R18: a 3xx carrying a sentence is not
+    the sidecar's refusal before running, so it is no answer."""
+
+    def test_the_script_runner(self) -> None:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
+
+        sidecar = _ASidecarThatRefusesWith(302, b'{"error": "request redirected"}')
+        try:
+            answer = SidecarScriptRunner(base_url=sidecar.url, repo="guardkit/api_test")(
+                cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=1
+            )
+        finally:
+            sidecar.close()
+        assert no_answer_came_back(answer)
+        assert getattr(answer, "confirmed", False) is False
+
+    def test_the_live_gate_invoker(self, tmp_path) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        tree = tmp_path / ".forge-candidates" / "FEAT-TF"
+        tree.mkdir(parents=True)
+        sidecar = _ASidecarThatRefusesWith(302, b'{"error": "request redirected"}')
+        try:
+            answer = SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo="guardkit/api_test",
+                repo_path=tree,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            ).invoke(feature="FEAT-TF", target="apitest-sbx")
+        finally:
+            sidecar.close()
+        assert answer.answer_lost is True
+        assert answer.confirmed is False
+

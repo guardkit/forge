@@ -65,6 +65,19 @@ class GuardKitResult(BaseModel):
     stderr: str | None = None
     exit_code: int
     warnings: list[GuardKitWarning] = Field(default_factory=list)
+    #: The command was refused before anything was run, and the refusal was
+    #: an answer in its own words (15 October 2026): nothing it could start
+    #: is running.
+    refused_before_running: bool = False
+    #: No answer came back that could be read (15 October 2026): the command
+    #: may have started and may still be running. A ``status="timeout"``
+    #: result is read the same way.
+    answer_lost: bool = False
+    #: True only for a complete answer (15 October 2026): the command ran to
+    #: an exit code and was read, or was refused in words before anything
+    #: ran. Every other result — and any result built without saying — is
+    #: unconfirmed, and the merge press keeps its hold for it.
+    confirmed: bool = False
 
 
 __all__ = [
