@@ -139,6 +139,24 @@ def _rendered(*extra: str, profiles: str | None = None) -> str:
     return done.stdout
 
 
+def _lines_naming_a_home(rendered: str) -> list[str]:
+    """The rendered lines that name a home directory, with the bundle's own
+    folder taken out first.
+
+    The bundle's own files, bound from beside compose.yaml (the model door's
+    settings, 14 October 2026), render as an absolute path to wherever the
+    bundle was checked out, and a developer's checkout lives under /home. That
+    folder is the bundle, not anything of the machine: it is replaced by
+    ``<the bundle>`` before looking. Only that exact folder is replaced, so any
+    OTHER home path (a socket, a state folder, a credential file) still shows.
+    """
+    return [
+        line
+        for line in rendered.replace(str(ESTATE), "<the bundle>").splitlines()
+        if "/home/" in line
+    ]
+
+
 def _service_block(rendered: str, service: str) -> str:
     """One service's lines out of the rendered document. A service's own lines
     are indented four spaces; anything less ends it."""
@@ -391,9 +409,7 @@ class TestTheTwoBusModes:
             and not address.startswith(_DOCUMENTATION_BLOCK)
         }
         assert not found, f"external bus mode brought an address: {sorted(found)}"
-        for line in rendered_against_an_external_bus.splitlines():
-            if "/home/" not in line:
-                continue
+        for line in _lines_naming_a_home(rendered_against_an_external_bus):
             assert any(home in line for home in _IN_IMAGE_HOMES), (
                 f"external bus mode carries a home directory: {line.strip()}"
             )
@@ -455,12 +471,7 @@ class TestNothingOfThisMachineIsInIt:
         assert "127.0.0.1" not in rendered
 
     def test_no_home_directory_but_the_images_own(self, rendered: str) -> None:
-        # The bundle's own files, bound from beside compose.yaml (the model
-        # door's settings, 14 October 2026), render as a path to wherever the
-        # bundle was checked out. That folder is the bundle, not a machine's.
-        for line in rendered.replace(str(ESTATE), "<the bundle>").splitlines():
-            if "/home/" not in line:
-                continue
+        for line in _lines_naming_a_home(rendered):
             assert any(home in line for home in _IN_IMAGE_HOMES), (
                 f"the rendered estate carries a home directory: {line.strip()}"
             )
@@ -484,9 +495,7 @@ class TestNothingOfThisMachineIsInIt:
             and not address.startswith(_DOCUMENTATION_BLOCK)
         }
         assert not found, f"the sandbox service brought an address: {sorted(found)}"
-        for line in rendered_with_the_sandbox.splitlines():
-            if "/home/" not in line:
-                continue
+        for line in _lines_naming_a_home(rendered_with_the_sandbox):
             assert any(home in line for home in _IN_IMAGE_HOMES), (
                 "the sandbox service carries a home directory, which is where "
                 f"the daemon's socket really lives on most machines: {line.strip()}"
