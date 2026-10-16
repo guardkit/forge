@@ -16,6 +16,18 @@ This test relies on:
 - TASK-FMDR-002: CLI wired to real shell handlers
 - TASK-FMDR-006: Local wrappers at ``../fleet-memory/deploy/local/{deploy.sh,smoke.sh}``
 
+Isolation
+---------
+
+The wrappers run from a COPY of ``fleet-memory/deploy/local`` in a temporary
+folder, with their own ``.env.deploy`` (and ``.env``, which ``docker compose``
+reads) naming a free host port and a compose project of this run's own. Until 16
+October 2026 they ran in the sibling checkout on host port 5432 and compose
+project ``local``: on a machine where anything else already holds 5432 (here,
+another Postgres) the deploy step could not start, and the test wrote
+``.env.deploy`` into the sibling checkout. Nothing else on the machine is
+stopped or changed.
+
 Docker Dependency
 -----------------
 
@@ -26,8 +38,11 @@ message rather than skipping — we want a real green from the e2e on this machi
 from __future__ import annotations
 
 import json
+import shutil
+import socket
 import subprocess
 import tempfile
+import uuid
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -80,15 +95,32 @@ def fleet_memory_repo_root() -> Path:
     return fleet_memory_root
 
 
+def _a_free_port() -> int:
+    """A host port nothing is listening on now (the OS picks it)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("", 0))
+        return int(probe.getsockname()[1])
+
+
 @pytest.fixture(scope="module")
-def local_deploy_wrappers(fleet_memory_repo_root: Path) -> Path:
-    """Path to the local deploy wrappers directory.
+def local_deploy_wrappers(
+    fleet_memory_repo_root: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """A copy of the local deploy wrappers directory, set up for this run alone.
+
+    The sibling's ``deploy/local`` (deploy.sh, smoke.sh, docker-compose.yml,
+    initdb) is copied as it is into a fresh git checkout, without any ``.env``
+    file of its own, and given
+    an ``.env.deploy`` and ``.env`` naming a free host port and a compose
+    project of this run's own. The wrappers source ``.env.deploy``; compose
+    reads ``.env``, so ``docker compose exec``/``down`` here reach the same
+    project.
 
     Args:
         fleet_memory_repo_root: Root of the fleet-memory repository.
 
     Returns:
-        Path to deploy/local/ directory containing deploy.sh and smoke.sh.
+        Path to the copied deploy/local/ directory containing deploy.sh and smoke.sh.
 
     Raises:
         pytest.skip: If the wrappers from TASK-FMDR-006 are not present.
@@ -110,7 +142,22 @@ def local_deploy_wrappers(fleet_memory_repo_root: Path) -> Path:
             "Expected files: deploy.sh, smoke.sh"
         )
 
-    return local_dir
+    copy = tmp_path_factory.mktemp("fleet-memory-deploy") / "local"
+    shutil.copytree(local_dir, copy, ignore=shutil.ignore_patterns(".env", ".env.*"))
+    settings = (
+        "# Written by forge's test_fleet_memory_e2e for this run alone\n"
+        f"COMPOSE_PROJECT_NAME=forge-test-fleet-memory-{uuid.uuid4().hex[:8]}\n"
+        f"PGPORT={_a_free_port()}\n"
+        "POSTGRES_PASSWORD=fleet_memory\n"
+        "POSTGRES_USER=fleet_memory\n"
+        "POSTGRES_DB=fleet_memory\n"
+    )
+    (copy / ".env.deploy").write_text(settings, encoding="utf-8")
+    (copy / ".env").write_text(settings, encoding="utf-8")
+    # A project's script is run only from a git checkout: its private HOME and
+    # TMPDIR go in the checkout's own git directory, outside the project.
+    subprocess.run(["git", "init", "-q", str(copy)], check=True)
+    return copy
 
 
 @pytest.fixture(scope="module")
@@ -225,26 +272,16 @@ def test_db_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def env_file(local_deploy_wrappers: Path) -> Path:
-    """Ensure .env.deploy exists for the local target.
+    """The copy's .env.deploy (written by ``local_deploy_wrappers``).
 
     Args:
-        local_deploy_wrappers: Path to deploy/local/ directory.
+        local_deploy_wrappers: Path to the copied deploy/local/ directory.
 
     Returns:
         Path to the .env.deploy file.
     """
     env_path = local_deploy_wrappers / ".env.deploy"
-
-    # Create a minimal .env.deploy if it doesn't exist
-    if not env_path.exists():
-        env_content = """# Fleet-memory local deploy configuration
-PGPORT=5432
-POSTGRES_PASSWORD=fleet_memory
-POSTGRES_USER=fleet_memory
-POSTGRES_DB=fleet_memory
-"""
-        env_path.write_text(env_content, encoding="utf-8")
-
+    assert env_path.is_file(), "the copied wrappers have no .env.deploy"
     return env_path
 
 
