@@ -1354,12 +1354,15 @@ volumes:
 
   # THE BUS GATEWAY'S OWN STATE, with the gateway as its ONE writer and the
   # gateway watch as its one reader, read-only (26 September 2026, build item
-  # E3-j2). One small file in it: how the gateway's Slack Socket Mode session is,
-  # and when it last said so.
+  # E3-j2). Two small files in it: how the gateway's Slack Socket Mode session
+  # is, and when it last said so; and (16 October 2026) merge-cards.json, where
+  # each previewed merge card was posted, so the gateway can edit it later.
   #
   # IT IS NOT IN THE ROLLOUT'S LIST OF STATE TO CARRY ACROSS, and that is by
-  # design: it starts empty and is written fresh on every start, so there is
-  # nothing in it a cutover has to move or could lose. 'down -v' removes it, the
+  # design: the heartbeat is written fresh on every start, and losing the card
+  # file costs only replacement cards (Forge's five-minute sweep describes
+  # every live card again and the gateway posts a fresh one it can answer), so
+  # nothing a cutover could lose breaks anything. 'down -v' removes it, the
   # same as the bus's store.
   gateway-state:
 
