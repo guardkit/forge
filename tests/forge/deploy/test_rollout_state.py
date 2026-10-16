@@ -13,21 +13,18 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 import pytest
 import sys
-from types import ModuleType
 
-# Persistence imports forge.pipeline's initializer, which imports the event
-# package initializer. Mock its client boundary BEFORE that transitive import;
-# neither a real broker client module nor a usable fake connection is loaded.
-_mock_client = ModuleType('nats_core.client')
-_mock_client.__rollout_mock__ = True
-class ForbiddenBrokerClient:
-    def __init__(self, *args, **kwargs):
-        raise AssertionError('a broker client is outside these SQLite tests')
-_mock_client.NATSClient = ForbiddenBrokerClient
-_mock_client.NATSKVManifestRegistry = ForbiddenBrokerClient
-assert 'nats_core.client' not in sys.modules, 'client boundary initialized before mock'
-sys.modules['nats_core.client'] = _mock_client
-
+# These tests never reach a broker. Two checks hold that, and neither changes
+# the interpreter's import state for any other test module:
+#   * test_fresh_process_import_boundary_and_real_writer runs this file in a
+#     FRESH interpreter that refuses any broker-client import, with the client
+#     module mocked before forge's package initializers load it;
+#   * no_broker_connection (below) makes every connection attempt fail here.
+# Until 16 October 2026 the mock was put into sys.modules when this file was
+# imported, with an assertion that no other test had loaded the real client
+# first. In a whole-suite run that assertion always failed, so the file never
+# collected; and when it did collect first, the mock leaked into every module
+# collected after it.
 from forge.lifecycle import migrations
 from forge.adapters.sqlite.connect import connect_writer
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
@@ -36,6 +33,19 @@ BUNDLE = Path(__file__).resolve().parents[3] / 'deploy' / 'estate'
 spec = importlib.util.spec_from_file_location('rollout_support', BUNDLE / 'rollout_support.py')
 r = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(r)
+
+@pytest.fixture(autouse=True)
+def no_broker_connection(monkeypatch):
+    """A broker connection is outside these SQLite tests: any attempt fails."""
+    import nats
+    import nats.aio.client
+
+    def refuse(*args, **kwargs):
+        raise AssertionError('a broker connection is outside these SQLite tests')
+
+    monkeypatch.setattr(nats, 'connect', refuse)
+    monkeypatch.setattr(nats.aio.client.Client, 'connect', refuse)
+
 
 @pytest.fixture(autouse=True)
 def packaged_boot_transport(monkeypatch):
@@ -500,6 +510,11 @@ class NoBrokerClient(importlib.abc.MetaPathFinder):
   if fullname=='nats' or fullname.startswith('nats.') or fullname=='nats_core.client':
    raise AssertionError('real broker-client import attempted: '+fullname)
 sys.meta_path.insert(0,NoBrokerClient())
+assert not any(n=='nats' or n.startswith('nats.') or n=='nats_core.client' for n in sys.modules)
+import types
+mock=types.ModuleType('nats_core.client');mock.__rollout_mock__=True
+def forbidden(*a,**k):raise AssertionError('a broker client is outside these SQLite tests')
+mock.NATSClient=forbidden;mock.NATSKVManifestRegistry=forbidden;sys.modules['nats_core.client']=mock
 module=runpy.run_path(sys.argv[1])
 with tempfile.TemporaryDirectory() as temporary:
  p=module['seed'](pathlib.Path(temporary)/'forge.db',build=True)
