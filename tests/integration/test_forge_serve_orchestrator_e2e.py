@@ -207,6 +207,32 @@ class _FakeBrokerClient:
         self.closed = True
 
 
+class _FakeFleetClient:
+    """Stand-in for the fleet-lifecycle ``nats_core.NATSClient``.
+
+    ``_run_serve`` opens a SECOND client, through the
+    :data:`forge.cli.serve.open_fleet_client` seam, for the fleet
+    registration (``register_agent`` on boot, ``deregister_agent`` on
+    shutdown). Until 16 October 2026 this test did not replace that seam,
+    so the default opener connected a real client to the default broker
+    address and the boot never got past it.
+    """
+
+    def __init__(self) -> None:
+        self.register_calls: list[Any] = []
+        self.deregister_calls: list[tuple[str, str]] = []
+        self.closed = False
+
+    async def register_agent(self, manifest: Any) -> None:
+        self.register_calls.append(manifest)
+
+    async def deregister_agent(self, agent_id: str, reason: str = "shutdown") -> None:
+        self.deregister_calls.append((agent_id, reason))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 # ---------------------------------------------------------------------------
 # Fake AutobuildDispatcher boundary — the AsyncTaskStarter Protocol seam
 # ---------------------------------------------------------------------------
@@ -556,7 +582,17 @@ class TestForgeServeLifecycleE2E:
             )
             _serve_daemon.dispatch_payload = make_handle_message_dispatcher(deps)
 
+        # The fleet registration's own client (a second connection by
+        # design, scoped to register/deregister) — never a real broker.
+        fleet_client = _FakeFleetClient()
+        fleet_opens: list[str] = []
+
+        async def _fake_open_fleet_client(nats_url: str) -> Any:
+            fleet_opens.append(nats_url)
+            return fleet_client
+
         monkeypatch.setattr(_serve_daemon, "nats_connect", _fake_connect)
+        monkeypatch.setattr(serve_module, "open_fleet_client", _fake_open_fleet_client)
         monkeypatch.setattr(
             serve_module, "compose_dispatch_chain", _compose_with_fake_autobuild
         )
@@ -610,6 +646,12 @@ class TestForgeServeLifecycleE2E:
             f"AC violated: expected one nats_connect on the startup path, "
             f"got {connect_calls!r}"
         )
+        # The fleet registration went through its own (fake) client, on
+        # the same broker address, and was withdrawn on shutdown.
+        assert fleet_opens == [config.nats_url], fleet_opens
+        assert len(fleet_client.register_calls) == 1
+        assert [reason for _agent, reason in fleet_client.deregister_calls] == ["shutdown"]
+        assert fleet_client.closed
 
         # AC: the daemon attached to the durable consumer named
         # 'forge-serve' on pipeline.build-queued.* with explicit ack and
