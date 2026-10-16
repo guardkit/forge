@@ -26,6 +26,7 @@ import shutil
 import subprocess
 import sys
 import textwrap
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -176,7 +177,22 @@ class _Factory:
         raise AssertionError(f"the child for {feature_id} never started")
 
 
+#: Added to every build ID in this file (16 October 2026). When a build ends,
+#: the runner stops every process on the machine whose environment carries
+#: ``GUARDKIT_RUN_OWNER=<build id>`` (by design: it catches the build's
+#: orphans). Two test runs at once on one machine (two checkouts' suites)
+#: used the same IDs, so one run's end-of-build stop killed the other run's
+#: stand-in child before it started. IDs unique to this run cannot collide.
+RUN_TOKEN = uuid.uuid4().hex[:10]
+
+
+def _id(build_id: str) -> str:
+    """This run's own version of a build ID used in this file."""
+    return f"{build_id}-{RUN_TOKEN}"
+
+
 def _payload(build_id: str, feature_id: str, repo: str, **extra: Any) -> dict:
+    build_id = _id(build_id)
     return {
         "build_id": build_id,
         "feature_id": feature_id,
@@ -224,7 +240,7 @@ def test_the_child_is_handed_the_concurrency_settings_and_its_owner(
     assert child is not None, f"no child recorded its owner: {snapshot}"
     for name, value in CONCURRENCY_SETTINGS.items():
         assert child["env"].get(name) == value, name
-    assert child["env"]["GUARDKIT_RUN_OWNER"] == "build-FEAT-A-1"
+    assert child["env"]["GUARDKIT_RUN_OWNER"] == _id("build-FEAT-A-1")
     # The project's Coach is still the project's: no flag chooses it, and the
     # file that does reached the child as committed.
     assert not any(arg.startswith("--coach-model") for arg in child["argv"])
@@ -263,7 +279,7 @@ def test_two_builds_of_one_repository_run_in_their_own_worktrees(
     assert "planning/b" in b["argv"]
     # Distinct receipts folders, one per build, each with its own output.
     for build_id, feature_id in (("build-FEAT-A-1", "FEAT-A"), ("build-FEAT-B-1", "FEAT-B")):
-        logs = list((factory.receipts / build_id).rglob("*.log"))
+        logs = list((factory.receipts / _id(build_id)).rglob("*.log"))
         assert logs, f"no receipts for {build_id}"
         assert all(feature_id in log.read_text() for log in logs)
 
@@ -534,12 +550,12 @@ def test_a_second_build_of_a_feature_leaves_the_running_ones_worktree_alone(
         try:
             # Either the second build's child starts, or the build ends first
             # (refused); then the first build's worktree is looked at.
-            owner = factory.out / "FEAT-A.build-FEAT-A-2.owner"
+            owner = factory.out / f"FEAT-A.{_id('build-FEAT-A-2')}.owner"
             for _ in range(400):
                 if owner.exists() or second.done():
                     break
                 await asyncio.sleep(0.05)
-            first_still_there = (factory.worktrees / "build-FEAT-A-1").is_dir()
+            first_still_there = (factory.worktrees / _id("build-FEAT-A-1")).is_dir()
         finally:
             factory.release()
         return await first, await second, first_still_there
@@ -548,7 +564,7 @@ def test_a_second_build_of_a_feature_leaves_the_running_ones_worktree_alone(
 
     assert first_still_there, "the running build's worktree was swept"
     # The second build was not refused over it either: it went ahead.
-    assert (factory.out / "FEAT-A.build-FEAT-A-2.owner").exists(), second
+    assert (factory.out / f"FEAT-A.{_id('build-FEAT-A-2')}.owner").exists(), second
     assert first["lifecycle"] != "failed", first
     assert second["lifecycle"] != "failed", second
 
@@ -567,7 +583,7 @@ def test_sweeping_a_finished_builds_worktree_does_not_stall_other_builds(
         _build(_payload("build-FEAT-A-1", "FEAT-A", "widget", branch="planning/a"))
     )
     assert first["lifecycle"] == "failed"
-    kept = factory.worktrees / "build-FEAT-A-1"
+    kept = factory.worktrees / _id("build-FEAT-A-1")
     assert kept.is_dir(), "the failed build's worktree should be kept"
     (factory.out / "exit-code").unlink()
     (factory.out / "inner").unlink()
