@@ -673,6 +673,24 @@ class _ASidecarThatAnswers:
                         self.end_headers()
                         self.wfile.write(stopped)
                         return
+                if how in ("exec-error", "refused-400"):
+                    # A 5xx: the sidecar's run raised while running. A 4xx:
+                    # refused before anything ran (Codex R9).
+                    said = json.dumps(
+                        {
+                            "error": (
+                                "sidecar execution error: OSError: the pipe broke"
+                                if how == "exec-error"
+                                else "script deploy/evil.sh is not one the profile names"
+                            )
+                        }
+                    ).encode()
+                    self.send_response(500 if how == "exec-error" else 400)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(said)))
+                    self.end_headers()
+                    self.wfile.write(said)
+                    return
                 if how == "html-error":
                     page = b"<html><body>502 Bad Gateway</body></html>"
                     self.send_response(502)
@@ -1456,8 +1474,17 @@ _REFUSALS = [
     (400, b"{}", True),
     (400, b'{"error": ""}', True),
     (400, b'{"error": "script deploy/evil.sh is not one the profile names"}', False),
+    # Codex R9: a 5xx is an error met while running, whatever its sentence.
+    (500, b'{"error": "sidecar execution error: OSError: the pipe broke"}', True),
 ]
-_REFUSAL_IDS = ["html", "empty", "empty-object", "blank-sentence", "sidecars-own-words"]
+_REFUSAL_IDS = [
+    "html",
+    "empty",
+    "empty-object",
+    "blank-sentence",
+    "sidecars-own-words",
+    "5xx-with-a-sentence",
+]
 
 
 class TestAnHttpErrorIsAnAnswerOnlyInTheSidecarsOwnWords:

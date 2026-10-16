@@ -1038,7 +1038,8 @@ class SidecarLiveGateInvoker:
                     "time limit",
                     answer_lost=True,
                 )
-            sentence = refusal_sentence_in(payload)
+            # Only a 4xx is a refusal before running; any 5xx is no answer.
+            sentence = refusal_sentence_in(payload) if exc.code < 500 else None
             if sentence is None:
                 return _instrument(
                     f"the deploy sidecar at {self._base_url} answered HTTP "

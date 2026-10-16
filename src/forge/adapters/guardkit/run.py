@@ -633,9 +633,10 @@ async def run(
                 *_surrender,
             ) = await _execute_subprocess(**execute_kwargs)
             output_surrendered = bool(_surrender[0]) if _surrender else False
-        except PermissionError as exc:
-            # Binary not in DeepAgents' shell allowlist — convert to a
-            # structured failed result with the canonical warning code.
+        except (PermissionError, FileNotFoundError, NotADirectoryError) as exc:
+            # Binary not in DeepAgents' shell allowlist, or a program the
+            # operating system would not start (15 October 2026) — convert to
+            # a structured failed result with the canonical warning code.
             warnings.append(
                 GuardKitWarning(
                     code="permissions_refused",

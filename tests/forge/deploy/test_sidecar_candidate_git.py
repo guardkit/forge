@@ -411,8 +411,22 @@ class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
         "status, body",
-        [(200, {}), (200, {"status": "maybe"}), (400, {}), (200, [])],
-        ids=["empty-200", "unknown-status", "refusal-with-no-sentence", "not-an-object"],
+        [
+            (200, {}),
+            (200, {"status": "maybe"}),
+            (400, {}),
+            (200, []),
+            # Codex R9: a 5xx is an error met while the operation may have
+            # been under way, whatever its sentence.
+            (500, {"error": "sidecar git error: OSError: the disk went away"}),
+        ],
+        ids=[
+            "empty-200",
+            "unknown-status",
+            "refusal-with-no-sentence",
+            "not-an-object",
+            "5xx-with-a-sentence",
+        ],
     )
     async def test_malformed_replies(self, status: int, body: object) -> None:
         sidecar = _ASidecarThatAnswersWith(status, body)

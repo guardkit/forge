@@ -2535,6 +2535,16 @@ def process_run_request(
             "exit_code": 1,
             "output_tail": "",
         }
+    # The run raised after the script may have started (15 October 2026): a
+    # 5xx, which every caller reads as no answer.
+    if getattr(ran, "answer_lost", False) is True and not getattr(
+        ran, "timed_out", False
+    ):
+        return 500, {
+            "error": f"sidecar execution error: {output}",
+            "exit_code": exit_code,
+            "output_tail": _tail(output),
+        }
 
     # LAW 8, the other half: say where the script ran, so a caller that named
     # a candidate tree can tell it was honoured. A script stopped at its time
@@ -2828,22 +2838,20 @@ def _start_and_collect(
             stderr=subprocess.PIPE,
             start_new_session=True,
         )
+    # NOTHING STARTED (15 October 2026): the operating system refused to
+    # start the program, so it says so in a field of its own.
     except FileNotFoundError as exc:
-        return (
-            MERGE_NOT_STARTED_EXIT_CODE,
-            "",
-            f"{what} could not be started: {exc}",
+        return RefusedBeforeStart(
+            (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} could not be started: {exc}")
         )
     except NotADirectoryError as exc:
-        return (
-            MERGE_NOT_STARTED_EXIT_CODE,
-            "",
-            f"{what} could not be started: {exc}",
+        return RefusedBeforeStart(
+            (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} could not be started: {exc}")
         )
     except PermissionError as exc:
-        return (126, "", f"{what} could not be run: {exc}")
+        return RefusedBeforeStart((126, "", f"{what} could not be run: {exc}"))
     except OSError as exc:
-        return (1, "", f"{what} could not be started: {exc}")
+        return RefusedBeforeStart((1, "", f"{what} could not be started: {exc}"))
 
     timed_out = False
     try:
@@ -2869,6 +2877,13 @@ def _start_and_collect(
         )
         return StoppedAtItsTimeLimit((exit_code, stdout, stderr))
     return exit_code, stdout, stderr
+
+
+class RefusedBeforeStart(tuple):
+    """``(exit code, stdout, stderr)`` of a program the operating system
+    refused to start (15 October 2026): nothing ran, so it is an answer."""
+
+    refused_before_running = True
 
 
 class StoppedAtItsTimeLimit(tuple):
@@ -3130,7 +3145,10 @@ def process_guardkit_merge_request(
 
     command = command_resolver()
     if not command:
-        return 500, {
+        # A refusal BEFORE anything runs is a 4xx (15 October 2026): only that
+        # is an answer; every 5xx is read as an answer that cannot be relied
+        # on.
+        return 400, {
             "error": (
                 "this host has no guardkit command to run — set "
                 f"{GUARDKIT_PATH_ENV} to its path, or put {GUARDKIT_BINARY_NAME} "
@@ -3178,7 +3196,8 @@ def process_guardkit_merge_request(
                 encoding="utf-8",
             )
         except OSError as exc:
-            return 500, {
+            # Before the command is started: a refusal, so a 4xx.
+            return 400, {
                 "error": (
                     "the sidecar could not write the list of tests that were "
                     f"already failing to {baseline_path}: {exc}"
@@ -3216,14 +3235,25 @@ def process_guardkit_merge_request(
         ran = merge_runner(**runner_kwargs)
         exit_code, stdout, stderr = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        # Raised while the command may already have been running: a 5xx,
+        # which every caller reads as no answer (15 October 2026).
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
             "exit_code": 1,
             "stdout": "",
             "stderr_tail": "",
-            # The command may already have been started (15 October 2026):
-            # the caller reads this as an answer nobody can rely on.
-            "may_have_started": True,
+        }
+
+    # THE PROGRAM WAS NEVER STARTED (15 October 2026): a refusal before
+    # anything ran, so a 4xx in the sidecar's own words.
+    if getattr(ran, "refused_before_running", False) is True:
+        return 400, {
+            "error": (
+                str(stderr or "").strip() or "the merge command could not be started"
+            ),
+            "exit_code": exit_code,
+            "stdout": "",
+            "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
         }
 
     return 200, {

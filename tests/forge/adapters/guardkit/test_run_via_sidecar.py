@@ -754,3 +754,31 @@ async def test_a_sidecar_that_cannot_be_reached_is_no_answer(repo: Path) -> None
     )
     assert result.answer_lost is True
     assert result.refused_before_running is False
+
+
+@pytest.mark.asyncio
+async def test_a_guardkit_the_system_will_not_start_is_refused_before_running(
+    sidecar: str, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """15 October 2026, Codex R10, through the REAL sidecar: a guardkit whose
+    interpreter is missing passes the command lookup, and the operating system
+    refuses to start it. Nothing ran, so it comes back refused before running."""
+    binary = tmp_path / "bin" / "guardkit"
+    binary.parent.mkdir(parents=True, exist_ok=True)
+    binary.write_text("#!/no/such/interpreter\n", encoding="utf-8")
+    binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+    monkeypatch.setenv(GUARDKIT_PATH_ENV, str(binary))
+
+    result = await _run(sidecar, repo)(
+        subcommand="autobuild",
+        args=_executor_args(),
+        repo_path=repo,
+        read_allowlist=[repo],
+        timeout_seconds=30,
+        with_nats_streaming=False,
+    )
+
+    assert result.status == "failed"
+    assert result.refused_before_running is True
+    assert result.answer_lost is False
+    assert "could not be started" in (result.stderr or "")

@@ -543,7 +543,13 @@ class _ARunThatNotesLostAnswers:
 
     def runner(self, inner: Any) -> Any:
         def _run(**kwargs: Any) -> Any:
-            answer = inner(**kwargs)
+            try:
+                answer = inner(**kwargs)
+            except BaseException:
+                # Raised while the script may have been running: noted before
+                # the executor turns it into an ordinary failed step.
+                self.lost = True
+                raise
             if no_answer_came_back(answer):
                 self.lost = True
             return answer
@@ -567,7 +573,12 @@ class _AnInvokerThatNotesLostAnswers:
         self._run = run
 
     def invoke(self, **kwargs: Any) -> Any:
-        invocation = self._inner.invoke(**kwargs)
+        try:
+            invocation = self._inner.invoke(**kwargs)
+        except BaseException:
+            # Raised while the driver may have been running (15 October 2026).
+            self._run.lost = True
+            raise
         if getattr(invocation, "answer_lost", False) is True:
             self._run.lost = True
         return invocation

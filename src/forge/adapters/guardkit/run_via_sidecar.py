@@ -524,18 +524,14 @@ def build_sidecar_guardkit_run(
                 answer_lost=True,
             )
         if status != 200:
-            # A REFUSAL IS AN ANSWER ONLY IN THE SIDECAR'S OWN WORDS, and only
-            # when it says nothing was started (15 October 2026, the rule the
-            # script runner and the live gate follow). Anything else — an
-            # unreadable or HTML body, {}, a blank sentence, or an error the
-            # sidecar met while the command may already have been running —
-            # is an answer nobody can read.
+            # A REFUSAL IS AN ANSWER ONLY AS A 4xx IN THE SIDECAR'S OWN WORDS
+            # (15 October 2026, the rule every sidecar client follows): the
+            # route sends a 4xx only for a refusal before anything ran.
+            # Anything else — any 5xx, an unreadable or HTML body, {}, a blank
+            # sentence — is an answer nobody can read.
+            # Any 5xx is an error met while the command may have been running.
             error = parsed.get("error") if isinstance(parsed, dict) else None
-            told = (
-                isinstance(error, str)
-                and bool(error.strip())
-                and not parsed.get("may_have_started")
-            )
+            told = status < 500 and isinstance(error, str) and bool(error.strip())
             return _failed_result(
                 detail=(
                     f"the deploy sidecar refused to run the merge "

@@ -4843,6 +4843,11 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
             ("ok", "timed-out", True),
             ("ok", "timed-out-no-cwd", True),
             ("ok", "timed-out-wrong-cwd", True),
+            # Codex R9: the sidecar's run raised (a 5xx) for the script or the
+            # gate; a refusal before running (a 4xx) is an answer.
+            ("exec-error", None, True),
+            ("ok", "exec-error", True),
+            ("refused-400", None, False),
         ],
         ids=[
             "script-timed-out-no-cwd",
@@ -4852,6 +4857,9 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
             "gate-timed-out",
             "gate-timed-out-no-cwd",
             "gate-timed-out-wrong-cwd",
+            "script-5xx",
+            "gate-5xx",
+            "script-refused-4xx",
         ],
     )
     async def test_a_check_script_that_ran_out_of_time_keeps_it(
@@ -4951,6 +4959,15 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         "status, body, kept",
         [
             (400, b'{"error": "this host has no guardkit command to run"}', False),
+            # Codex R10: the route's own answer when the operating system
+            # refused to start the merge command — nothing ran.
+            (
+                400,
+                b'{"error": "the merge command could not be started: [Errno 2] '
+                b'No such file or directory", "exit_code": 127, "stdout": "", '
+                b'"stderr_tail": ""}',
+                False,
+            ),
             (500, b"<html><body>502 Bad Gateway</body></html>", True),
             (200, b"{}", True),
             (
@@ -4961,7 +4978,14 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
             ),
             (None, b"", True),
         ],
-        ids=["refused-in-its-own-words", "html", "empty-object", "may-have-started", "unreachable"],
+        ids=[
+            "refused-in-its-own-words",
+            "spawn-refused",
+            "html",
+            "empty-object",
+            "5xx-while-running",
+            "unreachable",
+        ],
     )
     async def test_the_merge_command_through_the_sidecar(
         self,
@@ -5048,6 +5072,98 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         held = _the_hold(pool)
         assert held.result == "publication pending", outcome.detail
         assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("what", ["script", "gate"])
+    async def test_a_local_run_that_raised_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        what: str,
+    ) -> None:
+        """15 October 2026, Codex R9, with NO sidecar: the candidate check's
+        script, or its live gate, raised while it may have been running. The
+        stage notes it before the executor turns it into a failed step, the
+        teardown answers "down", and the hold is kept."""
+        import sqlite3
+        from unittest.mock import AsyncMock
+
+        from forge.config.models import DeployStageConfig
+        from forge.deploy.live_gate import DryRunBrokerInspector
+        from forge.deploy.reservation import InProcessReservationLease
+        from forge.deploy.stage import DeployStageRunner
+        from forge.executor import shell_steps
+        from forge.persistence.migrations.runbook import apply
+        from forge.persistence.repositories.runbook import RunbookRepository
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            RecordingDeployPublisher,
+            _Invoker,
+            _profile,
+        )
+
+        def _local_scripts(**kwargs: Any) -> Any:
+            down = (kwargs.get("extra_env") or {}).get("CANDIDATE_DOWN") == "1"
+            if what == "script" and not down:
+                raise OSError("the pipe broke while the script ran")
+            return (0, "ok\n")
+
+        class _AGateThatRaises(_Invoker):
+            def with_extra_env(self, overlay: dict[str, str]) -> Any:
+                outer = self
+
+                class _Raises:
+                    def with_repo_path(self, _path: Any) -> Any:
+                        return self
+
+                    def with_extra_env(self, _overlay: dict[str, str]) -> Any:
+                        return self
+
+                    def invoke(self, **_kwargs: Any) -> Any:
+                        raise OSError("the driver's pipe broke")
+
+                return _Raises() if what == "gate" else _Invoker.with_extra_env(outer, overlay)
+
+        monkeypatch.setattr(shell_steps, "_run_script_step", _local_scripts)
+        connection = sqlite3.connect(str(tmp_path / "runbooks.db"))
+        apply(connection)
+        stage = DeployStageRunner(
+            repository=RunbookRepository(connection=connection),
+            runbook_publisher=AsyncMock(),
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=_AGateThatRaises(),
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(),
+            deploy_record_root=str(tmp_path / "records"),
+            dry_run=False,
+        )
+
+        class _ACheckThroughTheRealStage(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") != "candidate_check":
+                    return await super().__call__(**kwargs)
+                self.calls.append(kwargs)
+                return await stage.candidate_check(
+                    _profile(),
+                    correlation_id=kwargs["correlation_id"],
+                    deploy_run_id=kwargs["deploy_run_id"],
+                    feature=kwargs["feature_id"],
+                    identity_env=kwargs.get("identity_env"),
+                )
+
+        deps, _publisher, _gk, _dp = _deps(
+            config, pool, guardkit=_JoinsForReal(), deploy=_ACheckThroughTheRealStage()
+        )
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert held.lease_holder is not None
 
     @pytest.mark.asyncio
     async def test_a_conflict_whose_record_moved_on_stops_as_replaced(

@@ -211,6 +211,24 @@ def test_a_script_stopped_at_its_time_limit_says_so(repo: Path) -> None:
     }
 
 
+def test_a_script_whose_run_raised_is_a_5xx(repo: Path) -> None:
+    """15 October 2026, Codex R9: the run raised after the script may have
+    started, so the answer is a 5xx, which every caller reads as no answer."""
+    from forge.executor.shell_steps import RaisedWhileRunning
+
+    cfg = _config({"appmilla/api_test": str(repo)})
+    runner = _RecordingRunner(
+        result=RaisedWhileRunning(1, "Unexpected error running script: OSError: x")
+    )
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": "deploy.sh"},
+        config=cfg,
+        script_runner=runner,
+    )
+    assert status == 500
+    assert "Unexpected error running script" in body["error"]
+
+
 def test_health_check_cmd_allowed(repo: Path) -> None:
     _write_profile(
         repo,

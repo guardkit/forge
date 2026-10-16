@@ -46,6 +46,22 @@ _TIMEOUT_EXIT_CODE = 124
 _TRUNCATION_MARKER = "\n... [OUTPUT TRUNCATED] ...\n"
 
 
+class RaisedWhileRunning(tuple):
+    """``(exit code, output)`` of a script whose run raised (15 October 2026).
+
+    The error may have come after the script started, so it is read like a
+    request with no answer (``answer_lost``).
+    """
+
+    answer_lost = True
+
+    def __new__(cls, exit_code: int, output: str) -> "RaisedWhileRunning":
+        return super().__new__(cls, (exit_code, output))
+
+    def __getnewargs__(self) -> tuple[int, str]:
+        return (self[0], self[1])
+
+
 class TimedOut(tuple):
     """``(exit code, output)`` of a script stopped at its time limit.
 
@@ -237,9 +253,11 @@ def _run_script_step(
         return (126, "")  # 126 = command not executable (shell convention)
 
     except Exception as exc:
-        # Any other error — return generic failure with error message
+        # Any other error — return generic failure with error message. It may
+        # have come after the script started, so nobody knows whether it is
+        # still running (15 October 2026): read like a lost answer.
         error_msg = f"Unexpected error running script: {type(exc).__name__}: {exc}"
-        return (1, error_msg)
+        return RaisedWhileRunning(1, error_msg)
 
     # Truncate to output_cap bytes BEFORE decoding and scrubbing
     if len(raw_output) > output_cap:
@@ -505,6 +523,7 @@ def register_shell_handlers(registry: StepTypeRegistry) -> None:
 
 
 __all__ = [
+    "RaisedWhileRunning",
     "TimedOut",
     "_run_script_step",
     "ScriptRunner",

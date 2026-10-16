@@ -309,7 +309,8 @@ def test_no_guardkit_on_the_host_is_reported_plainly(
         merge_runner=runner,
         command_resolver=lambda: None,
     )
-    assert status == 500
+    # Refused before anything ran: a 4xx (15 October 2026).
+    assert status == 400
     assert "no guardkit command" in body["error"]
     assert runner.calls == []
 
@@ -476,7 +477,8 @@ def test_a_baseline_that_cannot_be_written_stops_the_run(
         config=_config({REPO_KEY: str(repo)}),
         merge_runner=runner,
     )
-    assert status == 500
+    # Refused before anything ran: a 4xx (15 October 2026).
+    assert status == 400
     assert "already failing" in body["error"]
     assert runner.calls == []
 
@@ -1218,17 +1220,44 @@ def test_an_ordinary_answer_does_not_say_it_timed_out(
     assert "timed_out" not in body
 
 
-def test_an_error_while_running_says_it_may_have_started(
-    repo: Path, fake_guardkit: Path
-) -> None:
+def test_an_error_while_running_is_a_5xx(repo: Path, fake_guardkit: Path) -> None:
+    """Raised while the command may have been running: a 5xx, which every
+    caller reads as no answer (15 October 2026)."""
+
     def _raises(**_kwargs: Any) -> Any:
         raise OSError("the pipe broke")
 
-    status, body = process_guardkit_merge_request(
+    status, _body = process_guardkit_merge_request(
         _payload(), config=_config({REPO_KEY: str(repo)}), merge_runner=_raises
     )
     assert status == 500
-    assert body["may_have_started"] is True
+
+
+def test_a_command_the_system_would_not_start_is_a_refusal(
+    repo: Path, fake_guardkit: Path
+) -> None:
+    """15 October 2026, Codex R10: the operating system refused to start the
+    program, so nothing ran: a 4xx in the sidecar's own words."""
+    from forge.deploy_sidecar.service import RefusedBeforeStart
+
+    runner = _RecordingMergeRunner(
+        result=RefusedBeforeStart((127, "", "the merge command could not be started: no such file"))
+    )
+    status, body = process_guardkit_merge_request(
+        _payload(), config=_config({REPO_KEY: str(repo)}), merge_runner=runner
+    )
+    assert status == 400
+    assert "could not be started" in body["error"]
+
+
+def test_the_collector_says_a_program_was_never_started(tmp_path: Path) -> None:
+    script = tmp_path / "no-interpreter.sh"
+    script.write_text("#!/no/such/interpreter\n", encoding="utf-8")
+    script.chmod(0o755)
+
+    answer = run_merge_command(argv=[str(script)], cwd=str(tmp_path), timeout=5.0)
+
+    assert getattr(answer, "refused_before_running", False) is True
 
 
 def test_the_collector_says_a_command_was_stopped(tmp_path: Path) -> None:

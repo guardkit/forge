@@ -181,8 +181,11 @@ class SidecarCandidateGit:
         if not isinstance(decoded, dict):
             return None, self._sentence(route, answer), False
         if status != 200:
+            # Only a 4xx refusal in the sidecar's own words is an answer; any
+            # 5xx is an error met while the operation may have been under way
+            # (15 October 2026).
             error = decoded.get("error")
-            told = isinstance(error, str) and bool(error.strip())
+            told = status < 500 and isinstance(error, str) and bool(error.strip())
             return None, self._sentence(route, answer), told
         if not valid(decoded):
             return None, (
