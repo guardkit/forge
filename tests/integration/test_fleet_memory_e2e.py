@@ -20,8 +20,12 @@ Isolation
 ---------
 
 The wrappers run from a COPY of ``fleet-memory/deploy/local`` in a temporary
-folder, with their own ``.env.deploy`` (and ``.env``, which ``docker compose``
-reads) naming a free host port and a compose project of this run's own. Until 16
+folder, with their own ``.env.deploy`` naming a free host port and a compose
+project of this run's own. This module's own ``docker compose`` calls name that
+project, the copy's file and folder explicitly and take no COMPOSE_* setting
+from the shell; the wrappers, run through ``forge runbook run``, get the
+factory's minimal environment and so none either (both checked by
+``TestComposeCallsAreThisRunsOwn``). Until 16
 October 2026 they ran in the sibling checkout on host port 5432 and compose
 project ``local``: on a machine where anything else already holds 5432 (here,
 another Postgres) the deploy step could not start, and the test wrote
@@ -38,11 +42,13 @@ message rather than skipping — we want a real green from the e2e on this machi
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import socket
 import subprocess
 import tempfile
 import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -110,11 +116,10 @@ def local_deploy_wrappers(
 
     The sibling's ``deploy/local`` (deploy.sh, smoke.sh, docker-compose.yml,
     initdb) is copied as it is into a fresh git checkout, without any ``.env``
-    file of its own, and given
-    an ``.env.deploy`` and ``.env`` naming a free host port and a compose
-    project of this run's own. The wrappers source ``.env.deploy``; compose
-    reads ``.env``, so ``docker compose exec``/``down`` here reach the same
-    project.
+    file of its own, and given an ``.env.deploy`` naming a free host port and a
+    compose project of this run's own (see :func:`_prepare_copy`). The
+    wrappers source ``.env.deploy``; this module's own Compose calls name the
+    project and file explicitly (see :func:`_compose`).
 
     Args:
         fleet_memory_repo_root: Root of the fleet-memory repository.
@@ -142,7 +147,12 @@ def local_deploy_wrappers(
             "Expected files: deploy.sh, smoke.sh"
         )
 
-    copy = tmp_path_factory.mktemp("fleet-memory-deploy") / "local"
+    return _prepare_copy(local_dir, tmp_path_factory.mktemp("fleet-memory-deploy") / "local")
+
+
+def _prepare_copy(local_dir: Path, copy: Path) -> Path:
+    """Copy ``local_dir`` to ``copy`` (a fresh git checkout) with settings of
+    this run's own: a free port and a unique compose project."""
     shutil.copytree(local_dir, copy, ignore=shutil.ignore_patterns(".env", ".env.*"))
     settings = (
         "# Written by forge's test_fleet_memory_e2e for this run alone\n"
@@ -153,11 +163,69 @@ def local_deploy_wrappers(
         "POSTGRES_DB=fleet_memory\n"
     )
     (copy / ".env.deploy").write_text(settings, encoding="utf-8")
-    (copy / ".env").write_text(settings, encoding="utf-8")
     # A project's script is run only from a git checkout: its private HOME and
     # TMPDIR go in the checkout's own git directory, outside the project.
     subprocess.run(["git", "init", "-q", str(copy)], check=True)
     return copy
+
+
+def _settings(copy: Path) -> dict[str, str]:
+    """The copy's own .env.deploy, as names and values."""
+    found: dict[str, str] = {}
+    for line in (copy / ".env.deploy").read_text(encoding="utf-8").splitlines():
+        if line.strip() and not line.lstrip().startswith("#") and "=" in line:
+            name, value = line.split("=", 1)
+            found[name.strip()] = value.strip()
+    return found
+
+
+#: All a direct Compose call takes from the shell that runs the tests: where
+#: programs are and how to reach Docker. Every COMPOSE_* setting (a project
+#: name, a file list, profiles) is left behind, so an exported
+#: COMPOSE_PROJECT_NAME or COMPOSE_FILE can never point a call here, above all
+#: ``down -v``, at another project (Codex review R2, 16 October 2026).
+_INHERITED_BY_COMPOSE_CALLS = (
+    "PATH",
+    "HOME",
+    "DOCKER_HOST",
+    "DOCKER_CONFIG",
+    "DOCKER_CONTEXT",
+    "XDG_RUNTIME_DIR",
+)
+
+
+def _compose_call(copy: Path, *args: str) -> tuple[list[str], dict[str, str]]:
+    """The argv and environment of one ``docker compose`` call on the copy:
+    its own project directory, file and project name, named explicitly."""
+    settings = _settings(copy)
+    argv = [
+        "docker",
+        "compose",
+        "--project-directory",
+        str(copy),
+        "--file",
+        str(copy / "docker-compose.yml"),
+        "--project-name",
+        settings["COMPOSE_PROJECT_NAME"],
+        *args,
+    ]
+    env = {
+        name: os.environ[name]
+        for name in _INHERITED_BY_COMPOSE_CALLS
+        if name in os.environ
+    }
+    env["PGPORT"] = settings["PGPORT"]
+    return argv, env
+
+
+def _compose(copy: Path, *args: str, **kwargs: Any) -> subprocess.CompletedProcess:
+    argv, env = _compose_call(copy, *args)
+    return subprocess.run(argv, cwd=str(copy), env=env, check=False, **kwargs)
+
+
+def _down(copy: Path) -> None:
+    """Remove the copy's own compose project, containers and volumes."""
+    _compose(copy, "down", "-v", capture_output=True)
 
 
 @pytest.fixture(scope="module")
@@ -330,22 +398,12 @@ def teardown_compose(local_deploy_wrappers: Path) -> Any:
         None (fixture runs before and after test).
     """
     # Pre-test: ensure clean state
-    subprocess.run(
-        ["docker", "compose", "down", "-v"],
-        cwd=str(local_deploy_wrappers),
-        capture_output=True,
-        check=False,
-    )
+    _down(local_deploy_wrappers)
 
     yield
 
     # Post-test: teardown
-    subprocess.run(
-        ["docker", "compose", "down", "-v"],
-        cwd=str(local_deploy_wrappers),
-        capture_output=True,
-        check=False,
-    )
+    _down(local_deploy_wrappers)
 
 
 # ---------------------------------------------------------------------------
@@ -464,16 +522,13 @@ class TestSmokeGatesSatisfied:
 
         # Verify pgvector extension is installed by checking directly
         # (smoke.sh already checked this, but we verify independently)
-        check_result = subprocess.run(
-            [
-                "docker", "compose", "exec", "-T", "postgres",
-                "psql", "-U", "fleet_memory", "-d", "fleet_memory", "-tAc",
-                "SELECT extname FROM pg_extension WHERE extname='vector';",
-            ],
-            cwd=str(local_deploy_wrappers),
+        check_result = _compose(
+            local_deploy_wrappers,
+            "exec", "-T", "postgres",
+            "psql", "-U", "fleet_memory", "-d", "fleet_memory", "-tAc",
+            "SELECT extname FROM pg_extension WHERE extname='vector';",
             capture_output=True,
             text=True,
-            check=False,
         )
 
         assert check_result.returncode == 0, "pgvector check command failed"
@@ -552,14 +607,11 @@ class TestSmokeGatesSatisfied:
         )
 
         # Verify data volume is present (G5 gate)
-        volume_result = subprocess.run(
-            [
-                "docker", "compose", "exec", "-T", "postgres",
-                "test", "-f", "/var/lib/postgresql/data/PG_VERSION",
-            ],
-            cwd=str(local_deploy_wrappers),
+        volume_result = _compose(
+            local_deploy_wrappers,
+            "exec", "-T", "postgres",
+            "test", "-f", "/var/lib/postgresql/data/PG_VERSION",
             capture_output=True,
-            check=False,
         )
 
         assert volume_result.returncode == 0, (
@@ -647,12 +699,8 @@ class TestTeardown:
         # The teardown_compose fixture (autouse=True) has already run
         # Verify no fleet-memory containers are running
 
-        result = subprocess.run(
-            ["docker", "compose", "ps", "-q"],
-            cwd=str(local_deploy_wrappers),
-            capture_output=True,
-            text=True,
-            check=False,
+        result = _compose(
+            local_deploy_wrappers, "ps", "-q", capture_output=True, text=True
         )
 
         assert result.returncode == 0, f"docker compose ps failed: {result.stderr}"
@@ -754,3 +802,117 @@ class TestMissingWrapperCheck:
         assert "deploy.sh" in fixture_source and "smoke.sh" in fixture_source, (
             "local_deploy_wrappers fixture should check for deploy.sh and smoke.sh"
         )
+
+
+# ---------------------------------------------------------------------------
+# Every Compose call is this run's own, whatever the shell exported
+# (Codex review R2, 16 October 2026)
+# ---------------------------------------------------------------------------
+
+#: What a shell might have exported that names somebody else's project. The
+#: estate's own env file sets COMPOSE_FILE, so this is not hypothetical.
+_SOMEBODY_ELSES = {
+    "COMPOSE_PROJECT_NAME": "somebody-elses-postgres",
+    "COMPOSE_FILE": "/elsewhere/compose.yaml",
+    "COMPOSE_PROFILES": "everything",
+    "COMPOSE_ENV_FILES": "/elsewhere/.env",
+}
+
+
+class TestComposeCallsAreThisRunsOwn:
+    """Intercepted: no Docker is used, so these run on any machine."""
+
+    @pytest.fixture
+    def copy(self, tmp_path: Path) -> Path:
+        source = tmp_path / "source"
+        source.mkdir()
+        for name in ("docker-compose.yml", "deploy.sh", "smoke.sh"):
+            (source / name).write_text("# stand-in\n", encoding="utf-8")
+        return _prepare_copy(source, tmp_path / "local")
+
+    def test_this_modules_calls_name_the_copys_project_and_file(
+        self, copy: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name, value in _SOMEBODY_ELSES.items():
+            monkeypatch.setenv(name, value)
+        seen: list[tuple[list[str], dict[str, str], str]] = []
+
+        def intercepted(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
+            seen.append((list(argv), dict(kwargs["env"]), kwargs["cwd"]))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", intercepted)
+        _down(copy)
+        _compose(copy, "exec", "-T", "postgres", "true")
+        _compose(copy, "ps", "-q")
+
+        project = _settings(copy)["COMPOSE_PROJECT_NAME"]
+        assert project.startswith("forge-test-fleet-memory-")
+        assert len(seen) == 3
+        assert seen[0][0][-2:] == ["down", "-v"]
+        for argv, env, cwd in seen:
+            assert argv[:2] == ["docker", "compose"], argv
+            assert argv[argv.index("--project-name") + 1] == project, argv
+            assert argv[argv.index("--file") + 1] == str(copy / "docker-compose.yml"), argv
+            assert argv[argv.index("--project-directory") + 1] == str(copy), argv
+            assert cwd == str(copy)
+            assert not [name for name in env if name.startswith("COMPOSE_")], env
+            assert env["PGPORT"] == _settings(copy)["PGPORT"]
+
+    def test_the_wrappers_run_by_the_runbook_get_no_inherited_compose_settings(
+        self,
+        local_deploy_wrappers: Path,
+        fleet_memory_runbook_json: Path,
+        test_db_path: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The real wrappers, run through ``forge runbook run`` as the tests
+        above run them, with a stand-in ``docker`` first on PATH. Each call
+        must reach the copy's own project, never the exported one."""
+        log = tmp_path / "docker-calls.jsonl"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "docker").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            f"with open({str(log)!r}, 'a') as out:\n"
+            "    out.write(json.dumps({'argv': sys.argv[1:], 'env': {k: v for k, v in os.environ.items() if k.startswith('COMPOSE_')}}) + '\\n')\n"
+            "joined = ' '.join(sys.argv[1:])\n"
+            "print('vector' if 'pg_extension' in joined else '16' if 'PG_VERSION' in joined else '')\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "psql").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for name in ("docker", "psql"):
+            (bin_dir / name).chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        for name, value in _SOMEBODY_ELSES.items():
+            monkeypatch.setenv(name, value)
+
+        result = CliRunner().invoke(
+            runbook_cmd,
+            ["run", str(fleet_memory_runbook_json), "--db", str(test_db_path), "--no-events"],
+        )
+        assert result.exit_code == 0, (
+            f"{result.output}{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
+
+        project = _settings(local_deploy_wrappers)["COMPOSE_PROJECT_NAME"]
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        assert calls, "the wrappers made no docker call"
+        for call in calls:
+            argv, env = call["argv"], call["env"]
+            assert argv[0] == "compose", argv
+            # The project is named on the command line (fleet-memory's
+            # wrappers since 16 October 2026) or, in older wrappers, by
+            # COMPOSE_PROJECT_NAME from the copy's .env.deploy.
+            named = (
+                argv[argv.index("--project-name") + 1]
+                if "--project-name" in argv
+                else env.get("COMPOSE_PROJECT_NAME")
+            )
+            assert named == project, call
+            for name, value in _SOMEBODY_ELSES.items():
+                assert env.get(name) != value, call
+            if "--file" not in argv:
+                assert "COMPOSE_FILE" not in env, call
