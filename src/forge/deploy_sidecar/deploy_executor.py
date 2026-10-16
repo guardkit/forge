@@ -519,6 +519,9 @@ class ExecutorAnswer:
     #: nobody knows whether what it started is still running, so the route
     #: answers a 5xx and every caller reads it as no answer.
     raised_while_running: bool = False
+    #: The command was stopped at its time limit (15 October 2026). Carried
+    #: apart from the word, so a takeover that met a timeout still says so.
+    timed_out: bool = False
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -1884,7 +1887,9 @@ class DeployExecutor:
         except subprocess.TimeoutExpired:
             timed_out = True
             if not self._the_note_is_still_mine(note):
-                return self._stopped_by_a_takeover(note)
+                # Taken over AND stopped at its limit: the takeover's word,
+                # with the timeout carried (15 October 2026, Codex R9).
+                return self._stopped_by_a_takeover(note, timed_out=True)
             self._stop_and_confirm(note)
             try:
                 output_bytes, _ = process.communicate(timeout=5.0)
@@ -1892,7 +1897,9 @@ class DeployExecutor:
                 output_bytes = b""
         except Exception as exc:  # noqa: BLE001 — never raise past the boundary
             if not self._the_note_is_still_mine(note):
-                return self._stopped_by_a_takeover(note)
+                # Taken over AND the read raised once it had started: nobody
+                # knows whether it is still running (15 October 2026).
+                return self._stopped_by_a_takeover(note, raised_while_running=True)
             self._stop_and_confirm(note)
             self._clear_if_it_is_still_mine(note)
             return ExecutorAnswer(
@@ -1915,7 +1922,9 @@ class DeployExecutor:
         # the note on disk belongs to the command that holds the target now —
         # and it answers in its own word.
         if not self._the_note_is_still_mine(note):
-            return self._stopped_by_a_takeover(note, output=output)
+            return self._stopped_by_a_takeover(
+                note, output=output, timed_out=timed_out
+            )
         # RULE (d): the note is cleared only after every process of the command
         # is confirmed gone — not when the one we spawned returned.
         #
@@ -1945,6 +1954,7 @@ class DeployExecutor:
         if timed_out:
             return ExecutorAnswer(
                 accepted=True,
+                timed_out=True,
                 word="the-deploy-command-ran-out-of-time",
                 sentence=(
                     f"the deploy step for {note.target} was given "
@@ -1981,7 +1991,13 @@ class DeployExecutor:
         )
 
     @staticmethod
-    def _stopped_by_a_takeover(note: _Note, *, output: str = "") -> ExecutorAnswer:
+    def _stopped_by_a_takeover(
+        note: _Note,
+        *,
+        output: str = "",
+        timed_out: bool = False,
+        raised_while_running: bool = False,
+    ) -> ExecutorAnswer:
         """A command a later holder of the target stopped. IT IS NOT A DEPLOY.
 
         It gets its own word because it is its own thing. The command did not
@@ -2006,6 +2022,11 @@ class DeployExecutor:
             ),
             output=output,
             marker=note.marker,
+            # Whatever else happened to it is carried apart from the word: a
+            # takeover is not an answer about a command that also timed out
+            # or broke while it ran (15 October 2026).
+            timed_out=timed_out,
+            raised_while_running=raised_while_running,
         )
 
 

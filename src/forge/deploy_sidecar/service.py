@@ -2526,6 +2526,7 @@ def process_run_request(
             **(
                 {"timed_out": True}
                 if answered.word == "the-deploy-command-ran-out-of-time"
+                or getattr(answered, "timed_out", False) is True
                 else {}
             ),
         }

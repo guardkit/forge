@@ -1108,6 +1108,59 @@ class TestACommandThatDidNotFinish:
         assert answer.raised_while_running is False
 
 
+def _taken_over_while_it_ran(monkeypatch: pytest.MonkeyPatch, how: str) -> None:
+    """While the deploy command's output is read, a later holder takes the
+    target over; the read itself times out, breaks, or finishes (``how``)."""
+    import subprocess
+
+    from forge.deploy_sidecar import deploy_executor as module
+
+    taken = {"over": False}
+    real_mine = module.DeployExecutor._the_note_is_still_mine
+    real_read = subprocess.Popen.communicate
+
+    def _mine(self, note):  # type: ignore[no-untyped-def]
+        return False if taken["over"] else real_mine(self, note)
+
+    def _read(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        if module._RUNNER_SOURCE not in [str(a) for a in (self.args or [])]:
+            return real_read(self, *args, **kwargs)
+        if how == "finished":
+            answer = real_read(self, *args, **kwargs)
+            taken["over"] = True
+            return answer
+        taken["over"] = True
+        if how == "timed-out":
+            raise subprocess.TimeoutExpired(self.args, 1.0)
+        raise OSError("the deploy command's pipe broke")
+
+    monkeypatch.setattr(module.DeployExecutor, "_the_note_is_still_mine", _mine)
+    monkeypatch.setattr(subprocess.Popen, "communicate", _read)
+
+
+class TestATakeoverKeepsWhatElseHappened:
+    """15 October 2026, Codex R9: a takeover is answered in its own word, and
+    a timeout or an error after the start that came with it is carried apart
+    from the word, so it still reads as an answer that was lost."""
+
+    @pytest.mark.parametrize(
+        "how, timed_out, raised",
+        [("timed-out", True, False), ("raised", False, True), ("finished", False, False)],
+    )
+    def test_the_takeover_carries_it(
+        self, notes, workshop, TARGET, monkeypatch, how, timed_out, raised
+    ) -> None:
+        from forge.deploy_sidecar.deploy_executor import STOPPED_BY_A_TAKEOVER
+
+        _taken_over_while_it_ran(monkeypatch, how)
+        executor = _executor(notes, command_seconds=30.0, stop_confirm_seconds=20.0)
+        answer = executor.run(_ask(TARGET, _quick(workshop), 1, "build-a", workshop))
+        assert answer.word == STOPPED_BY_A_TAKEOVER
+        assert answer.accepted is False
+        assert answer.timed_out is timed_out
+        assert answer.raised_while_running is raised
+
+
 # ---------------------------------------------------------------------------
 # (h) the environment door
 # ---------------------------------------------------------------------------

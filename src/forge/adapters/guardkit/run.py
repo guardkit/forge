@@ -638,12 +638,16 @@ async def run(
                 *_surrender,
             ) = await _execute_subprocess(**execute_kwargs)
             output_surrendered = bool(_surrender[0]) if _surrender else False
-        except (
-            PermissionError, FileNotFoundError, NotADirectoryError, ProgramRefused
-        ) as exc:
+        except (PermissionError, ProgramRefused) as exc:
             # Binary not in DeepAgents' shell allowlist, or a program the
-            # operating system would not start (15 October 2026) — convert to
-            # a structured failed result with the canonical warning code.
+            # operating system would not start — convert to a structured
+            # failed result with the canonical warning code. ONLY a
+            # ProgramRefused, raised at the spawn boundary itself, is a refusal
+            # before anything ran (15 October 2026, Codex R12). Any other error
+            # from the start-and-collect call, a raw PermissionError included,
+            # may have come after the command started: nobody knows whether it
+            # is still running.
+            refused_first = isinstance(exc, ProgramRefused)
             warnings.append(
                 GuardKitWarning(
                     code="permissions_refused",
@@ -665,8 +669,8 @@ async def run(
                 stderr=str(exc),
                 exit_code=-1,
                 warnings=warnings,
-                # The spawn itself was refused: nothing ran.
-                refused_before_running=True,
+                refused_before_running=refused_first,
+                answer_lost=not refused_first,
             )
 
         if output_surrendered:

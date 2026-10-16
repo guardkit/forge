@@ -1473,6 +1473,48 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", ["timed-out", "raised", "finished"])
+    async def test_a_deploy_taken_over_while_it_ran(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+        how: str,
+    ) -> None:
+        """15 October 2026, Codex R9, through the REAL owned deploy executor:
+        a later holder takes the target over while the deploy command runs.
+        When the command also timed out, or its read broke after it started,
+        nobody knows whether it is still running: the hold is kept, although
+        the candidate's teardown answered that it is down. An ordinary
+        takeover is answered as before."""
+        from forge.pipeline.publication_record import PublicationRecordStore
+        from tests.forge.deploy_sidecar.test_the_deploy_executor_is_the_gate import (
+            _taken_over_while_it_ran,
+        )
+
+        _taken_over_while_it_ran(monkeypatch, how)
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert outcome.result != "merged-into-the-remote-and-running", outcome.detail
+        held = PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
+        if how == "finished":
+            assert outcome.result == "published-deployment-pending", outcome.detail
+            assert "stopped part-way by a later holder" in outcome.detail
+            assert held is None
+        else:
+            assert held is not None
+
+    @pytest.mark.asyncio
     async def test_a_press_that_picks_up_a_published_join_lays_its_tree_out_again(
         self,
         a_helper_that_deploys: tuple[str, dict[str, Any]],
