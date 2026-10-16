@@ -6857,15 +6857,14 @@ class PlanningRunDriver:
 
         * does it name a web address the request does not name?
         * does it ask for a capability the request never mentions?
-        * can it point at any of the words of the request it serves?
 
-        The first two are contradictions of something the person actually said,
-        and both of them already cost a refused run at the live gate an hour
+        Both are contradictions of something the person actually said, and
+        both of them already cost a refused run at the live gate an hour
         later, so a plan that still carries one after being sent back once stops
         the run here, where nothing has been written and nothing has been built.
-        The third never stops a run on its own — three or four of the nine tasks
-        that drew it in the measurement were innocent — and is said in one plain
-        line beside the plan instead.
+        How a task words what it serves is never asked (16 October 2026: the
+        exact-quote rule is gone), so it never sends a plan back and never puts
+        a line on the card.
 
         ONE NOTE ROUND PER RUN, and whether it has been spent is read from the
         durable rows, never from memory, so a crash and a re-drive cannot spend
@@ -6931,7 +6930,6 @@ class PlanningRunDriver:
                 review.tasks_read,
             )
             return files, receipt
-        receipt["card_line"] = review.cannot_cite_line()
         note = review.note()
         flagged = list(review.flagged_tasks)
         receipt["still_flagged"] = flagged
@@ -7057,7 +7055,6 @@ class PlanningRunDriver:
         still = list(second.flagged_tasks)
         receipt["still_flagged"] = still
         receipt["fixed_tasks"] = [t for t in flagged if t not in still]
-        receipt["card_line"] = second.cannot_cite_line()
         logger.info(
             "planning driver: run %s — after the plan review's round: %d "
             "task(s) fixed, %d still flagged",
@@ -7078,8 +7075,7 @@ class PlanningRunDriver:
         and the tree a rewrite starts from.
 
         A collaborator that predates the note round keeps working exactly as it
-        did: the finding is receipted, one plain line is said, and the plan
-        carries on. That is what lets the two images be redeployed in either
+        did: the finding is receipted and the plan carries on. That is what lets the two images be redeployed in either
         order with no window in which planning is refused.
         """
         if dispatch is None:
