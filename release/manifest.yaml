@@ -165,7 +165,16 @@ schema: 2
 # Image qualification passed in its measured packaging scope; full rehearsal
 # and rollout acceptance remain pending.
 # Preserve prior releases and their immutable image receipts.
-version: 2026.09.28-2
+# 16 October 2026: this file had stayed at 2026.09.28-2 while every release
+# since was cut from a copy kept with its release record. It now carries the
+# live release 2026.10.15-5's pins (Forge 5c45fef7, GuardKit 1973b84d,
+# nats-core ecf69eb1, guardkitfactory 40615a7e, Jarvis 8eabb71a), except
+# fleet-memory, which moves to ee7c2777: the memory service and relay images
+# run as an ordinary user (uid 1000) instead of root. The first release built
+# from it needs the one-off ownership step for the relay's existing volume
+# (ai-transition RUNBOOK-factory-release-to-both-machines, "One-off: the memory
+# images stop running as root"). Version names the next release candidate.
+version: 2026.10.16-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -263,27 +272,27 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 7bef3033f868ffeea8e480f0d29a2a4dc192aa88
+    commit: 5c45fef7fa00d126369e2bff0d7a3889e7713077
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: f126713696a459e8f129ef63af4afa8a0748eb77
+    commit: 1973b84db5586ec2d366dacc0fd62808622d6ced
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
     branch: main
-    commit: fc7bdbbe54aa158a7d77ed7a76eeaab137b6a66c
+    commit: ecf69eb1d22358e12076ca700df226c07f28f5e8
     role: named-context
   - name: fleet-memory
     url: https://github.com/guardkit/fleet-memory.git
     branch: main
-    commit: 18ab7de6a250bc31a602f0d5733ef8eb99698686
+    commit: ee7c2777b75b248955f7a6d93922d5a6baef6162
     role: named-context
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
-    commit: 8358670e3c57442bcc8862ea4ff96a7f4ec78dc7
+    commit: 40615a7e0ff6952b5a5492ada0d3a66dc10c8533
     role: named-context
   # THE SIXTH REPOSITORY (25 September 2026). It is a named context like the
   # four above — the jarvis image is built from ITS clone, at this pin, and
@@ -295,7 +304,7 @@ repositories:
   - name: jarvis
     url: https://github.com/guardkit/jarvis.git
     branch: main
-    commit: 4efff4f6f9a6d6d8eccea560facb1b0e5d574ac4
+    commit: 8eabb71ac8ea9bf7207bb1c40010634c2c247ebc
     role: named-context
 
 # ---------------------------------------------------------------------------

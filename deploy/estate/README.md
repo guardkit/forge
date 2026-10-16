@@ -263,15 +263,13 @@ found.**
   from its own compose file as well. It was tested, not assumed: the package
   installs, both entry modules import, and a real message went end to end on
   3.14. But it is a change of its own and should not be read as only a pin.
-- **Both run as root**, which the release's other images do not — the
-  publisher's own proof refuses root outright. That is how the memory
-  repository's Dockerfiles have always been, so it is not a regression, but
-  these are release images now. `../../scripts/verify-fleet-memory-image.sh`
-  says so in every release build rather than leaving it unasked, and closing it
-  is a change in **that** repository: a non-root user in both Dockerfiles, and
-  `/var/lib/fleet-memory` created in the relay's image owned by that user,
-  because Docker fills a fresh named volume from what the image has at that
-  path, ownership included.
+- **They run as an ordinary user, uid 1000, not root** (fleet-memory ee7c2777,
+  16 October 2026), and `/var/lib/fleet-memory` is made in the relay's image owned
+  by that user, because Docker fills a fresh named volume from what the image has
+  at that path, ownership included. `../../scripts/verify-fleet-memory-image.sh`
+  checks it in every release build. A volume written while the relay ran as root
+  needs one ownership change, with the relay stopped, before the first start of
+  the new image; the release runbook carries the step.
 
 ## The model door
 
