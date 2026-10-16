@@ -11,11 +11,13 @@ The last test in this file is the acceptance test the design asks for
 (``docs/planner-fix-design-2026-09-15.md`` section 3, lane F2): run the guard
 over ALL TWELVE captured plan trees and compare, task by task, against the
 retrospective that was written by hand from the same branches
-(``docs/planner-fix-twelve-plan-table-2026-09-15.md``). Exactly ONE row is
-expected to differ, and the design names it in advance: the plan that called
-everything "metrics" comes back clean on its first task, because "metrics" is
+(``docs/planner-fix-twelve-plan-table-2026-09-15.md``). The rows expected to
+differ are named in advance: the plan that called everything "metrics" comes
+back clean on the tasks whose only flag was that word, because "metrics" is
 deliberately off the shipped capability list — a list that flags a plan for its
-choice of names is a list a person learns to ignore.
+choice of names is a list a person learns to ignore. Since 16 October 2026 the
+table's "cannot cite" flag (not quoting the request word for word) is struck,
+because that question was removed.
 """
 
 from __future__ import annotations
@@ -26,11 +28,8 @@ from pathlib import Path
 import pytest
 
 from forge.planning.task_traceability import (
-    CANNOT_CITE,
     CONTRADICTED_PATH,
-    SCAFFOLDING_KINDS,
     UNASKED_CAPABILITY,
-    excused_task_line,
     review_task_traceability,
 )
 
@@ -39,14 +38,6 @@ REQUEST = (
     "Add a GET /users/created-per-day endpoint that returns the number of "
     "users created on each of the last 7 days, oldest first."
 )
-
-#: The boilerplate that appears in forty-nine of the fifty-eight task documents
-#: measured, and must be struck before anyone asks whether a task said anything.
-LINT_LINE = (
-    "- [ ] All modified files pass project-configured lint/format checks "
-    "with zero errors"
-)
-
 
 def _task(
     body: str,
@@ -233,168 +224,90 @@ def test_a_scaffolding_task_is_never_excused_from_the_first_two_questions() -> N
 
 
 # ---------------------------------------------------------------------------
-# Question three: can it point at the words of the request it serves?
+# No exact wording (16 October 2026): how a task words what it serves is never
+# held against it. Rich: "insists on exact wording from an LLM generated text
+# is just never going to be reliable so I don't think insisting on exact
+# wording makes sense".
 # ---------------------------------------------------------------------------
 
 
-def test_a_task_that_quotes_nothing_is_named_and_never_stops_a_run() -> None:
-    files = _task("# Create analytics schema\n\nDefine the models.\n")
-    review = review_task_traceability(files, request_text=REQUEST)
-
-    assert [f.flag for f in review.findings] == [CANNOT_CITE]
-    assert review.sends_it_back is True
-    assert review.stops_the_run is False
-    assert review.cannot_cite_line() == (
-        "One task in this plan does not quote any of the words of the request "
-        "it serves: TASK-AAAA-001. The run was not stopped for that on its own."
-    )
-
-
-def test_the_line_a_person_reads_counts_in_words_and_says_what_happened() -> None:
-    """The plural half of the same sentence, and the plain truth about what the
-    run did. The wording it replaced — "1 task(s) ... The plan was not sent
-    back for that on its own." — was machine talk AND untrue: any finding at
-    all opens the one note round, and what actually did not happen is that the
-    run was stopped."""
-    files: dict[str, str] = {}
-    for n in (1, 2, 3):
-        files.update(_task("# A task\n\nDo the work.\n", task_id=f"TASK-BBBB-00{n}"))
-    review = review_task_traceability(files, request_text=REQUEST)
-
-    assert [f.flag for f in review.findings] == [CANNOT_CITE] * 3
-    assert review.cannot_cite_line() == (
-        "Three tasks in this plan do not quote any of the words of the request "
-        "they serve: TASK-BBBB-001, TASK-BBBB-002, TASK-BBBB-003. The run was "
-        "not stopped for that on its own."
-    )
-    line = review.cannot_cite_line() or ""
-    assert "task(s)" not in line
-    assert "sent back" not in line
-
-
-def test_a_paraphrase_under_the_heading_is_not_a_quote() -> None:
-    """Rule 1 of the task document's shape says that section holds words
-    COPIED from the request. The guard as first built took any block quote,
-    so a task could paraphrase and pass while quoting nothing — the one thing
-    the section exists to prevent."""
+def test_a_task_that_paraphrases_the_request_is_clear() -> None:
     files = _task(
         "# The daily totals\n\n"
         "## The words of the request this task serves\n\n"
-        "> Provide a way to see how many accounts appeared recently.\n",
-    )
-    review = review_task_traceability(files, request_text=REQUEST)
-
-    assert [f.flag for f in review.findings] == [CANNOT_CITE]
-    assert review.findings[0].sentence == (
-        "TASK-AAAA-001 quotes words that are not in the request, and claims "
-        "no scaffolding kind (one of: tests, documentation, response-shape, "
-        "data-access)"
-    )
-
-
-def test_a_paraphrase_falls_through_to_the_two_questions_behind_it() -> None:
-    """A quote that is not the request's words is no quote at all, so the task
-    is judged exactly as if it had written no section: its kind still excuses
-    it, and three consecutive words of the request elsewhere in the document
-    still count."""
-    excused_by_kind = _task(
-        "# Add the tests\n\n"
-        "## The words of the request this task serves\n\n"
-        "> Provide a way to see how many accounts appeared recently.\n",
-        front="scaffolding_kind: tests\n",
-    )
-    assert review_task_traceability(excused_by_kind, request_text=REQUEST).findings == []
-
-    quotes_elsewhere = _task(
-        "# The query\n\n"
-        "## The words of the request this task serves\n\n"
         "> Provide a way to see how many accounts appeared recently.\n\n"
         "## Acceptance Criteria\n\n"
-        "- [ ] Count users for each of the last 7 days\n",
-    )
-    assert review_task_traceability(quotes_elsewhere, request_text=REQUEST).findings == []
-
-
-def test_three_consecutive_words_of_the_request_are_a_citation() -> None:
-    files = _task("# The query\n\nCount users for each of the last 7 days.\n")
-    review = review_task_traceability(files, request_text=REQUEST)
-
-    assert review.findings == []
-
-
-def test_the_task_quotes_the_request_under_its_own_heading() -> None:
-    files = _task(
-        "# The query\n\n"
-        "## The words of the request this task serves\n\n"
-        "> the number of users created\n",
+        "- [ ] GET /users/created-per-day answers with seven daily counts\n",
     )
     review = review_task_traceability(files, request_text=REQUEST)
 
     assert review.findings == []
+    assert review.sends_it_back is False
+    assert review.stops_the_run is False
 
 
-def test_the_excused_line_is_a_declaration_not_a_quote() -> None:
-    """The exact string a task writes when it genuinely cannot quote the
-    request. It is not a citation; what excuses the task is its kind."""
-    assert excused_task_line("tests") == "_none — this is a tests task_"
-
-    excused = _task(
-        "# Add the tests\n\n"
-        "## The words of the request this task serves\n\n"
-        f"{excused_task_line('tests')}\n",
-        front="scaffolding_kind: tests\n",
-    )
-    assert review_task_traceability(excused, request_text=REQUEST).findings == []
-
-    # The same document with no kind to stand on is a task that said nothing.
-    unexcused = _task(
-        "# Add the tests\n\n"
-        "## The words of the request this task serves\n\n"
-        f"{excused_task_line('tests')}\n",
-    )
-    review = review_task_traceability(unexcused, request_text=REQUEST)
-    assert [f.flag for f in review.findings] == [CANNOT_CITE]
-
-
-def test_a_kind_outside_the_four_excuses_nothing() -> None:
-    files = _task(
-        "# Add the error handling\n\nDo the work.\n",
-        front="scaffolding_kind: error-handling\n",
-    )
+def test_a_task_that_quotes_nothing_is_clear() -> None:
+    files = _task("# Create analytics schema\n\nDefine the models.\n")
     review = review_task_traceability(files, request_text=REQUEST)
 
-    assert CANNOT_CITE in [f.flag for f in review.findings]
-    assert "error-handling" not in SCAFFOLDING_KINDS
+    assert review.findings == []
+    assert review.sends_it_back is False
 
 
-def test_the_lint_boilerplate_is_struck_before_the_question_is_asked() -> None:
-    """Forty-nine of the fifty-eight task documents carry this one sentence.
-    Left in, every task looks as though it quoted something."""
-    request = "List all modified files in the repository, newest first."
-    files = _task(f"# A task\n\n## Acceptance Criteria\n\n{LINT_LINE}\n")
-
+def test_a_paraphrase_in_its_own_words_sends_nothing_back_and_names_nothing() -> None:
+    """The plain prose a plan writer really writes, in place of a quote: no
+    finding, no note, and nothing in the receipt that a card could show."""
+    request = "Refuse to create a note with an empty or blank title."
+    files = _task(
+        "# Blank titles\n\n"
+        "## The words of the request this task serves\n\n"
+        "Refusing to create a note with an empty title.\n",
+    )
     review = review_task_traceability(files, request_text=request)
-    assert [f.flag for f in review.findings] == [CANNOT_CITE]
 
-    # Proof the strike is what did it: the same words outside the boilerplate
-    # sentence really are a citation.
-    real = _task("# A task\n\nThis lists all modified files for the person.\n")
-    assert review_task_traceability(real, request_text=request).findings == []
+    assert review.findings == []
+    assert review.sends_it_back is False
+    assert review.receipt()["flagged"] == []
+    assert "CANNOT_CITE" not in str(review.receipt())
 
 
-def test_words_borrowed_from_an_invented_address_are_not_the_requests_words() -> None:
-    """The plan that moved the endpoint to /stats/users-created-per-day shares
-    the words "users created per" with the request only because it renamed the
-    request's own address. That is not a quote, and the retrospective read it
-    the same way."""
+def test_a_paraphrasing_task_that_moves_the_address_is_still_sent_back() -> None:
+    """Removing the wording rule takes nothing away from the two real
+    additions: a task naming /notes/v2 when the request names /notes is still
+    a contradiction, whatever words it uses."""
+    request = "Add a GET /notes endpoint that lists every note."
     files = _task(
-        "## Description\n\nCreate the endpoint.\n\n"
+        "# List the notes\n\n"
+        "## The words of the request this task serves\n\n"
+        "Listing all the notes.\n\n"
         "## Acceptance Criteria\n\n"
-        "- [ ] GET /stats/users-created-per-day returns 200 OK\n"
+        "- [ ] GET /notes/v2 returns every note\n",
     )
-    review = review_task_traceability(files, request_text=REQUEST)
+    review = review_task_traceability(files, request_text=request)
 
-    assert sorted(f.flag for f in review.findings) == [CANNOT_CITE, CONTRADICTED_PATH]
+    assert [(f.flag, f.what) for f in review.findings] == [
+        (CONTRADICTED_PATH, "/notes/v2")
+    ]
+    assert review.sends_it_back is True
+    assert review.stops_the_run is True
+
+
+def test_a_paraphrasing_task_that_adds_rate_limiting_is_still_sent_back() -> None:
+    request = "Add a GET /notes endpoint that lists every note."
+    files = _task(
+        "# List the notes\n\n"
+        "## The words of the request this task serves\n\n"
+        "Listing all the notes.\n\n"
+        "## Acceptance Criteria\n\n"
+        "- [ ] GET /notes applies rate limiting to each caller\n",
+    )
+    review = review_task_traceability(files, request_text=request)
+
+    assert [(f.flag, f.what) for f in review.findings] == [
+        (UNASKED_CAPABILITY, "rate limiting")
+    ]
+    assert review.sends_it_back is True
+    assert review.stops_the_run is True
 
 
 # ---------------------------------------------------------------------------
@@ -412,21 +325,20 @@ def test_a_document_that_cannot_be_read_is_said_not_raised() -> None:
     }
     review = review_task_traceability(files, request_text=REQUEST)
 
-    # Two task documents read, the feature file left alone, nothing raised.
+    # Two task documents read, the feature file left alone, nothing raised,
+    # and neither says anything the request did not ask for.
     assert review.tasks_read == 2
-    assert [f.task_id for f in review.findings] == [
-        "TASK-AAAA-001",
-        "TASK-AAAA-002",
-    ]
+    assert review.unreadable == []
+    assert review.findings == []
 
 
 def test_no_request_means_nothing_to_judge_against() -> None:
     files = _task("# A task\n\nDo the work at /stats/anything.\n")
     review = review_task_traceability(files, request_text="")
 
-    # A blank request cannot make a route a contradiction of anything, and the
-    # citation question has no words to look for.
-    assert [f.flag for f in review.findings] == [CONTRADICTED_PATH, CANNOT_CITE]
+    # A blank request names no web address, so any address a task names is
+    # one the request did not name.
+    assert [f.flag for f in review.findings] == [CONTRADICTED_PATH]
 
 
 def test_the_note_carries_every_finding_word_for_word() -> None:
@@ -482,23 +394,25 @@ ARMS: dict[str, tuple[str, str]] = {
 }
 
 #: The retrospective, transcribed task by task. ``flags`` is what the table's
-#: own "Flag" column says, in this guard's three words; ``capabilities`` is the
+#: own "Flag" column says, in this guard's words; ``capabilities`` is the
 #: capability classes it names, in the words of the shipped list. A task the
 #: table left blank is absent from this mapping.
+#:
+#: The table's third flag, "cannot cite" (a task that did not quote the
+#: request word for word), is struck from every row: that question was removed
+#: on 16 October 2026, so a row whose only flag it was is now absent.
 #:
 #: "metrics" is recorded here exactly as the table wrote it, because the ONE
 #: expected difference is measured against the table as published.
 TABLE: dict[str, dict[str, object]] = {
     # A1 — the cleanest of the twelve on the public contract.
-    "TASK-B539-003": {"flags": {CANNOT_CITE}, "capabilities": set()},
     # A2 — the plan that moved the endpoint, and said so only in a criterion.
     "TASK-9230-001": {
-        "flags": {CONTRADICTED_PATH, CANNOT_CITE},
+        "flags": {CONTRADICTED_PATH},
         "capabilities": set(),
     },
     # A3 — clean on every arm of the rule, and nothing went wrong in it.
     # B1 — refused at the live gate for a login requirement nobody asked for.
-    "TASK-BD8F-001": {"flags": {CANNOT_CITE}, "capabilities": set()},
     "TASK-BD8F-003": {
         "flags": {UNASKED_CAPABILITY},
         "capabilities": {"authentication"},
@@ -509,31 +423,29 @@ TABLE: dict[str, dict[str, object]] = {
     },
     # B6 — the migration that later poisoned the next run's database.
     "TASK-3560-003": {
-        "flags": {UNASKED_CAPABILITY, CANNOT_CITE},
+        "flags": {UNASKED_CAPABILITY},
         "capabilities": {"a database migration"},
     },
     # B7 — "Add error handling", the task that produced an application-wide
     # rewrite although its own body said "for the daily counts endpoint".
     "TASK-54E1-004": {
-        "flags": {UNASKED_CAPABILITY, CANNOT_CITE},
+        "flags": {UNASKED_CAPABILITY},
         "capabilities": {"error handling"},
     },
-    # B8 — five task documents with no description at all; no capability word
-    # anywhere, so only the citation question catches this plan.
-    "TASK-D49B-001": {"flags": {CANNOT_CITE}, "capabilities": set()},
-    "TASK-D49B-002": {"flags": {CANNOT_CITE}, "capabilities": set()},
-    "TASK-D49B-004": {"flags": {CANNOT_CITE}, "capabilities": set()},
+    # B8 — five task documents with no description at all and no capability
+    # word anywhere. Only the citation question (removed 16 October 2026)
+    # caught this plan, so nothing flags it now.
     # C1 — the worst of the twelve: the path moved, a login requirement and a
     # migration were added beside it.
     "TASK-6F57-001": {"flags": {CONTRADICTED_PATH}, "capabilities": set()},
     "TASK-6F57-003": {
-        "flags": {UNASKED_CAPABILITY, CANNOT_CITE},
+        "flags": {UNASKED_CAPABILITY},
         "capabilities": {"a database migration"},
     },
     "TASK-6F57-004": {
         # The table names authorisation beside authentication; the shipped list
         # covers both words in its first entry, so it is one class here.
-        "flags": {UNASKED_CAPABILITY, CANNOT_CITE},
+        "flags": {UNASKED_CAPABILITY},
         "capabilities": {"authentication"},
     },
     "TASK-6F57-005": {
@@ -542,32 +454,28 @@ TABLE: dict[str, dict[str, object]] = {
     },
     # C2 — the five-module package that named no source file at all.
     "TASK-6F3D-001": {
-        "flags": {UNASKED_CAPABILITY, CANNOT_CITE},
+        "flags": {UNASKED_CAPABILITY},
         "capabilities": {"a database migration"},
     },
-    "TASK-6F3D-002": {"flags": {CANNOT_CITE}, "capabilities": set()},
     "TASK-6F3D-004": {
-        "flags": {UNASKED_CAPABILITY, CANNOT_CITE},
+        "flags": {UNASKED_CAPABILITY},
         "capabilities": {"a service layer or module"},
     },
     # C3 — the same shape as C2, with a task called "service layer".
-    "TASK-A0AE-001": {"flags": {CANNOT_CITE}, "capabilities": set()},
-    "TASK-A0AE-002": {"flags": {CANNOT_CITE}, "capabilities": set()},
     "TASK-A0AE-004": {
         "flags": {UNASKED_CAPABILITY},
         "capabilities": {"a service layer or module"},
     },
     # C4 — refused at the live gate because the plan moved the endpoint.
     "TASK-CCBF-001": {"flags": {CONTRADICTED_PATH}, "capabilities": set()},
-    "TASK-CCBF-003": {"flags": {CANNOT_CITE}, "capabilities": set()},
     # C5 — error handling again, and the whole plan framed as "metrics".
     "TASK-C9C4-001": {"flags": {UNASKED_CAPABILITY}, "capabilities": {"metrics"}},
     "TASK-C9C4-003": {
-        "flags": {UNASKED_CAPABILITY, CANNOT_CITE},
+        "flags": {UNASKED_CAPABILITY},
         "capabilities": {"metrics"},
     },
     "TASK-C9C4-004": {
-        "flags": {UNASKED_CAPABILITY, CANNOT_CITE},
+        "flags": {UNASKED_CAPABILITY},
         "capabilities": {
             "a service layer or module",
             "error handling",
@@ -580,11 +488,13 @@ TABLE: dict[str, dict[str, object]] = {
     },
 }
 
-#: The one row the design says in advance will differ, and why. "metrics" is
-#: off the shipped capability list, so the task whose ONLY flag was that word
-#: comes back clean. Nothing else changes: the other three "metrics" tasks stay
-#: flagged, for citing nothing, for a service module and for error handling.
-THE_ONE_EXPECTED_DIFFERENCE = "TASK-C9C4-001"
+#: The rows the design says in advance will differ, and why. "metrics" is off
+#: the shipped capability list, so a task whose ONLY remaining flag was that
+#: word comes back clean. Until 16 October 2026 that was one row; TASK-C9C4-003
+#: was also flagged for not quoting the request word for word, and that
+#: question is gone, so it joins it. The other two "metrics" tasks stay
+#: flagged, for a service module and for error handling.
+THE_EXPECTED_DIFFERENCES = ("TASK-C9C4-001", "TASK-C9C4-003")
 
 
 def _as_the_shipped_list_reads_it(row: dict[str, object]) -> dict[str, set[str]]:
@@ -623,8 +533,8 @@ def test_the_guard_agrees_with_the_twelve_plan_retrospective() -> None:
     """Run the guard over all twelve captured plans and compare, row by row,
     with the table a person wrote by hand from the same branches.
 
-    Exactly one row may differ, and the design names it before the test runs.
-    A second difference is a defect in the guard, not in the table.
+    Only the rows named in ``THE_EXPECTED_DIFFERENCES`` may differ. Any other
+    difference is a defect in the guard, not in the table.
     """
     differences: list[str] = []
     verdict_differences: list[str] = []
@@ -681,8 +591,8 @@ def test_the_guard_agrees_with_the_twelve_plan_retrospective() -> None:
                     f"{sorted(actual['flags'])} {sorted(actual['capabilities'])}"
                 )
             # The row-level verdict — flagged or clean — against the table AS
-            # PUBLISHED. This is the comparison section 2g reasons about, and
-            # exactly one row of the fifty-eight may come out differently.
+            # PUBLISHED (less its struck "cannot cite" flag). This is the
+            # comparison section 2g reasons about.
             if bool(published["flags"]) != bool(actual["flags"]):  # type: ignore[arg-type]
                 verdict_differences.append(f"{arm} {task_id}")
 
@@ -690,14 +600,15 @@ def test_the_guard_agrees_with_the_twelve_plan_retrospective() -> None:
     # hand-written retrospective agree on every one of the fifty-eight tasks.
     assert differences == [], "\n".join(differences)
 
-    # And striking "metrics" changed exactly ONE row's verdict, the row the
-    # design named before this test was written: the task whose only flag was
-    # that word comes back clean. A second row here is a defect in the guard.
-    assert verdict_differences == [f"C5 {THE_ONE_EXPECTED_DIFFERENCE}"]
+    # And striking "metrics" changed only the verdicts named before this test
+    # ran: the tasks whose only flag was that word come back clean. Any other
+    # row here is a defect in the guard.
+    assert verdict_differences == [f"C5 {task}" for task in THE_EXPECTED_DIFFERENCES]
 
-    # The plan counts the design rests on still hold: eleven of the twelve
-    # plans draw a flag, and nine of the twelve draw one that can stop a run.
-    assert flagged_plans == 11
+    # Nine of the twelve plans draw a flag, and every flag can stop a run.
+    # (Before 16 October 2026 eleven drew one: A1 and B8 were flagged only for
+    # not quoting the request word for word.)
+    assert flagged_plans == 9
     assert plans_that_can_stop_a_run == 9
 
 

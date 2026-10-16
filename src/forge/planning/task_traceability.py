@@ -11,21 +11,26 @@ this is the deterministic half of the cure: the plan is read against the
 request before anything is committed.
 
 THE RULE, in one sentence: **a plan is sent back to be rewritten, once, when
-any of its tasks names a web address the request did not name, asks for a
-capability the request never mentioned, or cannot point at the words of the
-request it serves without being one of the four scaffolding kinds.**
+any of its tasks names a web address the request did not name or asks for a
+capability the request never mentioned.**
 
-Three flags, and they are not treated alike:
+Two flags, both real additions to what the person asked for:
 
 * ``CONTRADICTED_PATH`` — the task names a web address the request does not
   name. This is what got one run refused at the live gate an hour later.
 * ``UNASKED_CAPABILITY`` — the task asks for something the request never
   mentioned: a login requirement, a database migration, a service module,
   error handling, logging. This is what got two more runs refused.
-* ``CANNOT_CITE`` — the task cannot quote the request at all and claims no
-  scaffolding kind. Nine of fifty-eight tasks drew this flag alone in the
-  measurement and three or four of them were innocent, so **it never stops a
-  run on its own**; it is said in ordinary words to the person instead.
+
+NO EXACT WORDING (16 October 2026). There was a third flag, ``CANNOT_CITE``:
+a task whose quote was not three consecutive words of the request. It is
+gone. Rich, in his words: "insists on exact wording from an LLM generated text
+is just never going to be reliable so I don't think insisting on exact wording
+makes sense". A task may say what it serves in the request's words or its
+own; nothing here compares a task's wording with the request's any more. The
+two flags above never depended on quotes: they read every web address and
+capability word in the whole task document. (Design of record: ai-transition
+``docs/designs/planning-remove-exact-quote-rule-2026-10-16.md``.)
 
 Every question is asked of the WHOLE task document — its front matter, its
 title, its body sentence and its acceptance criteria — because that is where
@@ -50,13 +55,10 @@ from forge.planning.assumption_review import _CAPABILITIES
 from forge.planning.repository_facts import _ROUTE_PATH
 
 __all__ = [
-    "CANNOT_CITE",
     "CONTRADICTED_PATH",
     "UNASKED_CAPABILITY",
-    "SCAFFOLDING_KINDS",
     "TaskFinding",
     "TraceabilityReview",
-    "excused_task_line",
     "review_task_traceability",
 ]
 
@@ -67,53 +69,9 @@ CONTRADICTED_PATH = "CONTRADICTED_PATH"
 #: The task asks for a capability the request never mentions — an addition.
 UNASKED_CAPABILITY = "UNASKED_CAPABILITY"
 
-#: The task cannot point at the words of the request it serves, and claims no
-#: scaffolding kind. Never stops a run on its own.
-CANNOT_CITE = "CANNOT_CITE"
-
-#: The four kinds of task that are excused from quoting the request, and
-#: nothing else ever is. They are excused from QUOTING only: a scaffolding task
-#: that names a web address the request did not name, or asks for a capability
-#: nobody asked for, is flagged exactly like any other task.
-#:
-#: ``tests`` and ``documentation`` are the fourteen test tasks and seven
-#: documentation tasks of the fifty-eight measured, not one of which could
-#: quote the sentence. ``response-shape`` is a task that only defines the shape
-#: of the answer for the endpoint the sentence names — the sentence says
-#: "returns the number of users created", it does not say "Pydantic".
-#: ``data-access`` is the database query behind the named endpoint and nothing
-#: else. There is deliberately no error-handling kind: the task that produced
-#: an application-wide rewrite said "for the daily counts endpoint" in its own
-#: body, so it was already scoped in words and an allowlist keyed on wording
-#: would have waved it straight through. Error handling is on the capability
-#: list below instead.
-SCAFFOLDING_KINDS: tuple[str, ...] = ("tests", "documentation", "response-shape", "data-access")
-
-#: What a task document written under the new shape says, under the quote
-#: heading, when it genuinely cannot quote the request. The heading is never
-#: omitted; this line, and nothing else, goes under it.
-_EXCUSED_TASK_LINE = "_none — this is a {kind} task_"
-
-
-def excused_task_line(kind: str) -> str:
-    """The one line an excused task writes under the quote heading."""
-    return _EXCUSED_TASK_LINE.format(kind=kind)
-
-
-#: Task documents written before ``scaffolding_kind`` existed — every plan on
-#: every planning branch today — say the same thing in the older
-#: ``task_type:`` key the plan writer has always written. A test task is a test
-#: task whichever key names it, so the two older values are read as the two
-#: matching kinds. A document carrying ``scaffolding_kind`` is read from that
-#: key alone.
-_TASK_TYPE_AS_KIND: dict[str, str] = {"testing": "tests", "documentation": "documentation"}
-
-#: The heading a task writes the words of the request under.
-_QUOTE_HEADING = "## The words of the request this task serves"
-
-#: Boilerplate, and it must go before anyone asks whether a task quoted the
-#: request — otherwise every task looks as though it said something. This
-#: sentence appears in forty-nine of the fifty-eight task documents measured.
+#: Boilerplate, taken out before a task is read: it says nothing about what
+#: the task builds. This sentence appears in forty-nine of the fifty-eight task
+#: documents measured.
 _LINT_BOILERPLATE = re.compile(
     r"^.*all modified files pass project-configured lint/format checks.*$",
     re.IGNORECASE | re.MULTILINE,
@@ -201,34 +159,6 @@ _DEVICE_FILES: tuple[str, ...] = (
     "/dev/tcp", "/dev/udp",
 )
 
-#: How many consecutive words of the request count as quoting it.
-_QUOTE_WINDOW = 3
-
-
-#: Small numbers written the way a person writes them. A card that opens
-#: "1 task(s)" is machine talk; one that opens "One task" is a sentence.
-_IN_WORDS: tuple[str, ...] = (
-    "Zero",
-    "One",
-    "Two",
-    "Three",
-    "Four",
-    "Five",
-    "Six",
-    "Seven",
-    "Eight",
-    "Nine",
-    "Ten",
-)
-
-
-def _in_words(how_many: int) -> str:
-    """``3`` as ``"Three"``. Anything past ten keeps its digits, because
-    "Seventeen" on a card reads worse than "17"."""
-    if 0 <= how_many < len(_IN_WORDS):
-        return _IN_WORDS[how_many]
-    return str(how_many)
-
 
 @dataclass(frozen=True)
 class TaskFinding:
@@ -260,10 +190,6 @@ class TraceabilityReview:
         ]
 
     @property
-    def cannot_cite(self) -> list[TaskFinding]:
-        return [finding for finding in self.findings if finding.flag == CANNOT_CITE]
-
-    @property
     def flagged_tasks(self) -> list[str]:
         """Every task with a finding against it, in the order first found."""
         seen: list[str] = []
@@ -274,16 +200,16 @@ class TraceabilityReview:
 
     @property
     def sends_it_back(self) -> bool:
-        """True when this plan should be rewritten once: any finding at all,
-        including a task that cannot quote the request — the writer is asked
-        to fix everything it can in the one round it gets."""
-        return bool(self.findings)
+        """True when this plan should be rewritten once: a task contradicts
+        the request (a web address it did not name, or a capability it never
+        mentioned). How a task words what it serves never sends a plan back
+        (16 October 2026)."""
+        return bool(self.contradictions)
 
     @property
     def stops_the_run(self) -> bool:
         """True when a plan that has ALREADY been rewritten once still
-        contradicts the request. A task that merely cannot quote the request
-        never stops a run."""
+        contradicts the request."""
         return bool(self.contradictions)
 
     def note(self) -> str:
@@ -296,42 +222,12 @@ class TraceabilityReview:
         for finding in self.findings:
             lines.append(f"- {finding.sentence}")
         lines.append(
-            "Rewrite the plan so that every task points at the words of the "
-            "request it serves, answers at the web address the request names "
-            "and no other, and adds no capability the request does not "
-            "mention. A plan may choose between readings of what was asked; "
-            "it may not add. Change nothing else."
+            "Rewrite the plan so that every task answers at the web address "
+            "the request names and no other, and adds no capability the "
+            "request does not mention. A plan may choose between readings of "
+            "what was asked; it may not add. Change nothing else."
         )
         return "\n".join(lines)
-
-    def cannot_cite_line(self) -> str | None:
-        """The one plain line a person reads when tasks quote nothing from the
-        request. ``None`` when every task could quote it.
-
-        Written the way a person writes it: "One task ... does" or "Three
-        tasks ... do", and the plain truth about what happened, which is that
-        the run carried on. The earlier wording said the plan "was not sent
-        back for that on its own", and that was machine talk and untrue as
-        well: any finding at all opens the one note round the plan writer
-        gets. What is true, and what a person needs to know, is that the run
-        was not STOPPED for it.
-        """
-        findings = self.cannot_cite
-        if not findings:
-            return None
-        names = ", ".join(finding.task_id for finding in findings)
-        how_many = _in_words(len(findings))
-        if len(findings) == 1:
-            said = (
-                f"{how_many} task in this plan does not quote any of the "
-                "words of the request it serves"
-            )
-        else:
-            said = (
-                f"{how_many} tasks in this plan do not quote any of the "
-                "words of the request they serve"
-            )
-        return f"{said}: {names}. The run was not stopped for that on its own."
 
     def stop_sentences(self) -> list[str]:
         """The findings that stopped the run, in ordinary words."""
@@ -385,109 +281,6 @@ def _task_id_of(front: Mapping[str, Any], path: str) -> str:
     return name[:-3] if name.lower().endswith(".md") else name
 
 
-def _scaffolding_kind_of(front: Mapping[str, Any]) -> str | None:
-    """The kind this task claims, or ``None``.
-
-    The new ``scaffolding_kind`` key when the document carries one; otherwise
-    the older ``task_type`` where it names a test or documentation task, which
-    is how every plan written before this rule existed says the same thing.
-    Anything outside the four kinds is not a kind — it is never invented, and
-    a task claiming one the list does not have is simply not excused.
-    """
-    declared = str(front.get("scaffolding_kind") or "").strip().lower()
-    if declared:
-        return declared if declared in SCAFFOLDING_KINDS else None
-    older = str(front.get("task_type") or "").strip().lower()
-    return _TASK_TYPE_AS_KIND.get(older)
-
-
-def _section(text: str, heading: str) -> str:
-    """The body of one ``##`` section, or the empty string when absent."""
-    lowered = text.lower()
-    at = lowered.find(heading.lower())
-    if at < 0:
-        return ""
-    rest = text[at + len(heading) :]
-    nxt = re.search(r"^#{1,6} ", rest, re.MULTILINE)
-    return rest[: nxt.start()] if nxt else rest
-
-
-def _the_words_quoted(text: str) -> str:
-    """The block quote the task wrote under the quote heading, its ``>`` lines
-    joined — or the empty string when it wrote no quote there at all.
-
-    The excused line — ``_none — this is a tests task_`` — is a declaration
-    that there is nothing to quote, not a quote, so it yields nothing here;
-    whether that task is excused is the scaffolding question, asked next.
-    """
-    body = _section(text, _QUOTE_HEADING).strip()
-    if not body:
-        return ""
-    for kind in SCAFFOLDING_KINDS:
-        if body == excused_task_line(kind):
-            return ""
-    if re.fullmatch(r"_none.*_", body, re.IGNORECASE | re.DOTALL):
-        return ""
-    quoted = [
-        line.strip().lstrip(">").strip()
-        for line in body.splitlines()
-        if line.strip().startswith(">")
-    ]
-    return "\n".join(part for part in quoted if part)
-
-
-def _quotes_the_request_in_its_own_section(
-    text: str, request_words: Sequence[str]
-) -> bool:
-    """True when the words the task quoted under the heading really are the
-    request's own words.
-
-    Rule 1 of the task document's shape says that section holds "words copied
-    from the request". As first built, this counted ANY block quote under the
-    heading, so a task that paraphrased the request in its own words passed
-    the check while quoting nothing — which is the one thing the section
-    exists to prevent. Found in the coordinator's own review of the build and
-    fixed here: the quoted words count only when at least three consecutive
-    words of them appear in the request, read with this module's own
-    normalisation, so punctuation and capitals never decide it.
-
-    A quote that is not the request's words is no quote at all: the task then
-    falls through to the scaffolding-kind and three-consecutive-words
-    questions exactly as if it had written no section.
-    """
-    quoted = _the_words_quoted(text)
-    if not quoted:
-        return False
-    return _quotes_three_consecutive_words(quoted, request_words)
-
-
-def _words(text: str) -> list[str]:
-    """The text as plain lower-case words, punctuation gone.
-
-    ``GET /users/created-per-day`` and ``get users created per day`` are the
-    same words here on purpose: a task that repeats the web address has
-    repeated the request's words, however it punctuated them.
-    """
-    return re.findall(r"[a-z0-9]+", str(text or "").lower())
-
-
-def _quotes_three_consecutive_words(document: str, request_words: Sequence[str]) -> bool:
-    """True when three consecutive words of the request appear in the task."""
-    if len(request_words) < _QUOTE_WINDOW:
-        return False
-    task_words = _words(document)
-    if len(task_words) < _QUOTE_WINDOW:
-        return False
-    windows = {
-        tuple(task_words[i : i + _QUOTE_WINDOW])
-        for i in range(len(task_words) - _QUOTE_WINDOW + 1)
-    }
-    for i in range(len(request_words) - _QUOTE_WINDOW + 1):
-        if tuple(request_words[i : i + _QUOTE_WINDOW]) in windows:
-            return True
-    return False
-
-
 def _route_shaped(text: str) -> list[str]:
     """Every route-shaped string in ``text``, by the route reader's own rule:
     a slash-led path longer than three characters with a letter in it.
@@ -503,23 +296,6 @@ def _route_shaped(text: str) -> list[str]:
         if len(match) > 3 and re.search(r"[A-Za-z]", match) and match not in found:
             found.append(match)
     return found
-
-
-def _without(document: str, routes: Sequence[str]) -> str:
-    """The task document with the web addresses it invented taken out.
-
-    Only the addresses this task was flagged for naming — a web address the
-    request does not name and the repository does not already have. Asked
-    whether the task quotes the request, a document keeping them would answer
-    yes on its own invention: the plan that moved the endpoint to
-    ``/stats/users-created-per-day`` shares the words "users created per" with
-    the request only because it renamed the request's own address, and those
-    are not the request's words. Nothing else is removed.
-    """
-    trimmed = str(document or "")
-    for route in routes:
-        trimmed = trimmed.replace(route, " ")
-    return trimmed
 
 
 def _is_a_place_on_disk(path: str, test_roots: Sequence[str]) -> bool:
@@ -572,7 +348,6 @@ def review_task_traceability(
     review = TraceabilityReview()
     request = str(request_text or "")
     facts = str(repository_facts or "")
-    request_words = _words(request)
     request_routes = {route.rstrip("/").lower() for route in _route_shaped(request)}
     fact_routes = {route.rstrip("/").lower() for route in _route_shaped(facts)}
     roots = tuple(test_roots) if test_roots else _DEFAULT_TEST_ROOTS
@@ -590,9 +365,7 @@ def review_task_traceability(
                 task_id=task_id,
                 path=str(path),
                 document=document,
-                front=front,
                 request=request,
-                request_words=request_words,
                 request_routes=request_routes,
                 fact_routes=fact_routes,
                 test_roots=roots,
@@ -608,23 +381,19 @@ def _review_one_task(
     task_id: str,
     path: str,
     document: str,
-    front: Mapping[str, Any],
     request: str,
-    request_words: Sequence[str],
     request_routes: set[str],
     fact_routes: set[str],
     test_roots: Sequence[str],
 ) -> None:
-    """The three questions, asked of one whole task document."""
+    """The two questions, asked of one whole task document."""
     # 1. Does it name a web address the request did not name?
-    contradicted: list[str] = []
     for route in _route_shaped(document):
         key = route.rstrip("/").lower()
         if key in request_routes or key in fact_routes:
             continue
         if _is_a_place_on_disk(route, test_roots):
             continue
-        contradicted.append(route)
         review.findings.append(
             TaskFinding(
                 task_id=task_id,
@@ -656,37 +425,3 @@ def _review_one_task(
                 ),
             )
         )
-
-    # 3. Can it point at the words of the request it serves?
-    if _quotes_the_request_in_its_own_section(document, request_words):
-        return
-    kind = _scaffolding_kind_of(front)
-    if kind is not None:
-        return
-    if _quotes_three_consecutive_words(
-        _without(document, contradicted), request_words
-    ):
-        return
-    # A task that wrote a quote which is not the request's words is told
-    # exactly that, because it is a different mistake from writing nothing and
-    # a different thing to put right.
-    wrote_a_quote = bool(_the_words_quoted(document))
-    kinds = ", ".join(SCAFFOLDING_KINDS)
-    sentence = (
-        f"{task_id} quotes words that are not in the request, and claims no "
-        f"scaffolding kind (one of: {kinds})"
-        if wrote_a_quote
-        else (
-            f"{task_id} quotes nothing from the request and claims no "
-            f"scaffolding kind (one of: {kinds})"
-        )
-    )
-    review.findings.append(
-        TaskFinding(
-            task_id=task_id,
-            path=path,
-            flag=CANNOT_CITE,
-            what="",
-            sentence=sentence,
-        )
-    )

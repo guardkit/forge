@@ -3401,10 +3401,11 @@ _EXAMPLE_NOTE = (
     "These worked examples look like things the request does not mention:\n"
     f'- "{_PADDED_TITLE}" (another request method)\n'
     "\n"
-    "Remove each one unless the request needs it. If you keep one, quote the words of "
-    "the request that need it in its # Why: line. Remove any assumption written only "
-    "for an example you remove. Do not add other examples of the same kind. Keep every "
-    "other worked example exactly as it is."
+    "Remove each one unless the request needs it. If you keep one, say in its # Why: "
+    "line which part of the request needs it, and the example asks for nothing more "
+    "than that part does. Remove any assumption written only for an example you "
+    "remove. Do not add other examples of the same kind. Keep every other worked "
+    "example exactly as it is."
 )
 _REMOVED_LINE = (
     f'Removed as not asked for: "{_PADDED_TITLE}". If one of them was needed, send a note.'
@@ -3529,9 +3530,10 @@ async def test_assumptions_and_examples_share_one_rewrite_not_two(
     assert note.endswith(
         "\n\nRemove these assumptions and every worked example that depends on them. "
         "Remove each worked example listed above unless the request needs it; if you "
-        "keep one, quote the words of the request that need it in its # Why: line. "
-        "Remove any assumption written only for an example you remove. Do not add "
-        "other assumptions or examples of the same kind. Change nothing else."
+        "keep one, say in its # Why: line which part of the request needs it, and "
+        "the example asks for nothing more than that part does. Remove any "
+        "assumption written only for an example you remove. Do not add other "
+        "assumptions or examples of the same kind. Change nothing else."
     )
     # One closing instruction, not two that contradict each other.
     assert note.count("Change nothing else.") == 1
@@ -4037,14 +4039,18 @@ async def test_a_pair_against_the_request_reaches_the_card_whole(
 
 
 # ---------------------------------------------------------------------------
-# Planning improvements, item 4 (6 October 2026): two more example checks,
-# for every project and with no project words — the # Why: line must quote
-# the request (or a note, or a project document) for real, and the spec
-# writer's checker says whether an example asks for more than its quote.
-# They share the same note, the one rewrite and the card lines. They run ONLY
-# when the draft carries the checker's example_support.json, which the spec
-# writer sends once its own switch is on; without it, everything above holds
-# word for word. None of these projects declares a spec_examples block.
+# Planning improvements, item 4 (6 October 2026): one more example check, for
+# every project and with no project words — the spec writer's checker says
+# whether an example asks for more than the request does. It shares the same
+# note, the one rewrite and the card lines. It runs ONLY when the draft
+# carries the checker's example_support.json, which the spec writer sends once
+# its own switch is on; without it, everything above holds word for word.
+# None of these projects declares a spec_examples block.
+#
+# No exact wording (16 October 2026): the # Why: line used to have to quote
+# the request word for word, and a check sent back any example whose quote was
+# not exact. That check is gone. A # Why: line names the part of the request
+# in any words; only the meaning is checked.
 # ---------------------------------------------------------------------------
 
 from forge.planning.project_documents import ProjectDocument  # noqa: E402
@@ -4093,18 +4099,6 @@ def _reply_with_example(title: str, why: str, *, support: dict | None = _CLEAN_S
     return _supported(_spec_reply(feature=feature, digest=digest), support)
 
 
-_QUOTE_NOTE = (
-    "These worked examples look like things the request does not mention:\n"
-    f'- "{_UNQUOTED_TITLE}" (it quotes no words of the request)\n'
-    "\n"
-    "Remove each one unless the request needs it. If you keep one, quote the words of "
-    "the request that need it in its # Why: line, copied exactly, in double quotes, "
-    "and the example asks for nothing more than those words do. Remove any assumption "
-    "written only for an example you remove. Do not add other examples of the same "
-    "kind. Keep every other worked example exactly as it is."
-)
-
-
 def _last_receipt(store: SqlitePlanningRunStore) -> dict:
     drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
     return drafted[-1]["example_review"]
@@ -4135,66 +4129,39 @@ async def test_without_the_checkers_file_an_unquoted_example_changes_nothing(
     }
 
 
+_FAITHFUL_TITLE = "The version answers with the build it was made from"
+
+
+@pytest.mark.parametrize(
+    "why",
+    ["the version endpoint gives back the build", "", '"add a GET /version endpoint"'],
+    ids=["paraphrase", "no-why-line", "exact-quote"],
+)
 @pytest.mark.asyncio
-async def test_with_no_project_words_an_unquoted_example_goes_back_and_the_card_says_removed(
-    store: SqlitePlanningRunStore,
+async def test_a_faithful_example_is_not_sent_back_however_its_why_line_is_worded(
+    store: SqlitePlanningRunStore, why: str
 ) -> None:
+    """16 October 2026: a # Why: line in the writer's own words is not held
+    against the request. With the checker finding every example faithful and
+    no project words, there is no rewrite, no card line and no warning."""
     _queue(store)
     h = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[
-            _reply_with_example(_UNQUOTED_TITLE, "the request asks for durable versions"),
-            _quoted_reply(),
-        ],
+        spec_replies=[_reply_with_example(_FAITHFUL_TITLE, why)],
     )
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    dispatches = h.ctx["dispatches"]
-    assert len(dispatches) == 2
-    assert dispatches[1]["validate_feedback"] == _QUOTE_NOTE
-    removed = f'Removed as not asked for: "{_UNQUOTED_TITLE}". If one of them was needed, send a note.'
+    assert len(h.ctx["dispatches"]) == 1
     card = _digest_cards(h)[0].payload["details"]["summary"]
-    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {removed}"
+    assert card["what_happened"] == _ROUND_ONE_TEXT
     receipt = _last_receipt(store)
     assert receipt["checked"] is True
-    assert receipt["project_words"]["kinds"] is None
-    assert receipt["quotes"]["checked"] is True and receipt["quotes"]["guard_fired"] is False
-    assert receipt["quotes"]["first"]["untraced"] == [_UNQUOTED_TITLE]
-    assert receipt["quotes"]["final"]["untraced"] == []
-    assert receipt["reading"] == {
-        "status": "checked",
-        "first": {"status": "checked", "goes_beyond": []},
-        "final": {"status": "checked", "goes_beyond": []},
-    }
-    assert receipt["first"]["flagged"] == [
-        {"title": _UNQUOTED_TITLE, "kinds": ["it quotes no words of the request"]}
-    ]
-    assert receipt["card_lines"] == [removed]
-
-
-@pytest.mark.asyncio
-async def test_with_no_project_words_an_unquoted_example_the_writer_keeps_is_named(
-    store: SqlitePlanningRunStore,
-) -> None:
-    _queue(store)
-    h = _make_driver(
-        store,
-        subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[
-            _reply_with_example(_UNQUOTED_TITLE, ""),
-            _reply_with_example(_UNQUOTED_TITLE, ""),
-        ],
-    )
-    await h.driver.drive(CID)
-
-    assert len(h.ctx["dispatches"]) == 2
-    card = _digest_cards(h)[0].payload["details"]["summary"]
-    assert card["what_happened"] == (
-        f'{_ROUND_ONE_TEXT} Not asked for, but kept: "{_UNQUOTED_TITLE}" (it quotes no '
-        "words of the request). If you approve, it will be built; to drop it, send a note."
-    )
+    assert "quotes" not in receipt
+    assert receipt["first"]["flagged"] == []
+    assert receipt["final"]["flagged"] == []
+    assert receipt["card_lines"] == []
 
 
 @pytest.mark.asyncio
@@ -4237,51 +4204,56 @@ _BEYOND = {
 }
 
 
+@pytest.mark.parametrize(
+    "why",
+    ['"add a GET /version endpoint"', "the version endpoint gives back the build"],
+    ids=["exact-quote", "paraphrase"],
+)
 @pytest.mark.asyncio
 async def test_an_example_the_checker_reads_as_asking_for_more_is_sent_back_and_shown_kept(
-    store: SqlitePlanningRunStore,
+    store: SqlitePlanningRunStore, why: str
 ) -> None:
-    """The quote is real, so only the checker's reading can catch it: judged
-    to ask for more than its quote in the first and the final draft, it is
-    named as kept."""
+    """Whether its # Why: line quotes the request exactly or paraphrases it,
+    an example the checker judges to ask for more than the request (a restart
+    nobody asked about), in the first and the final draft, is sent back once
+    and named as kept."""
     _queue(store)
-    real_quote = '"add a GET /version endpoint"'
     h = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([_answer("approve")]),
         spec_replies=[
-            _reply_with_example(_UNQUOTED_TITLE, real_quote, support=_BEYOND),
-            _reply_with_example(_UNQUOTED_TITLE, real_quote, support=_BEYOND),
+            _reply_with_example(_UNQUOTED_TITLE, why, support=_BEYOND),
+            _reply_with_example(_UNQUOTED_TITLE, why, support=_BEYOND),
         ],
     )
     await h.driver.drive(CID)
 
     dispatches = h.ctx["dispatches"]
     assert len(dispatches) == 2
-    assert (
-        f'- "{_UNQUOTED_TITLE}" (it asks for more than the words it quotes)'
-        in dispatches[1]["validate_feedback"]
-    )
+    note = dispatches[1]["validate_feedback"]
+    assert f'- "{_UNQUOTED_TITLE}" (it asks for more than the request does)' in note
+    assert "copied exactly" not in note
     card = _digest_cards(h)[0].payload["details"]["summary"]
     assert card["what_happened"] == (
         f'{_ROUND_ONE_TEXT} Not asked for, but kept: "{_UNQUOTED_TITLE}" (it asks for '
-        "more than the words it quotes). If you approve, it will be built; to drop it, "
+        "more than the request does). If you approve, it will be built; to drop it, "
         "send a note."
     )
     receipt = _last_receipt(store)
     assert receipt["checked"] is True
-    assert receipt["quotes"]["final"]["untraced"] == []
     assert receipt["reading"]["status"] == "checked"
     assert receipt["reading"]["final"]["goes_beyond"] == _BEYOND["goes_beyond"]
-    assert set(receipt) >= {"checked", "project_words", "quotes", "reading", "first", "final", "card_lines"}
+    assert set(receipt) >= {"checked", "project_words", "reading", "first", "final", "card_lines"}
+    assert "quotes" not in receipt
 
 
 @pytest.mark.asyncio
-async def test_a_draft_that_mostly_quotes_nothing_is_not_sent_back_and_the_card_says_so(
+async def test_a_draft_whose_examples_quote_nothing_is_not_sent_back_and_nothing_is_said(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """The checker ran but the examples carry no quotes: the whole spec is
-    not sent back, and the card says the quotes were not checked."""
+    """The checker ran and found every example faithful, and the examples
+    carry no quotes at all: nothing is sent back, and the card says nothing
+    about quotes (until 16 October 2026 it said they were not checked)."""
     _queue(store)
     h = _make_driver(
         store,
@@ -4292,11 +4264,8 @@ async def test_a_draft_that_mostly_quotes_nothing_is_not_sent_back_and_the_card_
 
     assert len(h.ctx["dispatches"]) == 1
     card = _digest_cards(h)[0].payload["details"]["summary"]
-    assert card["what_happened"] == (
-        f"{_ROUND_ONE_TEXT} Most worked examples do not quote the request in their "
-        "# Why: line, so their quotes were not checked."
-    )
-    assert _last_receipt(store)["quotes"]["guard_fired"] is True
+    assert card["what_happened"] == _ROUND_ONE_TEXT
+    assert "quotes" not in _last_receipt(store)
 
 
 @pytest.mark.asyncio

@@ -4919,15 +4919,11 @@ async def test_stamp_normalizer_not_enforced_partial_proceeds_with_receipt_and_o
     lines = [(m, lvl) for _, m, lvl in h.ctx["notifications"] if "the plan proceeds" in m]
     assert lines == [(_UNENFORCED_LINE, "info")]
     assert (_UNENFORCED_LINE, False) in h.ctx["mentions"]
-    # every OTHER line kept its mention. The plan review's own plain line
-    # (2026-09-15) is the second line that is deliberately un-@mentioned: this
-    # fixture's one task document quotes nothing from the request, which is
-    # said once and never stops a run.
-    assert all(
-        mention
-        for m, mention in h.ctx["mentions"]
-        if m != _UNENFORCED_LINE and "quote any of the words" not in m
-    )
+    # every OTHER line kept its mention. (Until 16 October 2026 a plan review
+    # line about tasks that quote nothing from the request was excused here
+    # too; the exact-quote rule is gone and that line no longer exists.)
+    assert all(mention for m, mention in h.ctx["mentions"] if m != _UNENFORCED_LINE)
+    assert not any("quote any of the words" in m for m, _ in h.ctx["mentions"])
     # no error card
     assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
     # the plan-complete line's clause says what happened, in plain words
