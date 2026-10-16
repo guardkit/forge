@@ -1881,6 +1881,16 @@ class ReviewPreviewConfig(BaseModel):
             "public_url, when it has one, still wins."
         ),
     )
+    max_app_ttl_minutes: int | None = Field(
+        default=None,
+        ge=1,
+        description=(
+            "Optional cap, in minutes, on how long a preview (and its card's "
+            "Approve) lasts, below the project's profile's whole hours "
+            "(app_ttl_hours). None (default) = the profile's hours. Meant for a "
+            "short-lived proof window, for example 15 (16 October 2026)."
+        ),
+    )
 
     @field_validator("public_host")
     @classmethod

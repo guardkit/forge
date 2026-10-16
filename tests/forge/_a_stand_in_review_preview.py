@@ -97,6 +97,7 @@ class StandInReviewPreview:
         self.asked_about: list[str] = []
         self.requests: list[Any] = []
         self.released: list[dict[str, str]] = []
+        self.released_runs: list[dict[str, str]] = []
         self.refusal_questions: list[tuple[Any, datetime]] = []
         self.sweeps: list[datetime] = []
         self.reconciles = 0
@@ -120,6 +121,12 @@ class StandInReviewPreview:
         self.released.append(
             {"feature_id": feature_id, "build_id": build_id, "reason": reason}
         )
+        if self.release_raises is not None:
+            raise self.release_raises
+
+    async def release_run(self, *, run_id: str, reason: str) -> None:
+        """Release only the preview one offer names (16 October 2026)."""
+        self.released_runs.append({"run_id": run_id, "reason": reason})
         if self.release_raises is not None:
             raise self.release_raises
 

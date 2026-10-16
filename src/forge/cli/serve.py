@@ -126,6 +126,13 @@ feature_routing_required: bool = False
 # leaves both steps out and every merge card exactly as it was.
 review_preview_service: Any | None = None
 
+# The merge-card keeper (16 October 2026): the merge offer service, set beside
+# ``review_preview_service`` when previews are composed. At start-up, after
+# the preview reconcile, and on every preview sweep it ends unfinished
+# rebuilds, retries rebuilds waiting for a slot and describes every live
+# previewed card so the posted Slack message stays true.
+merge_card_keeper: Any | None = None
+
 #: How often the serve loop sweeps previews whose time is up, in seconds.
 REVIEW_PREVIEW_SWEEP_SECONDS: int = 300
 
@@ -539,6 +546,7 @@ def compose_merge_executor_deps(
     nats_client: Any,
     db_path: Any,
     review_preview: Any = None,
+    merge_card_keeper: Any = None,
 ) -> Any:
     """The merge press's deps, as the coordinator's merge-word listener has them.
 
@@ -570,6 +578,10 @@ def compose_merge_executor_deps(
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
         review_preview=review_preview,
+        # The previewed card is described at once after a decision, and a
+        # Rebuild press reaches the offer service (16 October 2026).
+        describe_card=getattr(merge_card_keeper, "describe_card", None),
+        rebuild_preview=getattr(merge_card_keeper, "rebuild_preview", None),
     )
 
 
@@ -750,7 +762,8 @@ def bind_production_dispatch_chain(
         # sweep. A composition failure never stops boot, and with previews
         # switched on it never lets an unpreviewed card out either: every card
         # then carries a failed preview record with the reason, and no Approve.
-        global review_preview_service
+        global review_preview_service, merge_card_keeper
+        merge_card_keeper = None
         review_preview: Any = None
         _merge_cfg = getattr(forge_config, "merge_executor", None)
         _preview_cfg = getattr(forge_config, "review_preview", None)
@@ -805,6 +818,8 @@ def bind_production_dispatch_chain(
                     **_offer_kwargs,
                 )
                 merge_offer_hook = merge_offer_service.maybe_offer
+                if review_preview is not None:
+                    merge_card_keeper = merge_offer_service
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
             merge_offer_hook = None
             merge_offer_service = None
@@ -1162,6 +1177,7 @@ def bind_production_dispatch_chain(
                         nats_client=client,
                         db_path=db_path,
                         review_preview=review_preview,
+                        merge_card_keeper=merge_card_keeper,
                     )
                 )
                 await _merge_consumer.attach(EnvelopeSubscribeClient(client))
@@ -2903,12 +2919,15 @@ async def _run_ack_watchdog(
             )
 
 
-async def _run_review_preview_sweep(service: Any, interval_seconds: int) -> None:
+async def _run_review_preview_sweep(
+    service: Any, interval_seconds: int, keeper: Any = None
+) -> None:
     """Sweep previews whose time is up, every ``interval_seconds`` (W7).
 
     Beside the daemon, like the ack-slot watchdog, and cancelled with it. Each
     sweep is exception-guarded so a fault never stops the next one;
-    cancellation propagates cleanly for shutdown.
+    cancellation propagates cleanly for shutdown. With a merge-card ``keeper``
+    (16 October 2026) every sweep then keeps the posted cards true.
     """
     from datetime import datetime, timezone
 
@@ -2916,6 +2935,8 @@ async def _run_review_preview_sweep(service: Any, interval_seconds: int) -> None
         try:
             await asyncio.sleep(interval_seconds)
             await service.sweep(now=datetime.now(timezone.utc))
+            if keeper is not None:
+                await keeper.sweep_cards(now=datetime.now(timezone.utc))
         except asyncio.CancelledError:
             raise
         except Exception as exc:  # noqa: BLE001 — a sweep fault must not stop the next
@@ -3030,6 +3051,18 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
                     type(exc).__name__,
                     exc,
                 )
+            # Unfinished rebuilds end and every live card is described
+            # (16 October 2026). Guarded the same way.
+            if merge_card_keeper is not None:
+                try:
+                    await merge_card_keeper.on_boot()
+                except Exception as exc:  # noqa: BLE001 — never blocks boot
+                    logger.error(
+                        "forge-serve: describing the merge cards at start-up "
+                        "failed (%s: %s)",
+                        type(exc).__name__,
+                        exc,
+                    )
 
         # Step 4 — chain composition complete. The daemon may still
         # be bootstrapping its pull subscription, but the lifecycle
@@ -3069,7 +3102,9 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
             tasks.add(
                 asyncio.create_task(
                     _run_review_preview_sweep(
-                        review_preview_service, REVIEW_PREVIEW_SWEEP_SECONDS
+                        review_preview_service,
+                        REVIEW_PREVIEW_SWEEP_SECONDS,
+                        merge_card_keeper,
                     ),
                     name="forge-serve-review-preview-sweep",
                 )

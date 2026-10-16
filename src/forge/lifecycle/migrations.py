@@ -218,6 +218,11 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # table: which review preview holds which slot, with which link token,
     # until when. Purely additive: one new table and its indexes.
     (19, "schema_v19.sql"),
+    # v20 (previews kept true on the card, 16 October 2026) -- the new
+    # ``merge_card_revisions`` table: one counter per merge card, raised in the
+    # same transaction as every change that can alter the card, so Jarvis can
+    # tell a newer description from an older one. Purely additive.
+    (20, "schema_v20.sql"),
 )
 
 

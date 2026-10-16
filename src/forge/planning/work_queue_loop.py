@@ -697,9 +697,27 @@ def work_landing(
         if (
             finished is not None
             and (moment - finished).total_seconds() >= MERGE_CARD_GRACE_SECONDS
+            # A preview still being prepared means the card is on its way
+            # (16 October 2026): preparing can take longer than the grace.
+            and not _preview_being_prepared(connection, build_id)
         ):
             return NO_MERGE_CARD
     return NOT_LANDED_YET
+
+
+def _preview_being_prepared(connection: sqlite3.Connection, build_id: str) -> bool:
+    """True while a review preview for this build is being prepared."""
+    try:
+        row = connection.execute(
+            "SELECT 1 FROM preview_leases WHERE build_id = ? AND state = 'preparing' "
+            "LIMIT 1",
+            (build_id,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return False
+        raise
+    return row is not None
 
 
 def _build_was_refused(connection: sqlite3.Connection, correlation_id: str) -> bool:

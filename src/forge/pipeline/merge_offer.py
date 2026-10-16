@@ -1739,8 +1739,20 @@ class MergeOfferService:
         # GuardKit's merge rules; ``None`` imports GuardKit's own at offer time.
         self._merge_check_rules = merge_check_rules
         # Builds whose offer is between its durable-record check and its
-        # durable record (see :meth:`offer`).
+        # durable record (see :meth:`offer`), and builds whose preview is
+        # being rebuilt (see :meth:`rebuild_preview`): one guard for both, so
+        # an offer and a rebuild, or two rebuilds, never run for one build at
+        # once.
         self._preparing: set[str] = set()
+        # Descriptions sent at once on a lease change, and rebuilds the sweep
+        # started; held so they are not collected mid-flight.
+        self._card_tasks: set[asyncio.Task[Any]] = set()
+        # KEEPING THE POSTED CARD TRUE (16 October 2026): told of every
+        # committed change to a preview lease, so the card is described at
+        # once. The five-minute sweep describes every card anyway.
+        listen = getattr(review_preview, "set_card_listener", None)
+        if callable(listen):
+            listen(self._card_changed)
 
     async def maybe_offer(self, event: Any) -> None:
         """The wireup's fire-and-forget hook — never raises past itself."""
@@ -2013,6 +2025,7 @@ class MergeOfferService:
         candidate_tree: str,
         expect_main_sha: str,
         target_branch: str,
+        make_room: bool = False,
     ) -> tuple[Any, str | None] | None:
         """``(evidence or None, the commit it was joined onto)`` — or ``None``
         when the service raised and no card may be offered.
@@ -2055,6 +2068,7 @@ class MergeOfferService:
                     target_branch=target_branch,
                     preview_base_sha=base,
                     preview_base_refusal=None if where.ok else where.refusal,
+                    make_room=make_room,
                 )
             )
             return evidence, base
@@ -2270,19 +2284,7 @@ class MergeOfferService:
         # (b) Pin the RECORDED target branch and the exact offered candidate.
         merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
         branch = branch_to_merge(feature_id, merge_branch)
-        from forge.deploy.candidate_tree import InContainerCandidateGit
-
-        # With no venue composed, this container's git, given the project's
-        # recorded fetch address (Forge git hardening, 14 October 2026), as
-        # the press's own git_surface_for does.
-        addresses = getattr(self._config.planning, "fetch_addresses", None) or {}
-        git = (
-            self._git_surface(row.repo, repo_root)
-            if self._git_surface is not None
-            else None
-        ) or InContainerCandidateGit(
-            repo_root, fetch_address=addresses.get(row.repo), repo=row.repo
-        )
+        git = self._git_for(row, repo_root)
         # WHICH BRANCH OF THE REMOTE THIS WORK IS AIMED AT, off the build's own
         # row — the name written down when the work started, never one chosen
         # here (23 September 2026, carried from stage 4a's list). This used to
@@ -2436,6 +2438,22 @@ class MergeOfferService:
                     # Also on the record itself (nats-core's optional field);
                     # here beside preview_tree for the press and the receipts.
                     details["preview_base_sha"] = preview_base_sha
+                    # THE CARD'S OWN SENTENCES (16 October 2026), so the card
+                    # can be described again — kept true, rebuilt, replaced —
+                    # long after this offer. Only a previewed offer stores
+                    # them; every other offer's row is byte for byte today's.
+                    from forge.pipeline.merge_card import CARD_WORDS_KEY
+
+                    details[CARD_WORDS_KEY] = card_words(branch, merge_branch)
+                    if changed_files is not None:
+                        details["changed_files"] = [
+                            {
+                                "status": str(getattr(c, "status", "") or ""),
+                                "path": str(getattr(c, "path", "") or ""),
+                                "old_path": str(getattr(c, "old_path", "") or ""),
+                            }
+                            for c in changed_files
+                        ]
             merge_check_reading = await self._read_the_merge_check(
                 row=row,
                 repo_root=repo_root,
@@ -2449,27 +2467,35 @@ class MergeOfferService:
             if merge_check_reading is not None:
                 details["merge_check_reading"] = merge_check_reading
             now = self._clock()
-            self._pool.record_stage(
-                StageLogEntry(
-                    build_id=build_id,
-                    stage_label=MERGE_OFFER_STAGE_LABEL,
-                    target_kind="local_tool",
-                    target_identifier=MERGE_OFFER_TARGET_IDENTIFIER,
-                    status="GATED",
-                    gate_mode="MANDATORY_HUMAN_APPROVAL",
-                    started_at=now,
-                    completed_at=now,
-                    duration_secs=0.0,
-                    details={
-                        MERGE_OFFER_DETAILS_KEY: {
-                            "request_id": request_id,
-                            "correlation_id": row.correlation_id,
-                            "approval_subject": subject,
-                            **details,
-                        }
-                    },
+            record = {
+                "request_id": request_id,
+                "correlation_id": row.correlation_id,
+                "approval_subject": subject,
+                **details,
+            }
+            if review_evidence is not None and self._ledger() is not None:
+                # A previewed card's offer row raises the card's revision
+                # counter in the same transaction (16 October 2026).
+                from forge.pipeline.merge_card import append_offer_row
+
+                append_offer_row(
+                    self._pool.connection, build_id=build_id, record=record, now=now
                 )
-            )
+            else:
+                self._pool.record_stage(
+                    StageLogEntry(
+                        build_id=build_id,
+                        stage_label=MERGE_OFFER_STAGE_LABEL,
+                        target_kind="local_tool",
+                        target_identifier=MERGE_OFFER_TARGET_IDENTIFIER,
+                        status="GATED",
+                        gate_mode="MANDATORY_HUMAN_APPROVAL",
+                        started_at=now,
+                        completed_at=now,
+                        duration_secs=0.0,
+                        details={MERGE_OFFER_DETAILS_KEY: record},
+                    )
+                )
         finally:
             self._preparing.discard(build_id)
 
@@ -2509,7 +2535,13 @@ class MergeOfferService:
             await self._raw_publish(
                 subject, envelope.model_dump_json().encode("utf-8")
             )
-            paused = BuildPausedPayload(
+            # A previewed card goes out as its own description (16 October
+            # 2026): the same words, evidence and synthetic build id, plus the
+            # ``merge_card`` block Jarvis keeps the posted card true by.
+            described_card = (
+                self._description_of(build_id) if review_evidence is not None else None
+            )
+            paused = described_card or BuildPausedPayload(
                 feature_id=feature_id,
                 # Deliberately NOT the real build_id: merge-{feature_id} is
                 # the join key jarvis uses, and the synthetic id keeps
@@ -2547,3 +2579,357 @@ class MergeOfferService:
                     reason="the merge card could not be published",
                 )
         return True
+
+    def _git_for(self, row: Any, repo_root: Path) -> Any:
+        """Where this repository's git happens, as the press's own
+        ``git_surface_for`` answers it."""
+        from forge.deploy.candidate_tree import InContainerCandidateGit
+
+        # With no venue composed, this container's git, given the project's
+        # recorded fetch address (Forge git hardening, 14 October 2026), as
+        # the press's own git_surface_for does.
+        addresses = getattr(self._config.planning, "fetch_addresses", None) or {}
+        return (
+            self._git_surface(row.repo, repo_root)
+            if self._git_surface is not None
+            else None
+        ) or InContainerCandidateGit(
+            repo_root, fetch_address=addresses.get(row.repo), repo=row.repo
+        )
+
+    # ------------------------------------------------------------------
+    # Keeping the posted card true (previews design, 16 October 2026)
+    # ------------------------------------------------------------------
+
+    def _ledger(self) -> Any | None:
+        """The ledger's writer connection, or None for a pool without one."""
+        import sqlite3
+
+        cx = getattr(self._pool, "connection", None)
+        return cx if isinstance(cx, sqlite3.Connection) else None
+
+    def _facts_of(self, build_id: str) -> Any | None:
+        from forge.pipeline.merge_card import read_card_facts
+
+        cx = self._ledger()
+        if cx is None:
+            return None
+        return read_card_facts(
+            cx,
+            build_id,
+            leases=self._review_preview,
+            preparing=build_id in self._preparing,
+        )
+
+    def _description_of(self, build_id: str) -> Any | None:
+        """The ``build-paused`` message describing this card now, or None."""
+        from forge.pipeline.merge_card import build_paused_for
+
+        try:
+            facts = self._facts_of(build_id)
+            return build_paused_for(facts) if facts is not None else None
+        except Exception as exc:  # noqa: BLE001 — a description never stops a card
+            logger.warning(
+                "merge-card: %s could not be described (%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+
+    async def describe_card(self, build_id: str) -> bool:
+        """Send this card's description once; True when one went out.
+
+        Only a card from this release with a preview is described. Never
+        raises: a description that fails is sent again by the next sweep.
+        """
+        paused = self._description_of(build_id)
+        if paused is None:
+            return False
+        try:
+            await self._publisher.publish_build_paused(paused)
+        except Exception as exc:  # noqa: BLE001 — the sweep sends it again
+            logger.warning(
+                "merge-card: the description of %s could not be sent (%s: %s); "
+                "the next sweep sends it again",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
+        return True
+
+    def _spawn(self, coro: Any) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            coro.close()
+            return
+        task = loop.create_task(coro)
+        self._card_tasks.add(task)
+        task.add_done_callback(self._card_tasks.discard)
+
+    def _card_changed(self, build_id: str) -> None:
+        """A lease of this build changed: describe its card at once."""
+        self._spawn(self.describe_card(build_id))
+
+    async def rebuild_preview(self, *, build_id: str) -> str:
+        """Rebuild the preview for the same candidate (a Rebuild press).
+
+        Returns a word for the log: ``rebuilt``, ``waiting``, ``decided``,
+        ``capped``, ``still-running``, ``already-running`` and so on. Never
+        raises. Whatever happens, the card is described afterwards, so a card
+        Jarvis shows as "Rebuilding…" always goes back to the truth.
+        """
+        if self._review_preview is None:
+            return "no-preview-service"
+        # One offer or rebuild per build at a time (the "being prepared" set).
+        if build_id in self._preparing:
+            await self.describe_card(build_id)
+            return "already-running"
+        self._preparing.add(build_id)
+        outcome = "raised"
+        try:
+            outcome = await self._rebuild(build_id)
+        except Exception as exc:  # noqa: BLE001 — a press never kills the listener
+            logger.error(
+                "merge-card: rebuilding %s's preview raised (%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+        finally:
+            self._preparing.discard(build_id)
+        logger.info("merge-card: Rebuild preview for %s: %s", build_id, outcome)
+        await self.describe_card(build_id)
+        return outcome
+
+    async def _rebuild(self, build_id: str) -> str:
+        from forge.deploy.review_preview import is_slots_busy
+        from forge.pipeline.merge_card import (
+            REBUILD_CAP,
+            REBUILD_WANTED_KEY,
+            REBUILDS_KEY,
+            append_amended_offer,
+        )
+
+        service = self._review_preview
+        cx = self._ledger()
+        facts = self._facts_of(build_id)
+        if cx is None or facts is None:
+            return "no-card"
+        # (1) When it refuses.
+        if facts.decision is not None:
+            return "decided"
+        offer = facts.offer
+        if int(offer.get(REBUILDS_KEY) or 0) >= REBUILD_CAP:
+            return "capped"
+        named = facts.named_lease
+        if named is not None and getattr(named, "state", None) == "ready":
+            # Still running and named by the committed offer: nothing to do;
+            # the next description shows the card as ready.
+            return "still-running"
+        row = self._pool.get_build_row(build_id)
+        if row is None:
+            return "no-build-row"
+        repo_root_raw = self._config.planning.target_repo_paths.get(row.repo)
+        if not repo_root_raw:
+            return "no-repo-path"
+        repo_root = Path(repo_root_raw)
+        # The card now reads "Rebuilding the preview for the same build".
+        await self.describe_card(build_id)
+        has_room = getattr(service, "has_room", None)
+        if callable(has_room) and not await has_room(
+            row.repo, build_id=build_id, make_room=True
+        ):
+            self._want_a_slot(build_id, again=False)
+            return "waiting"
+        # (2) The candidate FROM THE OFFER ROW, never from the branch now.
+        git = self._git_for(row, repo_root)
+        candidate_sha = str(offer.get("candidate_sha") or "")
+        recorded_target = str(getattr(row, "target_branch", None) or "").strip()
+        # (3) Preparation, exactly as the first time.
+        prepared = await self._prepare_the_preview(
+            row=row,
+            git=git,
+            build_id=build_id,
+            feature_id=str(offer.get("feature_id") or facts.feature_id),
+            branch=str(offer.get("branch") or ""),
+            candidate_sha=candidate_sha,
+            candidate_tree=str(offer.get("candidate_tree") or ""),
+            expect_main_sha=str(offer.get("expect_main_sha") or ""),
+            target_branch=recorded_target or MERGE_BASE_REF,
+            make_room=True,
+        )
+        if prepared is None:
+            return "preparation-raised"
+        evidence, base = prepared
+        if evidence is None:
+            return "preview-switched-off"
+        if getattr(evidence, "state", None) == "failed" and is_slots_busy(
+            getattr(evidence, "failure_reason", None)
+        ):
+            # Someone took the slot first: wait, and the sweep tries again.
+            self._want_a_slot(build_id, again=True)
+            return "waiting"
+        # (4) The merge check, read against the new base: the last step that
+        # waits on anything.
+        reading = await self._read_the_merge_check(
+            row=row,
+            repo_root=repo_root,
+            git=git,
+            build_id=build_id,
+            candidate_sha=candidate_sha,
+            review_evidence=evidence,
+            preview_base_sha=base,
+            changed_files=_changes_of(offer),
+        )
+
+        # (5) Finishing, with nothing that waits in between.
+        def amend(latest: dict[str, Any]) -> dict[str, Any]:
+            latest["review_evidence"] = evidence.model_dump(mode="json")
+            latest["preview_tree"] = evidence.preview_tree
+            latest["preview_base_sha"] = base
+            if reading is not None:
+                latest["merge_check_reading"] = reading
+            else:
+                latest.pop("merge_check_reading", None)
+            latest[REBUILDS_KEY] = int(latest.get(REBUILDS_KEY) or 0) + 1
+            latest.pop(REBUILD_WANTED_KEY, None)
+            return latest
+
+        if append_amended_offer(cx, build_id=build_id, now=self._clock(), amend=amend):
+            return "rebuilt"
+        # A decision came first (Reject during the merge-check read): nothing
+        # was written, and the new preview goes.
+        release_run = getattr(service, "release_run", None)
+        if callable(release_run):
+            await release_run(
+                run_id=str(getattr(evidence, "run_id", "") or ""),
+                reason="the card was decided while its preview was being rebuilt",
+            )
+        return "decided"
+
+    def _want_a_slot(self, build_id: str, *, again: bool) -> None:
+        """Write on the offer that a rebuild waits for a slot (an amended row
+        with ``rebuild_wanted_at``); the sweep tries again. Waiting does not
+        count as a rebuild."""
+        from forge.pipeline.merge_card import REBUILD_WANTED_KEY, append_amended_offer
+
+        cx = self._ledger()
+        facts = self._facts_of(build_id)
+        if cx is None or facts is None:
+            return
+        if facts.offer.get(REBUILD_WANTED_KEY) and not again:
+            return
+        stamp = self._clock().isoformat()
+
+        def amend(latest: dict[str, Any]) -> dict[str, Any]:
+            latest[REBUILD_WANTED_KEY] = stamp
+            return latest
+
+        append_amended_offer(cx, build_id=build_id, now=self._clock(), amend=amend)
+
+    async def sweep_cards(self, *, now: datetime | None = None) -> None:
+        """The card side of the five-minute preview sweep. Never raises.
+
+        1. A ready preview no committed offer names, with no preparation
+           running here, is an unfinished rebuild (or first offer): it is
+           ended, and its card shows "stopped" with Rebuild.
+        2. A card waiting for a slot is rebuilt when one could be had.
+        3. Every card unanswered, or decided in the last day, is described.
+        """
+        from forge.pipeline.merge_card import cards_to_describe
+
+        cx = self._ledger()
+        if cx is None or self._review_preview is None:
+            return
+        moment = now or self._clock()
+        try:
+            await self.end_unfinished_previews()
+        except Exception:  # noqa: BLE001 — a sweep never raises
+            logger.exception("merge-card: ending unfinished previews raised")
+        try:
+            await self._retry_waiting_rebuilds(moment)
+        except Exception:  # noqa: BLE001
+            logger.exception("merge-card: retrying waiting rebuilds raised")
+        try:
+            for build_id in cards_to_describe(cx, moment):
+                await self.describe_card(build_id)
+        except Exception:  # noqa: BLE001
+            logger.exception("merge-card: describing the cards raised")
+
+    async def on_boot(self) -> None:
+        """At start-up, after the preview reconcile: the same as a sweep."""
+        await self.sweep_cards()
+
+    async def end_unfinished_previews(self) -> int:
+        """End every ready preview that no committed offer names and that no
+        preparation in this process is still working on. Returns how many."""
+        from forge.lifecycle.card_revisions import latest_offer_details
+        from forge.pipeline.merge_card import UNFINISHED_REBUILD_REASON
+
+        service = self._review_preview
+        cx = self._ledger()
+        live = getattr(service, "live_leases", None)
+        end_run = getattr(service, "end_run", None)
+        if cx is None or not callable(live) or not callable(end_run):
+            return 0
+        ended = 0
+        for lease in live():
+            if lease.state != "ready" or lease.build_id in self._preparing:
+                continue
+            offer = latest_offer_details(cx, lease.build_id)
+            evidence = (offer or {}).get("review_evidence")
+            if isinstance(evidence, Mapping) and evidence.get("run_id") == lease.run_id:
+                continue
+            reason = (
+                UNFINISHED_REBUILD_REASON
+                if offer is not None
+                else "its merge card was never offered"
+            )
+            if await end_run(lease.run_id, reason=reason):
+                ended += 1
+        return ended
+
+    async def _retry_waiting_rebuilds(self, now: datetime) -> None:
+        from forge.lifecycle.card_revisions import decision_on_record, latest_offer_details
+        from forge.pipeline.merge_card import REBUILD_WANTED_KEY, cards_to_describe
+
+        cx = self._ledger()
+        has_room = getattr(self._review_preview, "has_room", None)
+        if cx is None:
+            return
+        for build_id in cards_to_describe(cx, now):
+            if build_id in self._preparing:
+                continue
+            offer = latest_offer_details(cx, build_id) or {}
+            if not offer.get(REBUILD_WANTED_KEY):
+                continue
+            if decision_on_record(cx, build_id) is not None:
+                continue
+            if callable(has_room) and not await has_room(
+                str(offer.get("repo") or ""), build_id=build_id, make_room=True
+            ):
+                continue
+            self._spawn(self.rebuild_preview(build_id=build_id))
+
+
+def _changes_of(offer: Mapping[str, Any]) -> list[Any] | None:
+    """The build's changes as the offer kept them, or None."""
+    from forge.pipeline.merge_ready_checkpoint import BranchFileChange
+
+    raw = offer.get("changed_files")
+    if not isinstance(raw, list):
+        return None
+    changes: list[Any] = []
+    for item in raw:
+        if isinstance(item, Mapping) and item.get("path"):
+            changes.append(
+                BranchFileChange(
+                    status=str(item.get("status") or "M"),
+                    path=str(item["path"]),
+                    old_path=str(item.get("old_path") or ""),
+                )
+            )
+    return changes

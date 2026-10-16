@@ -521,7 +521,10 @@ class TestAnOfferWithAPreview:
             "SELECT lines_json FROM publication_records WHERE build_id = ?", (BUILD_ID,)
         ).fetchone()
         assert "the approval was refused" in row[0]
-        assert [r["reason"] for r in preview.released] == [
+        # Only the preview this offer names is released, by run id (16
+        # October 2026), never every preview of the build.
+        assert preview.released == []
+        assert [r["reason"] for r in preview.released_runs] == [
             "approval refused: the preview for this offer is no longer running"
         ]
 
