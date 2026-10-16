@@ -94,6 +94,9 @@ def _what_went_out(recorder: _Recorder, pool, build_id: str) -> dict[str, Any]:
     # it is the library's default, not anything this offer chose, and the
     # tests below say separately that it stays empty without a preview.
     paused.pop("review_evidence", None)
+    # Likewise the merge card block (16 October 2026), which only a previewed
+    # card carries.
+    assert paused.pop("merge_card", None) is None
     return {
         "subject": subject,
         "correlation_id": envelope.correlation_id,

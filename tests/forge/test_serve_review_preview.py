@@ -180,7 +180,10 @@ def _drive_boot(
     class _Offer:
         def __init__(self, **kwargs: Any) -> None:
             seen["offer"].append(kwargs)
+            seen.setdefault("offer_objects", []).append(self)
             self.maybe_offer = AsyncMock()
+            self.describe_card = AsyncMock()
+            self.rebuild_preview = AsyncMock()
 
     class _Consumer:
         def __init__(self, deps: Any) -> None:
@@ -277,7 +280,10 @@ class TestTheServiceReachesTheCardAndThePress:
 
 
 def _run_serve_once(
-    monkeypatch: pytest.MonkeyPatch, preview: Any, events: list[str]
+    monkeypatch: pytest.MonkeyPatch,
+    preview: Any,
+    events: list[str],
+    keeper: Any = None,
 ) -> None:
     from forge.cli import _serve_daemon
 
@@ -298,6 +304,7 @@ def _run_serve_once(
     async def _fake_compose(client: object) -> None:
         events.append("compose")
         serve_mod.review_preview_service = preview
+        serve_mod.merge_card_keeper = keeper
 
     async def _fake_daemon(config: object, state: object, *, client: object = None) -> None:
         events.append("daemon_started")
@@ -392,3 +399,68 @@ class TestTheSweep:
 
         assert len(preview.sweeps) == 2
         assert all(now.tzinfo is not None for now in preview.sweeps)
+
+
+# ---------------------------------------------------------------------------
+# The merge-card keeper (16 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class _Keeper:
+    def __init__(self, events: list[str]) -> None:
+        self.events = events
+        self.sweeps: list[Any] = []
+
+    async def on_boot(self) -> None:
+        self.events.append("cards_on_boot")
+
+    async def sweep_cards(self, *, now: Any = None) -> None:
+        self.sweeps.append(now)
+
+
+class TestTheMergeCardKeeper:
+    def test_with_previews_on_the_offer_service_keeps_the_cards(
+        self, pool, tmp_path: Path
+    ) -> None:
+        seen = _drive_boot(pool, tmp_path, merge_on=True, preview=StandInReviewPreview())
+        offer = seen["offer_objects"][0]
+        assert serve_mod.merge_card_keeper is offer
+        deps = seen["consumer"][0]
+        assert deps.describe_card is offer.describe_card
+        assert deps.rebuild_preview is offer.rebuild_preview
+
+    def test_without_previews_there_is_no_keeper(self, pool, tmp_path: Path) -> None:
+        seen = _drive_boot(pool, tmp_path, merge_on=True, preview=None)
+        assert serve_mod.merge_card_keeper is None
+        assert seen["consumer"][0].describe_card is None
+        assert seen["consumer"][0].rebuild_preview is None
+
+    def test_cards_are_kept_after_the_preview_reconcile_and_on_every_sweep(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        events: list[str] = []
+
+        class _Recording(StandInReviewPreview):
+            async def reconcile_on_boot(self) -> None:
+                events.append("preview_reconcile")
+
+        keeper = _Keeper(events)
+        try:
+            _run_serve_once(monkeypatch, _Recording(), events, keeper=keeper)
+        finally:
+            serve_mod.merge_card_keeper = None
+        assert events.index("preview_reconcile") < events.index("cards_on_boot")
+        assert events.index("cards_on_boot") < events.index("daemon_started")
+        assert keeper.sweeps
+
+    @pytest.mark.asyncio
+    async def test_the_sweep_keeps_the_cards_after_the_previews(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        fake_sleep = AsyncMock(side_effect=[None, asyncio.CancelledError()])
+        monkeypatch.setattr(serve_mod.asyncio, "sleep", fake_sleep)
+        preview = StandInReviewPreview()
+        keeper = _Keeper([])
+        with pytest.raises(asyncio.CancelledError):
+            await serve_mod._run_review_preview_sweep(preview, 300, keeper)
+        assert len(preview.sweeps) == 1 and len(keeper.sweeps) == 1

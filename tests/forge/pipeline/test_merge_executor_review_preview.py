@@ -214,13 +214,12 @@ class TestAnApprovalThePreviewRefuses:
         assert [(line["kind"], line["step"]) for line in lines] == [("done", "join")]
         assert lines[0]["detail"]["joined"] is False
         assert lines[0]["detail"]["refusal"] == f"the approval was refused: {why}"
-        # The preview is released: it can never be approved now.
-        assert preview.released == [
-            {
-                "feature_id": FEATURE_ID,
-                "build_id": BUILD_ID,
-                "reason": f"approval refused: {why}",
-            }
+        # The preview this offer names is released: it can never be approved
+        # now. Only that one, by run id (16 October 2026), never every preview
+        # of the build, so a refusal during a rebuild cannot tear it down.
+        assert preview.released == []
+        assert preview.released_runs == [
+            {"run_id": evidence["run_id"], "reason": f"approval refused: {why}"}
         ]
 
     @pytest.mark.asyncio
@@ -244,10 +243,11 @@ class TestAnApprovalThePreviewRefuses:
         assert decisions[0].details["merge_decision"]["decision"] == "reject"
         assert [r.result for r in publisher.reports] == ["rejected"]
         assert gk.calls == []
-        assert [r["reason"] for r in preview.released] == [
+        assert [r["reason"] for r in preview.released_runs] == [
             "approval refused: the preview was not prepared",
-            "rejected",
         ]
+        # Reject still releases everything for the build.
+        assert [r["reason"] for r in preview.released] == ["rejected"]
 
     @pytest.mark.asyncio
     async def test_no_service_here_refuses_rather_than_passes(

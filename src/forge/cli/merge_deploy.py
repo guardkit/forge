@@ -237,6 +237,7 @@ async def _arun(
         _publication_store_for,
         _write_the_refusal_down_for,
         execute_merge_deploy,
+        release_the_offers_own_preview,
         why_a_previewed_offer_is_refused,
     )
     from forge.pipeline.merge_offer import read_baseline_failing
@@ -377,9 +378,11 @@ async def _arun(
                         target_branch=recorded_branch,
                         refusal=f"the approval was refused: {refusal}",
                     )
+                    # Only the preview this offer names (16 October 2026),
+                    # so a refusal during a rebuild never tears it down.
                     if definitive and preview_service is not None:
-                        await _release_quietly(
-                            preview_service, row, f"approval refused: {refusal}"
+                        await release_the_offers_own_preview(
+                            preview_service, offer, reason=f"approval refused: {refusal}"
                         )
                 click.echo(
                     f"merge-deploy {row.feature_id} @ {row.repo}: refused — "

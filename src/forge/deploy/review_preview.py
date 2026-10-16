@@ -16,8 +16,12 @@ card goes out. This module prepares that and looks after it afterwards:
    previewed. The joined commit is kept under an unpushed local ref,
    ``refs/forge/preview/<lease>``, and its tree is laid out where the
    candidate's would be (``.forge-candidates/preview-<lease>``).
-2. **Lease a slot.** One row in the ledger's ``preview_leases`` table,
-   waiting up to the profile's ``slot_wait_minutes`` for a free slot.
+2. **Lease a slot.** One row in the ledger's ``preview_leases`` table. A
+   card never waits for a slot (16 October 2026): with every slot in use the
+   card goes out at once saying so, with Rebuild preview; a Rebuild press may
+   take the slot of the oldest preview that is ready with its card
+   unanswered. (``slot_wait_minutes`` now only bounds how long a preparation
+   may look unfinished before the sweep ends it.)
 3. **Stand it up.** The candidate leg's own deploy steps, through the deploy
    dispatch the merge press uses, with the values the preview issues
    (``PREVIEW=1``, the slot's ports and address, the link token, the resource
@@ -130,7 +134,9 @@ __all__ = [
     "SidecarPreviewVenue",
     "UnavailableReviewPreview",
     "build_review_preview_service",
+    "is_slots_busy",
     "serve_preview_operation",
+    "slots_busy_reason",
 ]
 
 # ---------------------------------------------------------------------------
@@ -371,6 +377,36 @@ def _parse_time(text: Any) -> datetime | None:
     return value if value.tzinfo is not None else value.replace(tzinfo=UTC)
 
 
+# ---------------------------------------------------------------------------
+# Both slots busy (16 October 2026)
+# ---------------------------------------------------------------------------
+
+#: How a reason that says every slot was in use begins. A card never waits for
+#: a slot: the card goes out at once with this reason and Rebuild preview.
+_SLOTS_BUSY = re.compile(r"^(both preview slots are|all \d+ preview slots are|the preview slot is) in use")
+
+
+def slots_busy_reason(features: Sequence[str], slot_count: int) -> str:
+    """``both preview slots are in use by FEAT-A and FEAT-B``, in plain words."""
+    named = list(dict.fromkeys(f for f in features if f))
+    if not named:
+        who = "other cards"
+    elif len(named) == 1:
+        who = named[0]
+    else:
+        who = ", ".join(named[:-1]) + f" and {named[-1]}"
+    if slot_count == 1:
+        return f"the preview slot is in use by {who}"
+    if slot_count == 2:
+        return f"both preview slots are in use by {who}"
+    return f"all {slot_count} preview slots are in use by {who}"
+
+
+def is_slots_busy(reason: Any) -> bool:
+    """True for a reason :func:`slots_busy_reason` wrote."""
+    return bool(_SLOTS_BUSY.match(str(reason or "")))
+
+
 def _new_lease_id() -> str:
     return f"pv{secrets.token_hex(6)}"
 
@@ -404,6 +440,10 @@ class PreviewRequest:
     preview_base_sha: str | None = None
     #: Why that commit could not be read, when it could not.
     preview_base_refusal: str | None = None
+    #: A Rebuild press (16 October 2026): when no slot is free, take the slot
+    #: of the oldest preview that is ready with its card unanswered. A first
+    #: offer never takes another card's slot.
+    make_room: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -474,8 +514,17 @@ class PreviewLeaseStore:
     one slot, whichever process asks.
     """
 
-    def __init__(self, connection: sqlite3.Connection) -> None:
+    def __init__(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        on_change: Callable[[str], Any] | None = None,
+    ) -> None:
         self._cx = connection
+        #: Told a build's id after every committed change to one of its
+        #: leases (16 October 2026), so its merge card can be described at
+        #: once. Best effort: the five-minute sweep describes every card anyway.
+        self.on_change = on_change
 
     @contextmanager
     def _transaction(self):
@@ -492,6 +541,26 @@ class PreviewLeaseStore:
         else:
             if started:
                 self._cx.commit()
+
+    def _bump(self, build_id: str, now: datetime) -> None:
+        """Raise the build's card revision inside the open transaction.
+
+        Every insert or update of a lease can change the build's merge card
+        (16 October 2026), so each one moves the card's counter in the same
+        transaction as the change itself.
+        """
+        from forge.lifecycle.card_revisions import bump_card_revision
+
+        bump_card_revision(self._cx, build_id, now)
+
+    def _changed(self, build_id: str) -> None:
+        listener = self.on_change
+        if listener is None:
+            return
+        try:
+            listener(build_id)
+        except Exception:  # noqa: BLE001 — telling the card never fails a write
+            logger.exception("review preview: telling %s's card raised", build_id)
 
     def _rows(self, where: str, params: Sequence[Any] = ()) -> list[PreviewLease]:
         cursor = self._cx.execute(
@@ -518,6 +587,104 @@ class PreviewLeaseStore:
             f"WHERE build_id = ? AND state IN ({marks}) ORDER BY created_at",
             (build_id, *_LIVE_STATES),
         )
+
+    def newest_for_build(self, build_id: str) -> PreviewLease | None:
+        """The build's newest lease, in any state, or None."""
+        rows = self._rows(
+            "WHERE build_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (build_id,),
+        )
+        return rows[0] if rows else None
+
+    def holders(self, ports: Sequence[int]) -> list[PreviewLease]:
+        """The live leases holding any of ``ports``, oldest first."""
+        if not ports:
+            return []
+        live = ", ".join("?" for _ in _LIVE_STATES)
+        marks = ", ".join("?" for _ in ports)
+        return self._rows(
+            f"WHERE state IN ({live}) AND port IN ({marks}) ORDER BY created_at",
+            (*_LIVE_STATES, *[int(p) for p in ports]),
+        )
+
+    def _eligible_to_make_room(
+        self, ports: Sequence[int], for_build: str
+    ) -> list[PreviewLease]:
+        """Ready previews on ``ports`` whose card is unanswered, oldest first.
+
+        Eligible means ready, named by its build's latest committed offer, and
+        with no decision on record. A preview still being prepared — or ready
+        but not yet named by an offer, which is a rebuild still reading its
+        merge check — and one whose card already has a decision, never is.
+        """
+        from forge.lifecycle.card_revisions import latest_offer_details
+
+        eligible: list[PreviewLease] = []
+        for lease in self.holders(ports):
+            if lease.state != "ready" or lease.build_id == for_build:
+                continue
+            decided = self._cx.execute(
+                "SELECT 1 FROM stage_log WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_decision' LIMIT 1",
+                (lease.build_id,),
+            ).fetchone()
+            if decided is not None:
+                continue
+            offer = latest_offer_details(self._cx, lease.build_id)
+            evidence = (offer or {}).get("review_evidence")
+            if not isinstance(evidence, Mapping) or evidence.get("run_id") != lease.run_id:
+                continue
+            eligible.append(lease)
+        return eligible
+
+    def has_room(self, ports: Sequence[int], *, for_build: str, make_room: bool, now: datetime) -> bool:
+        """Is a slot free, past its time, or (``make_room``) takeable? No writes."""
+        held = self.holders(ports)
+        if len({lease.port for lease in held}) < len(set(ports)):
+            return True
+        for lease in held:
+            expiry = _parse_time(lease.app_expires_at)
+            if lease.state == "ready" and expiry is not None and now >= expiry:
+                return True
+        return make_room and bool(self._eligible_to_make_room(ports, for_build))
+
+    def claim_room(
+        self, ports: Sequence[int], *, for_build: str, for_feature: str, now: datetime
+    ) -> PreviewLease | None:
+        """Take the oldest eligible preview's slot for ``for_feature``, or None.
+
+        One write transaction, BEFORE any teardown starts (review round 3,
+        R14): it checks again that the chosen preview is ready and its card
+        has no decision, marks it ``ending`` and moves its card's counter on.
+        The merge press checks a preview and writes its decision in one such
+        transaction too, so exactly one of them wins: an Approve committed
+        first leaves that preview ineligible, and one arriving later finds it
+        ending and is refused.
+        """
+        chosen: PreviewLease | None = None
+        with self._transaction():
+            # A card that already has a decision never takes another card's
+            # slot (coach's review, 16 October 2026): Reject may land while
+            # its rebuild is still joining.
+            decided = self._cx.execute(
+                "SELECT 1 FROM stage_log WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_decision' LIMIT 1",
+                (for_build,),
+            ).fetchone()
+            eligible = [] if decided else self._eligible_to_make_room(ports, for_build)
+            if eligible:
+                chosen = replace(
+                    eligible[0], state="ending", reason=f"to make room for {for_feature}"
+                )
+                self._cx.execute(
+                    "UPDATE preview_leases SET state = 'ending', reason = ?, "
+                    "updated_at = ? WHERE lease_id = ? AND state = 'ready'",
+                    (chosen.reason, now.isoformat(), chosen.lease_id),
+                )
+                self._bump(chosen.build_id, now)
+        if chosen is not None:
+            self._changed(chosen.build_id)
+        return chosen
 
     def projects(self) -> list[str]:
         return [
@@ -547,6 +714,8 @@ class PreviewLeaseStore:
                 f"VALUES ({', '.join('?' for _ in _COLUMNS)}, ?)",
                 (*values, now.isoformat()),
             )
+            self._bump(lease.build_id, now)
+        self._changed(lease.build_id)
 
     def take_slot(
         self,
@@ -580,24 +749,65 @@ class PreviewLeaseStore:
                         f"VALUES ({', '.join('?' for _ in _COLUMNS)}, ?)",
                         (*[getattr(taken, n) for n in _COLUMNS], now.isoformat()),
                     )
-                    return slot, port
+                    self._bump(lease.build_id, now)
+                    got = (slot, port)
+                    break
+                else:
+                    got = None
         except sqlite3.IntegrityError as exc:
             logger.info(
                 "review preview: a slot was taken under us (%s); asking again", exc
             )
-        return None
+            return None
+        if got is not None:
+            self._changed(lease.build_id)
+        return got
 
-    def update(self, lease_id: str, *, now: datetime, **fields: Any) -> None:
+    def update(
+        self,
+        lease_id: str,
+        *,
+        now: datetime,
+        expect: Sequence[str] | None = None,
+        **fields: Any,
+    ) -> bool:
+        """Change one lease; True when the change was made.
+
+        ONE RULE (coach's review, 16 October 2026): a lease that has ended
+        (``ended`` or ``failed``) never moves to any other state. Every write of
+        ``state`` is one guarded UPDATE that does nothing to an ended lease,
+        and ``expect`` narrows it to the states the caller is moving FROM (a
+        preparation's ``ready`` only from ``preparing``). Other fields (the
+        evidence's deletion, say) can still be written on an ended lease.
+        """
         unknown = set(fields) - set(_COLUMNS)
         if unknown:
             raise ValueError(f"unknown preview lease field(s): {sorted(unknown)}")
         sets = {**fields, "updated_at": now.isoformat()}
+        where = "WHERE lease_id = ?"
+        params: list[Any] = [lease_id]
+        if "state" in fields:
+            where += " AND state NOT IN ('ended', 'failed')"
+        if expect:
+            where += f" AND state IN ({', '.join('?' for _ in expect)})"
+            params.extend(expect)
+        build_id: str | None = None
         with self._transaction():
-            self._cx.execute(
+            cursor = self._cx.execute(
                 f"UPDATE preview_leases SET {', '.join(f'{k} = ?' for k in sets)} "
-                "WHERE lease_id = ?",
-                (*sets.values(), lease_id),
+                f"{where}",
+                (*sets.values(), *params),
             )
+            if cursor.rowcount:
+                row = self._cx.execute(
+                    "SELECT build_id FROM preview_leases WHERE lease_id = ?", (lease_id,)
+                ).fetchone()
+                if row is not None:
+                    build_id = str(row[0])
+                    self._bump(build_id, now)
+        if build_id is not None:
+            self._changed(build_id)
+        return build_id is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1514,8 +1724,17 @@ class ReviewPreviewService:
         slot_poll_seconds: float = _SLOT_POLL_SECONDS,
         profile_retry_seconds: float = _PROFILE_RETRY_SECONDS,
         blocking_sleep: Callable[[float], Any] = time.sleep,
+        max_app_ttl_minutes: int | None = None,
     ) -> None:
         self._store = store
+        #: ``review_preview.max_app_ttl_minutes`` (16 October 2026): a cap on
+        #: a preview's lifetime below the profile's whole hours, for a proof
+        #: that needs a short one. ``None`` leaves the profile's hours.
+        self._max_app_ttl = (
+            timedelta(minutes=int(max_app_ttl_minutes))
+            if max_app_ttl_minutes
+            else None
+        )
         self._profile_reader = profile_reader
         self._venue_for = venue_for
         self._dispatch = deploy_dispatcher
@@ -1533,6 +1752,78 @@ class ReviewPreviewService:
         self._slot_poll_seconds = slot_poll_seconds
         self._profile_retry_seconds = profile_retry_seconds
         self._blocking_sleep = blocking_sleep
+        #: Leases whose preparation is running in this process. A release
+        #: (Reject) marks such a lease ``ending`` and leaves the teardown to
+        #: the preparation, which stops at its next step; the slot stays held
+        #: until then, so no other card can be given its port while this
+        #: preparation's containers may still be starting.
+        self._active: set[str] = set()
+
+    def _app_ttl(self, preview: "DeployPreview | None") -> timedelta:
+        """How long a preview (and its Approve window) lasts."""
+        ttl = timedelta(hours=preview.app_ttl_hours if preview is not None else 24)
+        if self._max_app_ttl is not None and self._max_app_ttl < ttl:
+            return self._max_app_ttl
+        return ttl
+
+    # -- the card's view of the leases (16 October 2026) ----------------------
+
+    def set_card_listener(self, listener: Callable[[str], Any] | None) -> None:
+        """Be told a build's id after every committed change to its leases."""
+        self._store.on_change = listener
+
+    def lease_for_run(self, run_id: str) -> PreviewLease | None:
+        return self._store.for_run(run_id) if run_id else None
+
+    def newest_lease(self, build_id: str) -> PreviewLease | None:
+        return self._store.newest_for_build(build_id)
+
+    def live_leases(self) -> list[PreviewLease]:
+        return self._store.live()
+
+    async def has_room(self, project: str, *, build_id: str, make_room: bool) -> bool:
+        """Could a preview for ``build_id`` get a slot now? Writes nothing.
+
+        True when a slot is free or past its time, or, for a Rebuild press
+        (``make_room``), when another card's ready, unanswered preview could
+        make room. A project whose profile cannot be read answers True, so the
+        preparation runs and says why it failed.
+        """
+        _profile, preview, unreadable = await asyncio.to_thread(self._preview_of, project)
+        if unreadable is not None or preview is None:
+            return True
+        return self._store.has_room(
+            [slot.port for slot in preview.slots],
+            for_build=build_id,
+            make_room=make_room,
+            now=self._clock(),
+        )
+
+    async def end_run(self, run_id: str, *, reason: str, only_ready: bool = True) -> bool:
+        """End the lease a preparation run wrote; True when one was ended.
+
+        With ``only_ready`` (the default) only a ready preview is ended: one
+        already ending is left to whoever is ending it, so its reason stands.
+        """
+        lease = self._store.for_run(run_id) if run_id else None
+        if lease is None or not lease.live:
+            return False
+        if only_ready and lease.state != "ready":
+            return False
+        await self._end(lease, reason=reason)
+        return True
+
+    async def release_run(self, *, run_id: str, reason: str) -> None:
+        """Release only the preview one offer row names (16 October 2026).
+
+        A refused approval releases only the preview its own offer names,
+        matched by run id, so an Approve pressed during a rebuild can never
+        tear the rebuild's new preview down. Never raises.
+        """
+        try:
+            await self.end_run(run_id, reason=reason)
+        except Exception:  # noqa: BLE001 — a release never raises
+            logger.exception("review preview: releasing run %s raised", run_id)
 
     def _public_url_of(self, slot: "PreviewSlot") -> str | None:
         """Where a reviewer opens this slot: the profile's own ``public_url``
@@ -1689,7 +1980,7 @@ class ReviewPreviewService:
 
         lease_id = self._lease_id_factory()
         token = self._token_factory()
-        app_expires = now + timedelta(hours=preview.app_ttl_hours)
+        app_expires = now + self._app_ttl(preview)
         evidence_expires = now + timedelta(days=preview.evidence_days)
         base = PreviewLease(
             lease_id=lease_id,
@@ -1734,11 +2025,17 @@ class ReviewPreviewService:
                 return early(reason)
             base = replace(base, preview_tree=laid.tree)
 
-            # (2) A slot.
-            taken = await self._take_slot(base, preview)
+            # (2) A slot — never waited for (16 October 2026).
+            taken = await self._take_slot(base, preview, make_room=req.make_room)
             if taken is None:
-                reason = (
-                    f"no preview slot came free within {preview.slot_wait_minutes} minutes"
+                reason = slots_busy_reason(
+                    [
+                        lease.feature_id
+                        for lease in self._store.holders(
+                            [slot.port for slot in preview.slots]
+                        )
+                    ],
+                    len(preview.slots),
                 )
                 self._store.insert(
                     replace(base, reason=reason, ended_at=self._clock().isoformat()),
@@ -1798,6 +2095,7 @@ class ReviewPreviewService:
         # From here on the slot is held, so whatever happens — even something
         # nobody expected — ends in a teardown and a failed lease, never in a
         # preview left running under a lease that says "preparing".
+        self._active.add(lease_id)
         try:
             self._store.update(
                 lease_id,
@@ -1817,6 +2115,8 @@ class ReviewPreviewService:
                 context,
                 f"the preview could not be prepared ({type(exc).__name__}: {exc})",
             )
+        finally:
+            self._active.discard(lease_id)
 
     async def _cancelled_before_the_slot(
         self, venue: Any, base: PreviewLease, lease_id: str
@@ -1871,6 +2171,8 @@ class ReviewPreviewService:
         )
         # (3) Stand it up.
         up = await self._leg(context, "preview_up", issued)
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if up is None or getattr(up, "outcome", None) != "complete":
             return await self._fail(
                 context, f"the preview could not be started: {self._why(up)}"
@@ -1883,6 +2185,8 @@ class ReviewPreviewService:
         # EVERY container of the preview's compose project must carry it: one
         # left unlabelled would outlive the teardown unseen.
         seen = await venue.preview_containers(issued["COMPOSE_PROJECT_NAME"])
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if seen is None:
             return await self._fail(
                 context, "the preview's containers could not be listed"
@@ -1905,6 +2209,8 @@ class ReviewPreviewService:
 
         # (4) The link.
         refused = _link_refusal(await venue.probe(lease_id, slot.port, token))
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if refused:
             return await self._fail(
                 context, f"the preview does not enforce its link — {refused}"
@@ -1912,6 +2218,8 @@ class ReviewPreviewService:
 
         # (5) The journey, recorded.
         journey_leg = await self._leg(context, "preview_journey", issued_for_the_journey)
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if journey_leg is None or getattr(journey_leg, "outcome", None) != "complete":
             return await self._fail(
                 context, f"the key journey could not be run: {self._why(journey_leg)}"
@@ -1920,11 +2228,14 @@ class ReviewPreviewService:
 
         # (6) Keep the evidence, before anything is torn down.
         kept, why_not = await self._keep_evidence(context)
+        if kept is not None:
+            context.kept = kept
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if kept is None:
             return await self._fail(
                 context, f"the evidence could not be kept: {why_not}"
             )
-        context.kept = kept
 
         # (7) The record.
         verdict = str(journey.get("verdict") or "")
@@ -1953,7 +2264,12 @@ class ReviewPreviewService:
                 "(failure-only recording?)",
                 journey=journey,
             )
-        self._store.update(lease_id, now=self._clock(), state="ready", reason=None)
+        # Ready ONLY from preparing, in one guarded write: a lease released
+        # while the evidence was being checked is never brought back.
+        if not self._store.update(
+            lease_id, now=self._clock(), expect=("preparing",), state="ready", reason=None
+        ):
+            return await self._stop_under_us(context)
         return self._record(
             req,
             state="ready",
@@ -1970,25 +2286,89 @@ class ReviewPreviewService:
         )
 
     async def _take_slot(
-        self, lease: PreviewLease, preview: "DeployPreview"
+        self, lease: PreviewLease, preview: "DeployPreview", *, make_room: bool = False
     ) -> tuple[int, int] | None:
+        """A free slot now, or None — a card never waits for one (16 October 2026).
+
+        A preview past its time is ended first, as before. A Rebuild press
+        (``make_room``) that still finds none takes the slot of the oldest
+        preview that is ready with its card unanswered (see
+        :meth:`PreviewLeaseStore.claim_room`); a first offer never takes
+        another card's slot.
+        """
         slots = [(index, slot.port) for index, slot in enumerate(preview.slots)]
-        deadline = self._clock() + timedelta(minutes=preview.slot_wait_minutes)
-        while True:
-            taken = self._store.take_slot(lease, slots=slots, now=self._clock())
-            if taken is not None:
-                return taken
-            # A preview whose day is up is not a reason to keep waiting.
-            await self._end_expired(self._clock())
-            taken = self._store.take_slot(lease, slots=slots, now=self._clock())
-            if taken is not None:
-                return taken
-            if self._clock() >= deadline:
-                return None
-            logger.info(
-                "review preview: every slot is in use; %s waits for one", lease.build_id
-            )
-            await self._sleep(self._slot_poll_seconds)
+        taken = self._store.take_slot(lease, slots=slots, now=self._clock())
+        if taken is not None:
+            return taken
+        # A preview whose day is up does not keep its slot.
+        await self._end_expired(self._clock())
+        taken = self._store.take_slot(lease, slots=slots, now=self._clock())
+        if taken is not None or not make_room:
+            return taken
+        victim = self._store.claim_room(
+            [port for _index, port in slots],
+            for_build=lease.build_id,
+            for_feature=lease.feature_id,
+            now=self._clock(),
+        )
+        if victim is None:
+            return None
+        logger.info(
+            "review preview: %s's preview is stopped to make room for %s",
+            victim.build_id,
+            lease.build_id,
+        )
+        # Teardown starts only now, after the claim has committed.
+        await self._end(victim, reason=str(victim.reason))
+        return self._store.take_slot(lease, slots=slots, now=self._clock())
+
+    async def _stopped_under_us(self, context: "_Preparation") -> "ReviewEvidence | None":
+        """None while this preparation's lease is still ``preparing``;
+        otherwise stop it (see :meth:`_stop_under_us`) and return its record."""
+        lease = self._store.get(context.lease_id)
+        if lease is not None and lease.state == "preparing":
+            return None
+        return await self._stop_under_us(context)
+
+    async def _stop_under_us(self, context: "_Preparation") -> "ReviewEvidence":
+        """The lease was released while this preparation ran (a Reject).
+
+        Tear down only what this preparation started — its own labelled
+        resources, ref and tree; the slot is still held by this lease, so no
+        other card's preview is there — and write the lease down as ended (or
+        ending, when the teardown is not confirmed, for the sweep to retry).
+        Never ``ready``.
+        """
+        lease = self._store.get(context.lease_id)
+        reason = (
+            str(lease.reason).removesuffix(_NOT_CONFIRMED)
+            if lease is not None and lease.reason
+            else "the preview was released while it was being prepared"
+        )
+        logger.info(
+            "review preview: %s was released while being prepared (%s); "
+            "stopping and tearing down its own resources",
+            context.lease_id,
+            reason,
+        )
+        torn_down = await self._tear_down(context.venue, context.lease_id)
+        now = self._clock()
+        self._store.update(
+            context.lease_id,
+            now=now,
+            state="ended" if torn_down else "ending",
+            reason=reason if torn_down else f"{reason}{_NOT_CONFIRMED}",
+            ended_at=now.isoformat() if torn_down else None,
+        )
+        return self._record(
+            context.req,
+            state="failed",
+            run_id=context.run_id,
+            now=context.now,
+            preview=context.preview,
+            preview_tree=context.tree.tree,
+            failure_reason=f"the preview was stopped while it was being prepared: {reason}",
+        )
 
     async def _leg(
         self, context: "_Preparation", leg: str, issued: IssuedPreviewValues
@@ -2175,7 +2555,7 @@ class ReviewPreviewService:
     ) -> "ReviewEvidence":
         from nats_core.events import ReviewEvidence, ReviewOutcome
 
-        hours = preview.app_ttl_hours if preview is not None else 24
+        ttl = self._app_ttl(preview)
         days = preview.evidence_days if preview is not None else 14
         # A failure before the join has no joined tree; the candidate's own
         # tree stands in, and the record is failed, so it can never be approved.
@@ -2201,7 +2581,7 @@ class ReviewPreviewService:
             ),
             run_id=run_id,
             created_at=now,
-            app_expires_at=now + timedelta(hours=hours),
+            app_expires_at=now + ttl,
             evidence_expires_at=now + timedelta(days=days),
             outcome=ReviewOutcome(**dict(outcome or {})),
         )
@@ -2260,12 +2640,26 @@ class ReviewPreviewService:
             for lease in self._store.live_for_build(build_id):
                 if lease.feature_id != feature_id:
                     continue
+                if lease.lease_id in self._active:
+                    # Its preparation is running here: mark it ending (it
+                    # keeps its slot) and let the preparation stop and tear
+                    # down its own resources at its next step.
+                    self._store.update(
+                        lease.lease_id,
+                        now=self._clock(),
+                        expect=("preparing", "ready"),
+                        state="ending",
+                        reason=reason,
+                    )
+                    continue
                 await self._end(lease, reason=reason)
         except Exception:  # noqa: BLE001 — a release never raises
             logger.exception("review preview: releasing %s's preview raised", build_id)
 
     async def _end_expired(self, now: datetime) -> None:
         for lease in self._store.live():
+            if lease.lease_id in self._active:
+                continue  # its preparation is running here and ends it itself
             expiry = _parse_time(lease.app_expires_at)
             if lease.state == "ready" and expiry is not None and now >= expiry:
                 await self._end(lease, reason="the preview's time was up")
@@ -2383,13 +2777,18 @@ class ReviewPreviewService:
     def approval_refusal(
         self, review_evidence: Mapping[str, Any] | None, *, now: datetime
     ) -> str | None:
-        """None when approval may proceed; otherwise a plain-English reason."""
+        """None when approval may proceed; otherwise a plain-English reason.
+
+        The reasons no longer end "reject it and run the feature again"
+        (16 October 2026): the card now offers Rebuild preview, and says so
+        itself.
+        """
         if not isinstance(review_evidence, Mapping):
             return "this offer carries no preview record, so it cannot be approved"
         if review_evidence.get("state") != "ready":
             return (
                 "the preview for this offer was not prepared, so it cannot be "
-                "approved — reject it and run the feature again"
+                "approved"
             )
         expires = _parse_time(review_evidence.get("app_expires_at"))
         if expires is None:
@@ -2397,8 +2796,7 @@ class ReviewPreviewService:
         if now >= expires:
             return (
                 f"the preview and its approval window ended at "
-                f"{expires.strftime('%a %d %b %H:%M UTC')} — reject it and run the "
-                "feature again"
+                f"{expires.strftime('%a %d %b %H:%M UTC')}"
             )
         # The preview must still be standing: a lease ended by a release, the
         # sweep or the start-up reconcile is not approvable, whatever the
@@ -2413,13 +2811,13 @@ class ReviewPreviewService:
             return (
                 "the preview for this offer is no longer running"
                 + (f" ({lease.reason})" if lease is not None and lease.reason else "")
-                + ", so it cannot be approved — reject it and run the feature again"
+                + ", so it cannot be approved"
             )
         folder = self._folder_of(review_evidence)
         if folder is None or not folder.is_dir():
             return (
                 "the preview's evidence folder is missing, so this offer cannot be "
-                "approved — reject it and run the feature again"
+                "approved"
             )
         return None
 
@@ -2535,6 +2933,9 @@ class UnavailableReviewPreview:
     async def release(self, *, feature_id: str, build_id: str, reason: str) -> None:
         return None
 
+    async def release_run(self, *, run_id: str, reason: str) -> None:
+        return None
+
     async def sweep(self, *, now: datetime) -> None:
         return None
 
@@ -2633,4 +3034,5 @@ def build_review_preview_service(
         evidence_base_url=settings.evidence_base_url,
         public_host=settings.public_host,
         clock=clock,
+        max_app_ttl_minutes=getattr(settings, "max_app_ttl_minutes", None),
     )

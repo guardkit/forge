@@ -174,6 +174,7 @@ import pathlib,sys,importlib.util,json,hashlib
 from forge.adapters.sqlite.connect import connect_writer
 from forge.lifecycle.migrations import apply_at_boot
 from forge.persistence.migrations import lifecycle_bridge_registry
+from forge.lifecycle import card_revisions
 import forge.lifecycle.migrations as canonical
 module_path=pathlib.Path(canonical.__file__).parents[1]/'lifecycle_bridge'/'coexistence.py'
 spec=importlib.util.spec_from_file_location('rollout_boot_coexistence',module_path)
@@ -182,6 +183,7 @@ c=connect_writer(pathlib.Path('/copy/forge.db'))
 assert apply_at_boot(c)==__LEDGER_SCHEMA_VERSION__
 coexistence.apply_migration(c)
 lifecycle_bridge_registry.apply(c)
+card_revisions.ensure_table(c)
 c.execute('PRAGMA wal_checkpoint(TRUNCATE)');c.close()
 assert not any(n=='nats' or n.startswith('nats.') or n=='nats_core.client' for n in sys.modules)
 '''

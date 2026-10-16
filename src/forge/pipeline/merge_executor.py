@@ -157,6 +157,7 @@ from forge.pipeline.merge_offer import (
 )
 from forge.pipeline.digest_conformance import run_digest_conformance
 from forge.pipeline.merge_check_reading import names_for_record, names_from_record
+from forge.pipeline.merge_card import REBUILD_NOTE, decide_previewed_offer, describable
 from forge.pipeline.merge_join import (
     integration_branch,
     join_inputs,
@@ -529,6 +530,17 @@ class MergeExecutorDeps:
     #: refused unless the preview is usable, and the preview is released once
     #: the decision has ended. Every other offer never touches it.
     review_preview: Any = None
+    #: KEEPING THE POSTED CARD TRUE (16 October 2026) —
+    #: ``async (build_id) -> bool``, the offer service's
+    #: :meth:`~forge.pipeline.merge_offer.MergeOfferService.describe_card`.
+    #: Called after a previewed card's decision or refused approval, so the
+    #: card shows the truth at once. ``None`` leaves it to the sweep.
+    describe_card: Callable[[str], Awaitable[Any]] | None = None
+    #: THE REBUILD PRESS (16 October 2026) — ``async (*, build_id) -> str``,
+    #: the offer service's
+    #: :meth:`~forge.pipeline.merge_offer.MergeOfferService.rebuild_preview`.
+    #: ``None`` refuses every ``defer``, as before.
+    rebuild_preview: Callable[..., Awaitable[Any]] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -6003,6 +6015,80 @@ def why_a_previewed_offer_is_refused(
     return refusal, refusal is not None
 
 
+def _decision_entry(
+    *,
+    build_id: str,
+    decision: str,
+    decided_by: str,
+    request_id: str,
+    now: datetime,
+    attempt_id: str | None,
+) -> StageLogEntry:
+    """The durable decision row — the restart / duplicate fence."""
+    return StageLogEntry(
+        build_id=build_id,
+        stage_label=MERGE_OFFER_STAGE_LABEL,
+        target_kind="local_tool",
+        target_identifier=MERGE_DECISION_TARGET_IDENTIFIER,
+        status="PASSED" if decision == "approve" else "SKIPPED",
+        gate_mode="MANDATORY_HUMAN_APPROVAL",
+        started_at=now,
+        completed_at=now,
+        duration_secs=0.0,
+        details={
+            MERGE_DECISION_DETAILS_KEY: {
+                "decision": decision,
+                "decided_by": decided_by,
+                "request_id": request_id,
+                **(
+                    {
+                        MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                            MERGE_EXECUTION_ATTEMPT_VERSION
+                        ),
+                        MERGE_EXECUTION_ATTEMPT_ID_KEY: attempt_id,
+                    }
+                    if attempt_id is not None
+                    else {}
+                ),
+            }
+        },
+    )
+
+
+def _ledger_of(pool: Any) -> Any | None:
+    """The ledger's writer connection, or None for a pool without one."""
+    import sqlite3
+
+    cx = getattr(pool, "connection", None)
+    return cx if isinstance(cx, sqlite3.Connection) else None
+
+
+async def release_the_offers_own_preview(
+    service: Any, offer: dict[str, Any], *, reason: str
+) -> None:
+    """After a definitive refusal, release ONLY the preview this offer names.
+
+    Matched by run id (16 October 2026), so an Approve pressed during a
+    rebuild — refused, because the committed offer still names the old,
+    ended preview — can never tear the rebuild's new preview down. A service
+    without ``release_run`` releases nothing. Never raises.
+    """
+    release_run = getattr(service, "release_run", None)
+    evidence = offer.get("review_evidence")
+    run_id = str(evidence.get("run_id") or "") if isinstance(evidence, dict) else ""
+    if not callable(release_run) or not run_id:
+        return
+    try:
+        await release_run(run_id=run_id, reason=reason)
+    except Exception as exc:  # noqa: BLE001 — never costs the refusal
+        logger.warning(
+            "merge-executor: the refused offer's preview could not be released "
+            "(%s: %s)",
+            type(exc).__name__,
+            exc,
+        )
+
+
 class MergeApprovalConsumer:
     """Consumes merge-card presses and runs the executor on a genuine approve.
 
@@ -6108,6 +6194,27 @@ class MergeApprovalConsumer:
             )
             return
         decision = payload.decision
+        # THE REBUILD PRESS (16 October 2026): ``defer`` with the note
+        # ``rebuild-preview``, on an offer from this release that has a
+        # preview, after every check above. It writes no decision row and
+        # publishes no new approval request; the rebuild runs as its own task
+        # and keeps the candidate the offer pinned. Any other ``defer`` is
+        # refused as before.
+        if (
+            decision == "defer"
+            and (payload.notes or "").strip() == REBUILD_NOTE
+            and self._deps.rebuild_preview is not None
+            and describable(offer)
+        ):
+            logger.info(
+                "merge-executor: %s asked to rebuild the preview for %s",
+                payload.decided_by,
+                build_id,
+            )
+            task = asyncio.create_task(self._deps.rebuild_preview(build_id=build_id))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+            return
         if decision not in ("approve", "reject"):
             logger.warning(
                 "merge-executor: refusing %s — decision %r is not one of the "
@@ -6117,12 +6224,28 @@ class MergeApprovalConsumer:
             )
             return
 
+        # A CARD FROM THIS RELEASE WITH A PREVIEW (16 October 2026): its
+        # preview check and its decision row are written in ONE ledger write
+        # transaction, against the latest committed offer, so a rebuild's
+        # amended row and another card's slot-taking are each wholly before
+        # or wholly after it. Every other offer is pressed exactly as before.
+        recorded: tuple[dict[str, Any], datetime, str | None] | None = None
+        if describable(offer) and _ledger_of(self._deps.pool) is not None:
+            recorded = await self._decide_previewed(
+                payload=payload,
+                build_id=build_id,
+                request_id=request_id,
+                decision=decision,
+            )
+            if recorded is None:
+                return
+            offer = recorded[0]
         # A PREVIEWED OFFER IS APPROVED ONLY WHILE ITS PREVIEW IS USABLE
         # (web-readiness W7, 12 October 2026). Asked before the decision row,
         # so a refused approval is written down as a refusal and never as a
         # decision, and the card can still be rejected. Offers without
         # ``review_evidence`` never reach this.
-        if decision == "approve" and "review_evidence" in offer:
+        elif decision == "approve" and "review_evidence" in offer:
             refusal, definitive = why_a_previewed_offer_is_refused(
                 self._deps.review_preview, offer, now=self._deps.clock()
             )
@@ -6155,51 +6278,37 @@ class MergeApprovalConsumer:
                 # from a check that could not be made (a service that is not
                 # here, a check that raised) leaves it standing, so the same
                 # card can be approved once the check can be made again.
+                # And only the preview this offer names (16 October 2026).
                 if definitive:
-                    await self._release_the_preview(
-                        offer, build_id=build_id, reason=f"approval refused: {refusal}"
+                    await release_the_offers_own_preview(
+                        self._deps.review_preview,
+                        offer,
+                        reason=f"approval refused: {refusal}",
                     )
                 return
 
         # Durable decision row FIRST — the restart / duplicate fence.  An
         # approved decision gets a fresh unguessable executor-attribution
         # token in the same committed row, before its async task exists.
-        now = self._deps.clock()
-        merge_execution_attempt_id = (
-            uuid.uuid4().hex if decision == "approve" else None
-        )
-        self._deps.pool.record_stage(
-            StageLogEntry(
-                build_id=build_id,
-                stage_label=MERGE_OFFER_STAGE_LABEL,
-                target_kind="local_tool",
-                target_identifier=MERGE_DECISION_TARGET_IDENTIFIER,
-                status="PASSED" if decision == "approve" else "SKIPPED",
-                gate_mode="MANDATORY_HUMAN_APPROVAL",
-                started_at=now,
-                completed_at=now,
-                duration_secs=0.0,
-                details={
-                    MERGE_DECISION_DETAILS_KEY: {
-                        "decision": decision,
-                        "decided_by": payload.decided_by,
-                        "request_id": request_id,
-                        **(
-                            {
-                                MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
-                                    MERGE_EXECUTION_ATTEMPT_VERSION
-                                ),
-                                MERGE_EXECUTION_ATTEMPT_ID_KEY: (
-                                    merge_execution_attempt_id
-                                ),
-                            }
-                            if merge_execution_attempt_id is not None
-                            else {}
-                        ),
-                    }
-                },
+        # (A previewed card from this release has written its row already,
+        # in the same transaction as its preview check.)
+        if recorded is not None:
+            _offer, now, merge_execution_attempt_id = recorded
+        else:
+            now = self._deps.clock()
+            merge_execution_attempt_id = (
+                uuid.uuid4().hex if decision == "approve" else None
             )
-        )
+            self._deps.pool.record_stage(
+                _decision_entry(
+                    build_id=build_id,
+                    decision=decision,
+                    decided_by=payload.decided_by,
+                    request_id=request_id,
+                    now=now,
+                    attempt_id=merge_execution_attempt_id,
+                )
+            )
 
         feature_id = str(offer.get("feature_id") or "")
         correlation_id = str(offer.get("correlation_id") or "")
@@ -6309,6 +6418,101 @@ class MergeApprovalConsumer:
         )
         self._tasks.add(task)
         task.add_done_callback(self._tasks.discard)
+
+    async def _describe(self, build_id: str) -> None:
+        describe = self._deps.describe_card
+        if describe is None:
+            return
+        try:
+            await describe(build_id)
+        except Exception as exc:  # noqa: BLE001 — the sweep describes it again
+            logger.warning(
+                "merge-executor: %s's card could not be described (%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+
+    async def _decide_previewed(
+        self,
+        *,
+        payload: Any,
+        build_id: str,
+        request_id: str,
+        decision: str,
+    ) -> tuple[dict[str, Any], datetime, str | None] | None:
+        """A previewed card's press: check and decision in ONE transaction.
+
+        Returns ``(the latest offer, when, the attempt id)`` once the decision
+        row is committed, or None when nothing was recorded (a refusal, a
+        decision already there, an offer that changed). The card is described
+        either way.
+        """
+        now = self._deps.clock()
+        attempt_id = uuid.uuid4().hex if decision == "approve" else None
+
+        def check(latest: dict[str, Any]) -> tuple[str | None, bool]:
+            return why_a_previewed_offer_is_refused(
+                self._deps.review_preview, latest, now=now
+            )
+
+        attempt = decide_previewed_offer(
+            _ledger_of(self._deps.pool),
+            build_id=build_id,
+            request_id=request_id,
+            decision=decision,
+            now=now,
+            decision_entry=lambda _latest: _decision_entry(
+                build_id=build_id,
+                decision=decision,
+                decided_by=payload.decided_by,
+                request_id=request_id,
+                now=now,
+                attempt_id=attempt_id,
+            ),
+            approval_check=check,
+        )
+        if attempt.outcome == "recorded" and attempt.offer is not None:
+            await self._describe(build_id)
+            return attempt.offer, now, attempt_id
+        if attempt.outcome == "refused" and attempt.offer is not None:
+            refusal = str(attempt.refusal)
+            logger.warning(
+                "merge-executor: refusing %s — %s; nothing was merged and no "
+                "decision was recorded. The card gets its buttons back.",
+                request_id,
+                refusal,
+            )
+            _write_the_refusal_down_for(
+                _publication_store_for(self._deps, build_id),
+                deps=self._deps,
+                build_id=build_id,
+                holder=f"merge-press:{os.getpid()}:{uuid.uuid4().hex[:8]}",
+                feature_id=str(attempt.offer.get("feature_id") or ""),
+                repo=str(attempt.offer.get("repo") or ""),
+                decided_by=payload.decided_by,
+                target_branch=None,
+                refusal=f"the approval was refused: {refusal}",
+            )
+            if attempt.definitive:
+                await release_the_offers_own_preview(
+                    self._deps.review_preview,
+                    attempt.offer,
+                    reason=f"approval refused: {refusal}",
+                )
+            await self._describe(build_id)
+            return None
+        logger.warning(
+            "merge-executor: refusing %s — %s",
+            request_id,
+            {
+                "already-decided": "a decision is already on record",
+                "no-offer": "no durable merge offer is on record",
+                "changed": "the latest offer carries a different request_id",
+            }.get(attempt.outcome, attempt.outcome),
+        )
+        await self._describe(build_id)
+        return None
 
     async def _run_approved(
         self,

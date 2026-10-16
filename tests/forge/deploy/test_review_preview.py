@@ -46,7 +46,9 @@ from forge.deploy.review_preview import (
     probe_preview_link,
     remove_preview_resources,
     remove_preview_tree,
+    is_slots_busy,
     serve_preview_operation,
+    slots_busy_reason,
     store_evidence_once,
 )
 from forge.deploy.stage import DeployStageResult
@@ -500,7 +502,9 @@ async def test_two_concurrent_preparations_get_different_slots(world: World) -> 
 
 
 @pytest.mark.asyncio
-async def test_with_every_slot_held_it_waits_then_fails_in_plain_words(world: World) -> None:
+async def test_with_every_slot_held_it_fails_at_once_in_plain_words(world: World) -> None:
+    """A card never waits for a slot (16 October 2026): it goes out at once,
+    naming who holds the slots, and offers Rebuild preview."""
     await world.service.prepare(_request("build-1", "FEAT-AB12"))
     await world.service.prepare(_request("build-2", "FEAT-CD34"))
     world.dispatch.calls.clear()
@@ -508,10 +512,13 @@ async def test_with_every_slot_held_it_waits_then_fails_in_plain_words(world: Wo
     third = await world.service.prepare(_request("build-3", "FEAT-EF56"))
 
     assert third.state == "failed"
-    assert third.failure_reason == "no preview slot came free within 30 minutes"
+    assert third.failure_reason == (
+        "both preview slots are in use by FEAT-AB12 and FEAT-CD34"
+    )
+    assert is_slots_busy(third.failure_reason)
     assert third.app_url is None and third.report_url is None
-    assert world.clock.now - START >= timedelta(minutes=30)
-    assert len(world.clock.sleeps) >= 2
+    assert world.clock.now == START  # nothing waited
+    assert world.clock.sleeps == []
     assert world.dispatch.calls == []  # nothing was stood up
     assert "pv000000000003" in world.venue.named("remove_tree")
     assert world.lease("pv000000000003").state == "failed"
@@ -519,22 +526,48 @@ async def test_with_every_slot_held_it_waits_then_fails_in_plain_words(world: Wo
 
 
 @pytest.mark.asyncio
-async def test_a_slot_that_comes_free_while_waiting_is_taken(world: World) -> None:
+async def test_making_room_never_takes_a_preview_no_offer_names(world: World) -> None:
+    """A Rebuild press may take only a ready preview its card's committed offer
+    names; these two have no card at all, so both are kept."""
     await world.service.prepare(_request("build-1", "FEAT-AB12"))
     await world.service.prepare(_request("build-2", "FEAT-CD34"))
+    from dataclasses import replace as _replace
 
-    async def free_one() -> None:
-        if world.clock.now - START >= timedelta(minutes=5):
-            world.clock.on_sleep = None
-            await world.service.release(
-                feature_id="FEAT-AB12", build_id="build-1", reason="rejected"
-            )
+    third = await world.service.prepare(
+        _replace(_request("build-3", "FEAT-EF56"), make_room=True)
+    )
+    assert third.state == "failed" and is_slots_busy(third.failure_reason)
+    assert {lease.state for lease in world.store.live()} == {"ready"}
 
-    world.clock.on_sleep = free_one
-    third = await world.service.prepare(_request("build-3", "FEAT-EF56"))
-    assert third.state == "ready", third.failure_reason
-    assert third.app_url.startswith("https://preview.example.test:8950/")
-    assert world.clock.now - START < timedelta(minutes=30)
+
+def test_slots_busy_reason_names_who_holds_them() -> None:
+    assert slots_busy_reason(["FEAT-A"], 1) == "the preview slot is in use by FEAT-A"
+    assert slots_busy_reason(["FEAT-A", "FEAT-A"], 2) == (
+        "both preview slots are in use by FEAT-A"
+    )
+    assert slots_busy_reason(["FEAT-A", "FEAT-B", "FEAT-C"], 3) == (
+        "all 3 preview slots are in use by FEAT-A, FEAT-B and FEAT-C"
+    )
+    assert slots_busy_reason([], 2) == "both preview slots are in use by other cards"
+    assert not is_slots_busy("the preview could not be started")
+
+
+@pytest.mark.asyncio
+async def test_every_lease_write_moves_its_card_s_counter(
+    world: World, connection: sqlite3.Connection
+) -> None:
+    from forge.lifecycle.card_revisions import card_revision
+
+    told: list[str] = []
+    world.service.set_card_listener(told.append)
+    await world.service.prepare(_request("build-1", "FEAT-AB12"))
+    after_prepare = card_revision(connection, "build-1")
+    # The slot taken (preparing), the folders written down, then ready.
+    assert after_prepare == 3
+    assert told == ["build-1"] * 3
+    await world.service.release(feature_id="FEAT-AB12", build_id="build-1", reason="r")
+    assert card_revision(connection, "build-1") == after_prepare + 1
+    assert card_revision(connection, "build-2") == 0
 
 
 @pytest.mark.asyncio
@@ -1213,7 +1246,7 @@ async def test_a_preview_whose_lease_has_ended_is_not_approvable(world: World) -
     refusal = world.service.approval_refusal(ready, now=START)
     assert refusal == (
         "the preview for this offer is no longer running (rejected), so it cannot "
-        "be approved — reject it and run the feature again"
+        "be approved"
     )
 
 
@@ -2003,23 +2036,25 @@ async def _cancel_when(world: World, blocked: "asyncio.Event", task: "asyncio.Ta
 
 
 @pytest.mark.asyncio
-async def test_cancelled_while_waiting_for_a_slot(world: World) -> None:
-    await world.service.prepare(_request("build-1", "FEAT-AB12"))
-    await world.service.prepare(_request("build-2", "FEAT-CD34"))
+async def test_cancelled_before_it_holds_a_slot(world: World) -> None:
+    """Cancelled during the join, before any slot is held (there is no longer
+    a wait for a slot to be cancelled in)."""
     blocked = asyncio.Event()
+    laid = world.venue.lay_out
 
-    async def hold() -> None:
+    async def lay_out(lease_id: str, *, onto: str, candidate: str) -> Any:
+        await laid(lease_id, onto=onto, candidate=candidate)
         blocked.set()
         await asyncio.Event().wait()
 
-    world.clock.on_sleep = hold
+    world.venue.lay_out = lay_out
     task = asyncio.create_task(world.service.prepare(_request("build-3", "FEAT-EF56")))
     await _cancel_when(world, blocked, task)
 
-    lease = world.lease("pv000000000003")
+    lease = world.lease("pv000000000001")
     assert (lease.state, lease.reason) == ("failed", "the preparation was cancelled")
     assert lease.slot is None
-    assert "pv000000000003" in world.venue.named("remove_tree")
+    assert "pv000000000001" in world.venue.named("remove_tree")
 
 
 @pytest.mark.asyncio
