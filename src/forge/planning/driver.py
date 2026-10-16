@@ -140,7 +140,6 @@ from forge.planning.code_evidence import (
 from forge.planning.example_review import (
     ExampleReview,
     ExampleWords,
-    check_quotes,
     merge_reviews,
     read_example_words,
     reading_of,
@@ -1263,25 +1262,16 @@ _ASSUMPTION_REVIEW_AUTHOR = "planning-driver (assumption review)"
 _EXAMPLE_REVIEW_AUTHOR = "planning-driver (spec example check)"
 
 #: The one closing instruction when the assumption review and the spec example
-#: check both send something back in the shared rewrite.
+#: check both send something back in the shared rewrite. Since 16 October 2026
+#: it never asks for the request's words copied exactly: the # Why: line names
+#: the part of the request in any words, and the example asks for no more.
 _SHARED_REVIEW_NOTE_CLOSING = (
     "Remove these assumptions and every worked example that depends on them. "
     "Remove each worked example listed above unless the request needs it; if you "
-    "keep one, quote the words of the request that need it in its # Why: line. "
-    "Remove any assumption written only for an example you remove. Do not add "
-    "other assumptions or examples of the same kind. Change nothing else."
-)
-
-#: The same closing once the quote check runs (6 October 2026): the quote is
-#: asked for copied exactly, and the example asks for no more than it.
-_SHARED_REVIEW_NOTE_CLOSING_EXACT_QUOTES = (
-    "Remove these assumptions and every worked example that depends on them. "
-    "Remove each worked example listed above unless the request needs it; if you "
-    "keep one, quote the words of the request that need it in its # Why: line, "
-    "copied exactly, in double quotes, and the example asks for nothing more than "
-    "those words do. Remove any assumption written only for an example you "
-    "remove. Do not add other assumptions or examples of the same kind. Change "
-    "nothing else."
+    "keep one, say in its # Why: line which part of the request needs it, and "
+    "the example asks for nothing more than that part does. Remove any "
+    "assumption written only for an example you remove. Do not add other "
+    "assumptions or examples of the same kind. Change nothing else."
 )
 
 #: The spec card's line when the project's ``spec_examples:`` block is there
@@ -1292,14 +1282,6 @@ _EXAMPLE_WORDS_UNREADABLE_CARD_LINE = (
     "not be read ({reason}), so the worked examples were not checked against it."
 )
 
-#: The spec card's line when most worked examples quote nothing in their
-#: ``# Why:`` line (6 October 2026): a writer that does not quote yet, so the
-#: quotes were not held against the request for that draft.
-_EXAMPLE_QUOTES_GUARD_CARD_LINE = (
-    "Most worked examples do not quote the request in their # Why: line, so "
-    "their quotes were not checked."
-)
-
 #: The spec card's line when the spec writer's checker was asked whether each
 #: example follows from the request and gave no answer (6 October 2026).
 _EXAMPLE_READING_NO_VERDICT_CARD_LINE = (
@@ -1307,7 +1289,7 @@ _EXAMPLE_READING_NO_VERDICT_CARD_LINE = (
 )
 
 #: The file the spec writer puts beside the spec with its checker's reading
-#: of whether each example asks for more than the words it quotes.
+#: of whether each example asks for more than the request does.
 _EXAMPLE_SUPPORT_FILE = "example_support.json"
 
 #: The author stamped on the one note the PLAN review sends (2026-09-15,
@@ -3995,7 +3977,7 @@ class PlanningRunDriver:
         )
         if coherence_warning is not None:
             draft["coherence_warning"] = coherence_warning
-        # WHETHER EACH EXAMPLE ASKS FOR MORE THAN ITS QUOTE (6 October 2026):
+        # WHETHER EACH EXAMPLE ASKS FOR MORE THAN THE REQUEST (6 October 2026):
         # the spec writer's checker's reading, from THIS reply, beside the
         # contradiction; the example check reads it from the draft.
         example_support = self._capture_example_support(role_output, correlation_id)
@@ -4361,11 +4343,11 @@ class PlanningRunDriver:
         # THE SPEC EXAMPLE CHECK (4 October 2026) shares this step's one
         # rewrite: an example about something the request does not mention,
         # by the project's own declared words, goes back with the flagged
-        # assumptions in the same note. Since 6 October 2026 two more checks
-        # share it for every project, list or none, once the spec writer's
-        # checker sends its example_support.json: an example whose # Why:
-        # line quotes no words of the request, and one the checker reads as
-        # asking for more than its quote. Without that file, nothing changes.
+        # assumptions in the same note. Since 6 October 2026 one more check
+        # shares it for every project, list or none, once the spec writer's
+        # checker sends its example_support.json: an example the checker reads
+        # as asking for more than the request does. Without that file, nothing
+        # changes. (The # Why: exact-quote check went on 16 October 2026.)
         examples = await self._check_the_examples_first(
             correlation_id, draft, repo_path=repo_path, request_text=request_text, notes=notes
         )
@@ -4586,16 +4568,16 @@ class PlanningRunDriver:
         """The first draft's examples held against the request and the
         owner's notes so far.
 
-        Three checks, merged into one review (6 October 2026): the words the
-        project declares, when it declares some; whether each example's
-        ``# Why:`` line quotes words really in the request, a note or a
-        project document the writer was given; and the spec writer's
-        checker's reading of whether each example asks for more than its
-        quote. The last two run for every project, but ONLY for a draft that
-        carries the checker's ``example_support.json``: the spec writer writes
-        it, and quotes the request, only once its own switch is on. Without it
-        this is the 4 October check exactly: ``None`` when the project
-        declares no list, and the same note, card and receipt.
+        Two checks, merged into one review (6 October 2026): the words the
+        project declares, when it declares some; and the spec writer's
+        checker's reading of whether each example asks for more than the
+        request does. The second runs for every project, but ONLY for a draft
+        that carries the checker's ``example_support.json``: the spec writer
+        writes it only once its own switch is on. Without it this is the
+        4 October check exactly: ``None`` when the project declares no list,
+        and the same note, card and receipt. (A third check, that each
+        ``# Why:`` line quoted the request exactly, was removed on 16 October
+        2026.)
 
         What the card is later measured against is kept for the run, so
         :meth:`_open_the_card_with` can name what the rewrite removed and
@@ -4617,23 +4599,18 @@ class PlanningRunDriver:
                 "new_checks": False,
             }
             return first
-        documents, _broken = self._recorded_project_documents(correlation_id)
         state: dict[str, Any] = {
             "words": words,
             "request_text": request_text,
             "notes": [str(note) for note in notes],
-            "documents": [document.text for document in documents],
         }
-        first, quotes, reading = self._examples_reviewed(state, draft)
+        first, reading = self._examples_reviewed(state, draft)
         state.update(
             {
                 "new_checks": True,
                 "first": first,
-                "first_quotes": quotes,
                 "first_reading": reading,
-                "quotes_ran": quotes.checked,
                 "reading_ran": reading["status"] == "checked",
-                "guard_fired": quotes.guard_fired,
             }
         )
         self.__dict__.setdefault("_example_review_runs", {})[correlation_id] = state
@@ -4672,9 +4649,9 @@ class PlanningRunDriver:
     @staticmethod
     def _examples_reviewed(
         state: Mapping[str, Any], draft: Mapping[str, Any]
-    ) -> tuple[ExampleReview, Any, dict[str, Any]]:
-        """One draft's merged review, its quote check and the checker's
-        reading, from the inputs kept for the run."""
+    ) -> tuple[ExampleReview, dict[str, Any]]:
+        """One draft's merged review and the checker's reading, from the
+        inputs kept for the run."""
         feature_text = str((draft.get("card") or {}).get("worked_examples") or "")
         words: ExampleWords = state["words"]
         titles = [title for title, _ in worked_examples_in(feature_text)]
@@ -4688,10 +4665,6 @@ class PlanningRunDriver:
             if words.kinds is not None
             else None
         )
-        quotes = check_quotes(
-            feature_text,
-            sources=[state["request_text"], *state["notes"], *state["documents"]],
-        )
         support = draft.get("example_support")
         status, goes_beyond = reading_of(support, titles)
         reading = {
@@ -4704,22 +4677,20 @@ class PlanningRunDriver:
             if isinstance(support, Mapping)
             else [],
         }
-        merged = merge_reviews(
-            titles, project, untraced=quotes.untraced, goes_beyond=goes_beyond
-        )
-        return merged, quotes, reading
+        merged = merge_reviews(titles, project, goes_beyond=goes_beyond)
+        return merged, reading
 
     def _example_review_lines(
         self, correlation_id: str, final_draft: Mapping[str, Any]
     ) -> tuple[list[str], dict[str, Any] | None]:
         """The card's lines about the examples, and the run's receipt.
 
-        The final draft is checked again by all three checks: an example
-        flagged at first and gone now was removed; one flagged now was kept.
-        A project list that is there and could not be read is said in one
-        line, and the other two checks still run (6 October 2026).
+        The final draft is checked again by both checks: an example flagged
+        at first and gone now was removed; one flagged now was kept. A
+        project list that is there and could not be read is said in one line,
+        and the checker's reading is still used (6 October 2026).
 
-        Those two checks run only when a draft carried the checker's
+        The checker's reading is used only when a draft carried its
         ``example_support.json``; otherwise this is the 4 October card and
         receipt, word for word."""
         state = (self.__dict__.get("_example_review_runs") or {}).get(correlation_id)
@@ -4728,37 +4699,21 @@ class PlanningRunDriver:
         words: ExampleWords = state["words"]
         if not state.get("new_checks") and final_draft.get("example_support") is None:
             return self._project_words_lines(state, final_draft.get("card") or {})
-        if not state.get("new_checks"):
-            # Only the final draft carries the checker's file: the run's
-            # inputs for the two new checks, kept now.
-            documents, _broken = self._recorded_project_documents(correlation_id)
-            state = {**state, "documents": [document.text for document in documents]}
         lines: list[str] = []
         if words.unreadable:
             lines.append(_EXAMPLE_WORDS_UNREADABLE_CARD_LINE.format(reason=words.unreadable))
         first: ExampleReview | None = state["first"]
-        final, quotes, reading = self._examples_reviewed(state, final_draft)
+        final, reading = self._examples_reviewed(state, final_draft)
         lines += final.card_lines(first)
-        if quotes.guard_fired:
-            lines.append(_EXAMPLE_QUOTES_GUARD_CARD_LINE)
         if reading["status"] == "no_verdict":
             lines.append(_EXAMPLE_READING_NO_VERDICT_CARD_LINE)
-        first_quotes = state.get("first_quotes")
         receipt: dict[str, Any] = {
             "checked": bool(
                 words.kinds is not None
-                or state.get("quotes_ran")
-                or quotes.checked
                 or state.get("reading_ran")
                 or reading["status"] == "checked"
             ),
             "project_words": words.receipt(),
-            "quotes": {
-                "checked": bool(state.get("quotes_ran") or quotes.checked),
-                "guard_fired": bool(state.get("guard_fired") or quotes.guard_fired),
-                "first": first_quotes.receipt() if first_quotes is not None else None,
-                "final": quotes.receipt(),
-            },
             "reading": {
                 "status": reading["status"],
                 "first": state.get("first_reading"),
@@ -4780,12 +4735,7 @@ class PlanningRunDriver:
             "something the request did not ask for:"
         ]
         lines += [f"- {finding.assumption_id}: {finding.sentence}" for finding in review.findings]
-        closing = (
-            _SHARED_REVIEW_NOTE_CLOSING_EXACT_QUOTES
-            if examples.asks_for_exact_quotes
-            else _SHARED_REVIEW_NOTE_CLOSING
-        )
-        lines += ["", *examples.listed(), "", closing]
+        lines += ["", *examples.listed(), "", _SHARED_REVIEW_NOTE_CLOSING]
         return "\n".join(lines)
 
     @staticmethod

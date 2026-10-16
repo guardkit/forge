@@ -14,6 +14,9 @@ What this file proves:
   knows about web APIs;
 * no list means no check, and a list that is there but cannot be read says so;
 * the note never asks for removal without "unless the request needs it";
+* no note asks for the request's words copied exactly (16 October 2026): a
+  faithful paraphrase in a # Why: line is not flagged, while an example that
+  asks for more than the request is, whatever its # Why: line says;
 * the measured results are reproduced on a small saved sample, loaded from
   the project's declaration in a fixture file through the real reader.
 """
@@ -28,15 +31,11 @@ import pytest
 import yaml
 
 from forge.planning.example_review import (
-    QUOTE_KIND,
     READING_KIND,
     ExampleReview,
-    check_quotes,
     example_words_from,
     merge_reviews,
     reading_of,
-    untraced_examples,
-    why_lines_in,
     read_example_words,
     review_examples,
     worked_examples_in,
@@ -454,10 +453,11 @@ def test_the_note_names_each_example_and_never_orders_removal_outright(web_api_k
         '- "A POST request to the endpoint is rejected" (another request method)\n'
         '- "The endpoint fails gracefully when the database is unavailable" (a dependency being down)\n'
         "\n"
-        "Remove each one unless the request needs it. If you keep one, quote the words of "
-        "the request that need it in its # Why: line. Remove any assumption written only "
-        "for an example you remove. Do not add other examples of the same kind. Keep every "
-        "other worked example exactly as it is."
+        "Remove each one unless the request needs it. If you keep one, say in its # Why: "
+        "line which part of the request needs it, and the example asks for nothing more "
+        "than that part does. Remove any assumption written only for an example you "
+        "remove. Do not add other examples of the same kind. Keep every other worked "
+        "example exactly as it is."
     )
     for sentence in note.split(". "):
         if "remove" in sentence.lower():
@@ -532,15 +532,20 @@ def test_the_measured_results_are_reproduced_from_the_declared_file(tmp_path: Pa
 
 
 # ---------------------------------------------------------------------------
-# The quote is real (6 October 2026, planning improvements item 4): each
-# example's # Why: line must quote at least three words really in the
-# request, an owner's note or a project document. No project words needed.
+# No exact wording (16 October 2026). A # Why: line says which part of the
+# request the example serves, in the request's words or its own. Rich: "insists
+# on exact wording from an LLM generated text is just never going to be
+# reliable so I don't think insisting on exact wording makes sense". What is
+# still checked is the meaning: the checker's reading of whether the example
+# asks for more than the request does, and the project's own words.
 # ---------------------------------------------------------------------------
 
 DELETE_REQUEST = (
     "Add a REMOVE /things/{thing_id} endpoint that returns 204 on success, and "
     "make removed things disappear from all the tally reports."
 )
+
+BLANK_TITLE_REQUEST = "Refuse to create a note with an empty or blank title."
 
 
 def _quoted(*scenarios: tuple[str, str]) -> str:
@@ -550,76 +555,6 @@ def _quoted(*scenarios: tuple[str, str]) -> str:
             lines.append(f"  # Why: {why}")
         lines += ["  @key-example", f"  Scenario: {title}", "    When it runs", "    Then it works", ""]
     return "\n".join(lines)
-
-
-def test_the_why_line_above_each_heading_is_read_in_order() -> None:
-    feature = (
-        "Feature: x\n"
-        "  # a comment about nothing\n"
-        "  # Why: \"one two three\"\n"
-        "  # and it goes on\n"
-        "  @tag\n"
-        "  Scenario: First\n"
-        "    Given a\n"
-        "  # Divider\n"
-        "    When b\n"
-        "\n"
-        "  Scenario Outline: Second\n"
-        "    Given <x>\n"
-        "    Examples:\n"
-        "      | x |\n"
-    )
-    assert why_lines_in(feature) == [('First', 'Why: "one two three" and it goes on'), ("Second", "")]
-    assert [title for title, _ in why_lines_in(feature)] == [t for t, _ in worked_examples_in(feature)]
-
-
-def test_straight_and_curly_quotes_of_the_request_are_traced() -> None:
-    feature = _quoted(
-        ("A", '"make removed things disappear"'),
-        ("B", "the request says \u201cdisappear from all the tally reports\u201d"),
-        ("C", '"Returns 204 on success!"'),
-    )
-    assert untraced_examples(feature, sources=[DELETE_REQUEST]) == []
-
-
-def test_a_quote_under_three_words_is_not_enough() -> None:
-    feature = _quoted(("A", '"removed things"'), ("B", '"make removed things disappear"'))
-    assert untraced_examples(feature, sources=[DELETE_REQUEST]) == ["A"]
-
-
-def test_a_quote_found_in_a_note_or_a_project_document_is_traced() -> None:
-    feature = _quoted(
-        ("From the note", '"also show the empty case"'),
-        ("From the document", '"every report is read only"'),
-        ("From nowhere", '"survives a restart of the service"'),
-    )
-    sources = [DELETE_REQUEST, "Also show the empty case.", "# Rules\nEvery report is read-only."]
-    assert untraced_examples(feature, sources=sources) == ["From nowhere"]
-
-
-def test_a_quote_not_in_any_source_and_a_missing_why_are_untraced() -> None:
-    feature = _quoted(
-        ("Real", '"make removed things disappear"'),
-        ("Invented", '"the request asks for concurrent reads"'),
-        ("Silent", ""),
-        ("Real again", '"returns 204 on success"'),
-    )
-    assert untraced_examples(feature, sources=[DELETE_REQUEST]) == ["Invented", "Silent"]
-    check = check_quotes(feature, sources=[DELETE_REQUEST])
-    assert check.checked and not check.guard_fired
-    assert check.untraced == ("Invented", "Silent")
-
-
-def test_when_more_than_half_quote_nothing_the_guard_drops_the_findings() -> None:
-    feature = _quoted(
-        ("Real", '"make removed things disappear"'),
-        ("Silent one", ""),
-        ("Silent two", "because it matters"),
-    )
-    check = check_quotes(feature, sources=[DELETE_REQUEST])
-    assert check.guard_fired is True
-    assert check.untraced == ()
-    assert check.receipt() == {"examples": 3, "failed": 2, "guard_fired": True, "untraced": []}
 
 
 def test_the_checkers_reading_counts_only_a_checked_verdict_on_a_real_title() -> None:
@@ -636,11 +571,11 @@ def test_the_checkers_reading_counts_only_a_checked_verdict_on_a_real_title() ->
     assert reading_of(None, titles) == ("", [])
 
 
-def test_the_three_checks_merge_into_one_review_with_every_kind(web_api_kinds) -> None:
+def test_the_two_checks_merge_into_one_review_with_every_kind(web_api_kinds) -> None:
     feature = _quoted(
-        ("A POST request to the endpoint is rejected", '"the request asks for it"'),
+        ("A POST request to the endpoint is rejected", "the request asks for it"),
         ("A deletion survives a restart", '"make removed things disappear"'),
-        ("A count drops by exactly one", '"make removed things disappear"'),
+        ("A count drops by exactly one", "removed things leave the tallies"),
         ("Another real one", '"returns 204 on success"'),
     )
     project = review_examples(
@@ -652,34 +587,97 @@ def test_the_three_checks_merge_into_one_review_with_every_kind(web_api_kinds) -
     merged = merge_reviews(
         titles,
         project,
-        untraced=untraced_examples(feature, sources=[DELETE_REQUEST]),
         goes_beyond=["A deletion survives a restart", "A POST request to the endpoint is rejected"],
     )
     assert [(f.title, f.kinds) for f in merged.findings] == [
-        ("A POST request to the endpoint is rejected", (METHOD, QUOTE_KIND, READING_KIND)),
+        ("A POST request to the endpoint is rejected", (METHOD, READING_KIND)),
         ("A deletion survives a restart", (READING_KIND,)),
     ]
     assert merged.titles == titles
     lines = merged.card_lines(None)
     assert lines == [
         'Not asked for, but kept: "A POST request to the endpoint is rejected" (another '
-        "request method; it quotes no words of the request; it asks for more than the "
-        'words it quotes); "A deletion survives a restart" (it asks for more than the '
-        "words it quotes). If you approve, it will be built; to drop it, send a note."
+        "request method; it asks for more than the request does); "
+        '"A deletion survives a restart" (it asks for more than the request does). '
+        "If you approve, it will be built; to drop it, send a note."
     ]
 
 
-def test_only_a_merged_review_asks_for_the_quote_copied_exactly(web_api_kinds) -> None:
-    feature = _quoted(("A deletion survives a restart", ""), ("Real", '"make removed things disappear"'))
-    plain = review_examples(feature, request_text=DELETE_REQUEST, kinds=web_api_kinds)
-    assert "copied exactly" not in plain.note()
-    merged = merge_reviews(
-        [title for title, _ in worked_examples_in(feature)],
-        None,
-        untraced=untraced_examples(feature, sources=[DELETE_REQUEST]),
+def test_a_faithful_paraphrased_why_line_causes_no_rewrite_and_no_warning(web_api_kinds) -> None:
+    """The design's own case: "Why: blank titles must be refused" for "refuse
+    to create a note with an empty or blank title". Nothing is flagged, so
+    there is no rewrite note and no card line."""
+    feature = _quoted(
+        ("A note with a blank title is refused", "blank titles must be refused"),
+        ("A note with an empty title is refused", '"refuse to create a note with an empty"'),
     )
-    assert (
-        "quote the words of the request that need it in its # Why: line, copied "
-        "exactly, in double quotes, and the example asks for nothing more than "
-        "those words do. Remove any assumption"
-    ) in merged.note()
+    titles = [title for title, _ in worked_examples_in(feature)]
+    project = review_examples(feature, request_text=BLANK_TITLE_REQUEST, kinds=web_api_kinds)
+    status, beyond = reading_of({"status": "checked", "goes_beyond": []}, titles)
+    merged = merge_reviews(titles, project, goes_beyond=beyond)
+
+    assert status == "checked"
+    assert merged.findings == []
+    assert merged.card_lines(None) == []
+    assert merged.card_lines(merged) == []
+
+
+def test_an_added_example_is_still_flagged_whether_its_why_line_quotes_or_paraphrases(
+    web_api_kinds,
+) -> None:
+    """Something the request never asked for is flagged on its meaning: a
+    restart the checker reads as going beyond, with an exact quote or a
+    paraphrase above it, and an outage by the project's own words."""
+    feature = (
+        _quoted(
+            ("Quoted: a refused note survives a restart", '"refuse to create a note with an empty"'),
+            ("Paraphrased: a refused note survives a restart", "blank titles must be refused"),
+            ("A note with a blank title is refused", "blank titles must be refused"),
+        )
+        + "\n  # Why: blank titles must be refused\n"
+        "  Scenario: The service answers when the database is unavailable\n"
+        "    Given the database is unavailable\n"
+    )
+    titles = [title for title, _ in worked_examples_in(feature)]
+    project = review_examples(feature, request_text=BLANK_TITLE_REQUEST, kinds=web_api_kinds)
+    _status, beyond = reading_of(
+        {
+            "status": "checked",
+            "goes_beyond": [
+                {"title": "Quoted: a refused note survives a restart", "why": "restart"},
+                {"title": "Paraphrased: a refused note survives a restart", "why": "restart"},
+            ],
+        },
+        titles,
+    )
+    merged = merge_reviews(titles, project, goes_beyond=beyond)
+
+    assert [(f.title, f.kinds) for f in merged.findings] == [
+        ("Quoted: a refused note survives a restart", (READING_KIND,)),
+        ("Paraphrased: a refused note survives a restart", (READING_KIND,)),
+        ("The service answers when the database is unavailable", (DOWN,)),
+    ]
+    # Still sent back once, by the note, and still named on the card if kept.
+    assert "Paraphrased: a refused note survives a restart" in merged.note()
+    assert merged.card_lines(None)[0].startswith("Not asked for, but kept:")
+
+
+def test_no_note_asks_for_the_request_copied_exactly(web_api_kinds) -> None:
+    feature = _quoted(("A deletion survives a restart", ""), ("Real", "removed things disappear"))
+    titles = [title for title, _ in worked_examples_in(feature)]
+    plain = review_examples(
+        feature.replace("    When it runs", "    When a POST request is sent", 1),
+        request_text=DELETE_REQUEST,
+        kinds=web_api_kinds,
+    )
+    merged = merge_reviews(titles, plain, goes_beyond=["A deletion survives a restart"])
+    for review in (plain, merged):
+        note = review.note()
+        assert review.findings, "the note under test must have something to say"
+        assert "copied exactly" not in note
+        assert "double quotes" not in note
+        assert "quote" not in note.lower().replace('"', "")
+        assert (
+            "If you keep one, say in its # Why: line which part of the request "
+            "needs it, and the example asks for nothing more than that part does."
+        ) in note
