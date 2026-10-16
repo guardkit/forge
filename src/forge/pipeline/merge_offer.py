@@ -2659,7 +2659,7 @@ class MergeOfferService:
             return False
         return True
 
-    def _spawn(self, coro: Any) -> None:
+    def _start_card_task(self, coro: Any) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -2671,7 +2671,7 @@ class MergeOfferService:
 
     def _card_changed(self, build_id: str) -> None:
         """A lease of this build changed: describe its card at once."""
-        self._spawn(self.describe_card(build_id))
+        self._start_card_task(self.describe_card(build_id))
 
     async def rebuild_preview(self, *, build_id: str) -> str:
         """Rebuild the preview for the same candidate (a Rebuild press).
@@ -2912,7 +2912,7 @@ class MergeOfferService:
                 str(offer.get("repo") or ""), build_id=build_id, make_room=True
             ):
                 continue
-            self._spawn(self.rebuild_preview(build_id=build_id))
+            self._start_card_task(self.rebuild_preview(build_id=build_id))
 
 
 def _changes_of(offer: Mapping[str, Any]) -> list[Any] | None:

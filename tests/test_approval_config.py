@@ -370,6 +370,7 @@ class TestApprovalYamlRoundTrip:
                 "evidence_root": None,
                 "evidence_base_url": None,
                 "public_host": None,
+                "max_app_ttl_minutes": None,
             },
             "permissions": {
                 "filesystem": {
