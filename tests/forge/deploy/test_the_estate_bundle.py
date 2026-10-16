@@ -139,22 +139,68 @@ def _rendered(*extra: str, profiles: str | None = None) -> str:
     return done.stdout
 
 
-def _lines_naming_a_home(rendered: str) -> list[str]:
-    """The rendered lines that name a home directory, with the bundle's own
-    folder taken out first.
+#: The bundle's own files that compose.yaml binds from beside itself. Each
+#: renders as ``source: <absolute path of the checkout>/<name>``, and on a
+#: developer machine the checkout is under /home. That ONE line per file is the
+#: bundle, not anything of the machine.
+_THE_BUNDLES_OWN_BINDS = ("model-door.cfg",)
 
-    The bundle's own files, bound from beside compose.yaml (the model door's
-    settings, 14 October 2026), render as an absolute path to wherever the
-    bundle was checked out, and a developer's checkout lives under /home. That
-    folder is the bundle, not anything of the machine: it is replaced by
-    ``<the bundle>`` before looking. Only that exact folder is replaced, so any
-    OTHER home path (a socket, a state folder, a credential file) still shows.
-    """
+
+def _is_one_of_the_bundles_own_binds(line: str, bundle: Path = ESTATE) -> bool:
+    """True only for exactly ``source: <the bundle>/<a file it binds>``.
+
+    The whole line is compared, not a prefix or a substring, so a neighbour of
+    the bundle folder (``.../estate-private/credentials``), a path that climbs
+    out of it, or any other file inside it is still a home path."""
+    return line.strip() in {
+        f"source: {bundle / name}" for name in _THE_BUNDLES_OWN_BINDS
+    }
+
+
+def _lines_naming_a_home(rendered: str, bundle: Path = ESTATE) -> list[str]:
+    """The rendered lines that name a home directory, leaving out only the
+    binds of the bundle's own files (the model door's settings, 14 October
+    2026). Any OTHER home path (a socket, a state folder, a credential file,
+    a folder next to the bundle) is still returned."""
     return [
         line
-        for line in rendered.replace(str(ESTATE), "<the bundle>").splitlines()
-        if "/home/" in line
+        for line in rendered.splitlines()
+        if "/home/" in line and not _is_one_of_the_bundles_own_binds(line, bundle)
     ]
+
+
+class TestOnlyTheBundlesOwnBindIsExcused:
+    """The exception above is exactly one line per bundle file, nothing wider
+    (Codex review, 16 October 2026)."""
+
+    #: A checkout under a home directory, as on any developer machine, so
+    #: these hold wherever this checkout itself happens to be.
+    BUNDLE = Path("/home/dev/Projects/forge/deploy/estate")
+
+    def test_the_model_door_bind_is_excused(self) -> None:
+        line = f"        source: {self.BUNDLE / 'model-door.cfg'}"
+        assert _lines_naming_a_home(f"x:\n{line}\ny: 1\n", self.BUNDLE) == []
+
+    @pytest.mark.parametrize(
+        "source",
+        [
+            "/home/dev/Projects/forge/deploy/estate-private/credentials",
+            "/home/dev/Projects/forge/deploy/estate-private/model-door.cfg",
+            "/home/dev/Projects/forge/deploy/estate/../secrets/model-door.cfg",
+            "/home/dev/Projects/forge/deploy/estate/other.cfg",
+            "/home/dev/Projects/forge/deploy/estate/model-door.cfg.bak",
+            "/home/dev/Projects/forge/deploy/estate",
+            "/home/dev/.config/credentials",
+        ],
+    )
+    def test_anything_else_under_a_home_is_still_caught(self, source: str) -> None:
+        for line in (f"        source: {source}", f"      - {source}:/etc/x:ro"):
+            assert _lines_naming_a_home(line, self.BUNDLE) == [line]
+
+    def test_the_excused_bind_is_really_in_the_render(self, rendered: str) -> None:
+        """The exception names a line the bundle really renders; if the model
+        door's bind ever moves, this fails rather than excusing nothing."""
+        assert f"source: {ESTATE / 'model-door.cfg'}" in rendered
 
 
 def _service_block(rendered: str, service: str) -> str:
