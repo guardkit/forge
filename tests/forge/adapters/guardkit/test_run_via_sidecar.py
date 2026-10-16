@@ -703,6 +703,8 @@ class _ASidecarThatSays:
         (200, b'{"exit_code": 124, "stdout": "{\\"outcome\\": \\"refused\\"}", "timed_out": true}', "timeout"),
         (200, b'{"timed_out": true}', "timeout"),
         (200, b'{"exit_code": 1, "stdout": "{\\"outcome\\": \\"refused\\"}"}', "answered"),
+        # Codex round 10, R18: only a 4xx is a refusal; a 3xx with a sentence is not.
+        (302, b'{"error": "request redirected"}', "lost"),
     ],
     ids=[
         "refusal-in-its-own-words",
@@ -714,6 +716,7 @@ class _ASidecarThatSays:
         "timed-out-with-a-report",
         "timed-out-with-nothing-else",
         "an-ordinary-red-answer",
+        "3xx-with-a-sentence",
     ],
 )
 async def test_the_merge_client_says_what_kind_of_answer_it_was(

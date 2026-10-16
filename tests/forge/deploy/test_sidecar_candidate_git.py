@@ -419,6 +419,8 @@ class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
             # Codex R9: a 5xx is an error met while the operation may have
             # been under way, whatever its sentence.
             (500, {"error": "sidecar git error: OSError: the disk went away"}),
+            # Codex round 10, R18: only a 4xx is a refusal.
+            (302, {"error": "request redirected"}),
         ],
         ids=[
             "empty-200",
@@ -426,6 +428,7 @@ class TestAnAnswerThatIsNotTheOperationsOwnIsNoAnswer:
             "refusal-with-no-sentence",
             "not-an-object",
             "5xx-with-a-sentence",
+            "3xx-with-a-sentence",
         ],
     )
     async def test_malformed_replies(self, status: int, body: object) -> None:

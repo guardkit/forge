@@ -225,7 +225,7 @@ class SidecarScriptRunner:
                 )
             # Only a refusal BEFORE running is an answer, and only a 4xx is
             # one: any 5xx, whatever its body, is no answer (15 October 2026).
-            detail = refusal_sentence_in(payload) if exc.code < 500 else None
+            detail = refusal_sentence_in(payload) if 400 <= exc.code < 500 else None
             if detail is None:
                 return NoAnswer(
                     f"sidecar answered HTTP {exc.code} with no refusal it "

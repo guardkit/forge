@@ -533,7 +533,7 @@ def build_sidecar_guardkit_run(
             # sentence — is an answer nobody can read.
             # Any 5xx is an error met while the command may have been running.
             error = parsed.get("error") if isinstance(parsed, dict) else None
-            told = status < 500 and isinstance(error, str) and bool(error.strip())
+            told = 400 <= status < 500 and isinstance(error, str) and bool(error.strip())
             return _failed_result(
                 detail=(
                     f"the deploy sidecar refused to run the merge "

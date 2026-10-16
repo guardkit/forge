@@ -190,7 +190,7 @@ class SidecarCandidateGit:
             # 5xx is an error met while the operation may have been under way
             # (15 October 2026).
             error = decoded.get("error")
-            told = status < 500 and isinstance(error, str) and bool(error.strip())
+            told = 400 <= status < 500 and isinstance(error, str) and bool(error.strip())
             return None, self._sentence(route, answer), told
         if not valid(decoded):
             return None, (

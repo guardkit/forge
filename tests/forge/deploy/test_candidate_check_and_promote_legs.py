@@ -1693,3 +1693,41 @@ class TestAnOwnedDeployRefusalIsConfirmedOnlyInItsOwnShape:
         finally:
             sidecar.close()
         assert getattr(answer, "confirmed", False) is confirmed
+
+
+class TestOnlyA4xxIsARefusal:
+    """15 October 2026, Codex round 10, R18: a 3xx carrying a sentence is not
+    the sidecar's refusal before running, so it is no answer."""
+
+    def test_the_script_runner(self) -> None:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
+
+        sidecar = _ASidecarThatRefusesWith(302, b'{"error": "request redirected"}')
+        try:
+            answer = SidecarScriptRunner(base_url=sidecar.url, repo="guardkit/api_test")(
+                cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=1
+            )
+        finally:
+            sidecar.close()
+        assert no_answer_came_back(answer)
+        assert getattr(answer, "confirmed", False) is False
+
+    def test_the_live_gate_invoker(self, tmp_path) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        tree = tmp_path / ".forge-candidates" / "FEAT-TF"
+        tree.mkdir(parents=True)
+        sidecar = _ASidecarThatRefusesWith(302, b'{"error": "request redirected"}')
+        try:
+            answer = SidecarLiveGateInvoker(
+                base_url=sidecar.url,
+                repo="guardkit/api_test",
+                repo_path=tree,
+                driver_argv=["python3", "qa/gate.py"],
+                timeout_seconds=1,
+            ).invoke(feature="FEAT-TF", target="apitest-sbx")
+        finally:
+            sidecar.close()
+        assert answer.answer_lost is True
+        assert answer.confirmed is False
+
