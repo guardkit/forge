@@ -360,8 +360,11 @@ def test_forge_serve_arfs_inside_image() -> None:
             "docker",
             "run",
             "--rm",
-            "forge:production-validation",
+            # The image's entrypoint is ``forge`` (CMD ``serve``); without
+            # this override the reply is "No such command 'python'".
+            "--entrypoint",
             "python",
+            "forge:production-validation",
             "-c",
             snippet,
         ],

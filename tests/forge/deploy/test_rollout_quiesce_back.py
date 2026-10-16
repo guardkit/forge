@@ -1,14 +1,15 @@
-"""Owned offline tests; no real broker client may even be imported."""
-import sys,types,importlib.abc,importlib.machinery,importlib.util
-class NoClient(importlib.abc.MetaPathFinder):
-    def find_spec(self,name,path=None,target=None):
-        if name=='nats' or name.startswith('nats.') or name=='nats_core.client':raise AssertionError('real broker client import')
-sys.meta_path.insert(0,NoClient())
-if 'nats_core.client' not in sys.modules:
-    mock=types.ModuleType('nats_core.client');mock.__rollout_mock__=True
-    def forbidden(*a,**k):raise AssertionError('broker client use')
-    mock.NATSClient=forbidden;mock.NATSKVManifestRegistry=forbidden;sys.modules['nats_core.client']=mock
-assert getattr(sys.modules['nats_core.client'],'__rollout_mock__',False)
+"""Owned offline tests; no broker is reached.
+
+The rollout scripts' own import guard (rollout-quiesce's GUARD, used in every
+container they start) is proved in a fresh interpreter by
+test_fresh_process_import_guard_and_h6_source. In this process the
+no_broker_connection fixture makes any connection attempt fail. Until 16
+October 2026 this file put a refusing import hook and a mock client into the
+interpreter when it was imported, and asserted the mock was in place: in a
+whole-suite run another module had already loaded the real client, so the file
+never collected, and the hook stayed installed for every later test.
+"""
+import sys,importlib.machinery,importlib.util
 import json,os,sqlite3,subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -22,6 +23,13 @@ HERE=Path(__file__).resolve().parents[3]/'deploy/estate'
 def module(name):
     loader=importlib.machinery.SourceFileLoader('test_'+name,str(HERE/name));spec=importlib.util.spec_from_loader(loader.name,loader);m=importlib.util.module_from_spec(spec);loader.exec_module(m);return m
 b=module('rollout-back');q=b.q;r=q.r
+
+@pytest.fixture(autouse=True)
+def no_broker_connection(monkeypatch):
+    import nats
+    import nats.aio.client
+    def refuse(*a,**k):raise AssertionError('broker connection')
+    monkeypatch.setattr(nats,'connect',refuse);monkeypatch.setattr(nats.aio.client.Client,'connect',refuse)
 
 def monitor(pending=0,ack=0):
     return {'account_details':[{'name':'factory','stream_detail':[{'name':'PIPELINE','consumer_detail':[{'name':name,'num_pending':pending,'num_ack_pending':ack} for name in ('forge-serve','forge-serve-planning')]}]}]}

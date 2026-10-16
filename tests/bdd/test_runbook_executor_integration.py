@@ -4,21 +4,28 @@ Validates that lifecycle events are published to a real NATS broker and
 observed by a subscriber in the correct order:
   runbook-started → step-started/step-result (per step) → runbook-complete
 
-These tests are marked `@integration @slow` and excluded from the default
-pytest run. Run explicitly with: pytest -m "integration and slow"
+These tests are marked `@integration @slow`; select them alone with
+pytest -m "integration and slow". They talk to a throwaway ``nats-server``
+started in its own container on a random local port (label
+``forge.test=runbook-executor``) and removed afterwards, never to any other
+NATS server. When Docker or the image is not available they are skipped.
 """
 
 from __future__ import annotations
 
 import asyncio
-import os
+import shutil
 import sqlite3
+import subprocess
+import time
+from collections.abc import AsyncIterator, Iterator
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+import pytest_asyncio
 
 from forge.executor.executor import RunbookExecutor
 from forge.executor.registry import StepOutcome, StepTypeRegistry
@@ -39,33 +46,94 @@ from nats_core.events import (
 # ---------------------------------------------------------------------------
 
 
-@pytest.fixture
-def nats_url() -> str:
-    """NATS server URL from environment or default localhost.
+#: The image the estate's bus is built from; any plain nats-server will do.
+BROKER_IMAGE = "nats:2.11-alpine"
+TEST_LABEL = "forge.test=runbook-executor"
 
-    Tests skip if NATS server is not available.
+
+async def _connect(url: str):
+    import nats
+
+    return await nats.connect(
+        servers=[url],
+        connect_timeout=2,
+        allow_reconnect=False,
+        max_reconnect_attempts=0,
+    )
+
+
+@pytest.fixture(scope="module")
+def nats_url() -> Iterator[str]:
+    """A throwaway nats-server of this module's own, on a random local port.
+
+    Until 16 October 2026 this read ``NATS_URL`` (default localhost:4222). The
+    suite's conftest points that at an unroutable address so no test can reach
+    a live broker, and the async fixture below was declared with plain
+    ``@pytest.fixture``, which strict pytest-asyncio refuses, so neither test
+    ever ran. Skipped only when Docker or the image is not available here.
     """
-    return os.getenv("NATS_URL", "nats://localhost:4222")
-
-
-@pytest.fixture
-async def nats_client(nats_url: str):
-    """Real NATS client connection.
-
-    Skips the test if connection fails (broker not available).
-    """
+    pytest.importorskip("nats")
+    if shutil.which("docker") is None:
+        pytest.skip("docker is not installed, so no throwaway broker can start")
+    probe = subprocess.run(
+        ["docker", "image", "inspect", BROKER_IMAGE],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if probe.returncode != 0:
+        pytest.skip(f"docker image {BROKER_IMAGE} is not available locally")
+    started = subprocess.run(
+        [
+            "docker", "run", "-d", "--rm",
+            "--label", TEST_LABEL,
+            "-p", "127.0.0.1::4222",
+            BROKER_IMAGE,
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if started.returncode != 0:
+        pytest.skip(f"could not start {BROKER_IMAGE}: {started.stderr.strip()}")
+    container_id = started.stdout.strip()
     try:
-        import nats
-    except ImportError:
-        pytest.skip("nats-py not installed")
+        port_line = subprocess.run(
+            ["docker", "port", container_id, "4222/tcp"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.splitlines()[0]
+        url = f"nats://127.0.0.1:{port_line.rsplit(':', 1)[1]}"
 
-    try:
-        nc = await nats.connect(nats_url, connect_timeout=2)
-    except Exception as e:
-        pytest.skip(f"NATS broker not available at {nats_url}: {e}")
+        async def _wait_ready() -> None:
+            deadline = time.monotonic() + 15
+            while True:
+                try:
+                    nc = await _connect(url)
+                except Exception:  # noqa: BLE001 - the server is still starting
+                    if time.monotonic() > deadline:
+                        raise
+                    await asyncio.sleep(0.2)
+                    continue
+                await nc.close()
+                return
 
+        asyncio.run(_wait_ready())
+        yield url
+    finally:
+        subprocess.run(
+            ["docker", "rm", "-f", container_id],
+            capture_output=True,
+            check=False,
+        )
+
+
+@pytest_asyncio.fixture
+async def nats_client(nats_url: str) -> AsyncIterator[object]:
+    """A real NATS client connected to the throwaway broker."""
+    nc = await _connect(nats_url)
     yield nc
-
     await nc.close()
 
 
@@ -122,6 +190,7 @@ def create_integration_runbook(
 
 @pytest.mark.integration
 @pytest.mark.slow
+@pytest.mark.asyncio
 async def test_lifecycle_events_published_to_real_broker(
     nats_client,
     db_path_integration: Path,
@@ -256,6 +325,7 @@ async def test_lifecycle_events_published_to_real_broker(
 
 @pytest.mark.integration
 @pytest.mark.slow
+@pytest.mark.asyncio
 async def test_subscriber_observes_events_on_wire(
     nats_client,
     db_path_integration: Path,

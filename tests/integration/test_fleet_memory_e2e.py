@@ -16,6 +16,22 @@ This test relies on:
 - TASK-FMDR-002: CLI wired to real shell handlers
 - TASK-FMDR-006: Local wrappers at ``../fleet-memory/deploy/local/{deploy.sh,smoke.sh}``
 
+Isolation
+---------
+
+The wrappers run from a COPY of ``fleet-memory/deploy/local`` in a temporary
+folder, with their own ``.env.deploy`` naming a free host port and a compose
+project of this run's own. This module's own ``docker compose`` calls name that
+project, the copy's file and folder explicitly and take no COMPOSE_* setting
+from the shell; the wrappers, run through ``forge runbook run``, get the
+factory's minimal environment and so none either (both checked by
+``TestComposeCallsAreThisRunsOwn``). Until 16
+October 2026 they ran in the sibling checkout on host port 5432 and compose
+project ``local``: on a machine where anything else already holds 5432 (here,
+another Postgres) the deploy step could not start, and the test wrote
+``.env.deploy`` into the sibling checkout. Nothing else on the machine is
+stopped or changed.
+
 Docker Dependency
 -----------------
 
@@ -26,8 +42,13 @@ message rather than skipping — we want a real green from the e2e on this machi
 from __future__ import annotations
 
 import json
+import os
+import shutil
+import socket
 import subprocess
 import tempfile
+import uuid
+from collections.abc import Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -80,15 +101,31 @@ def fleet_memory_repo_root() -> Path:
     return fleet_memory_root
 
 
+def _a_free_port() -> int:
+    """A host port nothing is listening on now (the OS picks it)."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("", 0))
+        return int(probe.getsockname()[1])
+
+
 @pytest.fixture(scope="module")
-def local_deploy_wrappers(fleet_memory_repo_root: Path) -> Path:
-    """Path to the local deploy wrappers directory.
+def local_deploy_wrappers(
+    fleet_memory_repo_root: Path, tmp_path_factory: pytest.TempPathFactory
+) -> Path:
+    """A copy of the local deploy wrappers directory, set up for this run alone.
+
+    The sibling's ``deploy/local`` (deploy.sh, smoke.sh, docker-compose.yml,
+    initdb) is copied as it is into a fresh git checkout, without any ``.env``
+    file of its own, and given an ``.env.deploy`` naming a free host port and a
+    compose project of this run's own (see :func:`_prepare_copy`). The
+    wrappers source ``.env.deploy``; this module's own Compose calls name the
+    project and file explicitly (see :func:`_compose`).
 
     Args:
         fleet_memory_repo_root: Root of the fleet-memory repository.
 
     Returns:
-        Path to deploy/local/ directory containing deploy.sh and smoke.sh.
+        Path to the copied deploy/local/ directory containing deploy.sh and smoke.sh.
 
     Raises:
         pytest.skip: If the wrappers from TASK-FMDR-006 are not present.
@@ -110,7 +147,85 @@ def local_deploy_wrappers(fleet_memory_repo_root: Path) -> Path:
             "Expected files: deploy.sh, smoke.sh"
         )
 
-    return local_dir
+    return _prepare_copy(local_dir, tmp_path_factory.mktemp("fleet-memory-deploy") / "local")
+
+
+def _prepare_copy(local_dir: Path, copy: Path) -> Path:
+    """Copy ``local_dir`` to ``copy`` (a fresh git checkout) with settings of
+    this run's own: a free port and a unique compose project."""
+    shutil.copytree(local_dir, copy, ignore=shutil.ignore_patterns(".env", ".env.*"))
+    settings = (
+        "# Written by forge's test_fleet_memory_e2e for this run alone\n"
+        f"COMPOSE_PROJECT_NAME=forge-test-fleet-memory-{uuid.uuid4().hex[:8]}\n"
+        f"PGPORT={_a_free_port()}\n"
+        "POSTGRES_PASSWORD=fleet_memory\n"
+        "POSTGRES_USER=fleet_memory\n"
+        "POSTGRES_DB=fleet_memory\n"
+    )
+    (copy / ".env.deploy").write_text(settings, encoding="utf-8")
+    # A project's script is run only from a git checkout: its private HOME and
+    # TMPDIR go in the checkout's own git directory, outside the project.
+    subprocess.run(["git", "init", "-q", str(copy)], check=True)
+    return copy
+
+
+def _settings(copy: Path) -> dict[str, str]:
+    """The copy's own .env.deploy, as names and values."""
+    found: dict[str, str] = {}
+    for line in (copy / ".env.deploy").read_text(encoding="utf-8").splitlines():
+        if line.strip() and not line.lstrip().startswith("#") and "=" in line:
+            name, value = line.split("=", 1)
+            found[name.strip()] = value.strip()
+    return found
+
+
+#: All a direct Compose call takes from the shell that runs the tests: where
+#: programs are and how to reach Docker. Every COMPOSE_* setting (a project
+#: name, a file list, profiles) is left behind, so an exported
+#: COMPOSE_PROJECT_NAME or COMPOSE_FILE can never point a call here, above all
+#: ``down -v``, at another project (Codex review R2, 16 October 2026).
+_INHERITED_BY_COMPOSE_CALLS = (
+    "PATH",
+    "HOME",
+    "DOCKER_HOST",
+    "DOCKER_CONFIG",
+    "DOCKER_CONTEXT",
+    "XDG_RUNTIME_DIR",
+)
+
+
+def _compose_call(copy: Path, *args: str) -> tuple[list[str], dict[str, str]]:
+    """The argv and environment of one ``docker compose`` call on the copy:
+    its own project directory, file and project name, named explicitly."""
+    settings = _settings(copy)
+    argv = [
+        "docker",
+        "compose",
+        "--project-directory",
+        str(copy),
+        "--file",
+        str(copy / "docker-compose.yml"),
+        "--project-name",
+        settings["COMPOSE_PROJECT_NAME"],
+        *args,
+    ]
+    env = {
+        name: os.environ[name]
+        for name in _INHERITED_BY_COMPOSE_CALLS
+        if name in os.environ
+    }
+    env["PGPORT"] = settings["PGPORT"]
+    return argv, env
+
+
+def _compose(copy: Path, *args: str, **kwargs: Any) -> subprocess.CompletedProcess:
+    argv, env = _compose_call(copy, *args)
+    return subprocess.run(argv, cwd=str(copy), env=env, check=False, **kwargs)
+
+
+def _down(copy: Path) -> None:
+    """Remove the copy's own compose project, containers and volumes."""
+    _compose(copy, "down", "-v", capture_output=True)
 
 
 @pytest.fixture(scope="module")
@@ -196,6 +311,40 @@ def fleet_memory_runbook_json(
     return runbook_path
 
 
+def _what_the_steps_said(db_path: Path, runbook_path: Path) -> str:
+    """Each step's status, exit code and the end of its output, for a failure
+    message. The CLI names only the step that escalated; without this a failed
+    smoke gate (added 16 October 2026, after one failed in a whole-suite run
+    and left nothing to read) cannot be told from any other failure."""
+    try:
+        from forge.adapters.sqlite.connect import connect_writer
+        from forge.persistence.repositories.runbook import RunbookRepository
+
+        runbook_id = json.loads(runbook_path.read_text())["runbook_id"]
+        connection = connect_writer(db_path)
+        try:
+            stored = RunbookRepository(connection=connection).load_runbook(
+                runbook_id, correlation_id="e2e-failure-detail"
+            )
+        finally:
+            connection.close()
+    except Exception as exc:  # noqa: BLE001 - only ever adds to a failure message
+        return f"\n(the steps' output could not be read: {exc})"
+    if stored is None:
+        return "\n(the runbook is not in the database)"
+    parts = []
+    for step in stored.steps:
+        parts.append(f"\n--- step {step.sequence_index} {step.step_type}: {step.status.value}")
+        if step.result is not None:
+            # The shell steps' output travels in the structured payload; the
+            # record's own captured_output is empty for them.
+            payload = step.result.payload or {}
+            said = str(payload.get("captured_output") or step.result.captured_output)
+            exit_code = payload.get("exit_code", step.result.exit_code)
+            parts.append(f" (exit {exit_code})\n{said[-3000:]}")
+    return "".join(parts)
+
+
 @pytest.fixture
 def test_db_path(tmp_path: Path) -> Path:
     """Create a temporary SQLite database for testing.
@@ -225,26 +374,16 @@ def test_db_path(tmp_path: Path) -> Path:
 
 @pytest.fixture
 def env_file(local_deploy_wrappers: Path) -> Path:
-    """Ensure .env.deploy exists for the local target.
+    """The copy's .env.deploy (written by ``local_deploy_wrappers``).
 
     Args:
-        local_deploy_wrappers: Path to deploy/local/ directory.
+        local_deploy_wrappers: Path to the copied deploy/local/ directory.
 
     Returns:
         Path to the .env.deploy file.
     """
     env_path = local_deploy_wrappers / ".env.deploy"
-
-    # Create a minimal .env.deploy if it doesn't exist
-    if not env_path.exists():
-        env_content = """# Fleet-memory local deploy configuration
-PGPORT=5432
-POSTGRES_PASSWORD=fleet_memory
-POSTGRES_USER=fleet_memory
-POSTGRES_DB=fleet_memory
-"""
-        env_path.write_text(env_content, encoding="utf-8")
-
+    assert env_path.is_file(), "the copied wrappers have no .env.deploy"
     return env_path
 
 
@@ -259,22 +398,12 @@ def teardown_compose(local_deploy_wrappers: Path) -> Any:
         None (fixture runs before and after test).
     """
     # Pre-test: ensure clean state
-    subprocess.run(
-        ["docker", "compose", "down", "-v"],
-        cwd=str(local_deploy_wrappers),
-        capture_output=True,
-        check=False,
-    )
+    _down(local_deploy_wrappers)
 
     yield
 
     # Post-test: teardown
-    subprocess.run(
-        ["docker", "compose", "down", "-v"],
-        cwd=str(local_deploy_wrappers),
-        capture_output=True,
-        check=False,
-    )
+    _down(local_deploy_wrappers)
 
 
 # ---------------------------------------------------------------------------
@@ -308,7 +437,10 @@ class TestDeployVerifyComplete:
         )
 
         # Assert
-        assert result.exit_code == 0, f"Runbook execution failed: {result.output}"
+        assert result.exit_code == 0, (
+            f"Runbook execution failed: {result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
         assert "completed successfully" in result.output.lower(), (
             f"Expected 'completed successfully' in output, got: {result.output}"
         )
@@ -383,20 +515,20 @@ class TestSmokeGatesSatisfied:
         )
 
         # Assert
-        assert result.exit_code == 0, f"Runbook execution failed: {result.output}"
+        assert result.exit_code == 0, (
+            f"Runbook execution failed: {result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
 
         # Verify pgvector extension is installed by checking directly
         # (smoke.sh already checked this, but we verify independently)
-        check_result = subprocess.run(
-            [
-                "docker", "compose", "exec", "-T", "postgres",
-                "psql", "-U", "fleet_memory", "-d", "fleet_memory", "-tAc",
-                "SELECT extname FROM pg_extension WHERE extname='vector';",
-            ],
-            cwd=str(local_deploy_wrappers),
+        check_result = _compose(
+            local_deploy_wrappers,
+            "exec", "-T", "postgres",
+            "psql", "-U", "fleet_memory", "-d", "fleet_memory", "-tAc",
+            "SELECT extname FROM pg_extension WHERE extname='vector';",
             capture_output=True,
             text=True,
-            check=False,
         )
 
         assert check_result.returncode == 0, "pgvector check command failed"
@@ -421,7 +553,10 @@ class TestSmokeGatesSatisfied:
         )
 
         # Assert
-        assert result.exit_code == 0, f"Runbook execution failed: {result.output}"
+        assert result.exit_code == 0, (
+            f"Runbook execution failed: {result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
 
         # Verify network path by connecting via psql (G4 gate)
         # Read POSTGRES_PASSWORD from .env.deploy
@@ -466,17 +601,17 @@ class TestSmokeGatesSatisfied:
         )
 
         # Assert
-        assert result.exit_code == 0, f"Runbook execution failed: {result.output}"
+        assert result.exit_code == 0, (
+            f"Runbook execution failed: {result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
 
         # Verify data volume is present (G5 gate)
-        volume_result = subprocess.run(
-            [
-                "docker", "compose", "exec", "-T", "postgres",
-                "test", "-f", "/var/lib/postgresql/data/PG_VERSION",
-            ],
-            cwd=str(local_deploy_wrappers),
+        volume_result = _compose(
+            local_deploy_wrappers,
+            "exec", "-T", "postgres",
+            "test", "-f", "/var/lib/postgresql/data/PG_VERSION",
             capture_output=True,
-            check=False,
         )
 
         assert volume_result.returncode == 0, (
@@ -510,7 +645,10 @@ class TestIdempotentRedeploy:
             runbook_cmd,
             ["run", str(fleet_memory_runbook_json), "--db", str(test_db_path), "--no-events"],
         )
-        assert first_result.exit_code == 0, f"First run failed: {first_result.output}"
+        assert first_result.exit_code == 0, (
+            f"First run failed: {first_result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
 
         # Modify runbook_id for second run (avoid duplicate error)
         runbook_data = json.loads(fleet_memory_runbook_json.read_text())
@@ -534,6 +672,7 @@ class TestIdempotentRedeploy:
             # Assert
             assert second_result.exit_code == 0, (
                 f"Second run failed (idempotency violated): {second_result.output}"
+                f"{_what_the_steps_said(test_db_path, second_runbook_path)}"
             )
             assert "completed successfully" in second_result.output.lower(), (
                 f"Second run did not complete successfully: {second_result.output}"
@@ -560,12 +699,8 @@ class TestTeardown:
         # The teardown_compose fixture (autouse=True) has already run
         # Verify no fleet-memory containers are running
 
-        result = subprocess.run(
-            ["docker", "compose", "ps", "-q"],
-            cwd=str(local_deploy_wrappers),
-            capture_output=True,
-            text=True,
-            check=False,
+        result = _compose(
+            local_deploy_wrappers, "ps", "-q", capture_output=True, text=True
         )
 
         assert result.returncode == 0, f"docker compose ps failed: {result.stderr}"
@@ -667,3 +802,117 @@ class TestMissingWrapperCheck:
         assert "deploy.sh" in fixture_source and "smoke.sh" in fixture_source, (
             "local_deploy_wrappers fixture should check for deploy.sh and smoke.sh"
         )
+
+
+# ---------------------------------------------------------------------------
+# Every Compose call is this run's own, whatever the shell exported
+# (Codex review R2, 16 October 2026)
+# ---------------------------------------------------------------------------
+
+#: What a shell might have exported that names somebody else's project. The
+#: estate's own env file sets COMPOSE_FILE, so this is not hypothetical.
+_SOMEBODY_ELSES = {
+    "COMPOSE_PROJECT_NAME": "somebody-elses-postgres",
+    "COMPOSE_FILE": "/elsewhere/compose.yaml",
+    "COMPOSE_PROFILES": "everything",
+    "COMPOSE_ENV_FILES": "/elsewhere/.env",
+}
+
+
+class TestComposeCallsAreThisRunsOwn:
+    """Intercepted: no Docker is used, so these run on any machine."""
+
+    @pytest.fixture
+    def copy(self, tmp_path: Path) -> Path:
+        source = tmp_path / "source"
+        source.mkdir()
+        for name in ("docker-compose.yml", "deploy.sh", "smoke.sh"):
+            (source / name).write_text("# stand-in\n", encoding="utf-8")
+        return _prepare_copy(source, tmp_path / "local")
+
+    def test_this_modules_calls_name_the_copys_project_and_file(
+        self, copy: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        for name, value in _SOMEBODY_ELSES.items():
+            monkeypatch.setenv(name, value)
+        seen: list[tuple[list[str], dict[str, str], str]] = []
+
+        def intercepted(argv: Sequence[str], **kwargs: Any) -> subprocess.CompletedProcess:
+            seen.append((list(argv), dict(kwargs["env"]), kwargs["cwd"]))
+            return subprocess.CompletedProcess(argv, 0, "", "")
+
+        monkeypatch.setattr(subprocess, "run", intercepted)
+        _down(copy)
+        _compose(copy, "exec", "-T", "postgres", "true")
+        _compose(copy, "ps", "-q")
+
+        project = _settings(copy)["COMPOSE_PROJECT_NAME"]
+        assert project.startswith("forge-test-fleet-memory-")
+        assert len(seen) == 3
+        assert seen[0][0][-2:] == ["down", "-v"]
+        for argv, env, cwd in seen:
+            assert argv[:2] == ["docker", "compose"], argv
+            assert argv[argv.index("--project-name") + 1] == project, argv
+            assert argv[argv.index("--file") + 1] == str(copy / "docker-compose.yml"), argv
+            assert argv[argv.index("--project-directory") + 1] == str(copy), argv
+            assert cwd == str(copy)
+            assert not [name for name in env if name.startswith("COMPOSE_")], env
+            assert env["PGPORT"] == _settings(copy)["PGPORT"]
+
+    def test_the_wrappers_run_by_the_runbook_get_no_inherited_compose_settings(
+        self,
+        local_deploy_wrappers: Path,
+        fleet_memory_runbook_json: Path,
+        test_db_path: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The real wrappers, run through ``forge runbook run`` as the tests
+        above run them, with a stand-in ``docker`` first on PATH. Each call
+        must reach the copy's own project, never the exported one."""
+        log = tmp_path / "docker-calls.jsonl"
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        (bin_dir / "docker").write_text(
+            "#!/usr/bin/env python3\n"
+            "import json, os, sys\n"
+            f"with open({str(log)!r}, 'a') as out:\n"
+            "    out.write(json.dumps({'argv': sys.argv[1:], 'env': {k: v for k, v in os.environ.items() if k.startswith('COMPOSE_')}}) + '\\n')\n"
+            "joined = ' '.join(sys.argv[1:])\n"
+            "print('vector' if 'pg_extension' in joined else '16' if 'PG_VERSION' in joined else '')\n",
+            encoding="utf-8",
+        )
+        (bin_dir / "psql").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        for name in ("docker", "psql"):
+            (bin_dir / name).chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
+        for name, value in _SOMEBODY_ELSES.items():
+            monkeypatch.setenv(name, value)
+
+        result = CliRunner().invoke(
+            runbook_cmd,
+            ["run", str(fleet_memory_runbook_json), "--db", str(test_db_path), "--no-events"],
+        )
+        assert result.exit_code == 0, (
+            f"{result.output}{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
+
+        project = _settings(local_deploy_wrappers)["COMPOSE_PROJECT_NAME"]
+        calls = [json.loads(line) for line in log.read_text().splitlines()]
+        assert calls, "the wrappers made no docker call"
+        for call in calls:
+            argv, env = call["argv"], call["env"]
+            assert argv[0] == "compose", argv
+            # The project is named on the command line (fleet-memory's
+            # wrappers since 16 October 2026) or, in older wrappers, by
+            # COMPOSE_PROJECT_NAME from the copy's .env.deploy.
+            named = (
+                argv[argv.index("--project-name") + 1]
+                if "--project-name" in argv
+                else env.get("COMPOSE_PROJECT_NAME")
+            )
+            assert named == project, call
+            for name, value in _SOMEBODY_ELSES.items():
+                assert env.get(name) != value, call
+            if "--file" not in argv:
+                assert "COMPOSE_FILE" not in env, call
