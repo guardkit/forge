@@ -243,6 +243,40 @@ def fleet_memory_runbook_json(
     return runbook_path
 
 
+def _what_the_steps_said(db_path: Path, runbook_path: Path) -> str:
+    """Each step's status, exit code and the end of its output, for a failure
+    message. The CLI names only the step that escalated; without this a failed
+    smoke gate (added 16 October 2026, after one failed in a whole-suite run
+    and left nothing to read) cannot be told from any other failure."""
+    try:
+        from forge.adapters.sqlite.connect import connect_writer
+        from forge.persistence.repositories.runbook import RunbookRepository
+
+        runbook_id = json.loads(runbook_path.read_text())["runbook_id"]
+        connection = connect_writer(db_path)
+        try:
+            stored = RunbookRepository(connection=connection).load_runbook(
+                runbook_id, correlation_id="e2e-failure-detail"
+            )
+        finally:
+            connection.close()
+    except Exception as exc:  # noqa: BLE001 - only ever adds to a failure message
+        return f"\n(the steps' output could not be read: {exc})"
+    if stored is None:
+        return "\n(the runbook is not in the database)"
+    parts = []
+    for step in stored.steps:
+        parts.append(f"\n--- step {step.sequence_index} {step.step_type}: {step.status.value}")
+        if step.result is not None:
+            # The shell steps' output travels in the structured payload; the
+            # record's own captured_output is empty for them.
+            payload = step.result.payload or {}
+            said = str(payload.get("captured_output") or step.result.captured_output)
+            exit_code = payload.get("exit_code", step.result.exit_code)
+            parts.append(f" (exit {exit_code})\n{said[-3000:]}")
+    return "".join(parts)
+
+
 @pytest.fixture
 def test_db_path(tmp_path: Path) -> Path:
     """Create a temporary SQLite database for testing.
@@ -345,7 +379,10 @@ class TestDeployVerifyComplete:
         )
 
         # Assert
-        assert result.exit_code == 0, f"Runbook execution failed: {result.output}"
+        assert result.exit_code == 0, (
+            f"Runbook execution failed: {result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
         assert "completed successfully" in result.output.lower(), (
             f"Expected 'completed successfully' in output, got: {result.output}"
         )
@@ -420,7 +457,10 @@ class TestSmokeGatesSatisfied:
         )
 
         # Assert
-        assert result.exit_code == 0, f"Runbook execution failed: {result.output}"
+        assert result.exit_code == 0, (
+            f"Runbook execution failed: {result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
 
         # Verify pgvector extension is installed by checking directly
         # (smoke.sh already checked this, but we verify independently)
@@ -458,7 +498,10 @@ class TestSmokeGatesSatisfied:
         )
 
         # Assert
-        assert result.exit_code == 0, f"Runbook execution failed: {result.output}"
+        assert result.exit_code == 0, (
+            f"Runbook execution failed: {result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
 
         # Verify network path by connecting via psql (G4 gate)
         # Read POSTGRES_PASSWORD from .env.deploy
@@ -503,7 +546,10 @@ class TestSmokeGatesSatisfied:
         )
 
         # Assert
-        assert result.exit_code == 0, f"Runbook execution failed: {result.output}"
+        assert result.exit_code == 0, (
+            f"Runbook execution failed: {result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
 
         # Verify data volume is present (G5 gate)
         volume_result = subprocess.run(
@@ -547,7 +593,10 @@ class TestIdempotentRedeploy:
             runbook_cmd,
             ["run", str(fleet_memory_runbook_json), "--db", str(test_db_path), "--no-events"],
         )
-        assert first_result.exit_code == 0, f"First run failed: {first_result.output}"
+        assert first_result.exit_code == 0, (
+            f"First run failed: {first_result.output}"
+            f"{_what_the_steps_said(test_db_path, fleet_memory_runbook_json)}"
+        )
 
         # Modify runbook_id for second run (avoid duplicate error)
         runbook_data = json.loads(fleet_memory_runbook_json.read_text())
@@ -571,6 +620,7 @@ class TestIdempotentRedeploy:
             # Assert
             assert second_result.exit_code == 0, (
                 f"Second run failed (idempotency violated): {second_result.output}"
+                f"{_what_the_steps_said(test_db_path, second_runbook_path)}"
             )
             assert "completed successfully" in second_result.output.lower(), (
                 f"Second run did not complete successfully: {second_result.output}"
