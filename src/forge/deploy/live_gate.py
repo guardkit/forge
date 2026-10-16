@@ -665,7 +665,6 @@ class RepoDriverLiveGateInvoker:
     ) -> LiveGateInvocation:
         # Imported inside the method to keep this module's import surface small
         # (the seam-boundary precedent above).
-        import subprocess
 
         from forge.launch_environment import (
             build_project_command_env,
@@ -704,20 +703,26 @@ class RepoDriverLiveGateInvoker:
                     "stderr_tail": "",
                 },
             )
-        try:
-            proc = subprocess.run(
-                argv,
-                cwd=str(self._repo_path),
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=self._timeout_seconds,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as exc:
-            # A driver that never returns is an ENVIRONMENT problem — never a SUT
-            # fail (it never indicts the feature). Nor is it an answer
-            # (15 October 2026): what it started may still be running.
+        # THROUGH THE ONE PLACE PROGRAMS ARE STARTED (15 October 2026): the
+        # spawn's own error means the gate could not be run (an answer);
+        # anything raised once the driver had started, or a driver stopped at
+        # its limit, means what it started may still be running.
+        from forge.executor.programs import run_program
+
+        ran = run_program(
+            argv,
+            cwd=str(self._repo_path),
+            env=env,
+            timeout=float(self._timeout_seconds),
+            new_session=False,
+            stdin=None,
+            post_kill_read_seconds=1.0,
+        )
+        stdout = ran.stdout.decode("utf-8", errors="replace")
+        stderr = ran.stderr.decode("utf-8", errors="replace")
+        if ran.timed_out:
+            # A driver that never returns is an ENVIRONMENT problem — never a
+            # SUT fail (it never indicts the feature). Nor is it an answer.
             return LiveGateInvocation(
                 verdict="environment_fail",
                 run_id=run_id_fallback,
@@ -729,18 +734,14 @@ class RepoDriverLiveGateInvoker:
                     "cwd": str(self._repo_path),
                     "exit_code": None,
                     "error": f"driver timed out after {self._timeout_seconds}s",
-                    "stdout_tail": _bounded_tail(
-                        exc.stdout if isinstance(exc.stdout, str) else None
-                    ),
-                    "stderr_tail": _bounded_tail(
-                        exc.stderr if isinstance(exc.stderr, str) else None
-                    ),
+                    "stdout_tail": _bounded_tail(stdout),
+                    "stderr_tail": _bounded_tail(stderr),
                     "environment_note": project_program_note(
                         declared=self._launch_settings, overlay=self._extra_env
                     ),
                 },
             )
-        except OSError as exc:
+        if ran.refused_before_start:
             # Spawn failure — missing interpreter / script / not executable. An
             # INSTRUMENT problem (the gate could not be run), never a SUT fail.
             return LiveGateInvocation(
@@ -752,31 +753,33 @@ class RepoDriverLiveGateInvoker:
                     "argv": argv,
                     "cwd": str(self._repo_path),
                     "exit_code": None,
-                    "error": f"could not spawn driver: {exc}",
+                    "error": f"could not spawn driver: {ran.error}",
                     "stdout_tail": "",
                     "stderr_tail": "",
                 },
             )
-        except Exception as exc:  # noqa: BLE001 — NEVER raise past invoke()
+        if ran.raised_while_running:
+            # After the driver started: nobody knows whether it is running.
             return LiveGateInvocation(
                 verdict="instrument_fail",
                 run_id=run_id_fallback,
                 gate_ids=gate_ids,
                 dry_run=False,
+                answer_lost=True,
                 detail={
                     "argv": argv,
                     "cwd": str(self._repo_path),
                     "exit_code": None,
-                    "error": f"driver invocation error: {exc}",
+                    "error": f"driver invocation error: {ran.error}",
                 },
             )
 
         answer = project_driver_answer(
             argv=argv,
             cwd=str(self._repo_path),
-            exit_code=proc.returncode,
-            stdout=proc.stdout or "",
-            stderr=proc.stderr or "",
+            exit_code=int(ran.exit_code if ran.exit_code is not None else 1),
+            stdout=stdout,
+            stderr=stderr,
             gate_ids=gate_ids,
             run_id_fallback=run_id_fallback,
             journey_evidence=self._journey_evidence,

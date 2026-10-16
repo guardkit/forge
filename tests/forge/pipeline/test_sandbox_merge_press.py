@@ -1434,6 +1434,45 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
         assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder is None
 
     @pytest.mark.asyncio
+    async def test_a_deploy_whose_command_broke_after_it_started_keeps_the_hold(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """15 October 2026, Codex R9, through the REAL owned deploy executor:
+        the deploy command started and reading its output then broke. Nobody
+        knows whether it is still running, so the sidecar answers a 5xx, the
+        promote says no answer came back, and the hold is kept — although the
+        candidate's own teardown answered that it is down."""
+        from forge.deploy_sidecar.deploy_executor import _RUNNER_SOURCE
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        real_read = subprocess.Popen.communicate
+
+        def _the_deploy_read_breaks(self: Any, *args: Any, **kwargs: Any) -> Any:
+            if _RUNNER_SOURCE in [str(a) for a in (self.args or [])]:
+                raise OSError("the deploy command's pipe broke")
+            return real_read(self, *args, **kwargs)
+
+        monkeypatch.setattr(subprocess.Popen, "communicate", _the_deploy_read_breaks)
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert outcome.result != "merged-into-the-remote-and-running", outcome.detail
+        assert "down" in self._which_ran(log, clone)
+        assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
+
+    @pytest.mark.asyncio
     async def test_a_press_that_picks_up_a_published_join_lays_its_tree_out_again(
         self,
         a_helper_that_deploys: tuple[str, dict[str, Any]],

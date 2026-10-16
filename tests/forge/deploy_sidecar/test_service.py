@@ -229,6 +229,30 @@ def test_a_script_whose_run_raised_is_a_5xx(repo: Path) -> None:
     assert "Unexpected error running script" in body["error"]
 
 
+@pytest.mark.parametrize("how", ["ENOEXEC", "ENOTDIR"])
+def test_a_script_the_system_would_not_start_is_a_4xx(repo: Path, how: str) -> None:
+    """15 October 2026, Codex R11, through the REAL script runner: the system
+    refused to start the script (an exec format error, or a path through a
+    file), so nothing ran — a 4xx in the sidecar's own words, an answer."""
+    if how == "ENOEXEC":
+        script = "deploy.sh"
+        (repo / "deploy.sh").write_text("this is not a program\n", encoding="utf-8")
+        (repo / "deploy.sh").chmod(0o755)
+    else:
+        script = "notadir/deploy.sh"
+        (repo / "notadir").write_text("a file, not a folder\n", encoding="utf-8")
+        _write_profile(
+            repo,
+            {"env_id": "staging", "compose": {"file": "compose.yaml", "script": script}},
+        )
+    cfg = _config({"appmilla/api_test": str(repo)})
+    status, body = process_run_request(
+        {"repo": "appmilla/api_test", "script": script}, config=cfg
+    )
+    assert status == 400, body
+    assert body["error"]
+
+
 def test_health_check_cmd_allowed(repo: Path) -> None:
     _write_profile(
         repo,

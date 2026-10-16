@@ -231,6 +231,12 @@ from forge.deploy_sidecar.deploy_executor import (
     DeployExecutor,
     request_from as deploy_request_from,
 )
+from forge.executor.programs import (
+    RaisedWhileRunning,
+    RefusedBeforeStart,
+    TimedOut,
+    run_program,
+)
 from forge.executor.shell_steps import _run_script_step
 from forge.launch_environment import (
     build_launch_env,
@@ -2020,7 +2026,7 @@ def process_live_gate_run(
     # are some, so a runner written before them is called exactly as before.
     issued_kwargs: dict[str, Any] = {"issued": issued} if issued is not None else {}
     try:
-        exit_code, stdout, stderr = command_runner(
+        ran = command_runner(
             argv=argv,
             cwd=str(cwd),
             timeout=timeout,
@@ -2033,6 +2039,7 @@ def process_live_gate_run(
             repository=str(repo_path),
             **issued_kwargs,
         )
+        exit_code, stdout, stderr = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
@@ -2040,6 +2047,9 @@ def process_live_gate_run(
             "stdout": "",
             "stderr_tail": "",
         }
+    ended = _a_program_that_did_not_finish(ran)
+    if ended is not None:
+        return ended
     return 200, {
         "exit_code": exit_code,
         "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
@@ -2122,7 +2132,7 @@ def process_declared_test_run(
         timeout,
     )
     try:
-        exit_code, stdout, stderr = command_runner(
+        ran = command_runner(
             argv=["/bin/sh", "-c", declared],
             cwd=cwd,
             timeout=timeout,
@@ -2131,6 +2141,7 @@ def process_declared_test_run(
             launch_settings=launch_settings,
             repository=str(repo_path),
         )
+        exit_code, stdout, stderr = ran
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
         return 500, {
             "error": f"sidecar execution error: {type(exc).__name__}: {exc}",
@@ -2138,6 +2149,9 @@ def process_declared_test_run(
             "stdout": "",
             "stderr_tail": "",
         }
+    ended = _a_program_that_did_not_finish(ran)
+    if ended is not None:
+        return ended
     return 200, {
         "exit_code": exit_code,
         "stdout": _tail_chars(stdout, MERGE_STDOUT_CHARS),
@@ -2486,6 +2500,14 @@ def process_run_request(
                 "exit_code": 1,
                 "output_tail": "",
             }
+        # RAISED WHILE THE COMMAND WAS RUNNING (15 October 2026): a 5xx, which
+        # every caller reads as no answer, whatever the executor then did.
+        if getattr(answered, "raised_while_running", False) is True:
+            return 500, {
+                "error": f"sidecar deploy error: {answered.sentence}",
+                "exit_code": answered.exit_code,
+                "output_tail": "",
+            }
         # A REFUSAL IS NOT A TRANSPORT FAILURE and it is not a script that went
         # red: it is the executor saying this request may not run. Either way
         # the answer is a 200 carrying ``accepted``, the machine-readable word
@@ -2535,8 +2557,18 @@ def process_run_request(
             "exit_code": 1,
             "output_tail": "",
         }
-    # The run raised after the script may have started (15 October 2026): a
-    # 5xx, which every caller reads as no answer.
+    # The script was never started: a 4xx in the sidecar's own words, an
+    # answer (15 October 2026). It raised after it may have started: a 5xx,
+    # which every caller reads as no answer.
+    if getattr(ran, "refused_before_running", False) is True:
+        return 400, {
+            "error": (
+                output.strip()
+                or f"the script {script} could not be started (exit {exit_code})"
+            ),
+            "exit_code": exit_code,
+            "output_tail": "",
+        }
     if getattr(ran, "answer_lost", False) is True and not getattr(
         ran, "timed_out", False
     ):
@@ -2800,9 +2832,8 @@ def run_project_program(
         )
     except (OSError, ValueError) as exc:
         return (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} was not started: {exc}")
-    exit_code, stdout, stderr = _start_and_collect(
-        argv=argv, cwd=cwd, env=env, timeout=timeout, what=what
-    )
+    ran = _start_and_collect(argv=argv, cwd=cwd, env=env, timeout=timeout, what=what)
+    exit_code, stdout, stderr = ran
     if exit_code != 0:
         note = project_program_note(
             declared=launch_settings or (),
@@ -2811,7 +2842,12 @@ def run_project_program(
             run_owner=run_owner,
         )
         stderr = f"{stderr}\n{note}" if stderr else note
-    return exit_code, stdout, stderr
+    # The same kind of result, with the note added (15 October 2026).
+    return type(ran)((exit_code, stdout, stderr)) if type(ran) is not tuple else (
+        exit_code,
+        stdout,
+        stderr,
+    )
 
 
 def _start_and_collect(
@@ -2829,71 +2865,81 @@ def _start_and_collect(
     credential scrub. Which environment the child gets is decided by the
     caller and only by the caller. Never raises.
     """
-    try:
-        process = subprocess.Popen(  # noqa: S603 — fixed argv, no shell
-            argv,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
+    # THROUGH THE ONE PLACE PROGRAMS ARE STARTED (15 October 2026): the
+    # spawn's own error is a refusal (nothing ran); anything raised once the
+    # program had started is RaisedWhileRunning; a timeout stops the whole
+    # group and is TimedOut.
+    ran = run_program(
+        argv,
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        new_session=True,
+        kill_grace_seconds=MERGE_KILL_GRACE_SECONDS,
+        post_kill_read_seconds=MERGE_POST_KILL_READ_SECONDS,
+    )
+    if ran.refused_before_start:
+        error = ran.error
+        if isinstance(error, (FileNotFoundError, NotADirectoryError)):
+            code = MERGE_NOT_STARTED_EXIT_CODE
+            said = f"{what} could not be started: {error}"
+        elif isinstance(error, PermissionError):
+            code, said = 126, f"{what} could not be run: {error}"
+        else:
+            code, said = 1, f"{what} could not be started: {error}"
+        return RefusedBeforeStart(code, "", said)
+    stdout = scrub_process_output(ran.stdout.decode("utf-8", errors="replace"))
+    stderr = scrub_process_output(ran.stderr.decode("utf-8", errors="replace"))
+    if ran.raised_while_running:
+        error = ran.error
+        return RaisedWhileRunning(
+            1,
+            stdout,
+            f"{stderr}\n{what} raised while it was running: "
+            f"{type(error).__name__}: {error}".strip(),
         )
-    # NOTHING STARTED (15 October 2026): the operating system refused to
-    # start the program, so it says so in a field of its own.
-    except FileNotFoundError as exc:
-        return RefusedBeforeStart(
-            (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} could not be started: {exc}")
-        )
-    except NotADirectoryError as exc:
-        return RefusedBeforeStart(
-            (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} could not be started: {exc}")
-        )
-    except PermissionError as exc:
-        return RefusedBeforeStart((126, "", f"{what} could not be run: {exc}"))
-    except OSError as exc:
-        return RefusedBeforeStart((1, "", f"{what} could not be started: {exc}"))
-
-    timed_out = False
-    try:
-        raw_out, raw_err = process.communicate(timeout=timeout)
-        exit_code = process.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        _kill_process_group(process)
-        try:
-            raw_out, raw_err = process.communicate(
-                timeout=MERGE_POST_KILL_READ_SECONDS
-            )
-        except subprocess.TimeoutExpired:
-            raw_out, raw_err = b"", b""
-        exit_code = MERGE_TIMEOUT_EXIT_CODE
-
-    stdout = scrub_process_output((raw_out or b"").decode("utf-8", errors="replace"))
-    stderr = scrub_process_output((raw_err or b"").decode("utf-8", errors="replace"))
-    if timed_out:
+    if ran.timed_out:
         stderr += (
             f"\n{what} was stopped after {timeout:g} seconds and "
             "everything it had started was stopped with it"
         )
-        return StoppedAtItsTimeLimit((exit_code, stdout, stderr))
+        return StoppedAtItsTimeLimit(MERGE_TIMEOUT_EXIT_CODE, stdout, stderr)
+    exit_code = ran.exit_code if ran.exit_code is not None else 1
     return exit_code, stdout, stderr
 
 
-class RefusedBeforeStart(tuple):
-    """``(exit code, stdout, stderr)`` of a program the operating system
-    refused to start (15 October 2026): nothing ran, so it is an answer."""
-
-    refused_before_running = True
+#: The results the process collector answers with, from the one place
+#: programs are started (15 October 2026). The old name for a timeout is kept.
+StoppedAtItsTimeLimit = TimedOut
 
 
-class StoppedAtItsTimeLimit(tuple):
-    """``(exit code, stdout, stderr)`` of a command stopped at its time limit.
+def _a_program_that_did_not_finish(
+    ran: Any, *, stdout_key: str = "stdout"
+) -> tuple[int, dict[str, Any]] | None:
+    """The reply for a program that never started or raised while running.
 
-    15 October 2026: it unpacks like every other answer, and says in a field
-    of its own that it was stopped, so the route can tell the caller.
+    15 October 2026, the one rule every route follows: a program the system
+    refused to start is a 4xx in the sidecar's own words (nothing ran: an
+    answer); one that raised once it had started is a 5xx (nobody knows
+    whether it is still running: every caller reads it as no answer).
+    ``None`` for a program that ran to an end or was stopped at its limit,
+    which the route answers as it always has.
     """
-
-    timed_out = True
+    if getattr(ran, "refused_before_running", False) is True:
+        exit_code, _out, said = ran
+        return 400, {
+            "error": str(said or "").strip() or "the program could not be started",
+            "exit_code": exit_code,
+            stdout_key: "",
+        }
+    if getattr(ran, "answer_lost", False) is True and not getattr(ran, "timed_out", False):
+        exit_code, _out, said = ran
+        return 500, {
+            "error": f"sidecar execution error: {said}",
+            "exit_code": exit_code,
+            stdout_key: "",
+        }
+    return None
 
 
 def _tail_chars(text: str, limit: int) -> str:
@@ -3244,17 +3290,11 @@ def process_guardkit_merge_request(
             "stderr_tail": "",
         }
 
-    # THE PROGRAM WAS NEVER STARTED (15 October 2026): a refusal before
-    # anything ran, so a 4xx in the sidecar's own words.
-    if getattr(ran, "refused_before_running", False) is True:
-        return 400, {
-            "error": (
-                str(stderr or "").strip() or "the merge command could not be started"
-            ),
-            "exit_code": exit_code,
-            "stdout": "",
-            "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
-        }
+    # NEVER STARTED, or RAISED WHILE RUNNING (15 October 2026): a 4xx and a
+    # 5xx, as every route answers them.
+    ended = _a_program_that_did_not_finish(ran)
+    if ended is not None:
+        return ended
 
     return 200, {
         "exit_code": exit_code,

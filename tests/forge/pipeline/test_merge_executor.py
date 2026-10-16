@@ -5166,6 +5166,128 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         assert held.lease_holder is not None
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "how, kept",
+        [("ENOEXEC", False), ("ENOTDIR", False), ("repo-driver-raised", True)],
+    )
+    async def test_the_real_local_backends(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        how: str,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex R9 and R11, with no sidecar and the REAL
+        backends. The candidate's script goes through the real script runner:
+        one the system would not start (an exec format error, a path through a
+        file) was never started, its teardown answers "down", and the hold is
+        put down. The live gate goes through the real repo-driver invoker: a
+        driver whose output read breaks after it started may still be running,
+        and the hold is kept."""
+        import sqlite3
+        import subprocess
+        import sys
+        from unittest.mock import AsyncMock
+
+        from forge.config.models import DeployStageConfig
+        from forge.deploy.live_gate import DryRunBrokerInspector, RepoDriverLiveGateInvoker
+        from forge.deploy.reservation import InProcessReservationLease
+        from forge.deploy.stage import DeployStageRunner
+        from forge.executor import shell_steps
+        from forge.persistence.migrations.runbook import apply
+        from forge.persistence.repositories.runbook import RunbookRepository
+        from tests.forge.deploy.test_candidate_check_and_promote_legs import (
+            RecordingDeployPublisher,
+            _Invoker,
+            _profile,
+        )
+
+        scripts = tmp_path / "scripts"
+        scripts.mkdir()
+        # A real checkout: a project program's private home is made in its
+        # git directory.
+        subprocess.run(["git", "init", "-q", str(scripts)], check=True)
+        good = scripts / "ok.sh"
+        good.write_text("#!/bin/sh\necho ok\n", encoding="utf-8")
+        good.chmod(0o755)
+        bad = scripts / "no-format.sh"
+        bad.write_text("this is not a program\n", encoding="utf-8")
+        bad.chmod(0o755)
+        (scripts / "a-file").write_text("not a folder\n", encoding="utf-8")
+        real_runner = shell_steps._run_script_step
+
+        def _the_real_runner(**kwargs: Any) -> Any:
+            # The REAL script runner, on a real script: the candidate's own
+            # step is the one the system will not start; its teardown is fine.
+            down = (kwargs.get("extra_env") or {}).get("CANDIDATE_DOWN") == "1"
+            kwargs = dict(kwargs, cwd=str(scripts))
+            if down or how == "repo-driver-raised":
+                kwargs["script"] = "./ok.sh"
+            elif how == "ENOEXEC":
+                kwargs["script"] = "./no-format.sh"
+            else:
+                kwargs["script"] = "./a-file/deploy.sh"
+            return real_runner(**kwargs)
+
+        monkeypatch.setattr(shell_steps, "_run_script_step", _the_real_runner)
+        marker = "the-repo-driver-that-breaks"
+        if how == "repo-driver-raised":
+            real_read = subprocess.Popen.communicate
+
+            def _the_read_breaks(self: Any, *args: Any, **kwargs: Any) -> Any:
+                if marker in " ".join(str(a) for a in (self.args or [])):
+                    raise OSError("the driver's pipe broke")
+                return real_read(self, *args, **kwargs)
+
+            monkeypatch.setattr(subprocess.Popen, "communicate", _the_read_breaks)
+            invoker: Any = RepoDriverLiveGateInvoker(
+                repo_path=repo_root,
+                driver_argv=[sys.executable, "-c", "import time; time.sleep(30)", marker],
+                timeout_seconds=20,
+            )
+        else:
+            invoker = _Invoker()
+        connection = sqlite3.connect(str(tmp_path / "runbooks.db"))
+        apply(connection)
+        stage = DeployStageRunner(
+            repository=RunbookRepository(connection=connection),
+            runbook_publisher=AsyncMock(),
+            deploy_publisher=RecordingDeployPublisher(),
+            reservation=InProcessReservationLease(),
+            live_gate_invoker=invoker,
+            broker_inspector=DryRunBrokerInspector(),
+            config=DeployStageConfig(),
+            deploy_record_root=str(tmp_path / "records"),
+            dry_run=False,
+        )
+
+        class _ACheckThroughTheRealStage(_FakeDeploy):
+            async def __call__(self, **kwargs: Any) -> Any:
+                if kwargs.get("leg") != "candidate_check":
+                    return await super().__call__(**kwargs)
+                self.calls.append(kwargs)
+                return await stage.candidate_check(
+                    _profile(),
+                    correlation_id=kwargs["correlation_id"],
+                    deploy_run_id=kwargs["deploy_run_id"],
+                    feature=kwargs["feature_id"],
+                    identity_env=kwargs.get("identity_env"),
+                )
+
+        deploy = _ACheckThroughTheRealStage()
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal(), deploy=deploy)
+
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "candidate-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
     async def test_a_conflict_whose_record_moved_on_stops_as_replaced(
         self,
         config: ForgeConfig,

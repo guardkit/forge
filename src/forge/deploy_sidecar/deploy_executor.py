@@ -515,6 +515,10 @@ class ExecutorAnswer:
     exit_code: int | None = None
     output: str = ""
     marker: str | None = None
+    #: Something raised after the command had started (15 October 2026):
+    #: nobody knows whether what it started is still running, so the route
+    #: answers a 5xx and every caller reads it as no answer.
+    raised_while_running: bool = False
 
     def to_wire(self) -> dict[str, Any]:
         return {
@@ -1593,7 +1597,13 @@ class DeployExecutor:
 
     @staticmethod
     def _default_spawn(**kwargs: Any) -> "subprocess.Popen[bytes]":
-        return subprocess.Popen(**kwargs)  # noqa: S603 — a fixed argument list
+        # Through the one place programs are started (15 October 2026): the
+        # spawn's own error is a ProgramRefused (an OSError), which the caller
+        # answers as "would not start" — nothing ran.
+        from forge.executor.programs import start_program
+
+        argv = kwargs.pop("args")
+        return start_program(argv, **kwargs)
 
     def _child_environment(self, request: DeployRequest) -> dict[str, str]:
         """RULE (h): built, never a copy of this process's own.
@@ -1887,6 +1897,7 @@ class DeployExecutor:
             self._clear_if_it_is_still_mine(note)
             return ExecutorAnswer(
                 accepted=True,
+                raised_while_running=True,
                 word="the-deploy-command-ended-badly",
                 sentence=(
                     f"the deploy step for {note.target} ended in an error "

@@ -75,6 +75,7 @@ from forge.launch_environment import build_launch_env
 from forge.adapters.guardkit.models import GuardKitResult, GuardKitWarning
 from forge.adapters.guardkit.parser import parse_guardkit_output
 from forge.build_processes import signal_process_group
+from forge.executor.programs import ProgramRefused
 
 logger = logging.getLogger(__name__)
 
@@ -359,7 +360,11 @@ async def _execute_subprocess(
     # The environment is built HERE rather than passed in because this function
     # is the stubbable seam the tests replace: a seam that spawns nothing has
     # no environment to be given.
-    proc = await asyncio.create_subprocess_exec(
+    # Through the one place programs are started (15 October 2026): an error
+    # from the spawn itself is a ProgramRefused — nothing ran.
+    from forge.executor.programs import start_program_async
+
+    proc = await start_program_async(
         *command,
         cwd=cwd,
         env=build_launch_env(
@@ -633,7 +638,9 @@ async def run(
                 *_surrender,
             ) = await _execute_subprocess(**execute_kwargs)
             output_surrendered = bool(_surrender[0]) if _surrender else False
-        except (PermissionError, FileNotFoundError, NotADirectoryError) as exc:
+        except (
+            PermissionError, FileNotFoundError, NotADirectoryError, ProgramRefused
+        ) as exc:
             # Binary not in DeepAgents' shell allowlist, or a program the
             # operating system would not start (15 October 2026) — convert to
             # a structured failed result with the canonical warning code.

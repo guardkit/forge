@@ -12,7 +12,6 @@ on top of this mechanics-only foundation.
 from __future__ import annotations
 
 import os
-import subprocess
 from typing import Any, Callable, Sequence
 
 from forge.executor.registry import StepOutcome, StepTypeRegistry
@@ -46,41 +45,15 @@ _TIMEOUT_EXIT_CODE = 124
 _TRUNCATION_MARKER = "\n... [OUTPUT TRUNCATED] ...\n"
 
 
-class RaisedWhileRunning(tuple):
-    """``(exit code, output)`` of a script whose run raised (15 October 2026).
-
-    The error may have come after the script started, so it is read like a
-    request with no answer (``answer_lost``).
-    """
-
-    answer_lost = True
-
-    def __new__(cls, exit_code: int, output: str) -> "RaisedWhileRunning":
-        return super().__new__(cls, (exit_code, output))
-
-    def __getnewargs__(self) -> tuple[int, str]:
-        return (self[0], self[1])
-
-
-class TimedOut(tuple):
-    """``(exit code, output)`` of a script stopped at its time limit.
-
-    15 October 2026. Only the script itself is stopped; anything it started
-    may still be running, which no exit code can say. So the answer says it
-    in a field of its own, read the way a request with no answer is read
-    (``answer_lost``): the merge press keeps its hold for it. It unpacks like
-    every runner's ``(exit_code, output)``, so a caller that does not ask is
-    unchanged.
-    """
-
-    answer_lost = True
-    timed_out = True
-
-    def __new__(cls, exit_code: int, output: str) -> "TimedOut":
-        return super().__new__(cls, (exit_code, output))
-
-    def __getnewargs__(self) -> tuple[int, str]:
-        return (self[0], self[1])
+# The three results every program-starting backend answers with, from the one
+# place that starts programs for the merge press's legs (15 October 2026).
+# Kept importable from here, where the script runner's callers found them.
+from forge.executor.programs import (  # noqa: E402
+    RaisedWhileRunning,
+    RefusedBeforeStart,
+    TimedOut,
+    run_program,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -221,43 +194,32 @@ def _run_script_step(
     # (TASK-FMDR-007).
     program = script if os.path.dirname(script) else os.path.join(os.curdir, script)
 
-    timed_out = False
-    try:
-        # Run the subprocess with combined output capture
-        result = subprocess.run(
-            [program],
-            cwd=cwd,
-            env=env,
-            capture_output=True,
-            text=False,  # Capture as bytes for accurate size limiting
-            timeout=timeout,
-        )
-        exit_code = result.returncode
-        raw_output = result.stdout + result.stderr
-
-    except subprocess.TimeoutExpired as e:
-        # Script exceeded timeout — kill it and capture partial output
-        timed_out = True
-        exit_code = _TIMEOUT_EXIT_CODE
-        # TimeoutExpired.stdout/stderr may be None if process was killed early
-        stdout_bytes = e.stdout if e.stdout else b""
-        stderr_bytes = e.stderr if e.stderr else b""
-        raw_output = stdout_bytes + stderr_bytes
-
-    except FileNotFoundError:
-        # Script doesn't exist or is not executable
-        return (127, "")  # 127 = command not found (shell convention)
-
-    except PermissionError:
-        # Script exists but is not executable
-        return (126, "")  # 126 = command not executable (shell convention)
-
-    except Exception as exc:
-        # Any other error — return generic failure with error message. It may
-        # have come after the script started, so nobody knows whether it is
-        # still running (15 October 2026): read like a lost answer.
-        error_msg = f"Unexpected error running script: {type(exc).__name__}: {exc}"
+    # THROUGH THE ONE PLACE PROGRAMS ARE STARTED (15 October 2026): an error
+    # from the spawn itself means nothing ran; anything raised once the script
+    # had started means nobody knows whether it is still running. The script
+    # is stopped alone at its limit, as before (it leads no group of its own).
+    ran = run_program(
+        [program],
+        cwd=cwd,
+        env=env,
+        timeout=timeout,
+        new_session=False,
+        stdin=None,
+        post_kill_read_seconds=1.0,
+    )
+    if ran.refused_before_start:
+        # The script could not be started (shell conventions: 127 not found,
+        # 126 found but could not be executed — a bad format, not a folder,
+        # no permission). Nothing ran: an answer.
+        code = 127 if isinstance(ran.error, FileNotFoundError) else 126
+        return RefusedBeforeStart(code, "")
+    if ran.raised_while_running:
+        error = ran.error
+        error_msg = f"Unexpected error running script: {type(error).__name__}: {error}"
         return RaisedWhileRunning(1, error_msg)
+    timed_out = ran.timed_out
+    exit_code = _TIMEOUT_EXIT_CODE if timed_out else int(ran.exit_code or 0)
+    raw_output = ran.stdout + ran.stderr
 
     # Truncate to output_cap bytes BEFORE decoding and scrubbing
     if len(raw_output) > output_cap:
@@ -524,6 +486,7 @@ def register_shell_handlers(registry: StepTypeRegistry) -> None:
 
 __all__ = [
     "RaisedWhileRunning",
+    "RefusedBeforeStart",
     "TimedOut",
     "_run_script_step",
     "ScriptRunner",
