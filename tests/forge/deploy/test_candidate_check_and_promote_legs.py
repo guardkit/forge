@@ -674,6 +674,22 @@ class _ASidecarThatAnswers:
                         self.end_headers()
                         self.wfile.write(stopped)
                         return
+                if how in ("bad-refusal", "good-refusal"):
+                    # An owned-deploy refusal: of no known shape, or the
+                    # executor's own (Codex round 9, R16).
+                    body_out: dict[str, Any] = {"accepted": False, "exit_code": None}
+                    if how == "good-refusal":
+                        body_out.update(
+                            word="the-slot-is-occupied",
+                            sentence="the slot is held by another build, so nothing ran.",
+                        )
+                    said = json.dumps(body_out).encode()
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.send_header("Content-Length", str(len(said)))
+                    self.end_headers()
+                    self.wfile.write(said)
+                    return
                 if how in ("exec-error", "refused-400"):
                     # A 5xx: the sidecar's run raised while running. A 4xx:
                     # refused before anything ran (Codex R9).
@@ -1645,3 +1661,35 @@ class TestATimeoutIsReadFirst:
         finally:
             sidecar.close()
         assert answer.answer_lost is True
+
+
+
+class TestAnOwnedDeployRefusalIsConfirmedOnlyInItsOwnShape:
+    """15 October 2026, Codex round 9, R16: an ``accepted: false`` reply is a
+    confirmed refusal only with the executor's result word, a sentence and an
+    exit code that is an integer or the executor's "none"."""
+
+    @pytest.mark.parametrize(
+        "body, confirmed",
+        [
+            (b'{"accepted": false, "exit_code": null}', False),
+            (b'{"accepted": false, "word": "", "sentence": "x", "exit_code": null}', False),
+            (b'{"accepted": false, "word": "Not A Word", "sentence": "x", "exit_code": 1}', False),
+            (b'{"accepted": false, "word": "the-slot-is-occupied", "sentence": "", "exit_code": 1}', False),
+            (b'{"accepted": false, "word": "the-slot-is-occupied", "sentence": "s", "exit_code": "1"}', False),
+            (b'{"accepted": false, "word": "the-slot-is-occupied", "sentence": "s", "exit_code": null}', True),
+            (b'{"accepted": false, "word": "the-slot-is-occupied", "sentence": "s", "exit_code": 1}', True),
+        ],
+        ids=["no-word", "blank-word", "odd-word", "blank-sentence", "text-code", "none-code", "int-code"],
+    )
+    def test_the_refusal(self, body: bytes, confirmed: bool) -> None:
+        from forge.deploy.sidecar_runner import SidecarScriptRunner
+
+        sidecar = _ASidecarThatRefusesWith(200, body)
+        try:
+            answer = SidecarScriptRunner(base_url=sidecar.url, repo="guardkit/api_test")(
+                cwd="/sandbox/clone", script="deploy/deploy.sh", env_file=None, timeout=1
+            )
+        finally:
+            sidecar.close()
+        assert getattr(answer, "confirmed", False) is confirmed

@@ -1565,6 +1565,48 @@ class TestEveryDeployLegRunsTheStepsOfItsOwnCommit:
             assert held is not None
 
     @pytest.mark.asyncio
+    async def test_a_takeover_whose_old_group_could_not_be_confirmed_stopped(
+        self,
+        a_helper_that_deploys: tuple[str, dict[str, Any]],
+        pool: SqliteLifecyclePersistence,
+        clone: Path,
+        on_this_side: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        _receipts_env: Path,
+    ) -> None:
+        """15 October 2026, Codex round 9, R14, through the REAL executor: a
+        later holder takes the target over while the deploy runs; the deploy
+        command returns, but its own group cannot be confirmed stopped. The
+        takeover answer is not confirmed, so the hold is kept although the
+        candidate's teardown answered "down". (The ordinary takeover, whose
+        group is confirmed gone, puts the hold down:
+        ``test_a_deploy_taken_over_while_it_ran[finished]``.)"""
+        from forge.deploy_sidecar import deploy_executor as module
+        from forge.pipeline.publication_record import PublicationRecordStore
+        from tests.forge.deploy_sidecar.test_the_deploy_executor_is_the_gate import (
+            _taken_over_while_it_ran,
+        )
+
+        _taken_over_while_it_ran(monkeypatch, "finished")
+        monkeypatch.setattr(
+            module.DeployExecutor,
+            "_stop_and_confirm",
+            lambda self, note: (False, "a process of the group is still alive"),
+        )
+        log = tmp_path / "which-steps-ran.log"
+        _old, started_at = self._a_clone_left_behind(clone, log)
+        config = self._config(a_helper_that_deploys[0], on_this_side, clone)
+
+        outcome = await self._press_it(
+            config, pool, clone, on_this_side, tmp_path, started_at, monkeypatch
+        )
+
+        assert outcome.result != "merged-into-the-remote-and-running", outcome.detail
+        assert "down" in self._which_ran(log, clone)
+        assert PublicationRecordStore(pool.connection).read(BUILD_ID).lease_holder
+
+    @pytest.mark.asyncio
     async def test_a_press_that_picks_up_a_published_join_lays_its_tree_out_again(
         self,
         a_helper_that_deploys: tuple[str, dict[str, Any]],

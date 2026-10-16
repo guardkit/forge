@@ -1952,14 +1952,21 @@ class DeployExecutor:
         output = (output_bytes or b"").decode("utf-8", errors="replace")
         # HAS THIS COMMAND BEEN TAKEN OVER? Asked before anything is stopped,
         # cleared or answered. A takeover stops this command's whole process
-        # group and CONFIRMS every process of it gone before it writes its own
-        # note, so a note that is no longer this one's means this command was
-        # stopped and there is nothing of it left to stop. It writes nothing —
-        # the note on disk belongs to the command that holds the target now —
-        # and it answers in its own word.
+        # group and confirms every process of it gone before it writes its own
+        # note — but it marks this note superseded first, so a note that is no
+        # longer this one's does not by itself prove the group gone. This
+        # waiter writes nothing (the note on disk belongs to the command that
+        # holds the target now) and answers in its own word, confirmed only
+        # when it has seen its own group gone.
         if not self._the_note_is_still_mine(note):
+            # A CHANGED NOTE IS NOT A STOPPED GROUP (15 October 2026, Codex
+            # round 9): the holder that took over marks the note superseded
+            # BEFORE it confirms the stop, and that confirmation can fail. So
+            # this waiter looks for itself: its answer is complete only when
+            # its own command's group is confirmed gone.
+            stopped, _why = self._stop_and_confirm(note)
             return self._stopped_by_a_takeover(
-                note, output=output, timed_out=timed_out
+                note, output=output, timed_out=timed_out, stop_confirmed=stopped
             )
         # RULE (d): the note is cleared only after every process of the command
         # is confirmed gone — not when the one we spawned returned.
@@ -2036,6 +2043,7 @@ class DeployExecutor:
         output: str = "",
         timed_out: bool = False,
         raised_while_running: bool = False,
+        stop_confirmed: bool = False,
     ) -> ExecutorAnswer:
         """A command a later holder of the target stopped. IT IS NOT A DEPLOY.
 
@@ -2066,9 +2074,9 @@ class DeployExecutor:
             # or broke while it ran (15 October 2026).
             timed_out=timed_out,
             raised_while_running=raised_while_running,
-            # The holder that took over confirmed this command gone before it
-            # wrote its own note: complete, unless it also timed out or broke.
-            confirmed=not (timed_out or raised_while_running),
+            # Complete only when THIS command's group was confirmed gone, and
+            # it neither timed out nor broke while it ran.
+            confirmed=stop_confirmed and not (timed_out or raised_while_running),
         )
 
 

@@ -73,58 +73,94 @@ def test_only_a_complete_programs_answer_is_confirmed_by_its_kind() -> None:
     assert RefusedBeforeStart(127, "").confirmed is True
 
 
-#: The places a plain ``confirmed=True`` (or a ``"confirmed": True`` key) may
-#: be written: each reads a complete answer — git's exit code, a reply that
-#: passed its operation's own check, a refusal before anything ran, a
-#: process group confirmed gone, a leg whose every answer was complete.
-ALLOWED: dict[str, set[str]] = {
-    "adapters/git/operations.py": {"prepare_worktree", "cleanup_worktree"},
-    "adapters/guardkit/run.py": {"_binary_not_found_result", "_refused_cwd_result"},
-    "adapters/guardkit/run_via_sidecar.py": {"run_merge_via_sidecar"},
-    "cli/_conductor_worktree.py": {"cut_worktree_in_checkout", "remove_journey_worktree"},
+#: EXACTLY the places a plain ``confirmed=True`` (or a ``"confirmed": True``
+#: key, or a ``confirmed = True`` class attribute) is written, each with the
+#: validation it relies on (the audit of 15 October 2026, Codex round 9).
+ALLOWED: dict[str, dict[str, str]] = {
+    "adapters/git/operations.py": {
+        "prepare_worktree": "git worktree add ran to an exit code; or refused before git started",
+        "cleanup_worktree": "git worktree remove ran to an exit code",
+    },
+    "adapters/guardkit/run.py": {
+        "_binary_not_found_result": "no guardkit binary: refused before anything ran",
+        "_refused_cwd_result": "working folder refused before anything ran",
+    },
+    "adapters/guardkit/run_via_sidecar.py": {
+        "run_merge_via_sidecar": "200 reply with an integer exit code, timed_out read first",
+    },
+    "cli/_conductor_worktree.py": {
+        "cut_worktree_in_checkout": "an existing tree reused for this exact build: nothing changed",
+        "remove_journey_worktree": "the folder is already gone: nothing to do",
+    },
     "deploy/candidate_tree.py": {
-        "candidate_tree_path",
-        "_git",
-        "_extract_archive_into",
-        "materialise_candidate_tree",
-        "_ensure_excluded_sync",
-        "retire_autobuild_worktree",
+        "candidate_tree_path": "feature id refused before anything was written",
+        "_git": "git ran to an exit code (or could not be started) for a read",
+        "_extract_archive_into": "git archive exited, or was refused; extraction finished",
+        "materialise_candidate_tree": "laid out here to the end; or no commit named",
+        "_ensure_excluded_sync": "the exclude file could not be written: nothing else done",
+        "retire_autobuild_worktree": "ran here to its end with no git command that raised",
     },
-    "deploy/live_gate.py": {"project_driver_answer", "invoke"},
+    "deploy/live_gate.py": {
+        "project_driver_answer": "the driver ran to an exit code and its answer was read",
+        "invoke": "a dry run; the driver's environment refused; or a refused spawn",
+    },
     "deploy/sidecar_git.py": {
-        "materialise_candidate_tree",
-        "add_working_folder",
-        "retire_autobuild_worktree",
+        "materialise_candidate_tree": "200 reply with a path, timed_out read first",
+        "add_working_folder": "200 reply with status success or failed, timed_out read first",
+        "retire_autobuild_worktree": "200 reply with a known status and no git_raised",
     },
-    "deploy/stage.py": {"stamped"},
+    "deploy/stage.py": {
+        "stamped": "every runner and gate answer in the leg's run was confirmed",
+    },
     "deploy_sidecar/deploy_executor.py": {
-        "run",
-        "_settle_the_slot",
-        "_nothing_is_alive_after_all",
-        "_slot_with_no_note",
-        "_confirm_with_the_coordinator",
-        "_start",
+        "run": "the request refused before anything was started",
+        "_settle_the_slot": "the request refused before anything was started",
+        "_nothing_is_alive_after_all": "the request refused before anything was started",
+        "_slot_with_no_note": "the request refused before anything was started",
+        "_confirm_with_the_coordinator": "the request refused before anything was started",
+        "_start": "the request refused before the command was started",
     },
-    "pipeline/check_join.py": {"ask_the_build_system_to_check_the_join"},
-    "pipeline/merge_executor.py": {"execute_merge_deploy"},
-    # The two kinds of program result that are complete by what they are.
-    "executor/programs.py": {"Finished", "RefusedBeforeStart"},
+    "pipeline/check_join.py": {
+        "ask_the_build_system_to_check_the_join": "the door refused (MergeCallRefused) before anything was sent",
+    },
+    "pipeline/merge_executor.py": {
+        "execute_merge_deploy": "the retained worktree kept by the press's own decision: nothing touched",
+    },
+    "executor/programs.py": {
+        "RefusedBeforeStart": "the spawn itself failed: nothing ran",
+        "Finished": "the program ran to an end and said how",
+    },
+}
+
+#: EXACTLY the places a result that is complete by its kind (``Finished``,
+#: ``RefusedBeforeStart``) is built.
+COMPLETE_BY_KIND: dict[str, dict[str, str]] = {
+    "executor/shell_steps.py": {
+        "_run_script_step": "ran to an exit code; or refused in words before running",
+    },
+    "deploy/sidecar_runner.py": {
+        "__call__": "a 200 that passed every check, a 4xx refusal in words, or the executor's own refusal shape",
+    },
+    "deploy_sidecar/service.py": {
+        "_start_and_collect": "the spawn itself failed: nothing ran",
+    },
 }
 
 #: Files whose ``confirmed`` means something else entirely.
-UNRELATED = {"review_gate/assembler.py"}
+UNRELATED = {"review_gate/assembler.py", "review_gate/record.py"}
 
 
 def _plain_true(node: ast.AST) -> bool:
     return isinstance(node, ast.Constant) and node.value is True
 
 
-def test_confirmed_is_set_true_only_where_a_complete_answer_is_read() -> None:
-    found: list[str] = []
+def _places() -> tuple[set[tuple[str, str]], set[tuple[str, str]]]:
+    confirmed: set[tuple[str, str]] = set()
+    by_kind: set[tuple[str, str]] = set()
     for path in sorted(SRC.rglob("*.py")):
         rel = path.relative_to(SRC).as_posix()
         text = path.read_text(encoding="utf-8")
-        if "confirmed" not in text or rel in UNRELATED:
+        if rel in UNRELATED or ("confirmed" not in text and "Finished(" not in text and "RefusedBeforeStart(" not in text):
             continue
         tree = ast.parse(text)
         parents: dict[ast.AST, ast.AST] = {}
@@ -140,19 +176,26 @@ def test_confirmed_is_set_true_only_where_a_complete_answer_is_read() -> None:
             return "<module>"
 
         for node in ast.walk(tree):
-            places: list[ast.AST] = []
             if isinstance(node, ast.keyword) and node.arg == "confirmed" and _plain_true(node.value):
-                places.append(node)
+                confirmed.add((rel, enclosing(node)))
             elif isinstance(node, ast.Dict):
                 for key, value in zip(node.keys, node.values):
                     if isinstance(key, ast.Constant) and key.value == "confirmed" and _plain_true(value):
-                        places.append(node)
+                        confirmed.add((rel, enclosing(node)))
             elif isinstance(node, ast.Assign) and _plain_true(node.value) and any(
                 isinstance(t, ast.Name) and t.id == "confirmed" for t in node.targets
             ):
-                places.append(node)
-            for place in places:
-                where = enclosing(place)
-                if where not in ALLOWED.get(rel, set()):
-                    found.append(f"{rel}:{getattr(place, 'lineno', '?')} in {where}")
-    assert found == [], "confirmed=True set outside the validated-answer places"
+                confirmed.add((rel, enclosing(node)))
+            elif (
+                isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Name)
+                and node.func.id in ("Finished", "RefusedBeforeStart")
+            ):
+                by_kind.add((rel, enclosing(node)))
+    return confirmed, by_kind
+
+
+def test_confirmed_is_set_true_exactly_where_a_complete_answer_is_read() -> None:
+    confirmed, by_kind = _places()
+    assert confirmed == {(f, fn) for f, fns in ALLOWED.items() for fn in fns}
+    assert by_kind == {(f, fn) for f, fns in COMPLETE_BY_KIND.items() for fn in fns}

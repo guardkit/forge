@@ -1541,6 +1541,9 @@ class InContainerCandidateGit:
             path=Path(path),
             expected=expected,
         )
-        # The retirement ran here to its end and said what it did: a complete
-        # answer (15 October 2026). A raise goes past, and keeps the hold.
+        # The retirement ran here to its end and every git command in it
+        # answered: a complete answer (15 October 2026). One that met a git
+        # command that raised is not. A raise goes past, and keeps the hold.
+        if retired.get("git_raised"):
+            return {**retired, "confirmed": False}
         return {**retired, "confirmed": True}

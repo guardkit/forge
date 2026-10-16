@@ -1161,6 +1161,29 @@ class TestATakeoverKeepsWhatElseHappened:
         assert answer.raised_while_running is raised
 
 
+class TestATakeoverIsConfirmedOnlyWhenItsOwnGroupIsGone:
+    """15 October 2026, Codex round 9, R14: the holder that took over marks
+    the note superseded before it confirms the stop, so a changed note proves
+    nothing about the group. The takeover answer is confirmed only when this
+    waiter has itself seen its own group gone."""
+
+    @pytest.mark.parametrize("gone", [True, False])
+    def test_the_answer_says_it(self, notes, workshop, TARGET, monkeypatch, gone) -> None:
+        from forge.deploy_sidecar import deploy_executor as module
+
+        _taken_over_while_it_ran(monkeypatch, "finished")
+        if not gone:
+            monkeypatch.setattr(
+                module.DeployExecutor,
+                "_stop_and_confirm",
+                lambda self, note: (False, "a process of the group is still alive"),
+            )
+        executor = _executor(notes, command_seconds=30.0, stop_confirm_seconds=20.0)
+        answer = executor.run(_ask(TARGET, _quick(workshop), 1, "build-a", workshop))
+        assert answer.word == module.STOPPED_BY_A_TAKEOVER
+        assert answer.confirmed is gone
+
+
 class TestARanAnswerIsConfirmedOnlyWhenItsGroupIsGone:
     """15 October 2026, Codex R14: a deploy command that returned is a
     complete answer only when every process of its group was confirmed gone;

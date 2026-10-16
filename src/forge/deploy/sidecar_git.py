@@ -180,6 +180,11 @@ class SidecarCandidateGit:
         status, decoded = answer
         if not isinstance(decoded, dict):
             return None, self._sentence(route, answer), False
+        # TIMEOUT FIRST (15 October 2026, Codex R17): a reply that says the
+        # operation was stopped at its time limit is no answer, whatever else
+        # it carries.
+        if decoded.get("timed_out") is True:
+            return None, self._sentence(route, answer), False
         if status != 200:
             # Only a 4xx refusal in the sidecar's own words is an answer; any
             # 5xx is an error met while the operation may have been under way
@@ -482,7 +487,12 @@ class SidecarCandidateGit:
             },
             timeout=self._layout_timeout_s,
             # The retirement's own answer (15 October 2026, the R3 rule).
-            valid=lambda d: d.get("status") in ("removed", "kept", "already-gone"),
+            valid=lambda d: (
+                d.get("status") in ("removed", "kept", "already-gone")
+                # A retirement that met a git command that raised is not an
+                # answer (15 October 2026, Codex R15).
+                and not d.get("git_raised")
+            ),
         )
         if decoded is None:
             # No answer: the retirement may still be running in the sandbox,

@@ -517,3 +517,37 @@ class TestTheSandboxSaysWhetherGitAnswered:
         )
         assert made.ok is False
         assert made.confirmed is confirmed
+
+
+class TestATimeoutIsReadFirstInEveryGitReply:
+    """15 October 2026, Codex round 9, R17: a reply that says the operation
+    was stopped at its time limit is no answer, however complete the rest of
+    it looks."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "status, body",
+        [
+            (200, {"status": "success", "path": "/x/integration-FEAT-SG1", "removed": True, "timed_out": True}),
+            (200, {"status": "failed", "removed": False, "timed_out": True}),
+            (400, {"error": "stopped at its limit", "timed_out": True}),
+        ],
+        ids=["success", "failure", "refusal"],
+    )
+    async def test_every_operation(self, status: int, body: dict) -> None:
+        sidecar = _ASidecarThatAnswersWith(status, body)
+        try:
+            git = sidecar.git
+            made = await git.add_working_folder(
+                "integration-FEAT-SG1", "factory-integration/FEAT-SG1", "main"
+            )
+            assert made.confirmed is False
+            assert await git.remove_working_folder("/x/integration-FEAT-SG1") is None
+            assert await git.remove_candidate_tree(FEATURE_ID) is None
+            with pytest.raises(CandidateTreeError) as raised:
+                await git.materialise_candidate_tree(FEATURE_ID, "a" * 40)
+            assert raised.value.confirmed is False
+            retired = await git.retire_autobuild_worktree("build-X", "/retained", {})
+            assert retired["confirmed"] is False
+        finally:
+            sidecar.close()

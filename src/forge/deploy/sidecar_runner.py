@@ -33,6 +33,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import urllib.error
 import urllib.request
 from collections.abc import Sequence
@@ -47,6 +48,9 @@ logger = logging.getLogger(__name__)
 #: malformed data. Distinct from a script's own exit code (which the sidecar
 #: relays verbatim) so a transport failure is not mistaken for a script failure.
 SIDECAR_TRANSPORT_EXIT_CODE = 1
+
+#: The owned deploy executor's result words: lowercase words joined by dashes.
+_EXECUTOR_WORD = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 
 
 class NoAnswer(tuple):
@@ -257,8 +261,24 @@ class SidecarScriptRunner:
         # what a person reads, and the word beside it so a caller can tell the
         # refusals apart without reading English.
         if parsed.get("accepted") is False:
-            word = str(parsed.get("word") or "the-deploy-was-refused")
-            sentence = str(parsed.get("sentence") or "the deploy was refused")
+            # A REFUSAL IS CONFIRMED ONLY IN THE EXECUTOR'S OWN SHAPE (15
+            # October 2026, Codex R16): a result word, a sentence, and an exit
+            # code that is an integer or the executor's own "none" (nothing
+            # ran). Anything less was not an answer anybody can rely on.
+            word = parsed.get("word")
+            sentence = parsed.get("sentence")
+            refused_code = parsed.get("exit_code")
+            if not (
+                isinstance(word, str)
+                and _EXECUTOR_WORD.match(word)
+                and isinstance(sentence, str)
+                and sentence.strip()
+                and (
+                    refused_code is None
+                    or (isinstance(refused_code, int) and not isinstance(refused_code, bool))
+                )
+            ):
+                return NoAnswer(f"sidecar answered a refusal of no known shape: {parsed!r}")
             return Finished(SIDECAR_TRANSPORT_EXIT_CODE, f"[{word}] {sentence}")
         exit_code = parsed.get("exit_code")
         output = parsed.get("output_tail", "")

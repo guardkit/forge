@@ -4756,13 +4756,21 @@ def _autobuild_worktree_request(
     expected = payload.get("expected")
     if not isinstance(expected, dict):
         return 400, {"error": "'expected' retained worktree identity is required"}
-    return 200, retire_autobuild_worktree(
+    retired = retire_autobuild_worktree(
         repo=repo_path,
         base=base,
         build_id=build_id,
         path=Path(path),
         expected=expected,
     )
+    # A git command in it raised instead of answering (15 October 2026): a
+    # 5xx, which every caller reads as no answer.
+    if retired.get("git_raised"):
+        return 500, {
+            "error": "sidecar git error: a git command raised during the retirement",
+            **retired,
+        }
+    return 200, retired
 
 
 def process_git_autobuild_worktree_inspect_request(

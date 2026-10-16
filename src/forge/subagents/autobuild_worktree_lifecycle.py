@@ -21,10 +21,12 @@ is fail-closed when path ownership or offer-time identity cannot be proved.
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import os
 import re
 import stat
+import subprocess
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -35,6 +37,13 @@ DEFAULT_AUTOBUILD_WORKTREE_BASE = "/tmp/forge-autobuild-worktrees"
 GIB = 1024**3
 
 SAFE_BUILD_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+
+#: Where a retirement notes a git command that raised instead of answering
+#: (15 October 2026, Codex R15). Such a command may have been sent and may
+#: have done its work, so a retirement that met one is not a complete answer.
+_GIT_RAISED: contextvars.ContextVar[list[str] | None] = contextvars.ContextVar(
+    "autobuild_worktree_git_raised", default=None
+)
 INNER_WORKTREES_REL = Path(".guardkit/worktrees")
 
 
@@ -48,7 +57,13 @@ def _git(repo: Path, *args: str) -> tuple[int, bytes]:
     """
     try:
         done = run_git(["-C", str(repo), *args], text=False)
-    except OSError as exc:
+    except (OSError, subprocess.SubprocessError) as exc:
+        # NOT AN ANSWER (15 October 2026): git raised instead of exiting, so
+        # nobody knows what it did. The caller still gets its fixed shape;
+        # a retirement in progress notes it, and its report says so.
+        noted = _GIT_RAISED.get()
+        if noted is not None:
+            noted.append(f"git {args[0] if args else ''} raised {type(exc).__name__}")
         return 127, f"{type(exc).__name__}: {exc}".encode()
     return done.returncode, done.stdout if done.returncode == 0 else done.stderr
 
@@ -617,6 +632,27 @@ def _remove_worktree(repo: Path, worktree: Path) -> tuple[int, bytes]:
 
 
 def retire_autobuild_worktree(
+    *, repo: Path, base: Path, build_id: str, path: Path, expected: Mapping[str, Any]
+) -> dict[str, Any]:
+    """:func:`_retire_autobuild_worktree`, noting any git command that raised.
+
+    A report that met one carries ``git_raised`` (15 October 2026): it is not
+    a complete answer, so neither venue confirms it.
+    """
+    noted: list[str] = []
+    token = _GIT_RAISED.set(noted)
+    try:
+        report = _retire_autobuild_worktree(
+            repo=repo, base=base, build_id=build_id, path=path, expected=expected
+        )
+    finally:
+        _GIT_RAISED.reset(token)
+    if noted:
+        report = {**report, "git_raised": list(noted)}
+    return report
+
+
+def _retire_autobuild_worktree(
     *, repo: Path, base: Path, build_id: str, path: Path, expected: Mapping[str, Any]
 ) -> dict[str, Any]:
     """Remove one offer-pinned tree, nested registrations first.

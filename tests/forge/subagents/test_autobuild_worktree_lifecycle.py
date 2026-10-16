@@ -782,3 +782,111 @@ def test_gits_record_folders_swapped_for_a_link_to_a_writable_copy_are_not_remov
         for name in names
     } == files
     assert inner.exists()
+
+
+# ---------------------------------------------------------------------------
+# A GIT COMMAND THAT RAISED IS NOT AN ANSWER (15 October 2026, Codex R15). The
+# retirement used to turn it into exit 127 and an ordinary "kept" report, and
+# both venues confirmed that report. Now the report says git_raised and is
+# never confirmed: in this container, nor through the sandbox's route (a 5xx).
+# ---------------------------------------------------------------------------
+
+
+def _remove_raises(monkeypatch: pytest.MonkeyPatch, which: str) -> None:
+    """``git worktree remove`` raises for the ``nested`` tree or the ``outer``
+    one, as a command can after it was sent; every other git runs for real."""
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    real = lifecycle.run_git
+
+    def _git(args, **kwargs):  # type: ignore[no-untyped-def]
+        if "remove" in args:
+            target = Path(args[-1])
+            nested = ".guardkit" in target.parts
+            if (which == "nested") == nested:
+                raise OSError("the pipe to git worktree remove broke")
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "run_git", _git)
+
+
+@pytest.mark.parametrize("which", ["nested", "outer"])
+def test_a_removal_that_raised_is_noted_and_never_confirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, which: str
+) -> None:
+    import asyncio
+
+    from forge.deploy.candidate_tree import InContainerCandidateGit
+
+    repo, base, outer, _inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    _remove_raises(monkeypatch, which)
+    monkeypatch.setenv("FORGE_AUTOBUILD_WORKTREE_BASE", str(base))
+
+    # Through this container's venue, which runs the real helper.
+    retired = asyncio.run(
+        InContainerCandidateGit(repo).retire_autobuild_worktree(BUILD_ID, str(outer), offered)
+    )
+    assert retired["status"] == "kept", retired
+    assert retired["git_raised"], retired
+    assert retired["confirmed"] is False
+
+
+def test_an_ordinary_failed_removal_is_a_confirmed_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import asyncio
+
+    from forge.deploy.candidate_tree import InContainerCandidateGit
+    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
+
+    repo, base, outer, _inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    real = lifecycle.run_git
+
+    def _remove_fails(args, **kwargs):  # type: ignore[no-untyped-def]
+        if "remove" in args:
+            return real(["-C", str(repo), "branch", "-D", "no-such-branch"], **kwargs)
+        return real(args, **kwargs)
+
+    monkeypatch.setattr(lifecycle, "run_git", _remove_fails)
+    monkeypatch.setenv("FORGE_AUTOBUILD_WORKTREE_BASE", str(base))
+    retired = asyncio.run(
+        InContainerCandidateGit(repo).retire_autobuild_worktree(BUILD_ID, str(outer), offered)
+    )
+    assert retired["status"] == "kept", retired
+    assert "git_raised" not in retired
+    assert retired["confirmed"] is True
+
+
+def test_the_sandbox_route_answers_a_raised_removal_with_a_5xx(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge.config.models import ForgeConfig
+    from forge.deploy_sidecar.service import process_git_autobuild_worktree_retire_request
+
+    repo, base, outer, _inner = _repo_with_nested(tmp_path)
+    offered = inspect_autobuild_worktree(
+        repo=repo, base=base, build_id=BUILD_ID, path=outer
+    )
+    offered["cleanup_registrations"] = offered["nested_registrations"]
+    _remove_raises(monkeypatch, "outer")
+    monkeypatch.setenv("FORGE_AUTOBUILD_WORKTREE_BASE", str(base))
+    config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": [str(tmp_path)]}},
+            "planning": {"target_repo_paths": {"acme/shop": str(repo)}},
+        }
+    )
+    status, body = process_git_autobuild_worktree_retire_request(
+        {"repo": "acme/shop", "build_id": BUILD_ID, "path": str(outer), "expected": offered},
+        config=config,
+    )
+    assert status == 500, body
+    assert body["git_raised"]

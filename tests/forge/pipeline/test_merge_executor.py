@@ -4863,6 +4863,10 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
             ("exec-error", None, True),
             ("ok", "exec-error", True),
             ("refused-400", None, False),
+            # Codex round 9, R16: an owned-deploy refusal of no known shape is
+            # no answer; the executor's own refusal is one.
+            ("bad-refusal", None, True),
+            ("good-refusal", None, False),
         ],
         ids=[
             "script-timed-out-no-cwd",
@@ -4875,6 +4879,8 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
             "script-5xx",
             "gate-5xx",
             "script-refused-4xx",
+            "refusal-of-no-known-shape",
+            "the-executors-own-refusal",
         ],
     )
     async def test_a_check_script_that_ran_out_of_time_keeps_it(
@@ -5300,6 +5306,49 @@ class TestTheHoldIsPutDownOnlyWhenThePressHasFinished:
         outcome = await _run_executor(deps, repo_root)
 
         assert outcome.result == "candidate-refused", outcome.detail
+        held = _the_hold(pool)
+        assert held.result == "publication pending"
+        assert (held.lease_holder is not None) is kept
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("timed_out, kept", [(True, True), (False, False)])
+    async def test_a_join_folder_reply_that_says_it_timed_out_keeps_it(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,
+        repo_root: Path,
+        timed_out: bool,
+        kept: bool,
+    ) -> None:
+        """15 October 2026, Codex round 9, R17: the join folder is asked for
+        through the REAL sandbox git client; the sandbox answers "failed".
+        When the reply also says the operation timed out, it is no answer
+        and the hold is kept; without that, it is an answered refusal and
+        the hold goes down."""
+        import dataclasses
+
+        from tests.forge.deploy.test_sidecar_candidate_git import _ASidecarThatAnswersWith
+
+        body: dict[str, Any] = {"status": "failed", "detail": "the folder was not made"}
+        if timed_out:
+            body["timed_out"] = True
+        sidecar = _ASidecarThatAnswersWith(200, body)
+
+        class _AFolderMadeInTheSandbox(InContainerCandidateGit):
+            async def add_working_folder(self, leaf: str, branch: str, base_ref: str):
+                return await sidecar.git.add_working_folder(leaf, branch, base_ref)
+
+        venue = _AFolderMadeInTheSandbox(
+            repo_root, fetch_address=origin_of(repo_root), repo=REPO
+        )
+        deps, _publisher, _gk, _dp = _deps(config, pool, guardkit=_JoinsForReal())
+        deps = dataclasses.replace(deps, git_surface=lambda _repo, _root: venue)
+        try:
+            outcome = await _run_executor(deps, repo_root)
+        finally:
+            sidecar.close()
+
+        assert outcome.result == "merge-refused", outcome.detail
         held = _the_hold(pool)
         assert held.result == "publication pending"
         assert (held.lease_holder is not None) is kept
