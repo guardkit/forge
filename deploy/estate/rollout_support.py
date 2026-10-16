@@ -37,7 +37,7 @@ PUBLISHER_RUNTIME = 'sha256:dd5281444ec7fbe6f13473331c693383d458819b72789a858153
 # The ledger schema version this helper knows. Rich, 4 October 2026: "Teach it
 # version 17" (17 adds the builds.source_commit column and no table). Every
 # check below uses this one constant.
-LEDGER_SCHEMA_VERSION = 20
+LEDGER_SCHEMA_VERSION = 19
 WORK_TABLES = {'builds': 1, 'planning_runs': 3, 'work_queue': 10, 'publication_records': 15, 'deployment_targets': 16}
 
 # Temporary-folder names an estate env file may set for the sandbox (TMPDIR is
@@ -174,6 +174,7 @@ import pathlib,sys,importlib.util,json,hashlib
 from forge.adapters.sqlite.connect import connect_writer
 from forge.lifecycle.migrations import apply_at_boot
 from forge.persistence.migrations import lifecycle_bridge_registry
+from forge.lifecycle import card_revisions
 import forge.lifecycle.migrations as canonical
 module_path=pathlib.Path(canonical.__file__).parents[1]/'lifecycle_bridge'/'coexistence.py'
 spec=importlib.util.spec_from_file_location('rollout_boot_coexistence',module_path)
@@ -182,6 +183,7 @@ c=connect_writer(pathlib.Path('/copy/forge.db'))
 assert apply_at_boot(c)==__LEDGER_SCHEMA_VERSION__
 coexistence.apply_migration(c)
 lifecycle_bridge_registry.apply(c)
+card_revisions.ensure_table(c)
 c.execute('PRAGMA wal_checkpoint(TRUNCATE)');c.close()
 assert not any(n=='nats' or n.startswith('nats.') or n=='nats_core.client' for n in sys.modules)
 '''

@@ -155,6 +155,9 @@ class CardFacts:
     revision: int
     #: A preparation (a rebuild) for this build is running in this process.
     preparing: bool = False
+    #: When the facts were read; a ready preview past its time reads as
+    #: expired even before the sweep has ended its lease.
+    now: datetime | None = None
 
 
 @dataclass(frozen=True)
@@ -180,7 +183,9 @@ def _reason_of(lease: Any) -> str:
 def _stopped_text(lease: Any, fallback: str) -> str:
     """ "Preview expired at 14:07 UTC." or "Preview stopped: <reason>."."""
     reason = _reason_of(lease) if lease is not None else ""
-    if reason == EXPIRED_REASON:
+    # An Approve refused because the time was up ends the preview with the
+    # refusal's words; the card says what happened, not what to do about it.
+    if reason == EXPIRED_REASON or "approval window ended" in reason:
         expiry = _parse(getattr(lease, "app_expires_at", None))
         if expiry is not None:
             return f"Preview expired at {expiry.astimezone(timezone.utc):%H:%M} UTC."
@@ -249,6 +254,27 @@ def card_view(facts: CardFacts) -> CardView:
     if facts.preparing or newest_state == "preparing":
         return rebuilding("Rebuilding the preview for the same build.")
     if newest_state == "ready":
+        expiry = _parse(getattr(newest, "app_expires_at", None))
+        if (
+            getattr(newest, "run_id", None) == named_run
+            and ready_record
+            and facts.now is not None
+            and expiry is not None
+            and facts.now >= expiry
+        ):
+            # Past its time, though the sweep has not ended it yet: no Approve.
+            text = (
+                f"Preview expired at {expiry.astimezone(timezone.utc):%H:%M} UTC."
+            )
+            if capped:
+                text = f"{text} Rebuilt three times; reject and run the feature again."
+            return CardView(
+                status="ended",
+                status_text=text,
+                rebuild_offered=not capped,
+                evidence=without_app(EXPIRED_REASON),
+                preview_line=text,
+            )
         if getattr(newest, "run_id", None) == named_run and ready_record:
             return CardView(
                 status="ready",
@@ -415,6 +441,7 @@ def read_card_facts(
     *,
     leases: Any | None,
     preparing: bool = False,
+    now: datetime | None = None,
 ) -> CardFacts | None:
     """Everything one description needs, or None for a card not described.
 
@@ -457,6 +484,7 @@ def read_card_facts(
         named_lease=named,
         revision=card_revision(cx, build_id),
         preparing=preparing,
+        now=now,
     )
 
 

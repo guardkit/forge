@@ -269,10 +269,8 @@ class TestBootLogEmitsAppliedCount:
         # exact commit a feature planned elsewhere was admitted at;
         # schema_v18.sql adds the coordinator's durable seed-once authority;
         # schema_v19.sql added on 12 October 2026 for the preview_leases
-        # table — one live review-preview lease per port; schema_v20.sql
-        # added on 16 October 2026 for the merge_card_revisions table — one
-        # revision counter per previewed merge card).
-        assert "applied 20" in applied_lines[0], applied_lines[0]
+        # table — one live review-preview lease per port).
+        assert "applied 19" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------

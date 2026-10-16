@@ -138,6 +138,8 @@ class Harness:
             }
         )
         self.wire = CardWire()
+        # No expiry timers unless a test asks for them (they would sleep a day).
+        self.expiry_sleep: Any = None
         self.approvals: list[tuple[str, bytes]] = []
         self.offers = self.new_offer_service()
         self.reports: list[Any] = []
@@ -164,6 +166,7 @@ class Harness:
             after_deploy_check_reader=lambda _p, _r: None,
             clock=self.clock,
             review_preview=self.service,
+            expiry_sleep=self.expiry_sleep,
         )
 
     def new_consumer(self, offers: MergeOfferService) -> MergeApprovalConsumer:
@@ -369,9 +372,90 @@ def _pending_offers(cx: sqlite3.Connection) -> list[str]:
 # ---------------------------------------------------------------------------
 
 
-def test_schema_v20_adds_the_revision_table(h: Harness) -> None:
-    assert h.cx.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 20
+def _tables(cx: sqlite3.Connection) -> set[str]:
+    return {
+        r[0] for r in cx.execute("SELECT name FROM sqlite_master WHERE type='table'")
+    }
+
+
+def test_the_table_is_outside_the_ladder_and_made_when_needed(h: Harness) -> None:
+    """Schema stays 19 (coordinator's decision, 16 October 2026); a ledger
+    without the table works, and the first counter write makes it."""
+    assert h.cx.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 19
+    assert migrations.target_schema_version() == 19
+    assert "merge_card_revisions" not in _tables(h.cx)
     assert h.revision("nobody") == 0
+    with card_revisions.immediate_transaction(h.cx):
+        assert card_revisions.bump_card_revision(h.cx, "b1", START) == 1
+    assert "merge_card_revisions" in _tables(h.cx)
+    card_revisions.ensure_table(h.cx)  # idempotent
+    assert h.revision("b1") == 1
+
+
+@pytest.mark.asyncio
+async def test_a_card_works_on_a_ledger_without_the_table(h: Harness) -> None:
+    assert "merge_card_revisions" not in _tables(h.cx)
+    await h.offer("b1", "FEAT-AB12")
+    assert h.card("b1").status == "ready" and h.card("b1").revision >= 1
+
+
+def test_release_2026_10_16_1_accepts_a_ledger_with_the_extra_table(
+    tmp_path: Path,
+) -> None:
+    """Rolling back to 2026.10.16-1 stays an image swap.
+
+    These are the checks that release (Forge 5c45fef7) makes of a ledger:
+    the migrations, the planning-handoff preflight and reader, and the estate
+    rollout helper's ledger_state. The first three files on this branch are
+    byte for byte that release's, and the rollout helper differs from it only
+    by the two boot-step lines that make this table (checked with git diff
+    against 5c45fef7 when this was written), so running them here is running
+    that release's checks.
+    """
+    import importlib.util
+
+    from forge.lifecycle.planning_handoff_preflight import (
+        preflight_retired_planning_handoff_correlations,
+    )
+    from forge.lifecycle.planning_handoff_retirement import (
+        retired_planning_handoff_correlations,
+    )
+
+    db = tmp_path / "forge.db"
+    cx = connect_writer(db)
+    migrations.apply_at_boot(cx)
+    card_revisions.ensure_table(cx)
+    with card_revisions.immediate_transaction(cx):
+        card_revisions.bump_card_revision(cx, "b1", START)
+    assert migrations.apply_at_boot(cx) == 19  # nothing to apply, nothing refused
+    retired_planning_handoff_correlations(cx)
+    cx.close()
+    preflight_retired_planning_handoff_correlations(db)
+
+    bundle = Path(__file__).resolve().parents[3] / "deploy" / "estate"
+    spec = importlib.util.spec_from_file_location(
+        "rollout_support_1016", bundle / "rollout_support.py"
+    )
+    rollout = importlib.util.module_from_spec(spec)
+    assert spec.loader is not None
+    spec.loader.exec_module(rollout)
+    assert rollout.LEDGER_SCHEMA_VERSION == 19
+    state = rollout.ledger_state(db)
+    assert state["schema_version"] == 19
+    # The helper's own copy of the boot steps makes the same table, so a
+    # started ledger and its loaded copy still match.
+    assert "card_revisions.ensure_table(c)" in rollout.BOOT_SQLITE_CODE
+
+
+def test_the_coordinator_boot_makes_the_table() -> None:
+    import inspect
+
+    from forge.cli import _serve_production
+
+    source = inspect.getsource(_serve_production.bind_production_serve)
+    assert source.index("_bridge_registry_migration.apply(connection)") < source.index(
+        "_ensure_card_revisions(connection)"
+    )
 
 
 def test_the_lifecycle_names_match_the_pipelines() -> None:
@@ -1008,3 +1092,175 @@ def test_the_queue_counts_a_preparing_preview_as_a_card_on_its_way(h: Harness) -
     assert work_landing(h.cx, "corr-b1", now=later) == NO_MERGE_CARD
     h.hold_a_slot(8950, build_id="b1", feature_id="FEAT-AB12", state="preparing")
     assert work_landing(h.cx, "corr-b1", now=later) == NOT_LANDED_YET
+
+
+# ---------------------------------------------------------------------------
+# The coach's review (16 October 2026): Reject during a rebuild, and expiry
+# ---------------------------------------------------------------------------
+
+
+def _record_states(h: Harness) -> list[tuple[str, str]]:
+    seen: list[tuple[str, str]] = []
+    original = h.store.update
+
+    def update(lease_id: str, *, now: Any, **fields: Any) -> bool:
+        applied = original(lease_id, now=now, **fields)
+        if applied and "state" in fields:
+            seen.append((lease_id, fields["state"]))
+        return applied
+
+    h.store.update = update  # type: ignore[method-assign]
+    return seen
+
+
+def _hold_preview_up(
+    h: Harness,
+) -> tuple[asyncio.Event, asyncio.Event, list[tuple[str, str]]]:
+    entered, go = asyncio.Event(), asyncio.Event()
+    calls: list[tuple[str, str]] = []
+    original = h.service._dispatch
+
+    async def held(**kwargs: Any) -> Any:
+        calls.append((kwargs["leg"], str(kwargs.get("build_id"))))
+        if kwargs["leg"] == "preview_up" and not entered.is_set():
+            entered.set()
+            await go.wait()
+        return await original(**kwargs)
+
+    h.service._dispatch = held
+    return entered, go, calls
+
+
+class TestRejectDuringARebuild:
+    @pytest.mark.asyncio
+    async def test_an_ended_lease_never_comes_back(self, h: Harness) -> None:
+        """S1a: Reject while the rebuild's preview is being started."""
+        await h.offer("b1", "FEAT-AB12")
+        await h.expire()
+        entered, go, calls = _hold_preview_up(h)
+        seen = _record_states(h)
+        await h.rebuild("b1", drain=False)
+        await asyncio.wait_for(entered.wait(), 30)
+        lease = h.lease_of("b1")
+        assert lease.state == "preparing"
+        await h.press("b1", "reject", drain=False)
+        # Released, but it keeps its slot until its own preparation stops.
+        assert h.store.get(lease.lease_id).state == "ending"
+        go.set()
+        await asyncio.wait_for(h.drain(), 30)
+        mine = [state for lease_id, state in seen if lease_id == lease.lease_id]
+        assert "ready" not in mine, mine
+        assert h.store.get(lease.lease_id).state == "ended"
+        assert h.store.get(lease.lease_id).reason == "rejected"
+        assert ("preview_journey", "b1") not in calls
+        assert lease.lease_id in h.venue.named("remove_project")
+        # An ended lease stays ended, whatever writes it.
+        assert not h.store.update(lease.lease_id, now=h.clock.now, state="ready")
+        assert h.store.get(lease.lease_id).state == "ended"
+        assert h.card("b1").status == "decided"
+
+    @pytest.mark.asyncio
+    async def test_no_other_card_gets_the_slot_while_it_stops(self, h: Harness) -> None:
+        """S1b: the rejected rebuild's slot is not handed to another card
+        while its preparation may still be starting containers."""
+        await h.offer("b1", "FEAT-AB12")
+        await h.expire()
+        await h.offer("b0", "FEAT-0000")  # holds the other slot
+        entered, go, calls = _hold_preview_up(h)
+        await h.rebuild("b1", drain=False)
+        await asyncio.wait_for(entered.wait(), 30)
+        b1_lease = h.lease_of("b1")
+        await h.press("b1", "reject", drain=False)
+        h.add_build("b2", "FEAT-CD34")
+        await asyncio.wait_for(
+            h.offers.offer(
+                build_id="b2", feature_id="FEAT-CD34", card_words=lambda _b, _m: "w"
+            ),
+            30,
+        )
+        await asyncio.sleep(0)
+        assert h.card("b2").status == "failed"  # both slots still held
+        assert h.lease_of("b2").port is None
+        go.set()
+        await asyncio.wait_for(h.drain(), 30)
+        assert ("preview_journey", "b1") not in calls
+        assert h.store.get(b1_lease.lease_id).state == "ended"
+        # Once it has stopped, the slot is free for b2's own Rebuild.
+        await h.rebuild("b2")
+        assert h.card("b2").status == "ready"
+        assert h.named_lease("b2").port == b1_lease.port
+        assert h.named_lease("b0").state == "ready"
+
+    @pytest.mark.asyncio
+    async def test_a_rejected_card_never_takes_another_card_s_slot(
+        self, h: Harness
+    ) -> None:
+        """S2: Reject while the rebuild is joining; it must not then evict."""
+        await h.offer("bA", "FEAT-AAAA")
+        await h.offer("bB", "FEAT-BBBB")
+        await h.offer("bC", "FEAT-CCCC")
+        entered, go = asyncio.Event(), asyncio.Event()
+        original = h.venue.lay_out
+
+        async def held(lease_id: str, *, onto: str, candidate: str) -> Any:
+            entered.set()
+            await go.wait()
+            return await original(lease_id, onto=onto, candidate=candidate)
+
+        h.venue.lay_out = held  # type: ignore[method-assign]
+        await h.rebuild("bC", drain=False)
+        await asyncio.wait_for(entered.wait(), 30)
+        await h.press("bC", "reject", drain=False)
+        go.set()
+        await asyncio.wait_for(h.drain(), 30)
+        assert h.named_lease("bA").state == "ready", h.named_lease("bA").reason
+        assert h.named_lease("bB").state == "ready", h.named_lease("bB").reason
+        assert h.card("bC").status == "decided"
+        assert len(h.offer_rows("bC")) == 1
+
+
+class TestExpiryShowsAtOnce:
+    @pytest.mark.asyncio
+    async def test_past_its_time_the_card_has_no_approve_before_the_sweep(
+        self, h: Harness
+    ) -> None:
+        """S3: between expiry and the next sweep the card no longer says ready."""
+        await h.offer("b1", "FEAT-AB12")
+        h.clock.now += timedelta(hours=25)
+        await h.offers.describe_card("b1")
+        card = h.card("b1")
+        expiry = h.lease_of("b1").app_expires_at[11:16]
+        assert (card.status, card.rebuild_offered) == ("ended", True)
+        assert card.status_text == f"Preview expired at {expiry} UTC."
+        assert h.paused("b1").review_evidence.app_url is None
+        # An Approve pressed now is refused, and the card says the same thing,
+        # without telling anyone to reject.
+        await h.press("b1", "approve")
+        card = h.card("b1")
+        assert card.status == "ended" and card.rebuild_offered
+        assert card.status_text == f"Preview expired at {expiry} UTC."
+        assert "reject" not in card.status_text.lower()
+
+    @pytest.mark.asyncio
+    async def test_the_preview_is_ended_and_described_at_its_expiry(
+        self, tmp_path: Path
+    ) -> None:
+        h = Harness(tmp_path)
+        slept: list[float] = []
+
+        async def sleep_until(seconds: float) -> None:
+            slept.append(seconds)
+            h.clock.now += timedelta(seconds=seconds)
+
+        h.expiry_sleep = sleep_until
+        h.offers = h.new_offer_service()
+        h.consumer = h.new_consumer(h.offers)
+        await h.offer("b1", "FEAT-AB12")
+        for _ in range(5):
+            await asyncio.sleep(0)
+        await h.drain()
+        assert slept == [24 * 3600.0]
+        lease = h.lease_of("b1")
+        assert (lease.state, lease.reason) == ("ended", "the preview's time was up")
+        assert h.card("b1").status == "ended"
+        assert h.offers._expiry_timers == {}

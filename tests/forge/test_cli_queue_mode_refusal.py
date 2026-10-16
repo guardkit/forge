@@ -475,11 +475,11 @@ class TestPlanningHandoffPostMigrationValidation:
 
         assert result.exit_code == 0, result.output
         assert len(opened) == 1
-        # Migrated all the way to the version this release ships (20 since
-        # the merge card revisions of 16 October 2026).
+        # Migrated all the way to the version this release ships (19 since
+        # the preview leases of 12 October 2026).
         assert opened[0].execute("SELECT max(version) FROM schema_version").fetchone()[
             0
-        ] == 20
+        ] == 19
         assert opened[0].execute("SELECT count(*) FROM builds").fetchone()[0] == 1
         assert len(published) == 1
         opened[0].close()

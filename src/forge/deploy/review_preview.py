@@ -663,7 +663,15 @@ class PreviewLeaseStore:
         """
         chosen: PreviewLease | None = None
         with self._transaction():
-            eligible = self._eligible_to_make_room(ports, for_build)
+            # A card that already has a decision never takes another card's
+            # slot (coach's review, 16 October 2026): Reject may land while
+            # its rebuild is still joining.
+            decided = self._cx.execute(
+                "SELECT 1 FROM stage_log WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_decision' LIMIT 1",
+                (for_build,),
+            ).fetchone()
+            eligible = [] if decided else self._eligible_to_make_room(ports, for_build)
             if eligible:
                 chosen = replace(
                     eligible[0], state="ending", reason=f"to make room for {for_feature}"
@@ -755,26 +763,51 @@ class PreviewLeaseStore:
             self._changed(lease.build_id)
         return got
 
-    def update(self, lease_id: str, *, now: datetime, **fields: Any) -> None:
+    def update(
+        self,
+        lease_id: str,
+        *,
+        now: datetime,
+        expect: Sequence[str] | None = None,
+        **fields: Any,
+    ) -> bool:
+        """Change one lease; True when the change was made.
+
+        ONE RULE (coach's review, 16 October 2026): a lease that has ended
+        (``ended`` or ``failed``) never moves to any other state. Every write of
+        ``state`` is one guarded UPDATE that does nothing to an ended lease,
+        and ``expect`` narrows it to the states the caller is moving FROM (a
+        preparation's ``ready`` only from ``preparing``). Other fields (the
+        evidence's deletion, say) can still be written on an ended lease.
+        """
         unknown = set(fields) - set(_COLUMNS)
         if unknown:
             raise ValueError(f"unknown preview lease field(s): {sorted(unknown)}")
         sets = {**fields, "updated_at": now.isoformat()}
+        where = "WHERE lease_id = ?"
+        params: list[Any] = [lease_id]
+        if "state" in fields:
+            where += " AND state NOT IN ('ended', 'failed')"
+        if expect:
+            where += f" AND state IN ({', '.join('?' for _ in expect)})"
+            params.extend(expect)
         build_id: str | None = None
         with self._transaction():
-            self._cx.execute(
+            cursor = self._cx.execute(
                 f"UPDATE preview_leases SET {', '.join(f'{k} = ?' for k in sets)} "
-                "WHERE lease_id = ?",
-                (*sets.values(), lease_id),
+                f"{where}",
+                (*sets.values(), *params),
             )
-            row = self._cx.execute(
-                "SELECT build_id FROM preview_leases WHERE lease_id = ?", (lease_id,)
-            ).fetchone()
-            if row is not None:
-                build_id = str(row[0])
-                self._bump(build_id, now)
+            if cursor.rowcount:
+                row = self._cx.execute(
+                    "SELECT build_id FROM preview_leases WHERE lease_id = ?", (lease_id,)
+                ).fetchone()
+                if row is not None:
+                    build_id = str(row[0])
+                    self._bump(build_id, now)
         if build_id is not None:
             self._changed(build_id)
+        return build_id is not None
 
 
 # ---------------------------------------------------------------------------
@@ -1719,6 +1752,12 @@ class ReviewPreviewService:
         self._slot_poll_seconds = slot_poll_seconds
         self._profile_retry_seconds = profile_retry_seconds
         self._blocking_sleep = blocking_sleep
+        #: Leases whose preparation is running in this process. A release
+        #: (Reject) marks such a lease ``ending`` and leaves the teardown to
+        #: the preparation, which stops at its next step; the slot stays held
+        #: until then, so no other card can be given its port while this
+        #: preparation's containers may still be starting.
+        self._active: set[str] = set()
 
     def _app_ttl(self, preview: "DeployPreview | None") -> timedelta:
         """How long a preview (and its Approve window) lasts."""
@@ -2056,6 +2095,7 @@ class ReviewPreviewService:
         # From here on the slot is held, so whatever happens — even something
         # nobody expected — ends in a teardown and a failed lease, never in a
         # preview left running under a lease that says "preparing".
+        self._active.add(lease_id)
         try:
             self._store.update(
                 lease_id,
@@ -2075,6 +2115,8 @@ class ReviewPreviewService:
                 context,
                 f"the preview could not be prepared ({type(exc).__name__}: {exc})",
             )
+        finally:
+            self._active.discard(lease_id)
 
     async def _cancelled_before_the_slot(
         self, venue: Any, base: PreviewLease, lease_id: str
@@ -2129,6 +2171,8 @@ class ReviewPreviewService:
         )
         # (3) Stand it up.
         up = await self._leg(context, "preview_up", issued)
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if up is None or getattr(up, "outcome", None) != "complete":
             return await self._fail(
                 context, f"the preview could not be started: {self._why(up)}"
@@ -2141,6 +2185,8 @@ class ReviewPreviewService:
         # EVERY container of the preview's compose project must carry it: one
         # left unlabelled would outlive the teardown unseen.
         seen = await venue.preview_containers(issued["COMPOSE_PROJECT_NAME"])
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if seen is None:
             return await self._fail(
                 context, "the preview's containers could not be listed"
@@ -2163,6 +2209,8 @@ class ReviewPreviewService:
 
         # (4) The link.
         refused = _link_refusal(await venue.probe(lease_id, slot.port, token))
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if refused:
             return await self._fail(
                 context, f"the preview does not enforce its link — {refused}"
@@ -2170,6 +2218,8 @@ class ReviewPreviewService:
 
         # (5) The journey, recorded.
         journey_leg = await self._leg(context, "preview_journey", issued_for_the_journey)
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if journey_leg is None or getattr(journey_leg, "outcome", None) != "complete":
             return await self._fail(
                 context, f"the key journey could not be run: {self._why(journey_leg)}"
@@ -2178,11 +2228,14 @@ class ReviewPreviewService:
 
         # (6) Keep the evidence, before anything is torn down.
         kept, why_not = await self._keep_evidence(context)
+        if kept is not None:
+            context.kept = kept
+        if (stopped := await self._stopped_under_us(context)) is not None:
+            return stopped
         if kept is None:
             return await self._fail(
                 context, f"the evidence could not be kept: {why_not}"
             )
-        context.kept = kept
 
         # (7) The record.
         verdict = str(journey.get("verdict") or "")
@@ -2211,7 +2264,12 @@ class ReviewPreviewService:
                 "(failure-only recording?)",
                 journey=journey,
             )
-        self._store.update(lease_id, now=self._clock(), state="ready", reason=None)
+        # Ready ONLY from preparing, in one guarded write: a lease released
+        # while the evidence was being checked is never brought back.
+        if not self._store.update(
+            lease_id, now=self._clock(), expect=("preparing",), state="ready", reason=None
+        ):
+            return await self._stop_under_us(context)
         return self._record(
             req,
             state="ready",
@@ -2263,6 +2321,54 @@ class ReviewPreviewService:
         # Teardown starts only now, after the claim has committed.
         await self._end(victim, reason=str(victim.reason))
         return self._store.take_slot(lease, slots=slots, now=self._clock())
+
+    async def _stopped_under_us(self, context: "_Preparation") -> "ReviewEvidence | None":
+        """None while this preparation's lease is still ``preparing``;
+        otherwise stop it (see :meth:`_stop_under_us`) and return its record."""
+        lease = self._store.get(context.lease_id)
+        if lease is not None and lease.state == "preparing":
+            return None
+        return await self._stop_under_us(context)
+
+    async def _stop_under_us(self, context: "_Preparation") -> "ReviewEvidence":
+        """The lease was released while this preparation ran (a Reject).
+
+        Tear down only what this preparation started — its own labelled
+        resources, ref and tree; the slot is still held by this lease, so no
+        other card's preview is there — and write the lease down as ended (or
+        ending, when the teardown is not confirmed, for the sweep to retry).
+        Never ``ready``.
+        """
+        lease = self._store.get(context.lease_id)
+        reason = (
+            str(lease.reason).removesuffix(_NOT_CONFIRMED)
+            if lease is not None and lease.reason
+            else "the preview was released while it was being prepared"
+        )
+        logger.info(
+            "review preview: %s was released while being prepared (%s); "
+            "stopping and tearing down its own resources",
+            context.lease_id,
+            reason,
+        )
+        torn_down = await self._tear_down(context.venue, context.lease_id)
+        now = self._clock()
+        self._store.update(
+            context.lease_id,
+            now=now,
+            state="ended" if torn_down else "ending",
+            reason=reason if torn_down else f"{reason}{_NOT_CONFIRMED}",
+            ended_at=now.isoformat() if torn_down else None,
+        )
+        return self._record(
+            context.req,
+            state="failed",
+            run_id=context.run_id,
+            now=context.now,
+            preview=context.preview,
+            preview_tree=context.tree.tree,
+            failure_reason=f"the preview was stopped while it was being prepared: {reason}",
+        )
 
     async def _leg(
         self, context: "_Preparation", leg: str, issued: IssuedPreviewValues
@@ -2534,12 +2640,26 @@ class ReviewPreviewService:
             for lease in self._store.live_for_build(build_id):
                 if lease.feature_id != feature_id:
                     continue
+                if lease.lease_id in self._active:
+                    # Its preparation is running here: mark it ending (it
+                    # keeps its slot) and let the preparation stop and tear
+                    # down its own resources at its next step.
+                    self._store.update(
+                        lease.lease_id,
+                        now=self._clock(),
+                        expect=("preparing", "ready"),
+                        state="ending",
+                        reason=reason,
+                    )
+                    continue
                 await self._end(lease, reason=reason)
         except Exception:  # noqa: BLE001 — a release never raises
             logger.exception("review preview: releasing %s's preview raised", build_id)
 
     async def _end_expired(self, now: datetime) -> None:
         for lease in self._store.live():
+            if lease.lease_id in self._active:
+                continue  # its preparation is running here and ends it itself
             expiry = _parse_time(lease.app_expires_at)
             if lease.state == "ready" and expiry is not None and now >= expiry:
                 await self._end(lease, reason="the preview's time was up")
@@ -2657,13 +2777,18 @@ class ReviewPreviewService:
     def approval_refusal(
         self, review_evidence: Mapping[str, Any] | None, *, now: datetime
     ) -> str | None:
-        """None when approval may proceed; otherwise a plain-English reason."""
+        """None when approval may proceed; otherwise a plain-English reason.
+
+        The reasons no longer end "reject it and run the feature again"
+        (16 October 2026): the card now offers Rebuild preview, and says so
+        itself.
+        """
         if not isinstance(review_evidence, Mapping):
             return "this offer carries no preview record, so it cannot be approved"
         if review_evidence.get("state") != "ready":
             return (
                 "the preview for this offer was not prepared, so it cannot be "
-                "approved — reject it and run the feature again"
+                "approved"
             )
         expires = _parse_time(review_evidence.get("app_expires_at"))
         if expires is None:
@@ -2671,8 +2796,7 @@ class ReviewPreviewService:
         if now >= expires:
             return (
                 f"the preview and its approval window ended at "
-                f"{expires.strftime('%a %d %b %H:%M UTC')} — reject it and run the "
-                "feature again"
+                f"{expires.strftime('%a %d %b %H:%M UTC')}"
             )
         # The preview must still be standing: a lease ended by a release, the
         # sweep or the start-up reconcile is not approvable, whatever the
@@ -2687,13 +2811,13 @@ class ReviewPreviewService:
             return (
                 "the preview for this offer is no longer running"
                 + (f" ({lease.reason})" if lease is not None and lease.reason else "")
-                + ", so it cannot be approved — reject it and run the feature again"
+                + ", so it cannot be approved"
             )
         folder = self._folder_of(review_evidence)
         if folder is None or not folder.is_dir():
             return (
                 "the preview's evidence folder is missing, so this offer cannot be "
-                "approved — reject it and run the feature again"
+                "approved"
             )
         return None
 

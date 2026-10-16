@@ -1719,6 +1719,7 @@ class MergeOfferService:
         review_preview: Any | None = None,
         commit_reader: Callable[[str, Path], Any] | None = None,
         merge_check_rules: Any | None = None,
+        expiry_sleep: Callable[[float], Awaitable[Any]] | None = asyncio.sleep,
     ) -> None:
         self._config = config
         self._pool = pool
@@ -1747,6 +1748,12 @@ class MergeOfferService:
         # Descriptions sent at once on a lease change, and rebuilds the sweep
         # started; held so they are not collected mid-flight.
         self._card_tasks: set[asyncio.Task[Any]] = set()
+        # ONE TIMER PER READY PREVIEW (16 October 2026): at its expiry the
+        # preview is ended, which describes its card at once, so a card never
+        # shows Approve past its time while waiting for the five-minute sweep
+        # (the sweep stays the safety net). ``None`` (tests) sets no timers.
+        self._expiry_sleep = expiry_sleep
+        self._expiry_timers: dict[str, asyncio.Task[Any]] = {}
         # KEEPING THE POSTED CARD TRUE (16 October 2026): told of every
         # committed change to a preview lease, so the card is described at
         # once. The five-minute sweep describes every card anyway.
@@ -2619,6 +2626,7 @@ class MergeOfferService:
             build_id,
             leases=self._review_preview,
             preparing=build_id in self._preparing,
+            now=self._clock(),
         )
 
     def _description_of(self, build_id: str) -> Any | None:
@@ -2646,6 +2654,7 @@ class MergeOfferService:
         paused = self._description_of(build_id)
         if paused is None:
             return False
+        self._time_the_expiry(paused)
         try:
             await self._publisher.publish_build_paused(paused)
         except Exception as exc:  # noqa: BLE001 — the sweep sends it again
@@ -2668,6 +2677,51 @@ class MergeOfferService:
         task = loop.create_task(coro)
         self._card_tasks.add(task)
         task.add_done_callback(self._card_tasks.discard)
+
+    def _time_the_expiry(self, paused: Any) -> None:
+        """For a card described as ready, end its preview when its time is up."""
+        card = getattr(paused, "merge_card", None)
+        evidence = getattr(paused, "review_evidence", None)
+        end_run = getattr(self._review_preview, "end_run", None)
+        if (
+            self._expiry_sleep is None
+            or card is None
+            or evidence is None
+            or card.status != "ready"
+            or not callable(end_run)
+        ):
+            return
+        run_id = str(evidence.run_id)
+        if run_id in self._expiry_timers:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(self._end_at_expiry(run_id, evidence.app_expires_at))
+        self._expiry_timers[run_id] = task
+        task.add_done_callback(lambda _t, r=run_id: self._expiry_timers.pop(r, None))
+
+    async def _end_at_expiry(self, run_id: str, expires_at: datetime) -> None:
+        from forge.pipeline.merge_card import EXPIRED_REASON
+
+        assert self._expiry_sleep is not None
+        try:
+            delay = (expires_at - self._clock()).total_seconds()
+            await self._expiry_sleep(max(0.0, delay))
+            # Only a preview still ready is ended; its card is then described
+            # at once through the lease listener.
+            await self._review_preview.end_run(run_id, reason=EXPIRED_REASON)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 — the sweep is the safety net
+            logger.warning(
+                "merge-card: ending run %s at its expiry raised (%s: %s); the "
+                "sweep ends it",
+                run_id,
+                type(exc).__name__,
+                exc,
+            )
 
     def _card_changed(self, build_id: str) -> None:
         """A lease of this build changed: describe its card at once."""

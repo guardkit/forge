@@ -4,13 +4,22 @@ A merge card with a review preview is kept true after it is posted: Forge
 describes the card from its ledger and Jarvis edits the Slack message to
 match (``forge.pipeline.merge_card``). Lease rows change in place, so no row id
 can tell a newer description from an older one. Each card therefore has one
-counter (schema v20, ``merge_card_revisions``), raised by one in the SAME
-transaction as every change that can alter the card:
+counter (table ``merge_card_revisions``), raised by one in the SAME transaction
+as every change that can alter the card:
 
 * an offer or amended offer row;
 * a decision row;
 * a refused approval;
 * any insert or update of that build's preview lease.
+
+THE TABLE IS OUTSIDE THE MIGRATION LADDER, ON PURPOSE (coordinator's
+decision, 16 October 2026). The ledger stays at schema 19 so that rolling back
+to release 2026.10.16-1 stays a plain image swap: that release refuses to
+start on any schema it does not know, but it ignores a table it does not use.
+The table is created with ``CREATE TABLE IF NOT EXISTS`` at the coordinator's
+boot, beside the lifecycle-bridge tables (and the estate rollout helper's copy
+of those boot steps does the same), and :func:`bump_card_revision` creates it
+too, so a ledger without it still works.
 
 This module is the only writer of that table. It is deliberately small and
 low in the layers, so the lease store (``forge.deploy.review_preview``), the
@@ -35,6 +44,7 @@ __all__ = [
     "bump_card_revision",
     "card_revision",
     "decision_on_record",
+    "ensure_table",
     "immediate_transaction",
     "insert_stage_row",
     "latest_offer_details",
@@ -49,6 +59,25 @@ OFFER_ROW = "merge_deploy_offer"
 OFFER_DETAILS_KEY = "merge_offer"
 DECISION_ROW = "merge_deploy_decision"
 DECISION_DETAILS_KEY = "merge_decision"
+
+
+#: The table, created where it is needed and never migrated.
+_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS merge_card_revisions ("
+    "build_id TEXT PRIMARY KEY, "
+    "revision INTEGER NOT NULL CHECK (revision >= 0), "
+    "updated_at TEXT NOT NULL)"
+)
+
+
+def ensure_table(cx: sqlite3.Connection) -> None:
+    """Create ``merge_card_revisions`` if it is missing. Idempotent.
+
+    Called at the coordinator's boot (``bind_production_serve``) and by the
+    estate rollout helper's copy of the boot steps, so a started ledger and
+    the helper's loaded copy always have the same tables.
+    """
+    cx.execute(_TABLE_SQL)
 
 
 @contextmanager
@@ -82,6 +111,7 @@ def bump_card_revision(cx: sqlite3.Connection, build_id: str, now: datetime) -> 
     """
     if not cx.in_transaction:
         raise RuntimeError("bump_card_revision must run inside a transaction")
+    cx.execute(_TABLE_SQL)
     cx.execute(
         "INSERT INTO merge_card_revisions (build_id, revision, updated_at) "
         "VALUES (?, 1, ?) "
@@ -94,10 +124,15 @@ def bump_card_revision(cx: sqlite3.Connection, build_id: str, now: datetime) -> 
 
 
 def card_revision(cx: sqlite3.Connection, build_id: str) -> int:
-    """The card's revision now; 0 for a build with no row."""
-    row = cx.execute(
-        "SELECT revision FROM merge_card_revisions WHERE build_id = ?", (build_id,)
-    ).fetchone()
+    """The card's revision now; 0 for a build with no row (or no table yet)."""
+    try:
+        row = cx.execute(
+            "SELECT revision FROM merge_card_revisions WHERE build_id = ?", (build_id,)
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return 0
+        raise
     return int(row[0]) if row is not None else 0
 
 

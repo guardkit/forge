@@ -22,7 +22,7 @@ RETIREMENT_DETAILS_KEY = "planning_handoff_retirement"
 RETIREMENT_REASON = "owner-retired-undelivered-pre-routing-handoff"
 MAX_DETAILS_BYTES = 64 * 1024
 EXPECTED_ORIGINAL_EVENTS = 20
-SUPPORTED_RECEIPT_SCHEMA_VERSIONS = frozenset({17, 18, 19, 20})
+SUPPORTED_RECEIPT_SCHEMA_VERSIONS = frozenset({17, 18, 19})
 
 _HEX = frozenset("0123456789abcdef")
 _TOP_KEYS = frozenset({RETIREMENT_DETAILS_KEY})

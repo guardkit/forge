@@ -1246,7 +1246,7 @@ async def test_a_preview_whose_lease_has_ended_is_not_approvable(world: World) -
     refusal = world.service.approval_refusal(ready, now=START)
     assert refusal == (
         "the preview for this offer is no longer running (rejected), so it cannot "
-        "be approved — reject it and run the feature again"
+        "be approved"
     )
 
 

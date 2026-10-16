@@ -1378,6 +1378,15 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     # coexistence migration above.
     _bridge_registry_migration.apply(connection)
 
+    # The merge cards' revision counters (previews, 16 October 2026). Outside
+    # the migration ladder on purpose, like the two tables above: the ledger
+    # stays at schema 19 so rolling back to 2026.10.16-1 stays an image swap
+    # (that release ignores a table it does not use). Idempotent; the estate
+    # rollout helper's boot steps do the same, so its loaded copy matches.
+    from forge.lifecycle.card_revisions import ensure_table as _ensure_card_revisions
+
+    _ensure_card_revisions(connection)
+
     # Step 4 — wrap the connection.
     sqlite_pool = SqliteLifecyclePersistence(
         connection=connection, db_path=config.db_path
