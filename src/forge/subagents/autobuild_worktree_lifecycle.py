@@ -426,9 +426,14 @@ def _widen_by_handle(descriptor: int) -> None:
 
 # Passing through a folder needs only search access, so the folders on the
 # way down are opened as paths (Linux), and only the last one for reading.
-_PASS_THROUGH = (
-    getattr(os, "O_PATH", os.O_RDONLY) | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
-)
+# Read as a plain attribute, never as getattr(os, ...): handing the os module
+# to getattr hides which attribute is reached, and the estate's launch check
+# rightly refuses that for a module that can start programs.
+try:
+    _OPEN_AS_A_PATH = os.O_PATH
+except AttributeError:  # not Linux: open for reading instead
+    _OPEN_AS_A_PATH = os.O_RDONLY
+_PASS_THROUGH = _OPEN_AS_A_PATH | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC
 
 
 def _open_folder_strictly(path: Path) -> int | None:
