@@ -314,3 +314,92 @@ async def test_a_failed_read_is_shared_and_never_fetched_again(
     reading = offer["merge_check_reading"]
     assert reading["declared_at"] is None and reading["read"] is False
     assert said in reading["reason"]
+
+
+class _AFailedPreview(_OnePreview):
+    """The real service's answer for a base it could not get: failed evidence
+    with no ``preview_base_sha`` (``review_preview._record``)."""
+
+    async def prepare(self, request: Any) -> Any:
+        from datetime import UTC, datetime, timedelta
+
+        from nats_core.events import ReviewEvidence, ReviewOutcome
+
+        self.requests.append(request)
+        now = datetime.now(UTC)
+        return ReviewEvidence(
+            state="failed",
+            app_url=None,
+            report_url=None,
+            media_urls=[],
+            diagnostics_url=None,
+            failure_reason=(
+                f"{request.target_branch} could not be fetched from the remote, "
+                f"so there is nothing to join the candidate onto: "
+                f"{request.preview_base_refusal}"
+            ),
+            candidate_sha=request.candidate_sha,
+            candidate_tree=request.candidate_tree,
+            preview_tree=request.candidate_tree,
+            preview_base_sha=None,
+            run_id="run-1",
+            created_at=now,
+            app_expires_at=now + timedelta(hours=1),
+            evidence_expires_at=now + timedelta(days=14),
+            outcome=ReviewOutcome(),
+        )
+
+
+@pytest.mark.asyncio
+async def test_failed_preview_evidence_carries_the_shared_refusal_to_the_merge_check(
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,  # noqa: F811
+    repo_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex round 2, the rest of R2: the real preview answers failed evidence
+    with no base when the shared read failed; the merge-check reading's reason
+    is that read's refusal, not "the preview names no commit"."""
+    from forge.pipeline import merge_join
+    from forge.pipeline.merge_join import TargetNow
+
+    _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+    _somebody_lands_on_main(repo_root)
+    reads: list[Any] = []
+    real = merge_join.target_branch_now
+    said = "the project's recorded address did not answer just now"
+
+    async def fails_once(*args: Any, **kwargs: Any) -> Any:
+        reads.append(1)
+        if len(reads) == 1:
+            return TargetNow(branch="main", refusal=said)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(merge_join, "target_branch_now", fails_once)
+    preview = _AFailedPreview()
+
+    async def _nothing(*_a: Any) -> None:
+        return None
+
+    service = MergeOfferService(
+        config=config,
+        pool=pool,
+        pipeline_publisher=SimpleNamespace(publish_build_paused=_nothing),
+        raw_publish=_nothing,
+        review_preview=preview,
+        commit_reader=lambda _repo, _root: object(),
+    )
+
+    assert await service.offer(build_id=BUILD_ID, feature_id=FEATURE_ID, card_words=_words)
+
+    offer = [
+        s for s in pool.read_stages(BUILD_ID)
+        if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+    ][-1].details[MERGE_OFFER_DETAILS_KEY]
+    assert len(reads) == 1
+    assert offer["review_evidence"]["state"] == "failed"
+    assert offer["review_evidence"]["preview_base_sha"] is None
+    reading = offer["merge_check_reading"]
+    assert reading["declared_at"] is None and reading["read"] is False
+    assert said in reading["reason"]
+    assert "the preview names no commit" not in reading["reason"]

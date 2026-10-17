@@ -2306,7 +2306,13 @@ class MergeOfferService:
             if review_evidence is not None:
                 declared_at = preview_base_sha
                 if not declared_at:
-                    refusal = "the preview names no commit it was joined onto"
+                    # A preview with no base because the offer's shared read
+                    # failed says THAT failure (Codex R2), not a vaguer one.
+                    refusal = (
+                        target_read.refusal
+                        if target_read is not None and target_read.refusal
+                        else "the preview names no commit it was joined onto"
+                    )
             elif target_read is not None:
                 # The offer's own read of the target, made for the card's pin,
                 # whatever it found: a failed read is said, not fetched again.
