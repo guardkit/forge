@@ -1558,3 +1558,254 @@ class TestNothingIsPressedTwice:
 
         assert await mission_finish.finish_ready_missions(deps, wait=True) == []
         assert landed == []
+
+
+# ---------------------------------------------------------------------------
+# An approved mission merge that never reported is carried on (review R6)
+# ---------------------------------------------------------------------------
+
+
+class TestAnApprovedMergeThatNeverReported:
+    async def _offered(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> tuple[MissionStore, str]:
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        store = await _land(config, pool, repo_root)
+        service, _wire = _offer_service(config, pool)
+        deps, _thread = _finish_deps(config, pool, offer=service.offer)
+        assert await finish_ready_mission(deps, MISSION_ID) == "offered"
+        return store, str(mission_merge_build_id(pool, MISSION_ID))
+
+    def _approved(self, pool: SqliteLifecyclePersistence, build_id: str) -> None:  # noqa: F811
+        """The decision row the press commits before its task ever runs."""
+        pool.record_stage(
+            _decision_entry(
+                build_id=build_id,
+                decision="approve",
+                decided_by="rich",
+                request_id=f"merge-{build_id}",
+                now=datetime.now(UTC),
+                attempt_id="b" * 32,
+            )
+        )
+
+    def _finisher(
+        self,
+        config: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        consumer: MergeApprovalConsumer,
+        *,
+        after: int = mission_finish.MERGE_RESUME_GRACE_SECONDS + 10,
+    ) -> tuple[MissionFinishDeps, _Thread]:
+        async def offer(**_kwargs: Any) -> bool:
+            raise AssertionError("a carried-on merge never asks for another card")
+
+        deps, thread = _finish_deps(config, pool, offer=offer)
+        later = datetime.now(UTC) + timedelta(seconds=after)
+        deps.clock = lambda: later
+        deps.resume_merge = consumer.resume_mission_merge
+        return deps, thread
+
+    def _reports(self, pool: SqliteLifecyclePersistence, build_id: str) -> list[Any]:  # noqa: F811
+        return [
+            s for s in pool.read_stages(build_id)
+            if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_stop_after_the_decision_is_carried_on_and_merges(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        store, build_id = await self._offered(config_on, pool, repo_root)
+        tip = store.get(MISSION_ID).final_commit
+        self._approved(pool, build_id)
+        # The restart also lost the frozen source.
+        _git(repo_root, "branch", "-D", f"{SOURCE_BRANCH_PREFIX}{build_id}")
+        press, joins, _deploy, publisher, _bus = press_deps(
+            config_on, pool, repo_root, declares_a_target=False
+        )
+        deps, thread = self._finisher(config_on, pool, MergeApprovalConsumer(press))
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "merge carried on"
+        assert await finish_ready_mission(deps, MISSION_ID) == "merged"
+
+        assert store.get(MISSION_ID).status == "MERGED"
+        merges = [c for c in joins.calls if c["args"][0] == "merge"]
+        assert len(merges) == 1
+        args = merges[0]["args"]
+        assert args[args.index("--target") + 1] == f"factory-integration/mission-{MISSION_ID}"
+        assert args[args.index("--branch") + 1] == f"{SOURCE_BRANCH_PREFIX}{build_id}"
+        assert [a["target_branch"] for a in publisher.asked] == ["main"]
+        assert _local(repo_root, f"refs/heads/{SOURCE_BRANCH_PREFIX}{build_id}") == tip
+        # The ORIGINAL decision: its approver and its attempt, one row only.
+        decisions = [
+            s for s in pool.read_stages(build_id)
+            if s.target_identifier == "merge_deploy_decision"
+        ]
+        assert len(decisions) == 1
+        report = self._reports(pool, build_id)[-1]
+        assert report.details["merge_decision"]["execution_attempt_id"] == "b" * 32
+        assert PublicationRecordStore(pool.connection).read(build_id).decided_by == "rich"
+        assert thread.lines[-1][1].startswith('Mission "Tags for notes" is merged into main')
+
+    @pytest.mark.asyncio
+    async def test_a_stop_after_the_publish_sends_nothing_again(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from tests.forge.pipeline.test_merge_executor import _the_kept_hold_runs_out
+
+        store, build_id = await self._offered(config_on, pool, repo_root)
+        press, joins, _deploy, publisher, _bus = press_deps(
+            config_on, pool, repo_root, declares_a_target=False
+        )
+        consumer = MergeApprovalConsumer(press)
+        await consumer.handle_envelope(
+            _envelope(
+                request_id=f"merge-{build_id}",
+                decision="approve",
+                decided_by="rich",
+                correlation_id=MISSION_CORRELATION,
+            )
+        )
+        await _drain(consumer)
+        main_after = remote_tip(repo_root, "main")
+        assert len(publisher.asked) == 1
+        # The coordinator stopped after the send and before the report: the
+        # report row is not there, and the press's hold runs out.
+        pool.connection.execute(
+            "DELETE FROM stage_log WHERE build_id = ? AND target_identifier = ?",
+            (build_id, MERGE_REPORT_TARGET_IDENTIFIER),
+        )
+        pool.connection.commit()
+        _the_kept_hold_runs_out(pool, build_id)
+        restarted = MergeApprovalConsumer(press)
+        deps, _thread = self._finisher(config_on, pool, restarted)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "merge carried on"
+        assert await finish_ready_mission(deps, MISSION_ID) == "merged"
+
+        # NOTHING SENT TWICE, NOTHING JOINED TWICE: the pick-up read the remote.
+        assert len(publisher.asked) == 1
+        assert len([c for c in joins.calls if c["args"][0] == "merge"]) == 1
+        assert remote_tip(repo_root, "main") == main_after
+        assert len(self._reports(pool, build_id)) == 1
+        assert store.get(MISSION_ID).status == "MERGED"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("main_has_it", [False, True])
+    async def test_the_bound_settles_the_mission_honestly(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        main_has_it: bool,
+    ) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        store, build_id = await self._offered(config_on, pool, repo_root)
+        self._approved(pool, build_id)
+        if main_has_it:
+            records = PublicationRecordStore(pool.connection)
+            now = datetime.now(UTC)
+            grant = records.take_lease(
+                build_id=build_id, holder="dead-press", now=now, target_branch="main"
+            )
+            records.record(
+                build_id=build_id,
+                turn=grant.turn,
+                now=now,
+                result="published, deployment pending",
+            )
+            records.release_lease(
+                build_id=build_id, turn=grant.turn, holder="dead-press", now=now
+            )
+        # Every carried-on press raises before it does anything (its routing
+        # receipt is missing), so none of them ever reports.
+        press, joins, _deploy, publisher, _bus = press_deps(
+            config_on, pool, repo_root, routing_gate=_Router(set())
+        )
+        answers = []
+        for _ in range(5):
+            deps, thread = self._finisher(config_on, pool, MergeApprovalConsumer(press))
+            answers.append(await finish_ready_mission(deps, MISSION_ID))
+
+        assert answers[:4] == ["merge carried on"] * 4
+        resumes = [
+            s for s in pool.read_stages(build_id)
+            if s.target_identifier == "mission_merge_resume"
+        ]
+        assert len(resumes) == 3
+        reports = self._reports(pool, build_id)
+        assert len(reports) == 1 and reports[0].status == "FAILED"
+        assert reports[0].details["result"] == "mission-merge-unfinished"
+        assert reports[0].details["merge_decision"]["execution_attempt_id"] == "b" * 32
+        assert publisher.asked == []
+        mission = store.get(MISSION_ID)
+        if main_has_it:
+            assert answers[4] == "merged" and mission.status == "MERGED"
+            assert "it is not deployed yet" in thread.lines[-1][1]
+        else:
+            assert answers[4] == "not merged" and mission.status == "NOT_MERGED"
+            assert "was not merged" in thread.lines[-1][1]
+            assert "never reported" in str(mission.closed_reason)
+
+    @pytest.mark.asyncio
+    async def test_a_live_lease_or_a_fresh_decision_is_not_carried_on(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        store, build_id = await self._offered(config_on, pool, repo_root)
+        self._approved(pool, build_id)
+        resumed: list[str] = []
+
+        async def resume(build_id: str) -> bool:
+            resumed.append(build_id)
+            return True
+
+        press, *_rest = press_deps(config_on, pool, repo_root)
+        # Inside the grace: the approved press may only now be taking its hold.
+        deps, _thread = self._finisher(config_on, pool, MergeApprovalConsumer(press), after=5)
+        deps.resume_merge = resume
+        assert await finish_ready_mission(deps, MISSION_ID) == "merging"
+        # Past the grace, but another worker holds the record.
+        assert PublicationRecordStore(pool.connection).take_lease(
+            build_id=build_id, holder="another-worker", now=datetime.now(UTC)
+        )
+        deps, _thread = self._finisher(config_on, pool, MergeApprovalConsumer(press))
+        deps.resume_merge = resume
+        assert await finish_ready_mission(deps, MISSION_ID) == "merging"
+
+        assert resumed == []
+        assert store.get(MISSION_ID).status == "MERGING"
+
+    @pytest.mark.asyncio
+    async def test_a_press_already_running_here_is_not_pressed_again(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        _store, build_id = await self._offered(config_on, pool, repo_root)
+        self._approved(pool, build_id)
+        press, joins, *_rest = press_deps(config_on, pool, repo_root)
+        consumer = MergeApprovalConsumer(press)
+        consumer._pressing_now.add(build_id)
+
+        assert await consumer.resume_mission_merge(build_id) is False
+        assert joins.calls == []

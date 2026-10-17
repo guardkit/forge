@@ -102,6 +102,11 @@ OFFER_RETRY_SECONDS: int = 300
 OFFER_GIVE_UP_SECONDS: int = 1800
 MISSION_OFFER_ATTEMPT_TARGET_IDENTIFIER: str = "mission_offer_attempt"
 
+#: How long after an approved decision the finishing step waits before it
+#: treats a mission merge with no report and no live lease as stopped: the
+#: approved press takes its lease within moments of the decision.
+MERGE_RESUME_GRACE_SECONDS: int = 120
+
 #: How many files the card names before it says "and N more".
 _RISKY_SHOWN: int = 12
 
@@ -237,6 +242,11 @@ class MissionFinishDeps:
     #: started and never reported (the coordinator stopped part-way) is
     #: carried on with it. ``None`` resumes nothing.
     land: Callable[[str], Awaitable[Any]] | None = None
+    #: ``MergeApprovalConsumer.resume_mission_merge``: an approved mission
+    #: merge into main that never reported (the coordinator stopped after
+    #: the decision) is pressed again through the approved press's own locked
+    #: entry. ``None`` resumes nothing.
+    resume_merge: Callable[[str], Awaitable[Any]] | None = None
     feature_routing_gate: Any | None = None
     feature_routing_required: bool = False
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
@@ -861,6 +871,47 @@ async def _freeze_and_offer(
     )
 
 
+async def _carry_the_merge_on(
+    deps: MissionFinishDeps, mission: Mission, row: Any, repo_root: Path, decision: Any
+) -> str:
+    """An approved mission merge with no report: carry it on if it stopped.
+
+    Implementation review round 2, R6. Only when the decision is older than
+    :data:`MERGE_RESUME_GRACE_SECONDS` and the publication record holds no
+    live lease (a press running anywhere holds one); the press itself also
+    refuses a build it is pressing right now. The frozen source is put back
+    at the recorded tip first, so the press finds the very candidate the card
+    pinned. The press's own pick-up settles a merge already published.
+    """
+    from forge.pipeline.publication_record import PublicationRecordStore
+
+    if deps.resume_merge is None:
+        return "merging"
+    now = deps.clock()
+    decided_at = decision.started_at
+    if decided_at.tzinfo is None:
+        decided_at = decided_at.replace(tzinfo=timezone.utc)
+    if (now - decided_at).total_seconds() < MERGE_RESUME_GRACE_SECONDS:
+        return "merging"
+    if PublicationRecordStore(deps.pool.connection).read(row.build_id).lease_is_live(now):
+        return "merging"
+    tip = str(mission.final_commit or "")
+    branch = str(row.merge_branch or f"forge/source/{row.build_id}")
+    git = deps.git_for(row.repo, repo_root)
+    if tip and await git.rev_parse(f"refs/heads/{branch}") != tip:
+        refusal = await make_frozen_source(git, row.build_id, tip)
+        if refusal is not None:
+            logger.warning(
+                "missions: %s's frozen source could not be put back before its "
+                "merge was carried on (%s)",
+                mission.id,
+                refusal,
+            )
+    if await deps.resume_merge(row.build_id):
+        return "merge carried on"
+    return "merging"
+
+
 def _failed_offers(deps: MissionFinishDeps, build_id: str) -> list[datetime]:
     """When each failed offer of this mission's card was made, oldest first."""
     moments: list[datetime] = []
@@ -977,7 +1028,7 @@ async def _follow_the_card(
         if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
     ]
     if not reports:
-        return "merging"
+        return await _carry_the_merge_on(deps, mission, row, repo_root, decision)
     report = reports[-1]
     word = str((report.details or {}).get("result") or "")
     detail = str((report.details or {}).get("detail") or "")
@@ -1045,6 +1096,7 @@ def compose_mission_finisher(
     offer_service: Any,
     nats_client: Any,
     land: Callable[[str], Awaitable[Any]] | None = None,
+    resume_merge: Callable[[str], Awaitable[Any]] | None = None,
     git_surface: Callable[[str, Path], Any] | None = None,
     tree_reader_for: Callable[[str, Path], Any] | None = None,
     feature_routing_gate: Any | None = None,
@@ -1088,6 +1140,7 @@ def compose_mission_finisher(
         notify=notify,
         tree_reader_for=tree_reader_for,
         land=land,
+        resume_merge=resume_merge,
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
     )

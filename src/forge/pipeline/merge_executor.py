@@ -377,6 +377,14 @@ RESULT_WORD_MISSION_LANDING_FAILED: str = "mission-landing-failed"
 MISSION_LANDING_ATTEMPT_TARGET_IDENTIFIER: str = "mission_landing_attempt"
 MISSION_LANDING_STAGE_LABEL: str = "mission landing"
 
+#: One stage row per RESUMED press of an approved mission merge into main
+#: (the coordinator stopped after the decision and before the report). At
+#: ``publication.send_attempts`` resumed presses with no report, the build
+#: gets a FAILED merge report with the word below, so the mission settles.
+MISSION_MERGE_RESUME_TARGET_IDENTIFIER: str = "mission_merge_resume"
+MISSION_MERGE_STAGE_LABEL: str = "mission merge"
+RESULT_WORD_MISSION_MERGE_UNFINISHED: str = "mission-merge-unfinished"
+
 #: THE EXECUTOR'S WORD FOR A COMMAND A TAKEOVER STOPPED. Written out here
 #: rather than imported, like the sidecar's own wall above, so this module does
 #: not depend on the sidecar; a test pins the two together
@@ -6318,6 +6326,10 @@ class MergeApprovalConsumer:
         # resumption asked for while the first landing still waits for the
         # repository's lock is not queued behind it a second time.
         self._landing_now: set[str] = set()
+        # Builds whose approved press this consumer has started and not yet
+        # finished — from the moment the decision row is committed — so a
+        # resume never presses one a second time.
+        self._pressing_now: set[str] = set()
 
         self._subscription: Any = None
 
@@ -6611,6 +6623,7 @@ class MergeApprovalConsumer:
             [str(x) for x in baseline] if isinstance(baseline, list) else None
         )
         merge_branch = _merge_branch_of_record(self._deps.pool, build_id, offer)
+        self._pressing_now.add(build_id)
         task = asyncio.create_task(
             self._run_approved(
                 build_id=build_id,
@@ -6766,6 +6779,51 @@ class MergeApprovalConsumer:
             if belongs is not None and belongs.is_merge
             else None
         )
+        self._pressing_now.add(build_id)
+        try:
+            await self._run_approved_locked(
+                build_id=build_id,
+                feature_id=feature_id,
+                repo=repo,
+                repo_root=repo_root,
+                expect_main_sha=expect_main_sha,
+                correlation_id=correlation_id,
+                decided_by=decided_by,
+                baseline_failing=baseline_failing,
+                merge_branch=merge_branch,
+                expected_candidate_sha=expected_candidate_sha,
+                expected_candidate_tree=expected_candidate_tree,
+                expected_candidate_branch=expected_candidate_branch,
+                worktree_retention=worktree_retention,
+                merge_execution_attempt_id=merge_execution_attempt_id,
+                previewed_offer=previewed_offer,
+                expected_preview_tree=expected_preview_tree,
+                join_name=join_name,
+            )
+        finally:
+            self._pressing_now.discard(build_id)
+
+    async def _run_approved_locked(
+        self,
+        *,
+        build_id: str,
+        feature_id: str,
+        repo: str,
+        repo_root: Path,
+        expect_main_sha: str,
+        correlation_id: str,
+        decided_by: str,
+        baseline_failing: list[str] | None,
+        merge_branch: str | None,
+        expected_candidate_sha: str | None,
+        expected_candidate_tree: str | None,
+        expected_candidate_branch: str | None,
+        worktree_retention: dict[str, Any] | None,
+        merge_execution_attempt_id: str,
+        previewed_offer: dict[str, Any] | None,
+        expected_preview_tree: str | None,
+        join_name: str | None,
+    ) -> None:
         async with self._lock_for(repo):
             ended = "approval failed: the merge press raised"
             try:
@@ -6807,6 +6865,169 @@ class MergeApprovalConsumer:
                 await self._release_the_preview(
                     previewed_offer, build_id=build_id, reason=ended
                 )
+
+    async def resume_mission_merge(self, build_id: str) -> bool:
+        """Carry on an approved mission merge into main that never reported.
+
+        Missions design, section 7, and implementation review round 2, R6:
+        the decision row is committed before the press runs, and the
+        duplicate guard then refuses any later answer, so a coordinator that
+        stopped in between would leave the mission MERGING for ever. The
+        finishing step calls this for a mission-merge build with an approved
+        decision, no merge report and no live publication lease.
+
+        It presses through the same locked entry as an approved merge
+        (:meth:`_run_approved`), with the ORIGINAL decision's approver and
+        execution attempt id and the durable offer's pinned candidate (the
+        frozen ``forge/source/<build_id>`` at the mission's tip, which the
+        caller puts back first), deploy on, and ``join_name mission-<id>``.
+        No new card is asked for. The press's own pick-up reconciles a merge
+        that was already published: it reads the remote first, finds the
+        joined commit there, and never sends it again.
+
+        Bounded durably: one ``mission_merge_resume`` row per resumed press,
+        written before it runs. At ``publication.send_attempts`` resumed
+        presses with no report, a FAILED merge report
+        (``mission-merge-unfinished``) is written instead, carrying the
+        decision's attempt id, so the mission settles.
+
+        Returns True when a press was run or the bound was reached; False
+        when nothing was done (not a mission merge, already reported, already
+        being pressed here, no approved decision or no offer on record).
+        """
+        from forge.lifecycle.mission_builds import mission_of_build
+
+        belongs = mission_of_build(self._deps.pool, build_id)
+        if belongs is None or not belongs.is_merge:
+            return False
+        if build_id in self._pressing_now:
+            return False
+        stages = self._deps.pool.read_stages(build_id)
+        if any(s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER for s in stages):
+            return False
+        decisions = [
+            s for s in stages if s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
+        ]
+        offers = [s for s in stages if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER]
+        if not decisions or decisions[-1].status != "PASSED" or not offers:
+            return False
+        said = (decisions[-1].details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}
+        attempt_id = str(said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY) or "")
+        decided_by = str(said.get("decided_by") or "")
+        offer = offers[-1].details.get(MERGE_OFFER_DETAILS_KEY) or {}
+        row = self._deps.pool.get_build_row(build_id)
+        repo = str(offer.get("repo") or (row.repo if row is not None else ""))
+        repo_root_raw = self._deps.config.planning.target_repo_paths.get(repo)
+        allowed = _how_many_attempts(self._deps.config)
+        resumed = sum(
+            1 for s in stages if s.target_identifier == MISSION_MERGE_RESUME_TARGET_IDENTIFIER
+        )
+        if resumed >= allowed or not attempt_id or not repo_root_raw or row is None:
+            why = (
+                f"the approved merge of mission {belongs.mission_id} was "
+                f"carried on {resumed} times after the factory stopped and "
+                "never reported"
+                if resumed >= allowed
+                else f"the approved merge of mission {belongs.mission_id} "
+                "cannot be carried on: its decision, offer or repository is "
+                "not readable"
+            )
+            self._merge_unfinished(build_id, offer, why, attempt_id or None)
+            return True
+        now = self._deps.clock()
+        self._deps.pool.record_stage(
+            StageLogEntry(
+                build_id=build_id,
+                stage_label=MISSION_MERGE_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MISSION_MERGE_RESUME_TARGET_IDENTIFIER,
+                status="SKIPPED",
+                gate_mode=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={
+                    "mission_merge_resume": {"attempt": resumed + 1, "allowed": allowed}
+                },
+            )
+        )
+        logger.info(
+            "merge-executor: carrying on the approved merge of mission %s (%s), "
+            "resume %d of %d",
+            belongs.mission_id,
+            build_id,
+            resumed + 1,
+            allowed,
+        )
+        baseline = offer.get("baseline_failing")
+        await self._run_approved(
+            build_id=build_id,
+            feature_id=str(offer.get("feature_id") or row.feature_id),
+            repo=repo,
+            repo_root=Path(repo_root_raw),
+            expect_main_sha=str(offer.get("expect_main_sha") or ""),
+            correlation_id=str(offer.get("correlation_id") or row.correlation_id),
+            decided_by=decided_by,
+            baseline_failing=(
+                [str(x) for x in baseline] if isinstance(baseline, list) else None
+            ),
+            merge_branch=_merge_branch_of_record(self._deps.pool, build_id, offer),
+            expected_candidate_sha=str(offer.get("candidate_sha") or "") or None,
+            expected_candidate_tree=str(offer.get("candidate_tree") or "") or None,
+            expected_candidate_branch=(
+                str(offer.get("branch") or "").strip() or None
+                if offer.get("candidate_identity_version") == 1
+                else None
+            ),
+            merge_execution_attempt_id=attempt_id,
+            **({"previewed_offer": offer} if "review_evidence" in offer else {}),
+            **(
+                {"expected_preview_tree": str(offer["preview_tree"])}
+                if offer.get("preview_tree")
+                else {}
+            ),
+        )
+        return True
+
+    def _merge_unfinished(
+        self, build_id: str, offer: dict[str, Any], reason: str, attempt_id: str | None
+    ) -> None:
+        """A FAILED merge report for a mission merge that could not be carried on."""
+        now = self._deps.clock()
+        logger.warning("merge-executor: %s", reason)
+        self._deps.pool.record_stage(
+            StageLogEntry(
+                build_id=build_id,
+                stage_label=MERGE_REPORT_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+                status="FAILED",
+                gate_mode=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={
+                    "feature_id": offer.get("feature_id"),
+                    "build_id": build_id,
+                    "correlation_id": offer.get("correlation_id"),
+                    "status": "FAILED",
+                    "result": RESULT_WORD_MISSION_MERGE_UNFINISHED,
+                    "detail": reason,
+                    **(
+                        {
+                            MERGE_DECISION_DETAILS_KEY: {
+                                MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                                    MERGE_EXECUTION_ATTEMPT_VERSION
+                                ),
+                                MERGE_EXECUTION_ATTEMPT_ID_KEY: attempt_id,
+                            }
+                        }
+                        if attempt_id
+                        else {}
+                    ),
+                },
+            )
+        )
 
     async def land_mission_feature(
         self, build_id: str, *, tasks_failed: int | None = 0
