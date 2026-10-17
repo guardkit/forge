@@ -3,9 +3,9 @@
 Design "Building production features from a signed-off prototype", section
 2.8:
 
-* ``--via-git-door`` records the project's fetch address through the Git
-  door (``<planning.git_door><org>/<name>.git``) and makes the sandbox's read
-  and clone through it, with no credential;
+* ``--via-git-door`` records the project's fetch address through its own
+  sandbox's Git door port and makes the sandbox's read through it, with no
+  credential (one sandbox per project; test_register_repo_sandbox.py);
 * when the publisher's settings say ``private_only``, a route is written only
   for a repository confirmed private: the route's own key read it (step 1's
   check clone) and an anonymous lookup answers 404.
@@ -36,75 +36,10 @@ from tests.forge.cli.test_register_repo import (  # noqa: F401
     route_key_estate,
 )
 
-DOOR = "http://192.0.2.1:31825/"
-DOOR_ADDRESS = f"{DOOR}{KEY}.git"
-
-
-def _with_door(estate, door: str = DOOR) -> None:  # noqa: F811
-    estate.volume["forge.yaml"] = COORDINATOR_YAML.replace(
-        "planning:\n  enabled: true\n", f"planning:\n  enabled: true\n  git_door: {door}\n"
-    )
-
-
-def _sandbox_git(estate, command: str) -> list[list[str]]:  # noqa: F811
-    return [c for c in estate.calls if c[:2] == ["sbx", "exec"] and "git" in c and command in c]
-
-
 # ---------------------------------------------------------------------------
-# --via-git-door
-
-
-def test_through_the_door_the_address_and_the_sandbox_clone_go_through_it(estate):  # noqa: F811
-    _with_door(estate)
-    result = _run("--via-git-door")
-    assert result.exit_code == 0, result.output
-
-    staged = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-pending"])
-    assert staged["planning"]["fetch_addresses"] == {KEY: DOOR_ADDRESS}
-    assert staged["planning"]["git_door"] == DOOR
-    assert estate.clones == {CLONE_PATH: DOOR_ADDRESS}
-
-    reads = _sandbox_git(estate, "ls-remote") + _sandbox_git(estate, "clone")
-    assert reads, "the sandbox read and cloned"
-    for call in reads:
-        assert DOOR_ADDRESS in call
-        assert "GIT_ALLOW_PROTOCOL=http" in call
-        assert not any(part.startswith(("GIT_SSH_COMMAND=", "GIT_ASKPASS=/")) for part in call)
-        assert "credential.helper=" in call, "credential helpers are still cleared"
-    assert "allow-list" in result.output and KEY in result.output
-
-
-def test_without_the_flag_nothing_about_the_door_changes(estate):  # noqa: F811
-    _with_door(estate)
-    result = _run()
-    assert result.exit_code == 0, result.output
-    staged = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-pending"])
-    assert staged["planning"]["fetch_addresses"] == {KEY: URL}
-    assert estate.clones == {CLONE_PATH: URL}
-    assert "allow-list" not in result.output
-
-
-@pytest.mark.parametrize("door, said", [
-    (None, "add planning.git_door"),
-    ("${FACTORY_GIT_DOOR_URL}", "address itself"),
-    ("http://0.0.0.0:31825/", "every address"),
-])
-def test_the_door_must_be_declared_plainly_or_nothing_is_written(estate, door, said):  # noqa: F811
-    if door is not None:
-        _with_door(estate, door)
-    result = _run("--via-git-door")
-    assert result.exit_code == 1
-    assert said in result.output
-    assert estate.writes == [] and estate.clones == {}
-
-
-def test_a_repository_the_door_will_not_read_is_refused_with_the_allow_list_reminder(estate):  # noqa: F811
-    _with_door(estate)
-    estate.sandbox_can_read = False
-    result = _run("--via-git-door")
-    assert result.exit_code == 1
-    assert "through the Git door" in result.output and "allow-list" in result.output
-    assert estate.writes == [] and estate.clones == {}
+# --via-git-door: since one sandbox per project (17 October 2026) a project is
+# read through its own sandbox's Git door port, and the shared sandbox never
+# reads through the door; tests/forge/cli/test_register_repo_sandbox.py.
 
 
 # ---------------------------------------------------------------------------
@@ -212,16 +147,34 @@ def test_private_only_off_nothing_is_looked_up(
 def test_private_only_and_the_door_together(
     estate, publisher_file, route_key_estate, monkeypatch  # noqa: F811
 ):
-    """The route the design describes: a private repository registered
-    through the Git door, with its own write key, the publisher private-only."""
-    _with_door(estate)
+    """The route the design describes: a private repository registered in a
+    sandbox of its own, through its Git door port, with its own write key, the
+    publisher private-only."""
+    from tests.forge.cli.test_register_repo_sandbox import (
+        DOOR_ADDRESS,
+        OWN,
+        OWN_SETTINGS,
+        OWN_YAML,
+        WORKSPACE,
+        _run_own,
+    )
+
+    estate.sandbox_name, estate.clone_root = OWN, WORKSPACE
+    estate.sandbox_files = {OWN_SETTINGS: OWN_YAML}
+    estate.modes[OWN_SETTINGS] = "600"
     _private_only(publisher_file)
     monkeypatch.setattr(register_repo, "visibility_lookup", _Lookup(404))
-    result = _publish_with_key(publisher_file, route_key_estate, "--via-git-door")
+    result = _run_own(
+        "--publish", "--publisher-settings", str(publisher_file),
+        "--publish-credential-name", "widget-shop-key",
+        "--estate-env-file", str(route_key_estate), "--via-git-door",
+    )
     assert result.exit_code == 0, result.output
     staged = json.loads((publisher_file.parent / f"settings.json.{LEAF}-pending").read_text())
     assert staged["projects"][KEY]["remote"] == f"git@github.com:{KEY}.git"
-    assert estate.clones == {CLONE_PATH: DOOR_ADDRESS}
+    coordinator = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-pending"])
+    assert coordinator["planning"]["fetch_addresses"] == {KEY: DOOR_ADDRESS}
+    assert estate.clones == {}
 
 
 @pytest.mark.parametrize("github", [

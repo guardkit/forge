@@ -176,6 +176,7 @@ def with_review_verification(
     worktree_path: "Path | str | None",
     forward_context: "Mapping[str, Any] | None",
     receipts_root: "Path | str | None" = None,
+    repo: "str | None" = None,
 ) -> "Mapping[str, Any] | None":
     """Add the verification document to a follow-up review's context.
 
@@ -204,6 +205,7 @@ def with_review_verification(
         build_id=build_id,
         worktree_path=worktree_path,
         receipts_root=receipts_root,
+        repo=repo,
     )
     if entry is None:
         return forward_context
@@ -499,6 +501,8 @@ def make_conductor_subprocess_dispatcher(
             worktree_path=repo_path,
             forward_context=forward_context,
             receipts_root=receipts_root,
+            # The build's own project's receipts (one sandbox per project).
+            repo=getattr(row, "repo", None),
         )
 
         stage_timeout = (timeout_seconds_by_stage or {}).get(stage, timeout_seconds)

@@ -165,6 +165,10 @@ class FakeEstate:
         #: File modes, by volume name or sandbox path, as ``stat -c %a`` says them.
         self.modes: dict[str, str] = {"forge.yaml": "640", SANDBOX_SETTINGS: "600"}
         self.clones: dict[str, str] = {}
+        #: The sandbox the commands go to and the clone git is asked about
+        #: (a sandbox of its own's tests change both, 17 October 2026).
+        self.sandbox_name = SANDBOX
+        self.clone_root = CLONE
         self.ignored = True
         self.sandbox_can_read = True
         self.host_can_read = True
@@ -266,7 +270,7 @@ class FakeEstate:
             else:
                 raise AssertionError(f"unexpected sbx flag {flag}")
         assert user == "1000", "every sandbox command runs as the sandbox user"
-        assert rest[0] == SANDBOX
+        assert rest[0] == self.sandbox_name
         command = rest[1:]
         isolated = _isolated_git(command)
         if isolated is not None:
@@ -289,6 +293,15 @@ class FakeEstate:
             # The sandbox's own proxy settings (14 October 2026): none here.
             self.proxy_reads += 1
             return _ok(self.sandbox_proxies)
+        if command[:2] == ["sh", "-c"] and command[2] == register_repo._CREATE_NEW:
+            # A new file (a sandbox of its own's settings, 17 October 2026).
+            assert interactive and input is not None
+            if command[4] in self.sandbox_files:
+                return _no(2, "sh: cannot create: File exists")
+            self.sandbox_files[command[4]] = input
+            self.modes[command[4]] = "600"
+            self.writes.append(f"sandbox:{command[4]}")
+            return _ok()
         if command[:2] == ["sh", "-c"]:
             assert interactive and input is not None
             assert command[2] == 'umask 077 && cat > "$1" && chmod "$(stat -c %a "$2")" "$1"'
@@ -309,7 +322,7 @@ class FakeEstate:
                 self.writes.append(f"clone:{command[-1]}")
                 return _ok()
             if command[1] == "-C" and command[3] == "check-ignore":
-                assert command[2] == CLONE
+                assert command[2] == self.clone_root
                 return _ok() if self.ignored else _no(1)
             if command[1] == "-C" and command[3:] == ["remote", "get-url", "origin"]:
                 return _ok(self.clones[command[2]] + "\n") if command[2] in self.clones else _no(2)

@@ -914,6 +914,26 @@ class SandboxEntry(BaseModel):
             "reaches it (http://127.0.0.1:<published port>)."
         ),
     )
+    git_door: str | None = Field(
+        default=None,
+        description=(
+            "This sandbox's own port on the Git door (one sandbox per project, "
+            "17 October 2026): one http://<address>:<port>/ base, as "
+            "planning.git_door. A repository mapped to this sandbox may have its "
+            "fetch address through this door only. Unset: the sandbox has no "
+            "door of its own."
+        ),
+    )
+    receipts_root: str | None = Field(
+        default=None,
+        description=(
+            "This project's own receipts folder, as the coordinator sees it (one "
+            "sandbox per project, design section 2.2a, 17 October 2026): an "
+            "absolute path. Every coordinator reader and writer of a build of a "
+            "repository mapped here uses it (forge.receipts.receipts_root_for). "
+            "Unset: the single receipts root, as before."
+        ),
+    )
 
     @field_validator("sidecar_url", "runner_url")
     @classmethod
@@ -922,6 +942,43 @@ class SandboxEntry(BaseModel):
         if not value.startswith(("http://", "https://")) or len(value) <= len("http://"):
             raise ValueError(
                 f"must be an http:// or https:// address, got {v!r}"
+            )
+        return value
+
+    @field_validator("receipts_root")
+    @classmethod
+    def _receipts_root_is_one_absolute_path(cls, value: str | None) -> str | None:
+        """An absolute path with no '..', space or control character, or unset."""
+        if value is None:
+            return None
+        text = str(value)
+        parts = text.split("/")
+        if (
+            not text.startswith("/")
+            or text != text.strip()
+            or any(ch.isspace() or ord(ch) < 32 for ch in text)
+            or ".." in parts
+            or text.rstrip("/") == ""
+        ):
+            raise ValueError(
+                "a sandbox's receipts_root must be one absolute folder path, with "
+                "no '..', space or control character in it"
+            )
+        return text.rstrip("/")
+
+    @field_validator("git_door")
+    @classmethod
+    def _git_door_is_one_http_base(cls, value: str | None) -> str | None:
+        """Exactly http://<address>:<port>/, or unset, as planning.git_door."""
+        if value is None:
+            return None
+        from forge.network_git import git_door_problem
+
+        problem = git_door_problem(value)
+        if problem:
+            raise ValueError(
+                "a sandbox's git_door must be exactly http://<address>:<port>/: "
+                f"{problem} (the value is not repeated here)"
             )
         return value
 
@@ -1140,29 +1197,88 @@ class PlanningConfig(BaseModel):
     def _fetch_addresses_are_plain_https(
         cls, value: dict[str, str], info: ValidationInfo
     ) -> dict[str, str]:
-        """Each key is an 'org/name' and each address a plain https:// one,
-        or (17 October 2026) the declared Git door followed by
-        '<owner>/<name>.git'.
-
-        The refusal names the project, never the address: what was written
-        may hold a credential.
-        """
+        """Each key is an 'org/name'; each address is checked by
+        :meth:`_fetch_addresses_use_their_own_sandbox_s_door`."""
         import re
 
         from forge.network_git import check_fetch_address
 
-        door = (info.data or {}).get("git_door")
-        for key, address in value.items():
+        for key in value:
             if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", str(key)):
                 raise ValueError(
                     f"planning.fetch_addresses has a key {key!r} that is not 'org/name'"
                 )
+        # Each address is checked once every setting is read (one sandbox per
+        # project, 17 October 2026): a door address must be the door of the
+        # repository's own sandbox, and planning.sandboxes comes after this.
+        return {str(k): str(v).strip() for k, v in value.items()}
+
+    def git_door_for(self, repo: str) -> str | None:
+        """The one Git door ``repo``'s fetch address may go through, or None.
+
+        The door of the sandbox ``repo`` is mapped to, when that sandbox has
+        one (one sandbox per project, 17 October 2026); otherwise the single
+        planning.git_door, which is for an estate with one sandbox.
+        """
+        entry = self.sandboxes.get(str(repo or "").strip())
+        own = entry.git_door if entry is not None else None
+        return own or self.git_door
+
+    @model_validator(mode="after")
+    def _fetch_addresses_use_their_own_sandbox_s_door(self) -> "PlanningConfig":
+        """Each fetch address is a plain https:// one, or the Git door of the
+        repository's own sandbox followed by that repository's
+        '<owner>/<name>.git' (one sandbox per project, 17 October 2026).
+
+        A door belongs to one sandbox: two sandboxes never share one, and with
+        any sandbox holding a door of its own the single planning.git_door is
+        left unset, so a repository can never be read through another
+        project's port. The refusal names the project, never the address: what
+        was written may hold a credential.
+        """
+        from forge.network_git import check_fetch_address, git_door_address, transport_of
+
+        owners: dict[str, str] = {}
+        for key, entry in self.sandboxes.items():
+            if entry.git_door is None:
+                continue
+            other = owners.setdefault(entry.git_door, entry.name)
+            if other != entry.name:
+                raise ValueError(
+                    f"planning.sandboxes gives sandboxes {other} and {entry.name} the "
+                    f"same git_door (at {key}); each sandbox has a door port of its own"
+                )
+        folders: dict[str, str] = {}
+        for key, entry in self.sandboxes.items():
+            if entry.receipts_root is None:
+                continue
+            other = folders.setdefault(entry.receipts_root, entry.name)
+            if other != entry.name:
+                raise ValueError(
+                    f"planning.sandboxes gives sandboxes {other} and {entry.name} the "
+                    f"same receipts_root (at {key}); each project's receipts are its own"
+                )
+        if owners and self.git_door is not None:
+            raise ValueError(
+                "planning.git_door is the single Git door of an estate with one "
+                "sandbox; with doors set per sandbox (planning.sandboxes.<repo>."
+                "git_door) leave it unset"
+            )
+        for key, address in self.fetch_addresses.items():
+            door = self.git_door_for(key)
             # The same check every fetch makes (forge.network_git): a plain
-            # https:// address, or one through the declared Git door.
-            problem = check_fetch_address(str(address), git_door=door)
+            # https:// address, or one through this repository's door.
+            problem = check_fetch_address(address, git_door=door)
             if problem:
                 raise ValueError(f"planning.fetch_addresses for {key}: {problem}")
-        return {str(k): str(v).strip() for k, v in value.items()}
+            if door is not None and transport_of(address) == "http":
+                if address.lower() != git_door_address(door, key).lower():
+                    raise ValueError(
+                        f"planning.fetch_addresses for {key}: an address through the "
+                        "Git door must name the repository it is recorded for "
+                        "(the value is not repeated here)"
+                    )
+        return self
 
     @field_validator("default_target_repo")
     @classmethod

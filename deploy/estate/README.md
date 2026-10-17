@@ -346,39 +346,60 @@ added to `COMPOSE_PROFILES` in the env file.
   in this bundle and in no declared setting, and the door refuses to start if
   it is missing, blank, or has spaces or line breaks in it.
 - The allow-list: the file `GIT_DOOR_REPOS_FILE` names (in the example
-  `/etc/factory/git-door.repos`), one `owner/name` per line, blank lines and
-  `#` comments left out. It names private repositories, so it is a file of the
-  machine, never in this bundle. It is bound read-only. The door refuses to
-  start without it, with a line that is not `owner/name`, or with no
+  `/etc/factory/git-door.repos`), one `<port>/<owner>/<name>` per line, blank
+  lines and `#` comments left out. It names private repositories, so it is a
+  file of the machine, never in this bundle. It is bound read-only. The door
+  refuses to start without it, with a line of any other shape, with a port it
+  does not listen on, with one repository listed for two ports, or with no
   repository on it.
 
-Also: `GIT_DOOR_PORT` (31825 in the example; the door listens on
-`FACTORY_GATEWAY_ADDRESS` and that port only, parsed as the model door's is) and
-`FACTORY_GIT_DOOR_IMAGE` (the same pinned image as the model door's, held to
-`estate-pins.conf`).
+**One port per sandbox** (design "One sandbox per project", 17 October 2026).
+Each project's sandbox reaches the door on a port of its own, 31830 + its slot
+number (`forge.config.sandbox_slots`), and the door looks each request up by
+the port it arrived on, so a repository listed as `31831/<owner>/<name>` is
+read through port 31831 and refused on every other port. `GIT_DOOR_PORTS` is
+the comma-separated list of those ports (`31831` in the example); the door
+listens on `FACTORY_GATEWAY_ADDRESS` and each of them only, every one parsed as
+the model door's port is. The single `GIT_DOOR_PORT` of before is still read
+when `GIT_DOOR_PORTS` is unset; the allow-list's lines take the port in either
+case. The shared sandbox from before, `api-test-deploy`, has no port on the
+door, so it can never read a private repository. `FACTORY_GIT_DOOR_IMAGE` is
+the same pinned image as the model door's, held to `estate-pins.conf`.
 
 **The live steps, each with the owner's word, none done by this bundle.**
 
 1. Make the token in the browser and store it in fleet-secrets as
    `GIT_DOOR_TOKEN`, without printing it; `factory-up.sh` then passes it in.
-2. Write the allow-list file and set `GIT_DOOR_PORT` and `GIT_DOOR_REPOS_FILE`
+2. Write the allow-list file and set `GIT_DOOR_PORTS` and `GIT_DOOR_REPOS_FILE`
    in the env file; add `git-door` to `COMPOSE_PROFILES`.
-3. This machine's guard admits only the sandbox's machine to
-   `GIT_DOOR_PORT`, as it does for `MODEL_DOOR_PORT`.
-4. The sandbox's `sbx` network rules allow `<gateway address>:<GIT_DOOR_PORT>`:
-   `rollout-sandbox` adds that one rule, beside the model door's, whenever
-   `GIT_DOOR_PORT` is set in the env file it is given (and refuses a port that
-   is another door's); with it unset, the rollout is as before.
-5. The coordinator's `forge.yaml` names the door as `planning.git_door:
-   http://<gateway address>:<GIT_DOOR_PORT>/`, written as the address itself.
+3. This machine's guard admits only the sandbox's machine to each of
+   `GIT_DOOR_PORTS`, as it does for `MODEL_DOOR_PORT`.
+4. Each sandbox's `sbx` network rules allow `<gateway address>:<its own
+   port>` and no other door port: `rollout-sandbox` adds that one rule, beside
+   the model door's, whenever `GIT_DOOR_PORT` is set in the env file it is
+   given for that sandbox (and refuses a port that is another door's); with it
+   unset, the rollout is as before. A slot sandbox's own env file sets
+   `GIT_DOOR_PORT=31830+k` and `FLEET_MEMORY_SANDBOX_PORT=31850+k` for its slot
+   *k*, and is never this estate's env file (whose `GIT_DOOR_PORTS` and
+   `FLEET_MEMORY_SANDBOX_PORT` name the doors for every sandbox and for the
+   shared one).
+5. The sandbox's entry in the coordinator's `forge.yaml` names its door as
+   `planning.sandboxes.<owner>/<name>.git_door: http://<gateway address>:<its
+   port>/`, written as the address itself (`forge register-repo --slot <k>`
+   writes it). The single `planning.git_door` is for an
+   estate with one sandbox, and is left unset once any sandbox has its own.
 
-**Adding a repository.** Add its `owner/name` as one line of the allow-list
-file and restart the door (`docker compose ... up -d git-door` after the
-change, or a restart of that one service). Then register it with
+**Adding a repository.** Register it into its own sandbox with
 `forge register-repo <owner>/<name> --github https://github.com/<owner>/<name>
---via-git-door --publish --publish-credential-name <its deploy key>`: the
-project's fetch address is recorded as `<planning.git_door><owner>/<name>.git`
-and the sandbox's read and clone go through the door. The check clone on this
+--slot <k> --sandbox-clone <its workspace clone> --via-git-door --publish
+--publish-credential-name <its deploy key>` (the sandbox is named after the
+project, and its receipts folder is
+`/var/lib/forge-project-receipts/<sandbox name>` in the coordinator unless
+`--receipts-root` says otherwise): the project's fetch address is
+recorded as `<its sandbox's git_door><owner>/<name>.git` and the sandbox's read
+goes through the door. Then add the line `<31830 + k>/<owner>/<name>` to the
+allow-list file (and the port to `GIT_DOOR_PORTS` if it is not there) and
+restart the door (`docker compose ... up -d git-door`). The check clone on this
 machine reads it with the route's own deploy key, so a private repository needs
 that key.
 

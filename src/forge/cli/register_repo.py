@@ -46,13 +46,34 @@ What the command does, in order, saying one plain line per step:
    restart the sandbox supervisor, start the publisher when its routes
    changed, start the rest, check — and restarts nothing itself.
 
-``--via-git-door`` (17 October 2026) is for a private repository: the
-sandbox reads it through the Git door on the factory's own machine (the
-coordinator's ``planning.git_door``), which adds a read-only token, so the
-sandbox still holds no credential. The project's fetch address is recorded
-as ``<git_door><org>/<name>.git`` and the sandbox's read and clone go through
-it. The repository must already be on the door's allow-list; the command
-says so, and changes nothing about the door itself.
+``--slot <k>`` (design "One sandbox per project", 17 October 2026) gives the
+project a sandbox of its own instead of the shared one, named after the
+project (``--sandbox`` may say the same name, and no other). The sandbox is
+made first, from the project's own clone on its machine, by the sandbox
+recipe; its workspace clone (``--sandbox-clone``, the same path inside the
+sandbox) IS the factory's clone of the project, and its own settings file
+(its FORGE_CONFIG_PATH) is ``<that clone>/.guardkit/tmp/factory-runtime/forge.yaml``,
+which this command writes when it is not there yet. So in this form nothing is
+cloned: the command checks that the workspace clone is this project's and
+keeps the runtime folder out of git, and the project's path in the sandbox's
+settings is the workspace clone itself. The publisher's route fetches from the
+sandbox's own git daemon, at its slot's port on the sandbox publish address. The
+``planning.sandboxes`` entry it writes is not copied from api_test's: it names
+this sandbox, the helper and runner at slot *k*'s ports
+(:mod:`forge.config.sandbox_slots`) on the sandbox publish address, and the
+sandbox's own Git door port. A sandbox takes one project: a sandbox, or a
+slot, that another project already has is refused. The shared sandbox
+``api-test-deploy`` keeps the projects already in it and the old form, but it
+has no slot and never a Git door.
+
+``--via-git-door`` (17 October 2026) is for a private repository, and needs a
+sandbox of its own: the sandbox reads it through its own port on the Git door
+on the factory's own machine (its entry's ``git_door``), which adds a
+read-only token, so the sandbox still holds no credential. The project's fetch
+address is recorded as ``<git_door><org>/<name>.git`` and the sandbox's read
+goes through it. The repository must already be on the door's allow-list,
+keyed by that port; the command says so, and changes nothing about the door
+itself.
 
 When the publisher's settings say ``private_only`` (17 October 2026), a
 route is written only for a repository confirmed private
@@ -95,8 +116,8 @@ from typing import Any, Callable, Mapping, Sequence
 import click
 import yaml
 
+from forge.config.sandbox_slots import LEGACY_SANDBOX, MAX_SLOT, SlotPorts, slot_ports
 from forge.network_git import (
-    GIT_DOOR_SETTING,
     NetworkRefused,
     git_door_address,
     proxy_environment,
@@ -115,8 +136,10 @@ __all__ = ["register_repo_cmd"]
 # estate passes its own; none of them is a path on anybody's machine.
 # ---------------------------------------------------------------------------
 
-#: The one shared sandbox every project is built in (Rich, 5 October 2026).
-DEFAULT_SANDBOX: str = "api-test-deploy"
+#: The one shared sandbox every project was built in (Rich, 5 October 2026).
+#: Since one sandbox per project (17 October 2026) a project may be given a
+#: sandbox of its own (``--slot <k>``, named after the project); this stays the default.
+DEFAULT_SANDBOX: str = LEGACY_SANDBOX
 
 #: The user the sandbox's helper and runner run as, and the owner of the clone.
 SANDBOX_USER: str = "1000"
@@ -149,6 +172,13 @@ RUNTIME_FOLDER: str = ".guardkit/tmp/factory-runtime"
 SANDBOX_SETTINGS_IN_CLONE: str = f"{RUNTIME_FOLDER}/forge.yaml"
 PROJECTS_FOLDER: str = f"{RUNTIME_FOLDER}/projects"
 
+#: Where the coordinator sees each project's own receipts folder (design
+#: section 2.2a): the machine's receipts folders are mounted here, one folder
+#: per sandbox, by the coordinator's project-receipts overlay
+#: (deploy/compose/compose.project-receipts.yaml). A sandbox of its own's
+#: entry names ``<this>/<sandbox name>``; the shared sandbox's never does.
+COORDINATOR_PROJECT_RECEIPTS: str = "/var/lib/forge-project-receipts"
+
 #: The project whose sandbox entry a new project copies: the sandbox name and
 #: its two addresses are the same for every project in the shared sandbox.
 REFERENCE_PROJECT: str = "guardkit/api_test"
@@ -167,6 +197,9 @@ ESTATE_ENV_SANDBOX_FILE: str = "SANDBOX_PROJECT_ENV_FILE"
 ESTATE_ENV_PUBLISHER_SETTINGS: str = "FORGE_PUBLISHER_SETTINGS_FILE"
 ESTATE_ENV_COMPOSE_FILE: str = "COMPOSE_FILE"
 ESTATE_ENV_GATEWAY: str = "FACTORY_GATEWAY_ADDRESS"
+#: Where the coordinator reaches a sandbox's helper and runner (a sandbox of
+#: its own's entry is written with this address and its slot's ports).
+ESTATE_ENV_SANDBOX_ADDRESS: str = "SANDBOX_PUBLISH_ADDRESS"
 SANDBOX_ENV_CONFIG_PATH: str = "FORGE_CONFIG_PATH"
 
 #: The three services that let work in: the two that receive Slack, and the
@@ -569,6 +602,11 @@ class Refused(Exception):
 #: but its owner able to read it, then gives it the mode of "$2", the live file.
 _WRITE_LIKE: str = 'umask 077 && cat > "$1" && chmod "$(stat -c %a "$2")" "$1"'
 
+#: Writes standard input to "$1", a file that must not be there yet, readable
+#: by its owner only, making its folder first (a sandbox of its own's settings
+#: file, 17 October 2026).
+_CREATE_NEW: str = 'umask 077 && mkdir -p -- "${1%/*}" && set -C && cat > "$1"'
+
 
 @dataclass(frozen=True)
 class VolumeStore:
@@ -680,6 +718,14 @@ class SandboxStore:
     def names(self, folder: str) -> list[str]:
         result = self.exec("ls", "-1", folder)
         return result.stdout.split() if result.returncode == 0 else []
+
+    def create(self, name: str, text: str) -> None:
+        """Write a new file ``name`` (refused if it is there), owner-only."""
+        result = self.exec("sh", "-c", _CREATE_NEW, "register-repo", name, input=text)
+        if result.returncode != 0:
+            raise Refused("sandbox", f"could not create {name} in {self.sandbox} ({_said(result)})")
+        if self.read(name) != text:
+            raise Refused("sandbox", f"{name} in {self.sandbox} did not read back as written")
 
     def write(self, name: str, text: str, *, like: str) -> None:
         result = self.exec("sh", "-c", _WRITE_LIKE, "register-repo", name, like, input=text)
@@ -1086,7 +1132,13 @@ class YamlEdit:
 
 
 def plan_settings_edit(
-    text: str, *, which: str, key: str, path: str, fetch_address: str | None = None
+    text: str,
+    *,
+    which: str,
+    key: str,
+    path: str,
+    fetch_address: str | None = None,
+    entry: Mapping[str, str] | None = None,
 ) -> YamlEdit:
     """The entries ``key`` needs in one ``forge.yaml``, by line insertion.
 
@@ -1096,7 +1148,10 @@ def plan_settings_edit(
 
     ``path`` is the project's folder as that file's own world knows it. The
     sandbox entry copies the reference project's name and addresses from the
-    same file, as written (an address may be a ``${NAME}``). Refuses — writing
+    same file, as written (an address may be a ``${NAME}``); with ``entry``
+    (a sandbox of its own, 17 October 2026) that entry is written instead, and
+    a sandbox another project's entry already names, or another sandbox's
+    addresses or door, is refused. Refuses — writing
     nothing — when an entry already says something else, when the result would
     not load, when it would change anything but the three entries, or when a
     line of the original (a comment included) would be lost.
@@ -1109,17 +1164,29 @@ def plan_settings_edit(
         raise Refused(which, "its forge.yaml is not a set of settings")
     planning = _mapping(data.get("planning"))
     sandboxes = _mapping(planning.get("sandboxes"))
-    reference = sandboxes.get(REFERENCE_PROJECT)
-    wanted_keys = ("name", "sidecar_url", "runner_url")
-    if not isinstance(reference, dict) or not all(
-        isinstance(reference.get(k), str) and reference.get(k) for k in wanted_keys
-    ):
-        raise Refused(
-            which,
-            f"its forge.yaml has no complete planning.sandboxes entry for "
-            f"{REFERENCE_PROJECT} to copy the sandbox name and addresses from",
-        )
-    entry = {k: str(reference[k]) for k in wanted_keys}
+    if entry is not None:
+        entry = {k: str(v) for k, v in entry.items()}
+        wanted_keys = tuple(entry)
+        _one_project_per_sandbox(which, sandboxes, key=key, entry=entry)
+    else:
+        reference = sandboxes.get(REFERENCE_PROJECT)
+        wanted_keys = ("name", "sidecar_url", "runner_url")
+        if not isinstance(reference, dict) or not all(
+            isinstance(reference.get(k), str) and reference.get(k) for k in wanted_keys
+        ):
+            raise Refused(
+                which,
+                f"its forge.yaml has no complete planning.sandboxes entry for "
+                f"{REFERENCE_PROJECT} to copy the sandbox name and addresses from",
+            )
+        if reference.get("git_door"):
+            raise Refused(
+                which,
+                f"its planning.sandboxes entry for {REFERENCE_PROJECT} names a Git door, "
+                f"and the shared sandbox {reference.get('name')} never has one (one "
+                "sandbox per project); take that line out by hand first",
+            )
+        entry = {k: str(reference[k]) for k in wanted_keys}
     filesystem = _mapping(_mapping(data.get("permissions")).get("filesystem"))
     allowlist = [str(item) for item in (filesystem.get("allowlist") or [])]
     repo_paths = _mapping(planning.get("target_repo_paths"))
@@ -1178,7 +1245,11 @@ def plan_settings_edit(
                 set_mapping_entry(
                     lines, ("planning", "sandboxes", _scalar(key)), name, _scalar(entry[name])
                 )
-            expected["planning"]["sandboxes"][key] = dict(entry)
+            expected.setdefault("planning", {})
+            expected["planning"]["sandboxes"] = {
+                **(expected["planning"].get("sandboxes") or {}),
+                key: dict(entry),
+            }
             steps.append(Step(which, "add", f"sandboxes {key} in sandbox {entry['name']}"))
             changed = True
 
@@ -1228,6 +1299,51 @@ def plan_settings_edit(
     if why_not is not None:
         raise Refused(which, f"the edited forge.yaml would not load ({why_not}); nothing was written")
     return YamlEdit(which, text, staged, steps, entry)
+
+
+def _one_project_per_sandbox(
+    which: str, sandboxes: Mapping[str, Any], *, key: str, entry: Mapping[str, str]
+) -> None:
+    """A sandbox of its own takes one project (17 October 2026): refuse when
+    another project's entry names this sandbox, or another sandbox has this
+    entry's helper, runner or Git door."""
+    for other, current in sandboxes.items():
+        if other == key or not isinstance(current, dict):
+            continue
+        if current.get("name") == entry["name"]:
+            raise Refused(
+                which,
+                f"the sandbox {entry['name']} already belongs to {other}, and a sandbox "
+                f"takes one project; give {key} a sandbox and a slot of its own",
+            )
+        # Compared by port, not by spelling: every sandbox is published on
+        # the same machine, so one port is one sandbox's whatever the address
+        # is written as (an address written as a ${NAME} has no port to read).
+        theirs = {_port_of(current.get(f)) for f in ("sidecar_url", "runner_url", "git_door")} - {None}
+        for field_name in ("sidecar_url", "runner_url", "git_door"):
+            port = _port_of(entry.get(field_name))
+            if port is not None and port in theirs:
+                raise Refused(
+                    which,
+                    f"port {port} ({field_name}) of {entry['name']} is already the sandbox "
+                    f"{current.get('name')}'s (for {other}); pick a slot no sandbox has",
+                )
+        if "receipts_root" in entry and current.get("receipts_root") == entry["receipts_root"]:
+            raise Refused(
+                which,
+                f"the receipts_root of {entry['name']} is already the sandbox "
+                f"{current.get('name')}'s (for {other}); pick a slot no sandbox has",
+            )
+
+
+def _port_of(address: Any) -> int | None:
+    """The port an http address names, or ``None``."""
+    if not isinstance(address, str) or "${" in address:
+        return None
+    try:
+        return urlsplit(address.strip()).port
+    except ValueError:
+        return None
 
 
 @dataclass
@@ -1458,6 +1574,78 @@ def make_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str
     if origin.returncode != 0 or not _same_repository(origin.stdout, url):
         raise Refused("clone", f"{target} was cloned but does not name {url} as its origin")
     return Step("clone", "done", f"{target} cloned from {url}")
+
+
+def _names_repository(origin: str, org: str, leaf: str) -> bool | None:
+    """Does a remote address name ``org/leaf``? ``None`` when it is not a
+    repository address at all (a folder, as a sandbox's own clone may have)."""
+    text = origin.strip().rstrip("/")
+    match = re.match(r"^(?:[a-z][a-z0-9+.-]*://[^/]+/|[^/@:\s]+@[^:/\s]+:)(.+)$", text)
+    if not match:
+        return None
+    path = match.group(1)
+    path = path[:-4] if path.endswith(".git") else path
+    parts = path.split("/")
+    return len(parts) >= 2 and "/".join(parts[-2:]).lower() == f"{org}/{leaf}".lower()
+
+
+def check_workspace_clone(
+    sandbox: SandboxStore, *, clone: str, org: str, leaf: str, url: str, door_note: str | None = None
+) -> Step:
+    """Step 3 for a sandbox of its own (17 October 2026): nothing is cloned.
+
+    The sandbox was made from the project's own clone, so its workspace clone
+    is the factory's clone of the project. Checked, reading only: the factory's
+    runtime folder (the sandbox's settings file and its staged copies) is
+    git-ignored there; the sandbox can read the project at ``url`` (https, or
+    its own Git door port); and the clone's origin, when it is a repository
+    address, names this project.
+    """
+    ignored = sandbox.git_read("-C", clone, "check-ignore", "-q", RUNTIME_FOLDER)
+    if ignored.returncode == 1:
+        raise Refused(
+            "clone",
+            f"{RUNTIME_FOLDER} is not git-ignored in the sandbox's workspace clone ({clone}), so "
+            "the sandbox's settings file there would show up as the project's own change; "
+            "add .guardkit/tmp/ to the project's .gitignore first",
+        )
+    if ignored.returncode != 0:
+        raise Refused(
+            "clone",
+            f"could not ask git whether {RUNTIME_FOLDER} is ignored in {clone} (is it the "
+            f"sandbox's workspace clone? git check-ignore stopped with exit code {ignored.returncode})",
+        )
+    try:
+        readable = sandbox_network_git(
+            sandbox, ["ls-remote", "--", url, "HEAD"], bare=True,
+            transport=transport_of(url) or "https",
+        )
+    except NetworkRefused as refused:
+        raise Refused("clone", f"{refused.sentence} Nothing was written") from None
+    if readable.returncode != 0 or not readable.stdout.strip():
+        if door_note is not None:
+            raise Refused(
+                "clone",
+                f"the sandbox cannot read {url} through its Git door port. Check that "
+                f"{door_note}, and that the sandbox may reach that port. Nothing was written",
+            )
+        raise Refused(
+            "clone",
+            f"the sandbox cannot read {url}. It holds no GitHub credential, so it reads a "
+            "public repository over https, or a private one through its own Git door port "
+            "(--via-git-door). Nothing was written",
+        )
+    origin = sandbox.git_read("-C", clone, "remote", "get-url", "origin")
+    if origin.returncode == 0 and _names_repository(origin.stdout, org, leaf) is False:
+        raise Refused(
+            "clone",
+            f"the sandbox's workspace clone {clone} comes from {origin.stdout.strip()}, not "
+            f"{org}/{leaf}; this sandbox was made for another project",
+        )
+    return Step(
+        "clone", "unchanged",
+        f"{clone} is the sandbox's own workspace clone; the factory builds {org}/{leaf} there",
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1908,6 +2096,8 @@ class Estate:
     volume: str
     coordinator: str
     settle_seconds: int = DEFAULT_SETTLE_SECONDS
+    #: A sandbox of its own (17 October 2026): its slot's ports, said in (e).
+    slot: SlotPorts | None = None
 
 
 def activation_sequence(
@@ -2001,9 +2191,22 @@ def activation_sequence(
     lines.append(f"    {chain[0]}" + (" \\" if len(chain) > 1 else ""))
     for index, command in enumerate(chain[1:], start=1):
         lines.append(f"      && {command}" + (" \\" if index < len(chain) - 1 else ""))
+    if estate.slot is None:
+        lines += [
+            "(e) Restart the sandbox supervisor and confirm the helper and runner are ready:",
+            f"    dc up -d {SANDBOX_SUPERVISOR_SERVICE}",
+        ]
+    else:
+        ports = estate.slot
+        lines += [
+            f"(e) Start or restart {estate.sandbox}'s own supervisor (its own Compose project on the"
+            " sandbox's machine, one per project) and confirm the helper and runner are ready."
+            f" Slot {ports.slot} publishes the runner on {ports.runner}, the helper on {ports.helper},"
+            f" the git daemon on {ports.git_daemon} and previews on {ports.previews[0]} and"
+            f" {ports.previews[1]}; its Git door port is {ports.git_door} and its memory door port"
+            f" {ports.memory_door}:",
+        ]
     lines += [
-        "(e) Restart the sandbox supervisor and confirm the helper and runner are ready:",
-        f"    dc up -d {SANDBOX_SUPERVISOR_SERVICE}",
         f"    sbx exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'"
         f"  (both {estate.sandbox}-helper and {estate.sandbox}-runner Up)",
     ]
@@ -2061,7 +2264,8 @@ class Options:
     sandbox_settings: str
     sandbox_clone: str
     publisher_settings: str | None
-    publish_source_base: str | None
+    #: With --publish: where the publisher fetches the project's clone from.
+    publish_source: str | None
     estate: Estate
     #: With --publish: the bare name of the route's own key, or None.
     publish_credential_name: str | None = None
@@ -2072,6 +2276,14 @@ class Options:
     publisher_uid: int | None = None
     #: Read the repository through the Git door (17 October 2026).
     via_git_door: bool = False
+    #: A sandbox of its own (17 October 2026): its slot, and the entry the
+    #: settings files are given (name, helper, runner, Git door). ``None`` =
+    #: the shared sandbox, whose entry is copied from api_test's.
+    slot: SlotPorts | None = None
+    sandbox_entry: dict[str, str] | None = None
+    #: The coordinator's copy of that entry also names the project's own
+    #: receipts folder as the coordinator sees it (design section 2.2a).
+    coordinator_entry: dict[str, str] | None = None
 
 
 def _parse_name(name: str) -> tuple[str, str]:
@@ -2121,15 +2333,77 @@ def resolve_options(
     sandbox_clone: str | None,
     publisher_settings: Path | None,
     gateway_address: str | None,
-    git_export_port: int,
-    sandbox: str,
+    git_export_port: int | None,
+    sandbox: str | None,
     volume: str,
     coordinator: str,
     settle_seconds: int = DEFAULT_SETTLE_SECONDS,
     publish_credential_name: str | None = None,
     via_git_door: bool = False,
+    slot: int | None = None,
+    sandbox_address: str | None = None,
+    receipts_root: str | None = None,
 ) -> Options:
     """The command's options with every default worked out, or a refusal."""
+    org, leaf = _parse_name(name)
+    if sandbox is None:
+        # A sandbox of its own is named after its project (the recipe's
+        # convention); without --slot, the shared sandbox as before.
+        sandbox = LEGACY_SANDBOX if slot is None else leaf
+    shared = sandbox == LEGACY_SANDBOX
+    ports: SlotPorts | None = None
+    if receipts_root is not None and slot is None:
+        raise Refused(
+            "sandbox",
+            f"--receipts-root is for a sandbox of its own (--slot); {LEGACY_SANDBOX} keeps "
+            "the single receipts folder",
+        )
+    if shared and slot is not None:
+        raise Refused(
+            "sandbox",
+            f"{LEGACY_SANDBOX} is the shared sandbox from before one sandbox per project: it "
+            "has no slot and never a Git door. Give the project a sandbox of its own "
+            "(--slot <k>, named after the project), or leave --slot out",
+        )
+    if shared and via_git_door:
+        raise Refused(
+            "git-door",
+            f"the shared sandbox {LEGACY_SANDBOX} never reads through the Git door, so no "
+            "private repository can be read where other projects build. Register it into "
+            "a sandbox of its own: --slot <k> --via-git-door. Nothing was written",
+        )
+    if not shared:
+        if slot is None:
+            raise Refused(
+                "sandbox",
+                f"a sandbox of its own ({sandbox}) needs its slot, --slot <k> from 1 to "
+                f"{MAX_SLOT}: its ports and its Git door port come from it",
+            )
+        try:
+            ports = slot_ports(slot)
+        except ValueError as exc:
+            raise Refused("sandbox", f"--slot: {exc}") from None
+        if receipts_root is None:
+            receipts_root = f"{COORDINATOR_PROJECT_RECEIPTS}/{sandbox}"
+        if not receipts_root.startswith("/") or ".." in receipts_root.split("/"):
+            raise Refused(
+                "sandbox",
+                "a sandbox of its own keeps its receipts in a folder of its own (design "
+                "section 2.2a): --receipts-root <that folder, as the coordinator sees it, "
+                "an absolute path>",
+            )
+        if sandbox != leaf:
+            raise Refused(
+                "sandbox",
+                f"a sandbox of its own is named after its project, {leaf}, and --sandbox "
+                f"says {sandbox}; leave --sandbox out or name it {leaf}",
+            )
+        if git_export_port is not None and git_export_port != ports.git_daemon:
+            raise Refused(
+                "sandbox",
+                f"--git-export-port {git_export_port} is not slot {slot}'s git daemon port "
+                f"({ports.git_daemon}); leave it out for a sandbox of its own",
+            )
     if publish_credential_name is not None:
         from forge.publisher.settings import WHAT_A_KEY_NAME_IS, a_route_key_name
 
@@ -2145,7 +2419,6 @@ def resolve_options(
                 "--publish-credential-name is not a key name: it must be "
                 f"{WHAT_A_KEY_NAME_IS} (the value is not repeated here)",
             )
-    org, leaf = _parse_name(name)
     if not github:
         raise Refused("github", "--github <https address of the repository> is needed")
     url = _check_url(github, leaf)
@@ -2157,7 +2430,9 @@ def resolve_options(
         except OSError as exc:
             raise Refused("estate", f"could not read the estate env file {estate_env_file} ({exc.strerror})") from None
 
-    if sandbox_env_file is None and estate_values.get(ESTATE_ENV_SANDBOX_FILE) and estate_env_file:
+    # The estate's sandbox env file is the shared sandbox's: a sandbox of its
+    # own names its settings file itself.
+    if shared and sandbox_env_file is None and estate_values.get(ESTATE_ENV_SANDBOX_FILE) and estate_env_file:
         sandbox_env_file = _resolve_beside(estate_values[ESTATE_ENV_SANDBOX_FILE], estate_env_file)
     if sandbox_settings is None and sandbox_env_file is not None:
         try:
@@ -2165,6 +2440,10 @@ def resolve_options(
         except OSError as exc:
             raise Refused("sandbox", f"could not read the sandbox env file {sandbox_env_file} ({exc.strerror})") from None
         sandbox_settings = sandbox_values.get(SANDBOX_ENV_CONFIG_PATH) or None
+    if not sandbox_settings and ports is not None and sandbox_clone:
+        # A sandbox of its own: its settings file is in its workspace clone's
+        # runtime folder, as api_test's is in api_test's.
+        sandbox_settings = f"{sandbox_clone.rstrip('/')}/{SANDBOX_SETTINGS_IN_CLONE}"
     if not sandbox_settings:
         raise Refused(
             "sandbox",
@@ -2195,19 +2474,44 @@ def resolve_options(
             f"--estate-env-file (its {ESTATE_ENV_PUBLISHER_SETTINGS} names it)",
         )
 
-    publish_source_base: str | None = None
-    if publish:
+    publish_source: str | None = None
+    gateway = ""
+    if publish or ports is not None:
         gateway = (gateway_address or estate_values.get(ESTATE_ENV_GATEWAY, "")).strip()
         if not gateway:
+            needs = "--publish" if ports is None else f"a sandbox of its own ({sandbox})"
             raise Refused(
-                "publisher",
-                "--publish needs the factory gateway address the publisher fetches from: pass "
-                f"--gateway-address, or --estate-env-file (its {ESTATE_ENV_GATEWAY} names it)",
+                "publisher" if ports is None else "sandbox",
+                f"{needs} needs the factory gateway address (where the publisher fetches from"
+                + (")" if ports is None else ", and where the sandbox reaches its Git door port)")
+                + f": pass --gateway-address, or --estate-env-file (its {ESTATE_ENV_GATEWAY} names it)",
             )
-        if not re.fullmatch(r"[A-Za-z0-9.:\[\]-]+", gateway) or "${" in gateway:
+        if not _a_plain_address(gateway):
             raise Refused("publisher", f"the gateway address {gateway!r} is not a plain host name or address")
-        clone_folder = PurePosixPath(sandbox_clone.rstrip("/")).name
-        publish_source_base = f"git://{gateway}:{git_export_port}/{clone_folder}/{PROJECTS_FOLDER}"
+    clone_folder = PurePosixPath(sandbox_clone.rstrip("/")).name
+    if publish and ports is None:
+        port = DEFAULT_GIT_EXPORT_PORT if git_export_port is None else git_export_port
+        publish_source = f"git://{gateway}:{port}/{clone_folder}/{PROJECTS_FOLDER}/{leaf}"
+
+    sandbox_entry: dict[str, str] | None = None
+    if ports is not None:
+        address = (sandbox_address or _env_value(estate_values, ESTATE_ENV_SANDBOX_ADDRESS) or gateway).strip()
+        if not _a_plain_address(address):
+            raise Refused(
+                "sandbox",
+                f"the sandbox publish address {address!r} is not a plain host name or address: "
+                f"pass --sandbox-address, or --estate-env-file (its {ESTATE_ENV_SANDBOX_ADDRESS} names it)",
+            )
+        if publish:
+            # The sandbox's own git daemon serves its workspace clone's parent
+            # folder, published with the helper and runner at its slot's port.
+            publish_source = f"git://{address}:{ports.git_daemon}/{clone_folder}"
+        sandbox_entry = {
+            "name": sandbox,
+            "sidecar_url": f"http://{address}:{ports.helper}",
+            "runner_url": f"http://{address}:{ports.runner}",
+            "git_door": f"http://{gateway}:{ports.git_door}/",
+        }
 
     env_text = str(estate_env_file) if estate_env_file is not None else "$ESTATE_ENV"
     # The estate's secrets file sits beside its env file (the one-page
@@ -2234,9 +2538,16 @@ def resolve_options(
         sandbox_settings=sandbox_settings,
         sandbox_clone=sandbox_clone.rstrip("/"),
         publisher_settings=str(publisher_settings) if publisher_settings is not None else None,
-        publish_source_base=publish_source_base,
+        publish_source=publish_source,
         publish_credential_name=publish_credential_name,
         via_git_door=via_git_door,
+        slot=ports,
+        sandbox_entry=sandbox_entry,
+        coordinator_entry=(
+            {**sandbox_entry, "receipts_root": str(receipts_root).rstrip("/")}
+            if sandbox_entry is not None
+            else None
+        ),
         route_keys_dir=estate_values.get(ESTATE_ENV_ROUTE_KEYS_DIR) or None,
         known_hosts_file=estate_values.get(ESTATE_ENV_KNOWN_HOSTS) or None,
         publisher_uid=(
@@ -2252,49 +2563,40 @@ def resolve_options(
             volume=volume,
             coordinator=coordinator,
             settle_seconds=settle_seconds,
+            slot=ports,
         ),
     )
+
+
+def _a_plain_address(value: str) -> bool:
+    """A host name or address with nothing else in it (no ${NAME}, no port)."""
+    return bool(re.fullmatch(r"[A-Za-z0-9.:\[\]-]+", value)) and "${" not in value
+
+
+def _env_value(values: Mapping[str, str], name: str) -> str:
+    """``values[name]`` with any ``${OTHER}`` in it filled from the same file
+    (the example writes SANDBOX_PUBLISH_ADDRESS=${FACTORY_GATEWAY_ADDRESS})."""
+    text = values.get(name, "")
+    for _ in range(5):
+        filled = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", lambda m: values.get(m.group(1), m.group(0)), text)
+        if filled == text:
+            break
+        text = filled
+    return text
 
 
 #: The anonymous visibility lookup register-repo makes when the publisher is
 #: private-only: one seam the tests replace, as :data:`run_command` is.
 visibility_lookup: Callable[[str, str], int | None] = anonymous_lookup
 
-#: The reminder about the Git door's allow-list (17 October 2026).
+#: The reminder about the Git door's allow-list (17 October 2026), keyed by
+#: the sandbox's own door port (one sandbox per project).
 GIT_DOOR_ALLOW_LIST_NOTE: str = (
-    "the Git door reads only the repositories on its allow-list: {key} must be "
-    "a line of the file the estate env file's GIT_DOOR_REPOS_FILE names (one "
-    "owner/name per line), and the door restarted after the line is added "
-    "(deploy/estate/README.md, 'The Git door')"
+    "the Git door reads only the repositories on its allow-list, each for one "
+    "sandbox's port: the line {port}/{key} must be in the file the estate env "
+    "file's GIT_DOOR_REPOS_FILE names, {port} in its GIT_DOOR_PORTS, and the door "
+    "restarted after the change (deploy/estate/README.md, 'The Git door')"
 )
-
-
-def door_fetch_address(coordinator_text: str, key: str) -> str:
-    """``<planning.git_door><org>/<name>.git``, from the coordinator's own
-    settings, or a refusal naming what is missing (17 October 2026)."""
-    try:
-        data = yaml.safe_load(coordinator_text) or {}
-    except yaml.YAMLError:
-        raise Refused("git-door", f"the coordinator's {SETTINGS_FILE_NAME} would not parse") from None
-    door = _mapping(_mapping(data).get("planning")).get("git_door")
-    if not door:
-        raise Refused(
-            "git-door",
-            f"--via-git-door needs the Git door's address in the coordinator's "
-            f"{SETTINGS_FILE_NAME}: add {GIT_DOOR_SETTING}: http://<gateway address>:"
-            "<door port>/ there first. Nothing was written",
-        )
-    if not isinstance(door, str) or "${" in door:
-        raise Refused(
-            "git-door",
-            f"{GIT_DOOR_SETTING} in the coordinator's {SETTINGS_FILE_NAME} must be "
-            "written as the address itself (http://<address>:<port>/), not a "
-            "${NAME}. Nothing was written",
-        )
-    try:
-        return git_door_address(door, key)
-    except ValueError as exc:
-        raise Refused("git-door", f"{exc}. Nothing was written") from None
 
 
 def _publisher_is_private_only(publisher_text: str) -> bool:
@@ -2305,6 +2607,16 @@ def _publisher_is_private_only(publisher_text: str) -> bool:
     except ValueError:
         return False
     return isinstance(data, dict) and data.get("private_only") is True
+
+
+#: Where a sandbox of its own's settings file starts (17 October 2026): the
+#: project's own entries are added to it as to any other settings file.
+NEW_SANDBOX_SETTINGS: str = (
+    "# THIS SANDBOX'S OWN SETTINGS FILE (FORGE_CONFIG_PATH), written by forge\n"
+    "# register-repo: one project per sandbox; paths are this sandbox's own.\n"
+    "planning:\n"
+    "  enabled: true\n"
+)
 
 
 def check_confirmed_private(options: Options) -> Step:
@@ -2379,50 +2691,78 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     if coordinator_text is None:
         raise Refused("coordinator", f"could not read {SETTINGS_FILE_NAME} from the volume {options.volume}")
     sandbox_text = sandbox.read(options.sandbox_settings)
+    # A sandbox of its own is made without a settings file: this command
+    # writes it (17 October 2026), from the few lines below plus the
+    # project's own entries, before the sandbox's services first start.
+    create_sandbox_file = sandbox_text is None and options.slot is not None
+    if create_sandbox_file:
+        sandbox_text = NEW_SANDBOX_SETTINGS
     if sandbox_text is None:
         raise Refused("sandbox", f"could not read {options.sandbox_settings} in the sandbox {options.sandbox}")
 
     coordinator_path = f"{COORDINATOR_PROJECTS_ROOT}/{options.leaf}"
-    clone_path = f"{options.sandbox_clone}/{PROJECTS_FOLDER}/{options.leaf}"
-    # Where the sandbox reads the project: the https address, or (17 October
-    # 2026) the Git door's address for it, which is then also the recorded
-    # fetch address.
-    read_from = (
-        door_fetch_address(coordinator_text, options.key)
-        if options.via_git_door
-        else options.url
+    # A sandbox of its own builds the project in its workspace clone itself;
+    # the shared sandbox in a clone in its projects folder.
+    clone_path = (
+        f"{options.sandbox_clone}/{PROJECTS_FOLDER}/{options.leaf}"
+        if options.slot is None
+        else options.sandbox_clone
     )
+    # Where the sandbox reads the project: the https address, or (17 October
+    # 2026) its own sandbox's Git door address for it, which is then also the
+    # recorded fetch address.
+    door = (options.sandbox_entry or {}).get("git_door")
+    if options.via_git_door:
+        assert door is not None  # resolve_options refuses the door without a sandbox of its own
+        try:
+            read_from = git_door_address(door, options.key)
+        except ValueError as exc:
+            raise Refused("git-door", f"{exc}. Nothing was written") from None
+    else:
+        read_from = options.url
     # The coordinator's settings also record the project's fetch address
     # (planning.fetch_addresses, 14 October 2026): the factory fetches a
     # starting point from it and never from a clone's own origin. The
     # sandbox's settings never carry it: that file sits inside a project clone.
     coordinator_edit = plan_settings_edit(
         coordinator_text, which="coordinator", key=options.key, path=coordinator_path,
-        fetch_address=read_from,
+        fetch_address=read_from, entry=options.coordinator_entry,
     )
-    sandbox_edit = plan_settings_edit(sandbox_text, which="sandbox", key=options.key, path=clone_path)
+    sandbox_edit = plan_settings_edit(
+        sandbox_text, which="sandbox", key=options.key, path=clone_path, entry=options.sandbox_entry,
+    )
 
     publisher_edit: JsonEdit | None = None
     if options.publish:
-        assert options.publisher_settings is not None and options.publish_source_base is not None
+        assert options.publisher_settings is not None and options.publish_source is not None
         publisher_text = host.read(options.publisher_settings)
         if publisher_text is None:
             raise Refused("publisher", f"could not read the publisher's settings file {options.publisher_settings}")
         publisher_edit = plan_publisher_edit(
             publisher_text,
             key=options.key,
-            source=f"{options.publish_source_base.rstrip('/')}/{options.leaf}",
+            source=options.publish_source,
             remote=f"git@github.com:{options.org}/{options.leaf}.git",
             credential_name=options.publish_credential_name,
         )
         if _publisher_is_private_only(publisher_text):
             steps.append(check_confirmed_private(options))
 
-    door_note = GIT_DOOR_ALLOW_LIST_NOTE.format(key=options.key) if options.via_git_door else None
-    clone_step, clone_needed = check_sandbox_clone(
-        sandbox, clone=options.sandbox_clone, leaf=options.leaf, url=read_from,
-        door_note=door_note,
+    door_note = (
+        GIT_DOOR_ALLOW_LIST_NOTE.format(key=options.key, port=options.slot.git_door)
+        if options.via_git_door and options.slot is not None
+        else None
     )
+    if options.slot is not None:
+        clone_step, clone_needed = check_workspace_clone(
+            sandbox, clone=options.sandbox_clone, org=options.org, leaf=options.leaf,
+            url=read_from, door_note=door_note,
+        ), False
+    else:
+        clone_step, clone_needed = check_sandbox_clone(
+            sandbox, clone=options.sandbox_clone, leaf=options.leaf, url=read_from,
+            door_note=door_note,
+        )
 
     # Every read is done and nothing refused: now, and only now, write.
     if clone_needed and options.dry_run:
@@ -2435,10 +2775,24 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
         steps.append(Step("git-door", "note", door_note))
 
     staged: dict[str, Staged | None] = {"coordinator": None, "sandbox": None, "publisher": None}
-    for edit, store, live, folder_name in (
-        (coordinator_edit, volume, SETTINGS_FILE_NAME, None),
-        (sandbox_edit, sandbox, options.sandbox_settings, str(PurePosixPath(options.sandbox_settings).parent)),
-    ):
+    edits = [(coordinator_edit, volume, SETTINGS_FILE_NAME, None)]
+    if create_sandbox_file:
+        steps += sandbox_edit.steps
+        assert sandbox_edit.staged is not None
+        if options.dry_run:
+            steps.append(Step("sandbox", "would create", sandbox.where(options.sandbox_settings)))
+        else:
+            sandbox.create(options.sandbox_settings, sandbox_edit.staged)
+            steps.append(Step(
+                "sandbox", "created",
+                f"{sandbox.where(options.sandbox_settings)}, the sandbox's own settings file "
+                "(nothing reads it until the sandbox's services start)",
+            ))
+    else:
+        edits.append(
+            (sandbox_edit, sandbox, options.sandbox_settings, str(PurePosixPath(options.sandbox_settings).parent))
+        )
+    for edit, store, live, folder_name in edits:
         steps += edit.steps
         if edit.staged is None:
             steps.append(Step(edit.which, "unchanged", "nothing to change, nothing staged"))
@@ -2517,9 +2871,21 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
               help=f"The publisher's settings file (default: the estate env's {ESTATE_ENV_PUBLISHER_SETTINGS}).")
 @click.option("--gateway-address", default=None,
               help=f"With --publish: the factory gateway address (default: the estate env's {ESTATE_ENV_GATEWAY}).")
-@click.option("--git-export-port", type=int, default=DEFAULT_GIT_EXPORT_PORT, show_default=True,
-              help="With --publish: the port the sandbox's git export is published on.")
-@click.option("--sandbox", "sandbox", default=DEFAULT_SANDBOX, show_default=True, help="The shared sandbox.")
+@click.option("--git-export-port", type=int, default=None,
+              help=f"With --publish: the port the sandbox's git export is published on (default "
+                   f"{DEFAULT_GIT_EXPORT_PORT} for the shared sandbox; a sandbox of its own uses its slot's).")
+@click.option("--sandbox", "sandbox", default=None,
+              help=f"The sandbox the project builds in: {DEFAULT_SANDBOX}, the shared one (the default), "
+                   "or with --slot one of its own, named after the project (the default with --slot).")
+@click.option("--slot", "slot", type=int, default=None,
+              help=f"With --sandbox <its own>: the sandbox's slot, 1 to {MAX_SLOT}; its ports and "
+                   "its Git door port come from it (one sandbox per project).")
+@click.option("--receipts-root", "receipts_root", default=None,
+              help="With --slot: the project's own receipts folder, as the coordinator sees it "
+                   f"(default {COORDINATOR_PROJECT_RECEIPTS}/<sandbox name>; design section 2.2a).")
+@click.option("--sandbox-address", "sandbox_address", default=None,
+              help=f"With --slot: where the coordinator reaches the sandbox's helper and runner "
+                   f"(default: the estate env's {ESTATE_ENV_SANDBOX_ADDRESS}, else the gateway address).")
 @click.option("--settings-volume", "volume", default=DEFAULT_SETTINGS_VOLUME, show_default=True,
               help="The coordinator's settings volume.")
 @click.option("--coordinator-container", "coordinator", default=DEFAULT_COORDINATOR_CONTAINER,
@@ -2540,8 +2906,11 @@ def register_repo_cmd(
     sandbox_clone: str | None,
     publisher_settings: Path | None,
     gateway_address: str | None,
-    git_export_port: int,
-    sandbox: str,
+    git_export_port: int | None,
+    sandbox: str | None,
+    slot: int | None,
+    receipts_root: str | None,
+    sandbox_address: str | None,
     volume: str,
     coordinator: str,
     as_json: bool,
@@ -2599,6 +2968,9 @@ def register_repo_cmd(
             settle_seconds=settle_seconds,
             publish_credential_name=publish_credential_name,
             via_git_door=via_git_door,
+            slot=slot,
+            sandbox_address=sandbox_address,
+            receipts_root=receipts_root,
         )
         tail = register(options, run, steps)
     except Refused as refusal:

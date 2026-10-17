@@ -90,7 +90,9 @@ _THE_BUSS_ACCOUNT_PASSWORDS = (
 )
 
 
-def _render(*extra: str, profiles: str | None = None) -> subprocess.CompletedProcess[str]:
+def _render(
+    *extra: str, profiles: str | None = None, settings: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[str]:
     """``docker compose config`` of the estate, with the example env and with
     NO password of any kind in the environment.
 
@@ -109,6 +111,9 @@ def _render(*extra: str, profiles: str | None = None) -> subprocess.CompletedPro
     bare["FORGE_PUBLISHER_BRIDGE"] = "fpb" + hashlib.sha256(b"forge-estate-bundle-check").hexdigest()[:12]
     if profiles is not None:
         bare["COMPOSE_PROFILES"] = profiles
+    # Settings a test puts in place of the example's (they win over the env
+    # file, as a machine's own environment would).
+    bare.update(settings or {})
     return subprocess.run(
         [
             "docker",
@@ -604,14 +609,93 @@ class TestWhatTheEstatePromises:
         assert environment["FLEET_MEMORY_MCP_SANDBOX_PORT"] == "8006"
         assert "192.0.2.1:31824" in environment["FLEET_MEMORY_MCP_ALLOWED_HOSTS"].split(",")
 
-    def test_the_memory_health_check_asks_both_doors(self, rendered: str) -> None:
-        """Both doors run in one process; if either stops, the process ends.
-        The probe asks both, so a door that never opened shows as unhealthy."""
+    def test_the_memory_health_check_asks_every_door(self, rendered: str) -> None:
+        """Every door runs in one process; if one stops, the process ends.
+        The probe asks the full door and every narrow one (8006 alone, or each
+        door per sandbox, 17 October 2026), so a door that never opened shows
+        as unhealthy."""
         import yaml
 
         probe = yaml.safe_load(rendered)["services"]["memory"]["healthcheck"]["test"][-1]
-        assert "for port in (8005, 8006)" in probe, probe
+        assert "for port in ports" in probe, probe
         assert "localhost:{port}/mcp/" in probe, probe
+        ports_of = _the_probe_s_ports(probe)
+        assert ports_of({}) == [8005, 8006]
+        assert ports_of({"FLEET_MEMORY_MCP_SANDBOX_DOORS": ""}) == [8005, 8006]
+        assert ports_of({"FLEET_MEMORY_MCP_SANDBOX_DOORS": "8006:a|b,31851:c"}) == [8005, 8006, 31851]
+
+    def test_without_doors_per_sandbox_the_memory_service_is_as_before(self, rendered: str) -> None:
+        """One sandbox per project (17 October 2026): with the doors setting
+        left out the render publishes and declares what it always did, and the
+        doors setting arrives empty, which fleet-memory reads as unset."""
+        import yaml
+
+        memory = yaml.safe_load(rendered)["services"]["memory"]
+        environment = memory["environment"]
+        assert environment["FLEET_MEMORY_MCP_SANDBOX_DOORS"] == ""
+        assert environment["FACTORY_MEMORY_DOOR_PORTS"] == ""
+        assert len(memory["ports"]) == 2
+
+    def test_each_door_per_sandbox_is_published_at_the_gateway_on_its_own_port(self) -> None:
+        import yaml
+
+        done = _render(settings={
+            "FLEET_MEMORY_SANDBOX_DOORS": "8006:api_test,31851:project_a,31852:project_b",
+            "FLEET_MEMORY_SANDBOX_DOOR_PORTS": "31851-31852",
+        })
+        assert done.returncode == 0, done.stderr
+        memory = yaml.safe_load(done.stdout)["services"]["memory"]
+        published = sorted(
+            (port["host_ip"], int(port["published"]), port["target"]) for port in memory["ports"]
+        )
+        assert published == [
+            ("192.0.2.1", 8005, 8005), ("192.0.2.1", 31824, 8006),
+            ("192.0.2.1", 31851, 31851), ("192.0.2.1", 31852, 31852),
+        ], published
+        environment = memory["environment"]
+        assert environment["FLEET_MEMORY_MCP_SANDBOX_DOORS"] == (
+            "8006:api_test,31851:project_a,31852:project_b"
+        )
+        assert environment["FACTORY_MEMORY_DOOR_PORTS"] == "31851-31852"
+        assert environment["FACTORY_MEMORY_DOOR_ADDRESS"] == "192.0.2.1"
+
+    @pytest.mark.parametrize("doors, published, said", [
+        ("8006:a,31851:b", "31852", "must name the same ports"),
+        ("8006:a,31851:b", "", "must name the same ports"),
+        ("8006:a", "31851", "must name the same ports"),
+        ("", "31851", "is set and FLEET_MEMORY_SANDBOX_DOORS is not"),
+        ("8006:a,031851:b", "31851", "not a number from 1024 to 65535"),
+        ("8006:a,31851:b", "31852-31851", "not one port or one range"),
+        ("8006:a,31851:b", "x", "not one port or one range"),
+    ], ids=["another-port", "not-published", "only-the-shared-door-and-a-port",
+            "no-doors-but-a-port", "a-port-with-a-zero", "a-range-backwards", "not-a-port"])
+    def test_the_memory_service_refuses_doors_and_published_ports_that_disagree(
+        self, memory_entry, tmp_path, doors, published, said
+    ) -> None:
+        done = _run_the_memory_entry(memory_entry, tmp_path, doors, published)
+        assert done.returncode != 0, done.stdout
+        assert said in done.stderr, done.stderr
+
+    def test_the_memory_service_hands_its_process_one_door_setting(
+        self, memory_entry, tmp_path
+    ) -> None:
+        """Doors per sandbox: the single door setting is taken away (fleet-memory
+        refuses both), and each door's gateway address joins the names the
+        service answers to. Without them, today's single door."""
+        done = _run_the_memory_entry(memory_entry, tmp_path, "8006:a,31851:b|c", "31851")
+        assert done.returncode == 0, done.stderr
+        seen = dict(line.split("=", 1) for line in done.stdout.splitlines() if "=" in line)
+        assert "FLEET_MEMORY_MCP_SANDBOX_PORT" not in seen
+        assert seen["FLEET_MEMORY_MCP_SANDBOX_DOORS"] == "8006:a,31851:b|c"
+        assert seen["FLEET_MEMORY_MCP_ALLOWED_HOSTS"] == "memory:8005,192.0.2.1:31824,192.0.2.1:31851"
+        assert "FACTORY_MEMORY_DOOR_PORTS" not in seen and "FACTORY_MEMORY_DOOR_ADDRESS" not in seen
+
+        before = _run_the_memory_entry(memory_entry, tmp_path, "", "")
+        assert before.returncode == 0, before.stderr
+        seen = dict(line.split("=", 1) for line in before.stdout.splitlines() if "=" in line)
+        assert seen["FLEET_MEMORY_MCP_SANDBOX_PORT"] == "8006"
+        assert "FLEET_MEMORY_MCP_SANDBOX_DOORS" not in seen
+        assert seen["FLEET_MEMORY_MCP_ALLOWED_HOSTS"] == "memory:8005,192.0.2.1:31824"
 
     def test_the_memory_relay_publishes_nothing(self, rendered: str) -> None:
         relay = _service_block(rendered, "memory-relay")
@@ -2729,3 +2813,60 @@ class TestAReleaseThatSendsNoNameIsUnknownAndNotDown:
             "name, so it would either fail a working door or pass on the "
             "account alone"
         )
+
+
+# --- the memory service's entry shell, run in a small pinned image ----------
+
+
+def _the_probe_s_ports(probe: str):
+    """The health probe's own list of ports, for a given environment."""
+    head = probe.split("for port in ports", 1)[0]
+
+    def ports_of(environ: dict[str, str]) -> list[int]:
+        import os as real_os
+        from unittest import mock
+
+        with mock.patch.dict(real_os.environ, environ, clear=True):
+            scope: dict = {}
+            exec(head.replace("import os, urllib.request, urllib.error, sys", "import os"), scope)  # noqa: S102
+            return scope["ports"]
+
+    return ports_of
+
+
+@pytest.fixture(scope="module")
+def memory_entry() -> list[str]:
+    """The memory service's entry shell and the pinned HAProxy image to run it
+    in (any small image with a shell; nothing is fetched)."""
+    import yaml
+
+    if shutil.which("docker") is None:
+        pytest.skip("docker is not installed here, so there is nothing to render")
+    pins = (ESTATE / "estate-pins.conf").read_text()
+    image = re.search(r"^MODEL_DOOR_BASE_IMAGE=(\S+)$", pins, re.M).group(1)
+    digest = re.search(r"^MODEL_DOOR_BASE_DIGEST=(\S+)$", pins, re.M).group(1)
+    pinned = f"{image.split(':')[0]}@{digest}"
+    if subprocess.run(["docker", "image", "inspect", pinned], capture_output=True).returncode != 0:
+        pytest.skip("the pinned HAProxy image is not on this machine; nothing is fetched")
+    entry = yaml.safe_load(_rendered())["services"]["memory"]["entrypoint"]
+    return [pinned, *[part.replace("$$", "$") for part in entry]]
+
+
+def _run_the_memory_entry(memory_entry, tmp_path: Path, doors: str, published: str):
+    image, *entry = memory_entry
+    address = tmp_path / "memory_database_address"
+    address.unlink(missing_ok=True)
+    address.write_text("postgresql://made-up-TESTONLY@192.0.2.9/none\n")
+    address.chmod(0o444)
+    return subprocess.run(
+        ["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL",
+         "-v", f"{address}:/run/secrets/memory_database_address:ro",
+         "-e", "FLEET_MEMORY_MCP_SANDBOX_PORT=8006",
+         "-e", "FLEET_MEMORY_MCP_ALLOWED_HOSTS=memory:8005,192.0.2.1:31824",
+         "-e", f"FLEET_MEMORY_MCP_SANDBOX_DOORS={doors}",
+         "-e", f"FACTORY_MEMORY_DOOR_PORTS={published}",
+         "-e", "FACTORY_MEMORY_DOOR_ADDRESS=192.0.2.1",
+         "--entrypoint", entry[0], image, *entry[1:], "sh", "-c",
+         "env | grep -E '^(FLEET_MEMORY_MCP_|FACTORY_MEMORY_)' | sort"],
+        capture_output=True, text=True, timeout=120,
+    )

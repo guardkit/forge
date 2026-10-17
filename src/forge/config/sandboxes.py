@@ -19,7 +19,7 @@ from __future__ import annotations
 
 from typing import Any
 
-__all__ = ["sandbox_for", "has_sandboxes", "sandboxes_of"]
+__all__ = ["sandbox_for", "has_sandboxes", "sandboxes_of", "git_door_for", "use_the_settings_receipts"]
 
 
 def _sandboxes(config: Any) -> dict[str, Any]:
@@ -69,3 +69,30 @@ def sandbox_for(config: Any, repo: Any) -> Any | None:
     if not key:
         return None
     return _sandboxes(config).get(key)
+
+
+def git_door_for(config: Any, repo: Any) -> str | None:
+    """The one Git door ``repo``'s fetch address may go through, or ``None``.
+
+    One sandbox per project (17 October 2026): the door of the sandbox the
+    repository is mapped to when that sandbox has one, otherwise the single
+    ``planning.git_door`` of an estate with one sandbox. The same rule as
+    :meth:`forge.config.models.PlanningConfig.git_door_for`, asked of a
+    configuration of any shape (a stand-in without the fields has no door).
+    """
+    entry = sandbox_for(config, repo)
+    own = getattr(entry, "git_door", None) if entry is not None else None
+    return own or getattr(getattr(config, "planning", None), "git_door", None)
+
+
+def use_the_settings_receipts(config: Any) -> None:
+    """Point :func:`forge.receipts.receipts_root_for` at each repository's own
+    receipts folder (its sandbox entry's ``receipts_root``, design section
+    2.2a), from these settings. A repository without one keeps today's root."""
+    from forge.receipts import use_project_receipts
+
+    use_project_receipts({
+        repo: str(entry.receipts_root)
+        for repo, entry in sandboxes_of(config).items()
+        if getattr(entry, "receipts_root", None)
+    })

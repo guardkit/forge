@@ -93,12 +93,22 @@ def _resolve_context_object(config_path: Path | None) -> object:
 
     try:
         if config_path is not None:
-            return load_config(config_path)
+            return _with_its_receipts(load_config(config_path))
         if DEFAULT_CONFIG_FILENAME.exists():
-            return load_config(DEFAULT_CONFIG_FILENAME)
+            return _with_its_receipts(load_config(DEFAULT_CONFIG_FILENAME))
     except AnAddressNameIsNotSet as exc:
         raise click.ClickException(str(exc)) from None
     return None
+
+
+def _with_its_receipts(config: object) -> object:
+    """The settings, with each project's own receipts folder put in use (one
+    sandbox per project, design section 2.2a), so ``forge status`` and every
+    other command read a build's receipts where its project keeps them."""
+    from forge.config.sandboxes import use_the_settings_receipts
+
+    use_the_settings_receipts(config)
+    return config
 
 
 @click.group(name="forge")

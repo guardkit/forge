@@ -256,7 +256,17 @@ def maybe_mint_fix_row(
             )
             return None
 
-        pack_path = _pack_path(build_id, receipts_root=receipts_root)
+        pack_root = receipts_root
+        if pack_root is None:
+            # The build's own project's receipts (one sandbox per project,
+            # design section 2.2a); a project without its own folder reads
+            # the pack exactly as before.
+            from forge.receipts import receipts_root_for
+
+            own = receipts_root_for(getattr(row, "repo", None))
+            if own != receipts_root_for(None):
+                pack_root = own
+        pack_path = _pack_path(build_id, receipts_root=pack_root)
         if source == SOURCE_BUILD_FAILED and pack_path is None:
             logger.info(
                 "fix producer: build %s failed but left no failure pack — "

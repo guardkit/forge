@@ -41,6 +41,7 @@ Ordering laws (all load-bearing):
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import json
 import logging
@@ -60,7 +61,7 @@ from nats_core.events import (
 
 from forge.lifecycle.persistence import StageLogEntry
 from forge.project_git import run_git_async
-from forge.receipts import receipts_root
+from forge.receipts import receipts_root_for
 
 logger = logging.getLogger(__name__)
 
@@ -295,16 +296,17 @@ def _the_default_branch_was_renamed(refusal: str | None) -> bool:
     return "now says its default branch is" in str(refusal or "")
 
 
-def read_baseline_failing(build_id: str) -> list[str] | None:
+def read_baseline_failing(build_id: str, *, repo: str | None = None) -> list[str] | None:
     """Best-effort pre-merge baseline failing set — fail-open ``None``.
 
-    Globs ``receipts_root()/<build_id>/**/baseline.json`` and accepts either
+    Globs ``<receipts of repo>/<build_id>/**/baseline.json`` (one sandbox per
+    project: :func:`forge.receipts.receipts_root_for`) and accepts either
     a bare list of test names or a dict carrying a ``failing`` list. Any
     read/parse trouble reads as "no baseline recorded" — the merge verb then
     runs without a ``--baseline-json`` and compares against its own record.
     """
     try:
-        root = receipts_root() / build_id
+        root = receipts_root_for(repo) / build_id
         for path in sorted(root.glob("**/baseline.json")):
             try:
                 data = json.loads(path.read_text(encoding="utf-8"))
@@ -507,13 +509,13 @@ _NAMES_NO_FEATURE: tuple[str, ...] = ("", "none", "null")
 
 
 def _read_one_record(
-    build_id: str, name: str, feature_id: str | None
+    build_id: str, name: str, feature_id: str | None, repo: str | None = None
 ) -> tuple[dict[str, Any] | None, str | None, str | None]:
     """One exported record by FILE NAME. Never raises.
 
     Returns ``(record, why not, the other feature it was written for)``.
 
-    Globs ``receipts_root()/<build_id>/**/<name>``, exactly as
+    Globs ``<receipts of repo>/<build_id>/**/<name>``, exactly as
     :func:`read_baseline_failing` does, so nothing here knows or assumes
     where in the exported tree a record landed.
 
@@ -535,7 +537,7 @@ def _read_one_record(
     order — a rule with no ties in it, so two runs can never disagree.
     """
     try:
-        root = receipts_root() / build_id
+        root = receipts_root_for(repo) / build_id
         if not root.is_dir():
             return None, "nothing was exported for this build", None
         found = sorted(
@@ -602,7 +604,7 @@ def _read_one_record(
 
 
 def read_what_was_checked(
-    build_id: str, feature_id: str | None = None
+    build_id: str, feature_id: str | None = None, *, repo: str | None = None
 ) -> tuple[
     dict[str, Any] | None, dict[str, Any] | None, str | None, str | None
 ]:
@@ -618,10 +620,10 @@ def read_what_was_checked(
     missing already has its own sentence. Never raises.
     """
     record, why_not, _ = _read_one_record(
-        build_id, FEATURE_CHECK_RECORD_NAME, feature_id
+        build_id, FEATURE_CHECK_RECORD_NAME, feature_id, repo
     )
     code_checks, _, code_checks_for_another = _read_one_record(
-        build_id, CODE_CHECKS_RECORD_NAME, feature_id
+        build_id, CODE_CHECKS_RECORD_NAME, feature_id, repo
     )
     return record, code_checks, why_not, code_checks_for_another
 
@@ -1636,7 +1638,7 @@ def run_the_scope_pass(
             f"({type(exc).__name__}: {exc})"
         )
         report.compared_against = base
-        write_scope_report(build_id, report)
+        write_scope_report(build_id, report, repo=repo_key)
         return report
 
     report = scope_of_the_build(
@@ -1689,7 +1691,7 @@ def run_the_scope_pass(
             base,
             ", ".join(item.path for item in existing),
         )
-    written = write_scope_report(build_id, report)
+    written = write_scope_report(build_id, report, repo=repo_key)
     report.receipt_path = str(written) if written is not None else None
     return report
 
@@ -2077,10 +2079,16 @@ class MergeOfferService:
         means something went wrong and the card has to say so rather than
         fall silent and read as clean.
         """
+        reader = self._finished_feature_reader
+        if reader is read_what_was_checked:
+            # The build's own project's receipts (one sandbox per project).
+            reader = functools.partial(
+                read_what_was_checked, repo=self._repo_of(event.build_id)
+            )
         try:
             read = await asyncio.wait_for(
                 asyncio.to_thread(
-                    self._finished_feature_reader,
+                    reader,
                     event.build_id,
                     event.feature_id,
                 ),
@@ -2137,6 +2145,15 @@ class MergeOfferService:
         return after_deploy_check_skip_for(
             self._after_deploy_check_reader, self._pool, event.build_id
         )
+
+    def _repo_of(self, build_id: str) -> str | None:
+        """The build's repository from its durable row, or ``None`` (its
+        receipts are then read from the single root, as before)."""
+        try:
+            row = self._pool.get_build_row(build_id)
+        except Exception:  # noqa: BLE001 — a reading never stops a card
+            return None
+        return getattr(row, "repo", None) if row is not None else None
 
     async def _take_the_scope_pass(self, event: Any) -> Any | None:
         """Run the scope pass off the event loop; ``None`` if nobody counted.
@@ -2677,7 +2694,13 @@ class MergeOfferService:
             retained_identity = dict(retained_identity)
             retained_identity["cleanup_registrations"] = candidate_registration
 
-        baseline_failing = self._baseline_reader(build_id)
+        # The build's own project's receipts (one sandbox per project); a
+        # reader put here by something else is asked as it always was.
+        baseline_failing = (
+            read_baseline_failing(build_id, repo=row.repo)
+            if self._baseline_reader is read_baseline_failing
+            else self._baseline_reader(build_id)
+        )
 
         # (c) DURABLE LATCH FIRST — probe, then write, BEFORE any wire.
         stages = self._pool.read_stages(build_id)
