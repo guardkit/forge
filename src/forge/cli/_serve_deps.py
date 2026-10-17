@@ -1574,20 +1574,38 @@ def _build_dispatch_build(
                 and gate_state_machine is not None
             )
             # A mission feature's build advances its own row to RUNNING before
-            # its runner launches (the mission arm below), so for it, too, a
-            # QUEUED or INTERRUPTED duplicate is definitively runless.
+            # its runner launches (the mission arm below), so for it a QUEUED
+            # duplicate is runless — unless a launch was recorded for it. That
+            # is a build launched by release 2026.10.17-1, which left the row
+            # QUEUED while it ran; boot recovery does not touch a QUEUED row, so
+            # after a coordinator-only restart its runner may still be going,
+            # and relaunching would launch it twice. Such a row is held. An
+            # INTERRUPTED one is re-dispatched as for any build (the recovery
+            # arm interrupts its recorded run first). The rule is the mission's
+            # whether or not the gate is wired, because the gated path's
+            # "a live build is past QUEUED" does not hold for those old rows.
+            from forge.lifecycle.identifiers import derive_build_id
             from forge.lifecycle.missions import mission_membership
 
-            advances_its_own_row = gate_wired or (
+            if (
                 mission_membership(
                     getattr(sqlite_pool, "connection", None), payload.correlation_id
                 )
                 is not None
-            )
-            if advances_its_own_row and status in (
-                BuildState.INTERRUPTED,
-                BuildState.QUEUED,
             ):
+                may_redispatch = status == BuildState.INTERRUPTED or (
+                    status == BuildState.QUEUED
+                    and not had_recorded_launch(
+                        sqlite_pool,
+                        derive_build_id(payload.feature_id, payload.queued_at),
+                    )
+                )
+            else:
+                may_redispatch = gate_wired and status in (
+                    BuildState.INTERRUPTED,
+                    BuildState.QUEUED,
+                )
+            if may_redispatch:
                 # Arm 3 (crash-mid-hop) extended by FWD-003
                 # (restart-mid-dispatch): an INTERRUPTED row (crash inside a
                 # QUEUED→…→PAUSED hop) OR a row still QUEUED (the original

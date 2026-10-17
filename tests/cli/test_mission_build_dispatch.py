@@ -13,7 +13,10 @@ runner launch replaced by a recorder:
   called, with its decision row citing the mission approval;
 * a redelivery for that live build holds the slot: no second launch, no ack;
 * a mission build whose first dispatch stopped before the row moved (still
-  QUEUED, no run) is re-dispatched once, and then held.
+  QUEUED, no run) is re-dispatched once, and then held;
+* a terminal write just before the hop to RUNNING holds the slot, no launch;
+* a QUEUED mission row with a recorded launch (launched by 2026.10.17-1,
+  which left rows QUEUED while running) is held, never relaunched.
 """
 
 from __future__ import annotations
@@ -165,9 +168,19 @@ async def test_a_redelivery_for_a_live_mission_build_holds_the_slot(
 async def test_a_mission_build_interrupted_before_it_moved_is_dispatched_once(
     persistence: SqliteLifecyclePersistence, tmp_path: Path
 ) -> None:
+    # The first dispatch wrote the row and stopped before it moved: QUEUED, no run.
+    _record_queued_row(persistence)
+    h = _Harness(persistence, tmp_path)
+    assert h.status(BUILD_ID) == "QUEUED"
+    await h.dispatch()
+    assert h.launches == [BUILD_ID] and h.status_at_launch == ["RUNNING"]
+    await h.dispatch()
+    assert h.launches == [BUILD_ID]
+
+
+def _record_queued_row(persistence: SqliteLifecyclePersistence) -> None:
     from nats_core.events import BuildQueuedPayload
 
-    # The first dispatch wrote the row and stopped before it moved: QUEUED, no run.
     payload = _payload()
     persistence.record_pending_build(
         BuildQueuedPayload(
@@ -181,9 +194,54 @@ async def test_a_mission_build_interrupted_before_it_moved_is_dispatched_once(
             queued_at=QUEUED_AT,
         )
     )
+
+
+@pytest.mark.asyncio
+async def test_a_failed_advance_holds_the_slot_with_no_launch(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """A terminal write lands just before the hop to RUNNING (the build was
+    cancelled meanwhile): the other writer owns the row, so nothing launches
+    and nothing is acked."""
+    from forge.cli import _serve_gate_activation
+
+    real = _serve_gate_activation.advance_to_running
+
+    def cancelled_first(sqlite_pool: Any, build_id: str, *args: Any, **kwargs: Any) -> bool:
+        sqlite_pool.connection.execute(
+            "UPDATE builds SET status = 'CANCELLED' WHERE build_id = ?", (build_id,)
+        )
+        answer = real(sqlite_pool, build_id, *args, **kwargs)
+        assert answer is False
+        return answer
+
     h = _Harness(persistence, tmp_path)
+    with patch.object(_serve_gate_activation, "advance_to_running", cancelled_first):
+        await h.dispatch()
+    assert h.launches == [] and h.acks == 0
+    assert h.status(BUILD_ID) == "CANCELLED"
+
+
+@pytest.mark.asyncio
+async def test_a_queued_mission_row_with_a_recorded_launch_is_held(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """A build launched by release 2026.10.17-1 stays QUEUED while it runs and
+    has its launch recorded; after a coordinator-only restart its runner may
+    still be going, so a redelivery is held: no relaunch, no ack."""
+    _record_queued_row(persistence)
+    now = QUEUED_AT.isoformat()
+    persistence.connection.execute(
+        "CREATE TABLE IF NOT EXISTS async_tasks (task_id TEXT PRIMARY KEY, "
+        "build_id TEXT NOT NULL, feature_id TEXT NOT NULL, correlation_id TEXT NOT NULL, "
+        "lifecycle TEXT NOT NULL, wave_index INTEGER NOT NULL, task_index INTEGER NOT NULL, "
+        "started_at TEXT NOT NULL, last_activity_at TEXT NOT NULL) STRICT"
+    )
+    persistence.connection.execute(
+        "INSERT INTO async_tasks VALUES ('task-old', ?, ?, ?, 'running', 1, 1, ?, ?)",
+        (BUILD_ID, FEATURE, _payload().correlation_id, now, now),
+    )
+    h = _Harness(persistence, tmp_path)
+    await h.dispatch()
+    assert h.launches == [] and h.acks == 0
     assert h.status(BUILD_ID) == "QUEUED"
-    await h.dispatch()
-    assert h.launches == [BUILD_ID] and h.status_at_launch == ["RUNNING"]
-    await h.dispatch()
-    assert h.launches == [BUILD_ID]
