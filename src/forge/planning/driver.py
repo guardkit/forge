@@ -1867,6 +1867,24 @@ class PlanningRunDriver:
     ) -> None:
         """Drive ``correlation_id`` forward from its durable state.
 
+        See :meth:`_drive_run`, which does the work. When it returns, however
+        it ends, the run's spec-writer code windows
+        (:meth:`_spec_code_evidence`) are let go, so that cache never grows
+        across runs (17 October 2026). A later drive of the same run builds
+        them again from the same recorded starting commit.
+        """
+        try:
+            await self._drive_run(correlation_id, republish_pending=republish_pending)
+        finally:
+            cache = self.__dict__.get("_spec_code_evidence_cache")
+            if cache:
+                cache.pop(correlation_id, None)
+
+    async def _drive_run(
+        self, correlation_id: str, *, republish_pending: bool = False
+    ) -> None:
+        """Drive ``correlation_id`` forward from its durable state.
+
         Args:
             correlation_id: The planning run to advance.
             republish_pending: True on the rearm path — the persisted
@@ -4250,8 +4268,9 @@ class PlanningRunDriver:
         reference material stays labelled and capped, and no ranked block,
         set line, file list or rule reaches the spec writer.
 
-        Kept for the run: every spec call of the run (rewrites included) is
-        sent the same windows, and the repository is read once for them.
+        Kept while the run is driven: every spec call of one drive (rewrites
+        included) is sent the same windows, and the repository is read once
+        for them; :meth:`drive` lets them go when it returns.
         ``None`` when nothing was found, or the repository could not be read
         (the fact sheet, sent beside, already says that); the field is then
         not sent. Never raises.
@@ -11872,15 +11891,19 @@ class PlanningRunDriver:
                     try:
                         answer = reader.lines_mentioning(example.literal)
                     except RepositoryUnreadable as exc:
-                        stopped = str(exc)
+                        # Not looked for, not said: the description stays
+                        # what the words alone made it.
+                        logger.warning(
+                            "target_repo_descriptor: the search for the "
+                            'example "%s" could not run (%s); left out',
+                            example.phrase,
+                            exc,
+                        )
                         break
                     searched_any = True
-                    cut = getattr(answer, "cut", None)
-                    if cut and partial is not None:
-                        partial.append(
-                            f'where the example "{example.phrase}" already appears '
-                            f"was only partly searched ({cut})"
-                        )
+                    # A search cut short adds no note: the lines it did find
+                    # are used, and a cut search that found none leaves the
+                    # description exactly as it was (17 October 2026).
                     for path, number, text in answer:
                         place = f"{path}:{number}"
                         if (

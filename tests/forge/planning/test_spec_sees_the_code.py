@@ -40,7 +40,7 @@ from forge.planning.code_evidence import (
 )
 from forge.planning.driver import PlanningRunDriver
 from forge.planning.reference_material import REFERENCE_WINDOW_LABEL
-from forge.planning.repository_facts import LocalCheckoutReader
+from forge.planning.repository_facts import LocalCheckoutReader, RepositoryUnreadable
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
 from tests.forge.planning import test_driver_spec_digest_door as door
@@ -319,6 +319,58 @@ def test_when_the_quoted_search_finds_nothing_the_plan_description_is_unchanged(
     assert now == before
 
 
+class _CutExampleSearch:
+    """The checkout reader, except that the example's literal search is cut
+    short (``cut``) with no line found, or cannot run at all (``raise``)."""
+
+    def __init__(self, inner: LocalCheckoutReader, literal: str, how: str) -> None:
+        self._inner = inner
+        self._literal = literal
+        self._how = how
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._inner, name)
+
+    def lines_mentioning(self, text: str, **kwargs: Any) -> Any:
+        if text != self._literal:
+            return self._inner.lines_mentioning(text, **kwargs)
+        if self._how == "raise":
+            raise RepositoryUnreadable("the helper stopped answering")
+        answer = _Cut()
+        answer.cut = "the search hit its 200-match limit"
+        return answer
+
+
+class _Cut(list):
+    cut: str = ""
+
+
+@pytest.mark.parametrize("how", ["cut", "raise"])
+def test_a_quoted_search_cut_short_with_nothing_found_changes_nothing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    repo, sha = _notes_fixture(tmp_path)
+    request = 'Keep the notes-count label, for example "3 notes".'
+
+    def describe() -> tuple[str, list[str], list[str]]:
+        unavailable: list[str] = []
+        partial: list[str] = []
+        descriptor = PlanningRunDriver._build_target_repo_descriptor(
+            "guardkit/react-go-notes-fixture",
+            str(repo),
+            APPROVED_SPEC,
+            reader=_CutExampleSearch(LocalCheckoutReader(str(repo), commit=sha), " notes", how),
+            unavailable=unavailable,
+            partial=partial,
+            request_text=request,
+        )
+        return json.dumps(descriptor), unavailable, partial
+
+    now = describe()
+    monkeypatch.setattr(driver_module, "quoted_example_shapes", lambda _text: [])
+    assert now == describe()
+
+
 def test_with_no_quoted_number_an_identifier_still_reaches_the_spec_writer(
     tmp_path: Path,
 ) -> None:
@@ -494,6 +546,8 @@ async def test_every_spec_call_of_the_run_gets_the_same_windows_built_once(
     # Built once for the spec leg, at the spec's budget; the plan leg builds its own.
     assert built.count(MAX_SPEC_EVIDENCE_CHARS) == 1
     assert built.count(MAX_EVIDENCE_CHARS) == 1
+    # Let go when the drive ends: the cache never grows across runs.
+    assert h.driver.__dict__.get("_spec_code_evidence_cache") == {}
     # The plan writer's description carries the same lines.
     (plan_call,) = h.calls["plan"]
     plan_windows = _windows(plan_call["target_repo_descriptor"])
