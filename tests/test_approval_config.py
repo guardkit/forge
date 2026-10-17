@@ -266,6 +266,9 @@ class TestApprovalYamlRoundTrip:
                 # Added 7, 12 and 14 October 2026 (the "nothing to build"
                 # switch, the ranked source switch, the per-repository fetch
                 # addresses); the unfiltered dump always includes them.
+                # ``planning.git_door`` (17 October 2026, the read-only Git
+                # door for private repositories) defaults to unset.
+                "git_door": None,
                 "fetch_addresses": {},
                 "nothing_to_build": {"enabled": False},
                 "ranked_source": {"enabled": False},
