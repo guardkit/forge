@@ -742,17 +742,63 @@ async def test_files_too_large_to_scan_are_said_not_checked(lab: Lab, monkeypatc
 
 @pytest.mark.asyncio
 async def test_a_hard_coded_value_gitleaks_misses_never_reaches_the_model(lab: Lab) -> None:
-    """A value only a CWE-798 Opengrep rule flags is hidden from the prompt
-    whatever Gitleaks says: the rule's matched lines are always hidden."""
+    """A value only a CWE-798 Opengrep rule flags is hidden from every prompt
+    whatever Gitleaks says: its matched lines are hidden in its own excerpt
+    and in any other excerpt cut from the same file (review 1, F2)."""
     value = "kq" + "Zt7mW3pLx9vRb2"  # not a shape the (fake) Gitleaks knows
     lab.add(
         "org/app",
-        {"app/auth.py": f'import jwt\n\ndef token(p):\n    return jwt.encode(p, "{value}", "HS256")\n'},
+        {
+            "app/auth.py": (
+                "import jwt\nimport subprocess\n\n"
+                "def token(p):\n"
+                f'    return jwt.encode(p, "{value}", "HS256")\n'
+                "\n"
+                "def run(c):\n"
+                "    subprocess.call(c, shell=True)\n"
+            )
+        },
     )
     await run_sweep(lab.deps())
-    (prompt,) = lab.model.prompts
-    assert "rule: hardcoded-jwt-secret" in prompt
-    assert "4: [line hidden: may hold a secret]" in prompt
-    assert "def token(p):" in prompt  # the rest of the excerpt is still shown
-    assert value not in prompt
+    assert len(lab.model.prompts) == 2
+    rules = {line for p in lab.model.prompts for line in p.splitlines() if line.startswith("rule: ")}
+    assert rules == {"rule: hardcoded-jwt-secret", "rule: subprocess-shell-true"}
+    for prompt in lab.model.prompts:
+        assert "5: [line hidden: may hold a secret]" in prompt
+        assert "def token(p):" in prompt  # the rest of the excerpt is still shown
+        assert value not in prompt
     assert value not in lab.every_stored_text()
+
+
+@pytest.mark.asyncio
+async def test_a_line_the_tree_scan_flagged_is_hidden_even_if_the_excerpt_check_misses_it(
+    lab: Lab,
+) -> None:
+    """Review 1, F1: the full-tree secret scan's lines are looked up by the
+    file's path and hidden, even when the excerpt's own check finds nothing."""
+    key = planted_key()
+    lab.add(
+        "org/app",
+        {"app/run.py": f'import subprocess\nKEY = "{key}"\nsubprocess.call(c, shell=True)\n'},
+    )
+    lab.scanners.stdin_blind = True
+    await run_sweep(lab.deps())
+    code_prompts = [p for p in lab.model.prompts if "rule: subprocess-shell-true" in p]
+    assert len(code_prompts) == 1
+    assert "2: [line hidden: may hold a secret]" in code_prompts[0]
+    for prompt in lab.model.prompts:
+        assert key not in prompt
+
+
+@pytest.mark.asyncio
+async def test_a_build_starting_during_the_excerpt_check_leaves_the_finding_pending(
+    lab: Lab,
+) -> None:
+    """Review 1, F3: idle is checked again right before the model is asked."""
+    lab.add("org/app", {"app/run.py": "import subprocess\nsubprocess.call(c, shell=True)\n"})
+    lab.scanners.on_stdin = lambda: lab.idle.extend([False, False, False])
+    report = await run_sweep(lab.deps())
+    assert len(lab.scanners.stdin_inputs) == 1
+    assert lab.model.prompts == []
+    assert report.projects[0].pending == 1
+    assert "a build started, so the model was left to it" in lab.slack.lines[-1]

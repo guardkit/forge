@@ -157,6 +157,11 @@ class FakeScanners:
     calls: list[list[str]] = field(default_factory=list)
     fail: dict[str, str] = field(default_factory=dict)
     stdin_inputs: list[bytes] = field(default_factory=list)
+    #: When True the excerpt check (gitleaks stdin) finds nothing, as a real
+    #: scanner may on a cut-off excerpt.
+    stdin_blind: bool = False
+    #: Called when the excerpt check runs (to change the world mid-run).
+    on_stdin: Callable[[], None] | None = None
 
     async def __call__(
         self,
@@ -181,6 +186,10 @@ class FakeScanners:
             return ToolRun(True, json.dumps(self._keys_in_history(target)).encode())
         if tool == "gitleaks" and mode == "stdin":
             self.stdin_inputs.append(stdin or b"")
+            if self.on_stdin is not None:
+                self.on_stdin()
+            if self.stdin_blind:
+                return ToolRun(True, b"[]")
             return ToolRun(True, json.dumps(self._keys_in(stdin or b"", "")).encode())
         if tool == "osv-scanner":
             return ToolRun(True, json.dumps(self._osv(target, "--all-packages" in argv)).encode())

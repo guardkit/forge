@@ -756,6 +756,20 @@ async def _sort_pending(deps, state, current, files, secret_lines, result, budge
             f.rule,
         )
     )
+    # Every line that may hold a secret, by the file's committed path: what the
+    # full-tree secret scan flagged, and every range a hard-coded-credential
+    # (CWE-798) rule matched in that file. Each applies to EVERY excerpt cut
+    # from the file, not only the finding's own (Codex implementation
+    # review 1, F2).
+    hidden_by_file: dict[str, set[int]] = {
+        path: set(lines) for path, lines in secret_lines.items()
+    }
+    for found in current.values():
+        if found.hide_own_lines and found.line is not None:
+            path = found.source_file or found.file
+            hidden_by_file.setdefault(path, set()).update(
+                range(found.line, (found.end_line or found.line) + 1)
+            )
     reason: str | None = None
     for finding in pending:
         if deps.asker is None:
@@ -772,7 +786,12 @@ async def _sort_pending(deps, state, current, files, secret_lines, result, budge
             break
         excerpt = None
         if finding.kind == KIND_CODE:
-            excerpt = await _excerpt(deps, finding, files, secret_lines)
+            excerpt = await _excerpt(deps, finding, files, hidden_by_file)
+        # The excerpt check can take up to a minute: look again right before
+        # the model is asked (Codex implementation review 1, F3).
+        if not deps.is_idle():
+            reason = "a build started, so the model was left to it"
+            break
         prompt = build_prompt(finding, excerpt)
         budget["questions"] -= 1
         try:
@@ -799,24 +818,34 @@ async def _sort_pending(deps, state, current, files, secret_lines, result, budge
         result.pending_reason = reason or "the model could not be asked"
 
 
-async def _excerpt(deps, finding: Finding, files: _Files, secret_lines: dict[str, set[int]]) -> str | None:
-    """The redacted excerpt for a code finding, or None when it cannot be made safe."""
+async def _excerpt(
+    deps, finding: Finding, files: _Files, hidden_by_file: dict[str, set[int]]
+) -> str | None:
+    """The redacted excerpt for a code finding, or None when it cannot be made safe.
+
+    ``hidden_by_file`` holds, by the file's committed path, every line already
+    known to possibly hold a secret (see :func:`_sort_pending`).
+    """
     if deps.setup.missing("gitleaks"):
         return None
-    raw = finding.source_file or finding.file
-    data = files.data(raw)
+    source_path = finding.source_file or finding.file
+    data = files.data(source_path)
     if data is None or finding.line is None:
         return None
     first, lines = excerpt_lines(data, finding.line, finding.end_line or finding.line)
-    raw = "\n".join(lines).encode("utf-8")
-    run = await deps.runner(gitleaks_stdin_argv(deps.setup), timeout=GITLEAKS_STDIN_TIMEOUT_S, stdin=raw)
+    excerpt_bytes = "\n".join(lines).encode("utf-8")
+    run = await deps.runner(
+        gitleaks_stdin_argv(deps.setup), timeout=GITLEAKS_STDIN_TIMEOUT_S, stdin=excerpt_bytes
+    )
     if not run.ok:
         return None
     try:
         flagged = read_gitleaks(run.stdout)
     except ValueError:
         return None
-    hidden = set(secret_lines.get(raw, set()))
+    # Looked up by the file's path, never by the excerpt's bytes (Codex
+    # implementation review 1, F1).
+    hidden = set(hidden_by_file.get(source_path, set()))
     for loc in flagged:
         hidden.update(range(first + loc.start - 1, first + loc.end))
     if finding.hide_own_lines:
