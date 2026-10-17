@@ -238,6 +238,12 @@ PROBES = {
     "refs-by-head": (f"HEAD /{LISTED}.git/info/refs?service=git-upload-pack", "403"),
     "the-api": (f"GET /repos/{LISTED}", "403"),
     "a-climb": (f"GET /example-owner/../{LISTED}.git/info/refs?service=git-upload-pack", "403"),
+    # Coach review, 17 October 2026.
+    "an-encoded-slash": ("GET /example-owner%2Flisted-repo.git/info/refs?service=git-upload-pack", "403"),
+    "an-archive": (f"POST /{LISTED}.git/git-upload-archive", "403"),
+    "an-absolute-url": (
+        f"GET http://github.com/{LISTED}.git/info/refs?service=git-upload-pack", "403"
+    ),
 }
 
 
@@ -247,7 +253,7 @@ def test_only_the_two_reads_of_a_listed_repository_are_passed_on(door_entry, tmp
     for name, (line, _) in PROBES.items():
         length = "Content-Length: 0\\r\\n" if line.startswith("POST") else ""
         lines.append(
-            f"printf '%s HTTP/1.1\\r\\nHost: x\\r\\nAuthorization: Basic Y2FsbGVy\\r\\n{length}"
+            f"printf '%s HTTP/1.1\\r\\nHost: github.com\\r\\nAuthorization: Basic Y2FsbGVy\\r\\n{length}"
             f"Connection: close\\r\\n\\r\\n' '{line}' | nc -w 3 127.0.0.1 18080 | head -1 "
             f"| sed 's/^/{name} /'"
         )

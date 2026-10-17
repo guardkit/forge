@@ -365,8 +365,10 @@ Also: `GIT_DOOR_PORT` (31825 in the example; the door listens on
    in the env file; add `git-door` to `COMPOSE_PROFILES`.
 3. This machine's guard admits only the sandbox's machine to
    `GIT_DOOR_PORT`, as it does for `MODEL_DOOR_PORT`.
-4. The sandbox's `sbx` network rules allow `<gateway address>:<GIT_DOOR_PORT>`,
-   as they allow the model door's port.
+4. The sandbox's `sbx` network rules allow `<gateway address>:<GIT_DOOR_PORT>`:
+   `rollout-sandbox` adds that one rule, beside the model door's, whenever
+   `GIT_DOOR_PORT` is set in the env file it is given (and refuses a port that
+   is another door's); with it unset, the rollout is as before.
 5. The coordinator's `forge.yaml` names the door as `planning.git_door:
    http://<gateway address>:<GIT_DOOR_PORT>/`, written as the address itself.
 

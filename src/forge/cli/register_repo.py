@@ -104,7 +104,7 @@ from forge.network_git import (
     sandbox_network_git,
     transport_of,
 )
-from forge.publisher.private_remote import anonymous_lookup, confirmed_private
+from forge.publisher.private_remote import GITHUB_HOST, anonymous_lookup, confirmed_private
 from forge.project_git import FIXED_SETTINGS
 
 __all__ = ["register_repo_cmd"]
@@ -2315,6 +2315,16 @@ def check_confirmed_private(options: Options) -> Step:
             "say private_only), so the repository must be confirmed private, and "
             "that needs the route's own key: run again with "
             "--publish-credential-name <its key>. Nothing was written",
+        )
+    # Step 1's check clone read git@<the --github host>:<org>/<name>.git, so
+    # the key read proves the GitHub repository only when that host is
+    # github.com (coach review, 17 October 2026).
+    if (urlsplit(options.url).hostname or "").lower() != GITHUB_HOST:
+        raise Refused(
+            "private",
+            "the publisher publishes only to private repositories (its settings "
+            f"say private_only), and only a {GITHUB_HOST} repository can be "
+            "confirmed private; --github names another host. Nothing was written",
         )
     answer = confirmed_private(
         f"git@github.com:{options.org}/{options.leaf}.git",

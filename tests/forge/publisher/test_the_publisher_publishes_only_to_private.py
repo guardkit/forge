@@ -330,3 +330,58 @@ def test_on_a_route_with_no_credential_cannot_be_confirmed(
     publisher = Publisher(settings, visibility_lookup=lookup)
     assert list(publisher.why_routes_are_not_private()) == [PROJECT]
     assert lookup.asked == []
+
+
+# ---------------------------------------------------------------------------
+# Coach review, 17 October 2026: a failed lookup at start is passing trouble
+
+
+@pytest.mark.parametrize("at_start", [403, 429, 500, 503, None],
+                         ids=["403", "429", "500", "503", "no-answer"])
+def test_a_failed_lookup_at_start_is_not_kept_and_the_push_check_decides(
+    tmp_path: Path, project: dict, as_github: None, at_start: Any
+) -> None:
+    lookup = _Lookup(at_start, 404)
+    publisher = _publisher(tmp_path, project, private_only=True, lookup=lookup)
+    assert publisher.why_routes_are_not_private() == {}, "a failed lookup is not kept"
+
+    answer = publisher.publish(a_request(project))
+
+    assert answer.published is True, answer.refusal
+    assert len(lookup.asked) == 2
+
+
+def test_a_failed_lookup_at_start_and_again_before_the_push_sends_nothing(
+    tmp_path: Path, project: dict, as_github: None
+) -> None:
+    publisher = _publisher(tmp_path, project, private_only=True, lookup=_Lookup(429))
+    assert publisher.why_routes_are_not_private() == {}
+    answer = publisher.publish(a_request(project))
+    assert answer.published is False and answer.refusal_kind == NOT_CONFIRMED_PRIVATE
+    assert "could not be told" in str(answer.refusal)
+    assert every_push_the_remote_saw(project["bare"]) == []
+
+
+def test_the_health_answer_names_the_routes_refused_at_start(
+    tmp_path: Path, project: dict, as_github: None
+) -> None:
+    import urllib.request
+
+    other_remote = tmp_path / "world" / "public-one.git"
+    subprocess.run(["git", "init", "--bare", "-q", str(other_remote)], check=True)
+    other = ProjectRoute(name="bench/public-one", source=str(project["copy"]), remote=str(other_remote))
+    publisher = _publisher(
+        tmp_path, project, private_only=True,
+        lookup=lambda owner, name: 200 if name == "public-one" else 404,
+        extra_routes={other.name: other},
+    )
+    server, _thread = service.serve(publisher.settings, publisher=publisher)
+    try:
+        host, port = server.server_address[0], server.server_address[1]
+        with urllib.request.urlopen(f"http://{host}:{port}/healthz", timeout=10) as said:
+            body = json.loads(said.read().decode("utf-8"))
+    finally:
+        server.shutdown()
+        server.server_close()
+    assert list(body["routes_refused_at_start"]) == ["bench/public-one"]
+    assert "public" in body["routes_refused_at_start"]["bench/public-one"]

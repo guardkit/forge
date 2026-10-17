@@ -59,9 +59,10 @@ production features from a signed-off prototype", section 2.8). With
 behaviour exactly), every route's repository must be confirmed private
 (:mod:`forge.publisher.private_remote`: the route's own key reads it, and an
 anonymous lookup does not find it). That is asked once at start-up, when a
-route that fails is refused, with its reason, until the publisher is
-restarted, while every other route works; and asked again immediately before
-every push, which a failure refuses.
+route with a known answer other than "private" is refused, with its reason,
+until the publisher is restarted, while every other route works (a lookup
+that merely failed is logged and left to the next check); and asked again
+immediately before every push, which any failure refuses.
 
 EVERY REFUSAL IS ONE SENTENCE a person can act on, and rides beside a short
 machine-readable name so that the coordinator can tell the one refusal it
@@ -91,6 +92,7 @@ from forge.publisher.git_work import (
     a_plain_commit_name,
 )
 from forge.publisher.private_remote import (
+    LOOKUP_FAILED,
     Visibility,
     anonymous_lookup,
     confirmed_private,
@@ -273,8 +275,12 @@ class Publisher:
         self._handing_out_locks = threading.Lock()
         # ONLY PRIVATE REPOSITORIES, when the settings say so (17 October
         # 2026). The anonymous lookup is injectable for the tests. Each
-        # route is asked once here; one that is not confirmed private is
-        # refused until the publisher is restarted, and the others work.
+        # route is asked once here; one with a KNOWN answer that is not
+        # "private" (public, not on GitHub, its key cannot read it) is
+        # refused until the publisher is restarted, and the others work. A
+        # lookup that failed (403, a rate limit, a server error, no answer)
+        # is passing trouble, so it is only logged: the check immediately
+        # before the push decides (coach review, 17 October 2026).
         self._visibility_lookup = visibility_lookup or anonymous_lookup
         self._not_private: dict[str, str] = {}
         if settings.private_only:
@@ -284,6 +290,14 @@ class Publisher:
                     logger.info(
                         "publisher: project '%s' is confirmed private, so it is served",
                         name,
+                    )
+                    continue
+                if answer.kind == LOOKUP_FAILED:
+                    logger.warning(
+                        "publisher: project '%s' could not be confirmed private at "
+                        "start (%s); it is checked again before every push",
+                        name,
+                        answer.reason,
                     )
                     continue
                 self._not_private[name] = str(answer.reason)
@@ -1017,6 +1031,12 @@ class PublisherHandler(BaseHTTPRequestHandler):
                         "status": "healthy",
                         "self_check": "passed" if said == "passed" else "failed",
                         "self_check_said": said,
+                        # With private_only on (17 October 2026): the routes
+                        # refused at start, and why. Said here, not as a
+                        # failed self-check, because the other routes work.
+                        "routes_refused_at_start": (
+                            self.server.publisher.why_routes_are_not_private()  # type: ignore[attr-defined]
+                        ),
                     },
                 )
                 return

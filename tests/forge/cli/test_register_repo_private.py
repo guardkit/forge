@@ -222,3 +222,53 @@ def test_private_only_and_the_door_together(
     staged = json.loads((publisher_file.parent / f"settings.json.{LEAF}-pending").read_text())
     assert staged["projects"][KEY]["remote"] == f"git@github.com:{KEY}.git"
     assert estate.clones == {CLONE_PATH: DOOR_ADDRESS}
+
+
+@pytest.mark.parametrize("github", [
+    f"https://example.invalid/guardkit/{LEAF}.git",
+    f"https://github.com.example.invalid/guardkit/{LEAF}.git",
+])
+def test_private_only_a_repository_not_on_github_cannot_be_confirmed(
+    estate, publisher_file, route_key_estate, monkeypatch, github  # noqa: F811
+):
+    """Coach review: the key read went to the --github host, so it proves a
+    GitHub repository only when that host is github.com."""
+    from click.testing import CliRunner
+
+    from forge.cli.main import main
+    from tests.forge.cli.test_register_repo import SANDBOX_SETTINGS
+
+    _private_only(publisher_file)
+    lookup = _Lookup(404)
+    monkeypatch.setattr(register_repo, "visibility_lookup", lookup)
+    result = CliRunner().invoke(main, [
+        "register-repo", KEY, "--github", github, "--sandbox-settings", SANDBOX_SETTINGS,
+        "--publish", "--publisher-settings", str(publisher_file),
+        "--publish-credential-name", "widget-shop-key",
+        "--estate-env-file", str(route_key_estate),
+    ], catch_exceptions=False)
+    assert result.exit_code == 1
+    assert "github.com" in result.output and "another host" in result.output
+    assert lookup.asked == []
+    assert estate.writes == [] and estate.clones == {}
+
+
+def test_private_only_the_github_host_is_matched_whatever_its_case(
+    estate, publisher_file, route_key_estate, monkeypatch  # noqa: F811
+):
+    from click.testing import CliRunner
+
+    from forge.cli.main import main
+    from tests.forge.cli.test_register_repo import SANDBOX_SETTINGS
+
+    _private_only(publisher_file)
+    monkeypatch.setattr(register_repo, "visibility_lookup", _Lookup(404))
+    result = CliRunner().invoke(main, [
+        "register-repo", KEY, "--github", f"https://GitHub.com/guardkit/{LEAF}.git",
+        "--sandbox-settings", SANDBOX_SETTINGS,
+        "--publish", "--publisher-settings", str(publisher_file),
+        "--publish-credential-name", "widget-shop-key",
+        "--estate-env-file", str(route_key_estate),
+    ], catch_exceptions=False)
+    assert result.exit_code == 0, result.output
+    assert "confirmed private" in result.output
