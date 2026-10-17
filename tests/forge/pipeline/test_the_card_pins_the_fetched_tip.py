@@ -89,7 +89,29 @@ async def test_the_pin_is_the_fetched_tip_when_local_main_lags(
 
 
 @pytest.mark.asyncio
-async def test_a_target_that_cannot_be_fetched_gives_no_card_and_may_pass(
+async def test_an_ordinary_build_whose_fetch_fails_still_gets_its_card(
+    config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path, tmp_path: Path  # noqa: F811
+) -> None:
+    """A routine build is offered once and never again, so a fetch that fails
+    must not cost it its card: it is pinned the way it always was."""
+    _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+    local_main = _git(repo_root, "rev-parse", "main")
+    away = config.model_copy(deep=True)
+    away.planning.fetch_addresses[REPO] = str(tmp_path / "nowhere.git")
+
+    assert await _service(away, pool).offer(
+        build_id=BUILD_ID, feature_id=FEATURE_ID, card_words=_words
+    )
+
+    offer = [
+        s for s in pool.read_stages(BUILD_ID)
+        if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+    ][0].details[MERGE_OFFER_DETAILS_KEY]
+    assert offer["expect_main_sha"] == local_main
+
+
+@pytest.mark.asyncio
+async def test_a_retrying_caller_whose_fetch_fails_is_refused_and_may_pass(
     config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path, tmp_path: Path  # noqa: F811
 ) -> None:
     _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
@@ -108,3 +130,77 @@ async def test_a_target_that_cannot_be_fetched_gives_no_card_and_may_pass(
     assert pool.read_stages(BUILD_ID) == []
     assert len(refusals) == 1 and refusals[0][1] is True
     assert refusals[0][0].startswith("the target branch could not be fetched")
+
+
+@pytest.mark.asyncio
+async def test_a_renamed_default_branch_will_not_pass_for_a_retrying_caller(
+    config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path  # noqa: F811
+) -> None:
+    # The work was recorded against "trunk"; the remote's default is "main".
+    _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID, target_branch="trunk")
+    refusals: list[tuple[str, bool]] = []
+
+    offered = await _service(config, pool).offer(
+        build_id=BUILD_ID,
+        feature_id=FEATURE_ID,
+        card_words=_words,
+        on_refusal=lambda sentence, may_pass: refusals.append((sentence, may_pass)),
+    )
+
+    assert offered is False
+    assert len(refusals) == 1 and refusals[0][1] is False
+    assert "now says its default branch is" in refusals[0][0]
+
+
+class _OnePreview:
+    """A preview service that records what it was asked to join onto."""
+
+    def __init__(self) -> None:
+        self.requests: list[Any] = []
+
+    def enabled_for(self, _repo: str) -> bool:
+        return True
+
+    async def prepare(self, request: Any) -> Any:
+        self.requests.append(request)
+        return None
+
+
+@pytest.mark.asyncio
+async def test_the_pin_and_the_preview_base_are_one_read(
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,  # noqa: F811
+    repo_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from forge.pipeline import merge_join
+
+    _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+    fetched = _somebody_lands_on_main(repo_root)
+    reads: list[Any] = []
+    real = merge_join.target_branch_now
+
+    async def counted(*args: Any, **kwargs: Any) -> Any:
+        reads.append(1)
+        return await real(*args, **kwargs)
+
+    preview = _OnePreview()
+    service = _service(config, pool)
+    service._review_preview = preview
+    monkeypatch.setattr(merge_join, "target_branch_now", counted)
+    await service._prepare_the_preview(
+        row=pool.get_build_row(BUILD_ID),
+        git=service._git_for(pool.get_build_row(BUILD_ID), repo_root),
+        build_id=BUILD_ID,
+        feature_id=FEATURE_ID,
+        branch=f"autobuild/{FEATURE_ID}",
+        candidate_sha="c" * 40,
+        candidate_tree="d" * 40,
+        expect_main_sha=fetched,
+        target_branch="main",
+        fetched_base=fetched,
+    )
+
+    assert reads == []
+    assert preview.requests[0].preview_base_sha == fetched
+    assert preview.requests[0].expect_main_sha == fetched

@@ -271,6 +271,15 @@ async def _ask_the_head_reader(
     return await read_head(repo_root)
 
 
+def _the_default_branch_was_renamed(refusal: str | None) -> bool:
+    """Is this ``target_branch_now``'s refusal for a renamed default branch?
+
+    That refusal cannot clear by itself (which branch the work belongs on is
+    a decision for a person), unlike a remote that could not be reached.
+    """
+    return "now says its default branch is" in str(refusal or "")
+
+
 def read_baseline_failing(build_id: str) -> list[str] | None:
     """Best-effort pre-merge baseline failing set — fail-open ``None``.
 
@@ -2157,6 +2166,7 @@ class MergeOfferService:
         expect_main_sha: str,
         target_branch: str,
         make_room: bool = False,
+        fetched_base: str | None = None,
     ) -> tuple[Any, str | None] | None:
         """``(evidence or None, the commit it was joined onto)`` — or ``None``
         when the service raised and no card may be offered.
@@ -2177,16 +2187,23 @@ class MergeOfferService:
             # the same git surface and the same helper the merge press uses —
             # never the clone's local branch, which can lag the remote after
             # any other merge.
-            start_point = self._pool.read_start_point(build_id)
-            where = await target_branch_now(
-                git,
-                recorded_branch=(
-                    getattr(start_point, "target_branch", None)
-                    if getattr(start_point, "recorded", False)
-                    else None
-                ),
-            )
-            base = where.commit if where.ok else None
+            # ``fetched_base`` is that very read when the offer already made
+            # it for the card's pin (one read for both).
+            if fetched_base:
+                base: str | None = fetched_base
+                base_refusal: str | None = None
+            else:
+                start_point = self._pool.read_start_point(build_id)
+                where = await target_branch_now(
+                    git,
+                    recorded_branch=(
+                        getattr(start_point, "target_branch", None)
+                        if getattr(start_point, "recorded", False)
+                        else None
+                    ),
+                )
+                base = where.commit if where.ok else None
+                base_refusal = None if where.ok else where.refusal
             evidence = await self._review_preview.prepare(
                 PreviewRequest(
                     project=row.repo,
@@ -2198,7 +2215,7 @@ class MergeOfferService:
                     expect_main_sha=expect_main_sha,
                     target_branch=target_branch,
                     preview_base_sha=base,
-                    preview_base_refusal=None if where.ok else where.refusal,
+                    preview_base_refusal=base_refusal,
                     make_room=make_room,
                 )
             )
@@ -2247,6 +2264,7 @@ class MergeOfferService:
         review_evidence: Any,
         preview_base_sha: str | None,
         changed_files: Sequence[Any] | None,
+        fetched_target: str | None = None,
     ) -> dict[str, Any] | None:
         """The offer's ``merge_check_reading``, or ``None`` with no reader.
 
@@ -2270,6 +2288,9 @@ class MergeOfferService:
                 declared_at = preview_base_sha
                 if not declared_at:
                     refusal = "the preview names no commit it was joined onto"
+            elif fetched_target:
+                # The offer's own read of the target, made for the card's pin.
+                declared_at = fetched_target
             else:
                 from forge.pipeline.merge_join import target_branch_now
 
@@ -2520,23 +2541,40 @@ class MergeOfferService:
         # stayed at the clone's first commit, so every card pinned a commit
         # months old. A venue that cannot fetch, or a build with no recorded
         # start point, is read the way it always was.
+        #
+        # A FETCH THAT FAILS refuses the card only for a caller that retries
+        # (it passed ``on_refusal``: the mission finisher). Every other caller
+        # is offered its card exactly as before, pinned to the head reader's
+        # answer, and its preview says the fetch failed: a routine build and
+        # a fix journey are offered once and never again, so a refusal here
+        # would leave the build with no card for good. A remote whose default
+        # branch was renamed cannot clear by itself, so for the retrying
+        # caller that refusal will not pass.
         fetched, fetch_refusal, fetched_it = await self._the_target_as_fetched(
             git, build_id
         )
-        if fetched_it:
-            if fetched is None:
-                logger.error(
+        expect_main_sha: str | None = None
+        if fetched_it and fetched is not None:
+            expect_main_sha = fetched
+        elif fetched_it and on_refusal is not None:
+            logger.error(
+                "merge-offer: the target branch of %s could not be fetched "
+                "(%s) — an offer without a pin would not be honest; no card",
+                build_id,
+                fetch_refusal,
+            )
+            return _refuse(
+                f"the target branch could not be fetched: {fetch_refusal}",
+                may_pass=not _the_default_branch_was_renamed(fetch_refusal),
+            )
+        else:
+            if fetched_it:
+                logger.warning(
                     "merge-offer: the target branch of %s could not be fetched "
-                    "(%s) — an offer without a pin would not be honest; no card",
+                    "(%s) — the card is pinned the way it always was",
                     build_id,
                     fetch_refusal,
                 )
-                return _refuse(
-                    f"the target branch could not be fetched: {fetch_refusal}",
-                    may_pass=True,
-                )
-            expect_main_sha: str | None = fetched
-        else:
             expect_main_sha = await _ask_the_head_reader(
                 self._git_head, repo_root, recorded_target or None
             )
@@ -2678,6 +2716,10 @@ class MergeOfferService:
                     candidate_tree=candidate_tree,
                     expect_main_sha=expect_main_sha,
                     target_branch=recorded_target or MERGE_BASE_REF,
+                    # ONE READ OF THE TARGET for the pin and the preview's
+                    # base, so the two can never disagree; a preview with no
+                    # fetched tip reads it itself and reports why it failed.
+                    fetched_base=fetched,
                 )
                 if prepared is None:
                     return _refuse("the preview could not be prepared", may_pass=True)
@@ -2713,6 +2755,7 @@ class MergeOfferService:
                 review_evidence=review_evidence,
                 preview_base_sha=preview_base_sha,
                 changed_files=changed_files,
+                fetched_target=fetched,
             )
             if merge_check_reading is not None:
                 details["merge_check_reading"] = merge_check_reading
