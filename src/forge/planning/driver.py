@@ -134,7 +134,11 @@ from forge.planning.code_evidence import (
     LISTED_ALL_MEANS,
     MAX_EVIDENCE_CHARS,
     MAX_EVIDENCE_WINDOWS,
+    MAX_SPEC_EVIDENCE_CHARS,
+    QuotedExample,
     candidate_windows,
+    quoted_example_shapes,
+    spec_writer_windows,
     ranked_source_field,
     choose_windows,
     is_documentation,
@@ -3789,6 +3793,15 @@ class PlanningRunDriver:
         reference_files = reference.files if reference is not None else ()
         texts = context_texts(documents) + reference_context_texts(reference_files)
         project_context: dict[str, Any] = {"context": texts} if texts else {}
+        # What the repository already has where the request's words and
+        # quoted examples appear (17 October 2026, FEAT-15DD): the same
+        # windows the plan writer is shown, built once per run. No windows,
+        # no field: the call is today's.
+        code_evidence = await self._spec_code_evidence(
+            row, correlation_id, target_repo=target_repo, repo_path=repo_path
+        )
+        if code_evidence is not None:
+            project_context["code_evidence"] = code_evidence
 
         try:
             result = await deps.dispatch_feature_spec(
@@ -4210,6 +4223,82 @@ class PlanningRunDriver:
             return str(row["request_text"] or "")
         except (KeyError, IndexError, TypeError):
             return str(getattr(row, "request_text", "") or "")
+
+    async def _spec_code_evidence(
+        self,
+        row: Any,
+        correlation_id: str,
+        *,
+        target_repo: str,
+        repo_path: str,
+    ) -> dict[str, Any] | None:
+        """The code windows the spec writer is shown, made once per run.
+
+        WHY (17 October 2026, FEAT-15DD). The spec writer was shown no code,
+        so it settled an open question ("1 note" or "1 notes") by guessing,
+        though the project's code and a committed browser check already
+        answered it. Since 1 October Forge reads the code itself, so the seat
+        still needs no checkout.
+
+        The same :meth:`_build_target_repo_descriptor` the plan leg calls,
+        from the request alone (there is no specification yet), at half the
+        plan's window budget
+        (:data:`~forge.planning.code_evidence.MAX_SPEC_EVIDENCE_CHARS`) and
+        never with the ranked search. Only the entries carrying the windows
+        :func:`~forge.planning.code_evidence.choose_windows` picked are kept
+        (:func:`~forge.planning.code_evidence.spec_writer_windows`), so
+        reference material stays labelled and capped, and no ranked block,
+        set line, file list or rule reaches the spec writer.
+
+        Kept for the run: every spec call of the run (rewrites included) is
+        sent the same windows, and the repository is read once for them.
+        ``None`` when nothing was found, or the repository could not be read
+        (the fact sheet, sent beside, already says that); the field is then
+        not sent. Never raises.
+        """
+        cache: dict[str, dict[str, Any] | None] = self.__dict__.setdefault(
+            "_spec_code_evidence_cache", {}
+        )
+        if correlation_id in cache:
+            return cache[correlation_id]
+        evidence: dict[str, Any] | None = None
+        try:
+            descriptor = await asyncio.to_thread(
+                self._build_target_repo_descriptor,
+                target_repo,
+                repo_path,
+                "",
+                reader=self._repository_reader_for(repo_path, correlation_id),
+                unavailable=[],
+                partial=[],
+                request_text=self._request_text_of(row),
+                ranked_source=False,
+                reference_paths=self._reference_paths_of(correlation_id),
+                max_evidence_chars=MAX_SPEC_EVIDENCE_CHARS,
+            )
+            evidence = spec_writer_windows(descriptor)
+        except Exception as exc:  # noqa: BLE001 — never fail a spec over this
+            logger.warning(
+                "planning driver: run %s — the spec writer's code windows could "
+                "not be built (%s: %s); it is sent none",
+                correlation_id,
+                type(exc).__name__,
+                exc,
+            )
+        if evidence is not None:
+            logger.info(
+                "planning driver: run %s — the spec writer is shown %d code "
+                "window(s), %d characters of window text",
+                correlation_id,
+                sum(len(e["evidence"]) for e in evidence["where_the_specs_words_already_appear"]),
+                sum(
+                    len(w.get("text") or "")
+                    for e in evidence["where_the_specs_words_already_appear"]
+                    for w in e["evidence"]
+                ),
+            )
+        cache[correlation_id] = evidence
+        return evidence
 
     async def _repository_facts_for(
         self, correlation_id: str, repo_path: str, row: Any
@@ -11609,6 +11698,15 @@ class PlanningRunDriver:
         :data:`~forge.planning.code_evidence.MAX_REFERENCE_WINDOWS` of them
         are shown; see
         :func:`~forge.planning.code_evidence.choose_windows`.
+
+        THE REQUEST'S QUOTED EXAMPLES (17 October 2026, FEAT-15DD). A quoted
+        phrase in the request that holds a number ("3 notes") is looked for
+        in its shape, whatever stands for the number
+        (:func:`~forge.planning.code_evidence.quoted_example_shapes`), and
+        the lines found join the words as ONE more entry the request names,
+        so the window choice, the reference label and cap and the budget
+        apply unchanged. A request with no such phrase, or one found nowhere,
+        gives exactly what it gave before.
         """
         reader = reader or LocalCheckoutReader(repo_path)
         try:
@@ -11651,7 +11749,11 @@ class PlanningRunDriver:
                     continue
                 seen.add(key)
                 words.append(word)
-            if not words:
+            # The request's own quoted examples holding a number (17 October
+            # 2026, FEAT-15DD): plain English names no word above, so "3
+            # notes" found nothing. None quoted, nothing here changes.
+            quoted = quoted_example_shapes(request_text)
+            if not words and not quoted:
                 return None
 
             found: list[dict[str, Any]] = []
@@ -11758,6 +11860,71 @@ class PlanningRunDriver:
                             and not re.fullmatch(r"/?\{[^}]*\}", s)
                         ]
                         anchors.extend(a for a in (named or [word]) if a not in anchors)
+            if quoted and not stopped:
+                # One more entry, beside the words: where the request's quoted
+                # examples already stand in the code, with whatever stands
+                # for the number. The window choice, the reference label and
+                # cap, and the size budget below treat it like any word the
+                # request names. Nothing found, nothing is added.
+                example_places: list[str] = []
+                looked_for: list[QuotedExample] = []
+                for example in quoted:
+                    try:
+                        answer = reader.lines_mentioning(example.literal)
+                    except RepositoryUnreadable as exc:
+                        stopped = str(exc)
+                        break
+                    searched_any = True
+                    cut = getattr(answer, "cut", None)
+                    if cut and partial is not None:
+                        partial.append(
+                            f'where the example "{example.phrase}" already appears '
+                            f"was only partly searched ({cut})"
+                        )
+                    for path, number, text in answer:
+                        place = f"{path}:{number}"
+                        if (
+                            not example.holds(text)
+                            or place in example_places
+                            or any(place.startswith(p) for p in _REPO_INVENTORY_SKIP_PREFIXES)
+                            or is_factory_file(reader, path, texts)
+                        ):
+                            continue
+                        example_places.append(place)
+                        if example not in looked_for:
+                            looked_for.append(example)
+                if example_places:
+                    example_places.sort(key=_how_interesting)
+                    entry = {
+                        "words": ", ".join(f'"{e.phrase}"' for e in looked_for),
+                        "already_in": example_places[:_MAX_PLACES_PER_SPEC_WORD],
+                    }
+                    try:
+                        candidates, hits, not_read = candidate_windows(
+                            reader,
+                            example_places,
+                            words=scoring_words,
+                            rank=_how_interesting,
+                            texts=texts,
+                            spellings=[e.literal for e in looked_for],
+                            is_reference=lambda path: is_reference_path(
+                                path, reference_paths
+                            ),
+                        )
+                    except RepositoryUnreadable as exc:
+                        stopped = str(exc)
+                        candidates, not_read = [], []
+                        hits = [
+                            (path, int(line))
+                            for path, _, line in (p.rpartition(":") for p in example_places)
+                            if path and line.isdigit()
+                        ]
+                    if not_read:
+                        entry["evidence_not_read"] = not_read
+                    found.append(entry)
+                    found_candidates.append(candidates)
+                    found_hits.append(hits)
+                    found_in_request.append(True)
             choose_windows(
                 found,
                 found_candidates,
@@ -11931,6 +12098,7 @@ class PlanningRunDriver:
         request_text: str = "",
         ranked_source: bool = False,
         reference_paths: Sequence[str] = (),
+        max_evidence_chars: int = MAX_EVIDENCE_CHARS,
     ) -> dict[str, Any]:
         """Build the 008 ``target_repo_descriptor`` honestly from what forge knows.
 
@@ -11968,6 +12136,12 @@ class PlanningRunDriver:
         inventory counts them apart, their code windows are labelled and
         capped, and no set's candidates come from them. Empty, the
         descriptor is byte for byte today's.
+
+        ``max_evidence_chars`` (17 October 2026) is the size budget of the
+        windows' text and the set candidates' lines together; the spec
+        leg's call (:meth:`_spec_code_evidence`) passes half the plan's.
+        Left out, it is :data:`~forge.planning.code_evidence.MAX_EVIDENCE_CHARS`
+        as before.
         """
         # Local import: keep the guardkit-boundary reuse out of the module
         # import graph (target_terminal_tools imports the guardkit run seam).
@@ -12092,7 +12266,7 @@ class PlanningRunDriver:
                 for candidate in entry.get("candidates") or []
                 for line in candidate.get("lines") or []
             )
-            return max(MAX_EVIDENCE_CHARS // 2, MAX_EVIDENCE_CHARS - set_lines_chars)
+            return max(max_evidence_chars // 2, max_evidence_chars - set_lines_chars)
 
         already_there = PlanningRunDriver._where_the_specs_words_already_appear(
             repo_path,
@@ -12113,7 +12287,9 @@ class PlanningRunDriver:
         # One size budget for both, across the whole descriptor: the
         # lowest-scoring windows go first, then candidate lines, and what
         # went is counted on the entries it came from.
-        trimmed = trim_to_budget(already_there or [], sets or [])
+        trimmed = trim_to_budget(
+            already_there or [], sets or [], budget=max_evidence_chars
+        )
         if trimmed["windows_trimmed"] or trimmed["lines_trimmed"]:
             logger.info(
                 "target_repo_descriptor: the code shown to the plan-writer was "

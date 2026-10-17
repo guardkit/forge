@@ -69,12 +69,17 @@ __all__ = [
     "MAX_SET_CANDIDATES_LISTED",
     "MAX_SET_FILES_READ",
     "MAX_SET_PHRASES",
+    "MAX_QUOTED_EXAMPLES",
+    "MAX_SPEC_EVIDENCE_CHARS",
+    "QuotedExample",
     "candidate_windows",
     "choose_windows",
     "is_documentation",
     "is_factory_record",
     "quantified_phrases",
+    "quoted_example_shapes",
     "request_method",
+    "spec_writer_windows",
     "request_words",
     "scenario_words",
     "set_candidates",
@@ -166,6 +171,13 @@ LISTED_ALL_MEANS = (
 #: its candidate lines from the lowest-ranked candidate up, and what went is
 #: counted. The windows are never emptied to make room for candidate lines.
 MAX_EVIDENCE_CHARS = 16_000
+
+#: The window text the SPEC writer is shown (17 October 2026, the spec writer
+#: sees the code): half the plan writer's budget, the same windows chosen the
+#: same way. The writer's whole rendered section, with its paths, labels and
+#: formatting, is held to 10,000 characters where it is rendered
+#: (specialist-agent ``feature_spec``).
+MAX_SPEC_EVIDENCE_CHARS = 8_000
 
 
 def _tokens(text: str) -> set[str]:
@@ -1411,6 +1423,114 @@ def trim_to_budget(
         "windows_trimmed": windows_trimmed,
         "lines_trimmed": lines_trimmed,
     }
+
+
+# ---------------------------------------------------------------------------
+# The request's own quoted examples (17 October 2026)
+# ---------------------------------------------------------------------------
+
+#: At most this many of the request's quoted phrases holding a number are
+#: looked for.
+MAX_QUOTED_EXAMPLES = 2
+#: The longest quoted phrase taken as an example.
+_QUOTED_EXAMPLE_CHARS = 80
+#: A phrase in double quotes (straight or curly), in backticks, or in single
+#: quotes that are not an apostrophe inside a word ("don't").
+_QUOTED_PHRASE = re.compile(
+    r'"([^"\n]{1,%(n)d})"|“([^”\n]{1,%(n)d})”|`([^`\n]{1,%(n)d})`'
+    r"|(?<![A-Za-z0-9])'([^'\n]{1,%(n)d})'(?![A-Za-z0-9])" % {"n": _QUOTED_EXAMPLE_CHARS}
+)
+_EXAMPLE_NUMBER = re.compile(r"\d+(?:[.,]\d+)*")
+#: What may stand where the example's number stands: a number; a run of
+#: characters ending in a closing bracket (``{notes.length}``,
+#: ``${expected}``, ``(\d+)``); or ``%`` and a letter (``%d``, ``%i``).
+_NUMBER_PLACE = r"(?:\d+(?:[.,]\d+)*|%[A-Za-z]|[^\s]{0,80}?[)\]}])"
+#: The same, when only the text AFTER the number is known: the character
+#: right before that text is a digit or a closing bracket, or ``%`` and a
+#: letter is.
+_NUMBER_PLACE_BEFORE = r"(?:\d|%[A-Za-z]|[)\]}])"
+
+
+class QuotedExample:
+    """One quoted example from the request, and how to find it in code.
+
+    ``phrase`` is the request's own quoted text (``3 notes``); ``literal``
+    is the part looked for literally, the longer side of its first number
+    (`` notes``); :meth:`holds` says whether a line holds the example's shape,
+    with anything that can stand for a number where the number is."""
+
+    __slots__ = ("phrase", "literal", "_shape")
+
+    def __init__(self, phrase: str, literal: str, shape: re.Pattern[str]) -> None:
+        self.phrase = phrase
+        self.literal = literal
+        self._shape = shape
+
+    def holds(self, line: str) -> bool:
+        return bool(self._shape.search(line or ""))
+
+    def __repr__(self) -> str:
+        return f"QuotedExample({self.phrase!r}, literal={self.literal!r})"
+
+
+def quoted_example_shapes(request_text: str) -> list[QuotedExample]:
+    """The request's quoted examples that hold a number, as shapes to find.
+
+    WHY (17 October 2026, FEAT-15DD). The request said "for example "3
+    notes"". The project already rendered ``{notes.length} notes`` and a
+    committed browser check required "N notes" for every count, but every
+    other search looks only for names (routes, ``snake_case``,
+    ``camelCase``), so neither writer was shown either line, and the spec
+    writer guessed "1 note".
+
+    Each quoted phrase holding a number (at most
+    :data:`MAX_QUOTED_EXAMPLES`) is split at its first number: ``"3 notes"``
+    gives nothing before and ``" notes"`` after; ``"Notes (3)"`` gives
+    ``"Notes ("`` and ``")"``. The longer part is looked for literally (with
+    the readers' ``lines_mentioning``), and a line is kept only where the
+    number's place holds a number, a run of characters ending in a closing
+    bracket, or ``%`` and a letter. Plain text in every language: no parser
+    and no file type. A phrase whose longer part has no letter or fewer than
+    two characters besides spaces is not looked for: it would find
+    everything.
+    """
+    examples: list[QuotedExample] = []
+    seen: set[str] = set()
+    for match in _QUOTED_PHRASE.finditer(request_text or ""):
+        phrase = next(group for group in match.groups() if group is not None)
+        number = _EXAMPLE_NUMBER.search(phrase)
+        if number is None or phrase in seen:
+            continue
+        before, after = phrase[: number.start()], phrase[number.end() :]
+        literal = after if len(after) >= len(before) else before
+        if len(literal.strip()) < 2 or not re.search(r"[A-Za-z]", literal):
+            continue
+        if before:
+            shape = re.compile(re.escape(before) + _NUMBER_PLACE + re.escape(after))
+        else:
+            shape = re.compile(_NUMBER_PLACE_BEFORE + re.escape(after))
+        seen.add(phrase)
+        examples.append(QuotedExample(phrase, literal, shape))
+        if len(examples) >= MAX_QUOTED_EXAMPLES:
+            break
+    return examples
+
+
+def spec_writer_windows(descriptor: Mapping[str, Any]) -> dict[str, Any] | None:
+    """What the spec writer is shown of a descriptor: only the
+    ``where_the_specs_words_already_appear`` entries that carry windows
+    (the windows :func:`choose_windows` picked, so reference material is
+    labelled and capped), the same filter the plan reviewer's view uses.
+    Never the ranked blocks, the set candidates, the file list or the
+    rules. ``None`` when no entry carries a window."""
+    entries = [
+        entry
+        for entry in descriptor.get("where_the_specs_words_already_appear") or []
+        if isinstance(entry, dict) and isinstance(entry.get("evidence"), list) and entry["evidence"]
+    ]
+    if not entries:
+        return None
+    return {"where_the_specs_words_already_appear": entries}
 
 
 # ---------------------------------------------------------------------------

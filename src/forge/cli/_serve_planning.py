@@ -142,7 +142,9 @@ DispatchCallable = Callable[..., Awaitable[Any]]
 #         optional: context, stack, revision_of, validate_feedback — the last
 #         two are EMITTED on a rewrite round: ``validate_feedback`` carries the
 #         owner's note on the spec digest VERBATIM and ``revision_of`` the prior
-#         artifact set. A first-round dispatch emits neither.)
+#         artifact set. A first-round dispatch emits neither. ``code_evidence``
+#         (17 October 2026) carries the code windows the plan writer is also
+#         shown, sent only when there are some; optional on both sides.)
 #   008  specialist-agent/src/specialist_agent/roles/architect/modes/
 #        feature_plan.py → required_args=("feature_id","spec_feature",
 #        "spec_summary","target_repo_descriptor")
@@ -180,6 +182,7 @@ def build_feature_spec_command_args(
     request_text: str | None = None,
     repository_facts: str | None = None,
     context: Sequence[str] | None = None,
+    code_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Exact ``po_feature_spec`` (007) wire args. See the CONTRACT note above.
 
@@ -216,6 +219,13 @@ def build_feature_spec_command_args(
     documents = _context_documents(context)
     if documents:
         args["context"] = documents
+    # What the repository already has where the request's words and quoted
+    # examples appear (17 October 2026): the code windows the plan writer is
+    # also shown, for the spec WRITER and its coach. Optional on both sides,
+    # so either image may be redeployed first; absent or empty, the wire is
+    # what it was.
+    if code_evidence:
+        args["code_evidence"] = dict(code_evidence)
     return args
 
 
@@ -1116,6 +1126,7 @@ async def compose_planning_consumer_and_dispatch(
             request_text: str | None = None,
             repository_facts: str | None = None,
             context: Sequence[str] | None = None,
+            code_evidence: Mapping[str, Any] | None = None,
         ) -> Any:
             return await dispatch_specialist_stage(
                 stage=StageClass.FEATURE_SPEC,
@@ -1132,6 +1143,7 @@ async def compose_planning_consumer_and_dispatch(
                     request_text=request_text,
                     repository_facts=repository_facts,
                     context=context,
+                    code_evidence=code_evidence,
                 ),
                 feature_routing_id=correlation_id,
                 feature_routing_gate=feature_routing_gate,
