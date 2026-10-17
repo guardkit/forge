@@ -1387,6 +1387,13 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
 
     _ensure_card_revisions(connection)
 
+    # The mission tables and the two ``builds`` columns (missions, 17 October
+    # 2026), outside the migration ladder for the same reason: created if
+    # missing, columns added only when a probe finds them absent, schema 19.
+    from forge.lifecycle.missions import ensure_tables as _ensure_mission_tables
+
+    _ensure_mission_tables(connection)
+
     # Step 4 — wrap the connection.
     sqlite_pool = SqliteLifecyclePersistence(
         connection=connection, db_path=config.db_path

@@ -60,6 +60,7 @@ __all__ = [
     "RESULT_MERGED_AND_RUNNING",
     "RESULT_PUBLICATION_PENDING",
     "RESULT_PUBLISHED_DEPLOYMENT_PENDING",
+    "RESULT_PUBLISHED_TO_MISSION_BRANCH",
     "STEP_CANDIDATE_CHECK",
     "STEP_DEPLOY",
     "STEP_JOIN",
@@ -124,6 +125,14 @@ RESULT_PUBLISHED_DEPLOYMENT_PENDING: str = "published, deployment pending"
 #: heard of. Renamed 22 September 2026 with its sibling in the press
 #: (``RESULT_WORD_MERGED_AND_RUNNING``).
 RESULT_MERGED_AND_RUNNING: str = "merged into the remote and running"
+
+#: A mission feature's joined commit is on the mission branch, and nothing is
+#: deployed or owed: a feature inside a mission is merged into its mission's
+#: branch with ``deploy=False``, and only the mission's own merge into main
+#: deploys (missions design, 17 October 2026, section 6). It is NOT one of the
+#: three below, because it is not a step on the way to "running"; every reader
+#: of these results must take it as finished, never as a deploy still owed.
+RESULT_PUBLISHED_TO_MISSION_BRANCH: str = "published to the mission branch"
 
 #: The three, in the order a build passes through them.
 PUBLICATION_RESULTS: tuple[str, ...] = (

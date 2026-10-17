@@ -938,6 +938,14 @@ class SqliteLifecyclePersistence:
             columns += ", source_commit"
             placeholders += ", ?"
             values.append(getattr(admitted, "source_commit", None) or None)
+        # Which mission this build belongs to (missions design, 17 October
+        # 2026, section 5), copied here from the mission attempt filed under
+        # this correlation id. A build that is no mission's records nothing.
+        mission_id = self._mission_of_attempt(correlation_id)
+        if mission_id is not None:
+            columns += ", mission_id, mission_role"
+            placeholders += ", ?, 'feature'"
+            values.append(mission_id)
 
         try:
             self._cx.execute("BEGIN IMMEDIATE;")
@@ -1322,6 +1330,27 @@ class SqliteLifecyclePersistence:
         except sqlite3.Error:
             return True
         return row is not None
+
+    def _mission_of_attempt(self, correlation_id: str | None) -> str | None:
+        """The mission id of the attempt filed under ``correlation_id``, or None.
+
+        None as well on a ledger without the mission tables or the two
+        ``builds`` columns, so nothing is written that could not be read.
+        """
+        if not correlation_id:
+            return None
+        from forge.lifecycle.missions import builds_record_missions
+
+        if not builds_record_missions(self._cx):
+            return None
+        try:
+            row = self._cx.execute(
+                "SELECT mission_id FROM mission_attempts WHERE correlation_id = ?",
+                (correlation_id,),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return None
+        return str(row[0]) if row is not None else None
 
     def _builds_record_the_source_commit(self) -> bool:
         """Does this ledger have ``builds.source_commit`` (``schema_v17``)?
