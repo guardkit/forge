@@ -532,6 +532,56 @@ def read_opengrep(stdout: bytes, root: Path, catalogue: "RuleCatalogue") -> list
     return found
 
 
+@dataclass(frozen=True)
+class OpengrepGaps:
+    """What Opengrep says it could not fully check (its JSON ``errors``).
+
+    ``files`` maps each file inside the export that an error names (by its
+    ``path``, or its ``spans``' ``file``) to the error's type, such as
+    ``PartialParsing``. ``incomplete`` is True when an error names no file
+    inside the export (a rule that failed, a time-out of the whole run): the
+    scan as a whole cannot be taken as complete. Only the path and the error
+    type are kept; the error's message quotes the scanned file and is never
+    read (Codex implementation review 3, F5).
+    """
+
+    files: dict[str, str]
+    incomplete: bool
+
+
+def _error_type(value: object) -> str:
+    name = value[0] if isinstance(value, list) and value else value
+    text = re.sub(r"[^A-Za-z0-9 _-]", "", str(name or ""))[:40].strip()
+    return text or "error"
+
+
+def read_opengrep_errors(stdout: bytes, root: Path) -> OpengrepGaps:
+    """The files Opengrep reported it could not fully check, and whether the
+    scan as a whole is incomplete."""
+    data = json.loads(stdout.decode("utf-8") or "{}")
+    errors = data.get("errors") if isinstance(data, dict) else None
+    files: dict[str, str] = {}
+    incomplete = False
+    for error in errors if isinstance(errors, list) else []:
+        if not isinstance(error, dict):
+            incomplete = True
+            continue
+        named = []
+        if error.get("path"):
+            named.append(str(error["path"]))
+        for span in error.get("spans") or []:
+            if isinstance(span, dict) and span.get("file"):
+                named.append(str(span["file"]))
+        inside = {f for f in (_relative(path, root) for path in named) if f}
+        if not inside:
+            incomplete = True
+            continue
+        kind = _error_type(error.get("type"))
+        for file in inside:
+            files.setdefault(file, kind)
+    return OpengrepGaps(files=files, incomplete=incomplete)
+
+
 _PLACEHOLDER = re.compile(r"\$[A-Z_][A-Z0-9_]*")
 
 
@@ -623,6 +673,7 @@ __all__ = [
     "OPENGREP_RULES",
     "OPENGREP_TIMEOUT_S",
     "OSV_TIMEOUT_S",
+    "OpengrepGaps",
     "OsvReading",
     "RuleCatalogue",
     "Runner",
@@ -638,6 +689,7 @@ __all__ = [
     "osv_argv",
     "read_gitleaks",
     "read_opengrep",
+    "read_opengrep_errors",
     "read_osv",
     "run_tool",
     "write_factory_ignore",

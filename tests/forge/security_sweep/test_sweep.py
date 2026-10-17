@@ -802,3 +802,80 @@ async def test_a_build_starting_during_the_excerpt_check_leaves_the_finding_pend
     assert lab.model.prompts == []
     assert report.projects[0].pending == 1
     assert "a build started, so the model was left to it" in lab.slack.lines[-1]
+
+
+def _partial_parsing(relative: str):
+    """An error shaped like Opengrep 1.30.1's own (the saved api_test scan)."""
+
+    def make(root):
+        path = str(root / relative)
+        span = {"start": {"line": 2, "col": 3, "offset": 0}, "end": {"line": 2, "col": 4, "offset": 1}}
+        return {
+            "code": 3,
+            "level": "warn",
+            "type": ["PartialParsing", [{"path": path, **span}]],
+            "message": f"Syntax error at line {path}:2:\n `(` was unexpected",
+            "path": path,
+            "spans": [{"file": path, **span}],
+        }
+
+    return make
+
+
+def _rule_error(root):
+    return {"code": 7, "level": "error", "type": "Rule parse error", "message": "rule x is invalid"}
+
+
+@pytest.mark.asyncio
+async def test_a_file_opengrep_could_not_parse_keeps_its_earlier_findings(lab: Lab) -> None:
+    """Review 3, F5: a parse error for a file, and no result for it, does not
+    mark that file's earlier code finding gone; it is said, not posted alone."""
+    lab.add("org/app", {"app/run.py": "import subprocess\nsubprocess.call(c, shell=True)\n"})
+    lab.model.answer = lambda prompt: '{"real": false}'
+    await run_sweep(lab.deps())
+    posted = len(lab.slack.lines)
+    (before,) = [e for e in _state(lab)["findings"].values() if e["kind"] == "code"]
+    assert before["status"] == "not-real"
+
+    lab.scanners.opengrep_errors = [_partial_parsing("app/run.py")]
+    lab.scanners.opengrep_silent_files = {"app/run.py"}
+    report = await run_sweep(lab.deps())
+    (after,) = [e for e in _state(lab)["findings"].values() if e["kind"] == "code"]
+    assert after["status"] == "not-real"
+    assert report.projects[0].code_partial == {"app/run.py": "PartialParsing"}
+    assert len(lab.slack.lines) == posted  # not on its own a reason to post
+    history = json.loads((lab.folder / "history.jsonl").read_text().splitlines()[-1])
+    assert history["projects"]["org/app"]["code_not_fully_checked"] == [
+        {"file": "app/run.py", "error": "PartialParsing"}
+    ]
+    assert "unexpected" not in (lab.folder / "history.jsonl").read_text()
+
+
+@pytest.mark.asyncio
+async def test_a_partial_scan_is_named_in_a_posted_line(lab: Lab) -> None:
+    lab.add("org/app", {"app/run.py": "x = 1\n", "k.sh": f"K={planted_key()}\n"})
+    lab.model.answer = lambda prompt: '{"real": false}'
+    lab.scanners.opengrep_errors = [_partial_parsing("app/run.py")]
+    await run_sweep(lab.deps())
+    assert "1 file not fully checked for code patterns" in lab.slack.lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_an_error_naming_no_file_marks_nothing_from_opengrep_gone(lab: Lab) -> None:
+    """Review 3, F5: an error with no file leaves the whole scan incomplete."""
+    project = lab.add("org/app", {"app/run.py": "import subprocess\nsubprocess.call(c, shell=True)\n"})
+    lab.model.answer = lambda prompt: '{"real": false}'
+    await run_sweep(lab.deps())
+    project.write({"app/run.py": "x = 1\n"})
+    project.commit()
+    lab.scanners.opengrep_errors = [_rule_error]
+    report = await run_sweep(lab.deps())
+    assert report.projects[0].code_scan_incomplete
+    assert [e["status"] for e in _state(lab)["findings"].values()] == ["not-real"]
+    history = json.loads((lab.folder / "history.jsonl").read_text().splitlines()[-1])
+    assert history["projects"]["org/app"]["code_scan_incomplete"] is True
+
+    # A complete scan the next night does mark it gone.
+    lab.scanners.opengrep_errors = []
+    await run_sweep(lab.deps())
+    assert [e["status"] for e in _state(lab)["findings"].values()] == ["gone"]

@@ -377,3 +377,30 @@ class TestTheModelRoute:
                "FORGE_SWEEP_MODEL_EXTRA_BODY": "[1, 2]"}
         asker, _ = default_asker(env)
         assert asker is not None and built[0][3] == {}
+
+
+def test_opengrep_errors_name_files_and_never_keep_the_message(tmp_path: Path) -> None:
+    """Review 3, F5, with the shapes Opengrep 1.30.1 really wrote (saved scans
+    of api_test and study-tutor)."""
+    from forge.security_sweep.scanners import read_opengrep_errors
+
+    sh = str(tmp_path / "deploy" / "deploy.sh")
+    py = str(tmp_path / "src" / "sanitise.py")
+    span = {"start": {"line": 269, "col": 39, "offset": 0}, "end": {"line": 269, "col": 40, "offset": 1}}
+    report = {
+        "results": [],
+        "errors": [
+            {"code": 3, "level": "warn", "type": ["PartialParsing", [{"path": sh, **span}]],
+             "message": f"Syntax error at line {sh}:269:\n `secret` was unexpected",
+             "path": sh, "spans": [{"file": sh, **span}]},
+            {"code": 2, "level": "warn", "type": "Other syntax error",
+             "message": f"Other syntax error at line {py}:3", "path": py},
+            {"code": 3, "level": "warn", "type": ["PartialParsing", []],
+             "spans": [{"file": "/elsewhere/x.sh", **span}]},
+        ],
+    }
+    gaps = read_opengrep_errors(json.dumps(report).encode(), tmp_path)
+    assert gaps.files == {"deploy/deploy.sh": "PartialParsing", "src/sanitise.py": "Other syntax error"}
+    assert gaps.incomplete  # the third names no file inside the export
+    clean = read_opengrep_errors(json.dumps({"results": [], "errors": []}).encode(), tmp_path)
+    assert clean.files == {} and not clean.incomplete

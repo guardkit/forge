@@ -83,6 +83,7 @@ from .scanners import (
     osv_argv,
     read_gitleaks,
     read_opengrep,
+    read_opengrep_errors,
     read_osv,
     run_tool,
     write_factory_ignore,
@@ -182,6 +183,11 @@ class ProjectResult:
     too_large: list[str] = field(default_factory=list)
     #: Declined repair rows whose findings are still present, by row.
     declined: dict[int, int] = field(default_factory=dict)
+    #: Files the code scanner could not fully check (shown path -> error
+    #: type), and whether its scan as a whole was incomplete. Said, never on
+    #: their own a reason to post (they recur every night).
+    code_partial: dict[str, str] = field(default_factory=dict)
+    code_scan_incomplete: bool = False
 
     @property
     def has_news(self) -> bool:
@@ -218,6 +224,12 @@ class ProjectResult:
             out["still_open"] = {str(k): v for k, v in self.still_open.items()}
         if self.declined:
             out["declined"] = {str(k): v for k, v in self.declined.items()}
+        if self.code_partial:
+            out["code_not_fully_checked"] = [
+                {"file": path, "error": kind} for path, kind in list(self.code_partial.items())[:20]
+            ]
+        if self.code_scan_incomplete:
+            out["code_scan_incomplete"] = True
         for name in ("symlinks_skipped", "submodules_skipped", "settings_left_out", "too_large"):
             values = getattr(self, name)
             if values:
@@ -290,6 +302,13 @@ def _project_phrase(result: ProjectResult, name: str) -> str:
         parts.append(f"{part} not checked ({reason})")
     if result.no_lockfile and PART_DEPENDENCIES not in result.not_checked:
         parts.append("dependencies can't be checked (no lockfile)")
+    if result.code_scan_incomplete:
+        parts.append("code patterns not fully checked (the scanner reported an error)")
+    elif result.code_partial:
+        parts.append(
+            f"{_plural(len(result.code_partial), 'file', 'files')} not fully checked "
+            "for code patterns (the scanner could not parse all of it)"
+        )
     if result.too_large:
         parts.append(
             f"{_plural(len(result.too_large), 'file', 'files')} not checked: too large"
@@ -659,10 +678,17 @@ async def _scan_code(deps, project, tree, work, key, files, catalogue, result, c
         return
     try:
         locations = read_opengrep(run.stdout, tree, catalogue)
+        gaps = read_opengrep_errors(run.stdout, tree)
     except ValueError:
         result.not_checked[PART_CODE] = "the code scanner's report could not be read"
         return
-    checked.add(TOOL_OPENGREP)
+    # Files the scanner could not fully parse keep their earlier findings;
+    # an error naming no file leaves the whole scan incomplete, and nothing
+    # from it is marked gone tonight (Codex implementation review 3, F5).
+    result.code_partial = {shown(path): kind for path, kind in sorted(gaps.files.items())}
+    result.code_scan_incomplete = gaps.incomplete
+    if not gaps.incomplete:
+        checked.add(TOOL_OPENGREP)
     for loc in locations:
         fp = line_fingerprint(
             key,
@@ -740,6 +766,8 @@ def _update_statuses(deps, project, state, rows, current, checked, result) -> se
     for fp, entry in list(state.entries_for(project)):
         if fp in current or entry.get("status") == "gone":
             continue
+        if entry.get("tool") == TOOL_OPENGREP and entry.get("file") in result.code_partial:
+            continue  # that file was not fully checked tonight
         if entry.get("tool") in checked:
             entry["status"] = "gone"
             entry["gone_at"] = today

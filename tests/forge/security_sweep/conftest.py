@@ -160,6 +160,10 @@ class FakeScanners:
     #: When True the excerpt check (gitleaks stdin) finds nothing, as a real
     #: scanner may on a cut-off excerpt.
     stdin_blind: bool = False
+    #: Opengrep's "errors" to report, each given the export root and returning
+    #: one error object; and file names (relative) whose results to leave out.
+    opengrep_errors: list[Callable[[Path], dict[str, Any]]] = field(default_factory=list)
+    opengrep_silent_files: set[str] = field(default_factory=set)
     #: Called when the excerpt check runs (to change the world mid-run).
     on_stdin: Callable[[], None] | None = None
 
@@ -194,7 +198,13 @@ class FakeScanners:
         if tool == "osv-scanner":
             return ToolRun(True, json.dumps(self._osv(target, "--all-packages" in argv)).encode())
         if tool == "opengrep":
-            return ToolRun(True, json.dumps(self._opengrep(target)).encode())
+            report = self._opengrep(target)
+            report["results"] = [
+                r for r in report["results"]
+                if Path(r["path"]).relative_to(target).as_posix() not in self.opengrep_silent_files
+            ]
+            report["errors"] = [make(target) for make in self.opengrep_errors]
+            return ToolRun(True, json.dumps(report).encode())
         return ToolRun(False, reason="unknown tool")
 
     @staticmethod
