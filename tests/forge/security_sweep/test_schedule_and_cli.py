@@ -271,19 +271,31 @@ class TestTheServeWiring:
         assert 'name="forge-serve-security-sweep"' in run_serve
 
 
-def test_the_coordinator_is_handed_the_sweeps_model_names_empty_by_default() -> None:
-    """Fix 9: the three names reach the coordinator from the env file, and an
-    unset one arrives empty (not configured), never as some other address."""
+def test_the_coordinator_is_handed_the_sweeps_own_model_names_empty_by_default() -> None:
+    """Item 9, as decided: the coordinator gets FORGE_SWEEP_MODEL_* with empty
+    defaults, and no GUARDKIT_STAMP_MODEL* name at all (that would switch on
+    the plan's stamp check)."""
     import yaml
 
     root = Path(__file__).resolve().parents[3]
     compose = yaml.safe_load((root / "deploy" / "compose" / "compose.yaml").read_text())
     environment = compose["services"]["coordinator"]["environment"]
-    assert environment["GUARDKIT_STAMP_MODEL_URL"] == "${FORGE_SWEEP_MODEL_URL:-}"
-    assert environment["GUARDKIT_STAMP_MODEL"] == "${FORGE_SWEEP_MODEL:-}"
-    assert environment["GUARDKIT_STAMP_MODEL_EXTRA_BODY"] == "${FORGE_SWEEP_MODEL_EXTRA_BODY:-}"
+    for name in ("FORGE_SWEEP_MODEL_URL", "FORGE_SWEEP_MODEL", "FORGE_SWEEP_MODEL_EXTRA_BODY"):
+        assert environment[name] == "${" + name + ":-}"
+    assert not [n for n in environment if n.startswith("GUARDKIT_STAMP_MODEL")]
     assert "OPENAI_BASE_URL" not in environment
     for example in ("deploy/estate/.env.example", "deploy/compose/.env.example"):
         text = (root / example).read_text()
         for name in ("FORGE_SWEEP_MODEL_URL", "FORGE_SWEEP_MODEL", "FORGE_SWEEP_MODEL_EXTRA_BODY"):
             assert f"\n{name}=\n" in text, f"{example} does not document {name}, empty"
+
+
+def test_the_estate_coordinator_sets_no_stamp_model_name() -> None:
+    """The estate's own compose file adds nothing GUARDKIT_STAMP_MODEL* to the
+    coordinator either."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[3]
+    estate = yaml.safe_load((root / "deploy" / "estate" / "compose.yaml").read_text())
+    environment = (estate.get("services", {}).get("coordinator") or {}).get("environment") or {}
+    assert not [n for n in environment if str(n).startswith("GUARDKIT_STAMP_MODEL")]

@@ -392,22 +392,22 @@ the door can be pushed to a public one.
 
 The coordinator's nightly security sweep (off unless `security_sweep.enabled`
 is true in its settings) has the factory's own model sort the secret and code
-findings it makes. It asks through GuardKit's own model client, and the
-coordinator hands that client three names from the env file:
+findings it makes. The coordinator is given three names from the env file, and
+the sweep hands them to GuardKit's own model client as arguments:
 
-| Env file | Becomes, in the coordinator | Example |
-| --- | --- | --- |
-| `FORGE_SWEEP_MODEL_URL` | `GUARDKIT_STAMP_MODEL_URL` | `http://<gateway address>:4100/v1` |
-| `FORGE_SWEEP_MODEL` | `GUARDKIT_STAMP_MODEL` | `qwen3.8-flash-next-autoround` |
-| `FORGE_SWEEP_MODEL_EXTRA_BODY` | `GUARDKIT_STAMP_MODEL_EXTRA_BODY` | `{"chat_template_kwargs":{"enable_thinking":false}}` (optional) |
+| Env file and coordinator | Example |
+| --- | --- |
+| `FORGE_SWEEP_MODEL_URL` | `http://<gateway address>:4100/v1` |
+| `FORGE_SWEEP_MODEL` | `qwen3.8-flash-next-autoround` |
+| `FORGE_SWEEP_MODEL_EXTRA_BODY` | `{"chat_template_kwargs":{"enable_thinking":false}}` (optional) |
 
 The address is the feature router at the gateway address, which the
 coordinator can reach and which needs no key. It is not the model door above:
 that door is the sandbox's way out and is firewalled from the coordinator on
-purpose. Empty means not configured: nothing is asked (an empty address never
-falls back to `OPENAI_BASE_URL`), the findings wait to be sorted, and the
-sweep's Slack line says so. The plan's stamp check, when it runs in the
-coordinator's container, reads the same three names.
+purpose. Empty means not configured: nothing is asked (nothing falls back to
+`OPENAI_BASE_URL`), the findings wait to be sorted, and the sweep's Slack line
+says so. GuardKit's own `GUARDKIT_STAMP_MODEL*` names are deliberately not set
+on the coordinator: they would also switch on the plan's stamp check there.
 
 ## The sandbox's memory door
 

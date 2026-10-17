@@ -307,41 +307,73 @@ class TestTheQuestion:
 
 
 class TestTheModelRoute:
-    """Fix 9: an empty address is "not configured", never OPENAI_BASE_URL."""
+    """Item 9, as decided: the sweep's own names, handed to GuardKit's client
+    as arguments; the process environment is never changed."""
 
-    def _fake_guardkit(self, monkeypatch: pytest.MonkeyPatch, asker: object) -> list[str]:
+    def _fake_guardkit(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple]:
         import types
 
-        asked: list[str] = []
+        built: list[tuple] = []
 
-        def build_default_asker() -> object:
-            asked.append("built")
-            return asker
+        class ConfiguredAsker:
+            def __init__(self, base_url, model, timeout, *, extra_body=None, timeout_note=""):
+                built.append((base_url, model, timeout, extra_body))
 
         module = types.ModuleType("guardkit.orchestrator.stamp_model_fallback")
-        module.build_default_asker = build_default_asker  # type: ignore[attr-defined]
-        for name in ("guardkit", "guardkit.orchestrator"):
-            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+        module.ConfiguredAsker = ConfiguredAsker  # type: ignore[attr-defined]
+        module.DEFAULT_TIMEOUT_S = 60.0  # type: ignore[attr-defined]
+        package = types.ModuleType("guardkit.orchestrator")
+        package.stamp_model_fallback = module  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, "guardkit", types.ModuleType("guardkit"))
+        monkeypatch.setitem(sys.modules, "guardkit.orchestrator", package)
         monkeypatch.setitem(sys.modules, "guardkit.orchestrator.stamp_model_fallback", module)
-        return asked
+        return built
 
-    def test_an_empty_address_is_not_configured_even_with_openai_base_url(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_the_sweeps_names_are_passed_as_arguments(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import os
+
+        from forge.security_sweep.sorting import default_asker
+
+        built = self._fake_guardkit(monkeypatch)
+        monkeypatch.setenv("FORGE_SWEEP_MODEL_URL", "http://192.0.2.1:4100/v1")
+        monkeypatch.setenv("FORGE_SWEEP_MODEL", "qwen3.8-flash-next-autoround")
+        monkeypatch.setenv("FORGE_SWEEP_MODEL_EXTRA_BODY", '{"chat_template_kwargs":{"enable_thinking":false}}')
+        for name in ("GUARDKIT_STAMP_MODEL_URL", "GUARDKIT_STAMP_MODEL", "OPENAI_BASE_URL"):
+            monkeypatch.delenv(name, raising=False)
+        before = dict(os.environ)
+        asker, why = default_asker()
+        assert asker is not None and why == ""
+        assert built == [(
+            "http://192.0.2.1:4100/v1", "qwen3.8-flash-next-autoround", 60.0,
+            {"chat_template_kwargs": {"enable_thinking": False}},
+        )]
+        assert dict(os.environ) == before
+        assert "GUARDKIT_STAMP_MODEL_URL" not in os.environ
+
+    @pytest.mark.parametrize("url, model", [("", "m"), ("http://192.0.2.1:4100/v1", ""), (None, None)])
+    def test_an_empty_address_or_name_is_not_configured(
+        self, monkeypatch: pytest.MonkeyPatch, url: str | None, model: str | None
     ) -> None:
         from forge.security_sweep.sorting import default_asker
 
-        asked = self._fake_guardkit(monkeypatch, asker=object())
-        monkeypatch.setenv("GUARDKIT_STAMP_MODEL_URL", "")
+        built = self._fake_guardkit(monkeypatch)
+        for name, value in (("FORGE_SWEEP_MODEL_URL", url), ("FORGE_SWEEP_MODEL", model)):
+            if value is None:
+                monkeypatch.delenv(name, raising=False)
+            else:
+                monkeypatch.setenv(name, value)
+        # Neither GuardKit's names nor OPENAI_BASE_URL count for the sweep.
         monkeypatch.setenv("OPENAI_BASE_URL", "http://192.0.2.1:4000/v1")
-        monkeypatch.setenv("GUARDKIT_STAMP_MODEL", "some-model")
+        monkeypatch.setenv("GUARDKIT_STAMP_MODEL_URL", "http://192.0.2.1:4000/v1")
+        monkeypatch.setenv("GUARDKIT_STAMP_MODEL", "other")
         assert default_asker() == (None, "the model is not configured")
-        assert asked == []
+        assert built == []
 
-    def test_a_set_address_uses_guardkits_own_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def test_an_extra_body_that_is_not_an_object_is_left_out(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from forge.security_sweep.sorting import default_asker
 
-        sentinel = object()
-        asked = self._fake_guardkit(monkeypatch, asker=sentinel)
-        monkeypatch.setenv("GUARDKIT_STAMP_MODEL_URL", "http://192.0.2.1:4100/v1")
-        assert default_asker() == (sentinel, "")
-        assert asked == ["built"]
+        built = self._fake_guardkit(monkeypatch)
+        env = {"FORGE_SWEEP_MODEL_URL": "http://192.0.2.1:4100/v1", "FORGE_SWEEP_MODEL": "m",
+               "FORGE_SWEEP_MODEL_EXTRA_BODY": "[1, 2]"}
+        asker, _ = default_asker(env)
+        assert asker is not None and built[0][3] == {}

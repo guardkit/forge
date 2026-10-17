@@ -29,25 +29,34 @@ The redaction boundary (design step 3, Codex R3)
 The model route
 ---------------
 
-The sweep asks the model the coordinator already asks during planning: the
-stamp check's model, named by ``GUARDKIT_STAMP_MODEL`` and reached at
-``GUARDKIT_STAMP_MODEL_URL`` (or ``OPENAI_BASE_URL``) with ``OPENAI_API_KEY``,
-through GuardKit's own client (``guardkit.orchestrator.stamp_model_fallback``).
-No new model client and no new credential. When that route is not configured,
-nothing is asked and the findings stay ``pending``, which the Slack line says.
+The sweep asks the factory's own model through GuardKit's own client
+(``guardkit.orchestrator.stamp_model_fallback.ConfiguredAsker``), built from
+the sweep's own three settings, ``FORGE_SWEEP_MODEL_URL``,
+``FORGE_SWEEP_MODEL`` and ``FORGE_SWEEP_MODEL_EXTRA_BODY``, passed as
+arguments (:func:`default_asker`). No new model client and no new
+credential; the process environment is never changed. When the address or
+the name is empty, nothing is asked and the findings stay ``pending``,
+which the Slack line says.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Iterable, Mapping, Sequence
 
 from .findings import KIND_CODE, Finding
 
-#: The model address name the sweep reads (GuardKit's stamp-check client).
-MODEL_URL_NAME = "GUARDKIT_STAMP_MODEL_URL"
+logger = logging.getLogger(__name__)
+
+#: The sweep's own model settings (fix pass, 17 October 2026). They are the
+#: sweep's alone: GuardKit's GUARDKIT_STAMP_MODEL* names would also switch on
+#: the plan's stamp check in the coordinator, so the sweep never uses them.
+MODEL_URL_NAME = "FORGE_SWEEP_MODEL_URL"
+MODEL_NAME = "FORGE_SWEEP_MODEL"
+MODEL_EXTRA_BODY_NAME = "FORGE_SWEEP_MODEL_EXTRA_BODY"
 
 #: Lines either side of a code finding in its excerpt.
 EXCERPT_CONTEXT = 20
@@ -155,30 +164,53 @@ def read_answer(text: object) -> bool | None:
     return answers[-1]
 
 
-def default_asker() -> tuple[Asker | None, str]:
-    """``(asker, why not)`` for the coordinator's existing model route.
+def _extra_body(raw: str) -> dict[str, object]:
+    """The optional extra request fields, or ``{}`` when unset or not a JSON object."""
+    if not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except ValueError:
+        value = None
+    if not isinstance(value, dict):
+        # The value is never logged: an operator could put something private in it.
+        logger.warning("security sweep: %s is not a JSON object; the model is asked without it", MODEL_EXTRA_BODY_NAME)
+        return {}
+    return value
 
-    ``why not`` is plain words when there is no asker ("the model is not
-    configured"); never the endpoint, never a key.
+
+def default_asker(environ: Mapping[str, str] | None = None) -> tuple[Asker | None, str]:
+    """``(asker, why not)`` from the sweep's own three settings.
+
+    ``FORGE_SWEEP_MODEL_URL`` (the OpenAI-compatible ``/v1`` root),
+    ``FORGE_SWEEP_MODEL`` (the name the router serves) and the optional
+    ``FORGE_SWEEP_MODEL_EXTRA_BODY`` (a JSON object). They are handed to
+    GuardKit's own client as constructor arguments; the process environment
+    is read, never changed, so nothing else in the coordinator — the plan's
+    stamp check above all — starts asking a model because the sweep was
+    configured. An empty or missing address or name means not configured:
+    nothing is asked and nothing falls back to ``OPENAI_BASE_URL``.
+
+    ``why not`` is plain words; never the address, never a key.
     """
-    # An address name that is present but empty means "not configured", and
-    # never falls through to OPENAI_BASE_URL. GuardKit's own rule says the
-    # same (empty_env_disables, checked on 17 October 2026); it is said again
-    # here so the sweep does not depend on that staying true. The estate
-    # passes FORGE_SWEEP_MODEL_URL through as GUARDKIT_STAMP_MODEL_URL, empty
-    # when it is not set.
-    if os.environ.get(MODEL_URL_NAME) is not None and not os.environ[MODEL_URL_NAME].strip():
+    env = os.environ if environ is None else environ
+    url = str(env.get(MODEL_URL_NAME) or "").strip()
+    model = str(env.get(MODEL_NAME) or "").strip()
+    if not url or not model:
         return None, "the model is not configured"
     try:
-        from guardkit.orchestrator.stamp_model_fallback import build_default_asker
+        from guardkit.orchestrator import stamp_model_fallback as client
     except Exception:  # noqa: BLE001 — an older or absent GuardKit means no model
         return None, "the model route is not available in this image"
     try:
-        asker = build_default_asker()
+        asker = client.ConfiguredAsker(
+            url,
+            model,
+            float(getattr(client, "DEFAULT_TIMEOUT_S", 60.0)),
+            extra_body=_extra_body(str(env.get(MODEL_EXTRA_BODY_NAME) or "")),
+        )
     except Exception:  # noqa: BLE001 — a bad setting means no model, said plainly
         return None, "the model route's settings could not be read"
-    if asker is None:
-        return None, "the model is not configured"
     return asker, ""
 
 

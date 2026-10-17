@@ -272,9 +272,10 @@ database: the saved state, one history line per run, the private key its
 fingerprints are made with, its lock, and its own copies of the projects. The
 model it asks is named in the env file by `FORGE_SWEEP_MODEL_URL`,
 `FORGE_SWEEP_MODEL` and `FORGE_SWEEP_MODEL_EXTRA_BODY`, which `compose.yaml`
-hands the coordinator as GuardKit's own `GUARDKIT_STAMP_MODEL_*` names (see
-`../estate/README.md`, "The model the nightly security check asks"). Left
-empty, findings wait to be sorted and the line says so. The block is refused by an image that does not know it, so put
+hands the coordinator under the same names and the sweep passes to GuardKit's
+own client as arguments (see `../estate/README.md`, "The model the nightly
+security check asks"). Left empty, findings wait to be sorted and the line
+says so. The block is refused by an image that does not know it, so put
 it in the settings file only once that image is running.
 
 ## What is deliberately not in this file
