@@ -300,6 +300,39 @@ class TestItReadsTheRemoteBack:
         assert _the_remote_branch(world["project"]["bare"]) is None
 
 
+    def test_a_push_that_failed_and_a_read_back_that_failed_is_not_known(
+        self, world: dict[str, Any]
+    ) -> None:
+        """The network went for both: the answer says ask again, not stop."""
+        publisher = Publisher(world["settings"])
+        real = publisher._commits_for  # noqa: SLF001
+
+        class _TheNetworkWent:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+                self._pushed = False
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            def send(self, commit: str, branch: str) -> Any:
+                self._pushed = True
+                return git_work.GitSaid(ok=False, said="git push ended with exit code 128")
+
+            def what_the_remote_lists(self, branch: str) -> Any:
+                if self._pushed:
+                    return git_work.TheRemotesList(ok=False, said="the remote could not be listed")
+                return self._inner.what_the_remote_lists(branch)
+
+        publisher._commits_for = lambda route: _TheNetworkWent(real(route))  # noqa: SLF001
+
+        answer = publisher.create_mission_branch(_ask(world))
+
+        assert answer.created is False
+        assert answer.refusal_kind == "the-remote-could-not-be-read-back"
+        assert answer.refusal_kind in publisher_client._OUTCOME_NOT_KNOWN  # noqa: SLF001
+
+
 class TestItRecovers:
     def test_a_lost_reply_then_the_same_request(self, world: dict[str, Any]) -> None:
         bare = world["project"]["bare"]

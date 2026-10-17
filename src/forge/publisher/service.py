@@ -1004,7 +1004,17 @@ class Publisher:
         # lost on the way back). The remote decides: if the branch is at the
         # commit, it was created.
         back = commits.what_the_remote_lists(branch)
-        if not sent.ok and not (back.ok and back.branch_tip == commit):
+        if not sent.ok and not back.ok:
+            # Neither the push nor the look after it could say: whether the
+            # branch is there is not known, and asking again is safe.
+            return _not_created(
+                "the-remote-could-not-be-read-back",
+                f"the push of '{branch}' at {commit[:10]} reported failure "
+                f"({sent.said}), and then {back.said}. Whether the branch is "
+                "there cannot be said from here; asking again is safe.",
+                **said,
+            )
+        if not sent.ok and back.branch_tip != commit:
             return _not_created(
                 "the-remote-refused-the-branch",
                 f"the remote named origin refused the new branch '{branch}' at "
