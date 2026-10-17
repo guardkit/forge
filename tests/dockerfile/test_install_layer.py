@@ -1406,11 +1406,12 @@ class TestTheSecurityScanners:
             body,
             re.MULTILINE,
         )
-        # 1,290 rules: every security rule in the .yaml and .yml rule files,
-        # less the hard-coded-secret rules Gitleaks owns (fix pass, 17 October).
+        # 1,338 rules: every security rule in the .yaml and .yml rule files,
+        # less the 225 secret-value detectors Gitleaks owns (fix pass,
+        # 17 October; listed in deploy/security/dropped-secret-rules.txt).
         assert re.search(
             r"^ARG\s+OPENGREP_RULES_SHA256="
-            r"4acd14e32d67a6c478aab0c3922f97c7cca25bd0a38d524691e3400b65fc1e07\s*$",
+            r"ba63c213f10965b80822c3427eb691e7c1b958e6e92b5ba5b9c004a9030f61d2\s*$",
             body,
             re.MULTILINE,
         )
@@ -1440,6 +1441,7 @@ class TestTheSecurityScanners:
             "timeout --kill-after=5 120 ${as_player} opengrep scan --config /opt/opengrep/security-rules.yaml"
             " --config /opt/factory-security/compose-rules.yaml",
             "grep -q 'factory-compose-privileged' \"${check_home}/opengrep.json\"",
+            "grep -q 'secret-in-build-arg' \"${check_home}/opengrep.json\"",
         ):
             assert check in run, f"the self-check must include: {check}"
 

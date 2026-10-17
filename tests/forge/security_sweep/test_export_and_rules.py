@@ -313,29 +313,59 @@ async def test_build_vendor_and_test_folders_are_scanned_but_node_modules_is_not
 
 
 class TestTheRuleFileBuilderFixPass:
-    """Fixes 7 and 8: .yml rule files are read; secret rules are left to Gitleaks."""
+    """Fixes 7 and 8, as decided: .yml rule files are read; only secret-VALUE
+    detectors are left to Gitleaks, and rules about handling secrets stay."""
 
-    def test_yml_rules_are_read_and_secret_rules_left_out(self, tmp_path: Path) -> None:
+    def test_only_value_detectors_are_left_out(self, tmp_path: Path) -> None:
         builder = _builder()
         root = tmp_path / "rules"
+        cwe798 = "    cwe: ['CWE-798: Use of Hard-coded Credentials']\n"
         files = {
             "rust/security/a.yml": "rules:\n- id: rust-keep\n  metadata: {category: security}\n",
             "rust/security/a.test.yml": "rules:\n- id: rust-test\n  metadata: {category: security}\n",
-            "generic/secrets/b.yaml": (
-                "rules:\n- id: detected-aws-access-token\n  metadata: {category: security}\n"
-                "- id: generic-cred\n  metadata:\n    category: security\n"
-                "    cwe: ['CWE-798: Use of Hard-coded Credentials']\n"
-                "- id: shell-injection\n  metadata: {category: security, cwe: ['CWE-78: OS Command Injection']}\n"
+            "generic/secrets/gitleaks/adafruit-api-key.yaml": (
+                "rules:\n- id: adafruit-api-key\n  metadata: {category: security}\n"
             ),
-            "x/c.yaml": (
-                "rules:\n- id: hardcoded-PASSWORD-x\n  metadata: {category: security}\n"
-                "- id: leaked-api_key\n  metadata: {category: security}\n"
-                "- id: private-key-in-repo\n  metadata: {category: security}\n"
-                "- id: client-secret\n  metadata: {category: security}\n"
+            "python/lang/secrets/x.yaml": "rules:\n- id: py-value\n  metadata: {category: security}\n",
+            "go/lang/security/c.yaml": (
+                "rules:\n- id: detected-thing\n  metadata:\n    category: security\n" + cwe798
+                + "- id: hardcoded-jwt-secret\n  metadata:\n    category: security\n" + cwe798
+            ),
+            "dockerfile/security/secret-in-build-arg.yaml": (
+                "rules:\n- id: secret-in-build-arg\n  metadata: {category: security}\n"
+            ),
+            "python/django/security/csrf.yaml": (
+                "rules:\n- id: django-no-csrf-token\n  metadata: {category: security}\n"
+                "- id: md5-used-as-password\n  metadata: {category: security}\n"
+                "- id: unvalidated-password\n  metadata: {category: security}\n"
+                "- id: ldap-bind-without-password\n  metadata: {category: security}\n"
             ),
         }
         for name, text in files.items():
             path = root / name
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(text)
-        assert [r["id"] for r in builder.security_rules(root)] == ["shell-injection", "rust-keep"]
+        kept = [r["id"] for r in builder.security_rules(root)]
+        assert kept == [
+            "secret-in-build-arg", "hardcoded-jwt-secret", "django-no-csrf-token",
+            "md5-used-as-password", "unvalidated-password", "ldap-bind-without-password",
+            "rust-keep",
+        ]
+        assert builder.dropped_rules(root) == [
+            ("generic/secrets/gitleaks/adafruit-api-key.yaml", "adafruit-api-key"),
+            ("go/lang/security/c.yaml", "detected-thing"),
+            ("python/lang/secrets/x.yaml", "py-value"),
+        ]
+
+    def test_the_committed_list_is_what_the_builder_drops(self) -> None:
+        listed = [
+            line for line in (REPO_ROOT / "deploy" / "security" / "dropped-secret-rules.txt")
+            .read_text().splitlines() if line and not line.startswith("#")
+        ]
+        assert len(listed) == 225
+        assert all(line.startswith("generic/secrets/") for line in listed)
+        ids = {line.split("\t")[1] for line in listed}
+        assert not ids & {
+            "secret-in-build-arg", "django-no-csrf-token", "md5-used-as-password",
+            "unvalidated-password", "ldap-bind-without-password",
+        }

@@ -213,10 +213,11 @@ RUN pip install \
 #
 # WHAT IT MAKES. One file, /out/security-rules.yaml, holding every rule of
 # the opengrep/opengrep-rules repository, at the commit pinned below, whose
-# metadata says "category: security", except the rules that look for
-# hard-coded secrets, which are Gitleaks' job (1,290 rules at this commit;
+# metadata says "category: security", except the rules that detect a secret
+# value, which are Gitleaks' job (1,338 rules kept at this commit, 225 left
+# out and listed in deploy/security/dropped-secret-rules.txt;
 # deploy/security/build_opengrep_rules.py says exactly which files it reads
-# and why the secret rules are left out). The runtime stage copies only that file
+# and which rules it leaves out). The runtime stage copies only that file
 # and its sha256 record; the checkout and git stay here, in a stage that is
 # thrown away.
 #
@@ -239,7 +240,7 @@ RUN pip install \
 FROM python:3.14-slim-bookworm@sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a AS opengrep-rules
 
 ARG OPENGREP_RULES_COMMIT=f1d2b562b414783763fd02a6ed2736eaed622efa
-ARG OPENGREP_RULES_SHA256=4acd14e32d67a6c478aab0c3922f97c7cca25bd0a38d524691e3400b65fc1e07
+ARG OPENGREP_RULES_SHA256=ba63c213f10965b80822c3427eb691e7c1b958e6e92b5ba5b9c004a9030f61d2
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates git \
     && apt-get clean \
@@ -628,7 +629,8 @@ RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium firef
 # three security scanners' exact versions, the Opengrep rule file against its
 # recorded sha256, and that Opengrep, run as the Player under a time limit,
 # loads both rule files and finds the factory's privileged-service rule in a
-# two-line Compose file.
+# small Compose file and the community secret-in-build-arg rule in a two-line
+# Dockerfile (the second proves the rule about handling secrets was kept).
 RUN check_home="$(mktemp -d)" \
     && chown 1000:1000 "${check_home}" \
     && as_player="setpriv --reuid=1000 --regid=1000 --clear-groups env -i PATH=/usr/bin:/bin HOME=${check_home}" \
@@ -648,10 +650,13 @@ RUN check_home="$(mktemp -d)" \
     && test "$(${as_player} opengrep --version)" = "${OPENGREP_VERSION}" \
     && (cd /opt/opengrep && sha256sum --check --strict security-rules.yaml.sha256) \
     && printf 'services:\n  app:\n    image: x\n    privileged: true\n' > "${check_home}/compose.yaml" \
+    && printf 'FROM scratch\nARG API_TOKEN\n' > "${check_home}/Dockerfile" \
     && { timeout --kill-after=5 120 ${as_player} opengrep scan --config /opt/opengrep/security-rules.yaml \
              --config /opt/factory-security/compose-rules.yaml --disable-version-check --json --quiet \
-             "${check_home}/compose.yaml" < /dev/null > "${check_home}/opengrep.json" 2> "${check_home}/opengrep.log" \
+             "${check_home}/compose.yaml" "${check_home}/Dockerfile" \
+             < /dev/null > "${check_home}/opengrep.json" 2> "${check_home}/opengrep.log" \
          && grep -q 'factory-compose-privileged' "${check_home}/opengrep.json" \
+         && grep -q 'secret-in-build-arg' "${check_home}/opengrep.json" \
          || { cat "${check_home}/opengrep.log" >&2; exit 1; }; } \
     && chrome="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -path '*/chromium-*/chrome-linux-arm64/chrome' -name chrome)" \
     && headless_shell="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -path '*/chromium_headless_shell-*/chrome-headless-shell-linux-arm64/chrome-headless-shell' -name chrome-headless-shell)" \
