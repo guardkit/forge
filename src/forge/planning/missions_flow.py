@@ -292,7 +292,7 @@ class MissionFlow:
         self._starting: set[str] = set()
         self._last_sent: dict[str, datetime] = {}
 
-    def _spawn(self, work: Awaitable[None]) -> None:
+    def _in_the_background(self, work: Awaitable[None]) -> None:
         task = self._spawn_task(work)
         if isinstance(task, asyncio.Future):
             self._tasks.add(task)
@@ -376,7 +376,7 @@ class MissionFlow:
         if mission.id in self._waiting:
             return
         self._waiting.add(mission.id)
-        self._spawn(self._wait_for_answer(mission.id))
+        self._in_the_background(self._wait_for_answer(mission.id))
 
     def _envelope(self, mission: Mission) -> tuple[Any, str]:
         from nats_core.envelope import EventType, MessageEnvelope
@@ -660,4 +660,4 @@ class MissionFlow:
                 continue
             if mission.id in self._starting:
                 continue
-            self._spawn(self.start_branch(mission))
+            self._in_the_background(self.start_branch(mission))
