@@ -53,7 +53,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Callable, Final, Iterator
+from typing import Any, Callable, Final, Iterator, Sequence
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -1418,6 +1418,8 @@ class SqliteLifecyclePersistence:
         start_commit: str,
         target_branch: str,
         queued_at: datetime,
+        memory_project: str | None = None,
+        launch_settings: Sequence[str] | None = None,
     ) -> str:
         """The mission's own merge build: one ``builds`` row, one transaction.
 
@@ -1433,7 +1435,14 @@ class SqliteLifecyclePersistence:
           ``forge/source/<build_id>``, the frozen local copy of the tip;
         * ``feature_yaml_path`` is the last landed feature's file;
         * ``COMPLETE``, ``triggered_by = 'forge-internal'``;
-        * the start point is main's tip now, on the remote's default branch.
+        * the start point is main's tip now, on the remote's default branch;
+        * ``memory_project`` and ``launch_settings`` are the last landed
+          feature's (17 October 2026, the live trial): the preview's deploy
+          stage and the press read the build's declared settings off this
+          row, and a row without them asked for none, so the preview ran
+          with no browser path and the press would have run with memory off.
+          ``launch_settings`` is stored as the JSON list of names, as at the
+          one build INSERT; ``None`` leaves it not declared.
 
         Idempotent per mission: a second call returns the row already written
         and writes nothing. Raises ``RuntimeError`` on a ledger without the
@@ -1471,8 +1480,9 @@ class SqliteLifecyclePersistence:
                 "feature_yaml_path, status, triggered_by, originating_user, "
                 "correlation_id, queued_at, started_at, completed_at, mode, "
                 "merge_branch, start_commit, target_branch, mission_id, "
-                "mission_role) VALUES (?, ?, ?, ?, ?, 'COMPLETE', "
-                "'forge-internal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "mission_role, memory_project, launch_settings) VALUES "
+                "(?, ?, ?, ?, ?, 'COMPLETE', "
+                "'forge-internal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     build_id,
                     feature_id,
@@ -1490,6 +1500,12 @@ class SqliteLifecyclePersistence:
                     target_branch,
                     mission_id,
                     MISSION_ROLE_MERGE,
+                    memory_project or None,
+                    (
+                        json.dumps([str(name).strip() for name in launch_settings])
+                        if launch_settings is not None
+                        else None
+                    ),
                 ),
             )
             self._cx.execute("COMMIT;")

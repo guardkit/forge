@@ -509,6 +509,44 @@ class TestTheMissionsMergeCard:
         assert len(_offers(pool, build_id)) == 1 and len(wire.approvals) == 1
 
     @pytest.mark.asyncio
+    async def test_the_merge_build_carries_the_last_features_declared_settings(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        tmp_path: Path,
+    ) -> None:
+        """The live trial, 17 October 2026: the mission-merge row had neither
+        field, so the preview's deploy asked for no settings (no browser path)
+        and the press would have run with memory off."""
+        from forge.pipeline.merge_executor import _the_builds_declarations
+
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        store = await _land(config_on, pool, repo_root)
+        pool.connection.execute(
+            "UPDATE builds SET memory_project = ?, launch_settings = ? WHERE build_id = ?",
+            ("react_go_notes_fixture", '["PLAYWRIGHT_BROWSERS_PATH"]', B_BUILD),
+        )
+        pool.connection.commit()
+        service, _wire = _offer_service(config_on, pool)
+        deps, _thread = _finish_deps(config_on, pool, offer=service.offer)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "offered"
+
+        build_id = str(mission_merge_build_id(pool, MISSION_ID))
+        assert pool.read_memory_project(build_id) == "react_go_notes_fixture"
+        assert pool.read_launch_settings(build_id) == ("PLAYWRIGHT_BROWSERS_PATH",)
+        # What the preview's deploy and the press read for this build is what
+        # they read for the last feature: the memory and the setting names.
+        db = tmp_path / "forge.db"
+        merge_memory, merge_names, _merge_start = _the_builds_declarations(db, build_id)
+        feature_memory, feature_names, _feature_start = _the_builds_declarations(db, B_BUILD)
+        assert (merge_memory, merge_names) == (feature_memory, feature_names)
+        assert merge_names == ("PLAYWRIGHT_BROWSERS_PATH",)
+        assert store.get(MISSION_ID).status == "READY"
+
+    @pytest.mark.asyncio
     async def test_a_stale_source_is_put_back_and_the_pin_survives_a_restart(
         self,
         config_on: ForgeConfig,

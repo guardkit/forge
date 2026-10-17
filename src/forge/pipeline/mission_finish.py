@@ -681,6 +681,10 @@ async def _offer_the_mission(
         start_commit=str(start.commit),
         target_branch=str(start.branch),
         queued_at=deps.clock(),
+        # The build's declared settings, as the last landed feature recorded
+        # them: the preview's deploy and the press read them off this row.
+        memory_project=deps.pool.read_memory_project(last.build_id),
+        launch_settings=deps.pool.read_launch_settings(last.build_id),
     )
     refreshed = store.get(mission.id) or mission
     return await _freeze_and_offer(
