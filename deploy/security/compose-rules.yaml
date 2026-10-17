@@ -1,0 +1,161 @@
+# ---------------------------------------------------------------------------
+# THE FACTORY'S OWN COMPOSE RULES (security check design, 17 October 2026,
+# piece 2, Codex review point R8).
+#
+# WHY THESE EXIST. The community Opengrep rules for Compose files all begin by
+# matching a top-level 'version:' field. Current Compose files, the factory's
+# own included, leave that field out, so those rules never fire on them. These
+# six rules check the same risky settings and match whether 'version:' is
+# there or not. The nightly sweep runs them instead of the community Compose
+# rules (it leaves those out by id).
+#
+# WHAT THEY CHECK, one rule each:
+#   * a service running privileged;
+#   * the Docker socket mounted into a service (whoever holds it controls the
+#     host's Docker);
+#   * security_opt switching off seccomp, AppArmor or SELinux labelling;
+#   * network_mode: host;
+#   * pid: host;
+#   * cap_add of ALL or SYS_ADMIN.
+#
+# WHAT THEY LEAVE OUT, on purpose: a missing 'no-new-privileges' and a
+# writable root filesystem. Nearly every Compose file would trip them, and a
+# rule that always fires is a rule nobody reads.
+#
+# WHERE THEY APPLY: only files named like '*compose*.yml' or
+# '*compose*.yaml'. Each rule's message is fixed text: the sweep repeats it
+# word for word and never adds anything from the scanned file.
+#
+# Copied into the factory image at /opt/factory-security/compose-rules.yaml.
+# ---------------------------------------------------------------------------
+rules:
+  - id: factory-compose-privileged
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      A Compose service runs privileged, which gives the container the
+      powers of root on the host. Remove 'privileged: true'.
+    metadata:
+      category: security
+      source: factory
+      cwe: ["CWE-250: Execution with Unnecessary Privileges"]
+    paths:
+      include: ["*compose*.yml", "*compose*.yaml"]
+    patterns:
+      - pattern-inside: |
+          services:
+            ...
+      - pattern: |
+          privileged: $VALUE
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: (?i)^["']?(true|yes|on)["']?$
+
+  - id: factory-compose-docker-socket
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      A Compose service mounts the Docker socket. Whoever can use that socket
+      controls the host's Docker and so the host. Remove the mount.
+    metadata:
+      category: security
+      source: factory
+      cwe: ["CWE-250: Execution with Unnecessary Privileges"]
+    paths:
+      include: ["*compose*.yml", "*compose*.yaml"]
+    patterns:
+      - pattern-inside: |
+          services:
+            ...
+      - pattern-inside: |
+          volumes:
+            ...
+      - pattern-regex: (?m)^[ \t]*(?:-[ \t]*)?(?:source:[ \t]*)?["']?[^"'\s#]*docker\.sock\b[^\n]*
+
+  - id: factory-compose-security-opt-disabled
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      A Compose service's security_opt switches off seccomp, AppArmor or
+      SELinux labelling, which removes a layer that keeps the container in.
+      Remove that security_opt entry.
+    metadata:
+      category: security
+      source: factory
+      cwe: ["CWE-284: Improper Access Control"]
+    paths:
+      include: ["*compose*.yml", "*compose*.yaml"]
+    patterns:
+      - pattern-inside: |
+          services:
+            ...
+      - pattern-inside: |
+          security_opt:
+            ...
+      - pattern-regex: (?i)\b(?:seccomp|apparmor)[ \t]*[:=][ \t]*["']?unconfined\b|\blabel[ \t]*[:=][ \t]*["']?disable\b
+
+  - id: factory-compose-network-host
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      A Compose service uses the host's network (network_mode: host), so it
+      can reach and listen on everything the host can. Give it its own
+      network instead.
+    metadata:
+      category: security
+      source: factory
+      cwe: ["CWE-668: Exposure of Resource to Wrong Sphere"]
+    paths:
+      include: ["*compose*.yml", "*compose*.yaml"]
+    patterns:
+      - pattern-inside: |
+          services:
+            ...
+      - pattern: |
+          network_mode: $VALUE
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: ^["']?host["']?$
+
+  - id: factory-compose-pid-host
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      A Compose service shares the host's process list (pid: host), so it can
+      see and signal the host's processes. Remove 'pid: host'.
+    metadata:
+      category: security
+      source: factory
+      cwe: ["CWE-668: Exposure of Resource to Wrong Sphere"]
+    paths:
+      include: ["*compose*.yml", "*compose*.yaml"]
+    patterns:
+      - pattern-inside: |
+          services:
+            ...
+      - pattern: |
+          pid: $VALUE
+      - metavariable-regex:
+          metavariable: $VALUE
+          regex: ^["']?host["']?$
+
+  - id: factory-compose-cap-add-all
+    languages: [yaml]
+    severity: ERROR
+    message: >-
+      A Compose service adds the ALL or SYS_ADMIN capability, which is close
+      to running it privileged. Add only the capabilities it needs.
+    metadata:
+      category: security
+      source: factory
+      cwe: ["CWE-250: Execution with Unnecessary Privileges"]
+    paths:
+      include: ["*compose*.yml", "*compose*.yaml"]
+    patterns:
+      - pattern-inside: |
+          services:
+            ...
+      - pattern-inside: |
+          cap_add:
+            ...
+      - pattern-regex: (?i)(?<![A-Za-z0-9_])(?:CAP_)?(?:ALL|SYS_ADMIN)(?![A-Za-z0-9_])
