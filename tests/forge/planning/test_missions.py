@@ -338,10 +338,13 @@ def _message(command: dict[str, Any], *, target_repo: str | None = "react-go-not
 
 
 class _FakeFlow:
-    def __init__(self, missions: MissionStore, *, can_create_branches: bool = True) -> None:
+    def __init__(self, missions: MissionStore, *, unable: str | None = None) -> None:
         self.missions = missions
-        self.can_create_branches = can_create_branches
+        self.unable = unable
         self.proposed: list[dict[str, Any]] = []
+
+    def cannot_start_reason(self) -> str | None:
+        return self.unable
 
     def propose(self, **kwargs: Any) -> Any:
         self.proposed.append(kwargs)
@@ -418,7 +421,7 @@ async def test_the_intake_refuses_when_missions_cannot_run_here(cx) -> None:
     missions = MissionStore(cx)
     said: list[str] = []
     msg = _message(_command())
-    flow = _FakeFlow(missions, can_create_branches=False)
+    flow = _FakeFlow(missions, unable="this factory cannot create a mission branch yet")
     await handle_planning_message(msg, _intake_deps(cx, flow, enabled=True, said=said))
     assert msg.acked and said[-1] == (
         "That mission was not started: this factory cannot create a mission branch yet."
@@ -494,6 +497,8 @@ def _flow(
     cards: list[Any],
     said: list[str],
     clock: Any = None,
+    merge_executor_enabled: bool = True,
+    publication_enabled: bool = True,
 ) -> MissionFlow:
     async def publish_card(envelope: Any) -> None:
         cards.append(envelope)
@@ -515,6 +520,8 @@ def _flow(
         routing_gate=gate,
         clock=clock,
         spawn=asyncio.ensure_future,
+        merge_executor_enabled=merge_executor_enabled,
+        publication_enabled=publication_enabled,
     )
 
 
@@ -654,6 +661,88 @@ async def test_an_unreachable_publisher_is_asked_again_a_minute_later_and_after_
     assert [r["commit"] for r in publisher.requests] == [MAIN_TIP] * 3
     assert missions.get(mission.id).status == "RUNNING"
     assert len(missions.attempts(mission.id)) == 4
+
+
+@pytest.mark.parametrize(
+    ("merge_on", "publication_on", "words"),
+    [
+        (False, True, "the merge step"),
+        (True, False, "publication"),
+    ],
+)
+def test_no_mission_can_start_without_the_merge_step_or_publication(
+    cx, merge_on: bool, publication_on: bool, words: str
+) -> None:
+    missions = MissionStore(cx)
+    flow = _flow(
+        missions,
+        answers=[],
+        gate=None,
+        publisher=_Publisher(missions, []),
+        cards=[],
+        said=[],
+        merge_executor_enabled=merge_on,
+        publication_enabled=publication_on,
+    )
+    reason = flow.cannot_start_reason()
+    assert reason is not None and words in reason and "switched off" in reason
+    assert _flow(
+        missions, answers=[], gate=None, publisher=_Publisher(missions, []), cards=[], said=[]
+    ).cannot_start_reason() is None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("merge_on", "publication_on"), [(False, True), (True, False)]
+)
+async def test_the_intake_refuses_without_the_merge_step_or_publication(
+    cx, merge_on: bool, publication_on: bool
+) -> None:
+    """The real flow's reason reaches the thread, and nothing is filed."""
+    missions = MissionStore(cx)
+    flow = _flow(
+        missions,
+        answers=[],
+        gate=None,
+        publisher=_Publisher(missions, []),
+        cards=[],
+        said=[],
+        merge_executor_enabled=merge_on,
+        publication_enabled=publication_on,
+    )
+    said: list[str] = []
+    msg = _message(_command())
+    await handle_planning_message(msg, _intake_deps(cx, flow, enabled=True, said=said))
+    assert msg.acked and said[-1].startswith("That mission was not started: missions need")
+    assert "switched off here" in said[-1]
+    assert cx.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_settings_changed_between_card_and_approval_are_checked_again(cx) -> None:
+    """A card posted on a factory that could run missions, approved after a
+    restart with the merge step switched off: not started, nothing seeded."""
+    missions = MissionStore(cx)
+    gate, cards, said = _Gate(), [], []
+    publisher = _Publisher(missions, ["created"])
+    first = _flow(missions, answers=[], gate=gate, publisher=publisher, cards=cards, said=said)
+    mission = _propose(first)
+    await _settle()
+    restarted = _flow(
+        missions,
+        answers=[_answer("approve", _request_id(mission.id))],
+        gate=gate,
+        publisher=publisher,
+        cards=cards,
+        said=said,
+        merge_executor_enabled=False,
+    )
+    await restarted.tend()
+    await _settle()
+    got = missions.get(mission.id)
+    assert got.status == "NOT_STARTED" and "merge step" in got.closed_reason
+    assert gate.calls == [] and publisher.requests == []
+    assert missions.attempts(mission.id) == []
 
 
 @pytest.mark.asyncio

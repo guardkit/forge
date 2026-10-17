@@ -638,7 +638,8 @@ async def _start_mission(
 
     Every check is made before any card, and a failure is one plain sentence
     in the thread, acked, with nothing filed: the switch, a publisher client
-    to create the branch with, the planning chain that reads the mission
+    to create the branch with, the merge step and publication (without them
+    nothing lands), the planning chain that reads the mission
     branch (``planning.target_terminal``), the repository
     (typed or the configured default, exactly as a ``build:`` hand-over
     resolves it), and the mission's own shape
@@ -661,15 +662,14 @@ async def _start_mission(
         await msg.ack()
         return
     planning = deps.planning_config
-    # Two things a mission cannot run without, refused before anything is
-    # filed: a way to ask the publisher for the mission branch, and the
-    # planning chain that writes the spec and plan into the project (only it
-    # reads the mission branch as its start).
-    if not getattr(deps.mission_flow, "can_create_branches", False):
-        await _say(
-            "That mission was not started: this factory cannot create a "
-            "mission branch yet."
-        )
+    # What a mission cannot run without, refused before anything is filed:
+    # the flow's own list (a branch client, the merge step, publication), and
+    # the planning chain that writes the spec and plan into the project (only
+    # it reads the mission branch as its start).
+    reason = getattr(deps.mission_flow, "cannot_start_reason", None)
+    unable = reason() if callable(reason) else "this factory cannot run missions"
+    if unable is not None:
+        await _say(f"That mission was not started: {unable}.")
         await msg.ack()
         return
     if not getattr(getattr(planning, "target_terminal", None), "enabled", False):

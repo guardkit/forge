@@ -1563,6 +1563,12 @@ async def compose_planning_consumer_and_dispatch(
             approval_wait_seconds=config.approval.max_wait_seconds,
             routing_gate=feature_routing_gate,
             clock=clock_fn,
+            merge_executor_enabled=bool(
+                getattr(getattr(config, "merge_executor", None), "enabled", False)
+            ),
+            publication_enabled=bool(
+                getattr(getattr(config, "publication", None), "enabled", False)
+            ),
         )
 
         consumer_deps = PlanningConsumerDeps(

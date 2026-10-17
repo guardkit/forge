@@ -268,8 +268,12 @@ class MissionFlow:
         routing_gate: Any | None = None,
         clock: Callable[[], datetime] | None = None,
         spawn: Callable[[Awaitable[None]], Any] | None = None,
+        merge_executor_enabled: bool = True,
+        publication_enabled: bool = True,
     ) -> None:
         self._missions = missions
+        self._merge_executor_enabled = bool(merge_executor_enabled)
+        self._publication_enabled = bool(publication_enabled)
         self._publish_card = publish_card
         self._subscriber_factory = subscriber_factory
         self._notify = notify
@@ -298,6 +302,30 @@ class MissionFlow:
     def can_create_branches(self) -> bool:
         """Is a publisher client wired to create mission branches with?"""
         return self._create_branch is not None
+
+    def cannot_start_reason(self) -> str | None:
+        """Why no mission can run on this factory as it is set up, or None.
+
+        Checked when a mission message arrives and again when its plan is
+        approved. A mission needs a way to create its branch, the merge
+        executor to merge each finished feature into that branch (without it
+        nothing lands, and every admitted feature would keep its place for
+        ever), and publication to send each merge to the remote (without it
+        every feature would stop at "publication pending").
+        """
+        if self._create_branch is None:
+            return "this factory cannot create a mission branch yet"
+        if not self._merge_executor_enabled:
+            return (
+                "missions need the merge step to merge each finished feature "
+                "into the mission branch, and it is switched off here"
+            )
+        if not self._publication_enabled:
+            return (
+                "missions need publication to send each merged feature to the "
+                "project's remote, and it is switched off here"
+            )
+        return None
 
     @property
     def missions(self) -> MissionStore:
@@ -492,6 +520,19 @@ class MissionFlow:
 
     async def _after_approval(self, mission: Mission) -> None:
         """Seed routing once, move to STARTING, and ask for the branch."""
+        unable = self.cannot_start_reason()
+        if unable is not None:
+            # The factory was set up differently when the card went out (a
+            # restart with other settings). Nothing has been seeded or built.
+            if self._missions.set_status(
+                mission.id, "NOT_STARTED", expected=("PROPOSED",), reason=unable
+            ):
+                await self._say(
+                    mission,
+                    f'Mission "{mission.title}" was not started: {unable}. '
+                    "Nothing was built.",
+                )
+            return
         if self._routing_gate is not None:
             try:
                 await self._routing_gate.ensure_seeded(
