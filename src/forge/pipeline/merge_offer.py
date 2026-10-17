@@ -1316,19 +1316,52 @@ def _read_after_deploy_check_event(pool: Any, correlation_id: str) -> str | None
     return str(raw) if raw else ""
 
 
-def signed_off_declared_at_start(pool: Any, row: Any) -> bool | None:
-    """Whether the planning run behind this build found ``reference.signed_off``
-    declared at its start (17 October 2026, coach's review).
+def _admission_record(pool: Any, build_id: str) -> bool | None:
+    """What a prepared build's admission recorded beside its row: ``True``
+    when a signed-off record was declared, ``False`` when none was, ``None``
+    when there is no admission record (a build not admitted that way)."""
+    from forge.lifecycle.persistence import PREPARED_ADMISSION_STAGE
 
-    ``True``/``False`` from the run's own record: a run that passed its door
-    (its memory name is recorded) and recorded reference material naming a
-    record, or not. ``None`` when there is no such run to ask (a prepared or
-    hand-queued build, a run that never passed its door) or the ledger cannot
-    be read. Never raises.
+    found = _one_row(
+        pool,
+        "SELECT details_json FROM stage_log WHERE build_id = ? "
+        "AND target_identifier = ? ORDER BY id DESC LIMIT 1",
+        (build_id, PREPARED_ADMISSION_STAGE),
+    )
+    if found is None:
+        return None
+    details = json.loads(found[0] or "{}") or {}
+    if "reference_signed_off" not in details:
+        return None
+    return bool(details.get("reference_signed_off"))
+
+
+def signed_off_declared_at_start(pool: Any, row: Any) -> bool | None:
+    """Whether ``reference.signed_off`` was declared where this build's work
+    started (17 October 2026, coach's review and Codex implementation review
+    R4).
+
+    ``True``/``False`` from a durable record made at the start: the prepared
+    admission's record beside the build row (or, for a repair, beside its
+    parent's), else the planning run's own (a run that passed its door — its
+    memory name is recorded — and recorded reference material naming a
+    record, or not). ``None`` when nothing was recorded (a build from before
+    this change, a row written ahead by hand) or the ledger cannot be read.
+    Never raises.
     """
+    from forge.pipeline.fix_row_producer import source_build_id_from_correlation_id
     from forge.planning.reference_material import REFERENCE_MATERIAL_STAGE
 
     try:
+        build_id = str(getattr(row, "build_id", "") or "")
+        parent = source_build_id_from_correlation_id(
+            str(getattr(row, "correlation_id", "") or "")
+        )
+        for candidate in (build_id, parent):
+            if candidate:
+                admitted = _admission_record(pool, str(candidate))
+                if admitted is not None:
+                    return admitted
         correlation_id = _planning_run_behind(pool, row)
         if correlation_id is None:
             return None
@@ -2276,34 +2309,43 @@ class MergeOfferService:
         if self._commit_reader is None:
             return ""
         from forge.planning.reference_material import (
+            PROTOTYPE_NOT_READ_LINE,
             prototype_card_line_at_commit,
         )
 
+        declared: bool | None = None
         try:
             if row is None:
                 row = self._pool.get_build_row(build_id)
             if row is None:
                 return ""
+            # What was recorded at the start decides every read failure below
+            # (Codex implementation review R4): declared → said, not declared
+            # → nothing, unknown → nothing and a warning.
+            declared = signed_off_declared_at_start(self._pool, row)
             repo_root = self._config.planning.target_repo_paths.get(row.repo)
             start_point = self._pool.read_start_point(build_id)
             commit = getattr(start_point, "start_commit", None)
             if not repo_root or not getattr(start_point, "recorded", False) or not commit:
-                return ""
+                raise LookupError("the build has no recorded start commit or checkout")
             return await prototype_card_line_at_commit(
                 self._commit_reader(row.repo, Path(repo_root)),
                 repo_path=str(repo_root),
                 commit=str(commit),
-                declared_at_start=signed_off_declared_at_start(self._pool, row),
+                declared_at_start=declared,
             )
         except Exception as exc:  # noqa: BLE001 — a reader never stops a card
             logger.warning(
                 "merge-offer: could not read which signed-off prototype %s "
-                "was built from (%s: %s) — the card says nothing about it",
+                "was built from (%s: %s) — %s",
                 build_id,
                 type(exc).__name__,
                 exc,
+                "the card says it could not be read"
+                if declared
+                else "the card says nothing about it",
             )
-            return ""
+            return PROTOTYPE_NOT_READ_LINE if declared else ""
 
     async def offer(
         self,

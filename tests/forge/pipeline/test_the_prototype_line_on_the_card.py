@@ -177,9 +177,11 @@ def _trees(at_start: dict[str, tuple[str, str]]) -> Trees:
     return Trees({START: at_start, TARGET: newer, CANDIDATE_SHA: newer, LOCAL_MAIN: newer})
 
 
-async def _routine(config: Any, pool: Any, trees: Trees | None) -> str:
+async def _routine(config: Any, pool: Any, trees: Trees | None, prepare: Any = None) -> str:
     _insert_build(pool)
     _record_start(pool)
+    if prepare is not None:
+        prepare(pool)
     recorder = _Recorder()
     await _service(config, pool, recorder, trees=trees, rules=StandInGuardKit()).maybe_offer(
         _event()
@@ -187,9 +189,11 @@ async def _routine(config: Any, pool: Any, trees: Trees | None) -> str:
     return _approval_words(recorder)
 
 
-async def _repair(config: Any, pool: Any, trees: Trees | None) -> str:
+async def _repair(config: Any, pool: Any, trees: Trees | None, prepare: Any = None) -> str:
     _insert_build(pool)
     _record_start(pool)
+    if prepare is not None:
+        prepare(pool)
     recorder = _Recorder()
     service = _service(config, pool, recorder, trees=trees, rules=StandInGuardKit())
     publish_card = make_merge_card_publisher(
@@ -304,3 +308,119 @@ async def test_an_unreadable_start_commit_follows_the_start_record(
         assert said in words
     else:
         assert "prototype" not in words
+
+
+# ---------------------------------------------------------------------------
+# A prepared build: what its admission found is kept beside its row (R4)
+# ---------------------------------------------------------------------------
+
+
+def _admission(signed_off: str | None) -> Any:
+    from forge.pipeline.prepared_admission import AdmittedBuild
+
+    return AdmittedBuild(
+        start_commit=START,
+        target_branch="main",
+        source_commit=START,
+        memory_project="gadgets",
+        reference_signed_off=signed_off,
+    )
+
+
+def _admitted_payload() -> Any:
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        feature_id="FEAT-PREP",
+        repo="acme/gadgets",
+        branch="feature/prepared",
+        feature_yaml_path=".guardkit/features/FEAT-PREP.yaml",
+        max_turns=5,
+        sdk_timeout_seconds=1800,
+        triggered_by="jarvis",
+        originating_adapter="slack",
+        originating_user="someone",
+        correlation_id="corr-prepared-1",
+        parent_request_id=None,
+        queued_at=datetime(2026, 10, 17, 9, 0, tzinfo=UTC),
+    )
+
+
+@pytest.mark.parametrize(("signed_off", "expected"), [(RECORD_PATH, True), (None, False)])
+def test_the_admission_keeps_what_it_found_beside_the_row(
+    pool: Any, signed_off: str | None, expected: bool
+) -> None:
+    build_id = pool.record_pending_build(_admitted_payload(), admitted=_admission(signed_off))
+    assert signed_off_declared_at_start(pool, pool.get_build_row(build_id)) is expected
+
+
+def _as_admitted(signed_off: str | None) -> Any:
+    """The record a prepared admission writes beside the build row, for the
+    harness's build (whose row the harness writes itself)."""
+    from forge.lifecycle.persistence import PREPARED_ADMISSION_STAGE
+
+    def write(pool: Any) -> None:
+        pool.connection.execute(
+            "INSERT INTO stage_log (build_id, stage_label, target_kind, "
+            "target_identifier, status, started_at, completed_at, duration_secs, "
+            "details_json) VALUES (?, ?, 'local_tool', ?, 'PASSED', ?, ?, 0.0, ?)",
+            (
+                BUILD_ID,
+                PREPARED_ADMISSION_STAGE,
+                PREPARED_ADMISSION_STAGE,
+                "2026-10-17T09:00:00+00:00",
+                "2026-10-17T09:00:00+00:00",
+                json.dumps({"reference_signed_off": signed_off}),
+            ),
+        )
+        pool.connection.commit()
+
+    return write
+
+
+@pytest.mark.parametrize("card", sorted(CARDS))
+@pytest.mark.parametrize(
+    ("signed_off", "said"),
+    [(RECORD_PATH, PROTOTYPE_NOT_READ_LINE), (None, None)],
+    ids=["prepared-declared", "prepared-undeclared"],
+)
+@pytest.mark.asyncio
+async def test_a_prepared_build_with_an_unreadable_start_follows_its_admission(
+    config: Any, pool: Any, card: str, signed_off: str | None, said: str | None
+) -> None:
+    trees = Trees({TARGET: _files(None), CANDIDATE_SHA: _files(None), LOCAL_MAIN: _files(None)})
+    words = await CARDS[card](config, pool, trees, prepare=_as_admitted(signed_off))
+    if said:
+        assert said in words
+    else:
+        assert "prototype" not in words
+
+
+@pytest.mark.parametrize(
+    ("signed_off", "expected"),
+    [(RECORD_PATH, PROTOTYPE_NOT_READ_LINE), (None, "")],
+    ids=["declared", "undeclared"],
+)
+@pytest.mark.asyncio
+async def test_the_outer_failure_path_follows_the_start_record(
+    config: Any, pool: Any, signed_off: str | None, expected: str
+) -> None:
+    """A failure outside the settings read itself (here the commit reader
+    cannot even be made) still follows what was recorded at the start."""
+    from forge.pipeline.merge_offer import MergeOfferService
+
+    _insert_build(pool)
+    _record_start(pool)
+    _as_admitted(signed_off)(pool)
+
+    def broken_reader(_repo: str, _root: Any) -> Any:
+        raise RuntimeError("no reader for this project")
+
+    service = MergeOfferService(
+        config=config,
+        pool=pool,
+        pipeline_publisher=None,
+        raw_publish=None,  # type: ignore[arg-type]
+        commit_reader=broken_reader,
+    )
+    assert await service.card_line_about_the_prototype(BUILD_ID) == expected
