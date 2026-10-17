@@ -213,8 +213,10 @@ RUN pip install \
 #
 # WHAT IT MAKES. One file, /out/security-rules.yaml, holding every rule of
 # the opengrep/opengrep-rules repository, at the commit pinned below, whose
-# metadata says "category: security" (deploy/security/build_opengrep_rules.py
-# says exactly which files it reads). The runtime stage copies only that file
+# metadata says "category: security", except the rules that look for
+# hard-coded secrets, which are Gitleaks' job (1,290 rules at this commit;
+# deploy/security/build_opengrep_rules.py says exactly which files it reads
+# and why the secret rules are left out). The runtime stage copies only that file
 # and its sha256 record; the checkout and git stay here, in a stage that is
 # thrown away.
 #
@@ -237,7 +239,7 @@ RUN pip install \
 FROM python:3.14-slim-bookworm@sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a AS opengrep-rules
 
 ARG OPENGREP_RULES_COMMIT=f1d2b562b414783763fd02a6ed2736eaed622efa
-ARG OPENGREP_RULES_SHA256=3422e1049c7905a7fab2f467c0ebf89f6fce4716d0c213012738b943add3c0f3
+ARG OPENGREP_RULES_SHA256=4acd14e32d67a6c478aab0c3922f97c7cca25bd0a38d524691e3400b65fc1e07
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends ca-certificates git \
     && apt-get clean \

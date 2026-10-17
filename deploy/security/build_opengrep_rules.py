@@ -8,14 +8,21 @@ YAML file per rule set, beside the test files the rules are checked against.
 The sweep wants only the security ones, in one file, fixed at image build
 time so nothing is fetched when the image runs.
 
-WHAT IT KEEPS. Every rule, in every rule file ending ``.yaml``, whose
-``metadata.category`` is ``security``. That is the selection the design
-measured on 17 October 2026 (1,543 rules at commit
-``f1d2b562b414783763fd02a6ed2736eaed622efa``). Left out: the repository's own
-test files (``*.test.yaml``, which hold copies of rules on purpose), anything
-under a hidden folder (``.github``), and files that are not rule files or do
-not parse. Duplicate rule ids are kept as the repository has them: some rules
-exist once per language under the same id.
+WHAT IT KEEPS. Every rule, in every rule file ending ``.yaml`` or ``.yml``,
+whose ``metadata.category`` is ``security`` — except the rules that look for
+hard-coded secrets. Left out: the repository's own test files
+(``*.test.yaml``, ``*.test.yml``, which hold copies of rules on purpose),
+anything under a hidden folder (``.github``), and files that are not rule
+files or do not parse. Duplicate rule ids are kept as the repository has
+them: some rules exist once per language under the same id.
+
+WHY THE SECRET RULES ARE LEFT OUT (fix pass, 17 October 2026). Secrets
+belong to Gitleaks, which runs with ``--redact``. A secret rule here would
+duplicate it, and worse: the sweep sends a code finding's surrounding lines
+to the model after hiding every line Gitleaks flags, so a secret only an
+Opengrep rule caught could reach the model. A rule is left out when its
+metadata names CWE-798 (hard-coded credentials) or its id says secret,
+token, password, api-key or private-key.
 
 WHY THE OUTPUT IS JSON IN A ``.yaml`` FILE. JSON is a subset of YAML, which is
 what Opengrep reads, and Python's ``json`` writes it the same way every time.
@@ -38,6 +45,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -47,11 +55,19 @@ import yaml
 #: The category a rule must carry to be kept.
 SECURITY_CATEGORY = "security"
 
+#: The weakness id of hard-coded credentials; rules naming it are Gitleaks' job.
+HARD_CODED_CREDENTIALS = "CWE-798"
+
+#: Rule ids that say they look for a secret.
+SECRET_RULE_ID = re.compile(
+    r"secret|token|password|api[-_]?key|private[-_]?key", re.IGNORECASE
+)
+
 
 def _rule_files(root: Path) -> list[Path]:
     """Every candidate rule file under ``root``, in a fixed order."""
     found: list[Path] = []
-    for path in root.rglob("*.yaml"):
+    for path in [*root.rglob("*.yaml"), *root.rglob("*.yml")]:
         relative = path.relative_to(root)
         if any(part.startswith(".") for part in relative.parts):
             continue
@@ -60,6 +76,16 @@ def _rule_files(root: Path) -> list[Path]:
         if path.is_file() and not path.is_symlink():
             found.append(path)
     return sorted(found, key=lambda p: p.relative_to(root).as_posix())
+
+
+def is_secret_rule(rule: dict[str, Any]) -> bool:
+    """Whether a rule looks for hard-coded secrets (left to Gitleaks)."""
+    if SECRET_RULE_ID.search(str(rule.get("id") or "")):
+        return True
+    metadata = rule.get("metadata")
+    cwe = metadata.get("cwe") if isinstance(metadata, dict) else None
+    entries = cwe if isinstance(cwe, list) else [cwe]
+    return any(HARD_CODED_CREDENTIALS in str(entry) for entry in entries if entry)
 
 
 def security_rules(root: Path) -> list[dict[str, Any]]:
@@ -82,7 +108,11 @@ def security_rules(root: Path) -> list[dict[str, Any]]:
             if not isinstance(rule, dict) or not isinstance(rule.get("id"), str):
                 continue
             metadata = rule.get("metadata")
-            if isinstance(metadata, dict) and metadata.get("category") == SECURITY_CATEGORY:
+            if (
+                isinstance(metadata, dict)
+                and metadata.get("category") == SECURITY_CATEGORY
+                and not is_secret_rule(rule)
+            ):
                 kept.append(rule)
     return kept
 

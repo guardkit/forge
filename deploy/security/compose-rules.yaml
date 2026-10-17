@@ -41,10 +41,11 @@ rules:
       cwe: ["CWE-250: Execution with Unnecessary Privileges"]
     paths:
       include: ["*compose*.yml", "*compose*.yaml"]
+    # Not limited to the services block: 'privileged: true' written in an
+    # 'x-' extension block and merged into a service with '<<: *anchor'
+    # counts too. Only Compose files are checked, where the setting means
+    # nothing else.
     patterns:
-      - pattern-inside: |
-          services:
-            ...
       - pattern: |
           privileged: $VALUE
       - metavariable-regex:
@@ -67,10 +68,20 @@ rules:
       - pattern-inside: |
           services:
             ...
-      - pattern-inside: |
-          volumes:
-            ...
-      - pattern-regex: (?m)^[ \t]*(?:-[ \t]*)?(?:source:[ \t]*)?["']?[^"'\s#]*docker\.sock\b[^\n]*
+      - pattern-either:
+          # The block forms: '- /var/run/docker.sock:...' and the long form's
+          # 'source: /var/run/docker.sock'. Comment lines never match.
+          - patterns:
+              - pattern-inside: |
+                  volumes:
+                    ...
+              - pattern-regex: (?m)^[ \t]*(?:-[ \t]*)?(?:source:[ \t]*)?["']?[^"'\s#]*docker\.sock\b[^\n]*
+          # The flow form: volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"].
+          # One list item, right after its '[' or ','.
+          - patterns:
+              - pattern-inside: |
+                  volumes: [...]
+              - pattern-regex: '(?<=[\[,])[ \t]*["'']?[^"''\]\n,#]*docker\.sock\b[^"''\]\n,]*'
 
   - id: factory-compose-security-opt-disabled
     languages: [yaml]

@@ -1406,7 +1406,14 @@ class TestTheSecurityScanners:
             body,
             re.MULTILINE,
         )
-        assert re.search(r"^ARG\s+OPENGREP_RULES_SHA256=[0-9a-f]{64}\s*$", body, re.MULTILINE)
+        # 1,290 rules: every security rule in the .yaml and .yml rule files,
+        # less the hard-coded-secret rules Gitleaks owns (fix pass, 17 October).
+        assert re.search(
+            r"^ARG\s+OPENGREP_RULES_SHA256="
+            r"4acd14e32d67a6c478aab0c3922f97c7cca25bd0a38d524691e3400b65fc1e07\s*$",
+            body,
+            re.MULTILINE,
+        )
         assert 'test "$(git -C /src/opengrep-rules rev-parse HEAD)" = "${OPENGREP_RULES_COMMIT}"' in body
         assert (
             'echo "${OPENGREP_RULES_SHA256}  /out/security-rules.yaml" | sha256sum --check --strict -'

@@ -238,3 +238,104 @@ class TestTheRuleFileBuilder:
         empty.mkdir()
         assert builder.main(["x", str(empty), str(tmp_path / "out.yaml")]) == 1
         assert not (tmp_path / "out.yaml").exists()
+
+
+@pytest.mark.skipif(not OPENGREP, reason="opengrep is not installed (set FORGE_TEST_OPENGREP)")
+class TestTheFixPassRules:
+    """Fix 3: the flow-style socket mount and a privileged x- anchor."""
+
+    def test_a_flow_style_socket_mount_is_found(self, tmp_path: Path) -> None:
+        target = tmp_path / "tree"
+        target.mkdir()
+        (target / "compose.yaml").write_text(
+            "services:\n  a:\n    image: x\n"
+            '    volumes: ["./data:/data", "/var/run/docker.sock:/var/run/docker.sock:ro"]\n'
+            "  b:\n    image: y\n    volumes: [\"./data:/data\"]\n"
+            '    command: ["echo", "docker.sock"]\n'
+        )
+        assert _opengrep(target) == [("factory-compose-docker-socket", "compose.yaml", 4)]
+
+    def test_privileged_in_a_merged_anchor_is_found(self, tmp_path: Path) -> None:
+        target = tmp_path / "tree"
+        target.mkdir()
+        (target / "docker-compose.yml").write_text(
+            "x-risky: &risky\n  privileged: true\nx-safe: &safe\n  privileged: false\n"
+            "services:\n  a:\n    <<: *risky\n    image: x\n"
+        )
+        assert _opengrep(target) == [("factory-compose-privileged", "docker-compose.yml", 2)]
+
+
+@pytest.mark.skipif(not OPENGREP, reason="opengrep is not installed (set FORGE_TEST_OPENGREP)")
+@pytest.mark.asyncio
+async def test_build_vendor_and_test_folders_are_scanned_but_node_modules_is_not(
+    tmp_path: Path,
+) -> None:
+    """Fix 2: the factory's .semgrepignore replaces Opengrep's built-in list."""
+    from forge.security_sweep.scanners import (
+        RuleCatalogue,
+        ScannerSetup,
+        opengrep_argv,
+        read_opengrep,
+        run_tool,
+        write_factory_ignore,
+    )
+
+    work = tmp_path / "work"
+    tree = work / "tree"
+    shell = "import subprocess\nsubprocess.call(c, shell=True)\n"
+    privileged = "services:\n  a:\n    privileged: true\n"
+    for folder in ("build", "vendor", "tests", "node_modules"):
+        (tree / folder).mkdir(parents=True)
+        (tree / folder / "run.py").write_text(shell)
+    (tree / "build" / "docker-compose.yml").write_text(privileged)
+    rules = tmp_path / "rules.yaml"
+    rules.write_text(json.dumps({"rules": [{
+        "id": "shell-call", "languages": ["python"], "severity": "ERROR",
+        "message": "A shell call.", "metadata": {"category": "security"},
+        "pattern": "subprocess.call(..., shell=True)",
+    }]}))
+    factory = tmp_path / "factory"
+    factory.mkdir()
+    shutil.copy(COMPOSE_RULES, factory / "compose-rules.yaml")
+    setup = ScannerSetup(gitleaks=None, osv_scanner=None, opengrep=str(OPENGREP),
+                         factory_dir=factory, opengrep_rules=rules)
+    write_factory_ignore(work)
+    run = await run_tool(opengrep_argv(setup, tree), cwd=work, timeout=300, ok_codes=(0, 1))
+    assert run.ok, run.reason
+    found = read_opengrep(run.stdout, tree, RuleCatalogue.from_files(rules, factory / "compose-rules.yaml"))
+    assert sorted((f.rule, f.file) for f in found) == [
+        ("factory-compose-privileged", "build/docker-compose.yml"),
+        ("shell-call", "build/run.py"),
+        ("shell-call", "tests/run.py"),
+        ("shell-call", "vendor/run.py"),
+    ]
+    assert not (tree / ".semgrepignore").exists()
+
+
+class TestTheRuleFileBuilderFixPass:
+    """Fixes 7 and 8: .yml rule files are read; secret rules are left to Gitleaks."""
+
+    def test_yml_rules_are_read_and_secret_rules_left_out(self, tmp_path: Path) -> None:
+        builder = _builder()
+        root = tmp_path / "rules"
+        files = {
+            "rust/security/a.yml": "rules:\n- id: rust-keep\n  metadata: {category: security}\n",
+            "rust/security/a.test.yml": "rules:\n- id: rust-test\n  metadata: {category: security}\n",
+            "generic/secrets/b.yaml": (
+                "rules:\n- id: detected-aws-access-token\n  metadata: {category: security}\n"
+                "- id: generic-cred\n  metadata:\n    category: security\n"
+                "    cwe: ['CWE-798: Use of Hard-coded Credentials']\n"
+                "- id: shell-injection\n  metadata: {category: security, cwe: ['CWE-78: OS Command Injection']}\n"
+            ),
+            "x/c.yaml": (
+                "rules:\n- id: hardcoded-PASSWORD-x\n  metadata: {category: security}\n"
+                "- id: leaked-api_key\n  metadata: {category: security}\n"
+                "- id: private-key-in-repo\n  metadata: {category: security}\n"
+                "- id: client-secret\n  metadata: {category: security}\n"
+            ),
+        }
+        for name, text in files.items():
+            path = root / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+        assert [r["id"] for r in builder.security_rules(root)] == ["shell-injection", "rust-keep"]
