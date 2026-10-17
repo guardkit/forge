@@ -1110,10 +1110,13 @@ class WorkQueueLoop:
                 await self._mission_step.run_once()
             except Exception:  # noqa: BLE001 — a mission never stops the queue
                 logger.exception("work queue: the mission step failed this tick")
-            # -- mission finishing goes here (missions design, section 7) ---
-            # READY missions are finished by their own module, called in its
-            # own clearly separated step, right after the mission step above.
-            # -- end of the mission steps -----------------------------------
+        # MISSIONS, FINISHING (design 17 October 2026, section 7): every
+        # READY mission's merge card, and its answer. It goes straight after
+        # the mission step that makes a mission READY. Nothing runs until
+        # boot installs a finisher; it never raises.
+        from forge.pipeline.mission_finish import run_finishing_step
+
+        await run_finishing_step()
         await self.ask_hold_or_go()
         await self.take_next()
 

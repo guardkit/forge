@@ -258,6 +258,26 @@ async def _arun(
     except (MergeRetired, MergeRetirementError) as exc:
         raise click.ClickException(str(exc)) from exc
 
+    # A MISSION'S BUILD IS NEVER PRESSED BY HAND (missions, 17 October 2026).
+    # A feature inside a mission lands on its mission's branch by itself, and
+    # the mission's own merge into main is pressed only by the answer to the
+    # mission's merge card, which moves the mission along as it goes.
+    from forge.lifecycle.mission_builds import mission_of_build
+
+    belongs = mission_of_build(pool, row.build_id)
+    if belongs is not None:
+        what = (
+            "a feature of mission"
+            if belongs.is_feature
+            else "the merge into main of mission"
+        )
+        raise click.ClickException(
+            f"{row.build_id} is {what} {belongs.mission_id}, so this command "
+            "will not press it: a mission's features land on its branch by "
+            "themselves, and the mission reaches main only through the answer "
+            "to its merge card. Nothing was merged."
+        )
+
     paths = config.planning.target_repo_paths
     if row.repo not in paths:
         known = ", ".join(sorted(paths)) or "(none configured)"

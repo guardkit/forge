@@ -185,6 +185,7 @@ from forge.pipeline.publication_record import (
     RESULT_MERGED_AND_RUNNING,
     RESULT_PUBLICATION_PENDING,
     RESULT_PUBLISHED_DEPLOYMENT_PENDING,
+    RESULT_PUBLISHED_TO_MISSION_BRANCH,
     STEP_CANDIDATE_CHECK,
     STEP_DEPLOY,
     STEP_JOIN,
@@ -355,6 +356,26 @@ MERGE_EXECUTION_ATTEMPT_VERSION_KEY: str = "execution_attempt_version"
 RESULT_WORD_PUBLICATION_PENDING: str = "publication-pending"
 RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING: str = "published-deployment-pending"
 RESULT_WORD_MERGED_AND_RUNNING: str = "merged-into-the-remote-and-running"
+
+#: A MISSION FEATURE'S LANDING (missions design, 17 October 2026, section 6):
+#: the joined commit was checked and is on the mission's branch, and the press
+#: stopped there on purpose (``deploy=False``). It is a finished ending, not a
+#: deploy still owed: only the mission's own merge into main deploys. The
+#: record's plain sentence is
+#: :data:`~forge.pipeline.publication_record.RESULT_PUBLISHED_TO_MISSION_BRANCH`.
+RESULT_WORD_PUBLISHED_TO_MISSION_BRANCH: str = "published-to-the-mission-branch"
+
+#: A mission feature that could not land at all (finished with failed tasks,
+#: an unknown repository, or a press that kept raising): its FAILED landing
+#: report, so the mission closes the attempt. Nothing was published.
+RESULT_WORD_MISSION_LANDING_FAILED: str = "mission-landing-failed"
+
+#: One stage row per landing press STARTED for a mission feature (written
+#: before the press runs, so a press that takes the coordinator down with it
+#: still counts). At ``publication.send_attempts`` started presses with no
+#: report, the build gets a FAILED landing report instead of another press.
+MISSION_LANDING_ATTEMPT_TARGET_IDENTIFIER: str = "mission_landing_attempt"
+MISSION_LANDING_STAGE_LABEL: str = "mission landing"
 
 #: THE EXECUTOR'S WORD FOR A COMMAND A TAKEOVER STOPPED. Written out here
 #: rather than imported, like the sidecar's own wall above, so this module does
@@ -774,7 +795,23 @@ def _mint_repair_row(
     The producer already swallows everything; this call site catches too,
     because the merge report is the only durable record of what the merge
     did and a queue row must never be able to cost it.
+
+    A MISSION'S BUILD FILES NONE (missions design, 17 October 2026, section
+    6, round 1 R3): its failure is recorded on the mission and named on the
+    mission's card. A repair row would sit outside the mission and be refused
+    anyway, because its target is not the default branch.
     """
+    from forge.lifecycle.mission_builds import mission_of_build
+
+    belongs = mission_of_build(pool, build_id)
+    if belongs is not None:
+        logger.info(
+            "merge-executor: %s belongs to mission %s, so no repair was filed — "
+            "the failure is reported on the mission's card",
+            feature_id or build_id,
+            belongs.mission_id,
+        )
+        return
     gate = outcome.gate_before_merge or {}
     if outcome.result == "merged-verify-failed" and outcome.verify_status != "failed":
         logger.info(
@@ -1344,6 +1381,8 @@ async def execute_merge_deploy(
     worktree_retention: dict[str, Any] | None = None,
     merge_execution_attempt_id: str | None = None,
     expected_preview_tree: str | None = None,
+    deploy: bool = True,
+    join_name: str | None = None,
 ) -> MergeDeployOutcome:
     """Run join -> checks -> report for one press, and stop before publishing.
 
@@ -1434,6 +1473,20 @@ async def execute_merge_deploy(
     check, any publication or any deploy; nothing reaches the target branch.
     When it is ``None`` — every offer without a preview — nothing here
     changes.
+
+    ``deploy=False`` is a mission feature's landing (missions design, 17
+    October 2026, section 6): the same join and the same two kinds of check
+    on J, the send to the build's recorded target (its mission's branch), and
+    then the press STOPS after a confirmed publish, recording
+    "published to the mission branch". Nothing is deployed and no preview
+    tree is pinned, because a feature inside a mission has no card and no
+    preview of its own.
+
+    ``join_name`` names the integration branches and working folders
+    (``factory-integration/<join_name>[-attempt-N]``); the feature id when it
+    is not given. A mission's merge into main passes ``mission-<id>``, so it
+    never meets the last feature's own integration names (round 2, R1). The
+    feature id stays the build system's argument.
     """
     # Permanent administrative retirement is checked before routing, clocks,
     # receipts, leases, publishers, git, model-bearing commands, or deploy.
@@ -1441,6 +1494,24 @@ async def execute_merge_deploy(
     from forge.lifecycle.merge_retirement import refuse_retired_build
 
     refuse_retired_build(deps.pool.connection, build_id)
+    # A MISSION'S BUILD IS PRESSED BY ITS OWN RULES, WHOEVER CALLS (missions
+    # design, 17 October 2026, sections 6 and 7). A feature built inside a
+    # mission is never deployed: it lands on its mission's branch only, so
+    # ``deploy`` is forced off whatever the caller passed. The mission's own
+    # merge into main always joins under ``mission-<id>`` (round 2, R1).
+    from forge.lifecycle.mission_builds import mission_join_name, mission_of_build
+
+    belongs_to = mission_of_build(deps.pool, build_id)
+    if belongs_to is not None and belongs_to.is_feature and deploy:
+        logger.info(
+            "merge-executor: %s is a feature of mission %s — it is landed on "
+            "the mission's branch and never deployed",
+            build_id,
+            belongs_to.mission_id,
+        )
+        deploy = False
+    if belongs_to is not None and belongs_to.is_merge:
+        join_name = mission_join_name(belongs_to.mission_id)
     feature_routing_receipt: dict[str, object] | None = None
     if deps.feature_routing_required:
         if deps.feature_routing_gate is None:
@@ -1455,6 +1526,12 @@ async def execute_merge_deploy(
     # The subject as the thread line names it: the branch is said only when it
     # is not the feature's own, so a feature build's words are unchanged.
     named = f"{feature_id} (branch {branch})" if merge_branch is not None else feature_id
+    # The name the join's folders and branches are made under (missions,
+    # round 2 R1): the feature id unless the caller named another.
+    join_as = str(join_name or "").strip() or feature_id
+    # A mission feature's landing has no card and so no previewed tree.
+    if not deploy:
+        expected_preview_tree = None
     # Advisory digest-conformance state — filled in after a landed merge,
     # read by the report step. It can add a warning line; it can never
     # block anything.
@@ -2623,6 +2700,94 @@ async def execute_merge_deploy(
             gate_before_merge=_gate_for_report() if gate_began else None,
         )
 
+    def _published_to_the_mission_branch(
+        *,
+        j_commit: str,
+        target_branch: str,
+        g_commit: str,
+        remote_now: str,
+        checks_passed: int | None,
+        checks_total: int | None,
+        what_was_checked: dict[str, Any],
+        attempt: int,
+        turn: int,
+        store: Any,
+    ) -> MergeDeployOutcome:
+        """A mission feature landed: J is on its mission's branch. Nothing more.
+
+        Missions design, section 6. The record's result is "published to the
+        mission branch", which no reader takes as a deploy still owed; the
+        mission's own merge into main is the only thing that deploys.
+        """
+        if store is not None and not store.record(
+            build_id=build_id,
+            turn=turn,
+            now=deps.clock(),
+            result=RESULT_PUBLISHED_TO_MISSION_BRANCH,
+        ):
+            return _replaced_here()
+        _write_receipt(
+            "merge_deploy_publication.json",
+            {
+                "step": "publication",
+                "switched_on": True,
+                "result": RESULT_PUBLISHED_TO_MISSION_BRANCH,
+                "target_branch": target_branch,
+                "g_commit": g_commit,
+                "build_tip": what_was_checked.get("build_tip"),
+                "j_commit": j_commit,
+                "remote_now": remote_now,
+                "contains_j": True,
+                "attempt": attempt,
+                "turn": turn,
+                "checked": what_was_checked,
+                "deployed": False,
+                "why_nothing_was_deployed": (
+                    "this feature is part of a mission: it is merged into the "
+                    "mission's branch, and only the mission's own merge into "
+                    "main deploys"
+                ),
+            },
+        )
+        return MergeDeployOutcome(
+            result=RESULT_WORD_PUBLISHED_TO_MISSION_BRANCH,
+            status="PASSED",
+            merged_sha=j_commit,
+            detail=(
+                f"{named} was joined onto its mission's branch {target_branch} "
+                f"at {g_commit[:10]} in a working folder of its own, the joined "
+                f"result {j_commit[:10]} was checked{_the_checks_sentence()}, "
+                f"and it was published: {target_branch} on the remote named "
+                f"origin is at {(remote_now or j_commit)[:10]} and contains it. "
+                "Nothing was deployed: only the mission's own merge into main "
+                "deploys."
+            ),
+            checks_passed=checks_passed,
+            checks_total=checks_total,
+            deployed_in=None,
+            gate_before_merge=_gate_for_report() if gate_began else None,
+        )
+
+    def _the_missions_branch() -> str | None:
+        """The branch of the mission this build belongs to, or ``None``.
+
+        Read off the mission record the build's ``mission_id`` names; the
+        join accepts it as the target only when it is also the build's
+        recorded target and the remote has it (``target_branch_now``).
+        """
+        from forge.lifecycle.mission_builds import mission_of_build
+
+        belongs = mission_of_build(deps.pool, build_id)
+        if belongs is None:
+            return None
+        try:
+            row = deps.pool.connection.execute(
+                "SELECT branch FROM missions WHERE id = ?", (belongs.mission_id,)
+            ).fetchone()
+        except Exception:  # noqa: BLE001 — no mission read is no mission branch
+            return None
+        return str(row[0]) if row is not None and row[0] else None
+
     # -----------------------------------------------------------------------
     # THE DEPLOY: under the lock, only forwards, by an identity that cannot be
     # reused, and confirmed from what the running thing itself reports.
@@ -2958,8 +3123,24 @@ async def execute_merge_deploy(
         6. read back the identity the step says is now running and compare it
            with the one it was handed, AS TEXT. A mismatch is a FAILED deploy;
         7. record R and release the lock.
+
+        A MISSION FEATURE'S LANDING STOPS HERE (``deploy=False``): published
+        to its mission's branch is the whole of what it does.
         """
         nonlocal candidate_standing
+        if not deploy:
+            return _published_to_the_mission_branch(
+                j_commit=j_commit,
+                target_branch=target_branch,
+                g_commit=g_commit,
+                remote_now=remote_now,
+                checks_passed=checks_passed,
+                checks_total=checks_total,
+                what_was_checked=what_was_checked,
+                attempt=attempt,
+                turn=turn,
+                store=store,
+            )
         lock = _deployment_lock_store()
         if lock is None:
             return _published_deployment_pending(
@@ -3868,7 +4049,11 @@ async def execute_merge_deploy(
                 a_leg_did_not_complete = True
             tree_path = None
             tree_commit = None
-        where = await target_branch_now(git, recorded_branch=recorded_branch)
+        where = await target_branch_now(
+            git,
+            recorded_branch=recorded_branch,
+            mission_branch=_the_missions_branch(),
+        )
         if not where.ok:
             return _cannot_join(
                 f"{named} could not be joined onto the remote again after it "
@@ -4058,7 +4243,11 @@ async def execute_merge_deploy(
                 type(exc).__name__,
                 exc,
             )
-        where = await target_branch_now(git, recorded_branch=recorded_branch)
+        where = await target_branch_now(
+            git,
+            recorded_branch=recorded_branch,
+            mission_branch=_the_missions_branch(),
+        )
         if not where.ok:
             _write_receipt(
                 "merge_deploy_join.json",
@@ -4216,7 +4405,7 @@ async def execute_merge_deploy(
                         "(%s) and the join is made afresh",
                         feature_id,
                         why,
-                        integration_branch(feature_id, attempt),
+                        integration_branch(join_as, attempt),
                     )
                     if store is not None and not store.done(
                         build_id=build_id,
@@ -4226,7 +4415,7 @@ async def execute_merge_deploy(
                         attempt=attempt,
                         result={
                             "set_aside": True,
-                            "branch_kept": integration_branch(feature_id, attempt),
+                            "branch_kept": integration_branch(join_as, attempt),
                             "commit_kept": record.j_commit,
                             "why": why,
                         },
@@ -4336,6 +4525,7 @@ async def execute_merge_deploy(
                     attempt=unfinished.attempt,
                     g_commit=g_commit,
                     build_tip=candidate_sha,
+                    join_name=join_as,
                 )
                 if leftover.is_the_join:
                     j_commit = leftover.commit
@@ -4384,7 +4574,7 @@ async def execute_merge_deploy(
                         attempt=attempt,
                         result={
                             "set_aside": True,
-                            "branch_kept": integration_branch(feature_id, attempt),
+                            "branch_kept": integration_branch(join_as, attempt),
                             "why": leftover.why,
                         },
                     ):
@@ -4408,7 +4598,7 @@ async def execute_merge_deploy(
                 # perform. The venue already has ``remove_working_folder``; the
                 # stage that can finish a record is the stage that may call it,
                 # and it has to leave the branch alone when it does.
-                folder = working_folder_path(repo_root, feature_id, attempt)
+                folder = working_folder_path(repo_root, join_as, attempt)
                 if store is not None and not store.about_to(
                     build_id=build_id,
                     turn=turn,
@@ -4423,6 +4613,7 @@ async def execute_merge_deploy(
                         build_tip=candidate_sha,
                         branch_to_merge=branch,
                         folder=folder,
+                        join_name=join_as,
                     ),
                 ):
                     return _replaced_here()
@@ -4433,6 +4624,7 @@ async def execute_merge_deploy(
                     feature_id=feature_id,
                     attempt=attempt,
                     at_commit=g_commit,
+                    join_name=join_as,
                 )
                 # CONFIRMED OR NOT (15 October 2026): a folder whose making was
                 # not confirmed — made or refused, in a complete answer — may
@@ -4649,6 +4841,7 @@ async def execute_merge_deploy(
                     attempt=attempt,
                     g_commit=g_commit,
                     build_tip=candidate_sha,
+                    join_name=join_as,
                 )
                 joined_but_unchecked = False
                 if refusal and landed.is_the_join:
@@ -4693,6 +4886,12 @@ async def execute_merge_deploy(
                         "nothing to check"
                     )
                     _release_step(MERGE_STEP_MERGE_TARGET_IDENTIFIER, sentence)
+                    joined_line: dict[str, Any] = {"joined": False, "refusal": sentence}
+                    # A CONFLICT IN A MISSION LANDING SAYS SO (missions design,
+                    # section 6): the mission step files the one rebuild on
+                    # exactly this, so it is a flag, never a sentence to parse.
+                    if not deploy and report is not None and _conflict_sentence(report):
+                        joined_line["conflict"] = True
                     if store is not None:
                         store.done(
                             build_id=build_id,
@@ -4700,7 +4899,7 @@ async def execute_merge_deploy(
                             now=deps.clock(),
                             step=STEP_JOIN,
                             attempt=attempt,
-                            result={"joined": False, "refusal": sentence},
+                            result=joined_line,
                         )
                     refused = MergeDeployOutcome(
                         result="merge-refused",
@@ -5531,7 +5730,7 @@ async def execute_merge_deploy(
                 joined_at[int(line.attempt)] = where
         for attempt_number in range(1, max(highest, 1) + 1):
             folder = joined_at.get(attempt_number) or working_folder_path(
-                repo_root, feature_id, attempt_number
+                repo_root, join_as, attempt_number
             )
             try:
                 removed = await git.remove_working_folder(folder)
@@ -5559,7 +5758,7 @@ async def execute_merge_deploy(
                     "folder": folder,
                     "removed": bool(removed),
                     "answered": removed is not None,
-                    "branch_kept": integration_branch(feature_id, attempt_number),
+                    "branch_kept": integration_branch(join_as, attempt_number),
                 }
             )
         return retired
@@ -5577,7 +5776,10 @@ async def execute_merge_deploy(
     # running thing reported. The JOIN'S working folders go here — every
     # attempt's, the branches left exactly as they are — and the build's own
     # retained folder is retired below on the same word.
-    if not dry_run and outcome.result == RESULT_WORD_MERGED_AND_RUNNING:
+    if not dry_run and outcome.result in (
+        RESULT_WORD_MERGED_AND_RUNNING,
+        RESULT_WORD_PUBLISHED_TO_MISSION_BRANCH,
+    ):
         try:
             store_now = _publication_store()
             record_now = store_now.read(build_id) if store_now is not None else None
@@ -5590,6 +5792,10 @@ async def execute_merge_deploy(
                 "why_now": (
                     "the build's record has reached its end: the joined "
                     "commit is on the remote and what was checked is running"
+                    if outcome.result == RESULT_WORD_MERGED_AND_RUNNING
+                    else "the build's record has reached its end: the joined "
+                    "commit is on its mission's branch, and a feature inside "
+                    "a mission deploys nothing of its own"
                 ),
                 "branches_kept": True,
                 "folders": await _retire_the_joins_working_folders(record_now),
@@ -6055,6 +6261,14 @@ def _decision_entry(
     )
 
 
+def _a_landing_has_reported(pool: Any, build_id: str) -> bool:
+    """Is a merge report on this build's record?"""
+    return any(
+        s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        for s in pool.read_stages(build_id)
+    )
+
+
 def _ledger_of(pool: Any) -> Any | None:
     """The ledger's writer connection, or None for a pool without one."""
     import sqlite3
@@ -6100,6 +6314,11 @@ class MergeApprovalConsumer:
         self._deps = deps
         self._repo_locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        # Mission feature builds this consumer is landing right now, so a
+        # resumption asked for while the first landing still waits for the
+        # repository's lock is not queued behind it a second time.
+        self._landing_now: set[str] = set()
+
         self._subscription: Any = None
 
     async def attach(self, envelope_client: Any) -> Any:
@@ -6536,6 +6755,17 @@ class MergeApprovalConsumer:
     ) -> None:
         # Per-repo single-flight: an asyncio lock per repo key PLUS the
         # executor's own durable step probes.
+        # A MISSION'S MERGE INTO MAIN joins under ``mission-<id>`` (missions
+        # design, round 2 R1), so it never meets the last feature's own
+        # integration names; every other press joins under its feature id.
+        from forge.lifecycle.mission_builds import mission_join_name, mission_of_build
+
+        belongs = mission_of_build(self._deps.pool, build_id)
+        join_name = (
+            mission_join_name(belongs.mission_id)
+            if belongs is not None and belongs.is_merge
+            else None
+        )
         async with self._lock_for(repo):
             ended = "approval failed: the merge press raised"
             try:
@@ -6560,6 +6790,7 @@ class MergeApprovalConsumer:
                         if expected_preview_tree
                         else {}
                     ),
+                    **({"join_name": join_name} if join_name else {}),
                 )
                 ended = f"approval ended: {getattr(outcome, 'result', None)}"
             except Exception as exc:  # noqa: BLE001 — the task must not die silent
@@ -6576,6 +6807,273 @@ class MergeApprovalConsumer:
                 await self._release_the_preview(
                     previewed_offer, build_id=build_id, reason=ended
                 )
+
+    async def land_mission_feature(
+        self, build_id: str, *, tasks_failed: int | None = 0
+    ) -> MergeDeployOutcome | None:
+        """Merge a finished mission feature into its mission's branch. No card.
+
+        Missions design, section 6. Called when a feature built inside a
+        mission finishes, from the place a routine build is offered its merge
+        card (:meth:`MergeOfferService.maybe_offer`, which offers no card for
+        it), and again by the finishing step for a landing that never
+        reported (a restart). It runs the ordinary press:
+
+        * UNDER THE SAME PER-REPOSITORY LOCK as an approved merge, so two
+          features finishing together join, check and publish one after the
+          other (round 1, R4);
+        * onto the build's recorded target, its mission's branch;
+        * with ``deploy=False``: after a confirmed publish it stops and
+          records "published to the mission branch";
+        * with no preview tree pinned.
+
+        The decision row says ``decided_by: "mission <id> (approved by
+        <who>)"``, and its execution attempt id comes from the build, so a
+        landing picked up after a restart is the same attempt. One decision
+        per request still holds: each feature build is its own request.
+
+        A BUILD THAT CANNOT LAND GETS A FAILED LANDING REPORT, so the mission
+        can close its attempt and nothing waits for ever: a build that
+        finished with failed tasks (``tasks_failed``), or whose failed-task
+        count is not known (``tasks_failed=None``: unknown counts as failed),
+        a repository this factory does not know, and a build whose press was
+        started as many times as a merge word may try a send
+        (``publication.send_attempts``, three by default) without reporting.
+        Each started press is one durable stage row, written before it runs,
+        so the count survives a press that takes the coordinator down.
+
+        Idempotent: a build whose landing has already reported is never
+        pressed again (``None``), and one whose decision is recorded but whose
+        press never reported is carried on.
+        """
+        from forge.lifecycle.mission_builds import landing_attempt_id, mission_of_build
+        from forge.lifecycle.missions import MissionStore
+
+        belongs = mission_of_build(self._deps.pool, build_id)
+        if belongs is None or not belongs.is_feature:
+            logger.warning(
+                "merge-executor: %s is not a mission feature — not landed on "
+                "any mission branch",
+                build_id,
+            )
+            return None
+        row = self._deps.pool.get_build_row(build_id)
+        if row is None:
+            logger.error("merge-executor: no builds row for %s — not landed", build_id)
+            return None
+        if _a_landing_has_reported(self._deps.pool, build_id):
+            logger.info(
+                "merge-executor: %s's landing has already reported — not pressed again",
+                build_id,
+            )
+            return None
+        if tasks_failed is None:
+            return self._landing_failed(
+                row,
+                f"{row.feature_id} was not merged into its mission's branch: the "
+                "factory stopped before it could tell whether every task "
+                "passed, and a build it cannot vouch for is not landed",
+            )
+        if tasks_failed:
+            return self._landing_failed(
+                row,
+                f"{row.feature_id} finished with {tasks_failed} failed task(s), so "
+                "it was not merged into its mission's branch",
+            )
+        mission = MissionStore(self._deps.pool.connection).get(belongs.mission_id)
+        if mission is None:
+            return self._landing_failed(
+                row,
+                f"{row.feature_id} names mission {belongs.mission_id}, which is not "
+                "on record, so it was not landed",
+            )
+        repo_root_raw = self._deps.config.planning.target_repo_paths.get(row.repo)
+        if not repo_root_raw:
+            return self._landing_failed(
+                row,
+                f"{row.feature_id}'s repository {row.repo} is not one this factory "
+                "knows, so it was not landed",
+            )
+        decided_by = (
+            f"mission {mission.id} (approved by {mission.approved_by or 'nobody on record'})"
+        )
+        request_id = f"{REQUEST_ID_PREFIX}{build_id}"
+        if build_id in self._landing_now:
+            logger.info(
+                "merge-executor: %s is already being landed on %s — not twice",
+                build_id,
+                mission.branch,
+            )
+            return None
+        self._landing_now.add(build_id)
+        try:
+            # THE DECISION ROW FIRST, before waiting for the repository's
+            # lock: it is the durable fact that this build was asked to land.
+            # One row per build: an existing one is reused, with its attempt.
+            decided = [
+                s
+                for s in self._deps.pool.read_stages(build_id)
+                if s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
+            ]
+            attempt_id = landing_attempt_id(build_id)
+            if decided:
+                said = (decided[-1].details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}
+                attempt_id = str(said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY) or attempt_id)
+            else:
+                self._deps.pool.record_stage(
+                    _decision_entry(
+                        build_id=build_id,
+                        decision="approve",
+                        decided_by=decided_by,
+                        request_id=request_id,
+                        now=self._deps.clock(),
+                        attempt_id=attempt_id,
+                    )
+                )
+            async with self._lock_for(row.repo):
+                if _a_landing_has_reported(self._deps.pool, build_id):
+                    return None
+                allowed = _how_many_attempts(self._deps.config)
+                started = self._landing_attempts(build_id)
+                if started >= allowed:
+                    self._landing_failed(
+                        row,
+                        f"{row.feature_id} could not be landed on "
+                        f"{mission.branch}: its press was started {started} "
+                        f"times and never reported",
+                        attempt_id=attempt_id,
+                    )
+                    return None
+                started += 1
+                self._record_landing_attempt(row, started)
+                try:
+                    outcome = await execute_merge_deploy(
+                        deps=self._deps,
+                        build_id=build_id,
+                        feature_id=row.feature_id,
+                        repo=row.repo,
+                        repo_root=Path(repo_root_raw),
+                        # Informational only on the merge step's row: the
+                        # press joins onto where the mission branch is NOW (G).
+                        expect_main_sha=str(row.start_commit or ""),
+                        correlation_id=row.correlation_id,
+                        decided_by=decided_by,
+                        baseline_failing=None,
+                        merge_branch=_merge_branch_of_record(self._deps.pool, build_id, {}),
+                        merge_execution_attempt_id=attempt_id,
+                        deploy=False,
+                    )
+                except Exception as exc:  # noqa: BLE001 — bounded, then reported
+                    logger.error(
+                        "merge-executor: landing %s on %s raised (%s), attempt %d "
+                        "of %d — see the receipts under merge-%s",
+                        build_id,
+                        mission.branch,
+                        exc,
+                        started,
+                        allowed,
+                        build_id,
+                    )
+                    if started >= allowed:
+                        self._landing_failed(
+                            row,
+                            f"{row.feature_id} could not be landed on "
+                            f"{mission.branch}: the press stopped with "
+                            f"{type(exc).__name__} on all {allowed} attempts "
+                            f"({_one_line(str(exc))[:200]})",
+                            attempt_id=attempt_id,
+                        )
+                    return None
+                return outcome
+        finally:
+            self._landing_now.discard(build_id)
+
+    def _landing_attempts(self, build_id: str) -> int:
+        """How many landing presses were started for this build, durably."""
+        return sum(
+            1
+            for s in self._deps.pool.read_stages(build_id)
+            if s.target_identifier == MISSION_LANDING_ATTEMPT_TARGET_IDENTIFIER
+        )
+
+    def _record_landing_attempt(self, row: Any, number: int) -> None:
+        """One durable row per landing press started, before it runs."""
+        now = self._deps.clock()
+        self._deps.pool.record_stage(
+            StageLogEntry(
+                build_id=row.build_id,
+                stage_label=MISSION_LANDING_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MISSION_LANDING_ATTEMPT_TARGET_IDENTIFIER,
+                status="SKIPPED",
+                gate_mode=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={
+                    "mission_landing_attempt": {
+                        "attempt": number,
+                        "allowed": _how_many_attempts(self._deps.config),
+                    }
+                },
+            )
+        )
+
+    def _landing_failed(
+        self, row: Any, reason: str, *, attempt_id: str | None = None
+    ) -> None:
+        """Write a FAILED landing report for a mission feature that cannot land.
+
+        A merge report row like the press's own, with the result word
+        ``mission-landing-failed`` and the reason, so the mission step closes
+        the attempt and the finishing step never presses the build again.
+        When a decision row was written, the report carries its attempt id, so
+        the router's "approved and pending" blocker clears.
+        """
+        stages = self._deps.pool.read_stages(row.build_id)
+        if any(s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER for s in stages):
+            return None
+        if attempt_id is None:
+            for stage in stages:
+                if stage.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER:
+                    said = (stage.details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}
+                    attempt_id = said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY) or attempt_id
+        now = self._deps.clock()
+        logger.warning("merge-executor: %s", reason)
+        self._deps.pool.record_stage(
+            StageLogEntry(
+                build_id=row.build_id,
+                stage_label=MERGE_REPORT_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+                status="FAILED",
+                gate_mode=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={
+                    "feature_id": row.feature_id,
+                    "build_id": row.build_id,
+                    "correlation_id": row.correlation_id,
+                    "status": "FAILED",
+                    "result": RESULT_WORD_MISSION_LANDING_FAILED,
+                    "detail": reason,
+                    **(
+                        {
+                            MERGE_DECISION_DETAILS_KEY: {
+                                MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                                    MERGE_EXECUTION_ATTEMPT_VERSION
+                                ),
+                                MERGE_EXECUTION_ATTEMPT_ID_KEY: attempt_id,
+                            }
+                        }
+                        if attempt_id is not None
+                        else {}
+                    ),
+                },
+            )
+        )
+        return None
 
     async def _release_the_preview(
         self, offer: dict[str, Any], *, build_id: str, reason: str

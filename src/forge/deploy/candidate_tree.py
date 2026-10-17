@@ -85,6 +85,8 @@ __all__ = [
     "REMOTE_NAME",
     "REMOTE_TIMEOUT_SECONDS",
     "RemoteStartPoint",
+    "SOURCE_BRANCH_PREFIX",
+    "SourceBranch",
     "TreeEntry",
     "TreeListing",
     "answered_as_ordinary",
@@ -101,6 +103,8 @@ __all__ = [
     "is_candidate_tree_path",
     "list_tree_at_commit",
     "list_tree_at_commit_sync",
+    "make_source_branch",
+    "make_source_branch_sync",
     "materialise_candidate_tree",
     "remove_candidate_tree",
 ]
@@ -1045,6 +1049,120 @@ async def list_tree_at_commit(repo_root: Path | str, commit: str) -> TreeListing
     return await asyncio.to_thread(list_tree_at_commit_sync, Path(repo_root), str(commit))
 
 
+# ---------------------------------------------------------------------------
+# A build-owned local branch at one commit (missions, 17 October 2026)
+# ---------------------------------------------------------------------------
+#
+# A mission's merge into main merges the mission's frozen tip. The clone the
+# press works in has only ``refs/remotes/origin/mission/...`` (imported by the
+# fetch), and both the offer and the build system's merge need a LOCAL branch.
+# So the tip is made local as ``forge/source/<build_id>`` by exactly the rule
+# the prepared route's runner uses (``subagents/autobuild_runner.py``
+# ``_make_source_branch``): the commit must already be in this clone and is
+# never fetched here, and ``branch --force`` puts a stale branch back at the
+# commit rather than reusing it. This is the narrowest operation that does
+# that, on the same venue as every other git operation of the press.
+
+#: The build-owned branch prefix; equal to the runner's own (a test pins it).
+SOURCE_BRANCH_PREFIX: str = "forge/source/"
+
+_SOURCE_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,64}$")
+_SOURCE_BRANCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
+
+
+@dataclass(frozen=True)
+class SourceBranch:
+    """The branch made, at the commit it resolves to now — or why not."""
+
+    branch: str | None = None
+    commit: str | None = None
+    refusal: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return bool(self.branch and self.commit and not self.refusal)
+
+    def to_wire(self) -> dict[str, Any]:
+        return {"branch": self.branch, "commit": self.commit, "refusal": self.refusal}
+
+    @classmethod
+    def from_wire(cls, decoded: Any) -> "SourceBranch":
+        if not isinstance(decoded, dict):
+            return cls(refusal="the answer was not an object naming a branch")
+        if decoded.get("refusal"):
+            return cls(refusal=str(decoded["refusal"]))
+        branch = decoded.get("branch")
+        commit = decoded.get("commit")
+        if not isinstance(branch, str) or not isinstance(commit, str) or not commit:
+            return cls(refusal="the answer named no branch and no commit")
+        return cls(branch=branch, commit=commit)
+
+
+def make_source_branch_sync(repo_root: Path, build_id: str, commit: str) -> SourceBranch:
+    """``forge/source/<build_id>`` at ``commit`` in this clone, read back.
+
+    LOCAL git only: a commit that is not already here is refused, never
+    fetched. Forced, so a stale branch of the same name is put back at the
+    commit. The answer is what the branch resolves to AFTERWARDS, so a caller
+    compares it with the commit it asked for. Never raises.
+    """
+    commit = str(commit or "").strip()
+    if not _SOURCE_COMMIT_PATTERN.match(commit):
+        return SourceBranch(
+            refusal=f"the commit {commit!r} is not a commit this factory will pass to git"
+        )
+    if not _SOURCE_BRANCH_ID_PATTERN.match(str(build_id or "")):
+        return SourceBranch(refusal=f"the build id {build_id!r} cannot be part of a branch name")
+    branch = f"{SOURCE_BRANCH_PREFIX}{build_id}"
+    where = Path(repo_root)
+    try:
+        present = _run_git(
+            where,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"{commit}^{{commit}}",
+            timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+        )
+        if present.returncode != 0 or not (present.stdout or "").strip():
+            return SourceBranch(
+                refusal=(
+                    f"the commit {commit} is not in the copy of this project at "
+                    f"{where} — refusing to fetch it (local commits only)"
+                )
+            )
+        made = _run_git(
+            where, "branch", "--force", branch, commit, timeout=READ_AT_COMMIT_TIMEOUT_SECONDS
+        )
+        if made.returncode != 0:
+            return SourceBranch(
+                refusal=f"could not make the branch {branch} at {commit[:10]} ({_git_said(made)})"
+            )
+        read_back = _run_git(
+            where,
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            f"refs/heads/{branch}",
+            timeout=READ_AT_COMMIT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        return SourceBranch(refusal=f"making the branch {branch} did not finish in time")
+    except OSError as exc:
+        return SourceBranch(refusal=f"git could not be run ({exc.strerror or exc})")
+    sha = (read_back.stdout or "").strip()
+    if read_back.returncode != 0 or not sha:
+        return SourceBranch(refusal=f"the branch {branch} could not be read back")
+    return SourceBranch(branch=branch, commit=sha)
+
+
+async def make_source_branch(repo_root: Path | str, build_id: str, commit: str) -> SourceBranch:
+    """:func:`make_source_branch_sync`, off the event loop."""
+    return await asyncio.to_thread(
+        make_source_branch_sync, Path(repo_root), str(build_id), str(commit)
+    )
+
+
 async def read_file_at_commit(
     repo_root: Path | str,
     commit: str,
@@ -1477,6 +1595,10 @@ class InContainerCandidateGit:
             # As git answered, or not (15 October 2026).
             confirmed=cut.confirmed,
         )
+
+    async def make_source_branch(self, build_id: str, commit: str) -> SourceBranch:
+        """``forge/source/<build_id>`` at ``commit``, here (missions)."""
+        return await make_source_branch(self._repo_root, build_id, commit)
 
     async def remove_working_folder(self, path: str) -> bool | None:
         from forge.cli._conductor_worktree import remove_journey_worktree

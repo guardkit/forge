@@ -4510,6 +4510,10 @@ GIT_CANDIDATE_TREE_ROUTE: str = "/git/candidate-tree"
 GIT_CANDIDATE_TREE_REMOVE_ROUTE: str = "/git/candidate-tree-remove"
 GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE: str = "/git/autobuild-worktree-inspect"
 GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE: str = "/git/autobuild-worktree-retire"
+#: The frozen local copy of a mission's tip (missions, 17 October 2026):
+#: ``forge/source/<build_id>`` made at a commit already in the clone, by the
+#: prepared route's rule. The only write these routes make is that one ref.
+GIT_SOURCE_BRANCH_ROUTE: str = "/git/source-branch"
 
 
 def _feature_id_error(value: Any) -> str | None:
@@ -4577,6 +4581,39 @@ def process_git_is_ancestor_request(
             f"(it exited {result.returncode})"
         ),
     }
+
+
+def process_git_source_branch_request(
+    payload: Any, *, config: ForgeConfig
+) -> tuple[int, dict[str, Any]]:
+    """``{repo, build_id, commit}`` → ``{branch, commit, refusal}``.
+
+    ``forge/source/<build_id>`` at ``commit`` in this repository, by
+    :func:`forge.deploy.candidate_tree.make_source_branch_sync` — the very
+    code the in-container venue runs: the commit must already be in the
+    clone (it is never fetched), the branch is forced so a stale one is put
+    back, and the answer is what the branch resolves to afterwards. A refusal
+    about the repository is a 200 with ``refusal``. Never raises.
+    """
+    from forge.deploy.candidate_tree import make_source_branch_sync
+
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    build_id = payload.get("build_id")
+    if not isinstance(build_id, str) or not SAFE_NAME_PATTERN.match(build_id):
+        return 400, {
+            "error": (
+                "'build_id' is required and must be a plain build id (letters, "
+                f"digits, dots, dashes and underscores); got {build_id!r}"
+            )
+        }
+    commit = payload.get("commit")
+    if not isinstance(commit, str) or not commit.strip():
+        return 400, {"error": "'commit' is required, as text"}
+    return 200, make_source_branch_sync(repo_path, build_id, commit).to_wire()
 
 
 def process_git_candidate_tree_request(
@@ -8310,6 +8347,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_CANDIDATE_TREE_REMOVE_ROUTE,
                 GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE,
                 GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE,
+                GIT_SOURCE_BRANCH_ROUTE,
                 GIT_WORKTREE_ADD_ROUTE,
                 GIT_WORKTREE_REMOVE_ROUTE,
                 GIT_WORKTREE_COMMIT_COUNT_ROUTE,
@@ -8392,6 +8430,10 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 )
             elif route == GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE:
                 status, body = process_git_autobuild_worktree_retire_request(
+                    payload, config=config
+                )
+            elif route == GIT_SOURCE_BRANCH_ROUTE:
+                status, body = process_git_source_branch_request(
                     payload, config=config
                 )
             elif route == GIT_WORKTREE_ADD_ROUTE:
@@ -8617,6 +8659,7 @@ __all__ = [
     "GIT_LIST_FILES_ON_BRANCH_ROUTE",
     "GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE",
     "GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE",
+    "GIT_SOURCE_BRANCH_ROUTE",
     "GIT_CHECK_NAMES",
     "GIT_CHECK_PATH_ARGS",
     "GIT_CHECK_TIMEOUT_DEFAULTS",
