@@ -14,6 +14,8 @@ every subcommand currently shipped:
 * ``forge repo-paths`` (register-repo spec 2026-09-05 rule 9 — prints the
   repository map's distinct checkout paths so the forge-prod recreate script
   derives its binds instead of carrying them by hand)
+* ``forge security-sweep --once`` (security check design 2026-10-17, piece 3 —
+  runs the nightly security sweep now, by hand)
 
 The ``[project.scripts]`` entry in ``pyproject.toml`` (TASK-PSM-012) wires
 ``forge.cli.main:main`` to the ``forge`` console script so
@@ -51,6 +53,7 @@ from forge.cli import register_repo as _register_repo
 from forge.cli import repo_paths as _repo_paths
 from forge.cli import review_gate as _review_gate
 from forge.cli import runbook as _runbook
+from forge.cli import security_sweep as _security_sweep
 from forge.cli import serve as _serve
 from forge.cli import skip as _skip
 from forge.cli import status as _status
@@ -124,6 +127,7 @@ main.add_command(_runbook.runbook_cmd)
 main.add_command(_review_gate.review_gate_cmd)
 main.add_command(_register_repo.register_repo_cmd)
 main.add_command(_repo_paths.repo_paths_cmd)
+main.add_command(_security_sweep.security_sweep_cmd)
 
 
 __all__ = ["CliRuntime", "build_cli_runtime", "main"]
