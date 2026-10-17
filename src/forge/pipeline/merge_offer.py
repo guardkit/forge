@@ -65,6 +65,7 @@ from forge.receipts import receipts_root
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "TargetRead",
     "AFTER_DEPLOY_CHECK_STAGE",
     "AfterDeployCheckSkip",
     "CHECK_COULD_NOT_RUN",
@@ -269,6 +270,20 @@ async def _ask_the_head_reader(
             branch,
         )
     return await read_head(repo_root)
+
+
+@dataclass(frozen=True)
+class TargetRead:
+    """The offer's one read of the recorded target branch, whatever it found.
+
+    ``commit`` when the fetch answered, ``refusal`` when it did not. Handed to
+    the preview and the merge-check reading so they use the very same read as
+    the card's pin and never fetch again: a read that failed is reported as
+    that failure, and is not retried behind the pin's back.
+    """
+
+    commit: str | None = None
+    refusal: str | None = None
 
 
 def _the_default_branch_was_renamed(refusal: str | None) -> bool:
@@ -2166,7 +2181,7 @@ class MergeOfferService:
         expect_main_sha: str,
         target_branch: str,
         make_room: bool = False,
-        fetched_base: str | None = None,
+        target_read: TargetRead | None = None,
     ) -> tuple[Any, str | None] | None:
         """``(evidence or None, the commit it was joined onto)`` — or ``None``
         when the service raised and no card may be offered.
@@ -2187,11 +2202,15 @@ class MergeOfferService:
             # the same git surface and the same helper the merge press uses —
             # never the clone's local branch, which can lag the remote after
             # any other merge.
-            # ``fetched_base`` is that very read when the offer already made
-            # it for the card's pin (one read for both).
-            if fetched_base:
-                base: str | None = fetched_base
-                base_refusal: str | None = None
+            # ``target_read`` is that very read when the offer already made it
+            # for the card's pin (one read for both), whatever it found: a
+            # read that failed is reported as that failure, never fetched
+            # again. Only an offer that made no read lets the preview read.
+            if target_read is not None:
+                base: str | None = target_read.commit
+                base_refusal: str | None = (
+                    None if target_read.commit else target_read.refusal
+                )
             else:
                 start_point = self._pool.read_start_point(build_id)
                 where = await target_branch_now(
@@ -2264,7 +2283,7 @@ class MergeOfferService:
         review_evidence: Any,
         preview_base_sha: str | None,
         changed_files: Sequence[Any] | None,
-        fetched_target: str | None = None,
+        target_read: TargetRead | None = None,
     ) -> dict[str, Any] | None:
         """The offer's ``merge_check_reading``, or ``None`` with no reader.
 
@@ -2288,9 +2307,15 @@ class MergeOfferService:
                 declared_at = preview_base_sha
                 if not declared_at:
                     refusal = "the preview names no commit it was joined onto"
-            elif fetched_target:
-                # The offer's own read of the target, made for the card's pin.
-                declared_at = fetched_target
+            elif target_read is not None:
+                # The offer's own read of the target, made for the card's pin,
+                # whatever it found: a failed read is said, not fetched again.
+                declared_at = target_read.commit
+                refusal = (
+                    None
+                    if target_read.commit
+                    else target_read.refusal or "the remote could not be read"
+                )
             else:
                 from forge.pipeline.merge_join import target_branch_now
 
@@ -2553,6 +2578,14 @@ class MergeOfferService:
         fetched, fetch_refusal, fetched_it = await self._the_target_as_fetched(
             git, build_id
         )
+        # The read, whatever it found, for the preview and the merge check;
+        # ``None`` only when no read was made (a venue that cannot fetch, a
+        # build with no recorded start point), and then they read themselves.
+        target_read = (
+            TargetRead(commit=fetched, refusal=None if fetched else fetch_refusal)
+            if fetched_it
+            else None
+        )
         expect_main_sha: str | None = None
         if fetched_it and fetched is not None:
             expect_main_sha = fetched
@@ -2719,7 +2752,7 @@ class MergeOfferService:
                     # ONE READ OF THE TARGET for the pin and the preview's
                     # base, so the two can never disagree; a preview with no
                     # fetched tip reads it itself and reports why it failed.
-                    fetched_base=fetched,
+                    target_read=target_read,
                 )
                 if prepared is None:
                     return _refuse("the preview could not be prepared", may_pass=True)
@@ -2755,7 +2788,7 @@ class MergeOfferService:
                 review_evidence=review_evidence,
                 preview_base_sha=preview_base_sha,
                 changed_files=changed_files,
-                fetched_target=fetched,
+                target_read=target_read,
             )
             if merge_check_reading is not None:
                 details["merge_check_reading"] = merge_check_reading

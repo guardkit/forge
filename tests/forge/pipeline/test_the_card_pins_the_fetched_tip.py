@@ -24,6 +24,7 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_DETAILS_KEY,
     MERGE_OFFER_TARGET_IDENTIFIER,
     MergeOfferService,
+    TargetRead,
 )
 from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     BUILD_ID,
@@ -198,7 +199,7 @@ async def test_the_pin_and_the_preview_base_are_one_read(
         candidate_tree="d" * 40,
         expect_main_sha=fetched,
         target_branch="main",
-        fetched_base=fetched,
+        target_read=TargetRead(commit=fetched),
     )
 
     assert reads == []
@@ -238,6 +239,7 @@ async def test_an_offer_with_a_preview_reads_the_target_once(
         pipeline_publisher=SimpleNamespace(publish_build_paused=_nothing),
         raw_publish=_nothing,
         review_preview=preview,
+        commit_reader=lambda _repo, _root: object(),
     )
 
     assert await service.offer(build_id=BUILD_ID, feature_id=FEATURE_ID, card_words=_words)
@@ -249,3 +251,66 @@ async def test_an_offer_with_a_preview_reads_the_target_once(
     assert len(reads) == 1
     assert len(preview.requests) == 1
     assert offer["expect_main_sha"] == preview.requests[0].preview_base_sha == fetched
+    assert preview.requests[0].preview_base_refusal is None
+    # The merge-check reading was made at the same commit.
+    assert offer["merge_check_reading"]["declared_at"] == fetched
+
+
+@pytest.mark.asyncio
+async def test_a_failed_read_is_shared_and_never_fetched_again(
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,  # noqa: F811
+    repo_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Codex R2: the offer's read fails and a second read would have
+    succeeded. There is no second read: the card still goes out with the old
+    pin, and the preview and the merge-check reading say the shared read
+    failed, with its own refusal."""
+    from forge.pipeline import merge_join
+    from forge.pipeline.merge_join import TargetNow
+
+    _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+    local_main = _git(repo_root, "rev-parse", "main")
+    _somebody_lands_on_main(repo_root)
+    reads: list[Any] = []
+    real = merge_join.target_branch_now
+    said = "the project's recorded address did not answer just now"
+
+    async def fails_once(*args: Any, **kwargs: Any) -> Any:
+        reads.append(1)
+        if len(reads) == 1:
+            return TargetNow(branch="main", refusal=said)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(merge_join, "target_branch_now", fails_once)
+    preview = _OnePreview()
+
+    async def _nothing(*_a: Any) -> None:
+        return None
+
+    service = MergeOfferService(
+        config=config,
+        pool=pool,
+        pipeline_publisher=SimpleNamespace(publish_build_paused=_nothing),
+        raw_publish=_nothing,
+        review_preview=preview,
+        commit_reader=lambda _repo, _root: object(),
+    )
+
+    assert await service.offer(build_id=BUILD_ID, feature_id=FEATURE_ID, card_words=_words)
+
+    offer = [
+        s for s in pool.read_stages(BUILD_ID)
+        if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+    ][0].details[MERGE_OFFER_DETAILS_KEY]
+    assert len(reads) == 1
+    # The ordinary card still goes out, pinned the way it always was.
+    assert offer["expect_main_sha"] == local_main
+    # The preview was told the shared read failed, and why.
+    assert preview.requests[0].preview_base_sha is None
+    assert preview.requests[0].preview_base_refusal == said
+    # And so was the merge-check reading.
+    reading = offer["merge_check_reading"]
+    assert reading["declared_at"] is None and reading["read"] is False
+    assert said in reading["reason"]
