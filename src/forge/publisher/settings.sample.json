@@ -11,6 +11,8 @@
   "known_hosts_file": "/etc/forge-publisher/known_hosts",
   "_private_path_prefixes": "Required. The folders that exist only on the factory's own machines: each factory machine's owner home folder, the host receipts folder and the sandbox storage folder, as absolute paths. Before every send the publisher refuses a commit that would publish a file naming one. A shared folder such as /home/ or /var/ is refused, because it would match ordinary product files. The values below are placeholders.",
   "private_path_prefixes": ["/home/the-factory-owner", "/the/host/receipts/folder", "/the/sandbox/storage/folder"],
+  "_private_only": "Optional, false when left out (17 October 2026). true: publish only to repositories confirmed private. Each route's repository is checked at start (its own key reads it, and GitHub does not show it to anybody signed out); a route that fails is refused, with its reason, until the publisher is restarted, and the check is made again immediately before every push.",
+  "private_only": false,
   "projects": {
     "the-project-name-as-registered": {
       "source": "the read-only git address the joined commit is brought out of (the sandbox's git daemon, or the project's copy)",

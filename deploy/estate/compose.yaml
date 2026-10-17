@@ -684,6 +684,189 @@ services:
           create_host_path: false
 
   # -------------------------------------------------------------------------
+  # THE GIT DOOR (17 October 2026) — how a project's sandbox reads a PRIVATE
+  # repository without holding a key. Design "Building production features
+  # from a signed-off prototype", section 2.8.
+  #
+  # The sandbox fetches every project itself, over https and with no
+  # credential, so until now it could read public repositories only. This
+  # door, at the gateway address, takes git's two READ requests for a
+  # repository named in its allow-list, adds a read-only GitHub token of its
+  # own, and passes them to github.com over verified TLS. Everything else is
+  # refused with 403, a push (git-receive-pack) included, and so is every
+  # repository that is not on the list. Its settings are git-door.cfg, beside
+  # this file, bound read-only.
+  #
+  # ITS TWO INPUTS, and nothing else of this machine:
+  #   * the token, GIT_DOOR_TOKEN: a fine-grained GitHub token with Contents
+  #     and Metadata read-only. A secret FILE, read from the environment the
+  #     command was run in, exactly as the model door's key is; the entry
+  #     shell below builds the Basic header from it for HAProxy's own process.
+  #     It is in no declared setting, so 'docker inspect' does not show it, and
+  #     it is in no file in this bundle;
+  #   * the allow-list, one owner/name per line, in the file the env file's
+  #     GIT_DOOR_REPOS_FILE names, bound read-only. It names private
+  #     repositories, so it lives with the machine's settings, never here.
+  #
+  # IT IS BEHIND A PROFILE, 'git-door', so 'docker compose up' leaves it alone
+  # until a machine adds 'git-door' to COMPOSE_PROFILES in its env file (not
+  # '--profile' on the command line, which REPLACES the env file's profiles).
+  # Its settings use ':-' rather than ':?' for the same reason: a ':?' stops
+  # the WHOLE file rendering even while the profile is off, which would stop
+  # an env file without these lines from starting anything. The entry shell
+  # refuses to start the door without each of them instead.
+  #
+  # The rest is the model door's: the host's network (it binds only the
+  # gateway address and its own port, and the machine's guard admits only the
+  # sandbox's machine to it), the same stock HAProxy image pinned by digest,
+  # the image's own unprivileged user, every capability dropped and no way to
+  # gain one, and not read-only, because Compose cannot copy a secret read
+  # from the environment into a read-only service.
+  # -------------------------------------------------------------------------
+  git-door:
+    profiles: ["git-door"]
+    image: ${FACTORY_GIT_DOOR_IMAGE:-}
+    restart: unless-stopped
+    network_mode: host
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        # WHERE IT LISTENS: one specific address and a port, never every address of
+        # the machine. GIT_DOOR_BIND is parsed (the same parsing as the
+        # model door's), not matched as text: an IPv4
+        # address must be four numbers of 0 to 255, an IPv6 address must be in
+        # brackets with at most eight groups of hex, and an address that works out
+        # to "unspecified" (0.0.0.0, ::, and every other spelling of them) or to the
+        # IPv4 broadcast address is refused.
+        refuse_the_address() {
+            echo "the Git door listens only on one specific address and port, and GIT_DOOR_BIND ($$GIT_DOOR_BIND) is not one: $$1. Set FACTORY_GATEWAY_ADDRESS and GIT_DOOR_PORT in the env file (deploy/estate/README.md, 'The Git door')." >&2
+            exit 1
+        }
+        an_ipv4_address() {
+            case "$$1" in ""|*[!0-9.]*|.*|*.|*..*) return 1 ;; esac
+            old_ifs="$$IFS"; IFS=.; set -f; set -- $$1; set +f; IFS="$$old_ifs"
+            [ "$$#" -eq 4 ] || return 1
+            total=0; all_full=1
+            for part in "$$@"; do
+                case "$$part" in 0) ;; 0*|????*) return 1 ;; esac
+                [ "$$part" -le 255 ] || return 1
+                total=$$((total + part))
+                [ "$$part" -eq 255 ] || all_full=0
+            done
+            [ "$$total" -gt 0 ] || refuse_the_address "it is the unspecified address, which means every IPv4 address"
+            [ "$$all_full" -eq 0 ] || refuse_the_address "it is the IPv4 broadcast address"
+            return 0
+        }
+        some_ipv6_groups() {
+            # Prints how many groups of one to four hex digits $$1 holds, or fails.
+            [ -n "$$1" ] || { echo 0; return 0; }
+            case "$$1" in :*|*:|*::*) return 1 ;; esac
+            old_ifs="$$IFS"; IFS=:; set -f; set -- $$1; set +f; IFS="$$old_ifs"
+            for group in "$$@"; do
+                case "$$group" in ""|?????*|*[!0-9a-fA-F]*) return 1 ;; esac
+            done
+            echo "$$#"
+        }
+        an_ipv6_address() {
+            case "$$1" in ""|*[!0-9a-fA-F:]*|*::*::*) return 1 ;; esac
+            case "$$1" in
+                *::*)
+                    left="$$(some_ipv6_groups "$${1%%::*}")" || return 1
+                    right="$$(some_ipv6_groups "$${1#*::}")" || return 1
+                    [ $$((left + right)) -le 7 ] || return 1
+                    ;;
+                *)
+                    groups="$$(some_ipv6_groups "$$1")" || return 1
+                    [ "$$groups" -eq 8 ] || return 1
+                    ;;
+            esac
+            # Every group zero, however it is spelt, is the unspecified address.
+            nonzero="$$(printf '%s' "$$1" | tr -d ':0')"
+            [ -n "$$nonzero" ] || refuse_the_address "it is the unspecified address, which means every IPv6 address"
+            return 0
+        }
+        bind="$$GIT_DOOR_BIND"
+        case "$$bind" in
+            \[*\]:*)
+                host="$${bind%%]:*}"; host="$${host#\[}"; port="$${bind##*]:}"
+                [ "$$bind" = "[$$host]:$$port" ] || refuse_the_address "it is not one [address]:port"
+                an_ipv6_address "$$host" || refuse_the_address "the part in brackets is not one IPv6 address"
+                ;;
+            *:*:*)
+                refuse_the_address "an IPv6 address must be written in brackets, as [address]:port"
+                ;;
+            *:*)
+                host="$${bind%:*}"; port="$${bind##*:}"
+                an_ipv4_address "$$host" || refuse_the_address "the part before the port is not one IPv4 address"
+                ;;
+            *)
+                refuse_the_address "it has no port"
+                ;;
+        esac
+        case "$$port" in ""|0*|*[!0-9]*|??????*) refuse_the_address "the port is not a number from 1 to 65535" ;; esac
+        [ "$$port" -le 65535 ] || refuse_the_address "the port is not a number from 1 to 65535"
+        token_file=/run/secrets/git_door_token
+        if [ ! -s "$$token_file" ]; then
+            echo "the Git door was given no token: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says ('The Git door'), with GIT_DOOR_TOKEN passed in from a child process." >&2
+            exit 1
+        fi
+        token="$$(cat "$$token_file")"
+        if [ -z "$$token" ] || [ "$$(printf '%s' "$$token" | tr -d '[:space:]')" != "$$token" ]; then
+            echo "the Git door's token file holds no usable token (it is blank, or has spaces or line breaks in it). Make the token again and pass it in as GIT_DOOR_TOKEN, the way deploy/estate/README.md says ('The Git door')." >&2
+            exit 1
+        fi
+        # THE ALLOW-LIST: a file, one owner/name per line; blank lines and
+        # lines starting with # are left out. Anything else on a line stops
+        # the door, and so does a list with no repository on it.
+        repos=/usr/local/etc/haproxy/git-door.repos
+        if [ ! -f "$$repos" ] || [ ! -r "$$repos" ]; then
+            echo "the Git door has no allow-list: GIT_DOOR_REPOS_FILE in the env file must name a readable file of owner/name lines (deploy/estate/README.md, 'The Git door')." >&2
+            exit 1
+        fi
+        if grep -v -E '^[[:space:]]*$$|^#|^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$$' "$$repos" >/dev/null; then
+            echo "the Git door's allow-list has a line that is not owner/name (one repository per line, # for a comment)." >&2
+            exit 1
+        fi
+        if ! grep -q -E '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$$' "$$repos"; then
+            echo "the Git door's allow-list names no repository, so there is nothing it may read." >&2
+            exit 1
+        fi
+        # GitHub takes a token as the password of Basic authentication, with
+        # x-access-token as the user. Built here, for HAProxy's own process.
+        GIT_DOOR_BASIC="$$(printf 'x-access-token:%s' "$$token" | base64 | tr -d '\n')"
+        unset token
+        export GIT_DOOR_BASIC
+        exec "$$@"
+      - the-estate-hands-the-git-door-its-token-as-a-file
+    command: ["haproxy", "-db", "-f", "/usr/local/etc/haproxy/git-door.cfg"]
+    environment:
+      # Where it listens: BUILT from the gateway address and the door's port,
+      # as the model door's is, and parsed again by the entry shell above.
+      GIT_DOOR_BIND: ${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${GIT_DOOR_PORT:-}
+    secrets:
+      - source: git-door-token
+        target: git_door_token
+    volumes:
+      - type: bind
+        source: ./git-door.cfg
+        target: /usr/local/etc/haproxy/git-door.cfg
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ${GIT_DOOR_REPOS_FILE:-}
+        target: /usr/local/etc/haproxy/git-door.repos
+        read_only: true
+        bind:
+          create_host_path: false
+
+  # -------------------------------------------------------------------------
   # THE MEMORY RELAY — it listens on the bus and writes what it hears into the
   # store. It PUBLISHES NOTHING: nothing outside the estate ever calls it, so
   # it has no port, and a sandbox cannot reach it at all.
@@ -1443,6 +1626,14 @@ secrets:
   # project's sandbox: that is the whole point of the door.
   sandbox-model-key:
     environment: SANDBOX_MODEL_KEY
+
+  # THE GIT DOOR'S TOKEN (17 October 2026). A fine-grained GitHub token,
+  # Contents and Metadata read-only, read from the environment the command
+  # was run in and handed to the Git door as a file, as the model door's key
+  # is. Only the door, behind its 'git-door' profile, asks for it; it never
+  # enters a project's sandbox.
+  git-door-token:
+    environment: GIT_DOOR_TOKEN
 
   # THE FRONT DOOR'S TWO SLACK CREDENTIALS, added 25 September 2026.
   #

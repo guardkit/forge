@@ -5,8 +5,9 @@
 This folder starts the factory's own services on a clean machine — a laptop or
 a cloud machine — from one set of files and one env file. It carries no
 machine's address, no home path and no checkout. One service, the model door,
-runs on the host's network, and *The model door* below says why; nothing else
-does.
+runs on the host's network, and *The model door* below says why; the Git door,
+when its profile is switched on, does the same for the same reason (*The Git
+door*); nothing else does.
 
 ## Supported first start and publisher host policy
 
@@ -315,6 +316,77 @@ nothing.
 **In a sandbox,** `OPENAI_BASE_URL` and `GUARDKIT_QAV_SHADOW_URL` are
 `http://<gateway address>:<MODEL_DOOR_PORT>`, and the sandbox's network list
 must allow that address and port.
+
+## The Git door
+
+**What it is.** `git-door` is how a project's sandbox reads a **private**
+GitHub repository without holding a credential (17 October 2026; design
+"Building production features from a signed-off prototype", section 2.8). The
+sandbox fetches every project itself and is given no GitHub credential, so on
+its own it can read public repositories only. The door is the same stock
+HAProxy as the model door, at the gateway address. It allows exactly git's two
+read requests, `GET /<owner>/<name>.git/info/refs?service=git-upload-pack` and
+`POST /<owner>/<name>.git/git-upload-pack`, and only for repositories on its
+allow-list. Everything else gets 403, a push (`git-receive-pack`) included. It
+drops whatever credential a caller sent, adds its own read-only token, and
+passes the request to `github.com:443` with the certificate and the name
+checked. Its settings are `git-door.cfg`. It is **off** until `git-door` is
+added to `COMPOSE_PROFILES` in the env file.
+
+**Its two inputs.**
+
+- `GIT_DOOR_TOKEN`, a fine-grained GitHub token: owner `guardkit`, Contents and
+  Metadata read-only (either all repositories, with the allow-list limiting what
+  is read, or only the named ones). It is a secret: keep it in the estate's
+  encrypted secrets (fleet-secrets) and start the estate the supported way, so
+  `factory-up.sh` passes it to Compose only as a value in the command's
+  environment through `sops exec-env`, exactly as `SANDBOX_MODEL_KEY` is.
+  Compose hands it to the door as a file under `/run/secrets`; the entry shell
+  builds the Basic header from it for HAProxy's own process. It is in no file
+  in this bundle and in no declared setting, and the door refuses to start if
+  it is missing, blank, or has spaces or line breaks in it.
+- The allow-list: the file `GIT_DOOR_REPOS_FILE` names (in the example
+  `/etc/factory/git-door.repos`), one `owner/name` per line, blank lines and
+  `#` comments left out. It names private repositories, so it is a file of the
+  machine, never in this bundle. It is bound read-only. The door refuses to
+  start without it, with a line that is not `owner/name`, or with no
+  repository on it.
+
+Also: `GIT_DOOR_PORT` (31825 in the example; the door listens on
+`FACTORY_GATEWAY_ADDRESS` and that port only, parsed as the model door's is) and
+`FACTORY_GIT_DOOR_IMAGE` (the same pinned image as the model door's, held to
+`estate-pins.conf`).
+
+**The live steps, each with the owner's word, none done by this bundle.**
+
+1. Make the token in the browser and store it in fleet-secrets as
+   `GIT_DOOR_TOKEN`, without printing it; `factory-up.sh` then passes it in.
+2. Write the allow-list file and set `GIT_DOOR_PORT` and `GIT_DOOR_REPOS_FILE`
+   in the env file; add `git-door` to `COMPOSE_PROFILES`.
+3. This machine's guard admits only the sandbox's machine to
+   `GIT_DOOR_PORT`, as it does for `MODEL_DOOR_PORT`.
+4. The sandbox's `sbx` network rules allow `<gateway address>:<GIT_DOOR_PORT>`:
+   `rollout-sandbox` adds that one rule, beside the model door's, whenever
+   `GIT_DOOR_PORT` is set in the env file it is given (and refuses a port that
+   is another door's); with it unset, the rollout is as before.
+5. The coordinator's `forge.yaml` names the door as `planning.git_door:
+   http://<gateway address>:<GIT_DOOR_PORT>/`, written as the address itself.
+
+**Adding a repository.** Add its `owner/name` as one line of the allow-list
+file and restart the door (`docker compose ... up -d git-door` after the
+change, or a restart of that one service). Then register it with
+`forge register-repo <owner>/<name> --github https://github.com/<owner>/<name>
+--via-git-door --publish --publish-credential-name <its deploy key>`: the
+project's fetch address is recorded as `<planning.git_door><owner>/<name>.git`
+and the sandbox's read and clone go through the door. The check clone on this
+machine reads it with the route's own deploy key, so a private repository needs
+that key.
+
+**What it does not do.** Product code in the sandbox can read any repository on
+the allow-list through the door, as it can use the model door. That is why the
+factory is meant to publish only to private repositories (the publisher's
+`private_only` setting, off until the owner says so), so nothing read through
+the door can be pushed to a public one.
 
 ## The sandbox's memory door
 

@@ -230,6 +230,7 @@ class SidecarCodeReader:
         clock: Callable[[], float] | None = None,
         commit: str | None = None,
         fetch_address: str | None = None,
+        git_door: str | None = None,
     ) -> None:
         import time
 
@@ -237,8 +238,10 @@ class SidecarCodeReader:
         self._repo = repo
         # The project's recorded fetch address, sent with every read at a
         # commit so the helper can fetch a missing commit from it (and never
-        # from the clone's own origin).
+        # from the clone's own origin). The declared Git door goes with it
+        # (planning.git_door, 17 October 2026).
         self._fetch_address = fetch_address
+        self._git_door = git_door
         self._post = post
         self._timeout_s = timeout_s
         self._clock = clock or time.monotonic
@@ -287,6 +290,8 @@ class SidecarCodeReader:
             sent["commit"] = self._commit
         if self._fetch_address:
             sent["fetch_address"] = self._fetch_address
+            if self._git_door:
+                sent["git_door"] = self._git_door
         try:
             status, decoded = self._post(url, sent, timeout)
         except Exception as exc:  # noqa: BLE001 — transport boundary
@@ -629,14 +634,17 @@ class SidecarGitRunner:
         write_timeout_s: float = _DEFAULT_WRITE_TIMEOUT_S,
         read_timeout_s: float = _DEFAULT_READ_TIMEOUT_S,
         fetch_address: str | None = None,
+        git_door: str | None = None,
     ) -> None:
         if not repo or not repo.strip():
             raise ValueError("SidecarGitRunner needs the repository's org/name key")
         self._base_url = base_url.rstrip("/")
         self._repo = repo
         # The project's recorded fetch address (planning.fetch_addresses),
-        # sent with each starting-point and code-read request.
+        # sent with each starting-point and code-read request, with the
+        # declared Git door beside it (planning.git_door, 17 October 2026).
         self._fetch_address = fetch_address
+        self._git_door = git_door
         self._post = post
         self._write_timeout_s = write_timeout_s
         self._read_timeout_s = read_timeout_s
@@ -663,6 +671,7 @@ class SidecarGitRunner:
             post=self._post,
             commit=commit,
             fetch_address=self._fetch_address,
+            git_door=self._git_door,
         )
 
     # -- the wire ----------------------------------------------------------
@@ -705,6 +714,8 @@ class SidecarGitRunner:
             body["branch"] = str(branch)
         if self._fetch_address:
             body["fetch_address"] = self._fetch_address
+            if self._git_door:
+                body["git_door"] = self._git_door
         answer = await self._call(
             "/git/remote-start-point",
             body,

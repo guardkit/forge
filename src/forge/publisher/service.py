@@ -53,6 +53,17 @@ no fallback to another credential, ever. A route key's identity is looked at
 again (``lstat``, never opening it) on every health self-check and
 immediately before each send for that route.
 
+ONLY PRIVATE REPOSITORIES, WHEN TOLD SO (17 October 2026; design "Building
+production features from a signed-off prototype", section 2.8). With
+``private_only`` in its settings (off by default, which is today's
+behaviour exactly), every route's repository must be confirmed private
+(:mod:`forge.publisher.private_remote`: the route's own key reads it, and an
+anonymous lookup does not find it). That is asked once at start-up, when a
+route found public or not on GitHub is refused, with its reason, until the
+publisher is restarted, while every other route works (a lookup or key read
+that merely failed is logged and left to the next check); and asked again
+immediately before every push, which any failure refuses.
+
 EVERY REFUSAL IS ONE SENTENCE a person can act on, and rides beside a short
 machine-readable name so that the coordinator can tell the one refusal it
 retries — the remote moved — from every other, which it does not.
@@ -79,6 +90,13 @@ from forge.publisher.git_work import (
     TheProjectsCommits,
     a_plain_branch_name,
     a_plain_commit_name,
+)
+from forge.publisher.private_remote import (
+    LOOKUP_FAILED,
+    UNREACHABLE,
+    Visibility,
+    anonymous_lookup,
+    confirmed_private,
 )
 from forge.publisher.settings import (
     ProjectRoute,
@@ -143,6 +161,10 @@ IT_HOLDS_FACTORY_RECORDS: str = "it-holds-factory-records"
 IT_HOLDS_PRIVATE_PATHS: str = "it-holds-private-paths"
 THE_COMMITS_COULD_NOT_BE_CHECKED: str = "the-commits-could-not-be-checked"
 
+#: The refusal when, with ``private_only`` on, a route's repository is not
+#: confirmed private (17 October 2026). Not retried.
+NOT_CONFIRMED_PRIVATE: str = "the-remote-is-not-confirmed-private"
+
 
 def the_remote_moved(answer: dict[str, Any] | None) -> bool:
     """Is this the one refusal a new attempt is the answer to?"""
@@ -189,6 +211,7 @@ class Publisher:
         *,
         reader: TheRecordReader | None = None,
         commits_for: Callable[[ProjectRoute], Any] | None = None,
+        visibility_lookup: Callable[[str, str], int | None] | None = None,
     ) -> None:
         self._settings = settings
         self._state = Path(settings.state_dir).expanduser()
@@ -251,6 +274,42 @@ class Publisher:
         #: again on every health request. ``None`` means it was never set.
         self.self_check: Callable[[], str | None] | None = None
         self._handing_out_locks = threading.Lock()
+        # ONLY PRIVATE REPOSITORIES, when the settings say so (17 October
+        # 2026). The anonymous lookup is injectable for the tests. Each
+        # route is asked once here; one with a KNOWN answer that is not
+        # "private" (public, or not on GitHub) is refused until the publisher
+        # is restarted, and the others work. A lookup that failed (403, a
+        # rate limit, a server error, no answer) or a key read that failed
+        # (the network may not be up yet after a reboot) is passing trouble,
+        # so it is only logged: the check immediately before the push, which
+        # still needs both the key read and the 404, decides (coach review,
+        # 17 October 2026).
+        self._visibility_lookup = visibility_lookup or anonymous_lookup
+        self._not_private: dict[str, str] = {}
+        if settings.private_only:
+            for name, route in sorted(settings.projects.items()):
+                answer = self._is_it_private(route)
+                if answer.private:
+                    logger.info(
+                        "publisher: project '%s' is confirmed private, so it is served",
+                        name,
+                    )
+                    continue
+                if answer.kind in (LOOKUP_FAILED, UNREACHABLE):
+                    logger.warning(
+                        "publisher: project '%s' could not be confirmed private at "
+                        "start (%s); it is checked again before every push",
+                        name,
+                        answer.reason,
+                    )
+                    continue
+                self._not_private[name] = str(answer.reason)
+                logger.warning(
+                    "publisher: project '%s' is refused until the publisher is "
+                    "restarted: %s",
+                    name,
+                    answer.reason,
+                )
 
     # -- the credentials, read once ----------------------------------------
 
@@ -419,6 +478,43 @@ class Publisher:
         ]
         return "; ".join(said) or None
 
+    # -- only private repositories (17 October 2026) ----------------------
+
+    def _is_it_private(self, route: ProjectRoute, commits: Any = None) -> Visibility:
+        """The confirmed-private test for one route, with its own key only."""
+        credential, _refusal = self._the_credential_for(route)
+        held = credential is not None and credential.held
+
+        def key_reads() -> bool:
+            if not held:
+                return False
+            copy = commits if commits is not None else self._commits_for(route)
+            return bool(copy.the_key_reads_the_remote().ok)
+
+        return confirmed_private(
+            route.remote, key_reads_the_remote=key_reads, lookup=self._visibility_lookup
+        )
+
+    def why_routes_are_not_private(self) -> dict[str, str]:
+        """With ``private_only`` on: each route refused at start-up, and why."""
+        return dict(self._not_private)
+
+    def _not_confirmed_private(self, route: ProjectRoute, commits: Any) -> Answer | None:
+        """Immediately before a push, with ``private_only`` on: is it still
+        confirmed private? ``None`` when it is, or when the setting is off."""
+        if not self._settings.private_only:
+            return None
+        answer = self._is_it_private(route, commits)
+        if answer.private:
+            return None
+        logger.warning("publisher: %s: %s; nothing was sent", route.name, answer.reason)
+        return _refused(
+            NOT_CONFIRMED_PRIVATE,
+            f"the route for project '{route.name}': {answer.reason}. The "
+            "publisher publishes only to private repositories, so nothing was "
+            "sent.",
+        )
+
     # -- the pieces --------------------------------------------------------
 
     @property
@@ -507,6 +603,15 @@ class Publisher:
                 f"the publisher was not told how to reach the project "
                 f"'{project}', so nothing was sent. Name its read-only source "
                 "and its remote in the publisher's settings.",
+            )
+        if route.name in self._not_private:
+            return _refused(
+                NOT_CONFIRMED_PRIVATE,
+                f"the route for project '{route.name}' was refused when the "
+                f"publisher started: {self._not_private[route.name]}. The "
+                "publisher publishes only to private repositories; restart it "
+                "once the repository is private and its key reads it. Nothing "
+                "was sent.",
             )
 
         # -- the record, read by the publisher itself ----------------------
@@ -689,6 +794,9 @@ class Publisher:
         changed = self._a_route_key_that_changed(route)
         if changed is not None:
             return changed
+        not_private = self._not_confirmed_private(route, commits)
+        if not_private is not None:
+            return not_private
         sent = commits.send(j_commit, target_branch)
         if not sent.ok:
             after = commits.where_the_remotes_branch_is(target_branch)
@@ -926,6 +1034,12 @@ class PublisherHandler(BaseHTTPRequestHandler):
                         "status": "healthy",
                         "self_check": "passed" if said == "passed" else "failed",
                         "self_check_said": said,
+                        # With private_only on (17 October 2026): the routes
+                        # refused at start, and why. Said here, not as a
+                        # failed self-check, because the other routes work.
+                        "routes_refused_at_start": (
+                            self.server.publisher.why_routes_are_not_private()  # type: ignore[attr-defined]
+                        ),
                     },
                 )
                 return
