@@ -155,7 +155,10 @@ class TargetNow:
 
 
 async def target_branch_now(
-    git: CandidateGit, *, recorded_branch: str | None
+    git: CandidateGit,
+    *,
+    recorded_branch: str | None,
+    mission_branch: str | None = None,
 ) -> TargetNow:
     """Fetch the remote and say where the RECORDED target branch is.
 
@@ -167,7 +170,31 @@ async def target_branch_now(
     A build with nothing recorded — every build queued before the starting
     rule — is refused here rather than started from a guess, because the whole
     point of the join is that it is made onto a branch somebody wrote down.
+
+    A MISSION'S BRANCH (missions design, 17 October 2026, section 6). A feature
+    built inside a mission records the mission's branch as its target, not
+    the default branch. ``mission_branch`` is the branch of the mission the
+    build's ``mission_id`` names, read by the caller off the mission record.
+    The recorded branch is accepted only when it equals that branch and the
+    branch exists on the remote; G is then the mission branch's tip. Any
+    other recorded branch is held to the default-branch rule above.
     """
+    recorded = str(recorded_branch or "").strip()
+    mission = str(mission_branch or "").strip()
+    if recorded and mission and recorded == mission:
+        start = await git.fetch_remote_start_point(recorded)
+        if start.refusal:
+            return TargetNow(branch=recorded, refusal=start.refusal)
+        if not start.branch_commit:
+            return TargetNow(
+                branch=recorded,
+                refusal=(
+                    f"this work is aimed at its mission's branch '{recorded}', "
+                    "but the remote did not say which commit that branch is "
+                    "at, so nothing was joined and nothing was sent."
+                ),
+            )
+        return TargetNow(branch=recorded, commit=start.branch_commit)
     recorded = str(recorded_branch or "").strip()
     if not recorded:
         return TargetNow(
@@ -223,6 +250,7 @@ async def make_the_working_folder(
     feature_id: str,
     attempt: int,
     at_commit: str,
+    join_name: str | None = None,
 ) -> JoinOutcome:
     """A working folder of its own, at G, on this attempt's branch.
 
@@ -230,13 +258,18 @@ async def make_the_working_folder(
     a sandbox has its folder made in there and a repository that does not has
     it made here. The operation is the one the factory already had; no route
     was added for this.
+
+    ``join_name`` is the name the folder and branch are made under; the
+    feature id when it is not given (missions design, round 2 R1: a
+    mission's merge joins under ``mission-<id>``).
     """
-    branch = integration_branch(feature_id, attempt)
-    leaf = working_folder_leaf(feature_id, attempt)
+    name = join_name or feature_id
+    branch = integration_branch(name, attempt)
+    leaf = working_folder_leaf(name, attempt)
     # Where it will be on THIS side, for the record and the receipt. The venue
     # answers where it really is, which for a sandboxed repository is a path
     # inside that sandbox.
-    path = working_folder_path(repo_root, feature_id, attempt)
+    path = working_folder_path(repo_root, name, attempt)
     made = await git.add_working_folder(leaf, branch, str(at_commit))
     if not made.ok:
         return JoinOutcome(
@@ -358,15 +391,17 @@ async def look_at_the_leftover_join(
     attempt: int,
     g_commit: str,
     build_tip: str,
+    join_name: str | None = None,
 ) -> LeftoverJoin:
     """Does this attempt's branch exist, and is it a merge of exactly G and the tip?
 
     The same question as :func:`look_at_a_join`, asked of the branch this
     attempt's join was made on. The two commits given are the ones the press
     holds NOW — where the remote's recorded branch is at this moment, and what
-    the build's branch is at this moment.
+    the build's branch is at this moment. ``join_name`` as for
+    :func:`make_the_working_folder`.
     """
-    branch = integration_branch(feature_id, attempt)
+    branch = integration_branch(join_name or feature_id, attempt)
     return await look_at_a_join(
         git, ref=branch, g_commit=g_commit, build_tip=build_tip, named=branch
     )
@@ -381,6 +416,7 @@ def join_inputs(
     build_tip: str,
     branch_to_merge: str,
     folder: str,
+    join_name: str | None = None,
 ) -> dict[str, Any]:
     """The exact inputs of one join attempt, for the record's "about to" line.
 
@@ -397,13 +433,18 @@ def join_inputs(
     on both lines until 22 September 2026, which read as though the two were
     the same fact.
     """
-    return {
+    inputs = {
         "feature_id": str(feature_id),
         "attempt": int(attempt),
         "target_branch": str(target_branch),
         "g_commit": str(g_commit),
         "build_tip": str(build_tip),
         "branch_merged": str(branch_to_merge),
-        "integration_branch": integration_branch(feature_id, attempt),
+        "integration_branch": integration_branch(join_name or feature_id, attempt),
         "working_folder_expected": str(folder),
     }
+    # Said only when it is not the feature's own, so every other record's
+    # line is what it always was.
+    if join_name and join_name != feature_id:
+        inputs["join_name"] = str(join_name)
+    return inputs

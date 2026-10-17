@@ -246,6 +246,16 @@ def maybe_mint_fix_row(
             )
             return None
 
+        if _is_mission_build(pool, row, build_id):
+            logger.info(
+                "fix producer: %s belongs to a mission and ended badly (%s) — "
+                "filing no repair row: a mission's failures are recorded on "
+                "the mission and named on its merge card",
+                build_id,
+                source,
+            )
+            return None
+
         pack_path = _pack_path(build_id, receipts_root=receipts_root)
         if source == SOURCE_BUILD_FAILED and pack_path is None:
             logger.info(
@@ -346,6 +356,22 @@ def _is_fix_journey(row: Any) -> bool:
         return False
     spelled = str(getattr(mode, "value", mode)).strip().lower().replace("_", "-")
     return spelled == FIX_JOURNEY_MODE
+
+
+def _is_mission_build(pool: Any, row: Any, build_id: str) -> bool:
+    """Does this build belong to a mission (missions design, 17 October 2026)?
+
+    No automatic repairs for a mission's builds (section 6, round 1 R3): a
+    fix row would sit outside the mission and be refused, because its target
+    is not the default branch. Read off the row when it carries the columns,
+    else off the ledger.
+    """
+    mission_id = getattr(row, "mission_id", None)
+    if isinstance(mission_id, str) and mission_id.strip():
+        return True
+    from forge.lifecycle.mission_builds import is_mission_build
+
+    return is_mission_build(pool, build_id)
 
 
 def _connection(pool: Any) -> Any:

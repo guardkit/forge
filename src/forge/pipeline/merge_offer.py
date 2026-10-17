@@ -1760,6 +1760,16 @@ class MergeOfferService:
         listen = getattr(review_preview, "set_card_listener", None)
         if callable(listen):
             listen(self._card_changed)
+        # A FEATURE INSIDE A MISSION HAS NO CARD (missions design, 17 October
+        # 2026, section 6): when it finishes cleanly it is merged into its
+        # mission's branch by the merge press's own
+        # ``MergeApprovalConsumer.land_mission_feature``, set here at boot
+        # once the press exists. ``None`` lands nothing, and says so.
+        self._mission_lander: Callable[[str], Awaitable[Any]] | None = None
+
+    def set_mission_lander(self, lander: Callable[[str], Awaitable[Any]] | None) -> None:
+        """What lands a clean mission feature on its mission's branch."""
+        self._mission_lander = lander
 
     async def maybe_offer(self, event: Any) -> None:
         """The wireup's fire-and-forget hook — never raises past itself."""
@@ -1804,6 +1814,35 @@ class MergeOfferService:
                 )
                 return
             self._pool.record_worktree_path(event.build_id, path)
+
+        # A FEATURE BUILT INSIDE A MISSION GETS NO CARD (missions design,
+        # section 6). It is merged into its mission's branch, with no deploy,
+        # by the press under the same per-repository lock an approved merge
+        # takes. A mission's own merge build is never offered through here
+        # either: finishing offers it, with the mission's own words.
+        from forge.lifecycle.mission_builds import mission_of_build
+
+        belongs = mission_of_build(self._pool, event.build_id)
+        if belongs is not None:
+            if not belongs.is_feature:
+                return
+            if self._mission_lander is None:
+                logger.error(
+                    "merge-offer: %s is a feature of mission %s, but nothing "
+                    "here can land it on the mission's branch (the merge press "
+                    "is not composed) — no card, and it does not land",
+                    event.build_id,
+                    belongs.mission_id,
+                )
+                return
+            logger.info(
+                "merge-offer: %s is a feature of mission %s — no card; it is "
+                "merged into the mission's branch",
+                event.build_id,
+                belongs.mission_id,
+            )
+            await self._mission_lander(event.build_id)
+            return
 
         # THE SCOPE PASS (the planner fix, 2026-09-15). Read the finished
         # branch once, here, before the card is built: what it changed that

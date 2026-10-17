@@ -1594,7 +1594,7 @@ def read_ledger(con, spec, between=None):
                 "SELECT lease_holder, lease_expires_at, result FROM publication_records"):
             if live(holder, expires):
                 merges_live += 1
-            elif result != spec["publication_finished"]:
+            elif result not in spec["publication_finished"]:
                 merges_resting += 1
         locks_live = locks_expired = 0
         for holder, expires in rows("SELECT holder_build, expires_at FROM deployment_targets"):
@@ -1655,13 +1655,21 @@ def drained_read_spec() -> dict[str, Any]:
     """The states, stream and consumer names the read uses — Forge's own."""
     from forge.adapters.nats.planning_consumer import PLANNING_DURABLE_NAME
     from forge.cli._serve_config import DEFAULT_DURABLE_NAME
-    from forge.pipeline.publication_record import RESULT_MERGED_AND_RUNNING
+    from forge.pipeline.publication_record import (
+        RESULT_MERGED_AND_RUNNING,
+        RESULT_PUBLISHED_TO_MISSION_BRANCH,
+    )
     from forge.planning.work_queue_loop import BUILD_ACTIVE_STATES, PLANNING_TERMINAL_STATES
 
     return {
         "db": COORDINATOR_LEDGER,
         "build_active": sorted(BUILD_ACTIVE_STATES),
-        "publication_finished": RESULT_MERGED_AND_RUNNING,
+        # Both are finished: a mission feature published to its mission's
+        # branch owes no deploy (missions, 17 October 2026).
+        "publication_finished": [
+            RESULT_MERGED_AND_RUNNING,
+            RESULT_PUBLISHED_TO_MISSION_BRANCH,
+        ],
         "planning_terminal": sorted(PLANNING_TERMINAL_STATES),
         "stream": BUS_STREAM,
         "consumers": [PLANNING_DURABLE_NAME, DEFAULT_DURABLE_NAME],
