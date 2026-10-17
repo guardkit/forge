@@ -252,6 +252,30 @@ docker compose down -v       # and removes the volumes too — the record with t
 
 `down -v` removes the record. On a real machine that is never what you want.
 
+## The nightly security check (off unless switched on)
+
+`settings.example.yaml` carries a `security_sweep:` block with `enabled:
+false`. Switched on (security check design, 17 October 2026), the coordinator
+runs one more background task: once a night, when nothing is building or being
+planned, it fetches every project in `planning.fetch_addresses` into its own
+copy, scans the default branch with the three scanners in the release image
+(Gitleaks for secrets, OSV-Scanner for dependencies, Opengrep for risky code),
+has the factory's own model sort the secret and code findings, files the
+serious problems as one ordinary repair request per project, and posts one
+Slack line. `forge security-sweep --once` runs one sweep by hand, with the same
+lock and line:
+
+    docker exec <coordinator> forge security-sweep --once
+
+Its files live on the ledger volume, in a `security-sweep` folder beside the
+database: the saved state, one history line per run, the private key its
+fingerprints are made with, its lock, and its own copies of the projects. The
+model it asks is the one the plan's stamp check already asks
+(`GUARDKIT_STAMP_MODEL`, at `GUARDKIT_STAMP_MODEL_URL` or `OPENAI_BASE_URL`);
+when the coordinator has no such route, findings wait to be sorted and the
+line says so. The block is refused by an image that does not know it, so put
+it in the settings file only once that image is running.
+
 ## What is deliberately not in this file
 
 - **The bus.** It is reached at the service name `FORGE_NATS_URL` gives, on
