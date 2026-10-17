@@ -57,6 +57,7 @@ __all__ = [
     "builds_record_missions",
     "ensure_tables",
     "mission_branch",
+    "mission_membership",
     "new_mission_id",
 ]
 
@@ -111,7 +112,10 @@ _TABLES_SQL: tuple[str, ...] = (
     "originating_user TEXT NOT NULL, "
     "plan_request_id TEXT, "
     "created_at TEXT NOT NULL, approved_at TEXT, approved_by TEXT, "
-    "closed_at TEXT, closed_reason TEXT"
+    "closed_at TEXT, closed_reason TEXT, "
+    # Where the mission message came from, so every feature's planning run
+    # answers in the same Slack thread the mission message started.
+    "parent_request_id TEXT, originating_adapter TEXT, triggered_by TEXT"
     ") STRICT",
     "CREATE TABLE IF NOT EXISTS mission_features ("
     "mission_id TEXT NOT NULL REFERENCES missions(id), "
@@ -221,6 +225,9 @@ class Mission:
     approved_by: str | None = None
     closed_at: str | None = None
     closed_reason: str | None = None
+    parent_request_id: str | None = None
+    originating_adapter: str | None = None
+    triggered_by: str | None = None
 
     @classmethod
     def from_row(cls, row: Any) -> "Mission":
@@ -240,6 +247,9 @@ class Mission:
             approved_by=row[12],
             closed_at=row[13],
             closed_reason=row[14],
+            parent_request_id=row[15],
+            originating_adapter=row[16],
+            triggered_by=row[17],
         )
 
 
@@ -287,11 +297,60 @@ class NeedsAnswer:
 _MISSION_COLUMNS = (
     "id, title, target_repo, branch, base_commit, final_commit, status, "
     "correlation_id, originating_user, plan_request_id, created_at, "
-    "approved_at, approved_by, closed_at, closed_reason"
+    "approved_at, approved_by, closed_at, closed_reason, "
+    "parent_request_id, originating_adapter, triggered_by"
 )
 _ATTEMPT_COLUMNS = (
     "mission_id, key, attempt, correlation_id, status, reason, admitted_at, closed_at"
 )
+
+
+def mission_membership(
+    cx: Any, correlation_id: str | None
+) -> tuple[Mission | None, MissionAttempt, MissionFeature | None] | None:
+    """``(mission, attempt, feature)`` when ``correlation_id`` is a mission
+    attempt's, else None. Read only; creates nothing.
+
+    Membership is the attempt's correlation id in ``mission_attempts`` and
+    nothing else — no queue row is involved (design round 3, R11). The mission
+    or the feature is None when the attempt names one that is missing, which
+    the caller treats as inconsistent metadata. A ledger without the mission
+    tables, or anything that is not a ledger connection, has no members.
+    """
+    if not correlation_id or not isinstance(cx, sqlite3.Connection):
+        return None
+    try:
+        row = cx.execute(
+            f"SELECT {_ATTEMPT_COLUMNS} FROM mission_attempts WHERE correlation_id = ?",
+            (correlation_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        attempt = MissionAttempt.from_row(tuple(row))
+        mission_row = cx.execute(
+            f"SELECT {_MISSION_COLUMNS} FROM missions WHERE id = ?",
+            (attempt.mission_id,),
+        ).fetchone()
+        feature_row = cx.execute(
+            "SELECT key, sentence, no_sign_in FROM mission_features "
+            "WHERE mission_id = ? AND key = ?",
+            (attempt.mission_id, attempt.key),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return None
+        raise
+    mission = Mission.from_row(tuple(mission_row)) if mission_row is not None else None
+    feature = (
+        MissionFeature(
+            key=str(feature_row[0]),
+            sentence=str(feature_row[1]),
+            no_sign_in=bool(feature_row[2]),
+        )
+        if feature_row is not None
+        else None
+    )
+    return mission, attempt, feature
 
 
 # ---------------------------------------------------------------------------
@@ -354,6 +413,9 @@ class MissionStore:
         originating_user: str,
         features: Sequence[MissionFeature],
         mission_id: str | None = None,
+        parent_request_id: str | None = None,
+        originating_adapter: str | None = None,
+        triggered_by: str | None = None,
     ) -> tuple[Mission, bool]:
         """File a PROPOSED mission with its features and needs.
 
@@ -380,8 +442,9 @@ class MissionStore:
                     raise ValueError(f"mission id {mission_id} is already used")
             cx.execute(
                 "INSERT INTO missions (id, title, target_repo, branch, status, "
-                "correlation_id, originating_user, created_at) "
-                "VALUES (?, ?, ?, ?, 'PROPOSED', ?, ?, ?)",
+                "correlation_id, originating_user, created_at, parent_request_id, "
+                "originating_adapter, triggered_by) "
+                "VALUES (?, ?, ?, ?, 'PROPOSED', ?, ?, ?, ?, ?, ?)",
                 (
                     chosen,
                     title,
@@ -390,6 +453,9 @@ class MissionStore:
                     correlation_id,
                     originating_user,
                     self._now(),
+                    parent_request_id,
+                    originating_adapter,
+                    triggered_by,
                 ),
             )
             for feature in features:

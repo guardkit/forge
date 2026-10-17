@@ -1924,6 +1924,24 @@ class ReviewPreviewConfig(BaseModel):
         return value
 
 
+class MissionsConfig(BaseModel):
+    """The missions switch (missions design, 17 October 2026, section 8).
+
+    A mission is a short list of dependent feature sentences for one
+    repository, built on one ``mission/m-<6 hex>`` branch and merged into main
+    once, on one card. ``enabled`` defaults to **False**: with it off a
+    ``mission:`` message is answered "missions are switched off" and nothing
+    is filed. Its own top-level block, so the switch reads at a glance.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description="Whether a mission message may start a mission.",
+    )
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -2031,6 +2049,14 @@ class ForgeConfig(BaseModel):
             "approval.max_wait_seconds."
         ),
     )
+    missions: MissionsConfig = Field(
+        default_factory=MissionsConfig,
+        description=(
+            "The missions switch (17 October 2026). Defaults to disabled "
+            "(enabled=False): a mission message is answered 'missions are "
+            "switched off' and nothing is filed."
+        ),
+    )
     permissions: PermissionsConfig = Field(
         ...,
         description=(
@@ -2041,6 +2067,7 @@ class ForgeConfig(BaseModel):
 
 
 __all__ = [
+    "MissionsConfig",
     "ATTENDED_PROFILE_NAME",
     "DEFAULT_APPROVAL_MAX_WAIT_SECONDS",
     "DEFAULT_AUTOBUILD_GATE_APPROVAL_MAX_WAIT_SECONDS",

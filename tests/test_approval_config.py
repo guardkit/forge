@@ -372,6 +372,7 @@ class TestApprovalYamlRoundTrip:
                 "public_host": None,
                 "max_app_ttl_minutes": None,
             },
+            "missions": {"enabled": False},
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

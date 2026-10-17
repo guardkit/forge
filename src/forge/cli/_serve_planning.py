@@ -667,6 +667,14 @@ class _PlanningPausePublisher:
                 approval_subject=f"agents.approval.forge.{build_id}",
                 paused_at=self._clock().isoformat(),
                 correlation_id=correlation_id,
+                # A mission plan card names the mission by its title (missions
+                # design, section 3); BuildPausedPayload takes extra keys and
+                # Jarvis reads this one. Absent on every other planning card.
+                **(
+                    {"feature_title": details["feature_title"]}
+                    if details.get("feature_title")
+                    else {}
+                ),
             )
             mirror = MessageEnvelope(
                 source_id="forge",
@@ -1517,8 +1525,50 @@ async def compose_planning_consumer_and_dispatch(
             # daemon's one client; the normal build route takes it from here.
             await publish_build_request(nats_client, build)
 
+        # -- missions (missions design, 17 October 2026) ----------------------
+        # A ``mission:`` message is filed in the mission tables (never in the
+        # work queue), shown on one plan card, and, once approved and its
+        # branch is confirmed, run by the mission step in the queue's tick.
+        from forge.lifecycle.missions import MissionStore
+        from forge.planning.missions_flow import MissionFlow
+
+        mission_store = MissionStore(pool, clock=clock_fn)
+
+        async def _read_mission_main_tip(target_repo: str) -> Any:
+            repo_path = dict(config.planning.target_repo_paths or {}).get(target_repo)
+            if not repo_path:
+                return None
+            return await planning_git_runner.fetch_remote_start_point(repo_path)
+
+        try:
+            from forge.pipeline.publisher_client import (  # type: ignore[attr-defined]
+                ask_the_publisher_to_create_mission_branch,
+            )
+
+            async def _create_mission_branch(**request: Any) -> Any:
+                return await ask_the_publisher_to_create_mission_branch(
+                    config, **request
+                )
+
+        except ImportError:  # the publisher's mission-branch client is not here yet
+            _create_mission_branch = None  # type: ignore[assignment]
+
+        mission_flow = MissionFlow(
+            mission_store,
+            publish_card=pause_publisher.publish_request,
+            subscriber_factory=subscriber_factory,
+            notify=_notify_in_thread,
+            read_remote_tip=_read_mission_main_tip,
+            create_branch=_create_mission_branch,
+            approval_wait_seconds=config.approval.max_wait_seconds,
+            routing_gate=feature_routing_gate,
+            clock=clock_fn,
+        )
+
         consumer_deps = PlanningConsumerDeps(
             store=store,
+            mission_flow=mission_flow,
+            missions_enabled=bool(config.missions.enabled),
             publish_notification=_notify_in_thread,
             publish_build_queued=_publish_build_queued,
             publish_planning_failed=publish_planning_failed,
@@ -1648,6 +1698,8 @@ async def compose_planning_consumer_and_dispatch(
             admit_fix_rows=config.conductor.admit_fix_rows,
             merge_cards=lambda: unanswered_merge_cards(pool),
             merge_offer_hold_seconds=merge_hold_seconds,
+            missions=mission_store,
+            tend_missions=mission_flow.tend,
         )
         queue_loop_task = asyncio.create_task(queue_loop.run())
         _supervise(queue_loop_task, "work-queue-take-next")

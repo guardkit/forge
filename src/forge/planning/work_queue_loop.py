@@ -114,6 +114,7 @@ from forge.pipeline.publication_record import (
     LINE_DONE,
     RESULT_MERGED_AND_RUNNING,
     RESULT_PUBLISHED_DEPLOYMENT_PENDING,
+    RESULT_PUBLISHED_TO_MISSION_BRANCH,
     STEP_SEND,
     PublicationRecordStore,
 )
@@ -262,9 +263,14 @@ MERGE_CARD_GRACE_SECONDS: int = 10 * 60
 
 #: Publication record results, and merge report result words, that mean the
 #: joined commit is on the remote. A later press that finds the work already
-#: there by looking writes one of these and no new send line.
+#: there by looking writes one of these and no new send line. A mission
+#: feature lands on its mission branch, and nothing is deployed for it.
 _LANDED_RECORD_RESULTS: frozenset[str] = frozenset(
-    {RESULT_PUBLISHED_DEPLOYMENT_PENDING, RESULT_MERGED_AND_RUNNING}
+    {
+        RESULT_PUBLISHED_DEPLOYMENT_PENDING,
+        RESULT_MERGED_AND_RUNNING,
+        RESULT_PUBLISHED_TO_MISSION_BRANCH,
+    }
 )
 _LANDED_REPORT_WORDS: frozenset[str] = frozenset(
     {RESULT_WORD_PUBLISHED_DEPLOYMENT_PENDING, RESULT_WORD_MERGED_AND_RUNNING}
@@ -405,6 +411,15 @@ class MergeCard:
     #: The build's correlation id — the piece of work the card belongs to, so
     #: the in-flight count does not count a build and its card twice.
     correlation_id: str = ""
+    #: The mission's title when this is a mission's own merge card (its build
+    #: row's ``mission_role`` is ``mission-merge``); empty for any other card.
+    mission_title: str = ""
+
+    def named(self) -> str:
+        """What the card is for, in words: the feature, or the mission."""
+        if self.mission_title:
+            return f'mission "{self.mission_title}"'
+        return self.feature_id
 
     def has_lapsed(self, hold_seconds: int, now: datetime) -> bool:
         """Has the card been waiting longer than the queue is willing to wait?"""
@@ -442,6 +457,7 @@ def unanswered_merge_cards(connection: sqlite3.Connection) -> list[MergeCard]:
             return []
         raise
 
+    titles = _mission_merge_titles(connection, [str(row[0]) for row in rows])
     cards: list[MergeCard] = []
     for row in rows:
         offered_at = _read_time(row[2])
@@ -456,9 +472,40 @@ def unanswered_merge_cards(connection: sqlite3.Connection) -> list[MergeCard]:
             )
             continue
         cards.append(
-            MergeCard(str(row[0]), str(row[1]), offered_at, str(row[3] or ""))
+            MergeCard(
+                str(row[0]),
+                str(row[1]),
+                offered_at,
+                str(row[3] or ""),
+                titles.get(str(row[0]), ""),
+            )
         )
     return cards
+
+
+def _mission_merge_titles(
+    connection: sqlite3.Connection, build_ids: Sequence[str]
+) -> dict[str, str]:
+    """``{build id: mission title}`` for the builds that are a mission's own merge.
+
+    Nothing for a ledger without the mission tables or columns.
+    """
+    if not build_ids:
+        return {}
+    marks = ", ".join("?" for _ in build_ids)
+    try:
+        rows = connection.execute(
+            "SELECT builds.build_id, missions.title FROM builds "
+            "JOIN missions ON missions.id = builds.mission_id "
+            f"WHERE builds.mission_role = 'mission-merge' AND builds.build_id IN ({marks})",
+            tuple(build_ids),
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        text = str(exc).lower()
+        if "no such table" in text or "no such column" in text:
+            return {}
+        raise
+    return {str(row[0]): str(row[1]) for row in rows}
 
 
 def _read_time(value: Any) -> datetime | None:
@@ -510,7 +557,7 @@ def plain_duration(seconds: int) -> str:
 def merge_hold_line(cards: Sequence[MergeCard], now: datetime) -> str:
     """Why the queue is holding, when an unanswered merge card is the reason."""
     return "; ".join(
-        f"the merge card for {card.feature_id} is waiting for a press "
+        f"the merge card for {card.named()} is waiting for a press "
         f"(offered {age_phrase(card.offered_at.isoformat(), now)})"
         for card in cards
     )
@@ -533,6 +580,9 @@ def count_in_flight(
       place and nothing else carries it. Once the run or build exists it
       speaks for itself, so a repair whose build was marked INTERRUPTED is not
       counted through its still-admitted row;
+    - it is a mission attempt ADMITTED with no planning run or build yet, by
+      the same rule (missions design, section 2a). Once its run exists the
+      attempt is counted through its run and build like any other work;
     - it has a planning run in an active state;
     - it has a build in an active state;
     - it has a build whose merge card is still waiting for Rich's word.
@@ -576,6 +626,15 @@ def count_in_flight(
         correlation_id
         for correlation_id in _correlation_ids_in(
             connection, "work_queue", "status", ("ADMITTED",)
+        )
+        if not _work_is_written(connection, correlation_id)
+    }
+    # A mission attempt admitted with no planning run yet (missions design,
+    # section 2a): the same place an admitted queue row with no run holds.
+    pieces |= {
+        correlation_id
+        for correlation_id in _correlation_ids_in(
+            connection, "mission_attempts", "status", ("ADMITTED",)
         )
         if not _work_is_written(connection, correlation_id)
     }
@@ -710,7 +769,16 @@ def work_landing(
     status = str(build[1])
     report = _latest_stage(connection, build_id, MERGE_REPORT_ROW)
     report_says = _report_result(report)
-    if (
+    if _is_mission_build(connection, build_id):
+        # A mission feature lands on its mission branch, and only its record's
+        # own result says so: a published send line alone is not read as
+        # landed for a mission build (missions design, section 6).
+        if (
+            PublicationRecordStore(connection).read(build_id).result
+            == RESULT_PUBLISHED_TO_MISSION_BRANCH
+        ):
+            return LANDED
+    elif (
         _was_published(connection, build_id)
         or report_says in _LANDED_REPORT_WORDS
     ):
@@ -730,6 +798,9 @@ def work_landing(
         status == "COMPLETE"
         and merge_executor_enabled
         and _latest_stage(connection, build_id, MERGE_OFFER_ROW) is None
+        # A mission feature never gets a card: it is merged into its mission
+        # branch with no card, so the grace for a missing card does not apply.
+        and not _is_mission_build(connection, build_id)
     ):
         finished = _read_time(build[2] or build[3])
         moment = now or datetime.now(timezone.utc)
@@ -742,6 +813,20 @@ def work_landing(
         ):
             return NO_MERGE_CARD
     return NOT_LANDED_YET
+
+
+def _is_mission_build(connection: sqlite3.Connection, build_id: str) -> bool:
+    """True when the build is a mission feature's (``mission_role`` 'feature')."""
+    try:
+        row = connection.execute(
+            "SELECT mission_id, mission_role FROM builds WHERE build_id = ?",
+            (build_id,),
+        ).fetchone()
+    except sqlite3.OperationalError as exc:
+        if "no such column" in str(exc).lower() or "no such table" in str(exc).lower():
+            return False
+        raise
+    return row is not None and row[0] is not None and row[1] == "feature"
 
 
 def _preview_being_prepared(connection: sqlite3.Connection, build_id: str) -> bool:
@@ -872,6 +957,8 @@ class WorkQueueLoop:
         | None = None,
         in_flight_database: sqlite3.Connection | None = None,
         merge_executor_enabled: bool = True,
+        missions: Any | None = None,
+        tend_missions: Callable[[], Awaitable[None]] | None = None,
     ) -> None:
         """Wire the loop to the store and to the rest of the estate.
 
@@ -949,6 +1036,15 @@ class WorkQueueLoop:
             How long the loop waits for a merge card before it moves on, and
             the same window ``count_in_flight`` uses. Nought — the default
             here — means do not wait for a card at all.
+        missions:
+            The mission store (``forge.lifecycle.missions.MissionStore``) on
+            this same database. When given, every tick runs the mission step
+            (``forge.planning.mission_step``) right after the queue's close
+            step. ``None`` — the default — runs no mission step.
+        tend_missions:
+            The mission flow's tending of PROPOSED and STARTING missions, run
+            at the start of the mission step (a plan card to re-arm after a
+            restart, a branch to ask for again).
         """
         if in_flight_database is not None and not same_database(
             in_flight_database, store.connection
@@ -978,6 +1074,20 @@ class WorkQueueLoop:
         self._merge_offer_hold_seconds = merge_offer_hold_seconds
         self._run_events = run_events
         self._merge_executor_enabled = merge_executor_enabled
+        self._mission_step = None
+        if missions is not None:
+            from forge.planning.mission_step import MissionStep
+
+            self._mission_step = MissionStep(
+                missions,
+                planning_run=planning_run,
+                count_in_flight=count_in_flight,
+                max_in_flight=max_in_flight,
+                start_run=start_run,
+                failure_reason=self._mission_failure_reason,
+                clock=self._clock,
+                before=tend_missions,
+            )
         # What the loop has already said, so it does not say it every ten
         # seconds: the number it was last holding at, the set of repair
         # rows it last reported as waiting, and the set of merge cards it
@@ -995,8 +1105,25 @@ class WorkQueueLoop:
         """Pick up what was dropped, close what finished, take the next one."""
         self.recover_admitted()
         self.close_finished()
+        if self._mission_step is not None:
+            try:
+                await self._mission_step.run_once()
+            except Exception:  # noqa: BLE001 — a mission never stops the queue
+                logger.exception("work queue: the mission step failed this tick")
+            # -- mission finishing goes here (missions design, section 7) ---
+            # READY missions are finished by their own module, called in its
+            # own clearly separated step, right after the mission step above.
+            # -- end of the mission steps -----------------------------------
         await self.ask_hold_or_go()
         await self.take_next()
+
+    def _mission_failure_reason(self, run: Any, state: str, correlation_id: str) -> str:
+        """Why a mission attempt's planning run ended badly, in the queue's words."""
+        if state == PlanningState.FAILED.value:
+            spoken = self._owner_failure_sentence(correlation_id)
+            if spoken:
+                return spoken
+        return self._failure_reason(run, state)
 
     # -- 0. picking up what was dropped ----------------------------------
 
@@ -1485,7 +1612,7 @@ class WorkQueueLoop:
             logger.info(
                 "work queue: the merge card for %s was not answered within "
                 "%s; the queue moves on. Its branch is kept.",
-                card.feature_id,
+                card.named(),
                 plain_duration(self._merge_offer_hold_seconds),
             )
         # Remember exactly the cards the queue is waiting for now. A card that

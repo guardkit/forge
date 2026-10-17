@@ -235,6 +235,12 @@ class PlanningConsumerDeps:
     #: ``build: FEAT-XXXX from <branch>`` (register-projects design, 5 October
     #: 2026, part 3). ``None`` takes no hand-overs: the person is told so.
     publish_build_queued: Callable[[BuildQueuedPayload], Awaitable[None]] | None = None
+    #: The mission flow (``forge.planning.missions_flow.MissionFlow``) that
+    #: files a ``mission:`` message and puts its plan card up. ``None`` takes
+    #: no missions: the person is told missions are switched off.
+    mission_flow: Any | None = None
+    #: Whether ``missions.enabled`` is on.
+    missions_enabled: bool = False
 
     #: Whether ``publish_notification`` can be told which conversation to
     #: answer in. Read from the callable once, here, when the consumer is
@@ -617,6 +623,94 @@ async def _hand_over_build(
 
 
 # ---------------------------------------------------------------------------
+# A mission: several dependent features on one branch (missions design,
+# 17 October 2026, section 1)
+# ---------------------------------------------------------------------------
+
+
+async def _start_mission(
+    msg: _MsgLike,
+    deps: PlanningConsumerDeps,
+    payload: Any,
+    command: Mapping[str, Any],
+) -> None:
+    """Check the mission, file it PROPOSED and put its plan card up.
+
+    Every check is made before any card, and a failure is one plain sentence
+    in the thread, acked, with nothing filed: the switch, the repository
+    (typed or the configured default, exactly as a ``build:`` hand-over
+    resolves it), and the mission's own shape
+    (:func:`forge.planning.missions_flow.validate_mission`). Filing is
+    idempotent on the message's correlation id, so a redelivery files nothing
+    new and posts no second card. A store failure is NOT acked — the mission
+    must not be lost. No planning run and no queue row is written.
+    """
+    from forge.planning.missions_flow import MISSIONS_SWITCHED_OFF, validate_mission
+
+    correlation_id = payload.correlation_id
+
+    async def _say(text: str) -> None:
+        await _notify_best_effort(
+            deps, correlation_id, text, parent_request_id=payload.parent_request_id
+        )
+
+    if deps.mission_flow is None or not deps.missions_enabled:
+        await _say(f"That mission was not started: {MISSIONS_SWITCHED_OFF}.")
+        await msg.ack()
+        return
+    planning = deps.planning_config
+    repo, refusal = resolve_named_or_default(
+        payload.target_repo,
+        dict(getattr(planning, "target_repo_paths", None) or {}),
+        getattr(planning, "default_target_repo", None),
+    )
+    if repo is None:
+        await _say(refusal or "No repository could be found for this mission.")
+        await msg.ack()
+        return
+    checked = validate_mission(command, mission_correlation_id=correlation_id)
+    if isinstance(checked, str):
+        logger.info(
+            "planning_consumer: mission from correlation_id=%s refused: %s",
+            correlation_id,
+            checked,
+        )
+        await _say(checked)
+        await msg.ack()
+        return
+    title, features = checked
+    try:
+        mission, created = deps.mission_flow.propose(
+            title=title,
+            target_repo=repo,
+            correlation_id=correlation_id,
+            originating_user=payload.originating_user,
+            features=features,
+            parent_request_id=payload.parent_request_id,
+            originating_adapter=payload.originating_adapter,
+            triggered_by=payload.triggered_by,
+        )
+    except Exception as exc:  # noqa: BLE001 — never drop a mission
+        logger.error(
+            "planning_consumer: filing the mission for correlation_id=%s raised "
+            "(%s); requesting redelivery (nak/no-ack)",
+            correlation_id,
+            exc,
+        )
+        await _nak_or_leave_unacked(msg, correlation_id)
+        return
+    logger.info(
+        "planning_consumer: mission %s (%d features, %s) %s for correlation_id=%s",
+        mission.id,
+        len(features),
+        repo,
+        "filed; plan card going up" if created else "already filed",
+        correlation_id,
+    )
+    await msg.ack()
+
+
+# ---------------------------------------------------------------------------
 # Correlation ID validation
 # ---------------------------------------------------------------------------
 
@@ -733,6 +827,11 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
     command = _queue_command_from(payload)
     if command is not None and command.get("verb") == "build":
         await _hand_over_build(msg, deps, payload, command)
+        return
+    # A mission (missions design, 17 October 2026) is not one queue row, so
+    # it is not one of the queue's verbs: it is taken here, like ``build``.
+    if command is not None and command.get("verb") == "mission":
+        await _start_mission(msg, deps, payload, command)
         return
 
     # --- 3b. Resolve the repository the sentence named (rule 3) ----------

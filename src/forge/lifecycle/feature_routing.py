@@ -516,4 +516,22 @@ def _router_restart_blockers_snapshot(
             marker = f"queued-build-active:{correlation_id}:{build_id}:{status}"
             if f"build:{build_id}:{status}" not in blockers:
                 blockers.append(marker)
+
+    # A mission holds its routing seed from plan approval to its final merge
+    # (missions design, 17 October 2026, section 7): the gaps between one
+    # attempt closing and the next being admitted, or between READY and its
+    # card, are never a window for a router table reset. A ledger without the
+    # mission tables has no missions.
+    try:
+        missions = connection.execute(
+            "SELECT id, status FROM missions "
+            "WHERE status IN ('STARTING', 'RUNNING', 'READY', 'MERGING') "
+            "ORDER BY created_at, id"
+        ).fetchall()
+    except sqlite3.OperationalError as exc:
+        if "no such table" not in str(exc).lower():
+            raise
+        missions = []
+    for mission_id, status in missions:
+        blockers.append(f"mission:{mission_id}:{status}")
     return tuple(blockers)

@@ -1855,6 +1855,37 @@ def _build_dispatch_build(
             await _say_building()
             return
 
+        # --- A mission feature has no build gate (missions design, 17 October
+        # 2026, section 5). The mission plan card was the go-ahead, so the
+        # build writes one stage-log decision citing that approval and then
+        # launches exactly as the "no gate wired" arm above does. It does not
+        # go through gate_check with a made-up auto-approve: reasoning refuses
+        # an auto-approve without a Coach score, rightly.
+        mission_gate = _mission_build_gate_decision(
+            sqlite_pool, build_id, payload.correlation_id, clock
+        )
+        if mission_gate is not None:
+            logger.info(
+                "dispatch_build: build_id=%s is part of mission %s; no build "
+                "gate (%s); launching",
+                build_id,
+                mission_gate["mission_id"],
+                mission_gate["decided_by"],
+            )
+            if register_observer is not None:
+                await _safe_register_observer(register_observer, build_id)
+            await launch_or_conduct(
+                ack_callback=ack_callback,
+                build_id=build_id,
+                feature_id=payload.feature_id,
+                correlation_id=payload.correlation_id,
+                branch=payload.branch,
+                repo=payload.repo,
+                budget=budget_entry,
+            )
+            await _say_building()
+            return
+
         outcome = await _serve_gate_activation.maybe_gate_build(
             parts=parts,
             sqlite_pool=sqlite_pool,
@@ -2270,6 +2301,52 @@ def build_prepared_build_admission(
     return admit
 
 
+def _mission_build_gate_decision(
+    sqlite_pool: Any, build_id: str, correlation_id: str | None, clock: Any
+) -> dict[str, Any] | None:
+    """For a mission feature's build, write its build-gate decision and return it.
+
+    One ``stage_log`` row at the build gate's own target (the autobuild runner,
+    stage ``autobuild``), PASSED, citing the mission approval: who approved
+    the mission plan and that card's request id. ``None`` — and nothing
+    written — for any build that is not a mission attempt's, or whose mission
+    is not running. A redelivery writes the row again; it says the same thing.
+    """
+    from forge.lifecycle.missions import mission_membership
+    from forge.lifecycle.persistence import StageLogEntry
+
+    connection = getattr(sqlite_pool, "connection", None)
+    membership = mission_membership(connection, correlation_id)
+    if membership is None or membership[0] is None:
+        return None
+    mission = membership[0]
+    if mission.status != "RUNNING":
+        return None
+    decision = {
+        "mission_id": mission.id,
+        "decided_by": f"mission {mission.id} (approved by {mission.approved_by})",
+        "approved_by": mission.approved_by,
+        "plan_request_id": mission.plan_request_id,
+        "approved_at": mission.approved_at,
+    }
+    now = clock()
+    sqlite_pool.record_stage(
+        StageLogEntry(
+            build_id=build_id,
+            stage_label="autobuild",
+            target_kind="subagent",
+            target_identifier="autobuild_runner",
+            status="PASSED",
+            gate_mode=None,
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.0,
+            details={"mission_gate": decision},
+        )
+    )
+    return decision
+
+
 def _work_queue_rejection_recorder(
     sqlite_pool: Any,
 ) -> Callable[[str, str], bool]:
@@ -2277,17 +2354,32 @@ def _work_queue_rejection_recorder(
 
     Uses the lifecycle pool's own connection — the work queue lives in the same
     Forge database — and leaves the connection's row factory as it found it.
+
+    A refusal of a mission feature's build (missions design, 17 October 2026,
+    section 2a) has no queue row; it is written against the mission attempt
+    filed under the same correlation id instead, which closes FAILED with the
+    refusal's first sentence, once. The mission step reads that directly, so
+    the features that need it are held and the mission can finish.
     """
 
     def _record(correlation_id: str, reason: str) -> bool:
+        from forge.lifecycle.missions import MissionStore
+        from forge.planning.work_queue_loop import first_sentence
         from forge.planning.work_queue_store import WorkQueueStore
 
         connection = sqlite_pool.connection
         previous = connection.row_factory
         try:
-            return WorkQueueStore(connection).record_build_rejection(
+            mission_noted = False
+            missions = MissionStore(connection)
+            if missions.attempt_by_correlation_id(correlation_id) is not None:
+                mission_noted = missions.mark_failed(
+                    correlation_id, first_sentence(reason) or reason
+                )
+            queue_noted = WorkQueueStore(connection).record_build_rejection(
                 correlation_id, reason
             )
+            return mission_noted or queue_noted
         finally:
             connection.row_factory = previous
 

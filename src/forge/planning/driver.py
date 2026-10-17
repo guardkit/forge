@@ -61,6 +61,7 @@ import yaml
 
 from forge.gating.identity import derive_request_id, parse_request_id
 from forge.lifecycle.identifiers import validate_feature_id
+from forge.lifecycle.missions import mission_membership
 from forge.pipeline.dispatchers.specialist import (
     FINAL_PLAN_REVIEW_FEEDBACK,
 )
@@ -296,7 +297,17 @@ _AUTH_CONFIRM_RATIONALE = (
 #: (Vocabulary refreshed 2026-07-31: "bars" → the plain-name noun for the
 #: ``qa-pass-bars`` stage, "the quality checklist" — see
 #: :mod:`forge.pipeline.stage_names`.)
+#: The sign-in answer recorded for a mission feature whose spec may involve
+#: sign-in when the mission message did not say ``[no sign-in]`` (missions
+#: design, section 5). Not a yes, so the pass-bars leg stops honestly, and no
+#: card is opened inside a mission.
+_MISSION_SIGN_IN_NOT_SAID = "not said in the mission"
+
 _AUTH_DOOR_TERMINAL_SUFFIX = {
+    _MISSION_SIGN_IN_NOT_SAID: (
+        "The spec may involve sign-in and the mission didn't say it has none, "
+        "so the quality checklist must be registered attended."
+    ),
     "rejected": (
         "The owner read the flagged lines and confirmed this IS a sign-in "
         "surface, so the quality checklist must be registered attended."
@@ -3055,6 +3066,17 @@ class PlanningRunDriver:
             )
             return str(recorded_commit), str(recorded_branch)
 
+        # A MISSION FEATURE starts from its mission's branch, never from the
+        # default branch (missions design, 17 October 2026, section 5).
+        # Membership is this run's correlation id in ``mission_attempts``.
+        membership = mission_membership(
+            getattr(deps.store, "_connection", None), correlation_id
+        )
+        if membership is not None:
+            return await self._mission_start_point(
+                correlation_id, target_repo, repo_path, membership
+            )
+
         # The SAME runner the branch write uses, so the fetch and the cut
         # always happen in one place: in the sandbox for a project that has
         # one, in the coordinator for a project that does not.
@@ -3107,6 +3129,89 @@ class PlanningRunDriver:
             remote_branch,
         )
         return commit, remote_branch
+
+    async def _mission_start_point(
+        self,
+        correlation_id: str,
+        target_repo: str,
+        repo_path: str,
+        membership: tuple[Any, Any, Any],
+    ) -> tuple[str, str] | None:
+        """A mission feature's start: its mission branch's tip, or None after failing.
+
+        Inconsistent mission metadata fails the run honestly here, before any
+        model is asked, naming what is wrong, and is never planned from the
+        default branch instead: a mission that is missing or not RUNNING, an
+        attempt that is not ADMITTED, a repository that is not the mission's,
+        or a mission branch the remote does not have. Otherwise the branch is
+        fetched by name and its tip is recorded as the start, with the mission
+        branch as the target. The features it needs have landed there, so the
+        tip contains them.
+        """
+        mission, attempt, _feature = membership
+        problem: str | None = None
+        if mission is None:
+            problem = f"its mission ({attempt.mission_id}) is not on record"
+        elif mission.status != "RUNNING":
+            problem = f"its mission {mission.id} is {mission.status}, not running"
+        elif attempt.status != "ADMITTED":
+            problem = f"its mission attempt is {attempt.status}, not admitted"
+        elif mission.target_repo != target_repo:
+            problem = (
+                f"its mission is for {mission.target_repo}, not {target_repo}"
+            )
+        if problem is not None:
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                f"this run is part of a mission but {problem}, so it was not "
+                "planned from anywhere",
+            )
+            return None
+        fetch = getattr(self._deps.git_runner, "fetch_remote_start_point", None)
+        if fetch is None:
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                "the git runner wired for this factory cannot fetch a "
+                "project's remote, so the mission branch could not be read",
+            )
+            return None
+        try:
+            answer = await fetch(repo_path, branch=mission.branch)
+        except Exception as exc:  # noqa: BLE001 — boundary, never crash the run
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                f"the mission branch {mission.branch} could not be read: "
+                f"{type(exc).__name__}: {exc}",
+            )
+            return None
+        commit = getattr(answer, "branch_commit", None) if answer is not None else None
+        if answer is None or not getattr(answer, "ok", False) or not commit:
+            reason = str(
+                getattr(answer, "refusal", None)
+                or f"the remote has no branch {mission.branch}"
+            )
+            await self._fail_leg(
+                correlation_id,
+                "target-terminal-enter",
+                f"the mission branch {mission.branch} could not be read: {reason}",
+            )
+            return None
+        self._deps.store.record_start_point(
+            correlation_id, start_commit=str(commit), target_branch=mission.branch
+        )
+        logger.info(
+            "planning driver: run %s is mission %s's %s and starts from %s, the "
+            "tip of %s",
+            correlation_id,
+            mission.id,
+            attempt.key,
+            commit,
+            mission.branch,
+        )
+        return str(commit), mission.branch
 
     async def _declarations(
         self,
@@ -3440,7 +3545,26 @@ class PlanningRunDriver:
 
             # THE ONE PAUSE. A run configured to skip the card on a thin
             # feature skips it here — mechanically decidable, no judgement.
-            skip = self._digest_review_skip_reason(draft)
+            skip = self._digest_review_skip_reason(draft, correlation_id)
+            mission_review = self._mission_spec_review(correlation_id, draft)
+            if skip is not None and mission_review is not None:
+                # A mission feature: Ready means spec approved, recorded with
+                # the mission approval rather than silent (section 5).
+                logger.info(
+                    "planning driver: run %s spec digest review skipped (%s)",
+                    correlation_id,
+                    skip,
+                )
+                deps.store._record_event(
+                    correlation_id=correlation_id,
+                    stage_label=_DIGEST_REVIEW_STAGE,
+                    status="skipped",
+                    actor_identity="planning-driver",
+                    details_json=json.dumps({"digest_review": {"skipped": skip}}),
+                )
+                return self._record_spec_approved(
+                    correlation_id, draft, branch, spec_review=mission_review
+                )
             if skip is not None:
                 logger.info(
                     "planning driver: run %s spec digest review skipped (%s)",
@@ -5278,8 +5402,13 @@ class PlanningRunDriver:
         branch: str,
         *,
         answer: "_DoorAnswer | None" = None,
+        spec_review: Mapping[str, Any] | None = None,
     ) -> bool:
         """Write the leg's durable ``approved`` row and advance to the plan leg.
+
+        ``spec_review`` is a mission feature's record of the mission approval
+        (:meth:`_mission_spec_review`), written in the same shape a card's
+        answer is.
 
         The row keeps the shape every downstream leg already reads (slug, files,
         repo, branch, sha, pass-bar seed) and ADDS the owner's act: who said yes
@@ -5324,11 +5453,16 @@ class PlanningRunDriver:
                 # the same fallback in :meth:`_spec_review_auth_answer`.
                 **({"auth_confirmed": True} if sign_in == "confirmed" else {}),
             }
+        elif spec_review is not None:
+            record["spec_review"] = dict(spec_review)
+        decided_by = (answer.decided_by if answer else None) or (
+            spec_review.get("decided_by") if spec_review else None
+        )
         self._deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_FEATURE_SPEC_STAGE,
             status="approved",
-            actor_identity=(answer.decided_by if answer else None) or "planning-driver",
+            actor_identity=decided_by or "planning-driver",
             details_json=json.dumps(record),
         )
         logger.info(
@@ -5584,6 +5718,24 @@ class PlanningRunDriver:
             "answered_on": "the spec digest card",
         }
 
+    def _mission_sign_in_answer(self, correlation_id: str) -> dict[str, Any] | None:
+        """For a mission feature with no recorded sign-in answer, the answer the
+        mission message gave, so no sign-in card is ever opened inside a
+        mission; None for any other run."""
+        membership = mission_membership(
+            getattr(self._deps.store, "_connection", None), correlation_id
+        )
+        if membership is None or membership[0] is None:
+            return None
+        mission, _attempt, feature = membership
+        said = feature is not None and feature.no_sign_in
+        return {
+            "outcome": "confirmed" if said else _MISSION_SIGN_IN_NOT_SAID,
+            "decided_by": mission.approved_by,
+            "request_id": mission.plan_request_id,
+            "answered_on": "the mission message",
+        }
+
     def _spec_review_notes(self, correlation_id: str) -> list[str]:
         """Every note the owner has sent about this spec, oldest first."""
         notes: list[str] = []
@@ -5633,8 +5785,48 @@ class PlanningRunDriver:
                 prior[str(rel).rsplit("/", 1)[-1]] = content
         return prior or None
 
-    def _digest_review_skip_reason(self, draft: Mapping[str, Any]) -> str | None:
+    def _mission_spec_review(
+        self, correlation_id: str, draft: Mapping[str, Any]
+    ) -> dict[str, Any] | None:
+        """A mission feature's spec approval record, or None for any other run.
+
+        Moving a feature to Ready is approving its spec (Rich, 17 October
+        2026), so a mission feature's spec is recorded as approved by whoever
+        approved the mission plan, citing that card's request. The sign-in
+        question (section 5): when the spec is flagged, an author who wrote
+        ``[no sign-in]`` has supplied the answer, recorded as ``confirmed``
+        with ``source: "mission message"``; without it the answer is recorded
+        as not given, which the pass-bars leg turns into its existing honest
+        stop with no card opened.
+        """
+        membership = mission_membership(
+            getattr(self._deps.store, "_connection", None), correlation_id
+        )
+        if membership is None or membership[0] is None:
+            return None
+        mission, _attempt, feature = membership
+        review: dict[str, Any] = {
+            "decided_by": mission.approved_by,
+            "request_id": mission.plan_request_id,
+            "source": "mission message",
+            "mission_id": mission.id,
+        }
+        if (draft.get("card") or {}).get("sign_in_check"):
+            if feature is not None and feature.no_sign_in:
+                review["sign_in_answer"] = "confirmed"
+                review["auth_confirmed"] = True
+            else:
+                review["sign_in_answer"] = _MISSION_SIGN_IN_NOT_SAID
+        return review
+
+    def _digest_review_skip_reason(
+        self, draft: Mapping[str, Any], correlation_id: str | None = None
+    ) -> str | None:
         """Why this run may skip the digest card, or ``None`` (it always asks).
+
+        A mission feature always skips it, with the reason "part of mission
+        <id>, approved by <who> at <when>" (missions design, section 5):
+        Ready means spec approved, and the mission plan card was the approval.
 
         The default is ALWAYS ASK, and that is the recommendation: a feature
         with no assumptions still has worked examples, and it is the examples —
@@ -5650,6 +5842,15 @@ class PlanningRunDriver:
         durably when it happens. One setting, both paths tested, so the ruling
         costs a value in a config file rather than a rebuild.
         """
+        membership = mission_membership(
+            getattr(self._deps.store, "_connection", None), correlation_id
+        )
+        if membership is not None and membership[0] is not None:
+            mission = membership[0]
+            return (
+                f"part of mission {mission.id}, approved by "
+                f"{mission.approved_by} at {mission.approved_at}"
+            )
         cfg = self._deps.planning_config.digest_review
         if cfg.always_ask:
             return None
@@ -8545,6 +8746,8 @@ class PlanningRunDriver:
             # that reached here without a digest-review answer — the flag-OFF
             # path and any run already in flight when this landed.
             already = self._spec_review_auth_answer(correlation_id)
+            if already is None:
+                already = self._mission_sign_in_answer(correlation_id)
             if already is not None:
                 # ALL THREE of the digest card's answers land here, not just
                 # the yes. "There IS a sign-in" takes the SAME terminal below

@@ -291,7 +291,13 @@ def execute_command(
         return "I do not know that queue command, so I have changed nothing."
 
     if verb == "list":
-        return list_reply(store.list_open(), now=now)
+        reply = list_reply(store.list_open(), now=now)
+        # One line per running mission (missions design, section 8): mission
+        # work never goes into the queue, so the listing names it here.
+        from forge.planning.mission_step import mission_queue_lines
+
+        missions = mission_queue_lines(store.connection)
+        return "\n".join([reply, *missions]) if missions else reply
 
     # Every verb below names a row. Jarvis matched the shape of what was
     # typed and forwarded it as it found it, so the number is checked here,
