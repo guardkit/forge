@@ -21,6 +21,7 @@ runner launch replaced by a recorder:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -119,17 +120,42 @@ class _Harness:
             ).fetchone()[0]
         )
 
-    async def dispatch(self) -> None:
+    def recorded_runs(self, build_id: str) -> int:
+        try:
+            return int(
+                self.persistence.connection.execute(
+                    "SELECT COUNT(*) FROM async_tasks WHERE build_id = ?", (build_id,)
+                ).fetchone()[0]
+            )
+        except sqlite3.OperationalError:
+            return 0
+
+    async def dispatch(
+        self, *, register_observer: Any = None, launch_error: Exception | None = None
+    ) -> None:
+        self.runs_seen_at_launch: list[int] = []
+
         async def fake_launch(build_id: str, feature_id: str, correlation_id: str, **_: Any):
+            await asyncio.sleep(0)  # the replacement launch is not instant
             self.launches.append(build_id)
             self.status_at_launch.append(self.status(build_id))
+            self.runs_seen_at_launch.append(self.recorded_runs(build_id))
+            if launch_error is not None:
+                raise launch_error
             return SimpleNamespace(task_id="task-1")
 
         async def ack() -> None:
             self.acks += 1
 
-        with patch.object(_serve_deps, "dispatch_autobuild_async", fake_launch):
-            await self.deps.dispatch_build(_payload(), ack)
+        async def interrupted(*_a: Any, **_k: Any) -> bool:
+            self.interrupts += 1
+            return True
+
+        self.interrupts = getattr(self, "interrupts", 0)
+        with patch.object(_serve_deps, "dispatch_autobuild_async", fake_launch), patch.object(
+            _serve_deps, "interrupt_recorded_run", interrupted
+        ):
+            await self.deps.dispatch_build(_payload(), ack, register_observer)
 
 
 BUILD_ID = derive_build_id(FEATURE, QUEUED_AT)
@@ -245,3 +271,76 @@ async def test_a_queued_mission_row_with_a_recorded_launch_is_held(
     await h.dispatch()
     assert h.launches == [] and h.acks == 0
     assert h.status(BUILD_ID) == "QUEUED"
+
+
+def _old_run_recorded(persistence: SqliteLifecyclePersistence) -> None:
+    """The run the earlier launch recorded, still in ``async_tasks``."""
+    now = QUEUED_AT.isoformat()
+    persistence.connection.execute(
+        "CREATE TABLE IF NOT EXISTS async_tasks (task_id TEXT PRIMARY KEY, "
+        "build_id TEXT NOT NULL, feature_id TEXT NOT NULL, correlation_id TEXT NOT NULL, "
+        "lifecycle TEXT NOT NULL, wave_index INTEGER NOT NULL, task_index INTEGER NOT NULL, "
+        "started_at TEXT NOT NULL, last_activity_at TEXT NOT NULL) STRICT"
+    )
+    persistence.connection.execute(
+        "INSERT INTO async_tasks VALUES ('task-old', ?, ?, ?, 'running', 1, 1, ?, ?)",
+        (BUILD_ID, FEATURE, _payload().correlation_id, now, now),
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_mission_build_relaunches_without_its_old_runs_identity(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """After a restart (RUNNING -> INTERRUPTED) the old run is interrupted and
+    its identity cleared BEFORE the observer registers, so the observer can
+    never bind the old run and report the relaunch CANCELLED."""
+    _record_queued_row(persistence)
+    persistence.connection.execute(
+        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (BUILD_ID,)
+    )
+    _old_run_recorded(persistence)
+    h = _Harness(persistence, tmp_path)
+    seen_by_observer: list[int] = []
+
+    async def register_observer() -> bool:
+        seen_by_observer.append(h.recorded_runs(BUILD_ID))
+        return True
+
+    await h.dispatch(register_observer=register_observer)
+    assert h.interrupts == 1
+    assert seen_by_observer == [0]  # the old run cannot be resolved
+    assert h.launches == [BUILD_ID] and h.status_at_launch == ["RUNNING"]
+    assert h.runs_seen_at_launch == [0]
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_mission_relaunch_that_fails_puts_the_old_identity_back(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    _record_queued_row(persistence)
+    persistence.connection.execute(
+        "UPDATE builds SET status = 'INTERRUPTED' WHERE build_id = ?", (BUILD_ID,)
+    )
+    _old_run_recorded(persistence)
+    h = _Harness(persistence, tmp_path)
+    with pytest.raises(RuntimeError, match="runner refused"):
+        await h.dispatch(launch_error=RuntimeError("runner refused"))
+    assert h.recorded_runs(BUILD_ID) == 1  # never left without its identity
+
+
+@pytest.mark.asyncio
+async def test_a_fresh_mission_build_launches_with_its_observer_as_before(
+    persistence: SqliteLifecyclePersistence, tmp_path: Path
+) -> None:
+    """Not recovered: no interrupt, no replacement, observer then launch."""
+    h = _Harness(persistence, tmp_path)
+    order: list[str] = []
+
+    async def register_observer() -> bool:
+        order.append("observer")
+        return True
+
+    await h.dispatch(register_observer=register_observer)
+    assert h.interrupts == 0
+    assert order == ["observer"] and h.launches == [BUILD_ID]

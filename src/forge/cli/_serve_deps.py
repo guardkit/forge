@@ -1808,17 +1808,33 @@ def _build_dispatch_build(
                 mission_gate["mission_id"],
                 mission_gate["decided_by"],
             )
-            if register_observer is not None:
-                await _safe_register_observer(register_observer, build_id)
-            await launch_or_conduct(
-                ack_callback=ack_callback,
-                build_id=build_id,
-                feature_id=payload.feature_id,
-                correlation_id=payload.correlation_id,
-                branch=payload.branch,
-                repo=payload.repo,
-                budget=budget_entry,
-            )
+
+            async def _register_and_launch_mission() -> None:
+                if register_observer is not None:
+                    await _safe_register_observer(register_observer, build_id)
+                await launch_or_conduct(
+                    ack_callback=ack_callback,
+                    build_id=build_id,
+                    feature_id=payload.feature_id,
+                    correlation_id=payload.correlation_id,
+                    branch=payload.branch,
+                    repo=payload.repo,
+                    budget=budget_entry,
+                )
+
+            # A recovered build (INTERRUPTED after a restart; its recorded run
+            # was interrupted above) is launched in place of that run, exactly
+            # as the gated arm does: the earlier run's ``async_tasks`` identity
+            # is cleared before the observer is registered, so the observer
+            # can never bind the old run and report the relaunch CANCELLED; it
+            # is put back if the launch does not complete, and a ledger that
+            # cannot clear it holds the message without ack.
+            if not recovered:
+                await _register_and_launch_mission()
+            elif not await launch_replacing_recorded_run(
+                sqlite_pool, build_id, _register_and_launch_mission
+            ):
+                return
             await _say_building()
             return
 
