@@ -575,7 +575,9 @@ class TestAnOpenMergeCardIsWorkInFlight:
         """Pins the gap accepted on 17 October 2026 (see ``count_in_flight``):
         a build recorded COMPLETE whose merge offer row does not exist yet is
         not counted, even with the one-day hold on. If a later change starts
-        counting it, this goes red and the docstring must change with it."""
+        counting it, this goes red and the docstring must change with it. A
+        mission feature's finished build is the deliberate exception: its
+        ADMITTED attempt holds the place."""
         _insert_build(connection, "build-3ABD", "COMPLETE", feature_id="FEAT-3ABD")
 
         assert (
@@ -592,6 +594,25 @@ class TestAnOpenMergeCardIsWorkInFlight:
                 connection, merge_offer_hold_seconds=A_DAY, now=START
             )
             == 1
+        )
+
+        # A mission feature is not in the gap (missions design, 17 October
+        # 2026): its attempt stays ADMITTED while its finished build is merged
+        # into the mission branch, with no card, and the attempt holds the place.
+        from forge.lifecycle.missions import ensure_tables
+
+        ensure_tables(connection)
+        connection.execute(
+            "INSERT INTO mission_attempts (mission_id, key, attempt, "
+            "correlation_id, status) VALUES ('m-00000a', 'A', 1, "
+            "'corr-build-M1SN', 'ADMITTED')"
+        )
+        _insert_build(connection, "build-M1SN", "COMPLETE", feature_id="FEAT-M1SN")
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 2
         )
 
     def test_the_earliest_offer_is_when_the_card_started_waiting(

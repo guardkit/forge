@@ -1752,6 +1752,39 @@ def _build_dispatch_build(
                 ),
             )
 
+        # --- A mission feature has no build gate (missions design, 17 October
+        # 2026, section 5). The mission plan card was the go-ahead, so the
+        # build writes one stage-log decision citing that approval and then
+        # launches exactly as the "no gate wired" arm below does, whether or
+        # not the gate is wired this boot. A member build whose mission is not
+        # running is refused with a plain sentence, and no card is opened. It
+        # does not go through gate_check with a made-up auto-approve:
+        # reasoning refuses an auto-approve without a Coach score, rightly.
+        mission_gate = _mission_build_gate_decision(
+            sqlite_pool, build_id, payload.correlation_id, clock
+        )
+        if mission_gate is not None:
+            logger.info(
+                "dispatch_build: build_id=%s is part of mission %s; no build "
+                "gate (%s); launching",
+                build_id,
+                mission_gate["mission_id"],
+                mission_gate["decided_by"],
+            )
+            if register_observer is not None:
+                await _safe_register_observer(register_observer, build_id)
+            await launch_or_conduct(
+                ack_callback=ack_callback,
+                build_id=build_id,
+                feature_id=payload.feature_id,
+                correlation_id=payload.correlation_id,
+                branch=payload.branch,
+                repo=payload.repo,
+                budget=budget_entry,
+            )
+            await _say_building()
+            return
+
         # --- Pre-dispatch approval gate (TASK-GATE-D659, R1) -------------
         from forge.cli import _serve_deps_gating, _serve_gate_activation
 
@@ -1844,37 +1877,6 @@ def _build_dispatch_build(
                 # Threaded so a TAKEN_TERMINAL on THIS arm acks and emits
                 # exactly as it does on the gate-approved arm (§3: "both
                 # launch_or_conduct call sites consume the outcome").
-                ack_callback=ack_callback,
-                build_id=build_id,
-                feature_id=payload.feature_id,
-                correlation_id=payload.correlation_id,
-                branch=payload.branch,
-                repo=payload.repo,
-                budget=budget_entry,
-            )
-            await _say_building()
-            return
-
-        # --- A mission feature has no build gate (missions design, 17 October
-        # 2026, section 5). The mission plan card was the go-ahead, so the
-        # build writes one stage-log decision citing that approval and then
-        # launches exactly as the "no gate wired" arm above does. It does not
-        # go through gate_check with a made-up auto-approve: reasoning refuses
-        # an auto-approve without a Coach score, rightly.
-        mission_gate = _mission_build_gate_decision(
-            sqlite_pool, build_id, payload.correlation_id, clock
-        )
-        if mission_gate is not None:
-            logger.info(
-                "dispatch_build: build_id=%s is part of mission %s; no build "
-                "gate (%s); launching",
-                build_id,
-                mission_gate["mission_id"],
-                mission_gate["decided_by"],
-            )
-            if register_observer is not None:
-                await _safe_register_observer(register_observer, build_id)
-            await launch_or_conduct(
                 ack_callback=ack_callback,
                 build_id=build_id,
                 feature_id=payload.feature_id,
@@ -2301,6 +2303,17 @@ def build_prepared_build_admission(
     return admit
 
 
+class MissionBuildRefused(RuntimeError):
+    """Raised by ``dispatch_build`` for a mission feature's build that may not run.
+
+    The build's correlation id is a mission attempt's, but its mission is
+    missing or not running (missions design, 17 October 2026, section 5), so
+    there is no approval to launch it under and no card may be opened for it.
+    The consumer's dispatch-error path publishes a terminal ``build-failed``
+    with this sentence and acks the slot, as for every refusal raised here.
+    """
+
+
 def _mission_build_gate_decision(
     sqlite_pool: Any, build_id: str, correlation_id: str | None, clock: Any
 ) -> dict[str, Any] | None:
@@ -2309,19 +2322,29 @@ def _mission_build_gate_decision(
     One ``stage_log`` row at the build gate's own target (the autobuild runner,
     stage ``autobuild``), PASSED, citing the mission approval: who approved
     the mission plan and that card's request id. ``None`` — and nothing
-    written — for any build that is not a mission attempt's, or whose mission
-    is not running. A redelivery writes the row again; it says the same thing.
+    written — for any build that is not a mission attempt's. Raises
+    :class:`MissionBuildRefused` for a member build whose mission is missing or
+    not running. A redelivery writes the row again; it says the same thing.
     """
     from forge.lifecycle.missions import mission_membership
     from forge.lifecycle.persistence import StageLogEntry
 
     connection = getattr(sqlite_pool, "connection", None)
     membership = mission_membership(connection, correlation_id)
-    if membership is None or membership[0] is None:
+    if membership is None:
         return None
-    mission = membership[0]
+    mission, attempt, _feature = membership
+    if mission is None:
+        raise MissionBuildRefused(
+            f"this build is part of mission {attempt.mission_id}, which is not "
+            "on record, so it was not started"
+        )
     if mission.status != "RUNNING":
-        return None
+        raise MissionBuildRefused(
+            f"this build is part of mission {mission.id}, which is "
+            f"{mission.status.lower().replace('_', ' ')} rather than running, so "
+            "it was not started"
+        )
     decision = {
         "mission_id": mission.id,
         "decided_by": f"mission {mission.id} (approved by {mission.approved_by})",

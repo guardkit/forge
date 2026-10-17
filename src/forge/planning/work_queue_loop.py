@@ -580,9 +580,10 @@ def count_in_flight(
       place and nothing else carries it. Once the run or build exists it
       speaks for itself, so a repair whose build was marked INTERRUPTED is not
       counted through its still-admitted row;
-    - it is a mission attempt ADMITTED with no planning run or build yet, by
-      the same rule (missions design, section 2a). Once its run exists the
-      attempt is counted through its run and build like any other work;
+    - it is an ADMITTED mission attempt (missions design, section 2a), from
+      its admission until its feature has landed on the mission branch or
+      failed — through its planning run, its build and its merge into the
+      mission branch, which has no card to hold the place;
     - it has a planning run in an active state;
     - it has a build in an active state;
     - it has a build whose merge card is still waiting for Rich's word.
@@ -621,6 +622,7 @@ def count_in_flight(
     was accepted on 17 October 2026 rather than fixed: closing it needs a
     durable record of a clean finish, a record of an offer not made, and a
     boot step, all described in the factory's 17 October queue-limit design.
+    A mission feature is not in that gap: its ADMITTED attempt holds the place.
     """
     pieces = {
         correlation_id
@@ -629,15 +631,13 @@ def count_in_flight(
         )
         if not _work_is_written(connection, correlation_id)
     }
-    # A mission attempt admitted with no planning run yet (missions design,
-    # section 2a): the same place an admitted queue row with no run holds.
-    pieces |= {
-        correlation_id
-        for correlation_id in _correlation_ids_in(
-            connection, "mission_attempts", "status", ("ADMITTED",)
-        )
-        if not _work_is_written(connection, correlation_id)
-    }
+    # Every ADMITTED mission attempt (missions design, section 2a), by its
+    # correlation id, from admission until its feature has landed on the
+    # mission branch or failed: a mission feature has no merge card to hold
+    # its place while its merge into the mission branch runs.
+    pieces |= _correlation_ids_in(
+        connection, "mission_attempts", "status", ("ADMITTED",)
+    )
     pieces |= _correlation_ids_in(
         connection, "planning_runs", "state", sorted(PLANNING_ACTIVE_STATES)
     )

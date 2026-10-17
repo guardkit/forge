@@ -295,6 +295,11 @@ class MissionFlow:
             task.add_done_callback(self._tasks.discard)
 
     @property
+    def can_create_branches(self) -> bool:
+        """Is a publisher client wired to create mission branches with?"""
+        return self._create_branch is not None
+
+    @property
     def missions(self) -> MissionStore:
         return self._missions
 

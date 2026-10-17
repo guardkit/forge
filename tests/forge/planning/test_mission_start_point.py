@@ -117,7 +117,7 @@ async def test_a_mission_run_starts_from_the_mission_branch_tip(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("problem", ["not running", "not admitted", "no branch"])
+@pytest.mark.parametrize("problem", ["not running", "not admitted", "no branch", "missing"])
 async def test_inconsistent_mission_metadata_fails_before_any_model(
     store: SqlitePlanningRunStore, tmp_path: Path, problem: str
 ) -> None:
@@ -126,6 +126,8 @@ async def test_inconsistent_mission_metadata_fails_before_any_model(
     if problem != "not admitted":
         missions.admit_attempt(cid)
     _run(store, cid)
+    if problem == "missing":
+        store._connection.execute("DELETE FROM missions")
     runner = _Runner()
     if problem == "no branch":
 

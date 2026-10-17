@@ -637,7 +637,9 @@ async def _start_mission(
     """Check the mission, file it PROPOSED and put its plan card up.
 
     Every check is made before any card, and a failure is one plain sentence
-    in the thread, acked, with nothing filed: the switch, the repository
+    in the thread, acked, with nothing filed: the switch, a publisher client
+    to create the branch with, the planning chain that reads the mission
+    branch (``planning.target_terminal``), the repository
     (typed or the configured default, exactly as a ``build:`` hand-over
     resolves it), and the mission's own shape
     (:func:`forge.planning.missions_flow.validate_mission`). Filing is
@@ -659,6 +661,25 @@ async def _start_mission(
         await msg.ack()
         return
     planning = deps.planning_config
+    # Two things a mission cannot run without, refused before anything is
+    # filed: a way to ask the publisher for the mission branch, and the
+    # planning chain that writes the spec and plan into the project (only it
+    # reads the mission branch as its start).
+    if not getattr(deps.mission_flow, "can_create_branches", False):
+        await _say(
+            "That mission was not started: this factory cannot create a "
+            "mission branch yet."
+        )
+        await msg.ack()
+        return
+    if not getattr(getattr(planning, "target_terminal", None), "enabled", False):
+        await _say(
+            "That mission was not started: missions need the planning chain "
+            "that writes the spec and plan into the project, and it is "
+            "switched off here."
+        )
+        await msg.ack()
+        return
     repo, refusal = resolve_named_or_default(
         payload.target_repo,
         dict(getattr(planning, "target_repo_paths", None) or {}),

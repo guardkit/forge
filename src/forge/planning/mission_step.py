@@ -10,8 +10,10 @@ its rows, in one transaction per change:
 1. **Closes.** Each ADMITTED attempt's planning run and build are read by its
    correlation id, with the same readers the queue uses. Landed on the mission
    branch is LANDED; a conflict on attempt 1 closes it FAILED and files
-   attempt 2 WAITING in the same transaction; anything else that ended is
-   FAILED, with the reason's first sentence.
+   attempt 2 WAITING in the same transaction; a failed planning run or build,
+   or the landing press's own FAILED report or refusal, is FAILED, with the
+   reason's first sentence. A finished build with no landing report yet waits:
+   resuming a press that stopped is the merge side's job, never a timer's.
 2. **Holds.** A WAITING attempt is HELD ("<key> did not land") when a key it
    needs has its final attempt FAILED or HELD. While a rebuild is pending the
    dependants keep waiting.
@@ -50,10 +52,6 @@ _CONFLICT_SENTENCE_START = "the merge stopped on a conflict"
 #: The answer :func:`mission_landing` gives for a conflict.
 CONFLICT: str = CONFLICT_REASON
 
-#: How long a COMPLETE mission feature may sit with no landing report, no
-#: result and no press holding its record before it is closed FAILED.
-MISSION_LANDING_STALL_SECONDS: int = 4 * 60 * 60
-
 
 def landing_was_a_conflict(connection: sqlite3.Connection, build_id: str) -> bool:
     """Did the merge into the mission branch stop on a conflict?
@@ -74,42 +72,6 @@ def landing_was_a_conflict(connection: sqlite3.Connection, build_id: str) -> boo
         return True
     refusal = str(detail.get("refusal") or "").strip().lower()
     return refusal.startswith(_CONFLICT_SENTENCE_START)
-
-
-def _landing_never_finished(
-    connection: sqlite3.Connection, build_id: str, *, now: datetime | None
-) -> bool:
-    """A COMPLETE mission build whose landing press stopped without a word.
-
-    The press writes its report when it ends, and holds the build's record
-    lease while it runs. A press that raised (no routing receipt, say) writes
-    neither a report nor a result. So: the build finished COMPLETE more than
-    :data:`MISSION_LANDING_STALL_SECONDS` ago, there is no merge report and no
-    result, and no live lease — nothing is landing it, and it is closed FAILED
-    rather than waited on for ever. While a press holds the lease, it waits.
-    The wait is long on purpose: a feature can queue behind its siblings'
-    presses for the repository's lock, and that wait holds no lease.
-    """
-    from datetime import timezone
-
-    from forge.planning import work_queue_loop as wq
-
-    row = connection.execute(
-        "SELECT status, completed_at, queued_at FROM builds WHERE build_id = ?",
-        (build_id,),
-    ).fetchone()
-    if row is None or str(row[0]) != "COMPLETE":
-        return False
-    finished = wq._read_time(row[1] or row[2])
-    moment = now or datetime.now(timezone.utc)
-    if finished is None or (moment - finished).total_seconds() < MISSION_LANDING_STALL_SECONDS:
-        return False
-    if wq._latest_stage(connection, build_id, wq.MERGE_REPORT_ROW) is not None:
-        return False
-    record = PublicationRecordStore(connection).read(build_id)
-    if record.result:
-        return False
-    return not (record.recorded and record.lease_is_live(moment))
 
 
 def mission_landing(
@@ -136,13 +98,6 @@ def mission_landing(
     build_id, error = str(build[0]), build[1]
     if answer == wq.DID_NOT_LAND and landing_was_a_conflict(connection, build_id):
         return CONFLICT, CONFLICT_REASON
-    if answer == wq.NOT_LANDED_YET and _landing_never_finished(
-        connection, build_id, now=now
-    ):
-        return wq.DID_NOT_LAND, (
-            "the merge into the mission branch stopped before it said how it "
-            "ended, so nothing was merged"
-        )
     reason = str(error) if error else None
     if reason is None and answer in (wq.DID_NOT_LAND, wq.NOT_PUBLISHED):
         record = PublicationRecordStore(connection).read(build_id)

@@ -338,8 +338,9 @@ def _message(command: dict[str, Any], *, target_repo: str | None = "react-go-not
 
 
 class _FakeFlow:
-    def __init__(self, missions: MissionStore) -> None:
+    def __init__(self, missions: MissionStore, *, can_create_branches: bool = True) -> None:
         self.missions = missions
+        self.can_create_branches = can_create_branches
         self.proposed: list[dict[str, Any]] = []
 
     def propose(self, **kwargs: Any) -> Any:
@@ -354,7 +355,9 @@ class _FakeFlow:
         )
 
 
-def _intake_deps(cx, flow: Any, *, enabled: bool, said: list[str]) -> PlanningConsumerDeps:
+def _intake_deps(
+    cx, flow: Any, *, enabled: bool, said: list[str], target_terminal: bool = True
+) -> PlanningConsumerDeps:
     async def notify(cid: str, message: str, *, parent_request_id: str | None = None) -> None:
         said.append(message)
 
@@ -364,6 +367,7 @@ def _intake_deps(cx, flow: Any, *, enabled: bool, said: list[str]) -> PlanningCo
         planning_config=SimpleNamespace(
             target_repo_paths={REPO: "/nonexistent/react-go-notes-fixture"},
             default_target_repo=None,
+            target_terminal=SimpleNamespace(enabled=target_terminal),
         ),
         mission_flow=flow,
         missions_enabled=enabled,
@@ -405,6 +409,28 @@ async def test_the_intake_answers_switched_off_and_refusals_in_one_sentence(cx) 
     )
     assert msg.acked and len(said) == 3
     assert cx.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_the_intake_refuses_when_missions_cannot_run_here(cx) -> None:
+    """No publisher client to create the branch, or no planning chain to read
+    it: one plain sentence, nothing filed."""
+    missions = MissionStore(cx)
+    said: list[str] = []
+    msg = _message(_command())
+    flow = _FakeFlow(missions, can_create_branches=False)
+    await handle_planning_message(msg, _intake_deps(cx, flow, enabled=True, said=said))
+    assert msg.acked and said[-1] == (
+        "That mission was not started: this factory cannot create a mission branch yet."
+    )
+    msg = _message(_command())
+    await handle_planning_message(
+        msg,
+        _intake_deps(cx, _FakeFlow(missions), enabled=True, said=said, target_terminal=False),
+    )
+    assert msg.acked and "planning chain" in said[-1] and "switched off" in said[-1]
+    assert cx.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 0
+    assert not flow.proposed
 
 
 def test_the_switch_is_off_by_default() -> None:
@@ -765,6 +791,33 @@ async def test_admission_respects_the_queue_limit(cx, tmp_path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_the_step_counts_again_inside_the_admission_transaction(cx, tmp_path) -> None:
+    """The count rises between the step's own look and the claim (another
+    admitter took the last place): nothing is admitted and nothing started."""
+    missions = _running_mission(cx)
+    run = _Run(cx, tmp_path)
+    looks: list[bool] = []
+
+    def rising() -> int:
+        looks.append(cx.in_transaction)
+        return 0 if len(looks) == 1 else 1
+
+    step = MissionStep(
+        missions,
+        planning_run=run.runs.get_run,
+        count_in_flight=rising,
+        max_in_flight=1,
+        start_run=run.start,
+        failure_reason=lambda _run, state, _cid: state,
+        clock=lambda: datetime.now(UTC),
+    )
+    assert not await step.admit(missions.get_by_correlation_id(CID))
+    assert looks == [False, True]  # the second look is inside the claim
+    assert run.started == []
+    assert missions.attempt_by_correlation_id(_cid("A")).status == "WAITING"
+
+
+@pytest.mark.asyncio
 async def test_a_refusal_before_a_build_row_fails_the_attempt_and_the_mission_finishes(
     cx, tmp_path
 ) -> None:
@@ -866,6 +919,25 @@ def test_a_mission_build_records_its_gate_decision_citing_the_approval(cx, tmp_p
     ).fetchone()
     assert tuple(row)[:3] == ("autobuild", "autobuild_runner", "PASSED")
     assert json.loads(row[3])["mission_gate"]["decided_by"].startswith("mission ")
+    from forge.cli._serve_deps import MissionBuildRefused
+
+    mission = missions.get_by_correlation_id(CID)
+    missions.set_status(mission.id, "READY", expected=("RUNNING",))
+    with pytest.raises(MissionBuildRefused, match="ready rather than running"):
+        _mission_build_gate_decision(
+            run.persistence, build_id, _cid("A"), lambda: datetime.now(UTC)
+        )
+    cx.execute("PRAGMA foreign_keys = OFF")
+    cx.execute("DELETE FROM missions WHERE id = ?", (mission.id,))
+    with pytest.raises(MissionBuildRefused, match="not on record"):
+        _mission_build_gate_decision(
+            run.persistence, build_id, _cid("A"), lambda: datetime.now(UTC)
+        )
+    assert (
+        cx.execute("SELECT COUNT(*) FROM stage_log WHERE build_id = ?", (build_id,))
+        .fetchone()[0]
+        == 1
+    )
     other = run.build("not-a-mission", "FEAT-OTH1", "QUEUED")
     assert (
         _mission_build_gate_decision(run.persistence, other, "not-a-mission", datetime.now)
@@ -939,35 +1011,53 @@ def test_only_the_last_join_says_whether_it_was_a_conflict(cx, tmp_path) -> None
     assert landing_was_a_conflict(cx, build_id)
 
 
-@pytest.mark.asyncio
-async def test_a_landing_that_never_reported_waits_then_fails(cx, tmp_path) -> None:
-    from forge.planning.mission_step import MISSION_LANDING_STALL_SECONDS
-
+def test_a_finished_build_with_no_landing_report_waits_however_long(cx, tmp_path) -> None:
+    """Resuming a press that stopped is the merge side's job; no timer here
+    may call a feature "not landed" that a resumed press could still land."""
     missions = _running_mission(cx)
     run = _Run(cx, tmp_path)
     cid = _admitted_with_run(missions, run)
     build_id = run.build(cid, "FEAT-AAA1", "COMPLETE")
-    step = _step(missions, run)
-    step.close(missions.get_by_correlation_id(CID))
-    assert missions.attempt_by_correlation_id(cid).status == "ADMITTED"  # waits
-    long_ago = datetime.now(UTC) - timedelta(seconds=MISSION_LANDING_STALL_SECONDS + 60)
+    week_ago = datetime.now(UTC) - timedelta(days=7)
     cx.execute(
         "UPDATE builds SET completed_at = ? WHERE build_id = ?",
-        (long_ago.isoformat(), build_id),
+        (week_ago.isoformat(), build_id),
     )
-    # A press holding the record's lease is still landing it.
-    cx.execute(
-        "INSERT INTO publication_records (build_id, lease_holder, lease_expires_at) "
-        "VALUES (?, 'press-1', ?)",
-        (build_id, (datetime.now(UTC) + timedelta(minutes=5)).isoformat()),
-    )
+    step = _step(missions, run)
     step.close(missions.get_by_correlation_id(CID))
     assert missions.attempt_by_correlation_id(cid).status == "ADMITTED"
-    cx.execute("UPDATE publication_records SET lease_holder = NULL WHERE build_id = ?", (build_id,))
-    step.close(missions.get_by_correlation_id(CID))
+    assert count_in_flight(cx) == 1  # and it still holds its place
+
+
+def test_the_presss_own_failed_report_fails_the_attempt(cx, tmp_path) -> None:
+    missions = _running_mission(cx)
+    run = _Run(cx, tmp_path)
+    cid = _admitted_with_run(missions, run)
+    build_id = run.build(cid, "FEAT-AAA1", "COMPLETE")
+    cx.execute(
+        "INSERT INTO publication_records (build_id, result, lines_json) VALUES (?, ?, ?)",
+        (
+            build_id,
+            "publication pending",
+            _lines(
+                {
+                    "step": "join",
+                    "detail": {"joined": False, "refusal": "the check failed. Details."},
+                }
+            ),
+        ),
+    )
+    now = datetime.now(UTC).isoformat()
+    cx.execute(
+        "INSERT INTO stage_log (build_id, stage_label, target_kind, target_identifier, "
+        "status, started_at, completed_at, duration_secs, details_json) "
+        "VALUES (?, 'merge', 'local_tool', 'merge_deploy_executor', 'FAILED', ?, ?, 0, '{}')",
+        (build_id, now, now),
+    )
+    _step(missions, run).close(missions.get_by_correlation_id(CID))
     attempt = missions.attempt_by_correlation_id(cid)
-    assert attempt.status == "FAILED"
-    assert attempt.reason.startswith("the merge into the mission branch stopped")
+    assert attempt.status == "FAILED" and attempt.reason == "the check failed"
+    assert [a.attempt for a in missions.attempts(attempt.mission_id) if a.key == "A"] == [1]
 
 
 def test_a_mission_merge_card_is_named_by_the_mission(cx, tmp_path) -> None:

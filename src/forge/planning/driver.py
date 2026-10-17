@@ -5715,7 +5715,13 @@ class PlanningRunDriver:
             "outcome": outcome,
             "decided_by": review.get("decided_by"),
             "request_id": review.get("request_id"),
-            "answered_on": "the spec digest card",
+            # A mission feature's answer came from the mission message, not a
+            # card (missions design, section 5), and the record says so.
+            "answered_on": (
+                "the mission message"
+                if review.get("source") == "mission message"
+                else "the spec digest card"
+            ),
         }
 
     def _mission_sign_in_answer(self, correlation_id: str) -> dict[str, Any] | None:
