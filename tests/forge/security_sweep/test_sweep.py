@@ -524,8 +524,8 @@ async def test_drafted_findings_still_present_after_seven_days_are_listed(lab: L
     lab.model.answer = lambda prompt: '{"real": false}'
     await run_sweep(lab.deps())
     assert (
-        f"app — repair request #{row['id']} still open after 7 days (1 finding still present)"
-        in lab.slack.lines[-1]
+        f"app — findings from repair request #{row['id']} are still present after 7 days "
+        "(1 of them);" in lab.slack.lines[-1] + ";"
     )
 
 
@@ -600,3 +600,70 @@ async def test_export_ignore_cannot_hide_a_lockfile_or_a_compose_file(lab: Lab) 
     rules = {e["rule"] for e in findings if e["kind"] == "code"}
     # The factory's Compose rule, not the community one it replaces.
     assert rules == {"factory-compose-privileged"}
+
+
+# ---------------------------------------------------------------------------
+# Fix pass, 17 October 2026
+
+
+@pytest.mark.asyncio
+async def test_a_clean_lockfile_is_not_reported_as_no_lockfile(lab: Lab) -> None:
+    """Fix 1: with --all-packages a lockfile with no advisories is still read."""
+    lab.add("org/clean", {"package-lock.json": LOCK})
+    lab.add("org/empty", {"README.md": "nothing to install\n"})
+    report = await run_sweep(lab.deps())
+    by_project = {r.project: r for r in report.projects}
+    assert not by_project["org/clean"].no_lockfile
+    assert by_project["org/empty"].no_lockfile
+    osv = next(call for call in lab.scanners.calls if call[0] == "/fake/osv-scanner")
+    assert "--all-packages" in osv
+
+
+@pytest.mark.asyncio
+async def test_control_characters_in_a_file_name_never_reach_outward_text(lab: Lab) -> None:
+    """Fix 4: a file named weird<newline>name.py is shown with a visible escape."""
+    lab.add("org/app", {"weird\nname.py": "import subprocess\nsubprocess.call(c, shell=True)\n"})
+    await run_sweep(lab.deps())
+    (row,) = lab.rows()
+    assert "weird\\x0aname.py" in row["sentence"]
+    assert "\n" not in row["sentence"]
+    for line in lab.slack.lines:
+        assert "\n" not in line
+    state = (lab.folder / STATE_FILE).read_text()
+    assert "weird\\\\x0aname.py" in state  # the escape, written as JSON
+    assert "weird\\nname" not in state
+    # The model still saw the code: the raw path was used to read it.
+    assert any("subprocess.call(c, shell=True)" in p for p in lab.model.prompts)
+
+
+@pytest.mark.asyncio
+async def test_still_present_findings_name_their_request_and_say_when_it_is_closed(lab: Lab) -> None:
+    """Fix 5: the line no longer calls a closed request open."""
+    lab.scanners.advisories = [VITEST]
+    lab.add("org/app", {"package-lock.json": LOCK})
+    await run_sweep(lab.deps())
+    (row,) = lab.rows()
+    lab.queue.close(int(row["id"]), status="DONE", actor_identity="test")
+    lab.now[0] = lab.now[0] + timedelta(days=8)
+    lab.add("org/zzz", {"k.sh": f"K={planted_key()}\n"})
+    lab.model.answer = lambda prompt: '{"real": false}'
+    await run_sweep(lab.deps())
+    assert (
+        f"app — findings from repair request #{row['id']} are still present after 7 days "
+        "(1 of them); that request is closed (done)"
+    ) in lab.slack.lines[-1]
+    assert "still open" not in lab.slack.lines[-1]
+
+
+@pytest.mark.asyncio
+async def test_files_too_large_to_scan_are_said_not_checked(lab: Lab, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Fix 6: a file over the size limit leaves a trace in the line and history."""
+    from forge.security_sweep import repository
+
+    monkeypatch.setattr(repository, "LARGEST_FILE_BYTES", 100)
+    lab.add("org/app", {"big.bin": "x" * 500, "k.sh": f"K={planted_key()}\n"})
+    lab.model.answer = lambda prompt: '{"real": false}'
+    await run_sweep(lab.deps())
+    assert "1 file not checked: too large" in lab.slack.lines[-1]
+    history = json.loads((lab.folder / "history.jsonl").read_text().splitlines()[-1])
+    assert history["projects"]["org/app"]["too_large"] == ["big.bin"]

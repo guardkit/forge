@@ -81,6 +81,21 @@ _DOC_SUFFIXES = frozenset({".md", ".markdown", ".rst", ".adoc", ".txt"})
 _DOC_FOLDERS = frozenset({"doc", "docs", "documentation"})
 
 
+def shown(text: object) -> str:
+    """``text`` safe to repeat outward: control characters made visible.
+
+    A file name, package name or version comes from the project, and a
+    newline or other control character in one could break a line Rich reads
+    (the queued sentence, the Slack line) or the saved state and history.
+    Every character below 0x20, and 0x7f, is written as ``\\xNN`` instead
+    (fix pass, 17 October 2026).
+    """
+    return "".join(
+        f"\\x{ord(ch):02x}" if ord(ch) < 0x20 or ord(ch) == 0x7F else ch
+        for ch in str(text)
+    )
+
+
 def path_kinds(path: str) -> tuple[str, ...]:
     """Whether ``path`` is a test, documentation or lockfile, from its name.
 
@@ -133,6 +148,9 @@ class Finding:
     #: The last line of a code finding, used only to cut the excerpt the
     #: model sees; never stored.
     end_line: int | None = field(default=None, compare=False)
+    #: The file's path exactly as committed (``file`` is its shown form),
+    #: used only to read the excerpt; never stored.
+    source_file: str | None = field(default=None, compare=False)
 
     @property
     def needs_sorting(self) -> bool:
@@ -291,4 +309,5 @@ __all__ = [
     "line_fingerprint",
     "path_kinds",
     "seriousness_order",
+    "shown",
 ]

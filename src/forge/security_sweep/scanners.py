@@ -228,6 +228,10 @@ def osv_argv(setup: ScannerSetup, target: Path) -> list[str]:
         "--recursive",
         "--no-ignore",
         "--allow-no-lockfiles",
+        # Every lockfile is listed, with or without advisories, so a project
+        # whose dependencies are clean is not mistaken for one with no
+        # lockfile (fix pass, 17 October 2026).
+        "--all-packages",
         "--no-call-analysis=all",
         "--config",
         str(setup.osv_config),
@@ -270,6 +274,26 @@ def gitleaks_history_argv(setup: ScannerSetup, mirror: Path) -> list[str]:
 def gitleaks_stdin_argv(setup: ScannerSetup) -> list[str]:
     """Gitleaks over a code excerpt on standard input, before the model sees it."""
     return [str(setup.gitleaks), "stdin", *_gitleaks_common(setup)]
+
+
+#: The factory's own ignore list for Opengrep (fix pass, 17 October 2026).
+#: With no ``.semgrepignore`` Opengrep falls back to a built-in list that
+#: silently skips ``build/``, ``dist/``, ``vendor/``, ``test/``, ``tests/`` and
+#: ``node_modules/``. The sweep skips only installed packages
+#: (``node_modules/``): everything else is scanned, test folders included,
+#: because the model sorts out the noise and a privileged Compose file under
+#: ``build/`` is still a privileged Compose file. Opengrep reads this file from
+#: the folder it runs in (checked with Opengrep 1.30.1), so it is written
+#: there, beside the exported tree and never inside it; the project's own
+#: ``.semgrepignore`` files are left out of the export.
+FACTORY_SEMGREPIGNORE = "node_modules/\n"
+
+
+def write_factory_ignore(folder: Path) -> Path:
+    """Write the factory's ``.semgrepignore`` into the folder Opengrep runs in."""
+    path = folder / ".semgrepignore"
+    path.write_text(FACTORY_SEMGREPIGNORE, encoding="utf-8")
+    return path
 
 
 def opengrep_argv(setup: ScannerSetup, target: Path) -> list[str]:
@@ -593,6 +617,7 @@ __all__ = [
     "SCANNER_PATH",
     "ScannerSetup",
     "ToolRun",
+    "FACTORY_SEMGREPIGNORE",
     "fixed_message",
     "gitleaks_history_argv",
     "gitleaks_stdin_argv",
@@ -603,4 +628,5 @@ __all__ = [
     "read_opengrep",
     "read_osv",
     "run_tool",
+    "write_factory_ignore",
 ]

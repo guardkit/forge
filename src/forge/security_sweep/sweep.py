@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
-from forge.planning.work_queue_store import WorkQueueStore
+from forge.planning.work_queue_store import OPEN_STATUSES, WorkQueueStore
 
 from . import drafting
 from .findings import (
@@ -59,6 +59,7 @@ from .findings import (
     line_fingerprint,
     path_kinds,
     seriousness_order,
+    shown,
 )
 from .repository import (
     ExportFailed,
@@ -84,6 +85,7 @@ from .scanners import (
     read_opengrep,
     read_osv,
     run_tool,
+    write_factory_ignore,
 )
 from .sorting import Asker, build_prompt, excerpt_lines, read_answer, redacted_excerpt
 from .state import (
@@ -173,6 +175,11 @@ class ProjectResult:
     symlinks_skipped: list[str] = field(default_factory=list)
     submodules_skipped: list[str] = field(default_factory=list)
     settings_left_out: list[str] = field(default_factory=list)
+    #: Files over the export's size limit: not checked, said so.
+    too_large: list[str] = field(default_factory=list)
+    #: Repair rows whose findings are still present, and the status of each
+    #: one that is already closed.
+    still_open_closed: dict[int, str] = field(default_factory=dict)
 
     @property
     def has_news(self) -> bool:
@@ -207,7 +214,9 @@ class ProjectResult:
             out["no_lockfile"] = True
         if self.still_open:
             out["still_open"] = {str(k): v for k, v in self.still_open.items()}
-        for name in ("symlinks_skipped", "submodules_skipped", "settings_left_out"):
+        if self.still_open_closed:
+            out["still_open_closed"] = {str(k): v for k, v in self.still_open_closed.items()}
+        for name in ("symlinks_skipped", "submodules_skipped", "settings_left_out", "too_large"):
             values = getattr(self, name)
             if values:
                 out[name] = values[:20]
@@ -279,11 +288,19 @@ def _project_phrase(result: ProjectResult, name: str) -> str:
         parts.append(f"{part} not checked ({reason})")
     if result.no_lockfile and PART_DEPENDENCIES not in result.not_checked:
         parts.append("dependencies can't be checked (no lockfile)")
-    for row, count in sorted(result.still_open.items()):
+    if result.too_large:
         parts.append(
-            f"repair request #{row} still open after 7 days "
-            f"({_plural(count, 'finding', 'findings')} still present)"
+            f"{_plural(len(result.too_large), 'file', 'files')} not checked: too large"
         )
+    for row, count in sorted(result.still_open.items()):
+        text = (
+            f"findings from repair request #{row} are still present after 7 days "
+            f"({count} of them)"
+        )
+        closed = result.still_open_closed.get(row)
+        if closed:
+            text += f"; that request is closed ({closed.lower()})"
+        parts.append(text)
     if not parts:
         parts.append("nothing new")
     return f"{name} — " + ", ".join(parts)
@@ -495,9 +512,10 @@ async def _sweep_project(
             result.unreadable = True
             logger.warning("security sweep: %s was fetched but its files could not be read", project)
             return result
-        result.symlinks_skipped = list(exported.symlinks)
-        result.submodules_skipped = list(exported.submodules)
-        result.settings_left_out = list(exported.settings_left_out)
+        result.symlinks_skipped = [shown(p) for p in exported.symlinks]
+        result.submodules_skipped = [shown(p) for p in exported.submodules]
+        result.settings_left_out = [shown(p) for p in exported.settings_left_out]
+        result.too_large = [shown(p) for p in exported.too_large]
         files = _Files(tree)
         current: dict[str, Finding] = {}
         checked: set[str] = set()
@@ -546,17 +564,17 @@ async def _scan_dependencies(deps, project, tree, work, result, current, checked
             project=project,
             kind=KIND_DEPENDENCY,
             tool=TOOL_OSV,
-            rule=adv.advisory,
-            file=adv.file,
+            rule=shown(adv.advisory),
+            file=shown(adv.file),
             line=None,
             fingerprint=fp,
-            severity=adv.severity,
-            package=adv.package,
-            version=adv.version,
-            ecosystem=adv.ecosystem,
-            advisory=adv.advisory,
+            severity=shown(adv.severity) if adv.severity else None,
+            package=shown(adv.package),
+            version=shown(adv.version),
+            ecosystem=shown(adv.ecosystem),
+            advisory=shown(adv.advisory),
             score=adv.score,
-            fixed=adv.fixed,
+            fixed=tuple(shown(v) for v in adv.fixed),
             path_kinds=path_kinds(adv.file) if adv.file else (),
         )
 
@@ -596,11 +614,12 @@ async def _scan_secrets(deps, project, tree, work, key, files, result, current, 
                 project=project,
                 kind=KIND_SECRET,
                 tool=TOOL_GITLEAKS,
-                rule=loc.rule,
-                file=loc.file,
+                rule=shown(loc.rule),
+                file=shown(loc.file),
                 line=loc.start,
                 fingerprint=fp,
                 path_kinds=path_kinds(loc.file),
+                source_file=loc.file,
             ),
         )
 
@@ -626,6 +645,9 @@ async def _scan_code(deps, project, tree, work, key, files, catalogue, result, c
     if catalogue is None:
         result.not_checked[PART_CODE] = "the code scanner's rules could not be read"
         return
+    # The factory's own ignore list, in the folder Opengrep runs in, in place
+    # of Opengrep's built-in one (see scanners.FACTORY_SEMGREPIGNORE).
+    write_factory_ignore(work)
     run = await deps.runner(opengrep_argv(deps.setup, tree), cwd=work, timeout=OPENGREP_TIMEOUT_S, ok_codes=(0, 1))
     if not run.ok:
         result.not_checked[PART_CODE] = f"the code scanner {run.reason}"
@@ -653,14 +675,15 @@ async def _scan_code(deps, project, tree, work, key, files, catalogue, result, c
                 project=project,
                 kind=KIND_CODE,
                 tool=TOOL_OPENGREP,
-                rule=loc.rule,
-                file=loc.file,
+                rule=shown(loc.rule),
+                file=shown(loc.file),
                 line=loc.start,
                 fingerprint=fp,
                 message=catalogue.message(loc.rule),
                 severity=loc.severity,
                 path_kinds=path_kinds(loc.file),
                 end_line=loc.end,
+                source_file=loc.file,
             ),
         )
 
@@ -755,7 +778,8 @@ async def _excerpt(deps, finding: Finding, files: _Files, secret_lines: dict[str
     """The redacted excerpt for a code finding, or None when it cannot be made safe."""
     if deps.setup.missing("gitleaks"):
         return None
-    data = files.data(finding.file)
+    raw = finding.source_file or finding.file
+    data = files.data(raw)
     if data is None or finding.line is None:
         return None
     first, lines = excerpt_lines(data, finding.line, finding.end_line or finding.line)
@@ -767,7 +791,7 @@ async def _excerpt(deps, finding: Finding, files: _Files, secret_lines: dict[str
         flagged = read_gitleaks(run.stdout)
     except ValueError:
         return None
-    hidden = set(secret_lines.get(finding.file, set()))
+    hidden = set(secret_lines.get(raw, set()))
     for loc in flagged:
         hidden.update(range(first + loc.start - 1, first + loc.end))
     return redacted_excerpt(first, lines, hidden)
@@ -790,6 +814,9 @@ def _draft(deps, project, state, rows, current, result) -> None:
             if today - since >= STILL_OPEN_AFTER and isinstance(entry.get("queue_id"), int):
                 row = int(entry["queue_id"])
                 result.still_open[row] = result.still_open.get(row, 0) + 1
+                status = next((r.status for r in rows if r.queue_id == row), None)
+                if status is not None and status not in OPEN_STATUSES:
+                    result.still_open_closed[row] = status
     result.serious_eligible = len(eligible)
     if not eligible:
         return

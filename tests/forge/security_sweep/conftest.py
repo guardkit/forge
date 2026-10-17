@@ -175,7 +175,7 @@ class FakeScanners:
             self.stdin_inputs.append(stdin or b"")
             return ToolRun(True, json.dumps(self._keys_in(stdin or b"", "")).encode())
         if tool == "osv-scanner":
-            return ToolRun(True, json.dumps(self._osv(target)).encode())
+            return ToolRun(True, json.dumps(self._osv(target, "--all-packages" in argv)).encode())
         if tool == "opengrep":
             return ToolRun(True, json.dumps(self._opengrep(target)).encode())
         return ToolRun(False, reason="unknown tool")
@@ -210,8 +210,12 @@ class FakeScanners:
             if line.startswith(b"+") and KEY_PATTERN.search(line)
         ]
 
-    def _osv(self, root: Path) -> dict[str, Any]:
+    def _osv(self, root: Path, all_packages: bool) -> dict[str, Any]:
+        """Like OSV-Scanner 2.7.0: without ``--all-packages`` a lockfile with
+        no advisories is not listed at all (checked on 17 October 2026)."""
         results = []
+        if not self.advisories and not all_packages:
+            return {"results": results}
         for lock in sorted(root.rglob("package-lock.json")):
             results.append(
                 {
