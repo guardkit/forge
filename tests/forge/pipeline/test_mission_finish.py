@@ -602,6 +602,18 @@ class TestTheAnswer:
             )
         )
 
+    def _published(self, pool: SqliteLifecyclePersistence, build_id: str, result: str) -> None:  # noqa: F811
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        records = PublicationRecordStore(pool.connection)
+        now = datetime.now(UTC)
+        grant = records.take_lease(
+            build_id=build_id, holder="press", now=now, target_branch="main"
+        )
+        assert grant is not None
+        assert records.record(build_id=build_id, turn=grant.turn, now=now, result=result)
+        records.release_lease(build_id=build_id, turn=grant.turn, holder="press", now=now)
+
     def _report(self, pool: SqliteLifecyclePersistence, build_id: str, *, status: str, result: str, detail: str) -> None:  # noqa: F811
         now = datetime.now(UTC)
         pool.record_stage(
@@ -632,6 +644,7 @@ class TestTheAnswer:
         assert await finish_ready_mission(deps, MISSION_ID) == "merging"
         assert store.get(MISSION_ID).status == "MERGING"
 
+        self._published(pool, build_id, "merged into the remote and running")
         self._report(
             pool,
             build_id,
@@ -642,6 +655,78 @@ class TestTheAnswer:
         assert await finish_ready_mission(deps, MISSION_ID) == "merged"
         assert store.get(MISSION_ID).status == "MERGED"
         assert thread.lines[-1][1] == 'Mission "Tags for notes" is merged into main and deployed.'
+
+    @pytest.mark.asyncio
+    async def test_a_deploy_that_failed_after_the_send_is_merged_and_says_so(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        store, deps, thread, build_id = await self._offered(config_on, pool, repo_root)
+        self._decide(pool, build_id, "approve")
+        await finish_ready_mission(deps, MISSION_ID)
+        self._published(pool, build_id, "published, deployment pending")
+        self._report(
+            pool,
+            build_id,
+            status="FAILED",
+            result="merged-deploy-failed",
+            detail="The deploy step stopped with exit 1. The joined result stays on main.",
+        )
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "merged"
+        assert store.get(MISSION_ID).status == "MERGED"
+        assert thread.lines[-1][1] == (
+            'Mission "Tags for notes" is merged into main, but its deploy '
+            "failed: The deploy step stopped with exit 1."
+        )
+
+    @pytest.mark.asyncio
+    async def test_published_and_not_deployed_says_so(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        store, deps, thread, build_id = await self._offered(config_on, pool, repo_root)
+        self._decide(pool, build_id, "approve")
+        await finish_ready_mission(deps, MISSION_ID)
+        self._published(pool, build_id, "published, deployment pending")
+        self._report(
+            pool,
+            build_id,
+            status="PASSED",
+            result="published-deployment-pending",
+            detail="The project declares no deployment target. More words.",
+        )
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "merged"
+        assert thread.lines[-1][1] == (
+            'Mission "Tags for notes" is merged into main; it is not deployed '
+            "yet: The project declares no deployment target."
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_report_word_alone_does_not_make_it_merged(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        store, deps, _thread, build_id = await self._offered(config_on, pool, repo_root)
+        self._decide(pool, build_id, "approve")
+        await finish_ready_mission(deps, MISSION_ID)
+        self._report(
+            pool,
+            build_id,
+            status="PASSED",
+            result="merged-into-the-remote-and-running",
+            detail="says so, but the record does not",
+        )
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "not merged"
+        assert store.get(MISSION_ID).status == "NOT_MERGED"
 
     @pytest.mark.asyncio
     async def test_reject_is_not_merged_and_the_branch_is_kept(
@@ -908,3 +993,339 @@ class TestForgeHistoryShowsTheMissionsMerge:
         assert f"Mission {MISSION_ID}'s merge into main." in render_markdown(
             [(row, [])], feature_id=None
         )
+
+
+class TestTheLastLandingIsTheOneThatCounts:
+    @pytest.mark.asyncio
+    async def test_two_landings_reach_an_offer_at_the_second(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        a_running_mission(pool, keys=("B", "C"))
+        the_mission_branch_on_the_remote(repo_root)
+        store = await _land(config_on, pool, repo_root, keys=("B", "C"))
+        records = PublicationRecordStore(pool.connection)
+        first, second = records.read(B_BUILD).j_commit, records.read(C_BUILD).j_commit
+        assert first != second
+        service, _wire = _offer_service(config_on, pool)
+        deps, _thread = _finish_deps(config_on, pool, offer=service.offer)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "offered"
+        assert store.get(MISSION_ID).final_commit == second
+        build_id = mission_merge_build_id(pool, MISSION_ID)
+        # The last feature to land names the merge build.
+        assert str(build_id).startswith("build-FEAT-MX2-")
+        assert _offers(pool, str(build_id))[0].details[MERGE_OFFER_DETAILS_KEY]["candidate_sha"] == second
+
+
+class _ReadsBackWrong:
+    """The venue, except the frozen source reads back as another commit."""
+
+    def __init__(self, inner: Any, wrong: str) -> None:
+        self.inner, self.wrong = inner, wrong
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.inner, name)
+
+    async def rev_parse(self, ref: str) -> str | None:
+        if ref.startswith(f"refs/heads/{SOURCE_BRANCH_PREFIX}"):
+            return self.wrong
+        return await self.inner.rev_parse(ref)
+
+
+class TestAFrozenSourceThatDoesNotReadBack:
+    @pytest.mark.asyncio
+    async def test_no_card_is_offered(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        store = await _land(config_on, pool, repo_root)
+        service, wire = _offer_service(config_on, pool)
+        deps, thread = _finish_deps(config_on, pool, offer=service.offer)
+        honest = deps.git_for
+        main = _git(repo_root, "rev-parse", "main")
+        deps.git_for = lambda repo, root: _ReadsBackWrong(honest(repo, root), main)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "not merged"
+        build_id = str(mission_merge_build_id(pool, MISSION_ID))
+        assert _offers(pool, build_id) == []
+        assert wire.approvals == [] and wire.cards == []
+        mission = store.get(MISSION_ID)
+        assert mission.status == "NOT_MERGED"
+        assert "reads back as" in str(mission.closed_reason)
+        assert len(thread.lines) == 1
+
+
+class TestARefusedOfferIsRetriedWhenItMayPass:
+    async def _ready(self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path) -> MissionStore:  # noqa: F811
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        return await _land(config, pool, repo_root)
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_that_may_pass_waits_for_the_next_tick(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        store = await self._ready(config_on, pool, repo_root)
+        service, wire = _offer_service(config_on, pool)
+        calls: list[int] = []
+
+        async def offer(**kwargs: Any) -> bool:
+            calls.append(1)
+            if len(calls) == 1:
+                kwargs["on_refusal"]("the target branch's commit could not be read", True)
+                return False
+            return await service.offer(**kwargs)
+
+        deps, thread = _finish_deps(config_on, pool, offer=offer)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "waiting to offer"
+        assert store.get(MISSION_ID).status == "READY" and thread.lines == []
+        assert await finish_ready_mission(deps, MISSION_ID) == "offered"
+        assert len(wire.approvals) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_that_will_not_pass_closes_the_mission(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        store = await self._ready(config_on, pool, repo_root)
+        off = config_on.model_copy(deep=True)
+        off.merge_executor.enabled = False
+        service, wire = _offer_service(off, pool)
+        deps, thread = _finish_deps(config_on, pool, offer=service.offer)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "not merged"
+        mission = store.get(MISSION_ID)
+        assert mission.status == "NOT_MERGED"
+        assert "switched off" in str(mission.closed_reason)
+        assert wire.approvals == []
+
+    @pytest.mark.asyncio
+    async def test_the_real_offer_says_an_unreadable_main_may_pass(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        store = await self._ready(config_on, pool, repo_root)
+        wire = _Wire()
+
+        async def no_head(_root: Path, _branch: str | None = None) -> str | None:
+            return None
+
+        service = MergeOfferService(
+            config=config_on,
+            pool=pool,
+            pipeline_publisher=SimpleNamespace(publish_build_paused=wire.publish_build_paused),
+            raw_publish=wire.raw_publish,
+            git_head=no_head,
+        )
+        deps, _thread = _finish_deps(config_on, pool, offer=service.offer)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "waiting to offer"
+        assert store.get(MISSION_ID).status == "READY"
+
+
+class TestTheMissionBranch:
+    @pytest.mark.asyncio
+    async def test_a_branch_gone_from_the_remote_is_not_merged(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        store = await _land(config_on, pool, repo_root)
+        _git(repo_root, "push", "-q", "origin", f":refs/heads/{MISSION_BRANCH}")
+
+        async def offer(**_kwargs: Any) -> bool:
+            raise AssertionError("no card for a branch that is gone")
+
+        deps, thread = _finish_deps(config_on, pool, offer=offer)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "not merged"
+        mission = store.get(MISSION_ID)
+        assert "something else changed the mission branch" in str(mission.closed_reason)
+        assert len(thread.lines) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_remote_that_cannot_be_reached_waits(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        tmp_path: Path,
+    ) -> None:
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        store = await _land(config_on, pool, repo_root)
+        away = config_on.model_copy(deep=True)
+        away.planning.fetch_addresses[REPO] = str(tmp_path / "nowhere.git")
+
+        async def offer(**_kwargs: Any) -> bool:
+            raise AssertionError("no card while the remote cannot be read")
+
+        deps, thread = _finish_deps(away, pool, offer=offer)
+
+        assert await finish_ready_mission(deps, MISSION_ID) == "waiting for the remote"
+        assert store.get(MISSION_ID).status == "READY" and thread.lines == []
+
+
+class TestALandingThatNeverReportedIsCarriedOn:
+    def _decided(self, pool: SqliteLifecyclePersistence, build_id: str) -> None:  # noqa: F811
+        from forge.lifecycle.mission_builds import landing_attempt_id
+
+        pool.record_stage(
+            _decision_entry(
+                build_id=build_id,
+                decision="approve",
+                decided_by=f"mission {MISSION_ID} (approved by rich)",
+                request_id=f"merge-{build_id}",
+                now=datetime.now(UTC),
+                attempt_id=landing_attempt_id(build_id),
+            )
+        )
+
+    def _finished_at(self, pool: SqliteLifecyclePersistence, build_id: str, when: datetime) -> None:  # noqa: F811
+        pool.connection.execute(
+            "UPDATE builds SET completed_at = ? WHERE build_id = ?",
+            (when.isoformat(), build_id),
+        )
+        pool.connection.commit()
+
+    async def _deps(self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path, **press: Any) -> tuple[MissionFinishDeps, Any, MergeApprovalConsumer]:  # noqa: F811
+        deps_, _joins, _deploy, publisher, _bus = press_deps(config, pool, repo_root, **press)
+        consumer = MergeApprovalConsumer(deps_)
+
+        async def offer(**_kwargs: Any) -> bool:
+            return True
+
+        deps, _thread = _finish_deps(config, pool, offer=offer)
+        deps.land = consumer.land_mission_feature
+        return deps, publisher, consumer
+
+    @pytest.mark.asyncio
+    async def test_after_a_restart_the_landing_is_pressed_once_more(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.pipeline.publication_record import (
+            RESULT_PUBLISHED_TO_MISSION_BRANCH,
+            PublicationRecordStore,
+        )
+
+        a_running_mission(pool, keys=("B", "C"))
+        tip = the_mission_branch_on_the_remote(repo_root)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        a_mission_feature_build(pool, build_id=C_BUILD, feature_id="FEAT-MX2", key="C")
+        # B's landing was asked for and the coordinator stopped before it
+        # pressed: a decision row and nothing else.
+        self._decided(pool, B_BUILD)
+        deps, publisher, consumer = await self._deps(config_on, pool, repo_root)
+        # C finished with failed tasks: the offer hook gave it a FAILED report.
+        assert await consumer.land_mission_feature(C_BUILD, tasks_failed=1) is None
+
+        started = await mission_finish.finish_ready_missions(deps, wait=True)
+        again = await mission_finish.finish_ready_missions(deps, wait=True)
+
+        assert started == [B_BUILD] and again == []
+        landed = PublicationRecordStore(pool.connection).read(B_BUILD)
+        assert landed.result == RESULT_PUBLISHED_TO_MISSION_BRANCH
+        assert landed.g_commit == tip
+        assert remote_tip(repo_root, MISSION_BRANCH) == landed.j_commit
+        assert len(publisher.asked) == 1
+        decisions = [
+            s for s in pool.read_stages(B_BUILD)
+            if s.target_identifier == "merge_deploy_decision"
+        ]
+        assert len(decisions) == 1
+        # C was never pressed, and its report says why.
+        assert not PublicationRecordStore(pool.connection).read(C_BUILD).recorded
+        reports = [
+            s for s in pool.read_stages(C_BUILD)
+            if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        ]
+        assert [r.status for r in reports] == ["FAILED"]
+        assert reports[0].details["result"] == "mission-landing-failed"
+        assert "1 failed task(s)" in reports[0].details["detail"]
+
+    @pytest.mark.asyncio
+    async def test_a_hook_that_never_ran_is_stepped_in_for_after_the_grace(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from datetime import timedelta
+
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        deps, publisher, _consumer = await self._deps(config_on, pool, repo_root)
+
+        self._finished_at(pool, B_BUILD, datetime.now(UTC))
+        assert await mission_finish.finish_ready_missions(deps, wait=True) == []
+
+        self._finished_at(
+            pool,
+            B_BUILD,
+            datetime.now(UTC) - timedelta(seconds=mission_finish.LANDING_GRACE_SECONDS + 5),
+        )
+        assert await mission_finish.finish_ready_missions(deps, wait=True) == [B_BUILD]
+        assert len(publisher.asked) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_press_that_keeps_raising_gets_a_failed_report_and_stops(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.lifecycle.mission_builds import landing_attempt_id
+        from forge.lifecycle.feature_routing import router_restart_blockers
+
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        self._decided(pool, B_BUILD)
+        # The routing gate is on and this attempt has no committed receipt:
+        # the press raises before it does anything, every time.
+        router = _Router(set())
+        deps, publisher, _consumer = await self._deps(
+            config_on, pool, repo_root, routing_gate=router
+        )
+
+        passes = [
+            await mission_finish.finish_ready_missions(deps, wait=True) for _ in range(5)
+        ]
+
+        assert passes == [[B_BUILD], [B_BUILD], [B_BUILD], [], []]
+        assert len(router.asked) == 3 and publisher.asked == []
+        reports = [
+            s for s in pool.read_stages(B_BUILD)
+            if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        ]
+        assert len(reports) == 1 and reports[0].status == "FAILED"
+        details = reports[0].details
+        assert details["result"] == "mission-landing-failed"
+        assert "RuntimeError 3 times" in details["detail"]
+        assert details["merge_decision"]["execution_attempt_id"] == landing_attempt_id(B_BUILD)
+        # The approved landing no longer holds the router.
+        assert f"merge-approved-pending:{B_BUILD}" not in router_restart_blockers(pool.connection)

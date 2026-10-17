@@ -365,6 +365,11 @@ RESULT_WORD_MERGED_AND_RUNNING: str = "merged-into-the-remote-and-running"
 #: :data:`~forge.pipeline.publication_record.RESULT_PUBLISHED_TO_MISSION_BRANCH`.
 RESULT_WORD_PUBLISHED_TO_MISSION_BRANCH: str = "published-to-the-mission-branch"
 
+#: A mission feature that could not land at all (finished with failed tasks,
+#: an unknown repository, or a press that kept raising): its FAILED landing
+#: report, so the mission closes the attempt. Nothing was published.
+RESULT_WORD_MISSION_LANDING_FAILED: str = "mission-landing-failed"
+
 #: THE EXECUTOR'S WORD FOR A COMMAND A TAKEOVER STOPPED. Written out here
 #: rather than imported, like the sidecar's own wall above, so this module does
 #: not depend on the sidecar; a test pins the two together
@@ -1482,6 +1487,24 @@ async def execute_merge_deploy(
     from forge.lifecycle.merge_retirement import refuse_retired_build
 
     refuse_retired_build(deps.pool.connection, build_id)
+    # A MISSION'S BUILD IS PRESSED BY ITS OWN RULES, WHOEVER CALLS (missions
+    # design, 17 October 2026, sections 6 and 7). A feature built inside a
+    # mission is never deployed: it lands on its mission's branch only, so
+    # ``deploy`` is forced off whatever the caller passed. The mission's own
+    # merge into main always joins under ``mission-<id>`` (round 2, R1).
+    from forge.lifecycle.mission_builds import mission_join_name, mission_of_build
+
+    belongs_to = mission_of_build(deps.pool, build_id)
+    if belongs_to is not None and belongs_to.is_feature and deploy:
+        logger.info(
+            "merge-executor: %s is a feature of mission %s — it is landed on "
+            "the mission's branch and never deployed",
+            build_id,
+            belongs_to.mission_id,
+        )
+        deploy = False
+    if belongs_to is not None and belongs_to.is_merge:
+        join_name = mission_join_name(belongs_to.mission_id)
     feature_routing_receipt: dict[str, object] | None = None
     if deps.feature_routing_required:
         if deps.feature_routing_gate is None:
@@ -6231,6 +6254,14 @@ def _decision_entry(
     )
 
 
+def _a_landing_has_reported(pool: Any, build_id: str) -> bool:
+    """Is a merge report on this build's record?"""
+    return any(
+        s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        for s in pool.read_stages(build_id)
+    )
+
+
 def _ledger_of(pool: Any) -> Any | None:
     """The ledger's writer connection, or None for a pool without one."""
     import sqlite3
@@ -6276,6 +6307,13 @@ class MergeApprovalConsumer:
         self._deps = deps
         self._repo_locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task[None]] = set()
+        # Mission feature builds this consumer is landing right now, so a
+        # resumption asked for while the first landing still waits for the
+        # repository's lock is not queued behind it a second time.
+        self._landing_now: set[str] = set()
+        # How many times each mission feature's landing has raised in this
+        # process; at ``publication.send_attempts`` it gets a FAILED report.
+        self._landing_raises: dict[str, int] = {}
         self._subscription: Any = None
 
     async def attach(self, envelope_client: Any) -> Any:
@@ -6765,13 +6803,16 @@ class MergeApprovalConsumer:
                     previewed_offer, build_id=build_id, reason=ended
                 )
 
-    async def land_mission_feature(self, build_id: str) -> MergeDeployOutcome | None:
+    async def land_mission_feature(
+        self, build_id: str, *, tasks_failed: int = 0
+    ) -> MergeDeployOutcome | None:
         """Merge a finished mission feature into its mission's branch. No card.
 
         Missions design, section 6. Called when a feature built inside a
-        mission finishes cleanly, from the place a routine build is offered
-        its merge card (:meth:`MergeOfferService.maybe_offer`, which offers no
-        card for it). It runs the ordinary press:
+        mission finishes, from the place a routine build is offered its merge
+        card (:meth:`MergeOfferService.maybe_offer`, which offers no card for
+        it), and again by the finishing step for a landing that never
+        reported (a restart). It runs the ordinary press:
 
         * UNDER THE SAME PER-REPOSITORY LOCK as an approved merge, so two
           features finishing together join, check and publish one after the
@@ -6786,10 +6827,16 @@ class MergeApprovalConsumer:
         landing picked up after a restart is the same attempt. One decision
         per request still holds: each feature build is its own request.
 
-        Idempotent: a build whose landing has already reported is left alone
-        (``None``), and one whose decision is recorded but whose press never
-        reported is carried on. Returns the press's outcome, or ``None`` when
-        nothing was pressed (with the reason in the log).
+        A BUILD THAT CANNOT LAND GETS A FAILED LANDING REPORT, so the mission
+        can close its attempt and nothing waits for ever: a build that
+        finished with failed tasks (``tasks_failed``), a repository this
+        factory does not know, and a press that raised as many times as a
+        merge word may try a send (``publication.send_attempts``, three by
+        default).
+
+        Idempotent: a build whose landing has already reported is never
+        pressed again (``None``), and one whose decision is recorded but whose
+        press never reported is carried on.
         """
         from forge.lifecycle.mission_builds import landing_attempt_id, mission_of_build
         from forge.lifecycle.missions import MissionStore
@@ -6806,40 +6853,52 @@ class MergeApprovalConsumer:
         if row is None:
             logger.error("merge-executor: no builds row for %s — not landed", build_id)
             return None
+        if _a_landing_has_reported(self._deps.pool, build_id):
+            logger.info(
+                "merge-executor: %s's landing has already reported — not pressed again",
+                build_id,
+            )
+            return None
+        if tasks_failed:
+            return self._landing_failed(
+                row,
+                f"{row.feature_id} finished with {tasks_failed} failed task(s), so "
+                "it was not merged into its mission's branch",
+            )
         mission = MissionStore(self._deps.pool.connection).get(belongs.mission_id)
         if mission is None:
-            logger.error(
-                "merge-executor: %s names mission %s, which is not on record — "
-                "not landed",
-                build_id,
-                belongs.mission_id,
+            return self._landing_failed(
+                row,
+                f"{row.feature_id} names mission {belongs.mission_id}, which is not "
+                "on record, so it was not landed",
             )
-            return None
         repo_root_raw = self._deps.config.planning.target_repo_paths.get(row.repo)
         if not repo_root_raw:
-            logger.error(
-                "merge-executor: %s's repo %r has no entry in "
-                "planning.target_repo_paths — not landed",
-                build_id,
-                row.repo,
+            return self._landing_failed(
+                row,
+                f"{row.feature_id}'s repository {row.repo} is not one this factory "
+                "knows, so it was not landed",
             )
-            return None
         decided_by = (
             f"mission {mission.id} (approved by {mission.approved_by or 'nobody on record'})"
         )
         request_id = f"{REQUEST_ID_PREFIX}{build_id}"
-        async with self._lock_for(row.repo):
-            stages = self._deps.pool.read_stages(build_id)
-            if any(s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER for s in stages):
-                logger.info(
-                    "merge-executor: %s's landing on %s has already reported — "
-                    "not pressed again",
-                    build_id,
-                    mission.branch,
-                )
-                return None
+        if build_id in self._landing_now:
+            logger.info(
+                "merge-executor: %s is already being landed on %s — not twice",
+                build_id,
+                mission.branch,
+            )
+            return None
+        self._landing_now.add(build_id)
+        try:
+            # THE DECISION ROW FIRST, before waiting for the repository's
+            # lock: it is the durable fact that this build was asked to land.
+            # One row per build: an existing one is reused, with its attempt.
             decided = [
-                s for s in stages if s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
+                s
+                for s in self._deps.pool.read_stages(build_id)
+                if s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
             ]
             attempt_id = landing_attempt_id(build_id)
             if decided:
@@ -6856,33 +6915,110 @@ class MergeApprovalConsumer:
                         attempt_id=attempt_id,
                     )
                 )
-            try:
-                return await execute_merge_deploy(
-                    deps=self._deps,
-                    build_id=build_id,
-                    feature_id=row.feature_id,
-                    repo=row.repo,
-                    repo_root=Path(repo_root_raw),
-                    # Informational only on the merge step's row: the press
-                    # joins onto where the mission branch is NOW (G).
-                    expect_main_sha=str(row.start_commit or ""),
-                    correlation_id=row.correlation_id,
-                    decided_by=decided_by,
-                    baseline_failing=None,
-                    merge_branch=_merge_branch_of_record(self._deps.pool, build_id, {}),
-                    merge_execution_attempt_id=attempt_id,
-                    deploy=False,
-                )
-            except Exception as exc:  # noqa: BLE001 — the task must not die silent
-                logger.error(
-                    "merge-executor: landing %s on %s raised (%s) — see the "
-                    "receipts under merge-%s",
-                    build_id,
-                    mission.branch,
-                    exc,
-                    build_id,
-                )
-                return None
+            async with self._lock_for(row.repo):
+                if _a_landing_has_reported(self._deps.pool, build_id):
+                    return None
+                try:
+                    outcome = await execute_merge_deploy(
+                        deps=self._deps,
+                        build_id=build_id,
+                        feature_id=row.feature_id,
+                        repo=row.repo,
+                        repo_root=Path(repo_root_raw),
+                        # Informational only on the merge step's row: the
+                        # press joins onto where the mission branch is NOW (G).
+                        expect_main_sha=str(row.start_commit or ""),
+                        correlation_id=row.correlation_id,
+                        decided_by=decided_by,
+                        baseline_failing=None,
+                        merge_branch=_merge_branch_of_record(self._deps.pool, build_id, {}),
+                        merge_execution_attempt_id=attempt_id,
+                        deploy=False,
+                    )
+                except Exception as exc:  # noqa: BLE001 — bounded, then reported
+                    raised = self._landing_raises.get(build_id, 0) + 1
+                    self._landing_raises[build_id] = raised
+                    allowed = _how_many_attempts(self._deps.config)
+                    logger.error(
+                        "merge-executor: landing %s on %s raised (%s), %d of %d — "
+                        "see the receipts under merge-%s",
+                        build_id,
+                        mission.branch,
+                        exc,
+                        raised,
+                        allowed,
+                        build_id,
+                    )
+                    if raised >= allowed:
+                        self._landing_failed(
+                            row,
+                            f"{row.feature_id} could not be landed on "
+                            f"{mission.branch}: the press stopped with "
+                            f"{type(exc).__name__} {raised} times "
+                            f"({_one_line(str(exc))[:200]})",
+                            attempt_id=attempt_id,
+                        )
+                    return None
+                self._landing_raises.pop(build_id, None)
+                return outcome
+        finally:
+            self._landing_now.discard(build_id)
+
+    def _landing_failed(
+        self, row: Any, reason: str, *, attempt_id: str | None = None
+    ) -> None:
+        """Write a FAILED landing report for a mission feature that cannot land.
+
+        A merge report row like the press's own, with the result word
+        ``mission-landing-failed`` and the reason, so the mission step closes
+        the attempt and the finishing step never presses the build again.
+        When a decision row was written, the report carries its attempt id, so
+        the router's "approved and pending" blocker clears.
+        """
+        stages = self._deps.pool.read_stages(row.build_id)
+        if any(s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER for s in stages):
+            return None
+        if attempt_id is None:
+            for stage in stages:
+                if stage.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER:
+                    said = (stage.details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}
+                    attempt_id = said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY) or attempt_id
+        now = self._deps.clock()
+        logger.warning("merge-executor: %s", reason)
+        self._deps.pool.record_stage(
+            StageLogEntry(
+                build_id=row.build_id,
+                stage_label=MERGE_REPORT_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+                status="FAILED",
+                gate_mode=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={
+                    "feature_id": row.feature_id,
+                    "build_id": row.build_id,
+                    "correlation_id": row.correlation_id,
+                    "status": "FAILED",
+                    "result": RESULT_WORD_MISSION_LANDING_FAILED,
+                    "detail": reason,
+                    **(
+                        {
+                            MERGE_DECISION_DETAILS_KEY: {
+                                MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                                    MERGE_EXECUTION_ATTEMPT_VERSION
+                                ),
+                                MERGE_EXECUTION_ATTEMPT_ID_KEY: attempt_id,
+                            }
+                        }
+                        if attempt_id is not None
+                        else {}
+                    ),
+                },
+            )
+        )
+        return None
 
     async def _release_the_preview(
         self, offer: dict[str, Any], *, build_id: str, reason: str

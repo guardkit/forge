@@ -1765,9 +1765,9 @@ class MergeOfferService:
         # mission's branch by the merge press's own
         # ``MergeApprovalConsumer.land_mission_feature``, set here at boot
         # once the press exists. ``None`` lands nothing, and says so.
-        self._mission_lander: Callable[[str], Awaitable[Any]] | None = None
+        self._mission_lander: Callable[..., Awaitable[Any]] | None = None
 
-    def set_mission_lander(self, lander: Callable[[str], Awaitable[Any]] | None) -> None:
+    def set_mission_lander(self, lander: Callable[..., Awaitable[Any]] | None) -> None:
         """What lands a clean mission feature on its mission's branch."""
         self._mission_lander = lander
 
@@ -1790,6 +1790,37 @@ class MergeOfferService:
             return
         if not isinstance(event, BuildCompletePayload):
             return
+
+        # A FEATURE BUILT INSIDE A MISSION GETS NO CARD (missions design,
+        # section 6). It is merged into its mission's branch, with no deploy,
+        # by the press under the same per-repository lock an approved merge
+        # takes; one that finished with failed tasks is given a FAILED landing
+        # report instead, so its mission closes the attempt. A mission's own
+        # merge build is never offered through here: finishing offers it.
+        from forge.lifecycle.mission_builds import mission_of_build
+
+        belongs = mission_of_build(self._pool, event.build_id)
+        if belongs is not None:
+            if not belongs.is_feature:
+                return
+            if self._mission_lander is None:
+                logger.error(
+                    "merge-offer: %s is a feature of mission %s, but nothing "
+                    "here can land it on the mission's branch (the merge press "
+                    "is not composed) — no card, and it does not land",
+                    event.build_id,
+                    belongs.mission_id,
+                )
+                return
+            logger.info(
+                "merge-offer: %s is a feature of mission %s — no card; it goes "
+                "to the mission's branch",
+                event.build_id,
+                belongs.mission_id,
+            )
+            await self._mission_lander(event.build_id, tasks_failed=event.tasks_failed)
+            return
+
         if event.tasks_failed != 0:
             logger.info(
                 "merge-offer: %s finished with %d failed task(s) — no merge "
@@ -1814,35 +1845,6 @@ class MergeOfferService:
                 )
                 return
             self._pool.record_worktree_path(event.build_id, path)
-
-        # A FEATURE BUILT INSIDE A MISSION GETS NO CARD (missions design,
-        # section 6). It is merged into its mission's branch, with no deploy,
-        # by the press under the same per-repository lock an approved merge
-        # takes. A mission's own merge build is never offered through here
-        # either: finishing offers it, with the mission's own words.
-        from forge.lifecycle.mission_builds import mission_of_build
-
-        belongs = mission_of_build(self._pool, event.build_id)
-        if belongs is not None:
-            if not belongs.is_feature:
-                return
-            if self._mission_lander is None:
-                logger.error(
-                    "merge-offer: %s is a feature of mission %s, but nothing "
-                    "here can land it on the mission's branch (the merge press "
-                    "is not composed) — no card, and it does not land",
-                    event.build_id,
-                    belongs.mission_id,
-                )
-                return
-            logger.info(
-                "merge-offer: %s is a feature of mission %s — no card; it is "
-                "merged into the mission's branch",
-                event.build_id,
-                belongs.mission_id,
-            )
-            await self._mission_lander(event.build_id)
-            return
 
         # THE SCOPE PASS (the planner fix, 2026-09-15). Read the finished
         # branch once, here, before the card is built: what it changed that
@@ -2248,6 +2250,7 @@ class MergeOfferService:
         card_words: Callable[[str, str | None], str],
         extra_details: Mapping[str, Any] | None = None,
         changed_files: Sequence[Any] | None = None,
+        on_refusal: Callable[[str, bool], None] | None = None,
     ) -> bool:
         """Latch the offer and put ONE merge card in front of the owner.
 
@@ -2288,7 +2291,23 @@ class MergeOfferService:
             the wire write itself raised. ``False`` when the offer refused
             before writing anything: the reason is always a logged sentence,
             and nothing reached the wire.
+
+        ``on_refusal(sentence, may_pass)`` is told why, when given (missions,
+        17 October 2026): ``may_pass`` is True for a refusal that can pass by
+        itself (a commit that could not be read just now, an offer already
+        being prepared, a preview service that raised), False for one that
+        will not (the press switched off, no build row, an unknown
+        repository). Every caller that passes nothing behaves as before.
         """
+
+        def _refuse(sentence: str, *, may_pass: bool) -> bool:
+            if on_refusal is not None:
+                try:
+                    on_refusal(sentence, may_pass)
+                except Exception:  # noqa: BLE001 — a listener never changes the answer
+                    logger.warning("merge-offer: the refusal listener raised")
+            return False
+
         merge_cfg = getattr(self._config, "merge_executor", None)
         if merge_cfg is None or not merge_cfg.enabled:
             logger.info(
@@ -2296,7 +2315,7 @@ class MergeOfferService:
                 "is offered for %s",
                 build_id,
             )
-            return False
+            return _refuse("the merge press is switched off", may_pass=False)
 
         # (a) Re-read the builds row — payload.repo is None BY DESIGN; the
         # durable row carries repo + correlation_id.
@@ -2308,7 +2327,7 @@ class MergeOfferService:
                 "correlation_id)",
                 build_id,
             )
-            return False
+            return _refuse("the build has no row on record", may_pass=False)
         repo_root_raw = self._config.planning.target_repo_paths.get(row.repo)
         if not repo_root_raw:
             logger.error(
@@ -2317,7 +2336,10 @@ class MergeOfferService:
                 row.repo,
                 build_id,
             )
-            return False
+            return _refuse(
+                f"the repository {row.repo} is not one this factory knows",
+                may_pass=False,
+            )
         repo_root = Path(repo_root_raw)
         if not row.correlation_id:
             logger.error(
@@ -2325,7 +2347,7 @@ class MergeOfferService:
                 "jarvis drops empty-correlation cards, so no offer is made",
                 build_id,
             )
-            return False
+            return _refuse("the build has no correlation id", may_pass=False)
 
         # (b) Pin the RECORDED target branch and the exact offered candidate.
         merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
@@ -2349,7 +2371,7 @@ class MergeOfferService:
                 repo_root,
                 build_id,
             )
-            return False
+            return _refuse("the target branch's commit could not be read", may_pass=True)
         candidate_sha = await git.rev_parse(branch)
         candidate_tree = (
             await git.rev_parse(f"{candidate_sha}^{{tree}}")
@@ -2363,7 +2385,7 @@ class MergeOfferService:
                 branch,
                 build_id,
             )
-            return False
+            return _refuse(f"the candidate {branch} could not be pinned", may_pass=True)
 
         retained_identity: dict[str, Any] | None = None
         runner_identity = (extra_details or {}).get("runner_worktree_retention")
@@ -2375,7 +2397,7 @@ class MergeOfferService:
                     "but the build row has no recorded path",
                     build_id,
                 )
-                return False
+                return _refuse("the retained worktree has no recorded path", may_pass=False)
             retained_identity = await git.inspect_autobuild_worktree(
                 build_id, worktree_path
             )
@@ -2397,7 +2419,7 @@ class MergeOfferService:
                     candidate_sha,
                     retained_identity.get("detail"),
                 )
-                return False
+                return _refuse("the retained worktree does not match", may_pass=False)
             retained_identity = dict(retained_identity)
             retained_identity["cleanup_registrations"] = candidate_registration
 
@@ -2413,7 +2435,7 @@ class MergeOfferService:
                 "offering twice",
                 build_id,
             )
-            return False
+            return _refuse("a merge card is already on record", may_pass=False)
 
         request_id = merge_request_id(build_id)
         subject = approval_subject_for(feature_id)
@@ -2458,7 +2480,7 @@ class MergeOfferService:
                 "offering twice",
                 build_id,
             )
-            return False
+            return _refuse("an offer is already being prepared", may_pass=True)
         self._preparing.add(build_id)
         try:
             review_evidence: Any = None
@@ -2476,7 +2498,7 @@ class MergeOfferService:
                     target_branch=recorded_target or MERGE_BASE_REF,
                 )
                 if prepared is None:
-                    return False
+                    return _refuse("the preview could not be prepared", may_pass=True)
                 review_evidence, preview_base_sha = prepared
                 if review_evidence is not None:
                     details["review_evidence"] = review_evidence.model_dump(mode="json")

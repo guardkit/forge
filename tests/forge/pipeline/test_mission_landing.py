@@ -622,9 +622,11 @@ class TestNoRepairRowAndNoDeployForAMissionFeature:
 class _Lander:
     def __init__(self) -> None:
         self.landed: list[str] = []
+        self.failed_tasks: list[int] = []
 
-    async def __call__(self, build_id: str) -> None:
+    async def __call__(self, build_id: str, *, tasks_failed: int = 0) -> None:
         self.landed.append(build_id)
+        self.failed_tasks.append(tasks_failed)
 
 
 def _offer_service(config: ForgeConfig, pool: SqliteLifecyclePersistence) -> tuple[MergeOfferService, list[Any]]:  # noqa: F811
@@ -672,7 +674,7 @@ class TestNoCardForAMissionFeature:
 
         await service.maybe_offer(_complete(B_BUILD, "FEAT-MX1"))
 
-        assert lander.landed == [B_BUILD]
+        assert lander.landed == [B_BUILD] and lander.failed_tasks == [0]
         assert wire == []
         assert not any(
             s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
@@ -680,7 +682,7 @@ class TestNoCardForAMissionFeature:
         )
 
     @pytest.mark.asyncio
-    async def test_a_mission_feature_with_failed_tasks_is_not_landed(
+    async def test_a_mission_feature_with_failed_tasks_is_handed_over_as_failed(
         self,
         config_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -693,7 +695,8 @@ class TestNoCardForAMissionFeature:
 
         await service.maybe_offer(_complete(B_BUILD, "FEAT-MX1", failed=1))
 
-        assert lander.landed == [] and wire == []
+        assert lander.landed == [B_BUILD] and lander.failed_tasks == [1]
+        assert wire == []
 
     @pytest.mark.asyncio
     async def test_with_no_press_composed_nothing_is_offered_or_landed(
@@ -772,3 +775,99 @@ class TestTheTargetIsTheRecordedMissionBranch:
 
 def test_the_mission_join_name() -> None:
     assert mission_join_name(MISSION_ID) == "mission-m-abc123"
+
+
+# ---------------------------------------------------------------------------
+# The build decides, not the caller
+# ---------------------------------------------------------------------------
+
+
+class TestAMissionFeatureIsNeverDeployedWhoeverPressesIt:
+    @pytest.mark.asyncio
+    async def test_a_press_asked_to_deploy_lands_it_on_the_mission_branch_only(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        a_running_mission(pool)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        the_mission_branch_on_the_remote(repo_root)
+        main_before = remote_tip(repo_root, "main")
+        deps, _joins, deploy, publisher, _bus = press_deps(config_on, pool, repo_root)
+
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=B_BUILD,
+            feature_id="FEAT-MX1",
+            repo=REPO,
+            repo_root=repo_root,
+            expect_main_sha="a" * 40,
+            correlation_id=attempt_correlation_id(MISSION_CORRELATION, "B", 1),
+            decided_by="rich",
+            deploy=True,
+        )
+
+        assert outcome.result == RESULT_WORD_PUBLISHED_TO_MISSION_BRANCH
+        assert record(pool, B_BUILD).result == RESULT_PUBLISHED_TO_MISSION_BRANCH
+        assert "promote" not in _legs(deploy)
+        assert [a["target_branch"] for a in publisher.asked] == [MISSION_BRANCH]
+        assert remote_tip(repo_root, "main") == main_before
+
+
+class TestALandingAndAnOrdinaryMergeShareTheLock:
+    @pytest.mark.asyncio
+    async def test_they_press_one_after_the_other(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from tests.forge.pipeline.test_merge_executor import _drain, _envelope, _write_offer
+
+        a_running_mission(pool)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        the_mission_branch_on_the_remote(repo_root)
+        _write_offer(pool, build_id=C_BUILD, feature_id="FEAT-MX2", correlation_id="corr-plain")
+        deps, joins, _deploy, publisher, _bus = press_deps(config_on, pool, repo_root)
+        consumer = MergeApprovalConsumer(deps)
+
+        await consumer.handle_envelope(
+            _envelope(request_id=f"merge-{C_BUILD}", correlation_id="corr-plain")
+        )
+        await consumer.land_mission_feature(B_BUILD)
+        await _drain(consumer)
+
+        merges = [c for c in joins.calls if c["args"][0] == "merge"]
+        assert len(merges) == 2
+        assert joins.most_at_once == 1
+        assert sorted(a["target_branch"] for a in publisher.asked) == ["main", MISSION_BRANCH]
+
+
+class TestAFeatureThatFinishedWithFailedTasks:
+    @pytest.mark.asyncio
+    async def test_it_gets_a_failed_landing_report_and_is_never_pressed(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.pipeline.merge_executor import MERGE_REPORT_TARGET_IDENTIFIER
+
+        a_running_mission(pool)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        the_mission_branch_on_the_remote(repo_root)
+        deps, joins, deploy, publisher, _bus = press_deps(config_on, pool, repo_root)
+        consumer = MergeApprovalConsumer(deps)
+
+        assert await consumer.land_mission_feature(B_BUILD, tasks_failed=2) is None
+        assert await consumer.land_mission_feature(B_BUILD) is None
+
+        reports = [
+            s for s in pool.read_stages(B_BUILD)
+            if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        ]
+        assert len(reports) == 1 and reports[0].status == "FAILED"
+        assert reports[0].details["result"] == "mission-landing-failed"
+        assert joins.calls == [] and publisher.asked == [] and deploy.calls == []
+        assert repair_rows(pool) == []

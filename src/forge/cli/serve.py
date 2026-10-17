@@ -1205,6 +1205,7 @@ def bind_production_dispatch_chain(
                             pool=sqlite_pool,
                             offer_service=merge_offer_service,
                             nats_client=client,
+                            land=_merge_consumer.land_mission_feature,
                             git_surface=compose_merge_git_surface(forge_config),
                             tree_reader_for=compose_merge_check_reader(forge_config),
                             feature_routing_gate=feature_routing_gate,

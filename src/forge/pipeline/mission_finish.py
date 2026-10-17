@@ -86,9 +86,9 @@ RISKY_WORDS: tuple[str, ...] = (
 #: The mission states this step acts on.
 _FINISHING_STATES: tuple[str, ...] = ("READY", "MERGING")
 
-#: Merge report words that mean the mission is on main.
-_ON_MAIN_WORDS: frozenset[str] = frozenset(
-    {"published-deployment-pending", "merged-into-the-remote-and-running"}
+#: Merge report words for a deploy that failed after the mission reached main.
+_DEPLOY_FAILED_WORDS: frozenset[str] = frozenset(
+    {"merged-deploy-failed", "merged-deploy-reverted"}
 )
 
 #: How many files the card names before it says "and N more".
@@ -222,6 +222,10 @@ class MissionFinishDeps:
     git_for: Callable[[str, Path], Any]
     notify: Callable[[Mission, str], Awaitable[None]]
     tree_reader_for: Callable[[str, Path], Any] | None = None
+    #: ``MergeApprovalConsumer.land_mission_feature``: a landing that was
+    #: started and never reported (the coordinator stopped part-way) is
+    #: carried on with it. ``None`` resumes nothing.
+    land: Callable[[str], Awaitable[Any]] | None = None
     feature_routing_gate: Any | None = None
     feature_routing_required: bool = False
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
@@ -234,6 +238,14 @@ class MissionFinishDeps:
 _finisher: Callable[[], Awaitable[Any]] | None = None
 _in_progress: set[str] = set()
 _tasks: set[asyncio.Task[Any]] = set()
+#: Landings being carried on right now, so one tick never starts a second.
+_resuming: set[str] = set()
+
+#: How long a mission feature build may sit COMPLETE with no decision row
+#: before the finishing step lands it itself. The offer hook asks for the
+#: landing within moments of the build finishing, and decides "failed tasks"
+#: there, so the step only steps in for a hook that never ran (a restart).
+LANDING_GRACE_SECONDS: int = 120
 
 
 def install_finisher(finisher: Callable[[], Awaitable[Any]] | None) -> None:
@@ -261,11 +273,12 @@ async def run_finishing_step() -> None:
 async def finish_ready_missions(
     deps: MissionFinishDeps, *, wait: bool = False
 ) -> list[str]:
-    """Start finishing every READY or MERGING mission not already being finished.
+    """Start finishing every READY or MERGING mission not already being finished,
+    and carry on every mission landing that started and never reported.
 
     Each runs as a task of its own and the call returns at once, so a preview
     being prepared never holds the queue. ``wait=True`` (tests) waits for them.
-    Returns the ids started.
+    Returns the build ids resumed, then the mission ids started.
     """
     cx = getattr(deps.pool, "connection", None)
     if cx is None:
@@ -276,6 +289,12 @@ async def finish_ready_missions(
         logger.warning("missions: could not list missions to finish (%s)", exc)
         return []
     started: list[str] = []
+    for build_id in _landings_to_resume(deps, cx):
+        _resuming.add(build_id)
+        started.append(build_id)
+        task = asyncio.create_task(_resume_guarded(deps, build_id))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
     for mission in missions:
         if mission.id in _in_progress:
             continue
@@ -288,6 +307,81 @@ async def finish_ready_missions(
         while _tasks:
             await asyncio.gather(*list(_tasks), return_exceptions=True)
     return started
+
+
+def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[str]:
+    """Mission features whose landing has not reported, and is not running.
+
+    On every pass, so a restart carries every landing on: a COMPLETE feature
+    build of a RUNNING mission, whose attempt is still ADMITTED, with no merge
+    report and no live lease on its publication record, and either a
+    decision row (the landing was asked for) or more than
+    :data:`LANDING_GRACE_SECONDS` since it finished (the offer hook never ran).
+    A build whose landing reported is never pressed again; one whose press
+    keeps raising is given a FAILED landing report by the press's own bound.
+    """
+    if deps.land is None:
+        return []
+    from forge.pipeline.merge_executor import (
+        MERGE_DECISION_TARGET_IDENTIFIER,
+        MERGE_REPORT_TARGET_IDENTIFIER,
+    )
+    from forge.pipeline.publication_record import PublicationRecordStore
+
+    try:
+        rows = cx.execute(
+            "SELECT b.build_id, COALESCE(b.completed_at, b.queued_at), "
+            "EXISTS (SELECT 1 FROM stage_log AS d WHERE d.build_id = b.build_id "
+            "AND d.target_identifier = ?) "
+            "FROM builds AS b "
+            "JOIN missions AS m ON m.id = b.mission_id "
+            "JOIN mission_attempts AS a ON a.correlation_id = b.correlation_id "
+            "WHERE b.mission_role = ? AND b.status = 'COMPLETE' "
+            "AND m.status = 'RUNNING' AND a.status = 'ADMITTED' "
+            "AND NOT EXISTS (SELECT 1 FROM stage_log AS r WHERE r.build_id = b.build_id "
+            "AND r.target_identifier = ?) "
+            "ORDER BY b.queued_at ASC",
+            (MERGE_DECISION_TARGET_IDENTIFIER, MISSION_ROLE_FEATURE, MERGE_REPORT_TARGET_IDENTIFIER),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — a read never stops the queue
+        logger.warning("missions: could not look for landings to resume (%s)", exc)
+        return []
+    records = PublicationRecordStore(cx)
+    now = deps.clock()
+    due: list[str] = []
+    for build_id, finished_at, decided in rows:
+        build_id = str(build_id)
+        if build_id in _resuming:
+            continue
+        if not decided:
+            try:
+                finished = datetime.fromisoformat(str(finished_at))
+            except (TypeError, ValueError):
+                continue
+            if finished.tzinfo is None:
+                finished = finished.replace(tzinfo=timezone.utc)
+            if (now - finished).total_seconds() < LANDING_GRACE_SECONDS:
+                continue
+        if records.read(build_id).lease_is_live(now):
+            continue
+        due.append(build_id)
+    return due
+
+
+async def _resume_guarded(deps: MissionFinishDeps, build_id: str) -> None:
+    try:
+        logger.info("missions: carrying on %s's landing, which has not reported", build_id)
+        assert deps.land is not None
+        await deps.land(build_id)
+    except Exception as exc:  # noqa: BLE001 — logged; tried again next pass
+        logger.error(
+            "missions: carrying on %s's landing raised (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+    finally:
+        _resuming.discard(build_id)
 
 
 async def _finish_guarded(deps: MissionFinishDeps, mission_id: str) -> None:
@@ -481,6 +575,18 @@ async def _offer_the_mission(
 
     start = await git.fetch_remote_start_point(mission.branch)
     if not getattr(start, "ok", False) or not getattr(start, "branch_commit", None):
+        # A BRANCH THAT IS GONE IS A FACT ABOUT THE MISSION: the remote
+        # answered, and it has no mission branch. Waiting for it would keep
+        # the mission active for ever, and an active mission blocks router
+        # restarts, so it is closed.
+        if await _the_branch_is_gone(git, mission.branch, start):
+            return await _not_merged(
+                deps,
+                store,
+                mission,
+                f"its branch {mission.branch} is no longer on the remote, so "
+                "something else changed the mission branch",
+            )
         # A remote that could not be read is not a fact about the mission:
         # the step tries again on the next tick and says nothing yet.
         logger.warning(
@@ -554,6 +660,20 @@ async def _offer_the_mission(
         features=features,
         latest=latest,
     )
+
+
+async def _the_branch_is_gone(git: Any, branch: str, refused: Any) -> bool:
+    """Did the remote answer, and say it has no such branch?
+
+    Both halves, so an unreachable remote is never read as a missing branch:
+    the refusal is the fetch's own "has no branch called" sentence, and the
+    default branch alone is then fetched successfully from the same remote.
+    """
+    said = str(getattr(refused, "refusal", None) or "")
+    if "no branch called" not in said or branch not in said:
+        return False
+    default = await git.fetch_remote_start_point()
+    return bool(getattr(default, "ok", False))
 
 
 async def make_frozen_source(git: Any, build_id: str, commit: str) -> str | None:
@@ -654,6 +774,7 @@ async def _freeze_and_offer(
     )
     row = deps.pool.get_build_row(build_id)
     landed = [f.key for f in features if _status(latest, f.key) == "LANDED"]
+    refusals: list[tuple[str, bool]] = []
     offered = await deps.offer(
         build_id=build_id,
         feature_id=str(row.feature_id),
@@ -671,18 +792,32 @@ async def _freeze_and_offer(
                 "risky_files_unread": unread,
             }
         },
+        on_refusal=lambda sentence, may_pass: refusals.append((sentence, may_pass)),
     )
-    if not offered and not any(
+    if offered or any(
         s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
         for s in deps.pool.read_stages(build_id)
     ):
-        return await _not_merged(
-            deps,
-            store,
-            mission,
-            "the merge card could not be offered (the factory's log says why)",
+        return "offered"
+    # A REFUSAL THAT MAY PASS IS TRIED AGAIN ON THE NEXT TICK (a commit that
+    # could not be read just now, an offer already being prepared, a preview
+    # service that raised). Only a refusal that will not pass closes the
+    # mission. An offer that gave no reason is tried again too.
+    final = [sentence for sentence, may_pass in refusals if not may_pass]
+    if not final:
+        logger.warning(
+            "missions: %s's merge card was not offered (%s) — tried again on "
+            "the next tick",
+            mission.id,
+            "; ".join(sentence for sentence, _ in refusals) or "no reason given",
         )
-    return "offered"
+        return "waiting to offer"
+    return await _not_merged(
+        deps,
+        store,
+        mission,
+        f"the merge card could not be offered: {final[0]}",
+    )
 
 
 async def _follow_the_card(
@@ -773,7 +908,35 @@ async def _follow_the_card(
     report = reports[-1]
     word = str((report.details or {}).get("result") or "")
     detail = str((report.details or {}).get("detail") or "")
-    if word in _ON_MAIN_WORDS:
+    # ON MAIN IS READ OFF THE PUBLICATION RECORD, never off the report's
+    # word: a deploy that failed after the send still left the mission on
+    # main ("merged-deploy-failed", with the record "published, deployment
+    # pending"), and calling that "not merged" would be untrue.
+    from forge.pipeline.publication_record import (
+        RESULT_MERGED_AND_RUNNING,
+        RESULT_PUBLISHED_DEPLOYMENT_PENDING,
+        PublicationRecordStore,
+    )
+
+    record = PublicationRecordStore(deps.pool.connection).read(build_id)
+    target = str(row.target_branch or "main")
+    on_main = record.recorded and record.result in (
+        RESULT_PUBLISHED_DEPLOYMENT_PENDING,
+        RESULT_MERGED_AND_RUNNING,
+    ) and (record.target_branch or target) == target
+    if on_main:
+        if record.result == RESULT_MERGED_AND_RUNNING:
+            line = f'Mission "{mission.title}" is merged into {target} and deployed.'
+        elif word in _DEPLOY_FAILED_WORDS:
+            line = (
+                f'Mission "{mission.title}" is merged into {target}, but its '
+                f"deploy failed: {_first_sentence(detail, 240)}"
+            )
+        else:
+            line = (
+                f'Mission "{mission.title}" is merged into {target}; it is not '
+                f"deployed yet: {_first_sentence(detail, 240)}"
+            )
         if not store.set_status(
             mission.id,
             "MERGED",
@@ -781,17 +944,7 @@ async def _follow_the_card(
             reason=_first_sentence(detail) or word,
         ):
             return "already moved on"
-        deployed = word == "merged-into-the-remote-and-running"
-        await _say(
-            deps,
-            mission,
-            (
-                f'Mission "{mission.title}" is merged into main and deployed.'
-                if deployed
-                else f'Mission "{mission.title}" is merged into main; it is '
-                f"not deployed yet: {_first_sentence(detail, 240)}"
-            ),
-        )
+        await _say(deps, mission, line)
         return "merged"
     reason = _first_sentence(detail, 240) or f"the merge ended {word or 'without a word'}"
     return await _not_merged(
@@ -818,6 +971,7 @@ def compose_mission_finisher(
     pool: Any,
     offer_service: Any,
     nats_client: Any,
+    land: Callable[[str], Awaitable[Any]] | None = None,
     git_surface: Callable[[str, Path], Any] | None = None,
     tree_reader_for: Callable[[str, Path], Any] | None = None,
     feature_routing_gate: Any | None = None,
@@ -860,6 +1014,7 @@ def compose_mission_finisher(
         git_for=git_for,
         notify=notify,
         tree_reader_for=tree_reader_for,
+        land=land,
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
     )
