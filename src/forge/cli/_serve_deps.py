@@ -1573,7 +1573,18 @@ def _build_dispatch_build(
                 and gate_repository is not None
                 and gate_state_machine is not None
             )
-            if gate_wired and status in (
+            # A mission feature's build advances its own row to RUNNING before
+            # its runner launches (the mission arm below), so for it, too, a
+            # QUEUED or INTERRUPTED duplicate is definitively runless.
+            from forge.lifecycle.missions import mission_membership
+
+            advances_its_own_row = gate_wired or (
+                mission_membership(
+                    getattr(sqlite_pool, "connection", None), payload.correlation_id
+                )
+                is not None
+            )
+            if advances_its_own_row and status in (
                 BuildState.INTERRUPTED,
                 BuildState.QUEUED,
             ):
@@ -1754,16 +1765,24 @@ def _build_dispatch_build(
 
         # --- A mission feature has no build gate (missions design, 17 October
         # 2026, section 5). The mission plan card was the go-ahead, so the
-        # build writes one stage-log decision citing that approval and then
-        # launches exactly as the "no gate wired" arm below does, whether or
-        # not the gate is wired this boot. A member build whose mission is not
-        # running is refused with a plain sentence, and no card is opened. It
-        # does not go through gate_check with a made-up auto-approve:
-        # reasoning refuses an auto-approve without a Coach score, rightly.
+        # build writes one stage-log decision citing that approval, advances
+        # its row to RUNNING exactly as an approved gate does, and launches
+        # — whether or not the gate is wired this boot. A live mission build
+        # is therefore never left QUEUED, so a build-queued message redelivered
+        # while it runs lands in the held-slot arm above and is not launched
+        # twice (live trial, mission m-f23129, 17 October 2026). A member build
+        # whose mission is not running is refused with a plain sentence, and
+        # no card is opened. It does not go through gate_check with a made-up
+        # auto-approve: reasoning refuses an auto-approve without a Coach
+        # score, rightly.
         mission_gate = _mission_build_gate_decision(
             sqlite_pool, build_id, payload.correlation_id, clock
         )
         if mission_gate is not None:
+            from forge.cli._serve_gate_activation import advance_to_running
+
+            if not advance_to_running(sqlite_pool, build_id, who="dispatch_build"):
+                return  # a concurrent terminal write owns the row: hold the slot
             logger.info(
                 "dispatch_build: build_id=%s is part of mission %s; no build "
                 "gate (%s); launching",

@@ -303,6 +303,46 @@ def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | 
     return " ".join(lines) if lines else None
 
 
+def advance_to_running(
+    sqlite_pool: SqliteLifecyclePersistence,
+    build_id: str,
+    status: BuildState | None = None,
+    *,
+    who: str = "dispatch",
+) -> bool:
+    """Drive the builds row to RUNNING through the synthetic hops; False to hold the slot.
+
+    QUEUED → PREPARING → RUNNING (or INTERRUPTED → PREPARING → RUNNING), via
+    :func:`transition_chain`, the single producer of transition values. The
+    approval gate does this before it pauses a build, and a mission feature's
+    build does it before its runner launches (missions, 17 October 2026): a
+    live build must never sit at QUEUED, or a redelivered build-queued message
+    would be read as runless and launched a second time. Nothing to do for a
+    row already RUNNING. A concurrent terminal write landing mid-chain makes a
+    hop illegal (``InvalidTransitionError``) or lose the optimistic-concurrency
+    race (0-row ``RuntimeError``); the other writer is authoritative, so the
+    answer is False — hold the slot: no launch, no ack, no build-failed.
+    """
+    if status is None:
+        status, _pending = _read_status_and_pending(sqlite_pool, build_id)
+    try:
+        for hop in transition_chain(
+            Build(build_id=build_id, status=status), BuildState.RUNNING
+        ):
+            sqlite_pool.apply_transition(hop)
+    except (InvalidTransitionError, RuntimeError) as exc:
+        logger.warning(
+            "%s: synthetic hop to RUNNING for build_id=%s failed (%s) — a "
+            "concurrent terminal write is authoritative; holding the slot (no "
+            "launch, no ack, no build-failed)",
+            who,
+            build_id,
+            exc,
+        )
+        return False
+    return True
+
+
 async def maybe_gate_build(
     *,
     parts: "ApprovalGateParts",
@@ -382,19 +422,7 @@ async def maybe_gate_build(
     #    (0-row ``RuntimeError``). The other writer is authoritative — hold
     #    the slot rather than let the error escape to handle_message as a
     #    (factually wrong) build-failed.
-    try:
-        for hop in transition_chain(
-            Build(build_id=build_id, status=status), BuildState.RUNNING
-        ):
-            sqlite_pool.apply_transition(hop)
-    except (InvalidTransitionError, RuntimeError) as exc:
-        logger.warning(
-            "maybe_gate_build: synthetic pre-gate hop for build_id=%s failed "
-            "(%s) — a concurrent terminal write is authoritative; holding the "
-            "slot (no launch, no ack, no build-failed)",
-            build_id,
-            exc,
-        )
+    if not advance_to_running(sqlite_pool, build_id, status, who="maybe_gate_build"):
         return HOLD_SLOT
 
     # 3. Assemble per-build deps against the degraded collaborators.
