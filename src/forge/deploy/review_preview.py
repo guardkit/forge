@@ -435,8 +435,9 @@ class PreviewRequest:
     #: The commit the preview is joined onto: the recorded target branch as
     #: freshly fetched from ``origin`` by the offer, through the merge press's
     #: own helper (:func:`forge.pipeline.merge_join.target_branch_now`), so it
-    #: is what the press will join onto. ``expect_main_sha`` is the clone's
-    #: local branch and can lag the remote, so it is never joined onto.
+    #: is what the press will join onto. ``expect_main_sha`` is the card's pin,
+    #: read the same way since 17 October 2026, but it is never joined onto:
+    #: this field is.
     preview_base_sha: str | None = None
     #: Why that commit could not be read, when it could not.
     preview_base_refusal: str | None = None

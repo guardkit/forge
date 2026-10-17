@@ -622,10 +622,11 @@ class TestThePreviewJoinsWhatThePressJoins:
 
         offer = await _offer_with_a_preview(config, pool, preview)
 
-        # The card pins the clone's main, but the preview was joined onto the
-        # remote's — the commit the press will join onto.
-        assert offer["expect_main_sha"] == local
-        assert offer["preview_base_sha"] == fetched != local
+        # The preview was joined onto the remote's main — the commit the press
+        # will join onto — and since 17 October 2026 the card's pin is that
+        # same fetched commit, never the clone's lagging local main.
+        assert offer["expect_main_sha"] == fetched != local
+        assert offer["preview_base_sha"] == fetched
         assert preview.requests[0].preview_base_sha == fetched
         consumer, publisher, gk, dp = _consumer(
             config, pool, preview, guardkit=_JoinsForReal()

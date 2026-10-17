@@ -1217,24 +1217,24 @@ class TestARefusedOfferIsRetriedWhenItMayPass:
         assert wire.approvals == []
 
     @pytest.mark.asyncio
-    async def test_the_real_offer_says_an_unreadable_main_may_pass(
+    async def test_the_real_offer_says_an_unfetchable_target_may_pass(
         self,
         config_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
+        tmp_path: Path,
     ) -> None:
         store = await self._ready(config_on, pool, repo_root)
         wire = _Wire()
-
-        async def no_head(_root: Path, _branch: str | None = None) -> str | None:
-            return None
-
+        # The card's pin is the target branch fetched now (17 October 2026);
+        # the offer's own fetch cannot reach the remote this time.
+        away = config_on.model_copy(deep=True)
+        away.planning.fetch_addresses[REPO] = str(tmp_path / "nowhere.git")
         service = MergeOfferService(
-            config=config_on,
+            config=away,
             pool=pool,
             pipeline_publisher=SimpleNamespace(publish_build_paused=wire.publish_build_paused),
             raw_publish=wire.raw_publish,
-            git_head=no_head,
         )
         deps, _thread = _finish_deps(config_on, pool, offer=service.offer)
 

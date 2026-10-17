@@ -2512,9 +2512,34 @@ class MergeOfferService:
         # there was none, so a project whose recorded branch is anything else
         # could never be offered a merge word at all.
         recorded_target = str(getattr(row, "target_branch", None) or "").strip()
-        expect_main_sha = await _ask_the_head_reader(
-            self._git_head, repo_root, recorded_target or None
+        # THE PIN IS THE TARGET BRANCH AS FETCHED NOW (17 October 2026, the
+        # missions trial): the recorded branch fetched afresh from the
+        # project's recorded address through the press's own helper, the same
+        # read the preview's base and the merge check use. It used to be the
+        # clone's LOCAL branch, which nothing fetches: in a sandbox clone that
+        # stayed at the clone's first commit, so every card pinned a commit
+        # months old. A venue that cannot fetch, or a build with no recorded
+        # start point, is read the way it always was.
+        fetched, fetch_refusal, fetched_it = await self._the_target_as_fetched(
+            git, build_id
         )
+        if fetched_it:
+            if fetched is None:
+                logger.error(
+                    "merge-offer: the target branch of %s could not be fetched "
+                    "(%s) — an offer without a pin would not be honest; no card",
+                    build_id,
+                    fetch_refusal,
+                )
+                return _refuse(
+                    f"the target branch could not be fetched: {fetch_refusal}",
+                    may_pass=True,
+                )
+            expect_main_sha: str | None = fetched
+        else:
+            expect_main_sha = await _ask_the_head_reader(
+                self._git_head, repo_root, recorded_target or None
+            )
         if expect_main_sha is None:
             logger.error(
                 "merge-offer: could not read %s's sha in %s — an offer "
@@ -2811,6 +2836,34 @@ class MergeOfferService:
                     reason="the merge card could not be published",
                 )
         return True
+
+    async def _the_target_as_fetched(
+        self, git: Any, build_id: str
+    ) -> tuple[str | None, str | None, bool]:
+        """``(tip, refusal, fetched)``: the recorded target branch, fetched now.
+
+        ``fetched`` is False when this venue cannot fetch or the build records
+        no start point, and the caller reads the pin the old way. Never raises.
+        """
+        if not callable(getattr(git, "fetch_remote_start_point", None)):
+            return None, None, False
+        try:
+            start_point = self._pool.read_start_point(build_id)
+        except Exception:  # noqa: BLE001 — unreadable reads the old way
+            return None, None, False
+        if not getattr(start_point, "recorded", False):
+            return None, None, False
+        from forge.pipeline.merge_join import target_branch_now
+
+        try:
+            where = await target_branch_now(
+                git, recorded_branch=getattr(start_point, "target_branch", None)
+            )
+        except Exception as exc:  # noqa: BLE001 — a refusal, never a crash
+            return None, f"{type(exc).__name__}: {exc}", True
+        if not where.ok:
+            return None, str(where.refusal or "the remote could not be read"), True
+        return str(where.commit), None, True
 
     def _git_for(self, row: Any, repo_root: Path) -> Any:
         """Where this repository's git happens, as the press's own
