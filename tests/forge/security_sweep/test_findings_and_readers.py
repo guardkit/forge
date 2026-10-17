@@ -304,3 +304,44 @@ class TestTheQuestion:
         prompt = build_prompt(finding, "1: x\n2: y")
         assert "1: x\n2: y" in prompt
         assert prompt.endswith('{"real": true} or {"real": false}.')
+
+
+class TestTheModelRoute:
+    """Fix 9: an empty address is "not configured", never OPENAI_BASE_URL."""
+
+    def _fake_guardkit(self, monkeypatch: pytest.MonkeyPatch, asker: object) -> list[str]:
+        import types
+
+        asked: list[str] = []
+
+        def build_default_asker() -> object:
+            asked.append("built")
+            return asker
+
+        module = types.ModuleType("guardkit.orchestrator.stamp_model_fallback")
+        module.build_default_asker = build_default_asker  # type: ignore[attr-defined]
+        for name in ("guardkit", "guardkit.orchestrator"):
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+        monkeypatch.setitem(sys.modules, "guardkit.orchestrator.stamp_model_fallback", module)
+        return asked
+
+    def test_an_empty_address_is_not_configured_even_with_openai_base_url(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.security_sweep.sorting import default_asker
+
+        asked = self._fake_guardkit(monkeypatch, asker=object())
+        monkeypatch.setenv("GUARDKIT_STAMP_MODEL_URL", "")
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://192.0.2.1:4000/v1")
+        monkeypatch.setenv("GUARDKIT_STAMP_MODEL", "some-model")
+        assert default_asker() == (None, "the model is not configured")
+        assert asked == []
+
+    def test_a_set_address_uses_guardkits_own_client(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from forge.security_sweep.sorting import default_asker
+
+        sentinel = object()
+        asked = self._fake_guardkit(monkeypatch, asker=sentinel)
+        monkeypatch.setenv("GUARDKIT_STAMP_MODEL_URL", "http://192.0.2.1:4100/v1")
+        assert default_asker() == (sentinel, "")
+        assert asked == ["built"]

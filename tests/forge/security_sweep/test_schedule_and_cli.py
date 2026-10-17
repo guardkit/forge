@@ -269,3 +269,21 @@ class TestTheServeWiring:
         run_serve = inspect.getsource(serve._run_serve)
         assert "compose_nightly_schedule" in run_serve
         assert 'name="forge-serve-security-sweep"' in run_serve
+
+
+def test_the_coordinator_is_handed_the_sweeps_model_names_empty_by_default() -> None:
+    """Fix 9: the three names reach the coordinator from the env file, and an
+    unset one arrives empty (not configured), never as some other address."""
+    import yaml
+
+    root = Path(__file__).resolve().parents[3]
+    compose = yaml.safe_load((root / "deploy" / "compose" / "compose.yaml").read_text())
+    environment = compose["services"]["coordinator"]["environment"]
+    assert environment["GUARDKIT_STAMP_MODEL_URL"] == "${FORGE_SWEEP_MODEL_URL:-}"
+    assert environment["GUARDKIT_STAMP_MODEL"] == "${FORGE_SWEEP_MODEL:-}"
+    assert environment["GUARDKIT_STAMP_MODEL_EXTRA_BODY"] == "${FORGE_SWEEP_MODEL_EXTRA_BODY:-}"
+    assert "OPENAI_BASE_URL" not in environment
+    for example in ("deploy/estate/.env.example", "deploy/compose/.env.example"):
+        text = (root / example).read_text()
+        for name in ("FORGE_SWEEP_MODEL_URL", "FORGE_SWEEP_MODEL", "FORGE_SWEEP_MODEL_EXTRA_BODY"):
+            assert f"\n{name}=\n" in text, f"{example} does not document {name}, empty"

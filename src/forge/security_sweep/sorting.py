@@ -40,10 +40,14 @@ nothing is asked and the findings stay ``pending``, which the Slack line says.
 from __future__ import annotations
 
 import json
+import os
 import re
 from typing import Callable, Iterable, Sequence
 
 from .findings import KIND_CODE, Finding
+
+#: The model address name the sweep reads (GuardKit's stamp-check client).
+MODEL_URL_NAME = "GUARDKIT_STAMP_MODEL_URL"
 
 #: Lines either side of a code finding in its excerpt.
 EXCERPT_CONTEXT = 20
@@ -157,6 +161,14 @@ def default_asker() -> tuple[Asker | None, str]:
     ``why not`` is plain words when there is no asker ("the model is not
     configured"); never the endpoint, never a key.
     """
+    # An address name that is present but empty means "not configured", and
+    # never falls through to OPENAI_BASE_URL. GuardKit's own rule says the
+    # same (empty_env_disables, checked on 17 October 2026); it is said again
+    # here so the sweep does not depend on that staying true. The estate
+    # passes FORGE_SWEEP_MODEL_URL through as GUARDKIT_STAMP_MODEL_URL, empty
+    # when it is not set.
+    if os.environ.get(MODEL_URL_NAME) is not None and not os.environ[MODEL_URL_NAME].strip():
+        return None, "the model is not configured"
     try:
         from guardkit.orchestrator.stamp_model_fallback import build_default_asker
     except Exception:  # noqa: BLE001 — an older or absent GuardKit means no model

@@ -68,6 +68,19 @@ services:
       # must still pass an operator-supplied router address into the
       # coordinator; an empty value preserves the unopted deployment.
       FORGE_FEATURE_ROUTER_URL: ${FORGE_FEATURE_ROUTER_URL:-}
+      # THE MODEL THE NIGHTLY SECURITY CHECK ASKS (17 October 2026). The sweep
+      # sorts its secret and code findings through GuardKit's own model client,
+      # which reads these three names. The address is the feature router on
+      # the gateway, which the coordinator can reach and which needs no key;
+      # the model door is firewalled from the coordinator on purpose (it is
+      # the sandbox's way out), so it is not used here. Empty means not
+      # configured: the client then asks nothing (an empty address never
+      # falls back to OPENAI_BASE_URL), the findings wait to be sorted, and
+      # the Slack line says so. The plan's stamp check, when it runs in this
+      # container, reads the same three names.
+      GUARDKIT_STAMP_MODEL_URL: ${FORGE_SWEEP_MODEL_URL:-}
+      GUARDKIT_STAMP_MODEL: ${FORGE_SWEEP_MODEL:-}
+      GUARDKIT_STAMP_MODEL_EXTRA_BODY: ${FORGE_SWEEP_MODEL_EXTRA_BODY:-}
       # THE RECORD. One file on the ledger volume, which this service is the
       # only writer of.
       FORGE_DB_PATH: /var/lib/forge/forge.db
