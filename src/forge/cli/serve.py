@@ -484,6 +484,8 @@ def compose_merge_git_surface(forge_config: Any) -> Any | None:
                 fetch_address=(
                     getattr(forge_config.planning, "fetch_addresses", {}) or {}
                 ).get(str(repo)),
+                # The declared Git door (17 October 2026).
+                git_door=getattr(forge_config.planning, "git_door", None),
             )
             logger.info(
                 "forge-serve: %s has a sandbox (%s), so the merge word's own "
@@ -520,8 +522,10 @@ def compose_merge_check_reader(forge_config: Any) -> Any:
 
     planning = forge_config.planning
     addresses = dict(getattr(planning, "fetch_addresses", None) or {})
+    door = getattr(planning, "git_door", None)
     here = WorktreeGitRunner(
-        target_repo_paths=planning.target_repo_paths, fetch_addresses=addresses
+        target_repo_paths=planning.target_repo_paths, fetch_addresses=addresses,
+        git_door=door,
     )
     per_repo: dict[str, Any] = {}
 
@@ -531,7 +535,8 @@ def compose_merge_check_reader(forge_config: Any) -> Any:
             return here
         if repo not in per_repo:
             per_repo[repo] = SidecarGitRunner(
-                str(entry.sidecar_url), repo=str(repo), fetch_address=addresses.get(str(repo))
+                str(entry.sidecar_url), repo=str(repo), fetch_address=addresses.get(str(repo)),
+                git_door=door,
             )
         return per_repo[repo]
 

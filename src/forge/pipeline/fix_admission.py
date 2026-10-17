@@ -1425,6 +1425,7 @@ async def admit_fix_row(
         sidecar_post=sidecar_post,
         merge_ending=_recorded_merge_ending(persistence, source),
         fetch_address=_fetch_address_for(config, resolution.name),
+        git_door=getattr(getattr(config, "planning", None), "git_door", None),
     )
     base_branch = repair_base.branch
     if base_branch != branch or sidecar is not None:
@@ -1912,12 +1913,15 @@ async def resolve_repair_base(
     sidecar_post: Any = None,
     merge_ending: str | None = None,
     fetch_address: str | None = None,
+    git_door: str | None = None,
 ) -> RepairBase:
     """Choose the repair base, preserving a verified build-failed candidate.
 
     ``fetch_address`` is the project's recorded address
     (``planning.fetch_addresses``), sent to the sandbox helper when the
-    remote's target branch is fetched (Forge git hardening, 14 October 2026).
+    remote's target branch is fetched (Forge git hardening, 14 October 2026),
+    with the declared Git door beside it (``planning.git_door``, 17 October
+    2026).
 
     A repair of a merge whose checks went red is cut from where the work
     really is (3 October 2026). When the joined result's checks failed,
@@ -1951,6 +1955,7 @@ async def resolve_repair_base(
             sidecar=sidecar,
             sidecar_post=sidecar_post,
             fetch_address=fetch_address,
+            git_door=git_door,
         )
     if source != SOURCE_BUILD_FAILED:
         return RepairBase(branch=chosen)
@@ -1974,6 +1979,7 @@ async def _remote_target_base(
     sidecar: tuple[str, str],
     sidecar_post: Any,
     fetch_address: str | None = None,
+    git_door: str | None = None,
 ) -> RepairBase:
     """Fetch the remote's target branch in the sandbox and pin where it is.
 
@@ -1998,6 +2004,7 @@ async def _remote_target_base(
         repo=repo_key,
         post=sidecar_post or _urllib_post,
         fetch_address=fetch_address,
+        git_door=git_door,
     )
     start = await git.fetch_remote_start_point()
     if not start.ok:

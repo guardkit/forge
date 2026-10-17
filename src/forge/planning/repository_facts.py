@@ -1106,14 +1106,20 @@ def _route_sheets(
     test_folders: tuple[str, ...] = (),
     into: list[str] | None = None,
     unread: list[str] | None = None,
+    reference_paths: tuple[str, ...] = (),
 ) -> list[str]:
     """Route facts for the request's paths. One search per first segment —
     ``/users/a`` and ``/users/b`` are the same search — and never a file
     in the repository's own test folders, which mention routes without
-    defining them."""
+    defining them, nor one in its declared reference folders, which are not
+    the product (17 October 2026)."""
 
     def _candidate(f: str) -> bool:
-        return _looks_like_routes(f) and not f.startswith(test_folders)
+        return (
+            _looks_like_routes(f)
+            and not f.startswith(test_folders)
+            and not f.startswith(reference_paths)
+        )
 
     sheets: list[str] = into if into is not None else []
     seen_files: set[str] = set()
@@ -1201,12 +1207,21 @@ def _bounded(text: str) -> str:
     return text[: _MAX_SHEET_CHARS - 60].rstrip() + f"\n(The sheet was cut at {_MAX_SHEET_CHARS} characters.)"
 
 
-def read_repository_facts(reader: RepositoryReader, request_text: str) -> RepositoryFacts:
+def read_repository_facts(
+    reader: RepositoryReader,
+    request_text: str,
+    *,
+    reference_paths: Sequence[str] = (),
+) -> RepositoryFacts:
     """The fact sheet for ``request_text``, read through ``reader``.
 
     Never raises. A repository that cannot be read answers with
     :attr:`RepositoryFacts.unavailable` set to the reason, never with an
     empty sheet that looks like "nothing there".
+
+    ``reference_paths`` (17 October 2026, prototype-to-factory design 2.2):
+    the project's declared reference folders. The facts describe the
+    product, so nothing under them is read; without them nothing changes.
     """
     where = str(getattr(reader, "where", "") or "the repository")
     try:
@@ -1217,7 +1232,8 @@ def read_repository_facts(reader: RepositoryReader, request_text: str) -> Reposi
         begin = getattr(reader, "begin", None)
         if callable(begin):
             begin()
-        tracked = reader.list_files()
+        reference = tuple(str(p) for p in reference_paths)
+        tracked = [f for f in reader.list_files() if not f.startswith(reference)]
         test_folders = _test_folders(tracked)
         route_nouns: list[str] = []
         for path in paths:
@@ -1237,7 +1253,10 @@ def read_repository_facts(reader: RepositoryReader, request_text: str) -> Reposi
         unread: list[str] = []
         stopped: str | None = None
         try:
-            _route_sheets(reader, paths, test_folders, into=route_lines, unread=unread)
+            _route_sheets(
+                reader, paths, test_folders, into=route_lines, unread=unread,
+                reference_paths=reference,
+            )
             models, migrations, note = _declared_paths(reader, tracked, unread)
             if note:
                 notes.append(note)

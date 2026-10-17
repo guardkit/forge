@@ -394,6 +394,7 @@ def _fetch_remote_start_point_sync(
     *,
     fetch_address: str | None = None,
     repo: str | None = None,
+    git_door: str | None = None,
 ) -> RemoteStartPoint:
     """The starting point, fetched from the project's RECORDED address.
 
@@ -409,7 +410,8 @@ def _fetch_remote_start_point_sync(
     to the clone's origin.
 
     ``branch`` (4 October 2026) names one more branch to fetch in the same
-    call and answer the commit of, as ``branch_commit``.
+    call and answer the commit of, as ``branch_commit``. ``git_door`` (17
+    October 2026) is the declared Git door, so a door address is taken.
     """
     wanted = (branch or "").strip() or None
     if wanted is not None and not _REMOTE_BRANCH_PATTERN.match(wanted):
@@ -426,6 +428,7 @@ def _fetch_remote_start_point_sync(
             branch=wanted,
             repo=repo,
             timeout=REMOTE_TIMEOUT_SECONDS,
+            git_door=git_door,
         )
     except OSError as exc:
         return RemoteStartPoint(
@@ -458,6 +461,7 @@ async def fetch_remote_start_point(
     *,
     fetch_address: str | None = None,
     repo: str | None = None,
+    git_door: str | None = None,
 ) -> RemoteStartPoint:
     """Fetch the project's default branch and say which commit it is at.
 
@@ -479,6 +483,7 @@ async def fetch_remote_start_point(
             branch,
             fetch_address=fetch_address,
             repo=repo,
+            git_door=git_door,
         )
     )
 
@@ -1387,12 +1392,15 @@ class InContainerCandidateGit:
         *,
         fetch_address: str | None = None,
         repo: str | None = None,
+        git_door: str | None = None,
     ) -> None:
         self._repo_root = Path(repo_root)
         # The project's recorded fetch address (planning.fetch_addresses) and
         # its org/name; the starting point is fetched from that address only.
+        # The declared Git door (planning.git_door), when there is one.
         self._fetch_address = fetch_address
         self._repo = repo
+        self._git_door = git_door
 
     @property
     def repo_root(self) -> Path:
@@ -1410,7 +1418,8 @@ class InContainerCandidateGit:
         self, branch: str | None = None
     ) -> RemoteStartPoint:
         return await fetch_remote_start_point(
-            self._repo_root, branch, fetch_address=self._fetch_address, repo=self._repo
+            self._repo_root, branch, fetch_address=self._fetch_address, repo=self._repo,
+            git_door=self._git_door,
         )
 
     async def is_ancestor(self, ancestor: str, descendant: str) -> bool | None:

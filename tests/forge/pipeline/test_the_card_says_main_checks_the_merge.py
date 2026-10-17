@@ -411,7 +411,17 @@ CARDS = {"routine card": _routine_card, "repair card": _repair_card}
 
 
 def _trees(target: dict[str, tuple[str, str]], candidate: dict[str, tuple[str, str]] | None = None) -> Trees:
-    return Trees({TARGET: target, CANDIDATE_SHA: candidate if candidate is not None else target, LOCAL_MAIN: target})
+    # The build's start commit is in the copy too: the card reads the
+    # project's settings there for its prototype line (17 October 2026), and
+    # a start commit the copy cannot read is said on the card.
+    return Trees(
+        {
+            TARGET: target,
+            CANDIDATE_SHA: candidate if candidate is not None else target,
+            LOCAL_MAIN: target,
+            START: target,
+        }
+    )
 
 
 def _project(config_text: str = CHECK_AND_INSTALL, **extra: tuple[str, str]) -> dict[str, tuple[str, str]]:
@@ -632,7 +642,10 @@ async def test_10_with_a_preview_it_reads_at_the_previews_base(config, pool, rul
     )
 
     assert reading["declared_at"] == PREVIEW_BASE
-    seen = {commit for commit, _p, _m in trees.calls} | set(trees.listed)
+    # The card's prototype line (17 October 2026) reads only the settings,
+    # at the build's start commit; that read is the card's, not the check's.
+    assert {p for c, p, _m in trees.calls if c == START} <= {".guardkit/config.yaml"}
+    seen = {commit for commit, _p, _m in trees.calls if commit != START} | set(trees.listed)
     assert seen <= {PREVIEW_BASE, CANDIDATE_SHA, JOINED}
     assert JOINED in trees.listed
 
@@ -847,7 +860,10 @@ async def test_no_path_is_ever_looked_up_on_its_own(config, pool, rules) -> None
     await _routine_card(config, pool, trees=trees, rules=rules, name_status="M\0scripts/check.sh\0")
 
     # Only the declaration is read; every link decision comes from listings.
-    assert [path for _c, path, _m in trees.calls] == [".guardkit/config.yaml"]
+    # (The card's prototype line reads the settings at the build's start
+    # commit, 17 October 2026; that read is the card's, not the check's.)
+    assert {p for c, p, _m in trees.calls if c == START} <= {".guardkit/config.yaml"}
+    assert [path for c, path, _m in trees.calls if c != START] == [".guardkit/config.yaml"]
     assert sorted(set(trees.listed)) == sorted({TARGET, CANDIDATE_SHA})
 
 
@@ -992,6 +1008,11 @@ async def _real_card(
 
     _insert_build(pool)
     _record_start(pool)
+    # The build started from the real main commit, which the copy holds.
+    pool.connection.execute(
+        "UPDATE builds SET start_commit = ? WHERE build_id = ?", (project.main, BUILD_ID)
+    )
+    pool.connection.commit()
     recorder = _Recorder()
     reader = WorktreeGitRunner(target_repo_paths={REPO: str(project.root)})
     service = _service(

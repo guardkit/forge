@@ -65,6 +65,7 @@ __all__ = [
     "FETCH_ADDRESS_SETTING",
     "FETCH_COPIES_ENV",
     "FETCH_TRANSPORTS",
+    "GIT_DOOR_SETTING",
     "NETWORK_SETTINGS",
     "NetworkResult",
     "PROXY_NAMES",
@@ -76,6 +77,8 @@ __all__ = [
     "factory_copy_for",
     "fetch_all_branches",
     "fetch_start_point",
+    "git_door_address",
+    "git_door_problem",
     "https_address_problem",
     "isolated_environment",
     "no_fetch_address_sentence",
@@ -108,6 +111,14 @@ FETCH_TRANSPORTS: Tuple[str, ...] = ("https",)
 
 #: The coordinator setting that records each project's fetch address.
 FETCH_ADDRESS_SETTING: str = "planning.fetch_addresses"
+
+#: The coordinator setting naming the Git door (17 October 2026): the one
+#: ``http://<address>:<port>/`` base a private repository is read through.
+#: The door, on the factory's own machine, adds a read-only token and allows
+#: only git's two read requests, so the sandbox still holds no credential.
+#: An ``http`` fetch address is taken only when it is this base followed by
+#: ``<owner>/<name>.git``; with no door declared, only ``https`` is taken.
+GIT_DOOR_SETTING: str = "planning.git_door"
 
 #: Where the factory's own fetch copies live, when set. Otherwise a folder of
 #: this container's own temporary space (lost on restart; the first fetch
@@ -237,16 +248,123 @@ def https_address_problem(address: str) -> Optional[str]:
     return None
 
 
-def check_fetch_address(address: Optional[str]) -> Optional[str]:
+#: One part of a repository's ``owner/name``: a letter or digit first, so it
+#: is never ``.``, ``..`` or an option, then letters, digits, dot, underscore
+#: or hyphen.
+_A_REPO_PART = r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}"
+_DOOR_REPO = re.compile(rf"^({_A_REPO_PART})/({_A_REPO_PART})\.git$")
+_A_HOST_NAME = re.compile(
+    r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"
+    r"(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$"
+)
+
+
+def git_door_problem(door: Optional[str]) -> Optional[str]:
+    """Why ``door`` is not a Git door base address, else ``None``.
+
+    A Git door base is exactly ``http://<address>:<port>/`` (17 October
+    2026): ``http`` only, one specific address (an IPv4 address, an IPv6
+    address in brackets, or a host name; never an "every address" one), an
+    explicit port from 1 to 65535 written plainly, and the path exactly
+    ``/``. No user name, query or fragment. The answer never repeats the
+    value.
+    """
+    import ipaddress
+
+    text = str(door or "")
+    if not text.strip():
+        return "it is empty"
+    if text != text.strip() or any(ch.isspace() or ord(ch) < 32 for ch in text):
+        return "it contains a space or a control character"
+    for char, called in (("@", "an @ (a user name or token before the address)"),
+                         ("?", "a ? (a query)"), ("#", "a # (a fragment)")):
+        if char in text:
+            return f"it contains {called}"
+    if not text.startswith("http://"):
+        return "it does not begin with http://"
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except ValueError:
+        return "its address or port cannot be read"
+    host = parts.hostname or ""
+    if not host:
+        return "it names no address"
+    if port is None:
+        return "it names no port"
+    if parts.path != "/":
+        return "its path is not exactly /"
+    try:
+        found = ipaddress.ip_address(host)
+    except ValueError:
+        found = None
+    if found is not None:
+        if found.is_unspecified or str(found) == "255.255.255.255":
+            return "it names every address rather than one"
+        shown = f"[{host}]" if found.version == 6 else host
+        if found.version == 4 and host != str(found):
+            return "its address is not written plainly"
+    else:
+        if not _A_HOST_NAME.match(host) or host.replace(".", "").isdigit():
+            return "its address is not one address or host name"
+        shown = host
+    if not 1 <= port <= 65535 or parts.netloc.lower() != f"{shown}:{port}".lower():
+        return "its port is not written plainly as a number from 1 to 65535"
+    return None
+
+
+def git_door_address(door: str, repo: str) -> str:
+    """The fetch address of ``repo`` (``owner/name``) through ``door``.
+
+    Raises ``ValueError`` when the door or the name will not do.
+    """
+    problem = git_door_problem(door)
+    if problem:
+        raise ValueError(f"the Git door ({GIT_DOOR_SETTING}) will not do: {problem}")
+    address = f"{door}{str(repo or '').strip()}.git"
+    if not _DOOR_REPO.match(address[len(door):]):
+        raise ValueError(f"{repo!r} is not a repository name of the form owner/name")
+    return address
+
+
+def _door_address_problem(text: str, git_door: str) -> Optional[str]:
+    """Why the http address ``text`` is not ``git_door`` + ``owner/name.git``."""
+    problem = git_door_problem(git_door)
+    if problem:
+        return (
+            f"The declared Git door ({GIT_DOOR_SETTING}) is not an "
+            f"http://<address>:<port>/ address: {problem} (the value is not "
+            "repeated here)."
+        )
+    if not text.startswith(git_door) or not _DOOR_REPO.match(text[len(git_door):]):
+        return (
+            "The recorded fetch address is an http:// address, and the factory "
+            "takes one only when it is the declared Git door "
+            f"({GIT_DOOR_SETTING}) followed by <owner>/<name>.git; this one is "
+            "not (the value is not repeated here)."
+        )
+    return None
+
+
+def check_fetch_address(
+    address: Optional[str], *, git_door: Optional[str] = None
+) -> Optional[str]:
     """A plain sentence when ``address`` may not be fetched from, else ``None``.
 
     The address must use one of :data:`FETCH_TRANSPORTS`; for ``https`` it
     must be a plain address (no user name, query or fragment).
+
+    ``git_door`` (17 October 2026) is the declared Git door
+    (:data:`GIT_DOOR_SETTING`). With it, an ``http`` address is also taken,
+    but only when it begins with exactly that door and the rest is
+    ``<owner>/<name>.git``. Without it the rule is today's.
     """
     text = str(address or "").strip()
     if not text:
         return "No fetch address was given."
     transport = transport_of(text)
+    if transport == "http" and git_door is not None:
+        return _door_address_problem(text, git_door)
     if transport not in FETCH_TRANSPORTS:
         return (
             "The recorded fetch address is not one the factory fetches from: it "
@@ -679,6 +797,7 @@ def fetch_start_point(
     repo: Optional[str] = None,
     timeout: float = _DEFAULT_TIMEOUT_S,
     copies_root: Optional[Path] = None,
+    git_door: Optional[str] = None,
 ) -> StartPoint:
     """The remote's default branch (and ``branch``, when named) at ``address``,
     fetched in two steps and brought into ``clone``'s
@@ -688,10 +807,14 @@ def fetch_start_point(
        the isolated policy and the one transport.
     2. Into the clone, through :func:`bring_in_from_copy`;
        then the clone's ``refs/remotes/origin/<b>`` must equal the copy's.
+
+    ``git_door`` is the declared Git door, when there is one
+    (:func:`check_fetch_address`); a door address is fetched over ``http``
+    with no credential, as every fetch is.
     """
     if not str(address or "").strip():
         return StartPoint(refusal=no_fetch_address_sentence(repo))
-    problem = check_fetch_address(address)
+    problem = check_fetch_address(address, git_door=git_door)
     if problem:
         return StartPoint(refusal=problem)
     address = str(address).strip()
@@ -801,16 +924,18 @@ def fetch_all_branches(
     repo: Optional[str] = None,
     timeout: float = _DEFAULT_TIMEOUT_S,
     copies_root: Optional[Path] = None,
+    git_door: Optional[str] = None,
 ) -> StartPoint:
     """Every branch at ``address``, brought into ``clone``'s
     ``refs/remotes/origin/*`` in the same two steps. Never raises.
 
     What used to be ``git fetch origin`` when a commit was missing. Only
-    ``refusal`` and ``branches`` are filled in.
+    ``refusal`` and ``branches`` are filled in. ``git_door`` as for
+    :func:`fetch_start_point`.
     """
     if not str(address or "").strip():
         return StartPoint(refusal=no_fetch_address_sentence(repo))
-    problem = check_fetch_address(address)
+    problem = check_fetch_address(address, git_door=git_door)
     if problem:
         return StartPoint(refusal=problem)
     address = str(address).strip()

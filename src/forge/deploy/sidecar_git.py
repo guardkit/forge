@@ -107,14 +107,18 @@ class SidecarCandidateGit:
         read_timeout_s: float = _DEFAULT_READ_TIMEOUT_S,
         layout_timeout_s: float = _DEFAULT_LAYOUT_TIMEOUT_S,
         fetch_address: str | None = None,
+        git_door: str | None = None,
     ) -> None:
         if not repo or not str(repo).strip():
             raise ValueError("SidecarCandidateGit needs the repository's org/name key")
         self._base_url = str(base_url).rstrip("/")
         self._repo = str(repo)
         # The project's recorded fetch address (planning.fetch_addresses),
-        # sent with each starting-point request (14 October 2026).
+        # sent with each starting-point request (14 October 2026), and the
+        # declared Git door (planning.git_door, 17 October 2026) beside it,
+        # so the sandbox takes a door address.
         self._fetch_address = fetch_address
+        self._git_door = git_door
         self._post = post
         self._read_timeout_s = read_timeout_s
         self._layout_timeout_s = layout_timeout_s
@@ -243,6 +247,8 @@ class SidecarCandidateGit:
             body["branch"] = str(branch)
         if self._fetch_address:
             body["fetch_address"] = self._fetch_address
+            if self._git_door:
+                body["git_door"] = self._git_door
         decoded, why = await self._ok(
             "/git/remote-start-point",
             body,
