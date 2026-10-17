@@ -69,6 +69,7 @@ from forge.planning.work_queue_loop import (
     count_in_flight,
     paused_repositories,
     plain_duration,
+    queue_limit_warning,
     unanswered_merge_cards,
 )
 from forge.planning.work_queue_store import WorkQueueStore
@@ -1668,6 +1669,13 @@ async def compose_planning_consumer_and_dispatch(
                 "is off)"
             ),
         )
+        # A queue limit below the build limit leaves build places that can
+        # never be used, silently (16 October 2026). Say so; never refuse.
+        limit_warning = queue_limit_warning(
+            config.queue.max_in_flight, config.pipeline.max_concurrent_builds
+        )
+        if limit_warning is not None:
+            logger.warning("planning composition: %s", limit_warning)
 
         subscription = None
         consumer_task = None

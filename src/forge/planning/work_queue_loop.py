@@ -7,6 +7,8 @@ Public surface
   every ten seconds, a ``stale_tick`` once a week, and a ``run`` that drives
   both forever.
 - :func:`count_in_flight` — how much work the factory has running right now.
+- :func:`queue_limit_warning` — the start-up line when the queue limit leaves
+  build places that can never be used.
 - :func:`unanswered_merge_cards` — the merge cards that have been offered and
   not yet answered, one per build.
 - :func:`paused_repositories` — the repositories with a card waiting on Rich.
@@ -554,6 +556,21 @@ def count_in_flight(
     boot recovery, waiting to be re-carded) are not in flight: nothing is
     happening for them, and when boot recovery re-cards one it becomes PAUSED
     and counts from then on.
+
+    **A known gap: a finished build before its merge card exists.** A build
+    counts nowhere between being recorded COMPLETE and its merge offer row
+    being written — about a minute, longer when the project has a review
+    preview, because the preview is prepared before the card. In that gap the
+    queue can take one more sentence, so once the card appears the count
+    reads one over the limit until a card is answered. What that costs:
+    planning and building together never exceed the limit (the next build to
+    finish finds the count full, so the extra place does not compound); one
+    feature can start before the finished build's card is answered, and so is
+    planned against a main without that build; and the finished build's
+    preview may be prepared in the sandbox while the new feature plans. This
+    was accepted on 17 October 2026 rather than fixed: closing it needs a
+    durable record of a clean finish, a record of an offer not made, and a
+    boot step, all described in the factory's 17 October queue-limit design.
     """
     pieces = {
         correlation_id
@@ -575,6 +592,28 @@ def count_in_flight(
         # without one is still one piece of work, named by its build.
         pieces.add(card.correlation_id or f"build:{card.build_id}")
     return len(pieces)
+
+
+def queue_limit_warning(
+    max_in_flight: int, max_concurrent_builds: int
+) -> str | None:
+    """The start-up warning when the queue limit is below the build limit.
+
+    ``queue.max_in_flight`` caps how many features plan and build at once;
+    ``pipeline.max_concurrent_builds`` is how many build places there are.
+    With the first below the second the extra build places can never be
+    used, and nothing else says so (16 October 2026: the build limit was
+    raised to 6 and the queue held every run at 4). A warning only — the
+    coordinator still starts. ``None`` when the queue limit is not below.
+    """
+    if max_in_flight >= max_concurrent_builds:
+        return None
+    features = "feature" if max_in_flight == 1 else "features"
+    return (
+        f"the queue lets at most {max_in_flight} {features} run at once, so "
+        f"no more than {max_in_flight} of the {max_concurrent_builds} build "
+        "places can ever be used (raise queue.max_in_flight to use them)"
+    )
 
 
 def paused_repositories(connection: sqlite3.Connection) -> set[str]:
@@ -2069,6 +2108,7 @@ __all__ = [
     "open_merge_cards",
     "paused_repositories",
     "plain_duration",
+    "queue_limit_warning",
     "refusal_line",
     "shadow_line",
     "unanswered_merge_cards",

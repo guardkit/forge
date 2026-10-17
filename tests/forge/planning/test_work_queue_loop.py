@@ -52,6 +52,7 @@ from forge.planning.work_queue_loop import (
     first_sentence,
     paused_repositories,
     plain_duration,
+    queue_limit_warning,
     shadow_line,
     unanswered_merge_cards,
 )
@@ -321,6 +322,29 @@ class TestTheInFlightCount:
         assert paused_repositories(connection) == {"api_test"}
 
 
+class TestTheQueueLimitWarning:
+    """The start-up line when the queue limit leaves build places unused
+    (16 October 2026: build limit 6, queue limit 4, nothing said)."""
+
+    def test_a_queue_limit_below_the_build_limit_is_said_plainly(self) -> None:
+        assert queue_limit_warning(4, 6) == (
+            "the queue lets at most 4 features run at once, so no more than "
+            "4 of the 6 build places can ever be used (raise "
+            "queue.max_in_flight to use them)"
+        )
+
+    def test_one_feature_is_singular(self) -> None:
+        line = queue_limit_warning(1, 2)
+        assert line is not None
+        assert line.startswith("the queue lets at most 1 feature run at once")
+
+    def test_equal_limits_say_nothing(self) -> None:
+        assert queue_limit_warning(6, 6) is None
+
+    def test_a_higher_queue_limit_says_nothing(self) -> None:
+        assert queue_limit_warning(8, 6) is None
+
+
 # ---------------------------------------------------------------------------
 # The queue waits for the merge word (spec 2026-09-06)
 # ---------------------------------------------------------------------------
@@ -543,6 +567,31 @@ class TestAnOpenMergeCardIsWorkInFlight:
                 connection, merge_offer_hold_seconds=A_DAY, now=START
             )
             == 2
+        )
+
+    def test_a_finished_build_before_its_card_is_written_counts_nowhere(
+        self, connection: sqlite3.Connection
+    ) -> None:
+        """Pins the gap accepted on 17 October 2026 (see ``count_in_flight``):
+        a build recorded COMPLETE whose merge offer row does not exist yet is
+        not counted, even with the one-day hold on. If a later change starts
+        counting it, this goes red and the docstring must change with it."""
+        _insert_build(connection, "build-3ABD", "COMPLETE", feature_id="FEAT-3ABD")
+
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 0
+        )
+
+        # The moment its card is written it counts again.
+        _offer_merge_card(connection, "build-3ABD", offered_at=START)
+        assert (
+            count_in_flight(
+                connection, merge_offer_hold_seconds=A_DAY, now=START
+            )
+            == 1
         )
 
     def test_the_earliest_offer_is_when_the_card_started_waiting(

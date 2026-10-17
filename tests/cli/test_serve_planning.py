@@ -691,6 +691,74 @@ class TestDurableConsumerBind:
             )
 
 
+class TestQueueLimitWarningAtStart:
+    """A queue limit below the build limit is said once at start (16 October
+    2026: the build limit was 6, the queue held every run at 4, and nothing
+    said so). A warning only: composition still completes."""
+
+    @staticmethod
+    def _limit_lines(caplog: Any) -> list[logging.LogRecord]:
+        return [
+            rec
+            for rec in caplog.records
+            if "build places can ever be used" in rec.getMessage()
+        ]
+
+    async def _compose(self, tmp_db: Path, config: ForgeConfig) -> Any:
+        result = await compose_planning_consumer_and_dispatch(
+            db_path=tmp_db, nats_client=JetStreamNats(), config=config,
+            clock=FixedClock(),
+        )
+        for task in list(result.background_tasks or []):
+            task.cancel()
+        await asyncio.gather(
+            *(result.background_tasks or []), return_exceptions=True
+        )
+        return result
+
+    @pytest.mark.asyncio
+    async def test_four_against_six_logs_the_line_once(
+        self, tmp_db: Path, caplog: Any
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        config = _make_planning_config()
+        config.queue.max_in_flight = 4
+        config.pipeline.max_concurrent_builds = 6
+
+        result = await self._compose(tmp_db, config)
+
+        assert result is not None
+        assert result.audit_passed
+        lines = self._limit_lines(caplog)
+        assert len(lines) == 1
+        assert lines[0].levelno == logging.WARNING
+        assert lines[0].getMessage() == (
+            "planning composition: the queue lets at most 4 features run at "
+            "once, so no more than 4 of the 6 build places can ever be used "
+            "(raise queue.max_in_flight to use them)"
+        )
+
+    @pytest.mark.asyncio
+    async def test_six_against_six_says_nothing(
+        self, tmp_db: Path, caplog: Any
+    ) -> None:
+        caplog.set_level(logging.INFO)
+        config = _make_planning_config()
+        config.queue.max_in_flight = 6
+        config.pipeline.max_concurrent_builds = 6
+
+        result = await self._compose(tmp_db, config)
+
+        assert result is not None
+        assert self._limit_lines(caplog) == []
+        # The queue's own start line is still there, so the absence above is
+        # not just the queue never being composed.
+        assert any(
+            "the work queue is live" in rec.getMessage()
+            for rec in caplog.records
+        )
+
+
 # ---------------------------------------------------------------------------
 # TASK-MP-012 review fixes: non-destructive sweep + jarvis-conformant mirror
 # ---------------------------------------------------------------------------
