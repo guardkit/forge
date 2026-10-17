@@ -1186,6 +1186,31 @@ def bind_production_dispatch_chain(
                     "(merge_executor.enabled=true) — the merge word has a "
                     "listener"
                 )
+                # MISSIONS (17 October 2026, sections 6 and 7): a clean
+                # mission feature lands on its mission's branch through this
+                # press, with no card; and the work queue's tick finishes
+                # READY missions with one merge card each.
+                if merge_offer_service is not None:
+                    from forge.pipeline.mission_finish import (
+                        compose_mission_finisher,
+                        install_finisher,
+                    )
+
+                    merge_offer_service.set_mission_lander(
+                        _merge_consumer.land_mission_feature
+                    )
+                    install_finisher(
+                        compose_mission_finisher(
+                            forge_config=forge_config,
+                            pool=sqlite_pool,
+                            offer_service=merge_offer_service,
+                            nats_client=client,
+                            git_surface=compose_merge_git_surface(forge_config),
+                            tree_reader_for=compose_merge_check_reader(forge_config),
+                            feature_routing_gate=feature_routing_gate,
+                            feature_routing_required=feature_routing_required,
+                        )
+                    )
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
             logger.error(
                 "forge-serve: merge-executor composition FAILED (%s) — merge "

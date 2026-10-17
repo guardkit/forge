@@ -51,7 +51,7 @@ import logging
 import sqlite3
 from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable, Final, Iterator
 
@@ -289,6 +289,14 @@ class BuildRow(BaseModel):
     # runner builds exactly it. ``None`` for every other build, which launches
     # exactly as it always has.
     source_commit: str | None = None
+    # Which mission this build belongs to, and the part it plays in it
+    # (missions, 17 October 2026): ``'feature'`` for a feature built inside a
+    # mission, ``'mission-merge'`` for the mission's own merge into main.
+    # Columns outside the migration ladder, added only when missing
+    # (``forge.lifecycle.missions.ensure_tables``); ``None`` for every other
+    # build and every ledger without them.
+    mission_id: str | None = None
+    mission_role: str | None = None
 
 
 class BuildStartPoint(BaseModel):
@@ -341,6 +349,10 @@ class BuildStatusView(BaseModel):
     # is broken" without opening the failure pack. ``None`` renders as a dash:
     # not classified, which is what every ordinary FAILED build stays.
     terminal_class: str | None = None
+    # The mission whose merge into main this row is (missions, 17 October
+    # 2026): set only on a ``mission-merge`` row, so ``forge status`` shows it
+    # as the mission's merge rather than as a build of its last feature.
+    mission_merge_of: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -421,6 +433,11 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "memory_project",
             "launch_settings",
             "source_commit",
+            # NOT the two mission columns (17 October 2026): they are outside
+            # the migration ladder, added only when a probe finds them
+            # missing, so this tuple stays the ladder's columns and a plain
+            # tuple row reads them as not recorded. A ``sqlite3.Row`` (every
+            # production read) carries them by name.
         )
         data = dict(zip(keys, row, strict=False))
 
@@ -464,6 +481,8 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
         memory_project=data.get("memory_project"),
         launch_settings=data.get("launch_settings"),
         source_commit=data.get("source_commit"),
+        mission_id=data.get("mission_id"),
+        mission_role=data.get("mission_role"),
     )
 
 
@@ -1351,6 +1370,102 @@ class SqliteLifecyclePersistence:
         except sqlite3.OperationalError:
             return None
         return str(row[0]) if row is not None else None
+
+    def record_mission_merge_build(
+        self,
+        *,
+        mission_id: str,
+        correlation_id: str,
+        feature_id: str,
+        repo: str,
+        branch: str,
+        feature_yaml_path: str,
+        originating_user: str | None,
+        start_commit: str,
+        target_branch: str,
+        queued_at: datetime,
+    ) -> str:
+        """The mission's own merge build: one ``builds`` row, one transaction.
+
+        Missions design, section 7. The merge card and the press are keyed by
+        a build, so at READY the mission gets a row of its own, never the last
+        feature's:
+
+        * ``build_id = build-<last landed FEAT>-<timestamp>``, the usual shape;
+        * ``mission_role = 'mission-merge'`` and ``mission_id``;
+        * ``correlation_id`` is the mission's own (whose routing seed was
+          committed when its plan was approved);
+        * ``branch`` is the mission branch, and ``merge_branch`` is
+          ``forge/source/<build_id>``, the frozen local copy of the tip;
+        * ``feature_yaml_path`` is the last landed feature's file;
+        * ``COMPLETE``, ``triggered_by = 'forge-internal'``;
+        * the start point is main's tip now, on the remote's default branch.
+
+        Idempotent per mission: a second call returns the row already written
+        and writes nothing. Raises ``RuntimeError`` on a ledger without the
+        mission columns.
+        """
+        from forge.lifecycle.missions import MISSION_ROLE_MERGE, builds_record_missions
+
+        if not builds_record_missions(self._cx):
+            raise RuntimeError(
+                "this ledger has no builds.mission_id / builds.mission_role "
+                "columns, so a mission's merge build cannot be recorded"
+            )
+        moment = queued_at.astimezone(UTC) if queued_at.tzinfo else queued_at
+        self._cx.execute("BEGIN IMMEDIATE;")
+        try:
+            existing = self._cx.execute(
+                "SELECT build_id FROM builds WHERE mission_id = ? AND mission_role = ?",
+                (mission_id, MISSION_ROLE_MERGE),
+            ).fetchone()
+            if existing is not None:
+                self._cx.execute("COMMIT;")
+                return str(existing[0])
+            # The usual shape; a second that is already taken moves on one.
+            while True:
+                build_id = derive_build_id(feature_id, moment)
+                taken = self._cx.execute(
+                    "SELECT 1 FROM builds WHERE build_id = ?", (build_id,)
+                ).fetchone()
+                if taken is None:
+                    break
+                moment = moment + timedelta(seconds=1)
+            stamp = moment.isoformat()
+            self._cx.execute(
+                "INSERT INTO builds (build_id, feature_id, repo, branch, "
+                "feature_yaml_path, status, triggered_by, originating_user, "
+                "correlation_id, queued_at, started_at, completed_at, mode, "
+                "merge_branch, start_commit, target_branch, mission_id, "
+                "mission_role) VALUES (?, ?, ?, ?, ?, 'COMPLETE', "
+                "'forge-internal', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    build_id,
+                    feature_id,
+                    repo,
+                    branch,
+                    feature_yaml_path,
+                    originating_user,
+                    correlation_id,
+                    stamp,
+                    stamp,
+                    stamp,
+                    BuildMode.MODE_A.value,
+                    f"forge/source/{build_id}",
+                    start_commit,
+                    target_branch,
+                    mission_id,
+                    MISSION_ROLE_MERGE,
+                ),
+            )
+            self._cx.execute("COMMIT;")
+        except BaseException:
+            try:
+                self._cx.execute("ROLLBACK;")
+            except sqlite3.Error:  # pragma: no cover
+                pass
+            raise
+        return build_id
 
     def _builds_record_the_source_commit(self) -> bool:
         """Does this ledger have ``builds.source_commit`` (``schema_v17``)?

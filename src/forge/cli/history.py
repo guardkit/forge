@@ -222,8 +222,22 @@ def render_table(pairs: list[tuple[BuildRow, list[StageLogEntry]]]) -> str:
         lines.append(
             f"{row.build_id:<48} {row.feature_id:<14} "
             f"{row.status.value:<11} {_format_dt(row.queued_at):<22}"
+            + _the_missions_merge(row, prefix="  ")
         )
     return "\n".join(lines) + "\n"
+
+
+def _the_missions_merge(row: BuildRow, *, prefix: str = "") -> str:
+    """``mission <id>'s merge into main`` for a mission's own merge row.
+
+    Missions (17 October 2026): that row carries the last landed feature's id
+    only as the build system's argument, so it is said to be the mission's
+    merge rather than read as a build of that feature. Empty for every other
+    row, so they print exactly as before.
+    """
+    if row.mission_role == "mission-merge" and row.mission_id:
+        return f"{prefix}(mission {row.mission_id}'s merge into main)"
+    return ""
 
 
 def render_json(pairs: list[tuple[BuildRow, list[StageLogEntry]]]) -> str:
@@ -265,6 +279,8 @@ def render_markdown(
         duration = _duration(row.started_at, row.completed_at)
         heading = f"## {row.build_id} — {row.status.value} ({duration})"
         sections.append(heading)
+        if _the_missions_merge(row):
+            sections.append(_the_missions_merge(row).strip("()").capitalize() + ".")
         sections.append(f"Started: {_format_dt(row.started_at)}")
         sections.append(f"Finished: {_format_dt(row.completed_at)}")
         if row.pr_url:

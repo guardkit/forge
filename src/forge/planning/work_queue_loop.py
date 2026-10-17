@@ -995,6 +995,13 @@ class WorkQueueLoop:
         """Pick up what was dropped, close what finished, take the next one."""
         self.recover_admitted()
         self.close_finished()
+        # MISSIONS, FINISHING (design 17 October 2026, section 7): every
+        # READY mission's merge card, and its answer. It goes straight after
+        # the mission step that makes a mission READY. Nothing runs until
+        # boot installs a finisher; it never raises.
+        from forge.pipeline.mission_finish import run_finishing_step
+
+        await run_finishing_step()
         await self.ask_hold_or_go()
         await self.take_next()
 

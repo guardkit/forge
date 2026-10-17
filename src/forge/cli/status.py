@@ -175,6 +175,17 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
         raw_terminal_class = row["terminal_class"]
     except (IndexError, KeyError):
         raw_terminal_class = None
+    # A mission's own merge into main (missions, 17 October 2026) is shown as
+    # the mission's merge, not as a build of its last feature. A ledger
+    # without the two mission columns has no such key.
+    try:
+        mission_merge_of = (
+            str(row["mission_id"])
+            if row["mission_role"] == "mission-merge" and row["mission_id"]
+            else None
+        )
+    except (IndexError, KeyError):
+        mission_merge_of = None
     return BuildStatusView(
         build_id=row["build_id"],
         feature_id=row["feature_id"],
@@ -190,6 +201,7 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
         error=row["error"],
         mode=BuildMode(raw_mode) if raw_mode else BuildMode.MODE_A,
         terminal_class=str(raw_terminal_class) if raw_terminal_class else None,
+        mission_merge_of=mission_merge_of,
     )
 
 
@@ -220,9 +232,12 @@ def _status_projection(cx: sqlite3.Connection) -> str:
         # whole read is about to fail anyway; degrade rather than add a
         # second, more confusing error on the way there.
         return _BASE_PROJECTION
+    projection = _BASE_PROJECTION
     if "terminal_class" in columns:
-        return f"{_BASE_PROJECTION}, terminal_class"
-    return _BASE_PROJECTION
+        projection = f"{projection}, terminal_class"
+    if {"mission_id", "mission_role"} <= columns:
+        projection = f"{projection}, mission_id, mission_role"
+    return projection
 
 
 def _query_status_views(
@@ -595,7 +610,11 @@ def _build_table(
                 stage_cell = _in_flight_stage_cell(in_flight)
         table.add_row(
             view.build_id,
-            view.feature_id,
+            (
+                f"mission {view.mission_merge_of}'s merge (last: {view.feature_id})"
+                if view.mission_merge_of
+                else view.feature_id
+            ),
             view.mode.value,
             view.status.value,
             view.terminal_class or "—",

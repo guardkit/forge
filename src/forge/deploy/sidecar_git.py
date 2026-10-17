@@ -24,6 +24,7 @@ operation                        route
 ``add_working_folder``           ``POST /git/worktree-add``
 ``remove_working_folder``        ``POST /git/worktree-remove``
 ``read_file_at_commit``          ``POST /git/read-file-at-commit``
+``make_source_branch``           ``POST /git/source-branch``
 ===============================  =========================================
 
 THE PROJECT'S OWN DEPLOY PROFILE IS READ IN THERE TOO (3 October 2026). The
@@ -71,6 +72,7 @@ from forge.deploy.candidate_tree import (
     CandidateTreeLayout,
     FileAtCommit,
     RemoteStartPoint,
+    SourceBranch,
     WorkingFolder,
     answered_for_branch,
 )
@@ -418,6 +420,22 @@ class SidecarCandidateGit:
                 None if ok else str(decoded.get("detail") or "the folder was not made")
             ),
         )
+
+    async def make_source_branch(self, build_id: str, commit: str) -> SourceBranch:
+        """``forge/source/<build_id>`` at ``commit`` in the sandbox's own clone.
+
+        Missions, 17 October 2026: the frozen local copy of a mission's tip,
+        made by the prepared route's rule (local commits only, forced) and
+        answered with what the branch resolves to afterwards. Never raises.
+        """
+        decoded, why = await self._ok(
+            "/git/source-branch",
+            {"repo": self._repo, "build_id": str(build_id), "commit": str(commit)},
+            timeout=self._read_timeout_s,
+        )
+        if decoded is None:
+            return SourceBranch(refusal=str(why))
+        return SourceBranch.from_wire(decoded)
 
     async def remove_working_folder(self, path: str) -> bool | None:
         """Remove the join's working folder in the sandbox. Never raises.
