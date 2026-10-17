@@ -1149,6 +1149,29 @@ def test_the_presss_own_failed_report_fails_the_attempt(cx, tmp_path) -> None:
     assert [a.attempt for a in missions.attempts(attempt.mission_id) if a.key == "A"] == [1]
 
 
+def test_a_landing_the_merge_side_gave_up_on_fails_with_its_sentence(cx, tmp_path) -> None:
+    missions = _running_mission(cx)
+    run = _Run(cx, tmp_path)
+    cid = _admitted_with_run(missions, run)
+    build_id = run.build(cid, "FEAT-AAA1", "COMPLETE")
+    now = datetime.now(UTC).isoformat()
+    details = {
+        "status": "FAILED",
+        "result": "mission-landing-failed",
+        "detail": "the factory could not tell whether every task passed. More.",
+    }
+    cx.execute(
+        "INSERT INTO stage_log (build_id, stage_label, target_kind, target_identifier, "
+        "status, started_at, completed_at, duration_secs, details_json) "
+        "VALUES (?, 'merge', 'local_tool', 'merge_deploy_executor', 'FAILED', ?, ?, 0, ?)",
+        (build_id, now, now, json.dumps(details)),
+    )
+    _step(missions, run).close(missions.get_by_correlation_id(CID))
+    attempt = missions.attempt_by_correlation_id(cid)
+    assert attempt.status == "FAILED"
+    assert attempt.reason == "the factory could not tell whether every task passed"
+
+
 def test_a_mission_merge_card_is_named_by_the_mission(cx, tmp_path) -> None:
     from forge.planning.work_queue_loop import merge_hold_line, unanswered_merge_cards
 

@@ -32,6 +32,7 @@ reports what did not land instead.
 from __future__ import annotations
 
 import logging
+import json
 import sqlite3
 from collections.abc import Awaitable, Callable, Mapping
 from datetime import datetime
@@ -106,6 +107,23 @@ def mission_landing(
             if line.kind == LINE_DONE and said:
                 reason = str(said)
                 break
+    if reason is None and answer == wq.DID_NOT_LAND:
+        # A landing the merge side gave up on (``mission-landing-failed``)
+        # carries its sentence on the merge report, not on the build or the
+        # publication record.
+        report = connection.execute(
+            "SELECT details_json FROM stage_log WHERE build_id = ? "
+            "AND target_identifier = 'merge_deploy_executor' AND status = 'FAILED' "
+            "ORDER BY rowid DESC LIMIT 1",
+            (build_id,),
+        ).fetchone()
+        if report is not None and report[0]:
+            try:
+                said = json.loads(report[0]).get("detail")
+            except (ValueError, AttributeError):
+                said = None
+            if said:
+                reason = str(said)
     return answer, reason
 
 
