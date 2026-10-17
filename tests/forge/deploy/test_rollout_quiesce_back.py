@@ -1317,3 +1317,42 @@ def test_resume_children_keep_every_other_env_file_value(estate,monkeypatch):
     expected={k:v for k,v in before.items() if k not in TEMP_NAMES}
     given=[env for _,env in children if env is not None]
     assert len(given)>=5 and all(env==expected for env in given)
+
+
+def _mission_ledger(tmp_path, status):
+    """A ledger with one mission in ``status`` and its landed feature's
+    publication record, which keeps its mission-branch result for ever."""
+    from forge.lifecycle import missions
+    from forge.pipeline.publication_record import RESULT_PUBLISHED_TO_MISSION_BRANCH
+    db=tmp_path/(status.lower()+'-mission.db');connection=connect_writer(db);apply_at_boot(connection)
+    missions.ensure_tables(connection)
+    connection.execute("INSERT INTO missions (id,title,target_repo,branch,status,correlation_id,originating_user,created_at) "
+                       "VALUES ('m-0000aa','Tags','guardkit/fixture','mission/m-0000aa',?,'thread-1','U1','2026-10-17T10:00:00+00:00')",(status,))
+    connection.execute("INSERT INTO publication_records (build_id,result) VALUES ('build-FEAT-A-1',?)",(RESULT_PUBLISHED_TO_MISSION_BRANCH,))
+    connection.commit();connection.close()
+    return db
+
+
+def test_a_finished_missions_feature_records_are_not_active_work(tmp_path):
+    from forge.pipeline.publication_record import RESULT_PUBLISHED_TO_MISSION_BRANCH
+    assert RESULT_PUBLISHED_TO_MISSION_BRANCH=='published to the mission branch'  # the literal the script reads
+    state=r.ledger_state(_mission_ledger(tmp_path,'NOT_MERGED'))
+    assert state['work_state']['missions']['rows']==[]
+    assert q.work_problems(state)==[]
+
+
+@pytest.mark.parametrize('status',['STARTING','RUNNING','READY','MERGING'])
+def test_a_mission_still_under_way_blocks_a_rollout(tmp_path,status):
+    state=r.ledger_state(_mission_ledger(tmp_path,status))
+    assert q.work_problems(state)==[{'table':'missions','row':{'id':'m-0000aa','status':status}}]
+
+
+def test_a_mission_branch_record_a_press_still_holds_is_active(tmp_path):
+    db=_mission_ledger(tmp_path,'NOT_MERGED')
+    connection=sqlite3.connect(db);connection.execute("UPDATE publication_records SET lease_holder='press-1'");connection.commit();connection.close()
+    assert [x['table'] for x in q.work_problems(r.ledger_state(db))]==['publication_records']
+
+
+def test_a_ledger_without_mission_tables_reads_as_before(tmp_path):
+    db=tmp_path/'plain.db';connection=connect_writer(db);apply_at_boot(connection);connection.close()
+    assert 'missions' not in r.ledger_state(db)['work_state']

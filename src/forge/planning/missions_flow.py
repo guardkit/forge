@@ -270,10 +270,12 @@ class MissionFlow:
         spawn: Callable[[Awaitable[None]], Any] | None = None,
         merge_executor_enabled: bool = True,
         publication_enabled: bool = True,
+        target_terminal_enabled: bool = True,
     ) -> None:
         self._missions = missions
         self._merge_executor_enabled = bool(merge_executor_enabled)
         self._publication_enabled = bool(publication_enabled)
+        self._target_terminal_enabled = bool(target_terminal_enabled)
         self._publish_card = publish_card
         self._subscriber_factory = subscriber_factory
         self._notify = notify
@@ -310,11 +312,18 @@ class MissionFlow:
         approved. A mission needs a way to create its branch, the merge
         executor to merge each finished feature into that branch (without it
         nothing lands, and every admitted feature would keep its place for
-        ever), and publication to send each merge to the remote (without it
-        every feature would stop at "publication pending").
+        ever), publication to send each merge to the remote (without it every
+        feature would stop at "publication pending"), and the planning chain
+        that writes the spec and plan into the project, which is the only
+        path that reads the mission branch as its start.
         """
         if self._create_branch is None:
             return "this factory cannot create a mission branch yet"
+        if not self._target_terminal_enabled:
+            return (
+                "missions need the planning chain that writes the spec and plan "
+                "into the project, and it is switched off here"
+            )
         if not self._merge_executor_enabled:
             return (
                 "missions need the merge step to merge each finished feature "

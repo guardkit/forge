@@ -135,6 +135,15 @@ def ledger_state(p, *, consolidated=False):
                 rows = [dict(r) for r in db.execute(f'SELECT {selection} FROM "{table}"{predicate}')]
                 rows.sort(key=lambda r: json.dumps(r, sort_keys=True))
                 work[table] = {'status': 'observed', 'rows': rows, 'count': len(rows)}
+        # Missions (17 October 2026) live outside the migration ladder, so they
+        # are read only when the table exists: a ledger without them reads
+        # exactly as before. Only missions still under way are work.
+        if 'missions' in tables:
+            rows = [dict(r) for r in db.execute(
+                "SELECT id, status FROM missions "
+                "WHERE status IN ('STARTING','RUNNING','READY','MERGING')")]
+            rows.sort(key=lambda r: json.dumps(r, sort_keys=True))
+            work['missions'] = {'status': 'observed', 'rows': rows, 'count': len(rows)}
         return {'schema_version': version, 'tables': counts, 'work_state': work}
 
 def logical_digest(db):

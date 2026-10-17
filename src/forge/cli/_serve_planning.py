@@ -612,6 +612,69 @@ class _PlanningStageLogWriter:
         )
 
 
+def compose_mission_flow(
+    config: Any,
+    *,
+    pool: Any,
+    publish_card: Callable[[Any], Awaitable[None]],
+    subscriber_factory: Callable[..., Any],
+    notify: Callable[..., Awaitable[None]],
+    git_runner: Any,
+    routing_gate: Any | None,
+    clock: Callable[[], datetime],
+) -> tuple[Any, Any]:
+    """The mission store and flow, wired from the forge's settings (17 October 2026).
+
+    Everything a mission cannot run without is read here and handed to the
+    flow, which refuses a mission message — and checks again at approval —
+    when one is missing: a publisher address to create the branch with
+    (``publication.publisher_url``; without one the branch request could
+    never be answered and the mission would wait in STARTING for ever), the
+    merge step, publication, and the planning chain that reads the mission
+    branch (``planning.target_terminal``).
+    """
+    from forge.lifecycle.missions import MissionStore
+    from forge.pipeline.publisher_client import (
+        ask_the_publisher_to_create_mission_branch,
+        the_publishers_address,
+    )
+    from forge.planning.missions_flow import MissionFlow
+
+    mission_store = MissionStore(pool, clock=clock)
+
+    async def _read_mission_main_tip(target_repo: str) -> Any:
+        repo_path = dict(config.planning.target_repo_paths or {}).get(target_repo)
+        if not repo_path:
+            return None
+        return await git_runner.fetch_remote_start_point(repo_path)
+
+    async def _create_mission_branch(**request: Any) -> Any:
+        return await ask_the_publisher_to_create_mission_branch(config, **request)
+
+    def _enabled(section: str) -> bool:
+        return bool(getattr(getattr(config, section, None), "enabled", False))
+
+    flow = MissionFlow(
+        mission_store,
+        publish_card=publish_card,
+        subscriber_factory=subscriber_factory,
+        notify=notify,
+        read_remote_tip=_read_mission_main_tip,
+        create_branch=(
+            _create_mission_branch if the_publishers_address(config) else None
+        ),
+        approval_wait_seconds=config.approval.max_wait_seconds,
+        routing_gate=routing_gate,
+        clock=clock,
+        merge_executor_enabled=_enabled("merge_executor"),
+        publication_enabled=_enabled("publication"),
+        target_terminal_enabled=bool(
+            getattr(getattr(config.planning, "target_terminal", None), "enabled", False)
+        ),
+    )
+    return mission_store, flow
+
+
 class _PlanningPausePublisher:
     """AGENTS approval request FIRST, PIPELINE build-paused SECOND.
 
@@ -1533,40 +1596,15 @@ async def compose_planning_consumer_and_dispatch(
         # A ``mission:`` message is filed in the mission tables (never in the
         # work queue), shown on one plan card, and, once approved and its
         # branch is confirmed, run by the mission step in the queue's tick.
-        from forge.lifecycle.missions import MissionStore
-        from forge.planning.missions_flow import MissionFlow
-
-        mission_store = MissionStore(pool, clock=clock_fn)
-
-        async def _read_mission_main_tip(target_repo: str) -> Any:
-            repo_path = dict(config.planning.target_repo_paths or {}).get(target_repo)
-            if not repo_path:
-                return None
-            return await planning_git_runner.fetch_remote_start_point(repo_path)
-
-        from forge.pipeline.publisher_client import (
-            ask_the_publisher_to_create_mission_branch,
-        )
-
-        async def _create_mission_branch(**request: Any) -> Any:
-            return await ask_the_publisher_to_create_mission_branch(config, **request)
-
-        mission_flow = MissionFlow(
-            mission_store,
+        mission_store, mission_flow = compose_mission_flow(
+            config,
+            pool=pool,
             publish_card=pause_publisher.publish_request,
             subscriber_factory=subscriber_factory,
             notify=_notify_in_thread,
-            read_remote_tip=_read_mission_main_tip,
-            create_branch=_create_mission_branch,
-            approval_wait_seconds=config.approval.max_wait_seconds,
+            git_runner=planning_git_runner,
             routing_gate=feature_routing_gate,
             clock=clock_fn,
-            merge_executor_enabled=bool(
-                getattr(getattr(config, "merge_executor", None), "enabled", False)
-            ),
-            publication_enabled=bool(
-                getattr(getattr(config, "publication", None), "enabled", False)
-            ),
         )
 
         consumer_deps = PlanningConsumerDeps(

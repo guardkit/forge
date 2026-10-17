@@ -499,6 +499,7 @@ def _flow(
     clock: Any = None,
     merge_executor_enabled: bool = True,
     publication_enabled: bool = True,
+    target_terminal_enabled: bool = True,
 ) -> MissionFlow:
     async def publish_card(envelope: Any) -> None:
         cards.append(envelope)
@@ -522,6 +523,7 @@ def _flow(
         spawn=asyncio.ensure_future,
         merge_executor_enabled=merge_executor_enabled,
         publication_enabled=publication_enabled,
+        target_terminal_enabled=target_terminal_enabled,
     )
 
 
@@ -743,6 +745,96 @@ async def test_settings_changed_between_card_and_approval_are_checked_again(cx) 
     assert got.status == "NOT_STARTED" and "merge step" in got.closed_reason
     assert gate.calls == [] and publisher.requests == []
     assert missions.attempts(mission.id) == []
+
+
+@pytest.mark.asyncio
+async def test_approval_after_a_restart_with_the_planning_chain_off_is_not_started(cx) -> None:
+    missions = MissionStore(cx)
+    gate, cards, said = _Gate(), [], []
+    publisher = _Publisher(missions, ["created"])
+    first = _flow(missions, answers=[], gate=gate, publisher=publisher, cards=cards, said=said)
+    mission = _propose(first)
+    await _settle()
+    run = _Run(cx)
+    restarted = _flow(
+        missions,
+        answers=[_answer("approve", _request_id(mission.id))],
+        gate=gate,
+        publisher=publisher,
+        cards=cards,
+        said=said,
+        target_terminal_enabled=False,
+    )
+    await restarted.tend()
+    await _settle()
+    await _step(missions, run).run_once()
+    got = missions.get(mission.id)
+    assert got.status == "NOT_STARTED" and "planning chain" in got.closed_reason
+    assert gate.calls == [] and publisher.requests == []
+    assert missions.attempts(mission.id) == [] and run.started == []
+
+
+def _composed(cx, *, publisher_url: str | None, answers: list[Any], cards: list[Any]) -> Any:
+    from forge.cli._serve_planning import compose_mission_flow
+
+    config = SimpleNamespace(
+        planning=SimpleNamespace(
+            target_repo_paths={REPO: "/nonexistent/react-go-notes-fixture"},
+            target_terminal=SimpleNamespace(enabled=True),
+        ),
+        approval=SimpleNamespace(max_wait_seconds=3600),
+        merge_executor=SimpleNamespace(enabled=True),
+        publication=SimpleNamespace(enabled=True, publisher_url=publisher_url),
+    )
+
+    async def publish_card(envelope: Any) -> None:
+        cards.append(envelope)
+
+    async def notify(cid: str, message: str, *, parent_request_id: str | None = None) -> None:
+        return None
+
+    _store, flow = compose_mission_flow(
+        config,
+        pool=cx,
+        publish_card=publish_card,
+        subscriber_factory=lambda approver, armed: _Subscriber(answers, armed),
+        notify=notify,
+        git_runner=object(),
+        routing_gate=None,
+        clock=lambda: datetime.now(UTC),
+    )
+    return flow
+
+
+@pytest.mark.asyncio
+async def test_with_no_publisher_address_the_composed_flow_refuses_at_intake_and_approval(
+    cx,
+) -> None:
+    """``publication.publisher_url`` unset: the branch request could never be
+    answered, so no mission may wait in STARTING for it."""
+    answers: list[Any] = []
+    cards: list[Any] = []
+    flow = _composed(cx, publisher_url=None, answers=answers, cards=cards)
+    assert flow.cannot_start_reason() == "this factory cannot create a mission branch yet"
+    said: list[str] = []
+    msg = _message(_command())
+    await handle_planning_message(msg, _intake_deps(cx, flow, enabled=True, said=said))
+    assert msg.acked and said == [
+        "That mission was not started: this factory cannot create a mission branch yet."
+    ]
+    assert cx.execute("SELECT COUNT(*) FROM missions").fetchone()[0] == 0
+    # A card posted before the address was taken away: approval refuses too.
+    mission = _propose(flow)
+    answers.append(_answer("approve", _request_id(mission.id)))
+    await _settle()
+    got = MissionStore(cx).get(mission.id)
+    assert got.status == "NOT_STARTED" and "cannot create a mission branch" in got.closed_reason
+    # With an address the composed flow has nothing to refuse.
+    assert (
+        _composed(cx, publisher_url="http://publisher:8080", answers=[], cards=[])
+        .cannot_start_reason()
+        is None
+    )
 
 
 @pytest.mark.asyncio
