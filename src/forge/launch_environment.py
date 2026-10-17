@@ -340,7 +340,7 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "several builds together do not crowd the one model seat",
     ),
     # --- the switches the owner turned on ----------------------------------
-    # These three are a class of their own, and the reason they are named here
+    # These four are a class of their own, and the reason they are named here
     # is a fault this list caused on the day it was written. Each one is a
     # check the build system ships with turned OFF; an operator turns it on by
     # dropping a file beside the runner's unit that sets it, and that file is
@@ -357,6 +357,15 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "declares, broken by freshly written code, is sent back to whatever "
         "wrote it as a fix-this on its next turn instead of being filed as a "
         "note. Unset, the build system adds no such rule at all",
+    ),
+    (
+        "GUARDKIT_SECURITY_CHECK_BLOCKING",
+        "the security check on each change (17 October 2026), the same shape "
+        "of switch: on, a secret or a newly vulnerable, malicious or brand-new "
+        "dependency in a task's own changes is sent back to the coder to fix. "
+        "OFF today by the owner's decision (Rich, 17 October 2026: not until "
+        "the problems already in the projects are fixed), and named here so "
+        "that turning it on is one setting and not a hunt through this list",
     ),
     (
         "GUARDKIT_ZERO_TEST_BLOCKING",
