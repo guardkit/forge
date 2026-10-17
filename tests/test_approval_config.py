@@ -375,6 +375,15 @@ class TestApprovalYamlRoundTrip:
                 "public_host": None,
                 "max_app_ttl_minutes": None,
             },
+            # The nightly security check (17 October 2026), off by default.
+            "security_sweep": {
+                "enabled": False,
+                "at": "02:30",
+                "until": "06:00",
+                "serious_score": 7.0,
+                "draft_repairs": True,
+                "weekly_all_clear": "monday",
+            },
             "missions": {"enabled": False},
             "permissions": {
                 "filesystem": {

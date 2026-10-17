@@ -136,6 +136,13 @@ merge_card_keeper: Any | None = None
 #: How often the serve loop sweeps previews whose time is up, in seconds.
 REVIEW_PREVIEW_SWEEP_SECONDS: int = 300
 
+# The nightly security sweep (security check design, 17 October 2026, piece
+# 3): the coordinator's settings when ``security_sweep.enabled`` is true, set
+# by ``serve_cmd``. The serve loop then runs the sweep's schedule beside the
+# daemon. ``None`` (the default, and every test that does not set it) leaves
+# the sweep out entirely.
+security_sweep_config: Any | None = None
+
 # stdlib ``logging`` format chosen for daemon-grep readability across
 # replicas: ISO-8601 timestamp, level, logger name, message. If the
 # project ever moves to structlog/JSON, ``_configure_logging`` is the
@@ -3142,6 +3149,35 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
                 )
             )
 
+        # Step 5.7 — the nightly security sweep, beside the daemon and
+        # cancelled with it. Only when switched on. Its schedule never
+        # returns, so it cannot end the serve loop; a composition fault is
+        # logged and leaves the sweep out, never stops the daemon.
+        if security_sweep_config is not None:
+            try:
+                from forge.security_sweep.schedule import compose_nightly_schedule
+
+                schedule = compose_nightly_schedule(
+                    security_sweep_config, db_path=config.db_path, nats_client=client
+                )
+                tasks.add(
+                    asyncio.create_task(
+                        schedule.run_forever(), name="forge-serve-security-sweep"
+                    )
+                )
+                logger.info(
+                    "forge-serve: the nightly security sweep is on (from %s UTC, "
+                    "latest start %s)",
+                    schedule.at,
+                    schedule.until,
+                )
+            except Exception as exc:  # noqa: BLE001 — never blocks boot
+                logger.error(
+                    "forge-serve: the nightly security sweep could not be "
+                    "composed (%s); it is off until the next start",
+                    type(exc).__name__,
+                )
+
         done, pending = await asyncio.wait(
             tasks,
             return_when=asyncio.FIRST_COMPLETED,
@@ -3248,6 +3284,11 @@ def serve_cmd(ctx: click.Context) -> None:
     _configure_logging(config.log_level)
     forge_config = _resolve_forge_config_for_serve(ctx)
     _apply_build_limit(config, forge_config)
+    global security_sweep_config
+    sweep_settings = getattr(forge_config, "security_sweep", None)
+    security_sweep_config = (
+        forge_config if sweep_settings is not None and sweep_settings.enabled else None
+    )
     # Bind the production dispatch-chain composer (TASK-FIX-F010)
     # before ``_run_serve`` enters its boot order. The wrapper opens
     # the SQLite writer connection, builds the middleware, and rebinds

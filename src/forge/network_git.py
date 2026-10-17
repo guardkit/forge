@@ -76,6 +76,7 @@ __all__ = [
     "check_fetch_address",
     "factory_copy_for",
     "fetch_all_branches",
+    "fetch_default_branch_copy",
     "fetch_start_point",
     "git_door_address",
     "git_door_problem",
@@ -789,6 +790,94 @@ def _proxy_refusal(transport: str) -> Optional[str]:
     return None
 
 
+def _default_and_listed(ls_remote: str) -> Tuple[Optional[str], Dict[str, str]]:
+    """``(default branch, {ref: commit})`` read from ``ls-remote --symref``."""
+    default: Optional[str] = None
+    listed: Dict[str, str] = {}
+    for line in ls_remote.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("ref:") and default is None:
+            rest = stripped[len("ref:"):].strip().split()
+            ref = rest[0] if rest else ""
+            if ref.startswith("refs/heads/"):
+                default = ref[len("refs/heads/"):]
+            continue
+        sha, _, ref = stripped.partition("\t")
+        if sha and ref:
+            listed[ref] = sha
+    return default, listed
+
+
+def fetch_default_branch_copy(
+    address: Optional[str],
+    *,
+    copies_root: Path,
+    timeout: float = _DEFAULT_TIMEOUT_S,
+    git_door: Optional[str] = None,
+) -> StartPoint:
+    """The remote's default branch at ``address``, with its whole history,
+    fetched into the factory's own bare copy under ``copies_root``. Never
+    raises.
+
+    The nightly security sweep's fetch (security check design, 17 October
+    2026, piece 3). It is the network half of :func:`fetch_start_point` and
+    nothing more: the same address check, isolated environment and one
+    transport, into a copy only the sweep owns
+    (:func:`factory_copy_for` under ``copies_root``), and nothing is brought
+    into any project's clone. The sweep reads the copy itself: its committed
+    files for the tree scans and its history for the secret count.
+
+    ``branch`` and ``commit`` name what was fetched; otherwise ``refusal``
+    is one plain sentence (git's own words are never kept).
+
+    ``git_door`` is the declared Git door, when there is one, exactly as for
+    :func:`fetch_start_point`: a door address is fetched over ``http`` with
+    no credential, and only an address of exactly that door is taken.
+    """
+    if not str(address or "").strip():
+        return StartPoint(refusal=no_fetch_address_sentence(None))
+    problem = check_fetch_address(address, git_door=git_door)
+    if problem:
+        return StartPoint(refusal=problem)
+    address = str(address).strip()
+    transport = transport_of(address) or "none"
+    refused = _proxy_refusal(transport)
+    if refused:
+        return StartPoint(refusal=refused)
+    copy = factory_copy_for(address, copies_root)
+    with _held(copy):
+        made = _ready(copy, timeout)
+        if not made.ok:
+            return StartPoint(refusal=f"The factory's own copy could not be made: {made.said}")
+        asked = run_network_git(
+            ["ls-remote", "--symref", "--", address, "HEAD"],
+            transport=transport, git_dir=copy, timeout=timeout,
+        )
+        if not asked.ok:
+            return StartPoint(
+                refusal=f"The project's recorded fetch address could not be reached: {asked.said}"
+            )
+        default, _listed = _default_and_listed(asked.stdout)
+        if not default or not _BRANCH.match(default):
+            return StartPoint(
+                refusal="The project's remote does not say which branch is its default."
+            )
+        fetched = run_network_git(
+            ["fetch", "--no-tags", "--no-recurse-submodules", "--", address,
+             f"+refs/heads/{default}:refs/heads/{default}"],
+            transport=transport, git_dir=copy, timeout=timeout,
+        )
+        if not fetched.ok:
+            return StartPoint(
+                refusal=f"The branch '{default}' could not be fetched: {fetched.said}"
+            )
+        held = _copy_refs(copy, "refs/heads/", timeout)
+        commit = (held or {}).get(f"refs/heads/{default}")
+        if not commit:
+            return StartPoint(refusal="The factory's own copy could not say which commit it holds.")
+    return StartPoint(branch=default, commit=commit)
+
+
 def fetch_start_point(
     clone: Path,
     address: Optional[str],
@@ -846,19 +935,7 @@ def fetch_start_point(
                     f"the work cannot be started from it: {asked.said}"
                 )
             )
-        default: Optional[str] = None
-        listed: Dict[str, str] = {}
-        for line in asked.stdout.splitlines():
-            stripped = line.strip()
-            if stripped.startswith("ref:") and default is None:
-                rest = stripped[len("ref:"):].strip().split()
-                ref = rest[0] if rest else ""
-                if ref.startswith("refs/heads/"):
-                    default = ref[len("refs/heads/"):]
-                continue
-            sha, _, ref = stripped.partition("\t")
-            if sha and ref:
-                listed[ref] = sha
+        default, listed = _default_and_listed(asked.stdout)
         if not default or not _BRANCH.match(default):
             return StartPoint(
                 refusal=(
