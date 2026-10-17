@@ -220,6 +220,13 @@ MISSION_BRANCH_CREATED: str = "created"
 MISSION_BRANCH_REFUSED: str = "refused"
 MISSION_BRANCH_UNREACHABLE: str = "unreachable"
 
+#: The publisher's refusals that say the outcome is not known (it stopped
+#: part way, or pushed and could not read the remote back). The client reads
+#: them as "unreachable": asking again is safe and is how recovery happens.
+_OUTCOME_NOT_KNOWN: frozenset[str] = frozenset(
+    {"the-publisher-could-not-finish", "the-remote-could-not-be-read-back"}
+)
+
 #: The publisher's route for the request. Written out here as well as in the
 #: publisher's own service, because the coordinator does not import the
 #: publisher; a test pins the two.
@@ -234,10 +241,11 @@ class MissionBranchAnswer:
       ``commit``. ``already_there`` says it was created by an earlier request
       and nothing was pushed this time.
     * ``refused``: the publisher answered and did not create it; ``refusal``
-      is its sentence and ``refusal_kind`` its short name. Some refusals say
-      asking again is safe (the remote could not be read back, for one).
+      is its sentence and ``refusal_kind`` its short name.
     * ``unreachable``: no answer came back (no publisher configured, it could
-      not be reached, or it said something that is not an answer). Whether a
+      not be reached, a server error, or something that is not an answer), or
+      the publisher answered that it does not know (it stopped part way, or
+      pushed and could not read the remote back). Whether a
       branch was created is not known; asking again is always safe, because a
       repeated request for a branch the publisher made is answered "created"
       without a second push.
@@ -276,11 +284,18 @@ def _mission_branch_post(
             decoded = json.loads(exc.read().decode("utf-8"))
         except Exception:  # noqa: BLE001 - an unreadable body is no answer
             decoded = None
-        if isinstance(decoded, dict) and isinstance(decoded.get("created"), bool):
+        if (
+            exc.code < 500
+            and isinstance(decoded, dict)
+            and isinstance(decoded.get("created"), bool)
+        ):
             return decoded, ""
+        # A server error is not an answer: the publisher stopped part way, so
+        # whether the branch was created is not known and asking again is
+        # safe. It is "unreachable", never "refused".
         return None, (
-            f"the publisher answered {exc.code} and said nothing this side "
-            "could read, so it is not known whether the branch was created"
+            f"the publisher answered {exc.code} and did not finish, so it is "
+            "not known whether the branch was created"
         )
     except (urllib.error.URLError, OSError, TimeoutError) as exc:
         # The publisher's address is never written down (as for a send).
@@ -347,6 +362,17 @@ async def ask_the_publisher_to_create_mission_branch(
     remote_tip = str(remote_tip) if isinstance(remote_tip, str) else None
     refusal = decoded.get("refusal")
     kind = decoded.get("refusal_kind")
+    if decoded.get("created") is not True and kind in _OUTCOME_NOT_KNOWN:
+        # The publisher answered, and its answer is that it does not know
+        # whether the branch is there: the same as no answer.
+        return MissionBranchAnswer(
+            outcome=MISSION_BRANCH_UNREACHABLE,
+            branch=request["branch"],
+            commit=request["commit"],
+            remote_tip=remote_tip,
+            refusal=str(refusal) if refusal else None,
+            refusal_kind=str(kind),
+        )
     if decoded.get("created") is True and remote_tip == request["commit"]:
         return MissionBranchAnswer(
             outcome=MISSION_BRANCH_CREATED,

@@ -214,6 +214,38 @@ class TestItCreates:
         assert seen["record"].commit == world["project"]["g"]
 
 
+class TestItReadsTheRemoteBack:
+    def test_a_send_that_says_it_worked_and_pushed_nothing(
+        self, world: dict[str, Any]
+    ) -> None:
+        bare = world["project"]["bare"]
+        publisher = Publisher(world["settings"])
+        real = publisher._commits_for  # noqa: SLF001
+
+        class _SaysItWorked:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            def send(self, commit: str, branch: str) -> Any:
+                return git_work.GitSaid(ok=True)
+
+        publisher._commits_for = lambda route: _SaysItWorked(real(route))  # noqa: SLF001
+
+        answer = publisher.create_mission_branch(_ask(world))
+
+        assert answer.created is False
+        assert answer.refusal_kind == "the-remote-does-not-have-it"
+        assert _the_remote_branch(bare) is None
+        record = TheMissionBranchRecords(Path(world["settings"].state_dir)).read(
+            PROJECT, BRANCH
+        )
+        assert record is not None
+        assert record.state == INTENDED  # never "confirmed"
+
+
 class TestItRecovers:
     def test_a_lost_reply_then_the_same_request(self, world: dict[str, Any]) -> None:
         bare = world["project"]["bare"]
@@ -309,6 +341,27 @@ class TestItRecovers:
         assert other.refusal_kind == "the-branch-already-exists"
         assert len(_every_move_of(bare)) == 1
 
+    def test_its_record_at_one_commit_does_not_vouch_for_another(
+        self, world: dict[str, Any]
+    ) -> None:
+        """Record at X, another hand moves the branch to Y, a request at Y."""
+        bare = world["project"]["bare"]
+        publisher = Publisher(world["settings"])
+        assert publisher.create_mission_branch(_ask(world)).created is True
+        y = somebody_else_lands_work(bare, world["root"], "y-work", branch="main")
+        mover = world["root"] / "mover-y"
+        subprocess.run(
+            ["git", "clone", "-q", str(bare), str(mover)], check=True, capture_output=True
+        )
+        git(mover, "push", "-q", "origin", f"{y}:refs/heads/{BRANCH}")
+        assert _the_remote_branch(bare) == y
+
+        at_y = publisher.create_mission_branch(_ask(world, commit=y))
+
+        assert at_y.created is False
+        assert at_y.refusal_kind == "the-branch-already-exists"
+        assert at_y.remote_tip == y
+
     def test_an_unreadable_record_is_refused(self, world: dict[str, Any]) -> None:
         publisher = Publisher(world["settings"])
         assert publisher.create_mission_branch(_ask(world)).created is True
@@ -360,7 +413,7 @@ def running(world: dict[str, Any]):
     server, _thread = serve(world["settings"], publisher=Publisher(world["settings"]))
     host, port = server.server_address[0], server.server_address[1]
     try:
-        yield {**world, "url": f"http://{host}:{port}"}
+        yield {**world, "url": f"http://{host}:{port}", "server": server}
     finally:
         server.shutdown()
         server.server_close()
@@ -447,6 +500,51 @@ class TestTheCoordinatorAsksOverTheWire:
         assert answer.outcome == "refused"
         assert answer.created is False
         assert answer.refusal_kind == "the-answer-did-not-match"
+
+    @pytest.mark.parametrize(
+        "said",
+        [
+            {"created": False, "refusal": "stopped", "refusal_kind": "the-publisher-could-not-finish"},
+            {"created": False, "refusal": "pushed, then", "refusal_kind": "the-remote-could-not-be-read-back"},
+        ],
+    )
+    def test_an_answer_that_does_not_know_is_unreachable(
+        self, monkeypatch: pytest.MonkeyPatch, said: dict[str, Any]
+    ) -> None:
+        monkeypatch.setattr(
+            publisher_client, "_mission_branch_post", lambda *_a, **_k: (said, "")
+        )
+        answer = asyncio.run(
+            publisher_client.ask_the_publisher_to_create_mission_branch(
+                _Config("http://127.0.0.1:1"),
+                project=PROJECT,
+                mission_id=MISSION,
+                branch=BRANCH,
+                commit="a" * 40,
+            )
+        )
+        assert answer.outcome == "unreachable"
+        assert answer.created is False
+        assert answer.refusal_kind == said["refusal_kind"]
+
+    def test_a_server_error_is_unreachable(self, running: dict[str, Any]) -> None:
+        def explodes(_request: Any) -> Any:
+            raise RuntimeError("the disk went away")
+
+        # The handler's own last resort: an error escaping the publisher.
+        running["server"].publisher.create_mission_branch = explodes
+        answer = asyncio.run(
+            publisher_client.ask_the_publisher_to_create_mission_branch(
+                _Config(running["url"]),
+                project=PROJECT,
+                mission_id=MISSION,
+                branch=BRANCH,
+                commit=running["project"]["g"],
+            )
+        )
+        assert answer.outcome == "unreachable"
+        assert answer.created is False
+        assert "500" in str(answer.refusal)
 
     def test_the_wire_answer_carries_no_credential(self, running: dict[str, Any]) -> None:
         import urllib.request

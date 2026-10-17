@@ -86,6 +86,8 @@ class MissionBranchRecord:
         """Is this the record of exactly this request?"""
         return (
             self.project == project
+            # A defensive duplicate: the branch name fixes the mission and the
+            # record's place, so a well-kept record never differs here.
             and self.mission_id == mission_id
             and self.branch == branch
             and self.commit == commit
