@@ -1540,18 +1540,12 @@ async def compose_planning_consumer_and_dispatch(
                 return None
             return await planning_git_runner.fetch_remote_start_point(repo_path)
 
-        try:
-            from forge.pipeline.publisher_client import (  # type: ignore[attr-defined]
-                ask_the_publisher_to_create_mission_branch,
-            )
+        from forge.pipeline.publisher_client import (
+            ask_the_publisher_to_create_mission_branch,
+        )
 
-            async def _create_mission_branch(**request: Any) -> Any:
-                return await ask_the_publisher_to_create_mission_branch(
-                    config, **request
-                )
-
-        except ImportError:  # the publisher's mission-branch client is not here yet
-            _create_mission_branch = None  # type: ignore[assignment]
+        async def _create_mission_branch(**request: Any) -> Any:
+            return await ask_the_publisher_to_create_mission_branch(config, **request)
 
         mission_flow = MissionFlow(
             mission_store,
