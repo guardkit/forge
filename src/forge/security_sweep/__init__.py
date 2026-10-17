@@ -1,7 +1,7 @@
 """The nightly security sweep of every product the factory builds.
 
 Security check design, 17 October 2026, piece 3
-(``ai-transition/docs/designs/factory-security-check-2026-10-17.md``). Rich's
+(``factory-security-check-2026-10-17``). Rich's
 words: "yes to automatically drafting a security repair, please proceed as
 per your recommendation".
 
