@@ -43,7 +43,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Mapping
 
-from forge.planning.work_queue_store import OPEN_STATUSES, WorkQueueStore
+from forge.planning.work_queue_store import WorkQueueStore
 
 from . import drafting
 from .findings import (
@@ -146,6 +146,9 @@ class SweepDeps:
     export: Callable[[Path, str, Path], ExportReport] = export_committed_files
     save: Callable[[Path, SweepState], None] = save_state
     catalogue: RuleCatalogue | None = None
+    #: Whether merges go through the merge card, which decides when a closed
+    #: repair's work has ended (``work_queue_loop.work_landing``).
+    merge_executor_enabled: bool = True
     max_model_questions: int = MAX_MODEL_QUESTIONS
     model_timeout: float = MODEL_TIMEOUT_S
 
@@ -177,9 +180,8 @@ class ProjectResult:
     settings_left_out: list[str] = field(default_factory=list)
     #: Files over the export's size limit: not checked, said so.
     too_large: list[str] = field(default_factory=list)
-    #: Repair rows whose findings are still present, and the status of each
-    #: one that is already closed.
-    still_open_closed: dict[int, str] = field(default_factory=dict)
+    #: Declined repair rows whose findings are still present, by row.
+    declined: dict[int, int] = field(default_factory=dict)
 
     @property
     def has_news(self) -> bool:
@@ -214,8 +216,8 @@ class ProjectResult:
             out["no_lockfile"] = True
         if self.still_open:
             out["still_open"] = {str(k): v for k, v in self.still_open.items()}
-        if self.still_open_closed:
-            out["still_open_closed"] = {str(k): v for k, v in self.still_open_closed.items()}
+        if self.declined:
+            out["declined"] = {str(k): v for k, v in self.declined.items()}
         for name in ("symlinks_skipped", "submodules_skipped", "settings_left_out", "too_large"):
             values = getattr(self, name)
             if values:
@@ -293,14 +295,15 @@ def _project_phrase(result: ProjectResult, name: str) -> str:
             f"{_plural(len(result.too_large), 'file', 'files')} not checked: too large"
         )
     for row, count in sorted(result.still_open.items()):
-        text = (
+        parts.append(
             f"findings from repair request #{row} are still present after 7 days "
             f"({count} of them)"
         )
-        closed = result.still_open_closed.get(row)
-        if closed:
-            text += f"; that request is closed ({closed.lower()})"
-        parts.append(text)
+    for row, count in sorted(result.declined.items()):
+        parts.append(
+            f"{_plural(count, 'finding', 'findings')} still present; repair request "
+            f"#{row} was declined"
+        )
     if not parts:
         parts.append("nothing new")
     return f"{name} — " + ", ".join(parts)
@@ -370,7 +373,9 @@ async def run_sweep(deps: SweepDeps) -> RunReport:
         try:
             key = fingerprint_key(deps.folder)
             state = load_state(deps.folder)
-            rows = drafting.security_rows(deps.queue)
+            rows = drafting.security_rows(
+                deps.queue, merge_executor_enabled=deps.merge_executor_enabled
+            )
             catalogue = deps.catalogue
             if catalogue is None and deps.setup.missing("opengrep") is None:
                 try:
@@ -692,16 +697,35 @@ def _update_statuses(deps, project, state, rows, current, checked, result) -> se
     """Name each finding's status; return the fingerprints that are new tonight."""
     today = _today(deps)
     new: set[str] = set()
-    drafted_in_queue = {fp: row.queue_id for row in rows for fp in row.fingerprints}
+    # The queue is the record: the newest security row naming a fingerprint
+    # decides what it is now (rows come oldest first).
+    latest: dict[str, drafting.SecurityRow] = {}
+    for row in rows:
+        for fp in row.fingerprints:
+            latest[fp] = row
     for fp, finding in current.items():
         entry = state.findings.get(fp)
-        if fp in drafted_in_queue:
+        row = latest.get(fp)
+        if row is not None:
             if entry is None or entry.get("status") == "gone":
                 entry = {"first_seen": today}
-            if entry.get("status") != "drafted":
+            if row.state == drafting.ROW_FINISHED:
+                # Its repair finished and it is still here: eligible once more,
+                # once for this closure (fix pass decision, 17 October 2026).
+                if entry.get("redraft_after") != row.queue_id:
+                    entry["status"] = "real"
+                    entry["redraft_after"] = row.queue_id
+                    entry.pop("declined", None)
+            else:
+                if entry.get("status") != "drafted" or entry.get("queue_id") != row.queue_id:
+                    entry["drafted_at"] = today
                 entry["status"] = "drafted"
-                entry["queue_id"] = drafted_in_queue[fp]
-                entry.setdefault("drafted_at", today)
+                entry["queue_id"] = row.queue_id
+                entry.pop("redraft_after", None)
+                if row.state == drafting.ROW_DECLINED:
+                    entry["declined"] = True
+                else:
+                    entry.pop("declined", None)
         elif entry is None or entry.get("status") == "gone":
             entry = {
                 "first_seen": today,
@@ -806,17 +830,19 @@ def _draft(deps, project, state, rows, current, result) -> None:
     ]
     for fp, f in current.items():
         entry = state.findings.get(fp) or {}
-        if entry.get("status") == "drafted" and entry.get("drafted_at"):
-            try:
-                since = datetime.fromisoformat(str(entry["drafted_at"])).date()
-            except ValueError:
-                continue
-            if today - since >= STILL_OPEN_AFTER and isinstance(entry.get("queue_id"), int):
-                row = int(entry["queue_id"])
-                result.still_open[row] = result.still_open.get(row, 0) + 1
-                status = next((r.status for r in rows if r.queue_id == row), None)
-                if status is not None and status not in OPEN_STATUSES:
-                    result.still_open_closed[row] = status
+        if entry.get("status") != "drafted" or not isinstance(entry.get("queue_id"), int):
+            continue
+        row = int(entry["queue_id"])
+        if entry.get("declined"):
+            # Declined: never drafted again, and the line keeps saying so.
+            result.declined[row] = result.declined.get(row, 0) + 1
+            continue
+        try:
+            since = datetime.fromisoformat(str(entry.get("drafted_at"))).date()
+        except ValueError:
+            continue
+        if today - since >= STILL_OPEN_AFTER:
+            result.still_open[row] = result.still_open.get(row, 0) + 1
     result.serious_eligible = len(eligible)
     if not eligible:
         return
@@ -831,8 +857,17 @@ def _draft(deps, project, state, rows, current, result) -> None:
         result.not_drafted_reason = "no approver is configured"
         return
     chosen = sorted(eligible, key=seriousness_order)[: drafting.MAX_ITEMS]
+    redraft_after = {
+        f.fingerprint: int(state.findings[f.fingerprint]["redraft_after"])
+        for f in chosen
+        if isinstance(state.findings[f.fingerprint].get("redraft_after"), int)
+    }
     queue_id, created, _correlation = drafting.file_repair(
-        deps.queue, project=project, findings=chosen, approver=deps.approver
+        deps.queue,
+        project=project,
+        findings=chosen,
+        approver=deps.approver,
+        redraft_after=redraft_after,
     )
     rows.append(
         drafting.SecurityRow(
@@ -847,6 +882,7 @@ def _draft(deps, project, state, rows, current, result) -> None:
         entry["status"] = "drafted"
         entry["queue_id"] = queue_id
         entry["drafted_at"] = today.isoformat()
+        entry.pop("redraft_after", None)
     result.drafted_row = queue_id
     result.drafted_count = len(chosen)
     logger.info(

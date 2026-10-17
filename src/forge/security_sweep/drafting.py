@@ -22,6 +22,17 @@ the sha256 of its sorted fingerprints>``, so a sweep that filed a row and was
 stopped before it saved its state files the same id on the next run, which
 the queue refuses as a duplicate. Either way nothing is filed twice.
 
+After a repair closes (fix pass decision, 17 October 2026)
+----------------------------------------------------------
+
+A finding drafted into a row whose work has finished (closed DONE and
+ended) and that is still present at a later sweep is eligible again: it is
+drafted once more, once per closure, and every redraft is a new spec card
+Rich approves, so nothing loops without a person. A finding whose row was
+withdrawn or blocked, or whose merge Rich declined, is never drafted again;
+the Slack line keeps saying it is still present and that its request was
+declined.
+
 One open repair per project; the ten most serious
 -------------------------------------------------
 
@@ -62,6 +73,13 @@ ACTOR = "forge-security-sweep"
 MAX_ITEMS = 10
 
 
+#: Where a security row's work stands, for drafting (fix pass decision,
+#: 17 October 2026).
+ROW_OPEN = "open"  # in the queue, or handed over and not landed yet
+ROW_FINISHED = "finished"  # closed DONE and its work has ended
+ROW_DECLINED = "declined"  # withdrawn, blocked, or its merge was declined
+
+
 @dataclass(frozen=True)
 class SecurityRow:
     """A security repair row already in the queue."""
@@ -70,13 +88,52 @@ class SecurityRow:
     status: str
     target_repo: str
     fingerprints: tuple[str, ...]
+    #: :data:`ROW_OPEN`, :data:`ROW_FINISHED` or :data:`ROW_DECLINED`.
+    state: str = ROW_OPEN
 
     @property
     def is_open(self) -> bool:
-        return self.status in OPEN_STATUSES
+        return self.state == ROW_OPEN
 
 
-def security_rows(store: WorkQueueStore) -> list[SecurityRow]:
+def row_state(
+    connection: sqlite3.Connection,
+    status: str,
+    correlation_id: str,
+    *,
+    merge_executor_enabled: bool = True,
+) -> str:
+    """Where a security row's work stands.
+
+    - Still in the queue: open.
+    - Closed WITHDRAWN or BLOCKED (Rich declined it, or it could not go
+      ahead): declined, and its findings are never drafted again.
+    - Closed DONE: a feature row closes DONE when its planning run hands the
+      build over, before the build has run (``work_queue_loop.work_landing``).
+      So DONE counts as finished only once that work has ended; while it can
+      still land it is open, and a merge Rich declined is declined.
+    """
+    if status in OPEN_STATUSES:
+        return ROW_OPEN
+    if status in ("WITHDRAWN", "BLOCKED"):
+        return ROW_DECLINED
+    from forge.planning.work_queue_loop import (
+        MERGE_DECLINED,
+        NOT_LANDED_YET,
+        work_landing,
+    )
+
+    landing = work_landing(connection, correlation_id, merge_executor_enabled=merge_executor_enabled)
+    if landing == NOT_LANDED_YET:
+        return ROW_OPEN
+    if landing == MERGE_DECLINED:
+        return ROW_DECLINED
+    return ROW_FINISHED
+
+
+def security_rows(
+    store: WorkQueueStore, *, merge_executor_enabled: bool = True
+) -> list[SecurityRow]:
     """Every security repair row in the queue, open or closed, oldest first.
 
     A row counts only when its filing event says it came from the sweep;
@@ -84,7 +141,7 @@ def security_rows(store: WorkQueueStore) -> list[SecurityRow]:
     """
     try:
         rows = store.connection.execute(
-            "SELECT id, status, target_repo FROM work_queue "
+            "SELECT id, status, target_repo, correlation_id FROM work_queue "
             "WHERE correlation_id LIKE ? ORDER BY id ASC",
             (CORRELATION_PREFIX + "%",),
         ).fetchall()
@@ -107,13 +164,24 @@ def security_rows(store: WorkQueueStore) -> list[SecurityRow]:
                 fingerprints=tuple(str(p) for p in prints if isinstance(p, str))
                 if isinstance(prints, list)
                 else (),
+                state=row_state(
+                    store.connection,
+                    str(row[1]),
+                    str(row[3]),
+                    merge_executor_enabled=merge_executor_enabled,
+                ),
             )
         )
     return found
 
 
 def repair_correlation_id(project: str, fingerprints: Iterable[str]) -> str:
-    """``security-<project>-<12 hex>``: the same findings, the same id, any day."""
+    """``security-<project>-<12 hex>``: the same findings, the same id, any day.
+
+    A finding drafted again after its earlier repair finished is named
+    ``<fingerprint>:after#<that row>`` here, so its new row has its own
+    identity (once per closure) and a rerun still finds the same one.
+    """
     digest = hashlib.sha256("\n".join(sorted(fingerprints)).encode("utf-8")).hexdigest()
     safe = re.sub(r"[^A-Za-z0-9_-]+", "-", project).strip("-") or "project"
     return f"{CORRELATION_PREFIX}{safe}-{digest[:12]}"
@@ -214,11 +282,22 @@ def file_repair(
     project: str,
     findings: Sequence[Finding],
     approver: str,
+    redraft_after: dict[str, int] | None = None,
 ) -> tuple[int, bool, str]:
-    """File one security repair row; ``(queue id, created, correlation id)``."""
+    """File one security repair row; ``(queue id, created, correlation id)``.
+
+    ``redraft_after`` names, for each finding being drafted again, the
+    finished row it was in before.
+    """
     chosen = list(findings)[:MAX_ITEMS]
     prints = [f.fingerprint for f in chosen]
-    correlation_id = repair_correlation_id(project, prints)
+    after = {fp: int(row) for fp, row in (redraft_after or {}).items() if fp in prints}
+    correlation_id = repair_correlation_id(
+        project, [f"{fp}:after#{after[fp]}" if fp in after else fp for fp in prints]
+    )
+    details: dict[str, object] = {"source": SOURCE, "fingerprints": prints}
+    if after:
+        details["drafted_again_after"] = {fp: row for fp, row in sorted(after.items())}
     filed = store.file_sentence(
         correlation_id=correlation_id,
         sentence=repair_sentence(project, chosen),
@@ -227,7 +306,7 @@ def file_repair(
         kind="feature",
         actor_identity=ACTOR,
         triggered_by="forge-internal",
-        extra_details={"source": SOURCE, "fingerprints": prints},
+        extra_details=details,
     )
     return filed.queue_id, filed.created, correlation_id
 
@@ -236,8 +315,12 @@ __all__ = [
     "ACTOR",
     "CORRELATION_PREFIX",
     "MAX_ITEMS",
+    "ROW_DECLINED",
+    "ROW_FINISHED",
+    "ROW_OPEN",
     "SOURCE",
     "SecurityRow",
+    "row_state",
     "file_repair",
     "repair_correlation_id",
     "repair_sentence",

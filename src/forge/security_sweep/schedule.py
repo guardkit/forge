@@ -223,6 +223,9 @@ def compose_sweep(
         is_idle=is_idle,
         asker=asker,
         asker_missing=why_not or "the model is not configured",
+        merge_executor_enabled=bool(
+            getattr(getattr(forge_config, "merge_executor", None), "enabled", False)
+        ),
     )
     return deps, is_idle
 

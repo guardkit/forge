@@ -234,8 +234,9 @@ async def test_more_than_ten_serious_findings_with_one_open_repair_per_project(l
     assert second.projects[0].waiting_for_row == int(row["id"])
     assert second.projects[0].serious_eligible == 6
 
-    # Once it closes, the remaining six are filed.
+    # Once it closes, having fixed its ten, the remaining six are filed.
     lab.queue.close(int(row["id"]), status="DONE", actor_identity="test")
+    lab.scanners.advisories = lab.scanners.advisories[:6]
     await run_sweep(lab.deps())
     rows = lab.rows()
     assert len(rows) == 2
@@ -637,22 +638,92 @@ async def test_control_characters_in_a_file_name_never_reach_outward_text(lab: L
 
 
 @pytest.mark.asyncio
-async def test_still_present_findings_name_their_request_and_say_when_it_is_closed(lab: Lab) -> None:
-    """Fix 5: the line no longer calls a closed request open."""
+async def test_a_finished_repair_that_did_not_fix_is_drafted_again_once(lab: Lab) -> None:
+    """Decision 3: a DONE row whose work has ended, with its finding still
+    present at the next sweep, gives one new row; not a second for the same
+    closure."""
+    lab.scanners.advisories = [VITEST]
+    lab.add("org/app", {"package-lock.json": LOCK})
+    await run_sweep(lab.deps())
+    (first,) = lab.rows()
+    lab.queue.close(int(first["id"]), status="DONE", actor_identity="test")
+
+    await run_sweep(lab.deps())
+    rows = lab.rows()
+    assert len(rows) == 2
+    second = rows[1]
+    assert second["correlation_id"] != first["correlation_id"]
+    details = lab.queue.origin_details(int(second["id"]))
+    assert details["fingerprints"] == lab.queue.origin_details(int(first["id"]))["fingerprints"]
+    assert details["drafted_again_after"] == {details["fingerprints"][0]: int(first["id"])}
+    assert "repair request sent" in lab.slack.lines[-1]
+
+    # The same closure never drafts it a third time, even with the state lost.
+    await run_sweep(lab.deps())
+    (lab.folder / STATE_FILE).unlink()
+    await run_sweep(lab.deps())
+    assert len(lab.rows()) == 2
+
+
+@pytest.mark.asyncio
+async def test_a_handed_over_repair_still_building_is_waited_for(lab: Lab) -> None:
+    """A DONE row whose build has not landed yet is still open: nothing new."""
+    from forge.planning.run_store import SqlitePlanningRunStore
+
     lab.scanners.advisories = [VITEST]
     lab.add("org/app", {"package-lock.json": LOCK})
     await run_sweep(lab.deps())
     (row,) = lab.rows()
+    runs = SqlitePlanningRunStore(lab.queue.connection)
+    runs.record_queued(
+        correlation_id=row["correlation_id"], originating_user="rich",
+        expected_approver="rich", request_text="x", triggered_by="forge-internal",
+    )
+    lab.queue.connection.execute(
+        "UPDATE planning_runs SET state = 'BUILD_QUEUED' WHERE correlation_id = ?",
+        (row["correlation_id"],),
+    )
     lab.queue.close(int(row["id"]), status="DONE", actor_identity="test")
-    lab.now[0] = lab.now[0] + timedelta(days=8)
-    lab.add("org/zzz", {"k.sh": f"K={planted_key()}\n"})
-    lab.model.answer = lambda prompt: '{"real": false}'
+    report = await run_sweep(lab.deps())
+    assert len(lab.rows()) == 1
+    assert report.projects[0].serious_eligible == 0
+
+
+@pytest.mark.asyncio
+async def test_a_declined_repair_is_never_drafted_again_and_is_said(lab: Lab) -> None:
+    """Decision 3: WITHDRAWN (or BLOCKED) never redrafts; the line says so."""
+    lab.scanners.advisories = [VITEST]
+    lab.add("org/app", {"package-lock.json": LOCK})
     await run_sweep(lab.deps())
+    (row,) = lab.rows()
+    lab.queue.drop(int(row["id"]), actor_identity="rich")
+    lab.add("org/zzz", {"k.sh": f"K={planted_key()}\n"})  # something new, so a line is posted
+    lab.model.answer = lambda prompt: '{"real": false}'
+    for _ in range(2):
+        await run_sweep(lab.deps())
+    assert len(lab.rows()) == 1
     assert (
-        f"app — findings from repair request #{row['id']} are still present after 7 days "
-        "(1 of them); that request is closed (done)"
-    ) in lab.slack.lines[-1]
-    assert "still open" not in lab.slack.lines[-1]
+        f"app — 1 finding still present; repair request #{row['id']} was declined"
+        in lab.slack.lines[1]
+    )
+    (lab.folder / STATE_FILE).unlink()
+    await run_sweep(lab.deps())
+    assert len(lab.rows()) == 1
+
+
+@pytest.mark.asyncio
+async def test_a_finished_repair_that_fixed_it_leaves_the_finding_gone(lab: Lab) -> None:
+    lab.scanners.advisories = [VITEST]
+    project = lab.add("org/app", {"package-lock.json": LOCK})
+    await run_sweep(lab.deps())
+    (row,) = lab.rows()
+    lab.queue.close(int(row["id"]), status="DONE", actor_identity="test")
+    lab.scanners.advisories = []
+    project.write({"package-lock.json": LOCK.replace("web", "web2")})
+    project.commit()
+    await run_sweep(lab.deps())
+    assert len(lab.rows()) == 1
+    assert [e["status"] for e in _state(lab)["findings"].values()] == ["gone"]
 
 
 @pytest.mark.asyncio
