@@ -1575,30 +1575,30 @@ def _build_dispatch_build(
             )
             # A mission feature's build advances its own row to RUNNING before
             # its runner launches (the mission arm below), so for it a QUEUED
-            # duplicate is runless — unless a launch was recorded for it. That
-            # is a build launched by release 2026.10.17-1, which left the row
-            # QUEUED while it ran; boot recovery does not touch a QUEUED row, so
-            # after a coordinator-only restart its runner may still be going,
-            # and relaunching would launch it twice. Such a row is held. An
-            # INTERRUPTED one is re-dispatched as for any build (the recovery
-            # arm interrupts its recorded run first). The rule is the mission's
-            # whether or not the gate is wired, because the gated path's
-            # "a live build is past QUEUED" does not hold for those old rows.
+            # or INTERRUPTED duplicate is re-dispatched whether or not the gate
+            # is wired. One QUEUED case is a recovery, not a first launch: a
+            # build launched by release 2026.10.17-1, which left the row QUEUED
+            # while it ran, has its launch recorded (``async_tasks``). Boot
+            # recovery leaves a QUEUED row alone, so after a restart its runner
+            # may still be going with no observer attached, and only this
+            # redelivery can finish it. It is recovered exactly as an
+            # INTERRUPTED build is: its recorded run is interrupted first, then
+            # the row is advanced to RUNNING and the build relaunched in place
+            # of that run (``launch_replacing_recorded_run``), so the new
+            # observer can never bind the old run. A RUNNING row is held.
             from forge.lifecycle.identifiers import derive_build_id
             from forge.lifecycle.missions import mission_membership
 
+            legacy_mission_launch = False
             if (
                 mission_membership(
                     getattr(sqlite_pool, "connection", None), payload.correlation_id
                 )
                 is not None
             ):
-                may_redispatch = status == BuildState.INTERRUPTED or (
-                    status == BuildState.QUEUED
-                    and not had_recorded_launch(
-                        sqlite_pool,
-                        derive_build_id(payload.feature_id, payload.queued_at),
-                    )
+                may_redispatch = status in (BuildState.INTERRUPTED, BuildState.QUEUED)
+                legacy_mission_launch = status == BuildState.QUEUED and had_recorded_launch(
+                    sqlite_pool, derive_build_id(payload.feature_id, payload.queued_at)
                 )
             else:
                 may_redispatch = gate_wired and status in (
@@ -1638,7 +1638,7 @@ def _build_dispatch_build(
                 answers_thread = True
                 answered_before = had_recorded_launch(sqlite_pool, build_id)
                 thread_target = _row_or(sqlite_pool, build_id, payload)
-                recovered = status == BuildState.INTERRUPTED
+                recovered = status == BuildState.INTERRUPTED or legacy_mission_launch
                 if recovered and not await _interrupted_first(build_id):
                     return
                 logger.info(

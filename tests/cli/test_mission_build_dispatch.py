@@ -16,7 +16,8 @@ runner launch replaced by a recorder:
   QUEUED, no run) is re-dispatched once, and then held;
 * a terminal write just before the hop to RUNNING holds the slot, no launch;
 * a QUEUED mission row with a recorded launch (launched by 2026.10.17-1,
-  which left rows QUEUED while running) is held, never relaunched.
+  which left rows QUEUED while running) is recovered as an INTERRUPTED build
+  is: its run interrupted, one replacement launch, the observer reattached.
 """
 
 from __future__ import annotations
@@ -249,29 +250,49 @@ async def test_a_failed_advance_holds_the_slot_with_no_launch(
 
 
 @pytest.mark.asyncio
-async def test_a_queued_mission_row_with_a_recorded_launch_is_held(
+async def test_a_queued_mission_row_with_a_recorded_launch_is_recovered_and_finishes(
     persistence: SqliteLifecyclePersistence, tmp_path: Path
 ) -> None:
     """A build launched by release 2026.10.17-1 stays QUEUED while it runs and
-    has its launch recorded; after a coordinator-only restart its runner may
-    still be going, so a redelivery is held: no relaunch, no ack."""
-    _record_queued_row(persistence)
-    now = QUEUED_AT.isoformat()
-    persistence.connection.execute(
-        "CREATE TABLE IF NOT EXISTS async_tasks (task_id TEXT PRIMARY KEY, "
-        "build_id TEXT NOT NULL, feature_id TEXT NOT NULL, correlation_id TEXT NOT NULL, "
-        "lifecycle TEXT NOT NULL, wave_index INTEGER NOT NULL, task_index INTEGER NOT NULL, "
-        "started_at TEXT NOT NULL, last_activity_at TEXT NOT NULL) STRICT"
-    )
-    persistence.connection.execute(
-        "INSERT INTO async_tasks VALUES ('task-old', ?, ?, ?, 'running', 1, 1, ?, ?)",
-        (BUILD_ID, FEATURE, _payload().correlation_id, now, now),
-    )
-    h = _Harness(persistence, tmp_path)
-    await h.dispatch()
-    assert h.launches == [] and h.acks == 0
-    assert h.status(BUILD_ID) == "QUEUED"
+    has its launch recorded; boot recovery leaves the QUEUED row alone, so the
+    redelivery after a restart is its only way to finish. It is recovered as an
+    INTERRUPTED build is: the recorded run interrupted once, then one
+    replacement launch at RUNNING in place of that run, with the observer
+    registered for the replacement — which acks the slot when it completes."""
+    from forge.lifecycle.persistence import Build
+    from forge.lifecycle.state_machine import BuildState, transition_chain
 
+    _record_queued_row(persistence)
+    _old_run_recorded(persistence)
+    h = _Harness(persistence, tmp_path)
+    observed: list[int] = []
+
+    async def register_observer() -> bool:
+        # The bridge resolves the run it observes from async_tasks: the old
+        # run's identity must already be gone.
+        observed.append(h.recorded_runs(BUILD_ID))
+        return True
+
+    await h.dispatch(register_observer=register_observer)
+    assert h.interrupts == 1
+    assert observed == [0]
+    assert h.launches == [BUILD_ID] and h.status_at_launch == ["RUNNING"]
+    assert h.runs_seen_at_launch == [0]
+    assert h.acks == 0  # the live replacement owns the slot until it ends
+
+    # The replacement completes: the build becomes terminal and its observer
+    # (the one registered for the replacement) acks the slot.
+    now = datetime.now(UTC)
+    for hop in transition_chain(
+        Build(build_id=BUILD_ID, status=BuildState.RUNNING),
+        BuildState.COMPLETE,
+        completed_at=now,
+    ):
+        persistence.apply_transition(hop)
+    h.acks += 1  # what the replacement's observer does on the terminal
+    assert h.status(BUILD_ID) == "COMPLETE" and h.acks == 1
+    await h.dispatch()  # a later redelivery of the same message is terminal: acked
+    assert h.launches == [BUILD_ID] and h.acks == 2
 
 def _old_run_recorded(persistence: SqliteLifecyclePersistence) -> None:
     """The run the earlier launch recorded, still in ``async_tasks``."""
