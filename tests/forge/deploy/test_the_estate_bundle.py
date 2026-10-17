@@ -1974,6 +1974,12 @@ class TestTheComposeFileGivesEachServiceItsOwnName:
         assert "JARVIS_SLACK_PLANNING_CHANNEL_ID:" in gateway, gateway
         assert "JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID:" in gateway, gateway
 
+    def test_the_gateway_is_given_the_evidence_link_hosts(self, rendered: str) -> None:
+        """A merge card's preview and evidence links become buttons only on these
+        hosts. It was set only in a hand-written live override (17 October 2026)."""
+        gateway = _service_block(rendered, "bus-gateway")
+        assert "JARVIS_SLACK_EVIDENCE_LINK_HOSTS:" in gateway, gateway
+
     def test_the_front_door_is_not_given_the_gateways_volume(
         self, rendered: str
     ) -> None:

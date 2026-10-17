@@ -1026,6 +1026,11 @@ services:
       # typed request is silently ignored (the live switch, 1 October 2026).
       JARVIS_SLACK_PLANNING_CHANNEL_ID: ${JARVIS_SLACK_PLANNING_CHANNEL_ID:?name the Slack channel planning requests are typed in, in the env file}
       JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID: ${JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID:?name the Slack member id whose sentences become planning requests, in the env file}
+      # WHERE A MERGE CARD'S PREVIEW AND EVIDENCE LINKS MAY POINT (17 October 2026).
+      # Comma-separated host names; a link becomes a button only when it is https
+      # and on one of them. Empty means the card shows no link buttons. Until now
+      # this was set only in a hand-written override on the live machine.
+      JARVIS_SLACK_EVIDENCE_LINK_HOSTS: ${JARVIS_SLACK_EVIDENCE_LINK_HOSTS:-}
       JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
       # WHERE IT WRITES DOWN HOW SLACK IS (26 September 2026, build item E3-j2).
       #
