@@ -369,3 +369,81 @@ class TestTheRuleFileBuilderFixPass:
             "secret-in-build-arg", "django-no-csrf-token", "md5-used-as-password",
             "unvalidated-password", "ldap-bind-without-password",
         }
+
+
+RISKY_INHERITED = """x-common: &common
+  network_mode: host
+  pid: "host"
+  volumes:
+    - /var/run/docker.sock:/var/run/docker.sock
+  security_opt:
+    - seccomp:unconfined
+  cap_add:
+    - SYS_ADMIN
+x-flow: &flow
+  volumes: ["/var/run/docker.sock:/var/run/docker.sock:ro"]
+x-priv: &priv
+  privileged: true
+services:
+  app:
+    <<: [*common, *flow, *priv]
+    image: x
+"""
+
+SAFE_INHERITED = """x-common: &common
+  network_mode: bridge
+  pid: service:db
+  privileged: false
+  volumes:
+    - ./data:/data
+    # - /var/run/docker.sock:/var/run/docker.sock
+  security_opt:
+    - no-new-privileges:true
+  cap_add:
+    - NET_BIND_SERVICE
+  cap_drop:
+    - ALL
+  command: ["echo", "docker.sock"]
+services:
+  app:
+    <<: *common
+    image: x
+volumes:
+  data: {}
+"""
+
+
+@pytest.mark.skipif(not OPENGREP, reason="opengrep is not installed (set FORGE_TEST_OPENGREP)")
+class TestSettingsInheritedFromAnExtensionBlock:
+    """Review 2, F4: every rule also matches a setting written in an x- block
+    and merged into a service with '<<:', with and without version:, and the
+    safe inherited settings stay quiet."""
+
+    EXPECTED = [
+        ("factory-compose-cap-add-all", 9),
+        ("factory-compose-docker-socket", 5),
+        ("factory-compose-docker-socket", 11),
+        ("factory-compose-network-host", 2),
+        ("factory-compose-pid-host", 3),
+        ("factory-compose-privileged", 13),
+        ("factory-compose-security-opt-disabled", 7),
+    ]
+
+    @pytest.mark.parametrize("with_version", [False, True])
+    def test_risky_inherited_settings_are_found(self, tmp_path: Path, with_version: bool) -> None:
+        target = tmp_path / "tree"
+        target.mkdir()
+        text = ('version: "3.8"\n' + RISKY_INHERITED) if with_version else RISKY_INHERITED
+        (target / "docker-compose.yml").write_text(text)
+        shift = 1 if with_version else 0
+        assert _opengrep(target) == sorted(
+            (rule, "docker-compose.yml", line + shift) for rule, line in self.EXPECTED
+        )
+
+    @pytest.mark.parametrize("with_version", [False, True])
+    def test_safe_inherited_settings_stay_quiet(self, tmp_path: Path, with_version: bool) -> None:
+        target = tmp_path / "tree"
+        target.mkdir()
+        text = ('version: "3.8"\n' + SAFE_INHERITED) if with_version else SAFE_INHERITED
+        (target / "compose.yaml").write_text(text)
+        assert _opengrep(target) == []

@@ -23,8 +23,10 @@
 # rule that always fires is a rule nobody reads.
 #
 # WHERE THEY APPLY: only files named like '*compose*.yml' or
-# '*compose*.yaml'. Each rule's message is fixed text: the sweep repeats it
-# word for word and never adds anything from the scanned file.
+# '*compose*.yaml', anywhere in such a file, so a setting written in an 'x-'
+# extension block and merged into a service with '<<: *anchor' is found too.
+# Each rule's message is fixed text: the sweep repeats it word for word and
+# never adds anything from the scanned file.
 #
 # Copied into the factory image at /opt/factory-security/compose-rules.yaml.
 # ---------------------------------------------------------------------------
@@ -64,10 +66,10 @@ rules:
       cwe: ["CWE-250: Execution with Unnecessary Privileges"]
     paths:
       include: ["*compose*.yml", "*compose*.yaml"]
+    # Anywhere in a Compose file, not only inside 'services': a setting in an
+    # 'x-' extension block merged into a service with '<<: *anchor' counts
+    # too (Codex implementation review 2, F4).
     patterns:
-      - pattern-inside: |
-          services:
-            ...
       - pattern-either:
           # The block forms: '- /var/run/docker.sock:...' and the long form's
           # 'source: /var/run/docker.sock'. Comment lines never match.
@@ -96,10 +98,10 @@ rules:
       cwe: ["CWE-284: Improper Access Control"]
     paths:
       include: ["*compose*.yml", "*compose*.yaml"]
+    # Anywhere in a Compose file, not only inside 'services': a setting in an
+    # 'x-' extension block merged into a service with '<<: *anchor' counts
+    # too (Codex implementation review 2, F4).
     patterns:
-      - pattern-inside: |
-          services:
-            ...
       - pattern-inside: |
           security_opt:
             ...
@@ -118,10 +120,10 @@ rules:
       cwe: ["CWE-668: Exposure of Resource to Wrong Sphere"]
     paths:
       include: ["*compose*.yml", "*compose*.yaml"]
+    # Anywhere in a Compose file, not only inside 'services': a setting in an
+    # 'x-' extension block merged into a service with '<<: *anchor' counts
+    # too (Codex implementation review 2, F4).
     patterns:
-      - pattern-inside: |
-          services:
-            ...
       - pattern: |
           network_mode: $VALUE
       - metavariable-regex:
@@ -140,10 +142,10 @@ rules:
       cwe: ["CWE-668: Exposure of Resource to Wrong Sphere"]
     paths:
       include: ["*compose*.yml", "*compose*.yaml"]
+    # Anywhere in a Compose file, not only inside 'services': a setting in an
+    # 'x-' extension block merged into a service with '<<: *anchor' counts
+    # too (Codex implementation review 2, F4).
     patterns:
-      - pattern-inside: |
-          services:
-            ...
       - pattern: |
           pid: $VALUE
       - metavariable-regex:
@@ -162,10 +164,10 @@ rules:
       cwe: ["CWE-250: Execution with Unnecessary Privileges"]
     paths:
       include: ["*compose*.yml", "*compose*.yaml"]
+    # Anywhere in a Compose file, not only inside 'services': a setting in an
+    # 'x-' extension block merged into a service with '<<: *anchor' counts
+    # too (Codex implementation review 2, F4).
     patterns:
-      - pattern-inside: |
-          services:
-            ...
       - pattern-inside: |
           cap_add:
             ...
