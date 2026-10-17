@@ -632,7 +632,10 @@ async def test_10_with_a_preview_it_reads_at_the_previews_base(config, pool, rul
     )
 
     assert reading["declared_at"] == PREVIEW_BASE
-    seen = {commit for commit, _p, _m in trees.calls} | set(trees.listed)
+    # The card's prototype line (17 October 2026) reads only the settings,
+    # at the build's start commit; that read is the card's, not the check's.
+    assert {p for c, p, _m in trees.calls if c == START} <= {".guardkit/config.yaml"}
+    seen = {commit for commit, _p, _m in trees.calls if commit != START} | set(trees.listed)
     assert seen <= {PREVIEW_BASE, CANDIDATE_SHA, JOINED}
     assert JOINED in trees.listed
 
@@ -847,7 +850,9 @@ async def test_no_path_is_ever_looked_up_on_its_own(config, pool, rules) -> None
     await _routine_card(config, pool, trees=trees, rules=rules, name_status="M\0scripts/check.sh\0")
 
     # Only the declaration is read; every link decision comes from listings.
-    assert [path for _c, path, _m in trees.calls] == [".guardkit/config.yaml"]
+    # (The card's prototype line reads the settings at the build's start
+    # commit, 17 October 2026; that read is the card's, not the check's.)
+    assert [path for c, path, _m in trees.calls if c != START] == [".guardkit/config.yaml"]
     assert sorted(set(trees.listed)) == sorted({TARGET, CANDIDATE_SHA})
 
 

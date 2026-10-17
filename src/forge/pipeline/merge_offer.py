@@ -1745,6 +1745,9 @@ class MergeOfferService:
         # an offer and a rebuild, or two rebuilds, never run for one build at
         # once.
         self._preparing: set[str] = set()
+        # The prototype line of each offer being prepared, read once inside
+        # the one-offer guard (17 October 2026); see :meth:`prototype_line`.
+        self._prototype_lines: dict[str, str] = {}
         # Descriptions sent at once on a lease change, and rebuilds the sweep
         # started; held so they are not collected mid-flight.
         self._card_tasks: set[asyncio.Task[Any]] = set()
@@ -1875,6 +1878,12 @@ class MergeOfferService:
             lines = [" ".join(opening)]
             if supplied:
                 lines.append(supplied)
+            # BUILT FROM A SIGNED-OFF PROTOTYPE (17 October 2026): one line,
+            # read at the build's start commit by :meth:`offer`, for a project
+            # that declares ``reference.signed_off``; nothing otherwise.
+            prototype = self.prototype_line(event.build_id)
+            if prototype:
+                lines.append(prototype)
             lines.extend(line for line in checked.lines if line)
             # FILES THAT ALREADY EXISTED (repair 2 part B, 12 October 2026),
             # straight after what was checked, because it says what that
@@ -2201,6 +2210,59 @@ class MergeOfferService:
                 "listing_unreadable": [],
             }
 
+    def prototype_line(self, build_id: str) -> str:
+        """The prototype line :meth:`offer` read for this build's card, for
+        the card builders to place; ``""`` outside an offer or without one."""
+        return self._prototype_lines.get(build_id, "")
+
+    async def card_line_about_the_prototype(
+        self, build_id: str, row: Any = None
+    ) -> str:
+        """The card's line naming the signed-off prototype version this build
+        was made from, or ``""`` (17 October 2026, prototype-to-factory design
+        2.6).
+
+        Read at the build's START commit with the commit reader the
+        merge-check reading uses, so a sign-off recorded during a build does
+        not change its card. A project whose settings there declare no
+        ``reference.signed_off`` gets nothing, and so does a build with no
+        reader, no recorded start or no known checkout. A declared record that
+        cannot be read gives the plain "could not be read" line instead.
+        :meth:`offer` asks here once, inside its one-offer guard, and both
+        merge cards' builders place the answer (:meth:`prototype_line`).
+        Never raises.
+        """
+        if self._commit_reader is None:
+            return ""
+        from forge.planning.reference_material import (
+            prototype_card_line_at_commit,
+        )
+
+        try:
+            if row is None:
+                row = self._pool.get_build_row(build_id)
+            if row is None:
+                return ""
+            repo_root = self._config.planning.target_repo_paths.get(row.repo)
+            start_point = self._pool.read_start_point(build_id)
+            commit = getattr(start_point, "start_commit", None)
+            if not repo_root or not getattr(start_point, "recorded", False) or not commit:
+                return ""
+            return await prototype_card_line_at_commit(
+                self._commit_reader(row.repo, Path(repo_root)),
+                repo_path=str(repo_root),
+                commit=str(commit),
+            )
+        except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+            logger.warning(
+                "merge-offer: could not read which signed-off prototype %s "
+                "was built from (%s: %s) — the card says nothing about it",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return ""
+
     async def offer(
         self,
         *,
@@ -2422,6 +2484,11 @@ class MergeOfferService:
             return False
         self._preparing.add(build_id)
         try:
+            # The card's prototype line (17 October 2026), read inside the
+            # guard so a second offer for the build reads nothing.
+            self._prototype_lines[build_id] = await self.card_line_about_the_prototype(
+                build_id, row
+            )
             review_evidence: Any = None
             preview_base_sha: str | None = None
             if self._review_preview is not None:
@@ -2508,6 +2575,7 @@ class MergeOfferService:
 
         # (d) ONE publish attempt ever — dual envelope, approval FIRST.
         rationale = card_words(branch, merge_branch)
+        self._prototype_lines.pop(build_id, None)
         from forge.pipeline.merge_check_reading import card_body, shown_sentence
 
         if review_evidence is not None:

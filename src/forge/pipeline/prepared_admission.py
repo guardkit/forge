@@ -44,8 +44,10 @@ import yaml
 from forge.planning.declared_memory import (
     read_declarations_at_commit,
     read_declared_project_documents,
+    read_declared_reference,
 )
 from forge.planning.project_documents import read_project_documents_at_commit
+from forge.planning.reference_material import read_signed_off_record
 
 __all__ = [
     "AdmittedBuild",
@@ -541,7 +543,8 @@ async def check_supplied_bundle(
     In order: the feature file and its ``id``; each task's file; at least one
     spec file, each present (whatever ``routing_law`` says); the two companion
     files beside each spec file; the guide in each folder holding task files;
-    the project's binding documents, as ordinary files; every relative
+    the project's binding documents, as ordinary files; the project's
+    signed-off reference record, when it declares one; every relative
     Markdown link in the supplied summaries, guides and task files; a pass bar
     per task and a QA seed per spec file (whatever the tier-1 enforcement
     setting); and the leak-sweep manifest when the guide claims a route. The
@@ -712,6 +715,21 @@ async def check_supplied_bundle(
     if declared.documents:
         _documents, why = await read_project_documents_at_commit(
             runner, repo_path=repo_path, commit=commit, declared=declared
+        )
+        if why:
+            return f"the prepared feature cannot be built: {why}"
+
+    # 6b. The project's reference material (17 October 2026, prototype-to-
+    #     factory design 2.2, Codex R4): a malformed ``reference:`` block is
+    #     refused, and a declared signed-off record must exist at this commit,
+    #     parse, and name a repository and a full commit — the same check the
+    #     planning door makes. Opt-in: nothing is judged without the block.
+    reference, why = read_declared_reference(config_text)
+    if why:
+        return f"the prepared feature cannot be built: {why}"
+    if reference.declared and reference.signed_off:
+        _record, why = await read_signed_off_record(
+            runner, repo_path=repo_path, commit=commit, path=reference.signed_off
         )
         if why:
             return f"the prepared feature cannot be built: {why}"
