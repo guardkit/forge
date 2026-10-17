@@ -429,6 +429,8 @@ def _make_driver(
         validate_feedback: str | None = None,
         request_text: str | None = None,
         repository_facts: str | None = None,
+        # The code windows (17 October 2026), as the real dispatcher takes them.
+        code_evidence: dict[str, Any] | None = None,
     ) -> Any:
         dispatches.append(
             {
