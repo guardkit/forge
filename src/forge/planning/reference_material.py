@@ -50,6 +50,7 @@ __all__ = [
     "NAMES_NO_BRIEF",
     "PROTOTYPE_NOT_READ_LINE",
     "REFERENCE_FILE_HEADING",
+    "REFERENCE_MATERIAL_STAGE",
     "REFERENCE_WINDOW_LABEL",
     "ReferenceMaterial",
     "SignedOffRecord",
@@ -62,6 +63,10 @@ __all__ = [
     "read_signed_off_record",
     "reference_context_texts",
 ]
+
+#: The planning run's durable record of its reference material, written at its
+#: start (``planning_run_events.stage_label``); the merge card reads it too.
+REFERENCE_MATERIAL_STAGE: str = "reference-material"
 
 #: The label on every code window from a reference folder (design 2.2).
 REFERENCE_WINDOW_LABEL: str = (
@@ -325,11 +330,13 @@ class ReferenceMaterial:
 
     paths: tuple[str, ...]
     files: tuple[ProjectDocument, ...] = ()
+    signed_off: str | None = None
 
     def to_record(self) -> dict[str, Any]:
         return {
             "paths": list(self.paths),
             "files": [document.to_record() for document in self.files],
+            "signed_off": self.signed_off,
         }
 
     @classmethod
@@ -350,9 +357,11 @@ class ReferenceMaterial:
         documents = [ProjectDocument.from_record(entry) for entry in files]
         if any(document is None for document in documents):
             return None
+        signed_off = record.get("signed_off")
         return cls(
             paths=tuple(paths),
             files=tuple(d for d in documents if d is not None),
+            signed_off=signed_off if isinstance(signed_off, str) else None,
         )
 
 
@@ -426,36 +435,56 @@ async def gather_reference_material(
             f"may be at most {MAX_REFERENCE_FILE_BYTES} bytes and all of them "
             f"together at most {MAX_REFERENCE_FILES_BYTES}: {sizes}."
         )
-    return ReferenceMaterial(paths=declared.paths, files=tuple(read)), None
+    return (
+        ReferenceMaterial(
+            paths=declared.paths, files=tuple(read), signed_off=declared.signed_off
+        ),
+        None,
+    )
 
 
 async def prototype_card_line_at_commit(
-    reader: Any, *, repo_path: str, commit: str
+    reader: Any,
+    *,
+    repo_path: str,
+    commit: str,
+    declared_at_start: bool | None = None,
 ) -> str:
     """The merge card's line for a build that started at ``commit``, read
     through ``reader`` (the merge-check reading's commit reader), or ``""``.
 
-    ``""`` — no line — only when the settings at that commit were read and
-    declare no ``reference.signed_off``, or there is no settings file at that
-    commit. When the settings cannot be read at all (no reader, a read that
-    raised or was refused) or the record is declared and cannot be read, the
-    card says so plainly (:data:`PROTOTYPE_NOT_READ_LINE`) and a warning is
-    logged: never silently left out (Codex R4; coach's review, 17 October
-    2026). Read at the START commit, so a sign-off recorded during a build
-    does not change what that build's card says. Never raises.
+    ``""`` — no line — when the settings at that commit were read and
+    declare no ``reference.signed_off``, or there is no settings file there.
+    A declared record that cannot be read gives
+    :data:`PROTOTYPE_NOT_READ_LINE`: never silently left out (Codex R4).
+
+    When the settings themselves cannot be read (no reader, a read that
+    raised or was refused), ``declared_at_start`` decides — what the planning
+    run behind the build recorded at its start (coach's review, 17 October
+    2026): ``True`` gives the "could not be read" line and a warning;
+    ``False`` gives nothing, since a project that declared no record must
+    never have a prototype named on its card; ``None`` (no start record to
+    ask) gives nothing and a warning. Read at the START commit, so a sign-off
+    recorded during a build does not change what that build's card says.
+    Never raises.
     """
     if not commit:
         return ""
 
     def not_read(why: str) -> str:
+        if declared_at_start is False:
+            return ""
         logger.warning(
             "merge card: the project's settings could not be read at %s to "
-            "tell which signed-off prototype the build was made from (%s); "
-            "the card says so",
+            "tell which signed-off prototype the build was made from (%s); %s",
             commit[:12],
             why,
+            "the card says so"
+            if declared_at_start
+            else "no start record says whether it declares one, so the card "
+            "says nothing",
         )
-        return PROTOTYPE_NOT_READ_LINE
+        return PROTOTYPE_NOT_READ_LINE if declared_at_start else ""
 
     read = getattr(reader, "read_file_at_commit", None)
     if read is None:

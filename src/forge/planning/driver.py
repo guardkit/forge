@@ -95,6 +95,7 @@ from forge.planning.project_documents import (
     read_project_documents_at_commit,
 )
 from forge.planning.reference_material import (
+    REFERENCE_MATERIAL_STAGE,
     ReferenceMaterial,
     gather_reference_material,
     is_reference_path,
@@ -275,7 +276,7 @@ _PROJECT_DOCUMENTS_STAGE = "project-documents"
 #: project's documents, and only for a project that declares the folders;
 #: every later spec and plan call, the planner's description of the
 #: repository and the facts sheet read it from here. Status ``recorded``.
-_REFERENCE_MATERIAL_STAGE = "reference-material"
+_REFERENCE_MATERIAL_STAGE = REFERENCE_MATERIAL_STAGE
 
 #: Durable stage label for the SPEC DIGEST REVIEW DOOR — the one pause of the
 #: machine chain (the product-docs pause, absorbed and moved to where there is

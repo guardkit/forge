@@ -1287,29 +1287,70 @@ def _planning_run_behind(pool: Any, row: Any) -> str | None:
     return parent_correlation
 
 
-def _read_after_deploy_check_event(pool: Any, correlation_id: str) -> str | None:
-    """The latest ``qa-feature-gate`` record's details for one planning run."""
+def _one_row(pool: Any, statement: str, params: tuple[Any, ...]) -> Any:
+    """One row of a read of the shared ledger, read only where it can be."""
     from forge.adapters.sqlite.connect import read_only_connect
 
-    statement = (
-        "SELECT details_json FROM planning_run_events "
-        "WHERE correlation_id = ? AND stage_label = ? AND status = 'approved' "
-        "ORDER BY id DESC LIMIT 1"
-    )
-    params = (correlation_id, AFTER_DEPLOY_CHECK_STAGE)
     db_path = getattr(pool, "db_path", None)
     if db_path is None or str(db_path) in ("", ":memory:"):
-        found = pool.connection.execute(statement, params).fetchone()
-    else:
-        cx = read_only_connect(db_path)
-        try:
-            found = cx.execute(statement, params).fetchone()
-        finally:
-            cx.close()
+        return pool.connection.execute(statement, params).fetchone()
+    cx = read_only_connect(db_path)
+    try:
+        return cx.execute(statement, params).fetchone()
+    finally:
+        cx.close()
+
+
+def _read_after_deploy_check_event(pool: Any, correlation_id: str) -> str | None:
+    """The latest ``qa-feature-gate`` record's details for one planning run."""
+    found = _one_row(
+        pool,
+        "SELECT details_json FROM planning_run_events "
+        "WHERE correlation_id = ? AND stage_label = ? AND status = 'approved' "
+        "ORDER BY id DESC LIMIT 1",
+        (correlation_id, AFTER_DEPLOY_CHECK_STAGE),
+    )
     if found is None:
         return None
     raw = found[0] if not isinstance(found, dict) else found.get("details_json")
     return str(raw) if raw else ""
+
+
+def signed_off_declared_at_start(pool: Any, row: Any) -> bool | None:
+    """Whether the planning run behind this build found ``reference.signed_off``
+    declared at its start (17 October 2026, coach's review).
+
+    ``True``/``False`` from the run's own record: a run that passed its door
+    (its memory name is recorded) and recorded reference material naming a
+    record, or not. ``None`` when there is no such run to ask (a prepared or
+    hand-queued build, a run that never passed its door) or the ledger cannot
+    be read. Never raises.
+    """
+    from forge.planning.reference_material import REFERENCE_MATERIAL_STAGE
+
+    try:
+        correlation_id = _planning_run_behind(pool, row)
+        if correlation_id is None:
+            return None
+        run = _one_row(
+            pool,
+            "SELECT memory_project FROM planning_runs WHERE correlation_id = ?",
+            (correlation_id,),
+        )
+        if run is None or not run[0]:
+            return None
+        found = _one_row(
+            pool,
+            "SELECT details_json FROM planning_run_events WHERE correlation_id = ? "
+            "AND stage_label = ? AND status = 'recorded' ORDER BY id DESC LIMIT 1",
+            (correlation_id, REFERENCE_MATERIAL_STAGE),
+        )
+        if found is None:
+            return False
+        record = (json.loads(found[0] or "{}") or {}).get("reference_material") or {}
+        return bool(record.get("signed_off"))
+    except Exception:  # noqa: BLE001 — a reader never stops a card
+        return None
 
 
 def read_after_deploy_check_skip(pool: Any, row: Any) -> AfterDeployCheckSkip | None:
@@ -2252,6 +2293,7 @@ class MergeOfferService:
                 self._commit_reader(row.repo, Path(repo_root)),
                 repo_path=str(repo_root),
                 commit=str(commit),
+                declared_at_start=signed_off_declared_at_start(self._pool, row),
             )
         except Exception as exc:  # noqa: BLE001 — a reader never stops a card
             logger.warning(

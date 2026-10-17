@@ -12,6 +12,7 @@ Trees are dictionaries; the repository names, commits and dates are invented.
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from typing import Any
 
@@ -24,8 +25,11 @@ from forge.planning.reference_material import (
     card_line_about_the_prototype,
     prototype_card_line_at_commit,
 )
+from forge.pipeline.merge_offer import signed_off_declared_at_start
+from forge.planning.run_store import SqlitePlanningRunStore
 from tests.forge.pipeline.test_merge_offer import (  # noqa: F401 - fixtures
     BUILD_ID,
+    CORRELATION,
     FEATURE_ID,
     _event,
     _insert_build,
@@ -121,22 +125,42 @@ class _Raising:
         raise OSError("the helper went away")
 
 
-@pytest.mark.parametrize(
-    "reader",
-    [Trees({}), _Raising(), object()],
-    ids=["refused", "raised", "no-reader"],
-)
+UNREADABLE = [Trees({}), _Raising(), object()]
+UNREADABLE_IDS = ["refused", "raised", "no-reader"]
+
+
+@pytest.mark.parametrize("reader", UNREADABLE, ids=UNREADABLE_IDS)
 @pytest.mark.asyncio
-async def test_settings_that_cannot_be_read_are_said_not_left_out(
+async def test_unreadable_settings_with_a_record_declared_at_start_are_said(
     reader: Any, caplog: pytest.LogCaptureFixture
 ) -> None:
-    """A refused read (the commit is not in the copy, the helper cannot be
-    reached), a read that raises, or no reader at all: nothing says the
-    project declares no record, so the card says it could not be read."""
+    """The run recorded a signed-off record at its start, and the settings
+    cannot be read now: the card says so rather than leaving it out."""
     with caplog.at_level("WARNING", logger="forge.planning.reference_material"):
-        line = await prototype_card_line_at_commit(reader, repo_path="/r", commit=START)
+        line = await prototype_card_line_at_commit(
+            reader, repo_path="/r", commit=START, declared_at_start=True
+        )
     assert line == PROTOTYPE_NOT_READ_LINE
     assert any("could not be read" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.parametrize("reader", UNREADABLE, ids=UNREADABLE_IDS)
+@pytest.mark.asyncio
+async def test_unreadable_settings_never_name_a_prototype_otherwise(
+    reader: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Declared nothing at its start: no line. No start record to ask: no
+    line, and a warning."""
+    assert (
+        await prototype_card_line_at_commit(
+            reader, repo_path="/r", commit=START, declared_at_start=False
+        )
+        == ""
+    )
+    with caplog.at_level("WARNING", logger="forge.planning.reference_material"):
+        line = await prototype_card_line_at_commit(reader, repo_path="/r", commit=START)
+    assert line == ""
+    assert any("no start record" in r.getMessage() for r in caplog.records)
 
 
 # ---------------------------------------------------------------------------
@@ -217,3 +241,66 @@ def test_the_repair_cards_words_are_unchanged_without_the_line() -> None:
         feature_id=FEATURE_ID, branch="autobuild/x", supplied_plan="S.", prototype=LINE
     )
     assert with_line == before.replace("S. ", f"S. {LINE} ", 1)
+
+
+# ---------------------------------------------------------------------------
+# What the planning run recorded at its start decides an unreadable case
+# ---------------------------------------------------------------------------
+
+
+def _planning_run(pool: Any, *, signed_off: str | None, recorded: bool = True) -> None:
+    """The planning run behind the build, as its door records it."""
+    store = SqlitePlanningRunStore(pool.connection, target_terminal_enabled=True)
+    store.record_queued(
+        correlation_id=CORRELATION,
+        originating_user="someone",
+        expected_approver="someone",
+        request_text="build the gadgets page",
+        triggered_by="jarvis",
+        target_repo="acme/gadgets",
+    )
+    if recorded:
+        store._record_event(
+            correlation_id=CORRELATION,
+            stage_label="reference-material",
+            status="recorded",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {"reference_material": {"paths": ["reference/"], "files": [], "signed_off": signed_off}}
+            ),
+        )
+    store.record_memory_project(CORRELATION, memory_project="gadgets")
+
+
+def test_the_start_record_says_whether_a_record_was_declared(pool: Any) -> None:
+    _insert_build(pool)
+    row = pool.get_build_row(BUILD_ID)
+    assert signed_off_declared_at_start(pool, row) is None  # no planning run
+    _planning_run(pool, signed_off=RECORD_PATH)
+    assert signed_off_declared_at_start(pool, row) is True
+
+
+def test_a_run_that_declared_no_record_says_false(pool: Any) -> None:
+    _insert_build(pool)
+    _planning_run(pool, signed_off=None, recorded=False)
+    assert signed_off_declared_at_start(pool, pool.get_build_row(BUILD_ID)) is False
+
+
+@pytest.mark.parametrize("card", sorted(CARDS))
+@pytest.mark.parametrize(
+    ("signed_off", "said"),
+    [(RECORD_PATH, PROTOTYPE_NOT_READ_LINE), (None, None)],
+    ids=["declared-at-start", "not-declared-at-start"],
+)
+@pytest.mark.asyncio
+async def test_an_unreadable_start_commit_follows_the_start_record(
+    config: Any, pool: Any, card: str, signed_off: str | None, said: str | None
+) -> None:
+    _planning_run(pool, signed_off=signed_off, recorded=signed_off is not None)
+    # The copy cannot read the start commit at all.
+    trees = Trees({TARGET: _files(None), CANDIDATE_SHA: _files(None), LOCAL_MAIN: _files(None)})
+    words = await CARDS[card](config, pool, trees)
+    if said:
+        assert said in words
+    else:
+        assert "prototype" not in words
