@@ -208,6 +208,56 @@ RUN pip install \
     && python -c "import importlib.metadata as m; import forge, guardkit, guardkit._installer_core, guardkitfactory; assert m.version('deepagents') == '0.7.14'"
 
 # ---------------------------------------------------------------------------
+# Stage 1b: the Opengrep security rules for the nightly security sweep
+# (security check design, 17 October 2026, piece 2).
+#
+# WHAT IT MAKES. One file, /out/security-rules.yaml, holding every rule of
+# the opengrep/opengrep-rules repository, at the commit pinned below, whose
+# metadata says "category: security", except the rules that detect a secret
+# value, which are Gitleaks' job (1,338 rules kept at this commit, 225 left
+# out and listed in deploy/security/dropped-secret-rules.txt;
+# deploy/security/build_opengrep_rules.py says exactly which files it reads
+# and which rules it leaves out). The runtime stage copies only that file
+# and its sha256 record; the checkout and git stay here, in a stage that is
+# thrown away.
+#
+# HOW THE DOWNLOAD IS TRUSTED, said plainly. It is NOT a release archive with
+# a published checksum like the tools in the runtime stage. Git fetches the
+# one pinned commit by its id and checks every object it receives against
+# that id, so the content is the commit's — but that check is git's SHA-1,
+# weaker than the sha256 checks used for the archives, and nobody signs the
+# commit. On top of it, the sha256 of the FILTERED RESULT is pinned here
+# (OPENGREP_RULES_SHA256): a different download, a changed filter or a
+# PyYAML that reads the rules differently all fail the build rather than
+# shipping different rules. The filter needs only PyYAML, copied from the
+# builder's own environment (the image lock's 6.0.3); nothing is installed
+# for it. Network is needed at image build time only.
+#
+# THE LICENCE. The rules carry the "Commons Clause" condition: internal use is
+# allowed, selling the rules is not. Fine for the factory; noted for any
+# future client sale.
+# ---------------------------------------------------------------------------
+FROM python:3.14-slim-bookworm@sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a AS opengrep-rules
+
+ARG OPENGREP_RULES_COMMIT=f1d2b562b414783763fd02a6ed2736eaed622efa
+ARG OPENGREP_RULES_SHA256=ba63c213f10965b80822c3427eb691e7c1b958e6e92b5ba5b9c004a9030f61d2
+RUN apt-get update \
+    && apt-get install --yes --no-install-recommends ca-certificates git \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && git init --quiet /src/opengrep-rules \
+    && git -C /src/opengrep-rules fetch --quiet --depth 1 \
+        https://github.com/opengrep/opengrep-rules.git "${OPENGREP_RULES_COMMIT}" \
+    && git -C /src/opengrep-rules -c advice.detachedHead=false checkout --quiet FETCH_HEAD \
+    && test "$(git -C /src/opengrep-rules rev-parse HEAD)" = "${OPENGREP_RULES_COMMIT}"
+COPY --from=builder /opt/venv/lib/python3.14/site-packages/yaml /opt/rules-build/yaml
+COPY deploy/security/build_opengrep_rules.py /opt/rules-build/build_opengrep_rules.py
+RUN PYTHONPATH=/opt/rules-build python /opt/rules-build/build_opengrep_rules.py \
+        /src/opengrep-rules /out/security-rules.yaml \
+    && echo "${OPENGREP_RULES_SHA256}  /out/security-rules.yaml" | sha256sum --check --strict - \
+    && echo "${OPENGREP_RULES_SHA256}  security-rules.yaml" > /out/security-rules.yaml.sha256
+
+# ---------------------------------------------------------------------------
 # Stage 2: runtime
 #
 # Copy the resolved venv from the builder stage, add curl for the
@@ -215,8 +265,9 @@ RUN pip install \
 # terminal (in-process ``WorktreeGitRunner`` shells out to ``git worktree
 # add``; TASK-FWD-PLAN-GITMOUNT), add the pinned tools the builds and
 # checks run (hurl, the docker client and Compose, code search, and since
-# 12 October 2026 Node, Go, Staticcheck, gcc and the Playwright browsers),
-# and run as the unprivileged ``forge`` user. No SSH, no debugger, no
+# 12 October 2026 Node, Go, Staticcheck, gcc and the Playwright browsers;
+# since 17 October 2026 Gitleaks, OSV-Scanner and Opengrep), and run as the
+# unprivileged ``forge`` user. No SSH, no debugger, no
 # secrets.
 # ---------------------------------------------------------------------------
 FROM python:3.14-slim-bookworm@sha256:2e256d0381371566ed96980584957ed31297f437569b79b0e5f7e17f2720e53a AS runtime
@@ -467,6 +518,70 @@ RUN curl -fsSL "https://github.com/dominikh/go-tools/releases/download/${STATICC
     && chmod 0755 /usr/local/bin/staticcheck \
     && ln -s /usr/local/bin/staticcheck /usr/bin/staticcheck
 
+# ---------------------------------------------------------------------------
+# THE SECURITY SCANNERS (security check design, 17 October 2026, piece 2).
+#
+# WHY THEY ARE IN THE FACTORY'S IMAGE. The build runner in each project's
+# sandbox runs this image, and GuardKit's per-change security check runs
+# Gitleaks and OSV-Scanner there on every task. The coordinator runs this
+# image too, and its nightly security sweep runs all three: OSV-Scanner for
+# vulnerable dependencies, Gitleaks for secrets, Opengrep for risky code.
+# Nothing here names a project or a language.
+#
+# HOW EACH DOWNLOAD IS TRUSTED. Each is one binary from a pinned release,
+# checked against the sha256 recorded here before it is unpacked or
+# installed, the same rule as Staticcheck above. The Gitleaks and OSV-Scanner
+# values were checked against the projects' own published checksum files.
+# Opengrep publishes none for this binary; its value is the one recorded in
+# the design. Each lands in /usr/local/bin, root-owned (--no-same-owner /
+# install -o root), with a plain link in /usr/bin where the Player's shell
+# (PATH=/usr/bin:/bin) finds it.
+#
+# OPENGREP is the open-source fork of Semgrep, one binary, with no usage
+# reporting; it replaces Semgrep, which publishes no current Python package
+# for arm64. 1.30.1 was chosen for being a month old on 17 October 2026.
+#
+# THE FACTORY'S OWN SCANNER SETTINGS, in /opt/factory-security (Codex R8, R9):
+# an empty osv-scanner.toml every OSV-Scanner run is given (it overrides any
+# osv-scanner.toml in the scanned tree), an empty folder Gitleaks looks in for
+# an ignore file, and the factory's six Compose rules
+# (deploy/security/compose-rules.yaml). The project's own scanner settings are
+# never read. The Opengrep security rules come from the stage above, with the
+# sha256 record the self-check checks.
+# ---------------------------------------------------------------------------
+ARG GITLEAKS_VERSION=8.30.1
+ARG GITLEAKS_SHA256=e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080
+ARG OSV_SCANNER_VERSION=2.7.0
+ARG OSV_SCANNER_SHA256=4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7
+ARG OPENGREP_VERSION=1.30.1
+ARG OPENGREP_SHA256=a730f6fdce1e978ea29e610a2e0503bfe1ec31fce08979a9a84e3699f03e16ee
+RUN curl -fsSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz" \
+        -o /tmp/gitleaks.tgz \
+    && echo "${GITLEAKS_SHA256}  /tmp/gitleaks.tgz" | sha256sum --check --strict - \
+    && tar --extract --gzip --file /tmp/gitleaks.tgz --directory /usr/local/bin \
+        --no-same-owner gitleaks \
+    && rm -f /tmp/gitleaks.tgz \
+    && chmod 0755 /usr/local/bin/gitleaks \
+    && ln -s /usr/local/bin/gitleaks /usr/bin/gitleaks \
+    && curl -fsSL "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/osv-scanner_linux_arm64" \
+        -o /tmp/osv-scanner \
+    && echo "${OSV_SCANNER_SHA256}  /tmp/osv-scanner" | sha256sum --check --strict - \
+    && install -m 0755 -o root -g root /tmp/osv-scanner /usr/local/bin/osv-scanner \
+    && rm -f /tmp/osv-scanner \
+    && ln -s /usr/local/bin/osv-scanner /usr/bin/osv-scanner \
+    && curl -fsSL "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/opengrep_manylinux_aarch64" \
+        -o /tmp/opengrep \
+    && echo "${OPENGREP_SHA256}  /tmp/opengrep" | sha256sum --check --strict - \
+    && install -m 0755 -o root -g root /tmp/opengrep /usr/local/bin/opengrep \
+    && rm -f /tmp/opengrep \
+    && ln -s /usr/local/bin/opengrep /usr/bin/opengrep
+COPY deploy/security/compose-rules.yaml /opt/factory-security/compose-rules.yaml
+COPY --from=opengrep-rules /out/security-rules.yaml /out/security-rules.yaml.sha256 /opt/opengrep/
+RUN mkdir -p /opt/factory-security/gitleaks-ignore \
+    && touch /opt/factory-security/osv-scanner.toml \
+    && test ! -s /opt/factory-security/osv-scanner.toml \
+    && chmod -R a+rX,go-w /opt/factory-security /opt/opengrep
+
 # The Playwright 1.63 browsers (Chromium, Firefox, WebKit) and the Debian
 # libraries they need, in /opt/ms-playwright, readable by every user and
 # writable by none but root. A project locks @playwright/test 1.63.0 to use
@@ -510,7 +625,12 @@ RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium firef
 # fails the build within about a minute. Firefox and WebKit are checked for presence and
 # readability only: they have no one-line headless launch outside Playwright's
 # own driver, so launching all three browsers is the acceptance smoke run in
-# the built image, not this step.
+# the built image, not this step. Since 17 October 2026 it also checks the
+# three security scanners' exact versions, the Opengrep rule file against its
+# recorded sha256, and that Opengrep, run as the Player under a time limit,
+# loads both rule files and finds the factory's privileged-service rule in a
+# small Compose file and the community secret-in-build-arg rule in a two-line
+# Dockerfile (the second proves the rule about handling secrets was kept).
 RUN check_home="$(mktemp -d)" \
     && chown 1000:1000 "${check_home}" \
     && as_player="setpriv --reuid=1000 --regid=1000 --clear-groups env -i PATH=/usr/bin:/bin HOME=${check_home}" \
@@ -525,6 +645,19 @@ RUN check_home="$(mktemp -d)" \
     && gofmt_out="$(${as_player} gofmt -l "${check_home}/race.go")" \
     && test -z "${gofmt_out}" \
     && test "$(${as_player} staticcheck -version)" = "staticcheck ${STATICCHECK_VERSION} (0.8.1)" \
+    && test "$(${as_player} gitleaks version)" = "${GITLEAKS_VERSION}" \
+    && ${as_player} osv-scanner --version | grep -qx "osv-scanner version: ${OSV_SCANNER_VERSION}" \
+    && test "$(${as_player} opengrep --version)" = "${OPENGREP_VERSION}" \
+    && (cd /opt/opengrep && sha256sum --check --strict security-rules.yaml.sha256) \
+    && printf 'services:\n  app:\n    image: x\n    privileged: true\n' > "${check_home}/compose.yaml" \
+    && printf 'FROM scratch\nARG API_TOKEN\n' > "${check_home}/Dockerfile" \
+    && { timeout --kill-after=5 120 ${as_player} opengrep scan --config /opt/opengrep/security-rules.yaml \
+             --config /opt/factory-security/compose-rules.yaml --disable-version-check --json --quiet \
+             "${check_home}/compose.yaml" "${check_home}/Dockerfile" \
+             < /dev/null > "${check_home}/opengrep.json" 2> "${check_home}/opengrep.log" \
+         && grep -q 'factory-compose-privileged' "${check_home}/opengrep.json" \
+         && grep -q 'secret-in-build-arg' "${check_home}/opengrep.json" \
+         || { cat "${check_home}/opengrep.log" >&2; exit 1; }; } \
     && chrome="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -path '*/chromium-*/chrome-linux-arm64/chrome' -name chrome)" \
     && headless_shell="$(find "${PLAYWRIGHT_BROWSERS_PATH}" -type f -path '*/chromium_headless_shell-*/chrome-headless-shell-linux-arm64/chrome-headless-shell' -name chrome-headless-shell)" \
     && test -x "${chrome}" && test -x "${headless_shell}" \

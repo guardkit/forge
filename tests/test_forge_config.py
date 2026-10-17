@@ -392,6 +392,17 @@ class TestYamlRoundTrip:
                 "public_host": None,
                 "max_app_ttl_minutes": None,
             },
+            # ``security_sweep`` (the nightly security check, 17 October
+            # 2026) — off by default and always present in the unfiltered
+            # dump, so this exhaustive fixture declares it.
+            "security_sweep": {
+                "enabled": False,
+                "at": "02:30",
+                "until": "06:00",
+                "serious_score": 7.0,
+                "draft_repairs": True,
+                "weekly_all_clear": "monday",
+            },
             "permissions": {
                 "filesystem": {
                     "allowlist": ["/srv/forge", "/var/data"],

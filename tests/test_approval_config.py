@@ -266,6 +266,9 @@ class TestApprovalYamlRoundTrip:
                 # Added 7, 12 and 14 October 2026 (the "nothing to build"
                 # switch, the ranked source switch, the per-repository fetch
                 # addresses); the unfiltered dump always includes them.
+                # ``planning.git_door`` (17 October 2026, the read-only Git
+                # door for private repositories) defaults to unset.
+                "git_door": None,
                 "fetch_addresses": {},
                 "nothing_to_build": {"enabled": False},
                 "ranked_source": {"enabled": False},
@@ -371,6 +374,15 @@ class TestApprovalYamlRoundTrip:
                 "evidence_base_url": None,
                 "public_host": None,
                 "max_app_ttl_minutes": None,
+            },
+            # The nightly security check (17 October 2026), off by default.
+            "security_sweep": {
+                "enabled": False,
+                "at": "02:30",
+                "until": "06:00",
+                "serious_score": 7.0,
+                "draft_repairs": True,
+                "weekly_all_clear": "monday",
             },
             "permissions": {
                 "filesystem": {
