@@ -78,6 +78,7 @@ __all__ = [
     "GitSaid",
     "THE_ADDRESS_IS_NOT_WRITTEN_DOWN",
     "TheProjectsCommits",
+    "TheRemotesList",
     "a_plain_branch_name",
     "a_plain_commit_name",
     "the_send_argv",
@@ -158,6 +159,22 @@ class GitSaid:
 
     ok: bool
     out: str = ""
+    said: str = ""
+
+
+@dataclass(frozen=True)
+class TheRemotesList:
+    """What one ``ls-remote`` of the remote said (missions design, section 4).
+
+    ``default_branch`` and ``default_tip`` are the branch the remote's
+    ``HEAD`` names and where it is; ``branch_tip`` is where the branch asked
+    about is, or ``None`` when the remote has no such branch.
+    """
+
+    ok: bool
+    default_branch: str | None = None
+    default_tip: str | None = None
+    branch_tip: str | None = None
     said: str = ""
 
 
@@ -584,6 +601,71 @@ class TheProjectsCommits:
                 ),
             )
         return GitSaid(ok=True, out=at.out)
+
+    def what_the_remote_lists(self, branch: str) -> "TheRemotesList":
+        """The remote's default branch, its tip, and ``branch``'s tip if any.
+
+        One ``ls-remote --symref`` of ``HEAD`` and ``refs/heads/<branch>``,
+        with this route's credential (missions design, section 4). Only exact
+        names are read off the list: a pattern matches the end of a name, so
+        ``refs/heads/x/HEAD`` is never taken for the remote's ``HEAD``.
+        ``branch_tip`` is ``None`` when the remote has no such branch. Never
+        raises; nothing is fetched or written.
+        """
+        if a_plain_branch_name(branch) is None:
+            return TheRemotesList(
+                ok=False, said="that is not a branch name the publisher will ask about"
+            )
+        ready = self.ready()
+        if not ready.ok:
+            return TheRemotesList(ok=False, said=ready.said)
+        transport = the_remote_transport(self._route.remote)
+        if transport is None:
+            return TheRemotesList(
+                ok=False,
+                said=(
+                    "the remote is not an https:// or SSH address, so the "
+                    "publisher will not read it"
+                ),
+            )
+        asked = self._git(
+            "ls-remote",
+            "--symref",
+            "--",
+            self._route.remote,
+            "HEAD",
+            f"refs/heads/{branch}",
+            transport=transport,
+            with_credential=True,
+        )
+        if not asked.ok:
+            return TheRemotesList(
+                ok=False,
+                said=f"the remote named origin could not be listed: {asked.said}",
+            )
+        default: str | None = None
+        listed: dict[str, str] = {}
+        for line in asked.out.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("ref:"):
+                target, _tab, name = stripped[len("ref:"):].strip().partition("\t")
+                if name.strip() == "HEAD" and target.startswith("refs/heads/"):
+                    default = target[len("refs/heads/"):].strip()
+                continue
+            sha, _tab, name = stripped.partition("\t")
+            if a_plain_commit_name(sha) and name.strip():
+                listed[name.strip()] = sha.strip().lower()
+        if default is not None and a_plain_branch_name(default) is None:
+            default = None
+        return TheRemotesList(
+            ok=True,
+            default_branch=default,
+            # The commit the remote's HEAD resolves to IS its default
+            # branch's tip; only the HEAD line carries it, because only HEAD
+            # and the branch asked about were listed.
+            default_tip=listed.get("HEAD") if default else None,
+            branch_tip=listed.get(f"refs/heads/{branch}"),
+        )
 
     def is_in(self, ancestor: str, descendant: str) -> bool | None:
         """Is ``ancestor`` part of ``descendant``? ``None`` = git could not say."""

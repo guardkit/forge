@@ -30,16 +30,22 @@ import json
 import logging
 import urllib.error
 import urllib.request
-from typing import Any
+from dataclasses import dataclass
+from typing import Any, Literal
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MISSION_BRANCH_CREATED",
+    "MISSION_BRANCH_REFUSED",
+    "MISSION_BRANCH_UNREACHABLE",
+    "MissionBranchAnswer",
     "PUBLISHER_COULD_NOT_BE_REACHED",
     "SELF_CHECK_PASSED",
     "THERE_IS_NO_PUBLISHER",
     "THE_REMOTE_MOVED",
     "ask_the_publisher",
+    "ask_the_publisher_to_create_mission_branch",
     "the_publishers_address",
     "the_publishers_self_check",
     "the_remote_moved",
@@ -202,4 +208,170 @@ def the_publishers_self_check(config: Any, *, timeout: float = 10.0) -> Any:
         )
     return WhatTheMachineSays(
         the_publisher_passed_its_self_check=said["self_check"] == SELF_CHECK_PASSED
+    )
+
+
+# ---------------------------------------------------------------------------
+# Creating a mission branch (missions design, 17 October 2026, section 4)
+# ---------------------------------------------------------------------------
+
+#: The three answers to ``create-mission-branch``.
+MISSION_BRANCH_CREATED: str = "created"
+MISSION_BRANCH_REFUSED: str = "refused"
+MISSION_BRANCH_UNREACHABLE: str = "unreachable"
+
+#: The publisher's route for the request. Written out here as well as in the
+#: publisher's own service, because the coordinator does not import the
+#: publisher; a test pins the two.
+MISSION_BRANCH_ROUTE: str = "/create-mission-branch"
+
+
+@dataclass(frozen=True)
+class MissionBranchAnswer:
+    """The publisher's answer to ``create-mission-branch``, in one of three.
+
+    * ``created``: the publisher read the remote back and the branch's tip IS
+      ``commit``. ``already_there`` says it was created by an earlier request
+      and nothing was pushed this time.
+    * ``refused``: the publisher answered and did not create it; ``refusal``
+      is its sentence and ``refusal_kind`` its short name. Some refusals say
+      asking again is safe (the remote could not be read back, for one).
+    * ``unreachable``: no answer came back (no publisher configured, it could
+      not be reached, or it said something that is not an answer). Whether a
+      branch was created is not known; asking again is always safe, because a
+      repeated request for a branch the publisher made is answered "created"
+      without a second push.
+    """
+
+    outcome: Literal["created", "refused", "unreachable"]
+    branch: str
+    commit: str
+    remote_tip: str | None = None
+    already_there: bool = False
+    refusal: str | None = None
+    refusal_kind: str | None = None
+
+    @property
+    def created(self) -> bool:
+        """True only when created AND the read-back tip is the commit."""
+        return self.outcome == MISSION_BRANCH_CREATED and self.remote_tip == self.commit
+
+
+def _mission_branch_post(
+    url: str, request: dict[str, Any], timeout: float
+) -> tuple[dict[str, Any] | None, str]:
+    """One POST, in a thread: the decoded answer, or ``None`` and why. Never raises."""
+    body = json.dumps(request).encode("utf-8")
+    post = urllib.request.Request(  # noqa: S310 - a loopback URL from settings
+        url.rstrip("/") + MISSION_BRANCH_ROUTE,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(post, timeout=timeout) as answered:  # noqa: S310
+            raw = answered.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        try:
+            decoded = json.loads(exc.read().decode("utf-8"))
+        except Exception:  # noqa: BLE001 - an unreadable body is no answer
+            decoded = None
+        if isinstance(decoded, dict) and isinstance(decoded.get("created"), bool):
+            return decoded, ""
+        return None, (
+            f"the publisher answered {exc.code} and said nothing this side "
+            "could read, so it is not known whether the branch was created"
+        )
+    except (urllib.error.URLError, OSError, TimeoutError) as exc:
+        # The publisher's address is never written down (as for a send).
+        return None, (
+            f"the publisher could not be reached ({type(exc).__name__}), so it "
+            "is not known whether the branch was created"
+        )
+    try:
+        decoded = json.loads(raw)
+    except ValueError:
+        decoded = None
+    if not isinstance(decoded, dict) or not isinstance(decoded.get("created"), bool):
+        return None, (
+            "the publisher's answer did not say whether it created the branch, "
+            "so it is not known whether it was"
+        )
+    return decoded, ""
+
+
+async def ask_the_publisher_to_create_mission_branch(
+    config: Any,
+    *,
+    project: str,
+    mission_id: str,
+    branch: str,
+    commit: str,
+) -> MissionBranchAnswer:
+    """Ask the publisher to create ``branch`` at ``commit``. Never raises.
+
+    The request is ``create-mission-branch {project, mission_id, branch,
+    commit}`` and nothing else. The coordinator sends the same request again
+    after a lost reply or a restart of either side; the publisher answers it
+    "created" without pushing again only when its own record shows it created
+    exactly this branch for this mission at this commit.
+    """
+    request = {
+        "project": str(project),
+        "mission_id": str(mission_id),
+        "branch": str(branch),
+        "commit": str(commit),
+    }
+    url = the_publishers_address(config)
+    if url is None:
+        return MissionBranchAnswer(
+            outcome=MISSION_BRANCH_UNREACHABLE,
+            branch=request["branch"],
+            commit=request["commit"],
+            refusal="no publisher is configured, so no branch was asked for. "
+            "Name one in the coordinator's settings",
+            refusal_kind=THERE_IS_NO_PUBLISHER,
+        )
+    decoded, why = await asyncio.to_thread(
+        _mission_branch_post, url, request, _timeout(config)
+    )
+    if decoded is None:
+        return MissionBranchAnswer(
+            outcome=MISSION_BRANCH_UNREACHABLE,
+            branch=request["branch"],
+            commit=request["commit"],
+            refusal=why,
+            refusal_kind=PUBLISHER_COULD_NOT_BE_REACHED,
+        )
+    remote_tip = decoded.get("remote_tip")
+    remote_tip = str(remote_tip) if isinstance(remote_tip, str) else None
+    refusal = decoded.get("refusal")
+    kind = decoded.get("refusal_kind")
+    if decoded.get("created") is True and remote_tip == request["commit"]:
+        return MissionBranchAnswer(
+            outcome=MISSION_BRANCH_CREATED,
+            branch=request["branch"],
+            commit=request["commit"],
+            remote_tip=remote_tip,
+            already_there=decoded.get("already_there") is True,
+        )
+    if decoded.get("created") is True:
+        # "Created" is only ever said with the tip read back; one without it
+        # is not taken on trust.
+        return MissionBranchAnswer(
+            outcome=MISSION_BRANCH_REFUSED,
+            branch=request["branch"],
+            commit=request["commit"],
+            remote_tip=remote_tip,
+            refusal="the publisher said the branch was created but did not say "
+            "it is at the commit asked for, so it is not taken as created",
+            refusal_kind="the-answer-did-not-match",
+        )
+    return MissionBranchAnswer(
+        outcome=MISSION_BRANCH_REFUSED,
+        branch=request["branch"],
+        commit=request["commit"],
+        remote_tip=remote_tip,
+        refusal=str(refusal) if refusal else "the publisher did not create the branch",
+        refusal_kind=str(kind) if kind else None,
     )

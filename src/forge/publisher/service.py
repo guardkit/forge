@@ -80,6 +80,13 @@ from forge.publisher.git_work import (
     a_plain_branch_name,
     a_plain_commit_name,
 )
+from forge.publisher.mission_branches import (
+    CONFIRMED,
+    TheMissionBranchRecords,
+    TheMissionRecordIsUnreadable,
+    a_mission_branch_name,
+    a_mission_id,
+)
 from forge.publisher.settings import (
     ProjectRoute,
     PublisherSettings,
@@ -97,9 +104,11 @@ from forge.publisher.the_record import (
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "MISSION_BRANCH_ROUTE",
     "PUBLISH_ROUTE",
     "PUBLISHER_WIDE",
     "Answer",
+    "MissionBranchAnswer",
     "Publisher",
     "PublisherWillNotStart",
     "PublisherHandler",
@@ -107,8 +116,12 @@ __all__ = [
     "the_remote_moved",
 ]
 
-#: The one route that does anything.
+#: The route that sends a joined commit.
 PUBLISH_ROUTE: str = "/publish"
+
+#: The route that creates a mission branch (missions design, 17 October 2026,
+#: section 4): the request kind ``create-mission-branch``.
+MISSION_BRANCH_ROUTE: str = "/create-mission-branch"
 
 #: The cache key of the publisher-wide credential. A route's own key is
 #: ``"route:<name>"``.
@@ -175,6 +188,39 @@ def _refused(kind: str, sentence: str, **rest: Any) -> Answer:
     return Answer(published=False, refusal=sentence, refusal_kind=kind, **rest)
 
 
+@dataclass(frozen=True)
+class MissionBranchAnswer:
+    """What the publisher answers to ``create-mission-branch``, every time.
+
+    ``created`` is true only when the remote was read and its branch's tip IS
+    ``commit``. ``already_there`` says the answer came from the publisher's
+    own record of an earlier creation, with nothing pushed this time.
+    """
+
+    created: bool
+    branch: str | None = None
+    commit: str | None = None
+    remote_tip: str | None = None
+    already_there: bool = False
+    refusal: str | None = None
+    refusal_kind: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        return {
+            "created": bool(self.created),
+            "branch": self.branch,
+            "commit": self.commit,
+            "remote_tip": self.remote_tip,
+            "already_there": bool(self.already_there),
+            "refusal": self.refusal,
+            "refusal_kind": self.refusal_kind,
+        }
+
+
+def _not_created(kind: str, sentence: str, **rest: Any) -> MissionBranchAnswer:
+    return MissionBranchAnswer(created=False, refusal=sentence, refusal_kind=kind, **rest)
+
+
 class Publisher:
     """One publisher: its settings, its credential, its ledger, its git.
 
@@ -193,6 +239,9 @@ class Publisher:
         self._settings = settings
         self._state = Path(settings.state_dir).expanduser()
         self._state.mkdir(parents=True, exist_ok=True)
+        #: Its own record of the mission branches it was asked to create, in
+        #: its own folder (never the ledger).
+        self._mission_records = TheMissionBranchRecords(self._state)
         # ONE CACHE, keyed by WHICH credential, never by path text: the
         # publisher-wide file and each distinct route key name, each read
         # once, here, and nowhere else.
@@ -722,6 +771,278 @@ class Publisher:
             )
         return Answer(published=True, remote_now=read_back.out, contains_j=True)
 
+    # -- creating a mission branch (missions design, section 4) -----------
+
+    def create_mission_branch(self, request: Any) -> MissionBranchAnswer:
+        """``create-mission-branch {project, mission_id, branch, commit}``.
+
+        Never raises. Creates ``branch`` on the project's remote at
+        ``commit`` with an ordinary, non-forcing push, and only when the name
+        is a mission branch name, the remote has no such branch, and
+        ``commit`` is the remote's default branch's tip as the publisher reads
+        it itself. Its own record of the request is written before the push.
+        A repeated request for a branch that exists is answered "created",
+        with nothing pushed, only when that record shows this branch was made
+        for this mission at this commit and the remote's tip is still it.
+        """
+        try:
+            return self._create_mission_branch(request)
+        except Exception as exc:  # noqa: BLE001 - a refusal, never a crash
+            logger.exception("publisher: a mission branch request ended in an error")
+            return _not_created(
+                "the-publisher-could-not-finish",
+                (
+                    "the publisher stopped on an unexpected error "
+                    f"({type(exc).__name__}) while creating a mission branch. "
+                    "Asking again is safe. Its log says where."
+                ),
+            )
+
+    def _create_mission_branch(self, request: Any) -> MissionBranchAnswer:
+        if not isinstance(request, dict):
+            return _not_created(
+                "the-request-made-no-sense",
+                "the publisher was sent something that is not a request, so "
+                "no branch was created.",
+            )
+        project = str(request.get("project") or "").strip()
+        mission_id = a_mission_id(request.get("mission_id"))
+        branch = a_mission_branch_name(request.get("branch"))
+        commit = a_plain_commit_name(request.get("commit"))
+        if not project:
+            return _not_created(
+                "the-request-made-no-sense",
+                "a request to create a mission branch has to name the project; "
+                "this one did not, so no branch was created.",
+            )
+        if mission_id is None:
+            return _not_created(
+                "the-request-made-no-sense",
+                f"'{request.get('mission_id')}' is not a mission id (m- and six "
+                "hexadecimal characters), so no branch was created.",
+            )
+        if branch is None or branch != f"mission/{mission_id}":
+            return _not_created(
+                "not-a-mission-branch-name",
+                f"'{request.get('branch')}' is not the branch of mission "
+                f"{mission_id} (mission/{mission_id}). The publisher creates "
+                "only branches named mission/m- and six hexadecimal "
+                "characters, so no branch was created.",
+            )
+        if commit is None:
+            return _not_created(
+                "the-request-made-no-sense",
+                f"'{request.get('commit')}' is not a commit the publisher will "
+                "put on a git command line, so no branch was created.",
+                branch=branch,
+            )
+
+        route = self._settings.route(project)
+        if route is None:
+            return _not_created(
+                "the-project-is-not-one-of-mine",
+                f"the publisher was not told how to reach the project "
+                f"'{project}', so no branch was created. Name its read-only "
+                "source and its remote in the publisher's settings.",
+                branch=branch,
+                commit=commit,
+            )
+        credential, no_credential = self._the_credential_for(route)
+        if credential is None or not credential.held:
+            return _not_created(
+                "there-is-no-credential",
+                f"{no_credential or 'the publisher holds no credential'} "
+                "No branch was created.",
+                branch=branch,
+                commit=commit,
+            )
+
+        with self._the_lock_for(route.name):
+            changed = self._a_route_key_that_changed(route)
+            if changed is not None:
+                return _not_created(
+                    str(changed.refusal_kind),
+                    str(changed.refusal),
+                    branch=branch,
+                    commit=commit,
+                )
+            return self._the_mission_branch_git_part(
+                route, project=project, mission_id=mission_id, branch=branch, commit=commit
+            )
+
+    def _the_mission_branch_git_part(
+        self,
+        route: ProjectRoute,
+        *,
+        project: str,
+        mission_id: str,
+        branch: str,
+        commit: str,
+    ) -> MissionBranchAnswer:
+        """Look at the remote, write the intent down, push, read back.
+
+        Held under this project's lock, like a send.
+        """
+        said = {"branch": branch, "commit": commit}
+        commits = self._commits_for(route)
+        listed = commits.what_the_remote_lists(branch)
+        if not listed.ok:
+            return _not_created("the-remote-could-not-be-read", f"{listed.said}.", **said)
+        try:
+            record = self._mission_records.read(project, branch)
+        except TheMissionRecordIsUnreadable as exc:
+            return _not_created(
+                "the-mission-record-could-not-be-read",
+                f"{exc}, so no branch was created and none is said to exist.",
+                **said,
+            )
+
+        # -- the branch is already there: only this publisher's own creation
+        # of exactly this branch, for this mission, at this commit, still at
+        # that commit, is "created". Anything else is refused, as ever.
+        if listed.branch_tip is not None:
+            mine = record is not None and record.is_for(
+                project=project, mission_id=mission_id, branch=branch, commit=commit
+            )
+            if mine and listed.branch_tip == commit:
+                logger.info(
+                    "publisher: %s of %s was created for mission %s at %s "
+                    "earlier; nothing was pushed again",
+                    branch,
+                    route.name,
+                    mission_id,
+                    commit[:10],
+                )
+                return MissionBranchAnswer(
+                    created=True, remote_tip=commit, already_there=True, **said
+                )
+            if mine:
+                sentence = (
+                    f"the publisher created '{branch}' for mission {mission_id} "
+                    f"at {commit[:10]}, and the branch on the remote named origin "
+                    f"is now at {listed.branch_tip[:10]}. It is not answered as "
+                    "just created, and nothing was pushed."
+                )
+            else:
+                sentence = (
+                    f"the remote named origin already has a branch '{branch}' "
+                    f"(at {listed.branch_tip[:10]}), and the publisher has no "
+                    f"record of creating it for mission {mission_id} at "
+                    f"{commit[:10]}. Nothing was pushed."
+                )
+            return _not_created(
+                "the-branch-already-exists",
+                sentence,
+                remote_tip=listed.branch_tip,
+                **said,
+            )
+
+        # -- a new branch: only at the default branch's tip as read here ----
+        if not listed.default_branch or not listed.default_tip:
+            return _not_created(
+                "the-remote-has-no-default-branch",
+                "the remote named origin does not say which branch is its "
+                "default, so the publisher cannot check that the mission "
+                "starts from its tip. No branch was created.",
+                **said,
+            )
+        if listed.default_tip != commit:
+            return _not_created(
+                "not-the-default-branch-tip",
+                f"the mission branch was asked for at {commit[:10]}, and "
+                f"'{listed.default_branch}' on the remote named origin is at "
+                f"{listed.default_tip[:10]}. A mission branch starts only at "
+                "the default branch's current tip, so no branch was created.",
+                remote_tip=listed.default_tip,
+                **said,
+            )
+        # The commit has to be in the publisher's own copy for git to push
+        # it: the default branch is brought in, and has to still be there.
+        brought = commits.where_the_remotes_branch_is(listed.default_branch)
+        if not brought.ok:
+            return _not_created("the-remote-could-not-be-read", f"{brought.said}.", **said)
+        if brought.out != commit:
+            return _not_created(
+                "not-the-default-branch-tip",
+                f"'{listed.default_branch}' on the remote named origin moved "
+                f"to {brought.out[:10]} while the publisher looked, so it is no "
+                f"longer at {commit[:10]}. No branch was created.",
+                remote_tip=brought.out,
+                **said,
+            )
+
+        # -- written down BEFORE the push ----------------------------------
+        try:
+            self._mission_records.write(
+                project=project, mission_id=mission_id, branch=branch, commit=commit
+            )
+        except OSError as exc:
+            return _not_created(
+                "the-mission-record-could-not-be-written",
+                "the publisher could not write down its own record of this "
+                f"request ({exc.strerror or type(exc).__name__}), so it pushed "
+                "nothing.",
+                **said,
+            )
+
+        changed = self._a_route_key_that_changed(route)
+        if changed is not None:
+            return _not_created(str(changed.refusal_kind), str(changed.refusal), **said)
+        logger.info(
+            "publisher: creating %s of %s for mission %s at %s",
+            branch,
+            route.name,
+            mission_id,
+            commit[:10],
+        )
+        # THE SAME ONE PUSH a send uses: <commit>:refs/heads/<branch>, which
+        # cannot force.
+        sent = commits.send(commit, branch)
+        if not sent.ok:
+            return _not_created(
+                "the-remote-refused-the-branch",
+                f"the remote named origin refused the new branch '{branch}' at "
+                f"{commit[:10]}: {sent.said}. Asking again is safe.",
+                **said,
+            )
+
+        # -- read the remote back ------------------------------------------
+        back = commits.what_the_remote_lists(branch)
+        if not back.ok:
+            return _not_created(
+                "the-remote-could-not-be-read-back",
+                f"the push was made, and then {back.said}. Whether the branch "
+                "is there cannot be said from here; asking again is safe.",
+                **said,
+            )
+        if back.branch_tip != commit:
+            return _not_created(
+                "the-remote-does-not-have-it",
+                f"the push reported success, but the branch '{branch}' on the "
+                "remote named origin is "
+                + (f"at {back.branch_tip[:10]}" if back.branch_tip else "not there")
+                + f", not at {commit[:10]}.",
+                remote_tip=back.branch_tip,
+                **said,
+            )
+        try:
+            self._mission_records.write(
+                project=project,
+                mission_id=mission_id,
+                branch=branch,
+                commit=commit,
+                state=CONFIRMED,
+            )
+        except OSError:
+            # The record written before the push already carries the
+            # recovery; this only notes that the read-back agreed.
+            logger.warning(
+                "publisher: %s was created and read back, and the note saying "
+                "so could not be written; the earlier record stands",
+                branch,
+            )
+        return MissionBranchAnswer(created=True, remote_tip=commit, **said)
+
     # -- what must not be published ---------------------------------------
 
     def _what_must_not_be_published(
@@ -900,7 +1221,8 @@ class _PublisherServer(ThreadingHTTPServer):
 
 
 class PublisherHandler(BaseHTTPRequestHandler):
-    """One route that does something, one that says the service is alive."""
+    """Two routes that do something (a send, a mission branch), one that says
+    the service is alive."""
 
     server_version = "forge-publisher/1"
 
@@ -935,7 +1257,11 @@ class PublisherHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler contract
         try:
-            if self.path.split("?", 1)[0] != PUBLISH_ROUTE:
+            path = self.path.split("?", 1)[0]
+            if path == MISSION_BRANCH_ROUTE:
+                self._a_mission_branch()
+                return
+            if path != PUBLISH_ROUTE:
                 self._answer(404, {"error": f"no such path: {self.path}"})
                 return
             length = int(self.headers.get("Content-Length") or 0)
@@ -965,6 +1291,39 @@ class PublisherHandler(BaseHTTPRequestHandler):
                         refusal="the publisher stopped on an unexpected error "
                         "and sent nothing.",
                         refusal_kind="the-publisher-could-not-finish",
+                    ).to_wire(),
+                )
+            except Exception:  # noqa: BLE001 - the socket is already gone
+                pass
+
+    def _a_mission_branch(self) -> None:
+        """``create-mission-branch``: read the body, ask, answer. Never raises."""
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            raw = self.rfile.read(length) if length > 0 else b""
+            try:
+                request = json.loads(raw.decode("utf-8")) if raw else None
+            except (ValueError, UnicodeDecodeError) as exc:
+                self._answer(
+                    400,
+                    _not_created(
+                        "the-request-made-no-sense",
+                        f"the request was not readable as JSON ({exc}), so no "
+                        "branch was created.",
+                    ).to_wire(),
+                )
+                return
+            answer = self.server.publisher.create_mission_branch(request)  # type: ignore[attr-defined]
+            self._answer(200, answer.to_wire())
+        except Exception:  # noqa: BLE001 - never crash the service
+            logger.exception("publisher: a mission branch request ended in an error")
+            try:
+                self._answer(
+                    500,
+                    _not_created(
+                        "the-publisher-could-not-finish",
+                        "the publisher stopped on an unexpected error; asking "
+                        "again is safe.",
                     ).to_wire(),
                 )
             except Exception:  # noqa: BLE001 - the socket is already gone
