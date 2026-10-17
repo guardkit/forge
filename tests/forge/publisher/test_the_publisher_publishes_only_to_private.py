@@ -36,7 +36,6 @@ from forge.publisher.private_remote import (
 from forge.publisher.service import NOT_CONFIRMED_PRIVATE, Publisher
 from forge.publisher.settings import ProjectRoute, SettingsRefused, load_settings
 from tests.forge.publisher.a_project_and_a_ledger import (
-    PROJECT,
     a_request,
     every_push_the_remote_saw,
     make_the_ledger,
@@ -282,17 +281,91 @@ def test_on_a_public_route_is_refused_from_the_start_and_the_others_still_work(
     assert sent.published is True, sent.refusal
 
 
-def test_on_a_route_its_key_cannot_read_is_refused_from_the_start(
+def test_on_a_route_its_key_cannot_read_at_start_is_not_kept_and_the_push_check_decides(
     tmp_path: Path, project: dict, as_github: None
 ) -> None:
+    """Follow-up to the coach review: a failed key read at start may only be
+    the network not being up yet, so it is logged and not kept."""
     gone = ProjectRoute(name="bench/gone", source=str(project["copy"]),
                         remote=str(tmp_path / "world" / "no-such-remote.git"))
     lookup = _Lookup(404)
     publisher = _publisher(tmp_path, project, private_only=True, lookup=lookup,
                            extra_routes={gone.name: gone})
-    refused = publisher.why_routes_are_not_private()
-    assert list(refused) == ["bench/gone"] and "missing" in refused["bench/gone"]
+    assert publisher.why_routes_are_not_private() == {}
     assert ("example-owner", "no-such-remote") not in lookup.asked
+
+
+class _KeyReadsOnlyLater:
+    """The publisher's own copy, whose key read fails the first time (the
+    network not up yet) and works after that, or never."""
+
+    def __init__(self, real: Any, *, fails: int) -> None:
+        self._real = real
+        self.fails = fails
+
+    def the_key_reads_the_remote(self):  # noqa: ANN201
+        if self.fails > 0:
+            self.fails -= 1
+            from forge.publisher.git_work import GitSaid
+
+            return GitSaid(ok=False, said="git ls-remote stopped with exit code 128")
+        return self._real.the_key_reads_the_remote()
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+
+def _flaky_publisher(tmp_path: Path, project: dict, *, fails: int, lookup: Any) -> Publisher:
+    import dataclasses
+
+    root = tmp_path / "world"
+    make_the_ledger(root / "forge.db", project=project)
+    settings = dataclasses.replace(
+        settings_for(root, project, ledger=root / "forge.db"), private_only=True
+    )
+    holder: dict[str, Any] = {}
+
+    def commits_for(route: ProjectRoute) -> Any:
+        if "copy" not in holder:
+            holder["copy"] = _KeyReadsOnlyLater(publisher_ref["p"]._its_own_copy(route), fails=fails)
+        return holder["copy"]
+
+    publisher_ref: dict[str, Any] = {}
+
+    class _Late(Publisher):
+        def __init__(self, *a: Any, **k: Any) -> None:
+            publisher_ref["p"] = self
+            super().__init__(*a, **k)
+
+    return _Late(settings, visibility_lookup=lookup, commits_for=commits_for)
+
+
+def test_a_key_read_that_fails_at_start_then_works_lets_the_push_through_after_a_404(
+    tmp_path: Path, project: dict, as_github: None
+) -> None:
+    lookup = _Lookup(404)
+    publisher = _flaky_publisher(tmp_path, project, fails=1, lookup=lookup)
+    assert publisher.why_routes_are_not_private() == {}
+    assert lookup.asked == [], "a route its key could not read is never looked up"
+
+    answer = publisher.publish(a_request(project))
+
+    assert answer.published is True, answer.refusal
+    assert lookup.asked == [("example-owner", "remote")]
+    assert what_the_remote_has(project["bare"]) == project["j"]
+
+
+def test_a_key_read_that_fails_at_start_and_at_the_push_sends_nothing(
+    tmp_path: Path, project: dict, as_github: None
+) -> None:
+    publisher = _flaky_publisher(tmp_path, project, fails=2, lookup=_Lookup(404))
+    assert publisher.why_routes_are_not_private() == {}
+
+    answer = publisher.publish(a_request(project))
+
+    assert answer.published is False and answer.refusal_kind == NOT_CONFIRMED_PRIVATE
+    assert "missing" in str(answer.refusal)
+    assert every_push_the_remote_saw(project["bare"]) == []
 
 
 @pytest.mark.parametrize("later", [200, 403, 429, 503, None],
@@ -328,8 +401,12 @@ def test_on_a_route_with_no_credential_cannot_be_confirmed(
     )
     lookup = _Lookup(404)
     publisher = Publisher(settings, visibility_lookup=lookup)
-    assert list(publisher.why_routes_are_not_private()) == [PROJECT]
+    # Not kept at start (a key read that fails is left to the push check),
+    # and never confirmed: with no credential there is no key read at all.
+    assert publisher.why_routes_are_not_private() == {}
     assert lookup.asked == []
+    assert publisher.publish(a_request(project)).published is False
+    assert every_push_the_remote_saw(project["bare"]) == []
 
 
 # ---------------------------------------------------------------------------

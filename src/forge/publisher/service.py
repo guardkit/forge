@@ -59,8 +59,8 @@ production features from a signed-off prototype", section 2.8). With
 behaviour exactly), every route's repository must be confirmed private
 (:mod:`forge.publisher.private_remote`: the route's own key reads it, and an
 anonymous lookup does not find it). That is asked once at start-up, when a
-route with a known answer other than "private" is refused, with its reason,
-until the publisher is restarted, while every other route works (a lookup
+route found public or not on GitHub is refused, with its reason, until the
+publisher is restarted, while every other route works (a lookup or key read
 that merely failed is logged and left to the next check); and asked again
 immediately before every push, which any failure refuses.
 
@@ -93,6 +93,7 @@ from forge.publisher.git_work import (
 )
 from forge.publisher.private_remote import (
     LOOKUP_FAILED,
+    UNREACHABLE,
     Visibility,
     anonymous_lookup,
     confirmed_private,
@@ -276,11 +277,13 @@ class Publisher:
         # ONLY PRIVATE REPOSITORIES, when the settings say so (17 October
         # 2026). The anonymous lookup is injectable for the tests. Each
         # route is asked once here; one with a KNOWN answer that is not
-        # "private" (public, not on GitHub, its key cannot read it) is
-        # refused until the publisher is restarted, and the others work. A
-        # lookup that failed (403, a rate limit, a server error, no answer)
-        # is passing trouble, so it is only logged: the check immediately
-        # before the push decides (coach review, 17 October 2026).
+        # "private" (public, or not on GitHub) is refused until the publisher
+        # is restarted, and the others work. A lookup that failed (403, a
+        # rate limit, a server error, no answer) or a key read that failed
+        # (the network may not be up yet after a reboot) is passing trouble,
+        # so it is only logged: the check immediately before the push, which
+        # still needs both the key read and the 404, decides (coach review,
+        # 17 October 2026).
         self._visibility_lookup = visibility_lookup or anonymous_lookup
         self._not_private: dict[str, str] = {}
         if settings.private_only:
@@ -292,7 +295,7 @@ class Publisher:
                         name,
                     )
                     continue
-                if answer.kind == LOOKUP_FAILED:
+                if answer.kind in (LOOKUP_FAILED, UNREACHABLE):
                     logger.warning(
                         "publisher: project '%s' could not be confirmed private at "
                         "start (%s); it is checked again before every push",
