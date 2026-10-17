@@ -558,6 +558,7 @@ class RuleCatalogue:
         self._messages: dict[str, str] = {}
         self._severity: dict[str, str] = {}
         community_compose: list[str] = []
+        hard_coded: set[str] = set()
         for rule in rules:
             rule_id = rule.get("id")
             if not isinstance(rule_id, str):
@@ -574,7 +575,15 @@ class RuleCatalogue:
                 and metadata.get("source") != "factory"
             ):
                 community_compose.append(rule_id)
+            cwe = metadata.get("cwe") if isinstance(metadata, dict) else None
+            if any("CWE-798" in str(entry) for entry in (cwe if isinstance(cwe, list) else [cwe]) if entry):
+                hard_coded.add(rule_id)
         self.community_compose_rules: tuple[str, ...] = tuple(sorted(set(community_compose)))
+        #: Rules naming CWE-798 (hard-coded credentials). Their matched lines
+        #: may hold the very value, so the sweep hides those lines from the
+        #: model whatever Gitleaks says (fix pass, 17 October 2026). Any rule
+        #: of that id naming it counts, so a duplicate id errs towards hiding.
+        self.hard_coded_credential_rules: frozenset[str] = frozenset(hard_coded)
 
     @classmethod
     def from_files(cls, *paths: Path) -> "RuleCatalogue":
@@ -600,6 +609,9 @@ class RuleCatalogue:
 
     def severity(self, rule_id: str) -> str | None:
         return self._severity.get(rule_id)
+
+    def names_hard_coded_credentials(self, rule_id: str) -> bool:
+        return rule_id in self.hard_coded_credential_rules
 
 
 __all__ = [

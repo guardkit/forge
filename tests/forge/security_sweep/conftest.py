@@ -66,6 +66,14 @@ CODE_RULES = [
         "pattern": "hashlib.md5(...)",
     },
     {
+        "id": "hardcoded-jwt-secret",
+        "languages": ["python"],
+        "severity": "ERROR",
+        "message": "A JWT secret is written into the code.",
+        "metadata": {"category": "security", "cwe": ["CWE-798: Use of Hard-coded Credentials"]},
+        "pattern": "jwt.encode(..., \"...\", ...)",
+    },
+    {
         "id": "privileged-service",
         "languages": ["yaml"],
         "severity": "WARNING",
@@ -262,6 +270,8 @@ class FakeScanners:
                         rule = "subprocess-shell-true"
                     elif b"hashlib.md5(" in line:
                         rule = "weak-hash"
+                    elif b"jwt.encode(" in line:
+                        rule = "hardcoded-jwt-secret"
                 if rule:
                     results.append(_og(rule, path, number))
         return {"results": results, "errors": []}

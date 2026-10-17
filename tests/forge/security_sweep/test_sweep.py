@@ -738,3 +738,21 @@ async def test_files_too_large_to_scan_are_said_not_checked(lab: Lab, monkeypatc
     assert "1 file not checked: too large" in lab.slack.lines[-1]
     history = json.loads((lab.folder / "history.jsonl").read_text().splitlines()[-1])
     assert history["projects"]["org/app"]["too_large"] == ["big.bin"]
+
+
+@pytest.mark.asyncio
+async def test_a_hard_coded_value_gitleaks_misses_never_reaches_the_model(lab: Lab) -> None:
+    """A value only a CWE-798 Opengrep rule flags is hidden from the prompt
+    whatever Gitleaks says: the rule's matched lines are always hidden."""
+    value = "kq" + "Zt7mW3pLx9vRb2"  # not a shape the (fake) Gitleaks knows
+    lab.add(
+        "org/app",
+        {"app/auth.py": f'import jwt\n\ndef token(p):\n    return jwt.encode(p, "{value}", "HS256")\n'},
+    )
+    await run_sweep(lab.deps())
+    (prompt,) = lab.model.prompts
+    assert "rule: hardcoded-jwt-secret" in prompt
+    assert "4: [line hidden: may hold a secret]" in prompt
+    assert "def token(p):" in prompt  # the rest of the excerpt is still shown
+    assert value not in prompt
+    assert value not in lab.every_stored_text()

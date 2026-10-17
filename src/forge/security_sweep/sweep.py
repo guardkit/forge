@@ -689,6 +689,7 @@ async def _scan_code(deps, project, tree, work, key, files, catalogue, result, c
                 path_kinds=path_kinds(loc.file),
                 end_line=loc.end,
                 source_file=loc.file,
+                hide_own_lines=catalogue.names_hard_coded_credentials(loc.rule),
             ),
         )
 
@@ -818,6 +819,11 @@ async def _excerpt(deps, finding: Finding, files: _Files, secret_lines: dict[str
     hidden = set(secret_lines.get(raw, set()))
     for loc in flagged:
         hidden.update(range(first + loc.start - 1, first + loc.end))
+    if finding.hide_own_lines:
+        # A hard-coded-credential rule matched these lines, so they may hold
+        # the value itself; they are hidden whatever Gitleaks said (the design
+        # promises a secret never reaches the model).
+        hidden.update(range(finding.line, (finding.end_line or finding.line) + 1))
     return redacted_excerpt(first, lines, hidden)
 
 

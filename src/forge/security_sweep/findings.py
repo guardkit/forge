@@ -151,6 +151,9 @@ class Finding:
     #: The file's path exactly as committed (``file`` is its shown form),
     #: used only to read the excerpt; never stored.
     source_file: str | None = field(default=None, compare=False)
+    #: The rule names CWE-798 (hard-coded credentials): the finding's own
+    #: lines are always hidden from the model; never stored.
+    hide_own_lines: bool = field(default=False, compare=False)
 
     @property
     def needs_sorting(self) -> bool:
