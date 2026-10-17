@@ -53,6 +53,7 @@ from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
 from forge.factory_files import is_shipped_script, shipped_script_path
+from forge.planning.reference_material import REFERENCE_WINDOW_LABEL
 from forge.planning.repository_facts import RepositoryUnreadable
 
 __all__ = [
@@ -64,6 +65,7 @@ __all__ = [
     "MAX_EVIDENCE_CHARS",
     "MAX_EVIDENCE_FILES_PER_WORD",
     "MAX_EVIDENCE_WINDOWS",
+    "MAX_REFERENCE_WINDOWS",
     "MAX_SET_CANDIDATES_LISTED",
     "MAX_SET_FILES_READ",
     "MAX_SET_PHRASES",
@@ -94,6 +96,10 @@ EVIDENCE_BLOCK_LINES_ABOVE = 24
 #: in all). The size budget, :data:`MAX_EVIDENCE_CHARS`, normally stops them
 #: first; see :func:`choose_windows`.
 MAX_EVIDENCE_WINDOWS = 24
+#: At most this many of them from the project's declared reference folders
+#: (17 October 2026, prototype-to-factory design 2.2), so reference material
+#: never crowds the product's own code out of the windows.
+MAX_REFERENCE_WINDOWS = 8
 #: At most this many files are read for one word's windows.
 MAX_EVIDENCE_FILES_PER_WORD = 10
 #: Each line of a window is cut to this many characters.
@@ -769,6 +775,7 @@ def candidate_windows(
     rank: Callable[[str], Any],
     texts: dict[str, str | None],
     spellings: Sequence[str] = (),
+    is_reference: Callable[[str], bool] = lambda _path: False,
 ) -> tuple[list[dict[str, Any]], list[tuple[str, int]], list[str]]:
     """Every window round one word's hits, best first.
 
@@ -783,6 +790,10 @@ def candidate_windows(
     read or not, which :func:`choose_windows` counts against the windows it
     keeps; ``not_read`` says why each refused file was refused. Raises
     :class:`RepositoryUnreadable` when the repository itself stops answering.
+
+    Files under the project's declared reference folders (``is_reference``,
+    17 October 2026) are read only after every product file with a hit, so
+    reference material cannot use up the files read for a word.
     """
     hits = [hit for hit in (_hit(place) for place in places) if hit is not None]
     hits = list(dict.fromkeys(hits))
@@ -791,7 +802,10 @@ def candidate_windows(
         per_file[path] = per_file.get(path, 0) + 1
     # Which files to read: most hits first, never by file type; the
     # kind-of-file order only breaks ties.
-    to_read = sorted(per_file, key=lambda path: (-per_file[path], rank(path), path))
+    to_read = sorted(
+        per_file,
+        key=lambda path: (is_reference(path), -per_file[path], rank(path), path),
+    )
     to_read = set(to_read[:MAX_EVIDENCE_FILES_PER_WORD])
     not_read: list[str] = []
     lines_of: dict[str, list[str]] = {}
@@ -905,6 +919,8 @@ def choose_windows(
     anchors: Sequence[str] = (),
     may_give_way: Callable[[str], bool] = lambda _path: False,
     request_text: str = "",
+    is_reference: Callable[[str], bool] = lambda _path: False,
+    max_reference_windows: int = MAX_REFERENCE_WINDOWS,
 ) -> None:
     """Choose the windows the planner is shown, across all the words, in place.
 
@@ -960,6 +976,14 @@ def choose_windows(
     together take at most half of the windows and half of the characters.
     Without ``scenarios``, ``test_roots`` or ``anchors`` nothing changes.
 
+    REFERENCE MATERIAL (17 October 2026, prototype-to-factory design 2.2).
+    A window for which ``is_reference`` is true (a file under one of the
+    project's declared reference folders) is still shown, so a request about
+    something in a signed-off prototype can find it, but at most
+    ``max_reference_windows`` of them, each labelled
+    :data:`~forge.planning.reference_material.REFERENCE_WINDOW_LABEL`, and
+    never as a scenario's test. Without reference folders nothing changes.
+
     Each entry gets ``evidence`` (when any window was chosen for it) and
     ``more_hits``: every hit of its word not inside a window shown, read or
     not. Each window carries private ``_covers`` (its own word's hits it
@@ -990,6 +1014,10 @@ def choose_windows(
         for window in candidates[index]:
             if new_file_only and window["path"] in shown_files:
                 continue
+            if is_reference(window["path"]) and sum(
+                1 for _i, w in chosen if is_reference(w["path"])
+            ) >= max_reference_windows:
+                continue
             if shown(window):
                 continue
             if used + len(window["text"]) > max_chars:
@@ -1015,7 +1043,8 @@ def choose_windows(
     if scenarios and test_roots and anchors:
         used = _add_scenario_tests(
             chosen,
-            candidates,
+            # Reference material is never a scenario's test (17 October 2026).
+            [[w for w in c if not is_reference(w["path"])] for c in candidates],
             order,
             from_request,
             _ScenarioFit(scenarios, test_roots, anchors, request_text),
@@ -1043,6 +1072,8 @@ def choose_windows(
         mine = [w for i, w in chosen if i == index]
         for window in mine:
             window.pop("_hit", None)
+            if is_reference(window["path"]):
+                window["label"] = REFERENCE_WINDOW_LABEL
         if mine:
             entry["evidence"] = mine
         if not_shown:

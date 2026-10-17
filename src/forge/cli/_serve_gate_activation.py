@@ -1006,6 +1006,7 @@ def merge_card_words(
     scope: Any = None,
     after_deploy_check_skip: Any = None,
     supplied_plan: str = "",
+    prototype: str = "",
 ) -> str:
     """The sentences on the face of the merge-ready checkpoint's card.
 
@@ -1047,6 +1048,12 @@ def merge_card_words(
             the routine card's own line): where its spec and plan were
             supplied. ``""`` — every other build — leaves the card byte for
             byte as it was (4 October 2026).
+        prototype: The one sentence naming the signed-off prototype version
+            the build was made from
+            (:meth:`forge.pipeline.merge_offer.MergeOfferService.card_line_about_the_prototype`,
+            the routine card's own line). ``""`` — a project that declares no
+            ``reference.signed_off`` — leaves the card byte for byte as it was
+            (17 October 2026).
     """
     detail = str(getattr(gates, "detail", "") or "").strip().rstrip(".")
     deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
@@ -1055,6 +1062,8 @@ def merge_card_words(
     sentences = [f"{named} is ready to merge on branch {branch}."]
     if supplied_plan:
         sentences.append(supplied_plan)
+    if prototype:
+        sentences.append(prototype)
     sentences.append(f"What was checked: {checked}.")
     tests = card_line_about_tests(getattr(gates, "test_changes", None))
     if tests:
@@ -1250,6 +1259,17 @@ def make_merge_card_publisher(
         except Exception:  # noqa: BLE001 — a reader never stops a card
             supplied = ""
 
+        def _prototype() -> str:
+            """The routine card's prototype line, as the offer read it inside
+            its guard (17 October 2026); an offer service without it adds
+            nothing."""
+            ask = getattr(offer_service, "prototype_line", None)
+            try:
+                line = ask(build_id) if callable(ask) else ""
+            except Exception:  # noqa: BLE001 — a reader never stops a card
+                line = ""
+            return line if isinstance(line, str) else ""
+
         def _words(merge_target: str, _merge_branch: str | None) -> str:
             if gated_branch is not None and gated_branch != merge_target:
                 logger.warning(
@@ -1267,6 +1287,7 @@ def make_merge_card_publisher(
                 scope=scope,
                 after_deploy_check_skip=no_check,
                 supplied_plan=supplied,
+                prototype=_prototype(),
             )
 
         logger.info(

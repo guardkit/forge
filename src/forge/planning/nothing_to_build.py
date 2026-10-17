@@ -179,13 +179,22 @@ def read_claim(
     return Claim(parts=parts, scenarios=scenarios), None
 
 
-def windows_sent(descriptor: Any) -> list[Window]:
+def windows_sent(
+    descriptor: Any, *, reference_paths: Sequence[str] = ()
+) -> list[Window]:
     """Every code window in the description Forge sent the plan writer.
 
     A window is any object in the description with a ``path`` and an integer
     ``first_line`` and ``last_line``: the windows round the places the
     request's words already appear, wherever the description carries them.
+
+    A window from one of the project's declared reference folders
+    (``reference_paths``, 17 October 2026, prototype-to-factory design 2.2)
+    is not product code, so it is never one: a citation into reference
+    material is outside every window and can never prove that something is
+    already built. Without reference folders nothing changes.
     """
+    folders = tuple(str(p) for p in reference_paths)
     found: list[Window] = []
 
     def walk(value: Any) -> None:
@@ -199,6 +208,7 @@ def windows_sent(descriptor: Any) -> list[Window]:
                 and type(first) is int
                 and type(last) is int
                 and first <= last
+                and not path.startswith(folders)
             ):
                 found.append(Window(path=path, first_line=first, last_line=last))
             for inner in value.values():

@@ -1287,29 +1287,70 @@ def _planning_run_behind(pool: Any, row: Any) -> str | None:
     return parent_correlation
 
 
-def _read_after_deploy_check_event(pool: Any, correlation_id: str) -> str | None:
-    """The latest ``qa-feature-gate`` record's details for one planning run."""
+def _one_row(pool: Any, statement: str, params: tuple[Any, ...]) -> Any:
+    """One row of a read of the shared ledger, read only where it can be."""
     from forge.adapters.sqlite.connect import read_only_connect
 
-    statement = (
-        "SELECT details_json FROM planning_run_events "
-        "WHERE correlation_id = ? AND stage_label = ? AND status = 'approved' "
-        "ORDER BY id DESC LIMIT 1"
-    )
-    params = (correlation_id, AFTER_DEPLOY_CHECK_STAGE)
     db_path = getattr(pool, "db_path", None)
     if db_path is None or str(db_path) in ("", ":memory:"):
-        found = pool.connection.execute(statement, params).fetchone()
-    else:
-        cx = read_only_connect(db_path)
-        try:
-            found = cx.execute(statement, params).fetchone()
-        finally:
-            cx.close()
+        return pool.connection.execute(statement, params).fetchone()
+    cx = read_only_connect(db_path)
+    try:
+        return cx.execute(statement, params).fetchone()
+    finally:
+        cx.close()
+
+
+def _read_after_deploy_check_event(pool: Any, correlation_id: str) -> str | None:
+    """The latest ``qa-feature-gate`` record's details for one planning run."""
+    found = _one_row(
+        pool,
+        "SELECT details_json FROM planning_run_events "
+        "WHERE correlation_id = ? AND stage_label = ? AND status = 'approved' "
+        "ORDER BY id DESC LIMIT 1",
+        (correlation_id, AFTER_DEPLOY_CHECK_STAGE),
+    )
     if found is None:
         return None
     raw = found[0] if not isinstance(found, dict) else found.get("details_json")
     return str(raw) if raw else ""
+
+
+def signed_off_declared_at_start(pool: Any, row: Any) -> bool | None:
+    """Whether the planning run behind this build found ``reference.signed_off``
+    declared at its start (17 October 2026, coach's review).
+
+    ``True``/``False`` from the run's own record: a run that passed its door
+    (its memory name is recorded) and recorded reference material naming a
+    record, or not. ``None`` when there is no such run to ask (a prepared or
+    hand-queued build, a run that never passed its door) or the ledger cannot
+    be read. Never raises.
+    """
+    from forge.planning.reference_material import REFERENCE_MATERIAL_STAGE
+
+    try:
+        correlation_id = _planning_run_behind(pool, row)
+        if correlation_id is None:
+            return None
+        run = _one_row(
+            pool,
+            "SELECT memory_project FROM planning_runs WHERE correlation_id = ?",
+            (correlation_id,),
+        )
+        if run is None or not run[0]:
+            return None
+        found = _one_row(
+            pool,
+            "SELECT details_json FROM planning_run_events WHERE correlation_id = ? "
+            "AND stage_label = ? AND status = 'recorded' ORDER BY id DESC LIMIT 1",
+            (correlation_id, REFERENCE_MATERIAL_STAGE),
+        )
+        if found is None:
+            return False
+        record = (json.loads(found[0] or "{}") or {}).get("reference_material") or {}
+        return bool(record.get("signed_off"))
+    except Exception:  # noqa: BLE001 — a reader never stops a card
+        return None
 
 
 def read_after_deploy_check_skip(pool: Any, row: Any) -> AfterDeployCheckSkip | None:
@@ -1745,6 +1786,9 @@ class MergeOfferService:
         # an offer and a rebuild, or two rebuilds, never run for one build at
         # once.
         self._preparing: set[str] = set()
+        # The prototype line of each offer being prepared, read once inside
+        # the one-offer guard (17 October 2026); see :meth:`prototype_line`.
+        self._prototype_lines: dict[str, str] = {}
         # Descriptions sent at once on a lease change, and rebuilds the sweep
         # started; held so they are not collected mid-flight.
         self._card_tasks: set[asyncio.Task[Any]] = set()
@@ -1875,6 +1919,12 @@ class MergeOfferService:
             lines = [" ".join(opening)]
             if supplied:
                 lines.append(supplied)
+            # BUILT FROM A SIGNED-OFF PROTOTYPE (17 October 2026): one line,
+            # read at the build's start commit by :meth:`offer`, for a project
+            # that declares ``reference.signed_off``; nothing otherwise.
+            prototype = self.prototype_line(event.build_id)
+            if prototype:
+                lines.append(prototype)
             lines.extend(line for line in checked.lines if line)
             # FILES THAT ALREADY EXISTED (repair 2 part B, 12 October 2026),
             # straight after what was checked, because it says what that
@@ -2201,6 +2251,60 @@ class MergeOfferService:
                 "listing_unreadable": [],
             }
 
+    def prototype_line(self, build_id: str) -> str:
+        """The prototype line :meth:`offer` read for this build's card, for
+        the card builders to place; ``""`` outside an offer or without one."""
+        return self._prototype_lines.get(build_id, "")
+
+    async def card_line_about_the_prototype(
+        self, build_id: str, row: Any = None
+    ) -> str:
+        """The card's line naming the signed-off prototype version this build
+        was made from, or ``""`` (17 October 2026, prototype-to-factory design
+        2.6).
+
+        Read at the build's START commit with the commit reader the
+        merge-check reading uses, so a sign-off recorded during a build does
+        not change its card. A project whose settings there declare no
+        ``reference.signed_off`` gets nothing, and so does a build with no
+        reader, no recorded start or no known checkout. A declared record that
+        cannot be read gives the plain "could not be read" line instead.
+        :meth:`offer` asks here once, inside its one-offer guard, and both
+        merge cards' builders place the answer (:meth:`prototype_line`).
+        Never raises.
+        """
+        if self._commit_reader is None:
+            return ""
+        from forge.planning.reference_material import (
+            prototype_card_line_at_commit,
+        )
+
+        try:
+            if row is None:
+                row = self._pool.get_build_row(build_id)
+            if row is None:
+                return ""
+            repo_root = self._config.planning.target_repo_paths.get(row.repo)
+            start_point = self._pool.read_start_point(build_id)
+            commit = getattr(start_point, "start_commit", None)
+            if not repo_root or not getattr(start_point, "recorded", False) or not commit:
+                return ""
+            return await prototype_card_line_at_commit(
+                self._commit_reader(row.repo, Path(repo_root)),
+                repo_path=str(repo_root),
+                commit=str(commit),
+                declared_at_start=signed_off_declared_at_start(self._pool, row),
+            )
+        except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+            logger.warning(
+                "merge-offer: could not read which signed-off prototype %s "
+                "was built from (%s: %s) — the card says nothing about it",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return ""
+
     async def offer(
         self,
         *,
@@ -2422,6 +2526,11 @@ class MergeOfferService:
             return False
         self._preparing.add(build_id)
         try:
+            # The card's prototype line (17 October 2026), read inside the
+            # guard so a second offer for the build reads nothing.
+            self._prototype_lines[build_id] = await self.card_line_about_the_prototype(
+                build_id, row
+            )
             review_evidence: Any = None
             preview_base_sha: str | None = None
             if self._review_preview is not None:
@@ -2505,9 +2614,16 @@ class MergeOfferService:
                 )
         finally:
             self._preparing.discard(build_id)
+            # Held only while the card's words are written; an early return
+            # leaves nothing behind (coach's review, 17 October 2026).
+            prototype_line = self._prototype_lines.pop(build_id, "")
 
         # (d) ONE publish attempt ever — dual envelope, approval FIRST.
-        rationale = card_words(branch, merge_branch)
+        self._prototype_lines[build_id] = prototype_line
+        try:
+            rationale = card_words(branch, merge_branch)
+        finally:
+            self._prototype_lines.pop(build_id, None)
         from forge.pipeline.merge_check_reading import card_body, shown_sentence
 
         if review_evidence is not None:
