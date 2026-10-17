@@ -42,6 +42,7 @@ __all__ = [
     "MissionBranchAnswer",
     "PUBLISHER_COULD_NOT_BE_REACHED",
     "SELF_CHECK_PASSED",
+    "THE_PUBLISHER_CANNOT_CREATE_MISSION_BRANCHES",
     "THERE_IS_NO_PUBLISHER",
     "THE_REMOTE_MOVED",
     "ask_the_publisher",
@@ -220,6 +221,12 @@ MISSION_BRANCH_CREATED: str = "created"
 MISSION_BRANCH_REFUSED: str = "refused"
 MISSION_BRANCH_UNREACHABLE: str = "unreachable"
 
+#: What this side says when the publisher refuses the request with no answer
+#: (a 4xx, such as an older publisher's 404 for an unknown route).
+THE_PUBLISHER_CANNOT_CREATE_MISSION_BRANCHES: str = (
+    "the-publisher-cannot-create-mission-branches"
+)
+
 #: The publisher's refusals that say the outcome is not known (it stopped
 #: part way, or pushed and could not read the remote back). The client reads
 #: them as "unreachable": asking again is safe and is how recovery happens.
@@ -241,7 +248,9 @@ class MissionBranchAnswer:
       ``commit``. ``already_there`` says it was created by an earlier request
       and nothing was pushed this time.
     * ``refused``: the publisher answered and did not create it; ``refusal``
-      is its sentence and ``refusal_kind`` its short name.
+      is its sentence and ``refusal_kind`` its short name. A publisher that
+      refuses the request with no answer (a 4xx, such as an older release's
+      404) is refused too: asking again would get the same answer.
     * ``unreachable``: no answer came back (no publisher configured, it could
       not be reached, a server error, or something that is not an answer), or
       the publisher answered that it does not know (it stopped part way, or
@@ -290,6 +299,20 @@ def _mission_branch_post(
             and isinstance(decoded.get("created"), bool)
         ):
             return decoded, ""
+        if exc.code < 500:
+            # A refusal of the request itself, with no answer: a publisher on
+            # an image without this route answers 404. Asking again would get
+            # the same, for ever, so it is "refused", never "unreachable".
+            return {
+                "created": False,
+                "remote_tip": None,
+                "refusal": (
+                    f"the publisher answered {exc.code} without an answer: it "
+                    "does not support creating mission branches (it may be on "
+                    "an older release), so no branch was created"
+                ),
+                "refusal_kind": THE_PUBLISHER_CANNOT_CREATE_MISSION_BRANCHES,
+            }, ""
         # A server error is not an answer: the publisher stopped part way, so
         # whether the branch was created is not known and asking again is
         # safe. It is "unreachable", never "refused".

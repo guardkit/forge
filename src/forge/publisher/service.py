@@ -998,16 +998,26 @@ class Publisher:
         # THE SAME ONE PUSH a send uses: <commit>:refs/heads/<branch>, which
         # cannot force.
         sent = commits.send(commit, branch)
-        if not sent.ok:
+
+        # -- read the remote back, whatever the push said -------------------
+        # A push that reports failure may still have landed (its reply was
+        # lost on the way back). The remote decides: if the branch is at the
+        # commit, it was created.
+        back = commits.what_the_remote_lists(branch)
+        if not sent.ok and not (back.ok and back.branch_tip == commit):
             return _not_created(
                 "the-remote-refused-the-branch",
                 f"the remote named origin refused the new branch '{branch}' at "
                 f"{commit[:10]}: {sent.said}. Asking again is safe.",
                 **said,
             )
-
-        # -- read the remote back ------------------------------------------
-        back = commits.what_the_remote_lists(branch)
+        if not sent.ok:
+            logger.info(
+                "publisher: the push of %s reported failure and the remote has "
+                "it at %s; it was created",
+                branch,
+                commit[:10],
+            )
         if not back.ok:
             return _not_created(
                 "the-remote-could-not-be-read-back",

@@ -246,6 +246,60 @@ class TestItReadsTheRemoteBack:
         assert record.state == INTENDED  # never "confirmed"
 
 
+    def test_a_push_that_says_it_failed_and_landed(self, world: dict[str, Any]) -> None:
+        """The reply was lost: the remote has the branch, so it was created."""
+        bare = world["project"]["bare"]
+        publisher = Publisher(world["settings"])
+        real = publisher._commits_for  # noqa: SLF001
+
+        class _ItsReplyWasLost:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            def send(self, commit: str, branch: str) -> Any:
+                self._inner.send(commit, branch)
+                return git_work.GitSaid(ok=False, said="git push ended with exit code 128")
+
+        publisher._commits_for = lambda route: _ItsReplyWasLost(real(route))  # noqa: SLF001
+
+        answer = publisher.create_mission_branch(_ask(world))
+
+        assert answer.created is True
+        assert answer.remote_tip == world["project"]["g"]
+        assert _the_remote_branch(bare) == world["project"]["g"]
+        record = TheMissionBranchRecords(Path(world["settings"].state_dir)).read(
+            PROJECT, BRANCH
+        )
+        assert record is not None and record.state == CONFIRMED
+
+    def test_a_push_that_failed_and_did_not_land_is_refused(
+        self, world: dict[str, Any]
+    ) -> None:
+        publisher = Publisher(world["settings"])
+        real = publisher._commits_for  # noqa: SLF001
+
+        class _Refused:
+            def __init__(self, inner: Any) -> None:
+                self._inner = inner
+
+            def __getattr__(self, name: str) -> Any:
+                return getattr(self._inner, name)
+
+            def send(self, commit: str, branch: str) -> Any:
+                return git_work.GitSaid(ok=False, said="git push ended with exit code 1")
+
+        publisher._commits_for = lambda route: _Refused(real(route))  # noqa: SLF001
+
+        answer = publisher.create_mission_branch(_ask(world))
+
+        assert answer.created is False
+        assert answer.refusal_kind == "the-remote-refused-the-branch"
+        assert _the_remote_branch(world["project"]["bare"]) is None
+
+
 class TestItRecovers:
     def test_a_lost_reply_then_the_same_request(self, world: dict[str, Any]) -> None:
         bare = world["project"]["bare"]
@@ -545,6 +599,47 @@ class TestTheCoordinatorAsksOverTheWire:
         assert answer.outcome == "unreachable"
         assert answer.created is False
         assert "500" in str(answer.refusal)
+
+    def test_an_older_publisher_without_the_route_is_refused(self) -> None:
+        """A stub answering as an older release does: 404 and no answer."""
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+        import threading
+
+        class _AnOlderPublisher(BaseHTTPRequestHandler):
+            def log_message(self, *_a: Any) -> None:
+                pass
+
+            def do_POST(self) -> None:  # noqa: N802
+                body = json.dumps({"error": f"no such path: {self.path}"}).encode()
+                self.send_response(404)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        stub = ThreadingHTTPServer(("127.0.0.1", 0), _AnOlderPublisher)
+        threading.Thread(target=stub.serve_forever, daemon=True).start()
+        try:
+            answer = asyncio.run(
+                publisher_client.ask_the_publisher_to_create_mission_branch(
+                    _Config(f"http://127.0.0.1:{stub.server_address[1]}"),
+                    project=PROJECT,
+                    mission_id=MISSION,
+                    branch=BRANCH,
+                    commit="a" * 40,
+                )
+            )
+        finally:
+            stub.shutdown()
+            stub.server_close()
+        assert answer.outcome == "refused"
+        assert answer.created is False
+        assert (
+            answer.refusal_kind
+            == publisher_client.THE_PUBLISHER_CANNOT_CREATE_MISSION_BRANCHES
+        )
+        assert "does not support creating mission branches" in str(answer.refusal)
+        assert "127.0.0.1" not in str(answer.refusal)
 
     def test_the_wire_answer_carries_no_credential(self, running: dict[str, Any]) -> None:
         import urllib.request
