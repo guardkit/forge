@@ -91,6 +91,17 @@ _DEPLOY_FAILED_WORDS: frozenset[str] = frozenset(
     {"merged-deploy-failed", "merged-deploy-reverted"}
 )
 
+#: A mission's card that keeps being refused for reasons that may pass (a
+#: preview service that raises, a commit that cannot be read) is tried at most
+#: once every OFFER_RETRY_SECONDS, and given up on (NOT_MERGED, the branch
+#: kept) once OFFER_ATTEMPTS failed offers have been made over at least
+#: OFFER_GIVE_UP_SECONDS. Each failed offer is one durable stage row on the
+#: mission's merge build, so a restart does not start the count again.
+OFFER_ATTEMPTS: int = 6
+OFFER_RETRY_SECONDS: int = 300
+OFFER_GIVE_UP_SECONDS: int = 1800
+MISSION_OFFER_ATTEMPT_TARGET_IDENTIFIER: str = "mission_offer_attempt"
+
 #: How many files the card names before it says "and N more".
 _RISKY_SHOWN: int = 12
 
@@ -289,10 +300,10 @@ async def finish_ready_missions(
         logger.warning("missions: could not list missions to finish (%s)", exc)
         return []
     started: list[str] = []
-    for build_id in _landings_to_resume(deps, cx):
+    for build_id, decided in _landings_to_resume(deps, cx):
         _resuming.add(build_id)
         started.append(build_id)
-        task = asyncio.create_task(_resume_guarded(deps, build_id))
+        task = asyncio.create_task(_resume_guarded(deps, build_id, decided=decided))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
     for mission in missions:
@@ -309,7 +320,7 @@ async def finish_ready_missions(
     return started
 
 
-def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[str]:
+def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[tuple[str, bool]]:
     """Mission features whose landing has not reported, and is not running.
 
     On every pass, so a restart carries every landing on: a COMPLETE feature
@@ -319,6 +330,13 @@ def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[str]:
     :data:`LANDING_GRACE_SECONDS` since it finished (the offer hook never ran).
     A build whose landing reported is never pressed again; one whose press
     keeps raising is given a FAILED landing report by the press's own bound.
+
+    THE DECISION ROW IS THE ONLY DURABLE PROOF OF A CLEAN FINISH. The offer
+    hook writes it only after the build's own terminal event said no task
+    failed; the ledger keeps no failed-task count. So a build with a decision
+    row is pressed, and one without (the hook never ran) is handed over with
+    its count unknown, which gives it a FAILED landing report and no press.
+    Answers ``(build id, has a decision row)``.
     """
     if deps.land is None:
         return []
@@ -348,7 +366,7 @@ def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[str]:
         return []
     records = PublicationRecordStore(cx)
     now = deps.clock()
-    due: list[str] = []
+    due: list[tuple[str, bool]] = []
     for build_id, finished_at, decided in rows:
         build_id = str(build_id)
         if build_id in _resuming:
@@ -364,15 +382,21 @@ def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[str]:
                 continue
         if records.read(build_id).lease_is_live(now):
             continue
-        due.append(build_id)
+        due.append((build_id, bool(decided)))
     return due
 
 
-async def _resume_guarded(deps: MissionFinishDeps, build_id: str) -> None:
+async def _resume_guarded(
+    deps: MissionFinishDeps, build_id: str, *, decided: bool
+) -> None:
     try:
         logger.info("missions: carrying on %s's landing, which has not reported", build_id)
         assert deps.land is not None
-        await deps.land(build_id)
+        if decided:
+            await deps.land(build_id)
+        else:
+            # Its failed-task count is not on record: unknown counts as failed.
+            await deps.land(build_id, tasks_failed=None)
     except Exception as exc:  # noqa: BLE001 — logged; tried again next pass
         logger.error(
             "missions: carrying on %s's landing raised (%s: %s)",
@@ -748,6 +772,11 @@ async def _freeze_and_offer(
     """Make the frozen source, read it back, and offer the card once."""
     from forge.pipeline.merge_offer import MERGE_OFFER_TARGET_IDENTIFIER
 
+    failed_offers = _failed_offers(deps, build_id)
+    if failed_offers:
+        since_last = (deps.clock() - failed_offers[-1]).total_seconds()
+        if since_last < OFFER_RETRY_SECONDS:
+            return "waiting to offer"
     tip = str(mission.final_commit or "")
     refusal = await make_frozen_source(git, build_id, tip)
     if refusal is not None:
@@ -805,6 +834,18 @@ async def _freeze_and_offer(
     # mission. An offer that gave no reason is tried again too.
     final = [sentence for sentence, may_pass in refusals if not may_pass]
     if not final:
+        why = "; ".join(sentence for sentence, _ in refusals) or "no reason given"
+        _record_failed_offer(deps, build_id, why)
+        failed_offers = _failed_offers(deps, build_id)
+        span = (failed_offers[-1] - failed_offers[0]).total_seconds()
+        if len(failed_offers) >= OFFER_ATTEMPTS and span >= OFFER_GIVE_UP_SECONDS:
+            return await _not_merged(
+                deps,
+                store,
+                mission,
+                f"the merge card could not be offered after {len(failed_offers)} "
+                f"tries over {int(span // 60)} minutes (last: {why})",
+            )
         logger.warning(
             "missions: %s's merge card was not offered (%s) — tried again on "
             "the next tick",
@@ -817,6 +858,38 @@ async def _freeze_and_offer(
         store,
         mission,
         f"the merge card could not be offered: {final[0]}",
+    )
+
+
+def _failed_offers(deps: MissionFinishDeps, build_id: str) -> list[datetime]:
+    """When each failed offer of this mission's card was made, oldest first."""
+    moments: list[datetime] = []
+    for stage in deps.pool.read_stages(build_id):
+        if stage.target_identifier != MISSION_OFFER_ATTEMPT_TARGET_IDENTIFIER:
+            continue
+        at = stage.started_at
+        moments.append(at if at.tzinfo else at.replace(tzinfo=timezone.utc))
+    return moments
+
+
+def _record_failed_offer(deps: MissionFinishDeps, build_id: str, why: str) -> None:
+    """One durable row per failed offer of the mission's card."""
+    from forge.lifecycle.persistence import StageLogEntry
+
+    now = deps.clock()
+    deps.pool.record_stage(
+        StageLogEntry(
+            build_id=build_id,
+            stage_label="mission merge card",
+            target_kind="local_tool",
+            target_identifier=MISSION_OFFER_ATTEMPT_TARGET_IDENTIFIER,
+            status="SKIPPED",
+            gate_mode=None,
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.0,
+            details={"mission_offer_attempt": {"refused": _first_sentence(why, 240)}},
+        )
     )
 
 

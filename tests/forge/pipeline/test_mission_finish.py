@@ -21,7 +21,7 @@ Missions design, 17 October 2026, section 7, and its tests in section 10
 from __future__ import annotations
 
 import subprocess
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -1092,8 +1092,72 @@ class TestARefusedOfferIsRetriedWhenItMayPass:
 
         assert await finish_ready_mission(deps, MISSION_ID) == "waiting to offer"
         assert store.get(MISSION_ID).status == "READY" and thread.lines == []
+        # Not offered again at once: once every OFFER_RETRY_SECONDS.
+        assert await finish_ready_mission(deps, MISSION_ID) == "waiting to offer"
+        assert len(calls) == 1
+        later = datetime.now(UTC) + timedelta(seconds=mission_finish.OFFER_RETRY_SECONDS + 1)
+        deps.clock = lambda: later
         assert await finish_ready_mission(deps, MISSION_ID) == "offered"
         assert len(wire.approvals) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_card_refused_for_half_an_hour_closes_the_mission(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        store = await self._ready(config_on, pool, repo_root)
+        tip = remote_tip(repo_root, MISSION_BRANCH)
+        calls: list[int] = []
+
+        async def offer(**kwargs: Any) -> bool:
+            calls.append(1)
+            kwargs["on_refusal"]("the preview could not be prepared", True)
+            return False
+
+        deps, thread = _finish_deps(config_on, pool, offer=offer)
+        start = datetime.now(UTC)
+        answers = []
+        for step in range(mission_finish.OFFER_ATTEMPTS + 1):
+            moment = start + timedelta(seconds=step * (mission_finish.OFFER_RETRY_SECONDS + 1))
+            deps.clock = lambda moment=moment: moment
+            answers.append(await finish_ready_mission(deps, MISSION_ID))
+            if answers[-1] != "waiting to offer":
+                break
+
+        # Six tries are only twenty-five minutes; the seventh is past thirty.
+        assert answers == ["waiting to offer"] * mission_finish.OFFER_ATTEMPTS + ["not merged"]
+        assert len(calls) == mission_finish.OFFER_ATTEMPTS + 1
+        mission = store.get(MISSION_ID)
+        assert mission.status == "NOT_MERGED"
+        assert "could not be offered after 7 tries" in str(mission.closed_reason)
+        assert "the preview could not be prepared" in str(mission.closed_reason)
+        assert remote_tip(repo_root, MISSION_BRANCH) == tip
+        assert len(thread.lines) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_count_of_failed_offers_survives_a_restart(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        store = await self._ready(config_on, pool, repo_root)
+
+        async def offer(**kwargs: Any) -> bool:
+            kwargs["on_refusal"]("the preview could not be prepared", True)
+            return False
+
+        start = datetime.now(UTC)
+        for step in range(mission_finish.OFFER_ATTEMPTS + 1):
+            # A fresh set of collaborators each time: nothing kept in memory.
+            deps, _thread = _finish_deps(config_on, pool, offer=offer)
+            moment = start + timedelta(seconds=step * (mission_finish.OFFER_RETRY_SECONDS + 1))
+            deps.clock = lambda moment=moment: moment
+            await finish_ready_mission(deps, MISSION_ID)
+
+        assert store.get(MISSION_ID).status == "NOT_MERGED"
 
     @pytest.mark.asyncio
     async def test_a_refusal_that_will_not_pass_closes_the_mission(
@@ -1267,7 +1331,7 @@ class TestALandingThatNeverReportedIsCarriedOn:
         assert "1 failed task(s)" in reports[0].details["detail"]
 
     @pytest.mark.asyncio
-    async def test_a_hook_that_never_ran_is_stepped_in_for_after_the_grace(
+    async def test_a_hook_that_never_ran_is_failed_after_the_grace_never_pressed(
         self,
         config_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -1289,7 +1353,17 @@ class TestALandingThatNeverReportedIsCarriedOn:
             datetime.now(UTC) - timedelta(seconds=mission_finish.LANDING_GRACE_SECONDS + 5),
         )
         assert await mission_finish.finish_ready_missions(deps, wait=True) == [B_BUILD]
-        assert len(publisher.asked) == 1
+        # NO DURABLE FAILED-TASK COUNT, SO UNKNOWN COUNTS AS FAILED: the build
+        # may have finished with failed tasks, and it is not pressed.
+        assert publisher.asked == []
+        reports = [
+            s for s in pool.read_stages(B_BUILD)
+            if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        ]
+        assert [r.status for r in reports] == ["FAILED"]
+        assert reports[0].details["result"] == "mission-landing-failed"
+        assert "could tell whether every task passed" in reports[0].details["detail"]
+        assert await mission_finish.finish_ready_missions(deps, wait=True) == []
 
     @pytest.mark.asyncio
     async def test_a_press_that_keeps_raising_gets_a_failed_report_and_stops(
@@ -1325,7 +1399,162 @@ class TestALandingThatNeverReportedIsCarriedOn:
         assert len(reports) == 1 and reports[0].status == "FAILED"
         details = reports[0].details
         assert details["result"] == "mission-landing-failed"
-        assert "RuntimeError 3 times" in details["detail"]
+        assert "RuntimeError on all 3 attempts" in details["detail"]
         assert details["merge_decision"]["execution_attempt_id"] == landing_attempt_id(B_BUILD)
         # The approved landing no longer holds the router.
         assert f"merge-approved-pending:{B_BUILD}" not in router_restart_blockers(pool.connection)
+
+
+class TestTheLandingCountIsDurable:
+    @pytest.mark.asyncio
+    async def test_a_restart_between_raises_still_stops_at_the_bound(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        router = _Router(set())
+        asked: list[str] = []
+        for _ in range(5):
+            # A new coordinator each pass: a fresh consumer, nothing in memory.
+            press, _joins, _deploy, publisher, _bus = press_deps(
+                config_on, pool, repo_root, routing_gate=router
+            )
+            consumer = MergeApprovalConsumer(press)
+            await consumer.land_mission_feature(B_BUILD)
+            asked.extend(a["target_branch"] for a in publisher.asked)
+
+        assert len(router.asked) == 3 and asked == []
+        attempts = [
+            s for s in pool.read_stages(B_BUILD)
+            if s.target_identifier == "mission_landing_attempt"
+        ]
+        assert [a.details["mission_landing_attempt"]["attempt"] for a in attempts] == [1, 2, 3]
+        reports = [
+            s for s in pool.read_stages(B_BUILD)
+            if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        ]
+        assert len(reports) == 1 and reports[0].status == "FAILED"
+
+    @pytest.mark.asyncio
+    async def test_a_press_that_took_the_coordinator_down_still_counts(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+
+        from tests.forge.pipeline.test_merge_executor import _the_kept_hold_runs_out
+
+        class _Down(BaseException):
+            """The coordinator going down: nothing in the press catches it."""
+
+        class _Crashes:
+            calls = 0
+
+            async def __call__(self, **_kwargs: Any) -> Any:
+                type(self).calls += 1
+                raise _Down("the coordinator went down mid-press")
+
+        for _ in range(3):
+            press, *_rest = press_deps(config_on, pool, repo_root, joins=_Crashes())
+            with pytest.raises(_Down):
+                await MergeApprovalConsumer(press).land_mission_feature(B_BUILD)
+            # The hold the dead press kept runs out on its own.
+            _the_kept_hold_runs_out(pool, B_BUILD)
+        press, joins, *_rest = press_deps(config_on, pool, repo_root)
+
+        assert await MergeApprovalConsumer(press).land_mission_feature(B_BUILD) is None
+        assert _Crashes.calls == 3 and joins.calls == []
+        reports = [
+            s for s in pool.read_stages(B_BUILD)
+            if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+        ]
+        assert len(reports) == 1 and "started 3 times and never reported" in (
+            reports[0].details["detail"]
+        )
+
+
+class TestNothingIsPressedTwice:
+    @pytest.mark.asyncio
+    async def test_a_resume_while_the_first_landing_waits_for_the_lock(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        import asyncio
+
+        a_running_mission(pool, keys=("B",))
+        the_mission_branch_on_the_remote(repo_root)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        press, joins, _deploy, publisher, _bus = press_deps(config_on, pool, repo_root)
+        consumer = MergeApprovalConsumer(press)
+
+        async def offer(**_kwargs: Any) -> bool:
+            return True
+
+        deps, _thread = _finish_deps(config_on, pool, offer=offer)
+        deps.land = consumer.land_mission_feature
+
+        lock = consumer._lock_for(REPO)
+        await lock.acquire()
+        first = asyncio.create_task(consumer.land_mission_feature(B_BUILD))
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if any(
+                s.target_identifier == "merge_deploy_decision"
+                for s in pool.read_stages(B_BUILD)
+            ):
+                break
+        # The resume sees a decision and no report, and must come back at once
+        # rather than queue a second press behind the first.
+        assert await mission_finish.finish_ready_missions(deps) == [B_BUILD]
+        await asyncio.wait_for(
+            asyncio.gather(*list(mission_finish._tasks)), timeout=5
+        )
+        lock.release()
+        await first
+
+        assert len([c for c in joins.calls if c["args"][0] == "merge"]) == 1
+        assert len(publisher.asked) == 1
+        decisions = [
+            s for s in pool.read_stages(B_BUILD)
+            if s.target_identifier == "merge_deploy_decision"
+        ]
+        assert len(decisions) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_landing_held_by_a_live_lease_is_not_resumed(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        TestALandingThatNeverReportedIsCarriedOn()._decided(pool, B_BUILD)
+        assert PublicationRecordStore(pool.connection).take_lease(
+            build_id=B_BUILD, holder="another-worker", now=datetime.now(UTC)
+        )
+        landed: list[str] = []
+
+        async def land(build_id: str, **_kwargs: Any) -> None:
+            landed.append(build_id)
+
+        async def offer(**_kwargs: Any) -> bool:
+            return True
+
+        deps, _thread = _finish_deps(config_on, pool, offer=offer)
+        deps.land = land
+
+        assert await mission_finish.finish_ready_missions(deps, wait=True) == []
+        assert landed == []

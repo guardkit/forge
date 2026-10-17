@@ -370,6 +370,13 @@ RESULT_WORD_PUBLISHED_TO_MISSION_BRANCH: str = "published-to-the-mission-branch"
 #: report, so the mission closes the attempt. Nothing was published.
 RESULT_WORD_MISSION_LANDING_FAILED: str = "mission-landing-failed"
 
+#: One stage row per landing press STARTED for a mission feature (written
+#: before the press runs, so a press that takes the coordinator down with it
+#: still counts). At ``publication.send_attempts`` started presses with no
+#: report, the build gets a FAILED landing report instead of another press.
+MISSION_LANDING_ATTEMPT_TARGET_IDENTIFIER: str = "mission_landing_attempt"
+MISSION_LANDING_STAGE_LABEL: str = "mission landing"
+
 #: THE EXECUTOR'S WORD FOR A COMMAND A TAKEOVER STOPPED. Written out here
 #: rather than imported, like the sidecar's own wall above, so this module does
 #: not depend on the sidecar; a test pins the two together
@@ -6311,9 +6318,7 @@ class MergeApprovalConsumer:
         # resumption asked for while the first landing still waits for the
         # repository's lock is not queued behind it a second time.
         self._landing_now: set[str] = set()
-        # How many times each mission feature's landing has raised in this
-        # process; at ``publication.send_attempts`` it gets a FAILED report.
-        self._landing_raises: dict[str, int] = {}
+
         self._subscription: Any = None
 
     async def attach(self, envelope_client: Any) -> Any:
@@ -6804,7 +6809,7 @@ class MergeApprovalConsumer:
                 )
 
     async def land_mission_feature(
-        self, build_id: str, *, tasks_failed: int = 0
+        self, build_id: str, *, tasks_failed: int | None = 0
     ) -> MergeDeployOutcome | None:
         """Merge a finished mission feature into its mission's branch. No card.
 
@@ -6829,10 +6834,13 @@ class MergeApprovalConsumer:
 
         A BUILD THAT CANNOT LAND GETS A FAILED LANDING REPORT, so the mission
         can close its attempt and nothing waits for ever: a build that
-        finished with failed tasks (``tasks_failed``), a repository this
-        factory does not know, and a press that raised as many times as a
-        merge word may try a send (``publication.send_attempts``, three by
-        default).
+        finished with failed tasks (``tasks_failed``), or whose failed-task
+        count is not known (``tasks_failed=None``: unknown counts as failed),
+        a repository this factory does not know, and a build whose press was
+        started as many times as a merge word may try a send
+        (``publication.send_attempts``, three by default) without reporting.
+        Each started press is one durable stage row, written before it runs,
+        so the count survives a press that takes the coordinator down.
 
         Idempotent: a build whose landing has already reported is never
         pressed again (``None``), and one whose decision is recorded but whose
@@ -6859,6 +6867,13 @@ class MergeApprovalConsumer:
                 build_id,
             )
             return None
+        if tasks_failed is None:
+            return self._landing_failed(
+                row,
+                f"{row.feature_id} was not merged into its mission's branch: the "
+                "factory stopped before it could tell whether every task "
+                "passed, and a build it cannot vouch for is not landed",
+            )
         if tasks_failed:
             return self._landing_failed(
                 row,
@@ -6918,6 +6933,19 @@ class MergeApprovalConsumer:
             async with self._lock_for(row.repo):
                 if _a_landing_has_reported(self._deps.pool, build_id):
                     return None
+                allowed = _how_many_attempts(self._deps.config)
+                started = self._landing_attempts(build_id)
+                if started >= allowed:
+                    self._landing_failed(
+                        row,
+                        f"{row.feature_id} could not be landed on "
+                        f"{mission.branch}: its press was started {started} "
+                        f"times and never reported",
+                        attempt_id=attempt_id,
+                    )
+                    return None
+                started += 1
+                self._record_landing_attempt(row, started)
                 try:
                     outcome = await execute_merge_deploy(
                         deps=self._deps,
@@ -6936,33 +6964,60 @@ class MergeApprovalConsumer:
                         deploy=False,
                     )
                 except Exception as exc:  # noqa: BLE001 — bounded, then reported
-                    raised = self._landing_raises.get(build_id, 0) + 1
-                    self._landing_raises[build_id] = raised
-                    allowed = _how_many_attempts(self._deps.config)
                     logger.error(
-                        "merge-executor: landing %s on %s raised (%s), %d of %d — "
-                        "see the receipts under merge-%s",
+                        "merge-executor: landing %s on %s raised (%s), attempt %d "
+                        "of %d — see the receipts under merge-%s",
                         build_id,
                         mission.branch,
                         exc,
-                        raised,
+                        started,
                         allowed,
                         build_id,
                     )
-                    if raised >= allowed:
+                    if started >= allowed:
                         self._landing_failed(
                             row,
                             f"{row.feature_id} could not be landed on "
                             f"{mission.branch}: the press stopped with "
-                            f"{type(exc).__name__} {raised} times "
+                            f"{type(exc).__name__} on all {allowed} attempts "
                             f"({_one_line(str(exc))[:200]})",
                             attempt_id=attempt_id,
                         )
                     return None
-                self._landing_raises.pop(build_id, None)
                 return outcome
         finally:
             self._landing_now.discard(build_id)
+
+    def _landing_attempts(self, build_id: str) -> int:
+        """How many landing presses were started for this build, durably."""
+        return sum(
+            1
+            for s in self._deps.pool.read_stages(build_id)
+            if s.target_identifier == MISSION_LANDING_ATTEMPT_TARGET_IDENTIFIER
+        )
+
+    def _record_landing_attempt(self, row: Any, number: int) -> None:
+        """One durable row per landing press started, before it runs."""
+        now = self._deps.clock()
+        self._deps.pool.record_stage(
+            StageLogEntry(
+                build_id=row.build_id,
+                stage_label=MISSION_LANDING_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MISSION_LANDING_ATTEMPT_TARGET_IDENTIFIER,
+                status="SKIPPED",
+                gate_mode=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={
+                    "mission_landing_attempt": {
+                        "attempt": number,
+                        "allowed": _how_many_attempts(self._deps.config),
+                    }
+                },
+            )
+        )
 
     def _landing_failed(
         self, row: Any, reason: str, *, attempt_id: str | None = None
