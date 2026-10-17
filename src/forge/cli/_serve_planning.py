@@ -799,18 +799,22 @@ def compose_planning_git_runner(
     # Each project's recorded fetch address goes to the runner that fetches
     # its starting point (Forge git hardening, 14 October 2026).
     addresses = dict(getattr(planning, "fetch_addresses", None) or {})
+    # The declared Git door, sent beside each address (17 October 2026).
+    door = getattr(planning, "git_door", None)
     default = (
         worktree_runner_factory()
         if worktree_runner_factory is not None
         else WorktreeGitRunner(
-            target_repo_paths=planning.target_repo_paths, fetch_addresses=addresses
+            target_repo_paths=planning.target_repo_paths, fetch_addresses=addresses,
+            git_door=door,
         )
     )
     if not planning.sandboxes:
         return default, None
     runners = {
         repo: SidecarGitRunner(
-            entry.sidecar_url, repo=repo, fetch_address=addresses.get(repo)
+            entry.sidecar_url, repo=repo, fetch_address=addresses.get(repo),
+            git_door=door,
         )
         for repo, entry in planning.sandboxes.items()
     }

@@ -172,12 +172,15 @@ class WorktreeGitRunner:
         hook_timeout_s: float = 900.0,
         target_repo_paths: Mapping[str, str] | None = None,
         fetch_addresses: Mapping[str, str] | None = None,
+        git_door: str | None = None,
     ) -> None:
         # The coordinator's own record of each project's clone and fetch
         # address (Forge git hardening, 14 October 2026): the starting point
         # is fetched from the recorded address, never the clone's origin.
+        # The declared Git door (planning.git_door, 17 October 2026).
         self._target_repo_paths = dict(target_repo_paths or {})
         self._fetch_addresses = dict(fetch_addresses or {})
+        self._git_door = git_door
         self._worktrees_root = worktrees_root or (
             Path(tempfile.gettempdir()) / "forge-planning-worktrees"
         )
@@ -232,7 +235,7 @@ class WorktreeGitRunner:
             self._target_repo_paths, self._fetch_addresses, repo
         )
         return await fetch_remote_start_point(
-            repo, branch, fetch_address=address, repo=name
+            repo, branch, fetch_address=address, repo=name, git_door=self._git_door
         )
 
     async def read_file_at_commit(
