@@ -73,6 +73,9 @@ async def test_a_good_record_is_admitted(project: Project, runner: WorktreeGitRu
     answer = await _admit(project, runner)
 
     assert answer.ok, answer.refusal
+    # Kept with the build, so the merge card knows a record was declared.
+    assert answer.admitted is not None
+    assert answer.admitted.reference_signed_off == RECORD_PATH
 
 
 @pytest.mark.parametrize(
@@ -125,6 +128,7 @@ async def test_without_a_record_setting_nothing_is_checked(
     answer = await _admit(project, runner)
 
     assert answer.ok, answer.refusal
+    assert answer.admitted is not None and answer.admitted.reference_signed_off is None
 
 
 # ---------------------------------------------------------------------------

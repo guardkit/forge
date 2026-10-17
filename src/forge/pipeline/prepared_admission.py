@@ -88,6 +88,11 @@ class AdmittedBuild:
     source_commit: str
     memory_project: str
     launch_settings: tuple[str, ...] = ()
+    #: The project's ``reference.signed_off`` record at the admitted commit,
+    #: or ``None`` when it declares none (17 October 2026, Codex
+    #: implementation review R4). Kept with the build row, so the merge card
+    #: knows a record was declared even if the commit cannot be read later.
+    reference_signed_off: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +176,8 @@ async def admit_prepared_build(
     )
     if missing is not None:
         return AdmissionAnswer(refusal=missing)
+    # Already checked (and found well formed) by the bundle check above.
+    reference, _why = read_declared_reference(declarations.content)
 
     return AdmissionAnswer(
         admitted=AdmittedBuild(
@@ -179,6 +186,7 @@ async def admit_prepared_build(
             source_commit=source,
             memory_project=str(declarations.memory_project),
             launch_settings=tuple(declarations.launch_settings),
+            reference_signed_off=reference.signed_off if reference.declared else None,
         )
     )
 
