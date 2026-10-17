@@ -837,6 +837,132 @@ async def test_with_no_publisher_address_the_composed_flow_refuses_at_intake_and
     )
 
 
+# ---------------------------------------------------------------------------
+# R7: STARTING is written with the approval, and the seed is made from there
+# ---------------------------------------------------------------------------
+
+
+class _RealGate:
+    """The real routing gate and seed store, with a stand-in router."""
+
+    def __init__(self, cx: sqlite3.Connection, *, answers_ok: bool = True) -> None:
+        from forge.lifecycle.feature_routing import FeatureRoutingSeedStore
+        from forge.pipeline.feature_routing import (
+            ACTUAL_SERVER_HEADER,
+            STORED_SERVER_HEADER,
+            FeatureRoutingGate,
+        )
+
+        self.seeds_sent = 0
+        self.status_when_seeded: list[str] = []
+        self.cx = cx
+        headers = {STORED_SERVER_HEADER: "1", ACTUAL_SERVER_HEADER: "1"}
+
+        async def request(url: str, key: str, timeout: float, preference: int) -> Any:
+            self.seeds_sent += 1
+            row = cx.execute(
+                "SELECT status FROM missions WHERE correlation_id = ?", (key,)
+            ).fetchone()
+            self.status_when_seeded.append(str(row[0]) if row else "none")
+            if not answers_ok:
+                raise OSError("the router is not answering")
+            return 200, headers
+
+        self.store = FeatureRoutingSeedStore(cx)
+        self.gate = FeatureRoutingGate(self.store, "http://router.invalid", request=request)
+
+    async def ensure_seeded(self, key: str, **kwargs: Any) -> Any:
+        return await self.gate.ensure_seeded(key, **kwargs)
+
+
+def _approved_and_crashed(missions: MissionStore) -> Any:
+    """A mission whose approval was written (so STARTING) before the forge stopped."""
+    mission, _ = missions.create_mission(
+        title="Tags for notes",
+        target_repo=REPO,
+        correlation_id=CID,
+        originating_user=RICH,
+        features=_features(),
+    )
+    assert missions.record_approval(mission.id, approved_by=RICH, plan_request_id="req-1")
+    return missions.get(mission.id)
+
+
+@pytest.mark.asyncio
+async def test_approval_writes_starting_before_the_seed(cx) -> None:
+    missions = MissionStore(cx)
+    gate = _RealGate(cx)
+    publisher = _Publisher(missions, ["created"])
+    answers: list[Any] = []
+    flow = _flow(missions, answers=answers, gate=gate, publisher=publisher, cards=[], said=[])
+    mission = _propose(flow)
+    answers.append(_answer("approve", _request_id(mission.id)))
+    await _settle()
+    assert gate.status_when_seeded == ["STARTING"]  # never seeded while PROPOSED
+    assert missions.get(mission.id).status == "RUNNING"
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_starting_before_the_seed_seeds_then_asks_for_the_branch(
+    cx,
+) -> None:
+    missions = MissionStore(cx)
+    mission = _approved_and_crashed(missions)
+    assert f"mission:{mission.id}:STARTING" in router_restart_blockers(cx)
+    gate = _RealGate(cx)
+    publisher = _Publisher(missions, ["created"])
+    restarted = _flow(missions, answers=[], gate=gate, publisher=publisher, cards=[], said=[])
+    await restarted.tend()
+    await _settle()
+    assert gate.seeds_sent == 1
+    assert len(publisher.requests) == 1
+    assert missions.get(mission.id).status == "RUNNING"
+
+
+@pytest.mark.asyncio
+async def test_a_crash_after_the_seed_reuses_its_receipt_and_asks_for_the_branch(cx) -> None:
+    missions = MissionStore(cx)
+    mission = _approved_and_crashed(missions)
+    gate = _RealGate(cx)
+    await gate.ensure_seeded(mission.correlation_id, origin_kind="mission", origin_id=mission.id)
+    assert gate.seeds_sent == 1  # ... and then the forge stopped
+    publisher = _Publisher(missions, ["created"])
+    restarted = _flow(missions, answers=[], gate=gate, publisher=publisher, cards=[], said=[])
+    await restarted.tend()
+    await _settle()
+    assert gate.seeds_sent == 1  # no second seed: the stored receipt
+    assert len(publisher.requests) == 1
+    assert missions.get(mission.id).status == "RUNNING"
+
+
+@pytest.mark.asyncio
+async def test_an_unknown_seed_on_recovery_is_not_started(cx) -> None:
+    missions = MissionStore(cx)
+    mission = _approved_and_crashed(missions)
+    gate = _RealGate(cx, answers_ok=False)
+    with pytest.raises(Exception):
+        await gate.ensure_seeded(
+            mission.correlation_id, origin_kind="mission", origin_id=mission.id
+        )
+    gate.store.poison_unfinished_seeds_on_boot()  # the boot after the crash
+    assert gate.store.state_for(mission.correlation_id) == "UNKNOWN"
+    publisher = _Publisher(missions, ["created"])
+    restarted = _flow(missions, answers=[], gate=gate, publisher=publisher, cards=[], said=[])
+    await restarted.tend()
+    await _settle()
+    got = missions.get(mission.id)
+    assert got.status == "NOT_STARTED" and got.closed_reason == ROUTING_NOT_SET_UP
+    assert publisher.requests == [] and missions.attempts(mission.id) == []
+    assert gate.seeds_sent == 1  # never retried
+
+
+def test_a_starting_mission_with_no_planning_run_blocks_a_router_restart(cx) -> None:
+    missions = MissionStore(cx)
+    mission = _approved_and_crashed(missions)
+    assert cx.execute("SELECT COUNT(*) FROM planning_runs").fetchone()[0] == 0
+    assert f"mission:{mission.id}:STARTING" in router_restart_blockers(cx)
+
+
 @pytest.mark.asyncio
 async def test_a_refused_branch_is_not_started(cx) -> None:
     missions = MissionStore(cx)

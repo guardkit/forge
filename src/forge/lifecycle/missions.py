@@ -531,14 +531,19 @@ class MissionStore:
     def record_approval(
         self, mission_id: str, *, approved_by: str, plan_request_id: str
     ) -> bool:
-        """Write who approved the plan card, when, and which request it was.
+        """Write who approved the plan card, when, which request it was, and STARTING.
 
-        Only on a PROPOSED mission with no approval yet: the first answer wins.
-        The status is not changed here; the approval handler moves it next.
+        One statement, so the approval and the move to STARTING land together:
+        an approved mission is never left PROPOSED, where every maintenance
+        check would read it as idle while its routing seed is being made
+        (Codex implementation review, round 2, R7). Only on a PROPOSED mission
+        with no approval yet: the first answer wins. The routing seed and the
+        branch request come after, from STARTING.
         """
         with self.transaction() as cx:
             cursor = cx.execute(
-                "UPDATE missions SET approved_by = ?, approved_at = ?, plan_request_id = ? "
+                "UPDATE missions SET approved_by = ?, approved_at = ?, plan_request_id = ?, "
+                "status = 'STARTING' "
                 "WHERE id = ? AND status = 'PROPOSED' AND approved_at IS NULL",
                 (approved_by, self._now(), plan_request_id, mission_id),
             )

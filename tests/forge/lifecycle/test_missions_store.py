@@ -105,8 +105,10 @@ def test_approval_first_answer_wins_and_status_is_compare_and_swap(cx) -> None:
     store = MissionStore(cx)
     mission = _mission(store)
     assert store.record_approval(mission.id, approved_by="U1", plan_request_id="r1")
+    # The approval and STARTING land in one statement (R7): never approved
+    # and still PROPOSED.
+    assert store.get(mission.id).status == "STARTING"
     assert not store.record_approval(mission.id, approved_by="U2", plan_request_id="r2")
-    assert store.set_status(mission.id, "STARTING", expected=("PROPOSED",))
     assert not store.set_status(mission.id, "STARTING", expected=("PROPOSED",))
     assert store.set_base_commit(mission.id, "a" * 40)
     assert not store.set_base_commit(mission.id, "b" * 40)

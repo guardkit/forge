@@ -10,11 +10,11 @@ planning intake as a queue command with the verb ``mission``. This module
   stage label ``"the mission plan"`` and the features in the order they will
   run;
 * on Approve (the expected approver only, first answer wins, a timeout counts
-  as no) records who approved and which request it was, seeds the factory's
-  model routing for the mission ONCE, moves it to STARTING, stores the main tip
-  the branch is to be made at BEFORE asking the publisher to create
-  ``mission/m-<6 hex>`` there, and, once the publisher confirms the branch,
-  files one WAITING attempt per feature and moves it to RUNNING;
+  as no) records who approved, which request it was and STARTING in one
+  transaction, then seeds the factory's model routing for the mission ONCE,
+  stores the main tip the branch is to be made at BEFORE asking the publisher
+  to create ``mission/m-<6 hex>`` there, and, once the publisher confirms the
+  branch, files one WAITING attempt per feature and moves it to RUNNING;
 * on Reject records REJECTED and files nothing.
 
 A routing seed that comes back unknown or failed is never retried (the gate's
@@ -451,10 +451,7 @@ class MissionFlow:
         published = False
         while True:
             mission = self._missions.get(mission_id)
-            if mission is None or mission.status != "PROPOSED":
-                return
-            if mission.approved_at:
-                await self._after_approval(mission)
+            if mission is None or mission.status != "PROPOSED" or mission.approved_at:
                 return
             remaining = self._remaining_seconds(mission)
             if remaining <= 0:
@@ -511,7 +508,7 @@ class MissionFlow:
                 ):
                     approved = self._missions.get(mission.id)
                     assert approved is not None
-                    await self._after_approval(approved)
+                    await self.start_branch(approved)
                 return
             if decision == "reject":
                 if self._missions.set_status(
@@ -525,56 +522,58 @@ class MissionFlow:
                 return
             # A defer keeps the card waiting.
 
-    # -- after Approve -----------------------------------------------------
+    # -- after Approve: STARTING -------------------------------------------
 
-    async def _after_approval(self, mission: Mission) -> None:
-        """Seed routing once, move to STARTING, and ask for the branch."""
+    async def _ready_to_start(self, mission: Mission) -> bool:
+        """Check the factory can run it and seed routing, from STARTING. False
+        after moving the mission to NOT_STARTED.
+
+        Run on every pass over a STARTING mission — straight after the
+        approval and again after a restart — before the branch is asked for.
+        The seed is idempotent: one that SUCCEEDED returns its stored receipt
+        and makes no second seed. One that is UNKNOWN or FAILED is never
+        retried (the gate's seed-once rule): the mission becomes NOT_STARTED.
+        """
         unable = self.cannot_start_reason()
         if unable is not None:
-            # The factory was set up differently when the card went out (a
+            # The factory is set up differently from when the card went out (a
             # restart with other settings). Nothing has been seeded or built.
+            await self._not_started(mission, unable)
+            return False
+        if self._routing_gate is None:
+            return True
+        try:
+            await self._routing_gate.ensure_seeded(
+                mission.correlation_id, origin_kind="mission", origin_id=mission.id
+            )
+        except Exception as exc:  # noqa: BLE001 — never retried (seed once)
+            logger.warning(
+                "missions: %s routing seed did not succeed (%s: %s); NOT_STARTED",
+                mission.id,
+                type(exc).__name__,
+                exc,
+            )
             if self._missions.set_status(
-                mission.id, "NOT_STARTED", expected=("PROPOSED",), reason=unable
+                mission.id, "NOT_STARTED", expected=("STARTING",), reason=ROUTING_NOT_SET_UP
             ):
                 await self._say(
                     mission,
-                    f'Mission "{mission.title}" was not started: {unable}. '
-                    "Nothing was built.",
+                    f'Mission "{mission.title}" was not started: '
+                    f"{ROUTING_NOT_SET_UP}. You can send it again.",
                 )
-            return
-        if self._routing_gate is not None:
-            try:
-                await self._routing_gate.ensure_seeded(
-                    mission.correlation_id, origin_kind="mission", origin_id=mission.id
-                )
-            except Exception as exc:  # noqa: BLE001 — never retried (seed once)
-                logger.warning(
-                    "missions: %s routing seed did not succeed (%s: %s); NOT_STARTED",
-                    mission.id,
-                    type(exc).__name__,
-                    exc,
-                )
-                if self._missions.set_status(
-                    mission.id, "NOT_STARTED", expected=("PROPOSED",), reason=ROUTING_NOT_SET_UP
-                ):
-                    await self._say(
-                        mission,
-                        f'Mission "{mission.title}" was not started: '
-                        f"{ROUTING_NOT_SET_UP}. You can send it again.",
-                    )
-                return
-        self._missions.set_status(mission.id, "STARTING", expected=("PROPOSED",))
-        starting = self._missions.get(mission.id)
-        if starting is not None and starting.status == "STARTING":
-            await self.start_branch(starting)
+            return False
+        return True
 
     async def start_branch(self, mission: Mission) -> None:
-        """Store the main tip, ask the publisher for the branch, and start on yes.
+        """Seed routing, store the main tip, ask for the branch, and start on yes.
 
-        Each step is written down before the next: ``base_commit`` is on the
-        mission row before the request is sent, and the attempts are filed
-        only once the branch is confirmed, so a restart sends the same request
-        again and can never find a feature merged on an unconfirmed branch.
+        The mission is already STARTING (the approval wrote it), so every
+        maintenance check counts it as active from the first step. Each step is
+        written down before the next: the routing seed, then ``base_commit`` on
+        the mission row before the request is sent, and the attempts filed only
+        once the branch is confirmed. A restart therefore repeats the same
+        steps — the seed returns its receipt, the same request is sent again —
+        and can never find a feature merged on an unconfirmed branch.
         """
         if mission.id in self._starting:
             return
@@ -586,6 +585,8 @@ class MissionFlow:
 
     async def _start_branch(self, mission: Mission) -> None:
         self._last_sent[mission.id] = self._clock()
+        if not await self._ready_to_start(mission):
+            return
         commit = mission.base_commit
         if not commit:
             try:
@@ -654,13 +655,16 @@ class MissionFlow:
     async def tend(self) -> None:
         """Re-arm PROPOSED missions' cards and resend STARTING missions' requests.
 
-        Run from the work queue loop's tick. A PROPOSED mission with no waiter
-        in this process (the forge restarted) gets its card re-armed and posted
-        again, the same card; one already approved before the restart carries
-        on from its approval. A STARTING mission is sent its branch request
-        again, at most once a minute, the first time straight after a restart.
+        Run from the work queue loop's tick. An unapproved PROPOSED mission
+        with no waiter in this process (the forge restarted) gets its card
+        re-armed and posted again, the same card. A STARTING mission goes
+        through its start again — the seed (its stored receipt, or NOT_STARTED
+        if it is unknown or failed), the stored main tip, the branch request —
+        at most once a minute, the first time straight after a restart.
         """
         for mission in self._missions.list_by_status(("PROPOSED",)):
+            if mission.approved_at:
+                continue  # never left so by this version; nothing to re-arm
             self._start_waiting(mission, republish=True)
         now = self._clock()
         for mission in self._missions.list_by_status(("STARTING",)):

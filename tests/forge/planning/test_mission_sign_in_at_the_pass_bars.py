@@ -58,7 +58,7 @@ def _member(store: SqlitePlanningRunStore, *, no_sign_in: bool) -> str:
         features=[MissionFeature(key="A", sentence="version", no_sign_in=no_sign_in)],
     )
     missions.record_approval(mission.id, approved_by="U0RIGINATOR", plan_request_id="req-7")
-    missions.set_status(mission.id, "RUNNING", expected=("PROPOSED",))
+    missions.set_status(mission.id, "RUNNING", expected=("STARTING",))
     store._connection.execute(
         "INSERT INTO mission_attempts (mission_id, key, attempt, correlation_id, status) "
         "VALUES (?, 'A', 1, ?, 'ADMITTED')",
