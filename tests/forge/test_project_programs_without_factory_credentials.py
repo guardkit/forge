@@ -1933,6 +1933,11 @@ ALLOWED: dict[tuple[str, str], str] = {
         "environment as _launch"
     ),
     ("review_gate/record.py", "validate_review_findings"): "guardkit qa validate, a factory program",
+    ("security_sweep/scanners.py", "run_tool"): (
+        "the nightly security sweep's scanners (the image's Gitleaks, "
+        "OSV-Scanner and Opengrep, by absolute path) with an environment of "
+        "PATH and a fresh HOME only"
+    ),
     ("subagents/autobuild_runner.py", "_guardkit_feature_validate"): "guardkit feature validate, a factory program",
     ("subagents/autobuild_runner.py", "_run_one_build"): "starts GuardKit's build with the factory's launch list",
 }

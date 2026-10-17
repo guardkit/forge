@@ -1317,3 +1317,140 @@ class TestTheWebToolchain:
             dockerfile_text,
             re.MULTILINE,
         )
+
+
+class TestTheSecurityScanners:
+    """17 October 2026 (security check design, piece 2): Gitleaks, OSV-Scanner
+    and Opengrep in the factory's image, the factory's own scanner settings,
+    and the Opengrep security rules built at image build time. The static
+    halves are here; the self-check RUN proves the versions and a rule match
+    inside the image as uid 1000 in the Player's minimal environment."""
+
+    BINARIES = (
+        (
+            "GITLEAKS",
+            "8.30.1",
+            "e4a487ee7ccd7d3a7f7ec08657610aa3606637dab924210b3aee62570fb4b080",
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/"
+            "gitleaks_${GITLEAKS_VERSION}_linux_arm64.tar.gz",
+            "/tmp/gitleaks.tgz",
+        ),
+        (
+            "OSV_SCANNER",
+            "2.7.0",
+            "4061ef4c021ed3c47f203b818f337e351336cc5cd67c0274fc36bd1dfc728dd7",
+            "https://github.com/google/osv-scanner/releases/download/v${OSV_SCANNER_VERSION}/"
+            "osv-scanner_linux_arm64",
+            "/tmp/osv-scanner",
+        ),
+        (
+            "OPENGREP",
+            "1.30.1",
+            "a730f6fdce1e978ea29e610a2e0503bfe1ec31fce08979a9a84e3699f03e16ee",
+            "https://github.com/opengrep/opengrep/releases/download/v${OPENGREP_VERSION}/"
+            "opengrep_manylinux_aarch64",
+            "/tmp/opengrep",
+        ),
+    )
+
+    @pytest.mark.parametrize(("name", "version", "digest", "url", "path"), BINARIES)
+    def test_each_binary_is_pinned_and_checked_before_it_is_installed(
+        self, dockerfile_text: str, name: str, version: str, digest: str, url: str, path: str
+    ) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert re.search(
+            rf"^ARG\s+{name}_VERSION={re.escape(version)}\s*$", runtime_body, re.MULTILINE
+        ), f"{name} must be pinned at {version}"
+        assert re.search(rf"^ARG\s+{name}_SHA256={digest}\s*$", runtime_body, re.MULTILINE), (
+            f"{name}'s sha256 must be the one recorded in the design"
+        )
+        (run,) = [r for r in _run_instructions(runtime_body) if url in r]
+        download = run.index(url)
+        check = run.index(f'echo "${{{name}_SHA256}}  {path}" | sha256sum --check --strict -')
+        use = run.index(f"--file {path}") if name == "GITLEAKS" else run.index(f"install -m 0755 -o root -g root {path}")
+        assert download < check < use, f"{name} must be checked before it is unpacked or installed"
+
+    def test_the_scanners_are_linked_where_the_player_looks(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        for tool in ("gitleaks", "osv-scanner", "opengrep"):
+            assert re.search(
+                rf"&& ln -s /usr/local/bin/{tool} /usr/bin/{tool}(?:\s|$)", runtime_body
+            ), f"{tool} must be linked into /usr/bin with a plain ln -s"
+        assert "--no-same-owner gitleaks" in runtime_body
+
+    def test_the_factory_scanner_settings_are_in_the_image(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert (
+            "COPY deploy/security/compose-rules.yaml /opt/factory-security/compose-rules.yaml"
+            in runtime_body
+        )
+        (run,) = [r for r in _run_instructions(runtime_body) if "gitleaks-ignore" in r]
+        assert "mkdir -p /opt/factory-security/gitleaks-ignore" in run
+        assert "touch /opt/factory-security/osv-scanner.toml" in run
+        assert "test ! -s /opt/factory-security/osv-scanner.toml" in run
+        assert (REPO_ROOT / "deploy" / "security" / "compose-rules.yaml").is_file()
+
+    def test_the_opengrep_rules_are_built_from_the_pinned_commit_and_checked(
+        self, dockerfile_text: str
+    ) -> None:
+        stage = re.search(
+            r"^FROM\s+python:3\.14-slim-bookworm@sha256:[0-9a-f]{64}\s+AS\s+opengrep-rules\b"
+            r"(?P<body>.*?)^FROM\s",
+            dockerfile_text,
+            re.MULTILINE | re.DOTALL,
+        )
+        assert stage, "the rules are built in their own throwaway stage"
+        body = stage.group("body")
+        assert re.search(
+            r"^ARG\s+OPENGREP_RULES_COMMIT=f1d2b562b414783763fd02a6ed2736eaed622efa\s*$",
+            body,
+            re.MULTILINE,
+        )
+        # 1,338 rules: every security rule in the .yaml and .yml rule files,
+        # less the 225 secret-value detectors Gitleaks owns (fix pass,
+        # 17 October; listed in deploy/security/dropped-secret-rules.txt).
+        assert re.search(
+            r"^ARG\s+OPENGREP_RULES_SHA256="
+            r"ba63c213f10965b80822c3427eb691e7c1b958e6e92b5ba5b9c004a9030f61d2\s*$",
+            body,
+            re.MULTILINE,
+        )
+        assert 'test "$(git -C /src/opengrep-rules rev-parse HEAD)" = "${OPENGREP_RULES_COMMIT}"' in body
+        assert (
+            'echo "${OPENGREP_RULES_SHA256}  /out/security-rules.yaml" | sha256sum --check --strict -'
+            in body
+        )
+        assert "COPY --from=builder /opt/venv/lib/python3.14/site-packages/yaml" in body
+        assert "pip install" not in body, "nothing is installed to build the rules"
+        assert "HOW THE DOWNLOAD IS TRUSTED" in dockerfile_text
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        assert (
+            "COPY --from=opengrep-rules /out/security-rules.yaml /out/security-rules.yaml.sha256 "
+            "/opt/opengrep/" in runtime_body
+        )
+
+    def test_the_self_check_proves_the_scanners_as_the_player(self, dockerfile_text: str) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        (run,) = [r for r in _run_instructions(runtime_body) if "as_player=" in r]
+        run = re.sub(r"\s+", " ", run)
+        for check in (
+            'test "$(${as_player} gitleaks version)" = "${GITLEAKS_VERSION}"',
+            '${as_player} osv-scanner --version | grep -qx "osv-scanner version: ${OSV_SCANNER_VERSION}"',
+            'test "$(${as_player} opengrep --version)" = "${OPENGREP_VERSION}"',
+            "(cd /opt/opengrep && sha256sum --check --strict security-rules.yaml.sha256)",
+            "timeout --kill-after=5 120 ${as_player} opengrep scan --config /opt/opengrep/security-rules.yaml"
+            " --config /opt/factory-security/compose-rules.yaml",
+            "grep -q 'factory-compose-privileged' \"${check_home}/opengrep.json\"",
+            "grep -q 'secret-in-build-arg' \"${check_home}/opengrep.json\"",
+        ):
+            assert check in run, f"the self-check must include: {check}"
+
+    def test_the_scanner_layers_sit_before_the_self_check_and_the_barrier(
+        self, dockerfile_text: str
+    ) -> None:
+        runtime_body = _runtime_stage_body(dockerfile_text)
+        scanners = runtime_body.index("ARG GITLEAKS_VERSION=")
+        rules = runtime_body.index("COPY --from=opengrep-rules")
+        self_check = runtime_body.index('RUN check_home="$(mktemp -d)"')
+        barrier = runtime_body.index("ARG FORGE_GIT_SHA")
+        assert runtime_body.index("ARG STATICCHECK_VERSION=") < scanners < rules < self_check < barrier

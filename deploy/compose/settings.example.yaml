@@ -76,3 +76,25 @@ publication:
   # publisher, which is the whole of the route to it. No credential travels
   # this way in either direction.
   publisher_url: "${FORGE_PUBLISHER_URL}"
+
+# THE NIGHTLY SECURITY CHECK (security check design, 17 October 2026). Off.
+# Switched on, the coordinator fetches each project in
+# 'planning.fetch_addresses' once a night into its own copy, scans the
+# default branch for secrets, vulnerable dependencies and risky code, has the
+# factory's own model sort what it finds, files the serious problems as one
+# ordinary repair request per project (a normal spec card for the approver),
+# and posts one Slack line. It starts only when nothing is building or being
+# planned; while the factory is busy it looks again every 15 minutes until
+# 'until'. 'forge security-sweep --once' runs one sweep by hand. Times are
+# UTC. Its files live in a 'security-sweep' folder beside the database.
+security_sweep:
+  enabled: false
+  at: "02:30"
+  until: "06:00"
+  # A dependency advisory scoring this or more counts as serious; a known
+  # malicious package always does.
+  serious_score: 7.0
+  # false = report only, never file a repair request.
+  draft_repairs: true
+  # The one day a night with nothing new still posts "all clear"; null = never.
+  weekly_all_clear: monday

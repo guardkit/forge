@@ -1964,6 +1964,115 @@ class ReviewPreviewConfig(BaseModel):
         return value
 
 
+#: The weekday names ``security_sweep.weekly_all_clear`` accepts.
+SECURITY_SWEEP_WEEKDAYS: tuple[str, ...] = (
+    "monday",
+    "tuesday",
+    "wednesday",
+    "thursday",
+    "friday",
+    "saturday",
+    "sunday",
+)
+
+
+class SecuritySweepConfig(BaseModel):
+    """The nightly security sweep of every product the factory builds.
+
+    Security check design, 17 October 2026, piece 3. Once a night the
+    coordinator fetches each project it builds from GitHub (the
+    ``planning.fetch_addresses`` list), scans the default branch for secrets,
+    vulnerable dependencies and risky code, has the factory's own model sort
+    the code and secret findings, and files the serious ones as one ordinary
+    repair request per project. Rich sees that request as a normal spec card.
+    One Slack line says what happened.
+
+    Off unless this block says ``enabled: true``. With it off, nothing is
+    scheduled and ``forge security-sweep --once`` refuses to run.
+
+    **Deploy-order law** (as :class:`MergeExecutorConfig`): ``extra="forbid"``
+    here and on the root, so writing a ``security_sweep:`` block into a
+    deployed ``forge.yaml`` before the image that defines it is running
+    refuses the whole file.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "True = the coordinator runs the sweep each night and "
+            "'forge security-sweep --once' may be run by hand. False "
+            "(default) = no sweep."
+        ),
+    )
+    at: str = Field(
+        default="02:30",
+        description=(
+            "The time of night (UTC, HH:MM) the sweep first tries to start. "
+            "It starts only when no build, planning run or unanswered merge "
+            "card is in flight; otherwise it looks again every 15 minutes."
+        ),
+    )
+    until: str = Field(
+        default="06:00",
+        description=(
+            "The latest time (UTC, HH:MM) the sweep may start. A night with "
+            "no quiet moment before then is reported as skipped. A time "
+            "earlier than 'at' means the next morning."
+        ),
+    )
+    serious_score: float = Field(
+        default=7.0,
+        ge=0.0,
+        le=10.0,
+        description=(
+            "A dependency advisory with at least this severity score (the "
+            "CVSS base score OSV records) counts as serious and may be "
+            "drafted as a repair. Malicious packages always count."
+        ),
+    )
+    draft_repairs: bool = Field(
+        default=True,
+        description=(
+            "True (default) = serious findings are filed as one repair "
+            "request per project, which reaches Rich as a normal spec card. "
+            "False = the sweep only reports."
+        ),
+    )
+    weekly_all_clear: str | None = Field(
+        default="monday",
+        description=(
+            "The weekday (a name such as 'monday') on which a night with "
+            "nothing to say still posts one 'all clear' line. None = never."
+        ),
+    )
+
+    @field_validator("at", "until")
+    @classmethod
+    def _a_time_of_day(cls, value: str) -> str:
+        text = str(value).strip()
+        match = re.fullmatch(r"([01]?\d|2[0-3]):([0-5]\d)", text)
+        if match is None:
+            raise ValueError(
+                f"must be a time of day written HH:MM (UTC), got {value!r}"
+            )
+        return f"{int(match.group(1)):02d}:{match.group(2)}"
+
+    @field_validator("weekly_all_clear")
+    @classmethod
+    def _a_weekday(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip().lower()
+        if text not in SECURITY_SWEEP_WEEKDAYS:
+            raise ValueError(
+                "must be a weekday name (monday to sunday) or null, got "
+                f"{value!r}"
+            )
+        return text
+
+
 class ForgeConfig(BaseModel):
     """Root model for ``forge.yaml``.
 
@@ -2054,6 +2163,14 @@ class ForgeConfig(BaseModel):
             "turns its preview on then gets a failed preview saying so."
         ),
     )
+    security_sweep: SecuritySweepConfig = Field(
+        default_factory=SecuritySweepConfig,
+        description=(
+            "The nightly security sweep of every product the factory "
+            "fetches from GitHub (security check design, 17 October 2026). "
+            "Defaults to disabled (enabled=False): nothing is scheduled."
+        ),
+    )
     resource_preflight: ResourcePreflightConfig = Field(
         default_factory=ResourcePreflightConfig,
         description=(
@@ -2118,6 +2235,8 @@ __all__ = [
     "ReviewGateConfig",
     "ReviewPreviewConfig",
     "RoutineConfig",
+    "SECURITY_SWEEP_WEEKDAYS",
+    "SecuritySweepConfig",
 ]
 
 
