@@ -30,6 +30,7 @@ one plain sentence.
 
 from __future__ import annotations
 
+import logging
 import re
 from dataclasses import dataclass
 from typing import Any, Sequence
@@ -93,6 +94,8 @@ PROTOTYPE_NOT_READ_LINE: str = (
     "The signed-off prototype version could not be read for this build."
 )
 
+logger = logging.getLogger(__name__)
+
 _ORDINARY_MODES = frozenset({"100644", "100755"})
 _LINK_MODE = "120000"
 _FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
@@ -101,6 +104,17 @@ _FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 #: both give the path alone).
 _PATH_REST = r"[^\s`'\"<>()\[\]]*"
 _TRAILING = ".,;:!?"
+#: Slack's link forms, ``<address|text>`` and ``<address>`` (17 October 2026,
+#: coach's review): Slack turns ``notes.md`` in a typed path into
+#: ``<http://notes.md|notes.md>``, so the text part is what was typed.
+_SLACK_LINK_WITH_TEXT = re.compile(r"<[^<>|\s]*\|([^<>]*)>")
+_SLACK_LINK = re.compile(r"<([^<>|@#!\s][^<>|\s]*)>")
+
+
+def _as_typed(request_text: str) -> str:
+    """The request with Slack's link forms put back as the words typed."""
+    text = _SLACK_LINK_WITH_TEXT.sub(lambda m: m.group(1), request_text or "")
+    return _SLACK_LINK.sub(lambda m: m.group(1), text)
 
 
 def is_reference_path(path: str, paths: Sequence[str]) -> bool:
@@ -113,17 +127,21 @@ def named_reference_files(request_text: str, paths: Sequence[str]) -> list[str]:
     """The files the request names under the declared folders, as written
     (without a leading ``/``), in order, once each.
 
-    A name must start a word: ``reference/x`` and ``/reference/x`` count,
-    ``myreference/x`` does not. Trailing sentence punctuation is dropped. A
-    name ending in ``/`` names a folder, not a file, and is not counted.
+    A name must start a word: ``reference/x``, ``/reference/x`` and
+    ``./reference/x`` count, ``myreference/x`` does not. Slack's link forms
+    are read as the text typed; a ``#fragment`` and trailing sentence
+    punctuation are dropped. A name ending in ``/`` names a folder, not a
+    file, and is not counted.
     """
     found: list[str] = []
+    text = _as_typed(request_text)
     for folder in paths:
         pattern = re.compile(
-            r"(?<![\w./-])/?" + re.escape(folder) + _PATH_REST
+            r"(?<![\w./-])(?:\./|/)?" + re.escape(folder) + _PATH_REST
         )
-        for match in pattern.finditer(request_text or ""):
-            name = match.group(0).rstrip(_TRAILING).lstrip("/")
+        for match in pattern.finditer(text):
+            name = match.group(0).split("#", 1)[0].rstrip(_TRAILING)
+            name = name[2:] if name.startswith("./") else name.lstrip("/")
             if not name.startswith(folder) or name == folder or name.endswith("/"):
                 continue
             if name not in found:
@@ -133,10 +151,11 @@ def named_reference_files(request_text: str, paths: Sequence[str]) -> list[str]:
 
 def mentions_a_request_word(request_text: str, words: Sequence[str]) -> bool:
     """True when the request holds one of ``words`` as a whole word, case
-    ignored."""
+    ignored (any language's letters count as word characters)."""
+    text = _as_typed(request_text)
     for word in words:
-        pattern = r"(?<![A-Za-z0-9_])" + re.escape(word) + r"(?![A-Za-z0-9_])"
-        if re.search(pattern, request_text or "", re.IGNORECASE):
+        pattern = r"(?<!\w)" + re.escape(word) + r"(?!\w)"
+        if re.search(pattern, text, re.IGNORECASE):
             return True
     return False
 
@@ -416,23 +435,40 @@ async def prototype_card_line_at_commit(
     """The merge card's line for a build that started at ``commit``, read
     through ``reader`` (the merge-check reading's commit reader), or ``""``.
 
-    ``""`` — no line — when the project's settings at that commit declare no
-    ``reference.signed_off``, or when the settings themselves cannot be read
-    (then nothing says the project declares one). When the record is
-    declared, the line names it, or says plainly that it could not be read
-    (:data:`PROTOTYPE_NOT_READ_LINE`): never silently left out. Read at the
-    START commit, so a sign-off recorded during a build does not change what
-    that build's card says. Never raises.
+    ``""`` — no line — only when the settings at that commit were read and
+    declare no ``reference.signed_off``, or there is no settings file at that
+    commit. When the settings cannot be read at all (no reader, a read that
+    raised or was refused) or the record is declared and cannot be read, the
+    card says so plainly (:data:`PROTOTYPE_NOT_READ_LINE`) and a warning is
+    logged: never silently left out (Codex R4; coach's review, 17 October
+    2026). Read at the START commit, so a sign-off recorded during a build
+    does not change what that build's card says. Never raises.
     """
-    read = getattr(reader, "read_file_at_commit", None)
-    if read is None or not commit:
+    if not commit:
         return ""
+
+    def not_read(why: str) -> str:
+        logger.warning(
+            "merge card: the project's settings could not be read at %s to "
+            "tell which signed-off prototype the build was made from (%s); "
+            "the card says so",
+            commit[:12],
+            why,
+        )
+        return PROTOTYPE_NOT_READ_LINE
+
+    read = getattr(reader, "read_file_at_commit", None)
+    if read is None:
+        return not_read("the reader cannot read a file at a commit")
     try:
         answer = await read(repo_path, commit, DECLARATION_PATH)
-    except Exception:  # noqa: BLE001 — a reader never stops a card
-        return ""
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        return not_read(f"{type(exc).__name__}: {exc}")
+    refusal = getattr(answer, "refusal", None)
+    if refusal:
+        return not_read(str(refusal))
     content = getattr(answer, "content", None)
-    if getattr(answer, "refusal", None) or not getattr(answer, "found", False):
+    if not getattr(answer, "found", False):
         return ""
     declared, why = read_declared_reference(
         content if isinstance(content, str) else None
@@ -441,7 +477,9 @@ async def prototype_card_line_at_commit(
         return PROTOTYPE_NOT_READ_LINE
     if not declared.declared or not declared.signed_off:
         return ""
-    record, _why = await read_signed_off_record(
+    record, why = await read_signed_off_record(
         reader, repo_path=repo_path, commit=commit, path=declared.signed_off
     )
+    if why is not None:
+        logger.warning("merge card: %s", why)
     return card_line_about_the_prototype(record)

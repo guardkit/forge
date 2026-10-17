@@ -2572,10 +2572,16 @@ class MergeOfferService:
                 )
         finally:
             self._preparing.discard(build_id)
+            # Held only while the card's words are written; an early return
+            # leaves nothing behind (coach's review, 17 October 2026).
+            prototype_line = self._prototype_lines.pop(build_id, "")
 
         # (d) ONE publish attempt ever — dual envelope, approval FIRST.
-        rationale = card_words(branch, merge_branch)
-        self._prototype_lines.pop(build_id, None)
+        self._prototype_lines[build_id] = prototype_line
+        try:
+            rationale = card_words(branch, merge_branch)
+        finally:
+            self._prototype_lines.pop(build_id, None)
         from forge.pipeline.merge_check_reading import card_body, shown_sentence
 
         if review_evidence is not None:

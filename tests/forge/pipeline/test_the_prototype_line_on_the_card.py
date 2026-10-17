@@ -116,6 +116,29 @@ async def test_without_the_setting_no_record_is_read() -> None:
     assert [path for _commit, path, _m in trees.calls] == [".guardkit/config.yaml"]
 
 
+class _Raising:
+    async def read_file_at_commit(self, *_a: Any, **_k: Any) -> Any:
+        raise OSError("the helper went away")
+
+
+@pytest.mark.parametrize(
+    "reader",
+    [Trees({}), _Raising(), object()],
+    ids=["refused", "raised", "no-reader"],
+)
+@pytest.mark.asyncio
+async def test_settings_that_cannot_be_read_are_said_not_left_out(
+    reader: Any, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A refused read (the commit is not in the copy, the helper cannot be
+    reached), a read that raises, or no reader at all: nothing says the
+    project declares no record, so the card says it could not be read."""
+    with caplog.at_level("WARNING", logger="forge.planning.reference_material"):
+        line = await prototype_card_line_at_commit(reader, repo_path="/r", commit=START)
+    assert line == PROTOTYPE_NOT_READ_LINE
+    assert any("could not be read" in r.getMessage() for r in caplog.records)
+
+
 # ---------------------------------------------------------------------------
 # Both cards
 # ---------------------------------------------------------------------------

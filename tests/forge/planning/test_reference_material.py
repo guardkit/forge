@@ -144,10 +144,28 @@ def test_named_files_are_found_however_they_are_written() -> None:
     assert named_reference_files("add a GET /version endpoint", ("reference/",)) == []
 
 
+def test_slack_links_dot_slash_and_fragments_are_read_as_typed() -> None:
+    """Slack turns ``gadgets.md`` in a typed path into a link; the text part
+    is what was typed. ``./`` and a ``#fragment`` are dropped."""
+    text = (
+        "build what reference/briefs/<http://gadgets.md|gadgets.md> says, "
+        "see ./reference/prototype/src/a.view and "
+        "[the list](/reference/briefs/list.md#states)"
+    )
+    assert named_reference_files(text, ("reference/",)) == [
+        "reference/briefs/gadgets.md",
+        "reference/prototype/src/a.view",
+        "reference/briefs/list.md",
+    ]
+
+
 def test_marker_words_match_whole_words_ignoring_case() -> None:
     assert mentions_a_request_word("Build it from the PROTOTYPE's page", ("prototype",))
     assert not mentions_a_request_word("several prototypes exist", ("prototype",))
     assert not mentions_a_request_word("anything at all", ())
+    # Any language's letters are word characters.
+    assert not mentions_a_request_word("the prototypeé page", ("prototype",))
+    assert mentions_a_request_word("le prototype: écran", ("prototype",))
 
 
 # ---------------------------------------------------------------------------
