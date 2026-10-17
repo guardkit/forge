@@ -424,3 +424,36 @@ async def test_the_outer_failure_path_follows_the_start_record(
         commit_reader=broken_reader,
     )
     assert await service.card_line_about_the_prototype(BUILD_ID) == expected
+
+
+@pytest.mark.parametrize(
+    ("how", "signed_off", "expected"),
+    [
+        ("prepared", RECORD_PATH, PROTOTYPE_NOT_READ_LINE),
+        ("prepared", None, ""),
+        ("planned", RECORD_PATH, PROTOTYPE_NOT_READ_LINE),
+        ("planned", None, ""),
+        ("nothing recorded", None, ""),
+    ],
+)
+@pytest.mark.asyncio
+async def test_with_no_commit_reader_the_start_record_still_decides(
+    config: Any, pool: Any, how: str, signed_off: str | None, expected: str
+) -> None:
+    """Codex implementation review R4, round 2: a service with no commit
+    reader (its default) consults the start record before anything else."""
+    from forge.pipeline.merge_offer import MergeOfferService
+
+    if how == "planned":
+        _planning_run(pool, signed_off=signed_off, recorded=signed_off is not None)
+    _insert_build(pool)
+    _record_start(pool)
+    if how == "prepared":
+        _as_admitted(signed_off)(pool)
+    service = MergeOfferService(
+        config=config,
+        pool=pool,
+        pipeline_publisher=None,
+        raw_publish=None,  # type: ignore[arg-type]
+    )
+    assert await service.card_line_about_the_prototype(BUILD_ID) == expected

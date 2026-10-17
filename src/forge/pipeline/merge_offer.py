@@ -2300,14 +2300,16 @@ class MergeOfferService:
         merge-check reading uses, so a sign-off recorded during a build does
         not change its card. A project whose settings there declare no
         ``reference.signed_off`` gets nothing, and so does a build with no
-        reader, no recorded start or no known checkout. A declared record that
-        cannot be read gives the plain "could not be read" line instead.
+        record. A declared record that cannot be read gives the plain "could
+        not be read" line instead. When the start commit cannot be read at all
+        (no reader wired, no recorded start or checkout, anything that
+        raises), what was recorded at the start decides: declared → the "could
+        not be read" line; undeclared → nothing; unknown → nothing and a
+        warning.
         :meth:`offer` asks here once, inside its one-offer guard, and both
         merge cards' builders place the answer (:meth:`prototype_line`).
         Never raises.
         """
-        if self._commit_reader is None:
-            return ""
         from forge.planning.reference_material import (
             PROTOTYPE_NOT_READ_LINE,
             prototype_card_line_at_commit,
@@ -2323,6 +2325,10 @@ class MergeOfferService:
             # (Codex implementation review R4): declared → said, not declared
             # → nothing, unknown → nothing and a warning.
             declared = signed_off_declared_at_start(self._pool, row)
+            if self._commit_reader is None:
+                # No reader wired: decided by the start record too (Codex
+                # implementation review R4, round 2).
+                raise LookupError("no commit reader is wired for the card")
             repo_root = self._config.planning.target_repo_paths.get(row.repo)
             start_point = self._pool.read_start_point(build_id)
             commit = getattr(start_point, "start_commit", None)
