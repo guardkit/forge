@@ -299,6 +299,11 @@ class BuildRow(BaseModel):
     mission_role: str | None = None
 
 
+#: The stage row a prepared build's admission writes beside its build row
+#: (17 October 2026): what the admission found at the admitted commit.
+PREPARED_ADMISSION_STAGE = "prepared-admission"
+
+
 class BuildStartPoint(BaseModel):
     """Where a build's work started, or the honest absence of that fact.
 
@@ -972,6 +977,35 @@ class SqliteLifecyclePersistence:
                 f"INSERT INTO builds ({columns}) VALUES ({placeholders})",
                 tuple(values),
             )
+            if admitted is not None:
+                # WHAT THE ADMISSION FOUND (17 October 2026, Codex
+                # implementation review R4), in the same transaction as the
+                # row: whether the project declared a signed-off reference
+                # record at the admitted commit, and its path. The merge card
+                # reads it when that commit cannot be read later. A stage row,
+                # not a new column, so the ledger's schema stays as it is.
+                stamp = queued_at.isoformat()
+                self._cx.execute(
+                    "INSERT INTO stage_log (build_id, stage_label, target_kind, "
+                    "target_identifier, status, started_at, completed_at, "
+                    "duration_secs, details_json) VALUES "
+                    "(?, ?, 'local_tool', ?, 'PASSED', ?, ?, 0.0, ?)",
+                    (
+                        build_id,
+                        PREPARED_ADMISSION_STAGE,
+                        PREPARED_ADMISSION_STAGE,
+                        stamp,
+                        stamp,
+                        json.dumps(
+                            {
+                                "reference_signed_off": getattr(
+                                    admitted, "reference_signed_off", None
+                                )
+                                or None
+                            }
+                        ),
+                    ),
+                )
             self._cx.execute("COMMIT;")
         except sqlite3.IntegrityError as exc:
             try:

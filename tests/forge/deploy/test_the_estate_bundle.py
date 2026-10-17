@@ -143,7 +143,7 @@ def _rendered(*extra: str, profiles: str | None = None) -> str:
 #: renders as ``source: <absolute path of the checkout>/<name>``, and on a
 #: developer machine the checkout is under /home. That ONE line per file is the
 #: bundle, not anything of the machine.
-_THE_BUNDLES_OWN_BINDS = ("model-door.cfg",)
+_THE_BUNDLES_OWN_BINDS = ("model-door.cfg", "git-door.cfg")
 
 
 def _is_one_of_the_bundles_own_binds(line: str, bundle: Path = ESTATE) -> bool:

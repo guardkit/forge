@@ -26,6 +26,12 @@ does ONE thing, so it is told only the things that one thing needs:
   (:mod:`forge.publisher.git_work`). The values live in the deploy settings
   file only, never in code, and are never logged: the start-up line gives a
   count;
+* **whether it publishes only to private repositories** (``private_only``,
+  17 October 2026; design "Building production features from a signed-off
+  prototype", section 2.8). Off unless the file says ``true``, which is
+  today's behaviour exactly. When on, a route is served only when its
+  repository is confirmed private (:mod:`forge.publisher.private_remote`),
+  checked at start-up and again immediately before every push;
 * **where to listen** — an address and a port. The loopback address by
   default; every address inside its own container when it is run as the
   service the compose fragment beside this package describes, which
@@ -141,6 +147,9 @@ class PublisherSettings:
     #: in the settings file (:func:`load_settings` refuses it missing, empty
     #: or generic). With none, nothing is sent: the publisher cannot look.
     private_path_prefixes: tuple[str, ...] = ()
+    #: Publish only to repositories confirmed private (17 October 2026).
+    #: False unless the settings file says ``true``: today's behaviour.
+    private_only: bool = False
 
     def route(self, project: str) -> ProjectRoute | None:
         return self.projects.get(str(project or "").strip())
@@ -176,6 +185,7 @@ class PublisherSettings:
             # A count, never the values: they name folders on the factory's
             # own machines.
             "private_path_prefix_count": len(self.private_path_prefixes),
+            "private_only": self.private_only,
         }
 
 
@@ -368,6 +378,13 @@ def load_settings(path: str | Path) -> PublisherSettings:
     ledger = _text(decoded, "ledger", where="the settings")
     state_dir = _text(decoded, "state_dir", where="the settings")
     private_path_prefixes = _private_path_prefixes(decoded)
+    private_only = decoded.get("private_only", False)
+    if not isinstance(private_only, bool):
+        raise SettingsRefused(
+            "'private_only' in the publisher's settings must be true or false "
+            "(true: publish only to repositories confirmed private); leave it "
+            "out for false"
+        )
     return PublisherSettings(
         credential_file=credential_file,
         ledger=ledger,
@@ -379,4 +396,5 @@ def load_settings(path: str | Path) -> PublisherSettings:
         git_timeout_seconds=float(timeout),
         known_hosts_file=known_hosts,
         private_path_prefixes=private_path_prefixes,
+        private_only=private_only,
     )

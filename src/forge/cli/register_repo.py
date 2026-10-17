@@ -46,6 +46,20 @@ What the command does, in order, saying one plain line per step:
    restart the sandbox supervisor, start the publisher when its routes
    changed, start the rest, check — and restarts nothing itself.
 
+``--via-git-door`` (17 October 2026) is for a private repository: the
+sandbox reads it through the Git door on the factory's own machine (the
+coordinator's ``planning.git_door``), which adds a read-only token, so the
+sandbox still holds no credential. The project's fetch address is recorded
+as ``<git_door><org>/<name>.git`` and the sandbox's read and clone go through
+it. The repository must already be on the door's allow-list; the command
+says so, and changes nothing about the door itself.
+
+When the publisher's settings say ``private_only`` (17 October 2026), a
+route is written only for a repository confirmed private
+(:mod:`forge.publisher.private_remote`): its own route key reads it (the
+check clone in step 1) and GitHub does not show it to anybody signed out.
+That needs ``--publish-credential-name``.
+
 ``--check-drained`` is step (b) of that sequence: it reads the ledger, the work
 queue and the two durable bus consumers that feed the coordinator, and says
 DRAINED only when every one of them reads zero.
@@ -82,12 +96,15 @@ import click
 import yaml
 
 from forge.network_git import (
+    GIT_DOOR_SETTING,
     NetworkRefused,
+    git_door_address,
     proxy_environment,
     sandbox_git_command,
     sandbox_network_git,
     transport_of,
 )
+from forge.publisher.private_remote import GITHUB_HOST, anonymous_lookup, confirmed_private
 from forge.project_git import FIXED_SETTINGS
 
 __all__ = ["register_repo_cmd"]
@@ -1354,10 +1371,14 @@ def _same_repository(a: str, b: str) -> bool:
     return norm(a) == norm(b)
 
 
-def check_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: str) -> tuple[Step, bool]:
+def check_sandbox_clone(
+    sandbox: SandboxStore, *, clone: str, leaf: str, url: str, door_note: str | None = None
+) -> tuple[Step, bool]:
     """Every read step 3 needs, before anything is written.
 
-    Returns the report line and whether a clone must be made.
+    Returns the report line and whether a clone must be made. ``url`` is the
+    https address, or the Git door's address for the project (``door_note``
+    then says what the door needs, 17 October 2026).
     """
     folder = f"{PROJECTS_FOLDER}/{leaf}"
     ignored = sandbox.git_read("-C", clone, "check-ignore", "-q", folder)
@@ -1382,6 +1403,12 @@ def check_sandbox_clone(sandbox: SandboxStore, *, clone: str, leaf: str, url: st
         )
     except NetworkRefused as refused:
         raise Refused("clone", f"{refused.sentence} Nothing was written") from None
+    if (readable.returncode != 0 or not readable.stdout.strip()) and door_note is not None:
+        raise Refused(
+            "clone",
+            f"the sandbox cannot read {url} through the Git door. Check that {door_note}, "
+            "and that the sandbox may reach the door's port. Nothing was written",
+        )
     if readable.returncode != 0 or not readable.stdout.strip():
         raise Refused(
             "clone",
@@ -2043,6 +2070,8 @@ class Options:
     route_keys_dir: str | None = None
     known_hosts_file: str | None = None
     publisher_uid: int | None = None
+    #: Read the repository through the Git door (17 October 2026).
+    via_git_door: bool = False
 
 
 def _parse_name(name: str) -> tuple[str, str]:
@@ -2098,6 +2127,7 @@ def resolve_options(
     coordinator: str,
     settle_seconds: int = DEFAULT_SETTLE_SECONDS,
     publish_credential_name: str | None = None,
+    via_git_door: bool = False,
 ) -> Options:
     """The command's options with every default worked out, or a refusal."""
     if publish_credential_name is not None:
@@ -2206,6 +2236,7 @@ def resolve_options(
         publisher_settings=str(publisher_settings) if publisher_settings is not None else None,
         publish_source_base=publish_source_base,
         publish_credential_name=publish_credential_name,
+        via_git_door=via_git_door,
         route_keys_dir=estate_values.get(ESTATE_ENV_ROUTE_KEYS_DIR) or None,
         known_hosts_file=estate_values.get(ESTATE_ENV_KNOWN_HOSTS) or None,
         publisher_uid=(
@@ -2222,6 +2253,99 @@ def resolve_options(
             coordinator=coordinator,
             settle_seconds=settle_seconds,
         ),
+    )
+
+
+#: The anonymous visibility lookup register-repo makes when the publisher is
+#: private-only: one seam the tests replace, as :data:`run_command` is.
+visibility_lookup: Callable[[str, str], int | None] = anonymous_lookup
+
+#: The reminder about the Git door's allow-list (17 October 2026).
+GIT_DOOR_ALLOW_LIST_NOTE: str = (
+    "the Git door reads only the repositories on its allow-list: {key} must be "
+    "a line of the file the estate env file's GIT_DOOR_REPOS_FILE names (one "
+    "owner/name per line), and the door restarted after the line is added "
+    "(deploy/estate/README.md, 'The Git door')"
+)
+
+
+def door_fetch_address(coordinator_text: str, key: str) -> str:
+    """``<planning.git_door><org>/<name>.git``, from the coordinator's own
+    settings, or a refusal naming what is missing (17 October 2026)."""
+    try:
+        data = yaml.safe_load(coordinator_text) or {}
+    except yaml.YAMLError:
+        raise Refused("git-door", f"the coordinator's {SETTINGS_FILE_NAME} would not parse") from None
+    door = _mapping(_mapping(data).get("planning")).get("git_door")
+    if not door:
+        raise Refused(
+            "git-door",
+            f"--via-git-door needs the Git door's address in the coordinator's "
+            f"{SETTINGS_FILE_NAME}: add {GIT_DOOR_SETTING}: http://<gateway address>:"
+            "<door port>/ there first. Nothing was written",
+        )
+    if not isinstance(door, str) or "${" in door:
+        raise Refused(
+            "git-door",
+            f"{GIT_DOOR_SETTING} in the coordinator's {SETTINGS_FILE_NAME} must be "
+            "written as the address itself (http://<address>:<port>/), not a "
+            "${NAME}. Nothing was written",
+        )
+    try:
+        return git_door_address(door, key)
+    except ValueError as exc:
+        raise Refused("git-door", f"{exc}. Nothing was written") from None
+
+
+def _publisher_is_private_only(publisher_text: str) -> bool:
+    """Does the publisher's settings file say ``private_only: true``? A file
+    that is not readable JSON is refused later, by the route's own check."""
+    try:
+        data = json.loads(publisher_text)
+    except ValueError:
+        return False
+    return isinstance(data, dict) and data.get("private_only") is True
+
+
+def check_confirmed_private(options: Options) -> Step:
+    """With the publisher private-only: is the repository confirmed private?
+
+    The same test the publisher makes (:func:`forge.publisher.private_remote.confirmed_private`).
+    Its first half, the route's own key reading the repository, is step 1's
+    check clone with that key, which has already passed by the time this
+    runs (it refuses otherwise); so a route with no key of its own cannot be
+    confirmed, and is refused.
+    """
+    if options.publish_credential_name is None:
+        raise Refused(
+            "private",
+            "the publisher publishes only to private repositories (its settings "
+            "say private_only), so the repository must be confirmed private, and "
+            "that needs the route's own key: run again with "
+            "--publish-credential-name <its key>. Nothing was written",
+        )
+    # Step 1's check clone read git@<the --github host>:<org>/<name>.git, so
+    # the key read proves the GitHub repository only when that host is
+    # github.com (coach review, 17 October 2026).
+    if (urlsplit(options.url).hostname or "").lower() != GITHUB_HOST:
+        raise Refused(
+            "private",
+            "the publisher publishes only to private repositories (its settings "
+            f"say private_only), and only a {GITHUB_HOST} repository can be "
+            "confirmed private; --github names another host. Nothing was written",
+        )
+    answer = confirmed_private(
+        f"git@github.com:{options.org}/{options.leaf}.git",
+        # Step 1's check clone read it with the route's own key.
+        key_reads_the_remote=lambda: True,
+        lookup=visibility_lookup,
+    )
+    if not answer.private:
+        raise Refused("private", f"{answer.reason}. Nothing was written")
+    return Step(
+        "private", "ok",
+        f"{options.key} is confirmed private: the route's own key read it, and "
+        "GitHub does not show it to anybody signed out",
     )
 
 
@@ -2260,13 +2384,21 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
 
     coordinator_path = f"{COORDINATOR_PROJECTS_ROOT}/{options.leaf}"
     clone_path = f"{options.sandbox_clone}/{PROJECTS_FOLDER}/{options.leaf}"
+    # Where the sandbox reads the project: the https address, or (17 October
+    # 2026) the Git door's address for it, which is then also the recorded
+    # fetch address.
+    read_from = (
+        door_fetch_address(coordinator_text, options.key)
+        if options.via_git_door
+        else options.url
+    )
     # The coordinator's settings also record the project's fetch address
     # (planning.fetch_addresses, 14 October 2026): the factory fetches a
     # starting point from it and never from a clone's own origin. The
     # sandbox's settings never carry it: that file sits inside a project clone.
     coordinator_edit = plan_settings_edit(
         coordinator_text, which="coordinator", key=options.key, path=coordinator_path,
-        fetch_address=options.url,
+        fetch_address=read_from,
     )
     sandbox_edit = plan_settings_edit(sandbox_text, which="sandbox", key=options.key, path=clone_path)
 
@@ -2283,18 +2415,24 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
             remote=f"git@github.com:{options.org}/{options.leaf}.git",
             credential_name=options.publish_credential_name,
         )
+        if _publisher_is_private_only(publisher_text):
+            steps.append(check_confirmed_private(options))
 
+    door_note = GIT_DOOR_ALLOW_LIST_NOTE.format(key=options.key) if options.via_git_door else None
     clone_step, clone_needed = check_sandbox_clone(
-        sandbox, clone=options.sandbox_clone, leaf=options.leaf, url=options.url
+        sandbox, clone=options.sandbox_clone, leaf=options.leaf, url=read_from,
+        door_note=door_note,
     )
 
     # Every read is done and nothing refused: now, and only now, write.
     if clone_needed and options.dry_run:
         steps.append(Step("clone", "would add", clone_step.detail))
     elif clone_needed:
-        steps.append(make_sandbox_clone(sandbox, clone=options.sandbox_clone, leaf=options.leaf, url=options.url))
+        steps.append(make_sandbox_clone(sandbox, clone=options.sandbox_clone, leaf=options.leaf, url=read_from))
     else:
         steps.append(clone_step)
+    if door_note is not None:
+        steps.append(Step("git-door", "note", door_note))
 
     staged: dict[str, Staged | None] = {"coordinator": None, "sandbox": None, "publisher": None}
     for edit, store, live, folder_name in (
@@ -2354,6 +2492,11 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
 @click.option("--publish-credential-name", "publish_credential_name", default=None,
               help="With --publish: the bare name of the route's own key in the publisher's "
                    "route-keys folder (default: the publisher-wide credential).")
+@click.option("--via-git-door", "via_git_door", is_flag=True, default=False,
+              help="Read a private repository through the Git door (the coordinator's "
+                   "planning.git_door): record its fetch address through the door and "
+                   "make the sandbox's clone through it. The repository must be on the "
+                   "door's allow-list.")
 @click.option("--dry-run", "dry_run", is_flag=True, default=False,
               help="Check the project and say what would change; write nothing anywhere.")
 @click.option("--check-drained", "check_drained_only", is_flag=True, default=False,
@@ -2387,6 +2530,7 @@ def register_repo_cmd(
     github: str | None,
     publish: bool,
     publish_credential_name: str | None,
+    via_git_door: bool,
     dry_run: bool,
     check_drained_only: bool,
     settle_seconds: int,
@@ -2454,6 +2598,7 @@ def register_repo_cmd(
             coordinator=coordinator,
             settle_seconds=settle_seconds,
             publish_credential_name=publish_credential_name,
+            via_git_door=via_git_door,
         )
         tail = register(options, run, steps)
     except Refused as refusal:

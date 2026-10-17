@@ -88,11 +88,19 @@ from forge.planning.checkpoint import (
 from forge.planning.declared_memory import (
     read_declarations_at_commit,
     read_declared_project_documents,
+    read_declared_reference,
 )
 from forge.planning.project_documents import (
     ProjectDocument,
     context_texts,
     read_project_documents_at_commit,
+)
+from forge.planning.reference_material import (
+    REFERENCE_MATERIAL_STAGE,
+    ReferenceMaterial,
+    gather_reference_material,
+    is_reference_path,
+    reference_context_texts,
 )
 from forge.planning.escalation import (
     EscalationOutcome,
@@ -261,6 +269,15 @@ _SPEC_DRAFT_STAGE = "feature-spec-draft"
 #: what it holds, so a re-drive never reads them again. Status ``recorded``,
 #: never ``approved``: it is a record, not any leg's sentinel.
 _PROJECT_DOCUMENTS_STAGE = "project-documents"
+
+#: Durable stage label for THE PROJECT'S REFERENCE MATERIAL as the door read it
+#: (17 October 2026, prototype-to-factory design 2.2): the folders the project
+#: declares in ``reference.paths`` and the files the request names under them,
+#: read whole at the starting commit. Written once, at the door, beside the
+#: project's documents, and only for a project that declares the folders;
+#: every later spec and plan call, the planner's description of the
+#: repository and the facts sheet read it from here. Status ``recorded``.
+_REFERENCE_MATERIAL_STAGE = REFERENCE_MATERIAL_STAGE
 
 #: Durable stage label for the SPEC DIGEST REVIEW DOOR — the one pause of the
 #: machine chain (the product-docs pause, absorbed and moved to where there is
@@ -3026,7 +3043,11 @@ class PlanningRunDriver:
         start_commit, target_branch = start
 
         declarations = await self._declarations(
-            correlation_id, target_repo, repo_path, start_commit
+            correlation_id,
+            target_repo,
+            repo_path,
+            start_commit,
+            request_text=self._request_text_of(row),
         )
         if declarations is None:
             return None
@@ -3219,6 +3240,8 @@ class PlanningRunDriver:
         target_repo: str,
         repo_path: str,
         start_commit: str,
+        *,
+        request_text: str = "",
     ) -> tuple[str, tuple[str, ...]] | None:
         """What the project declares at the starting commit, or None on refusal.
 
@@ -3296,6 +3319,17 @@ class PlanningRunDriver:
             config_text=declarations.content,
         ):
             return None
+        # THE PROJECT'S REFERENCE MATERIAL (17 October 2026), in the same step
+        # and on the same terms: out of the same file at the same commit,
+        # recorded before the memory name, refused in plain words.
+        if not await self._read_and_record_reference_material(
+            correlation_id,
+            repo_path=repo_path,
+            start_commit=start_commit,
+            config_text=declarations.content,
+            request_text=request_text,
+        ):
+            return None
 
         name = str(declarations.memory_project)
         wanted_names = declarations.launch_settings
@@ -3368,6 +3402,112 @@ class PlanningRunDriver:
             ", ".join(f"{d.path} ({d.bytes} bytes)" for d in documents),
         )
         return True
+
+    async def _read_and_record_reference_material(
+        self,
+        correlation_id: str,
+        *,
+        repo_path: str,
+        start_commit: str,
+        config_text: str | None,
+        request_text: str,
+    ) -> bool:
+        """Read the project's reference material at the starting commit and
+        record it (17 October 2026, prototype-to-factory design 2.2).
+
+        True to carry on (recorded, or nothing declared); False after failing
+        the run in plain words, before any model is asked anything. Opt-in: a
+        project without ``reference:`` has nothing read and nothing recorded,
+        so every request it sends is what it was. With it, the signed-off
+        record is checked when one is declared, the files the request names
+        under the reference folders are read whole, and a request that uses
+        one of the project's marker words but names no such file is refused
+        (:func:`~forge.planning.reference_material.gather_reference_material`).
+        A run that already has its material recorded reads nothing again.
+        """
+        if self._reference_material_event(correlation_id) is not None:
+            return True
+        declared, why = read_declared_reference(config_text)
+        material: ReferenceMaterial | None = None
+        if why is None and declared.declared:
+            material, why = await gather_reference_material(
+                self._deps.git_runner,
+                repo_path=repo_path,
+                commit=start_commit,
+                declared=declared,
+                request_text=request_text,
+            )
+        if why is not None:
+            await self._fail_leg(correlation_id, "target-terminal-enter", why)
+            return False
+        if material is None:
+            return True
+        self._deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_REFERENCE_MATERIAL_STAGE,
+            status="recorded",
+            actor_identity="planning-driver",
+            details_json=json.dumps({"reference_material": material.to_record()}),
+        )
+        logger.info(
+            "planning driver: run %s treats %s as reference material, and "
+            "will give the spec and plan writers %d named reference file(s) "
+            "read at %s%s",
+            correlation_id,
+            ", ".join(material.paths),
+            len(material.files),
+            start_commit,
+            (": " + ", ".join(f"{d.path} ({d.bytes} bytes)" for d in material.files))
+            if material.files
+            else "",
+        )
+        return True
+
+    def _reference_material_event(self, correlation_id: str) -> Any | None:
+        """The run's recorded reference-material row, or ``None`` (also when
+        there is no ledger to ask: the facts sheet asks too, and must never
+        fail over this)."""
+        list_events = getattr(getattr(self._deps, "store", None), "list_events", None)
+        if list_events is None:
+            return None
+        latest = None
+        for event in list_events(correlation_id):
+            if (
+                event["stage_label"] == _REFERENCE_MATERIAL_STAGE
+                and event["status"] == "recorded"
+            ):
+                latest = event
+        return latest
+
+    def _recorded_reference_material(
+        self, correlation_id: str
+    ) -> tuple[ReferenceMaterial | None, str | None]:
+        """What the door recorded: ``(material, None)``; ``(None, None)`` when
+        the project declares no reference folders; ``(None, why)`` when the
+        record does not hold together (sending nothing in its place would
+        quietly drop what the request named)."""
+        event = self._reference_material_event(correlation_id)
+        if event is None:
+            return None, None
+        broken = (
+            "the reference material recorded for this run at its start could "
+            "not be read back intact, so it cannot be given to the writers"
+        )
+        try:
+            record = json.loads(event["details_json"] or "{}").get(
+                "reference_material"
+            )
+        except (json.JSONDecodeError, ValueError, AttributeError):
+            return None, broken
+        material = ReferenceMaterial.from_record(record)
+        if material is None:
+            return None, broken
+        return material, None
+
+    def _reference_paths_of(self, correlation_id: str) -> tuple[str, ...]:
+        """The run's recorded reference folders; ``()`` when none."""
+        material, _broken = self._recorded_reference_material(correlation_id)
+        return material.paths if material is not None else ()
 
     def _say_once_when_no_documents_are_recorded(self, correlation_id: str) -> None:
         """One log line for a run past the door with no documents record.
@@ -3763,9 +3903,16 @@ class PlanningRunDriver:
         if broken is not None:
             await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
             return None
-        project_context: dict[str, Any] = (
-            {"context": context_texts(documents)} if documents else {}
-        )
+        # The files the request named under the project's reference folders
+        # (17 October 2026), after the documents, each under its heading.
+        # None named, or no folders declared: the call is today's.
+        reference, broken = self._recorded_reference_material(correlation_id)
+        if broken is not None:
+            await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
+            return None
+        reference_files = reference.files if reference is not None else ()
+        texts = context_texts(documents) + reference_context_texts(reference_files)
+        project_context: dict[str, Any] = {"context": texts} if texts else {}
 
         try:
             result = await deps.dispatch_feature_spec(
@@ -4073,6 +4220,10 @@ class PlanningRunDriver:
         if documents:
             # Which files, which versions, were given to the spec writer.
             draft["project_documents"] = self._project_documents_receipt(documents)
+        if reference_files:
+            draft["reference_files"] = self._project_documents_receipt(
+                reference_files
+            )
         if rewrite is not None:
             # Persisted on the draft row, not on the card: the door's opening
             # notification reads it, and a restart that re-opens the draft
@@ -4209,8 +4360,14 @@ class PlanningRunDriver:
         )
         if correlation_id not in cache:
             reader = self._repository_reader_for(repo_path, correlation_id)
+            # The facts describe the product: the project's reference
+            # folders, when it declares any, are left out (17 October 2026).
+            reference_paths = self._reference_paths_of(correlation_id)
             facts = await asyncio.to_thread(
-                read_repository_facts, reader, self._request_text_of(row)
+                read_repository_facts,
+                reader,
+                self._request_text_of(row),
+                **({"reference_paths": reference_paths} if reference_paths else {}),
             )
             if facts.unavailable:
                 logger.warning(
@@ -6567,6 +6724,7 @@ class PlanningRunDriver:
             partial=descriptor_partial,
             request_text=self._request_text_of(row),
             ranked_source=self._ranked_source_enabled(),
+            reference_paths=self._reference_paths_of(correlation_id),
         )
         if descriptor_unavailable:
             self.__dict__.setdefault("_descriptor_unavailable", {})[correlation_id] = (
@@ -6604,6 +6762,13 @@ class PlanningRunDriver:
         if broken is not None:
             await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
             return None
+        reference, broken = self._recorded_reference_material(correlation_id)
+        if broken is not None:
+            await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
+            return None
+        texts = context_texts(documents) + reference_context_texts(
+            reference.files if reference is not None else ()
+        )
 
         async def _ask_the_plan_writer(
             *, note: str | None = None, prior: Mapping[str, str] | None = None
@@ -6620,8 +6785,8 @@ class PlanningRunDriver:
                 extra["validate_feedback"] = note
             if prior is not None:
                 extra["revision_of"] = dict(prior)
-            if documents:
-                extra["context"] = context_texts(documents)
+            if texts:
+                extra["context"] = texts
             # "Already done, nothing to build" (7 October 2026): asked for only
             # with the switch on, on every plan call of the run (the exact
             # re-review must judge the same shape). Off, the call is today's.
@@ -6714,7 +6879,10 @@ class PlanningRunDriver:
                     claim=claim,
                     problem=claim_problem,
                     windows=tuple(
-                        nothing_to_build.windows_sent(target_repo_descriptor)
+                        nothing_to_build.windows_sent(
+                            target_repo_descriptor,
+                            reference_paths=self._reference_paths_of(correlation_id),
+                        )
                     ),
                 ),
             )
@@ -7947,6 +8115,11 @@ class PlanningRunDriver:
         if documents:
             # Which files, which versions, were given to the plan writer.
             details["project_documents"] = self._project_documents_receipt(documents)
+        reference, _broken = self._recorded_reference_material(correlation_id)
+        if reference is not None and reference.files:
+            details["reference_files"] = self._project_documents_receipt(
+                reference.files
+            )
         unavailable_line = self._repository_unavailable_line(correlation_id)
         if unavailable_line is not None:
             # Read by the build gate (the 1 October planner fix): the card the person
@@ -11378,6 +11551,7 @@ class PlanningRunDriver:
         *,
         reader: Any = None,
         unavailable: list[str] | None = None,
+        reference_paths: Sequence[str] = (),
     ) -> dict[str, Any] | None:
         """Read what the target repository already contains, for the plan seat.
 
@@ -11426,6 +11600,14 @@ class PlanningRunDriver:
         tells the plan-writer the repository could not be read. An inventory
         must never be able to stop a planning run, which is why the whole
         reader sits inside one try/except.
+
+        REFERENCE MATERIAL (17 October 2026, prototype-to-factory design 2.2).
+        Files under the project's declared reference folders
+        (``reference_paths``) are not product code: they are left out of the
+        list and of the :data:`_MAX_REPO_INVENTORY_FILES` count, and each
+        folder is said in one line instead (``reference_material``), so a few
+        hundred reference files cannot turn a small product's list into
+        folder counts. Without reference folders nothing changes.
         """
         try:
             reader = reader or LocalCheckoutReader(
@@ -11466,7 +11648,16 @@ class PlanningRunDriver:
                 for entry in tracked
                 if not entry.startswith(_REPO_INVENTORY_SKIP_PREFIXES)
             )
-            if not files:
+            reference_lines: list[str] = []
+            if reference_paths:
+                for folder in reference_paths:
+                    count = sum(1 for entry in files if entry.startswith(folder))
+                    reference_lines.append(
+                        f"`{folder}` — {count} files of reference material (not "
+                        f"product code); see the bound index"
+                    )
+                files = [f for f in files if not is_reference_path(f, reference_paths)]
+            if not files and not reference_lines:
                 logger.warning(
                     "target_repo_descriptor: %s tracks no files outside the "
                     "factory's own paperwork; planning without the repository "
@@ -11482,6 +11673,8 @@ class PlanningRunDriver:
                 ),
                 "file_count": len(files),
             }
+            if reference_lines:
+                inventory["reference_material"] = reference_lines
             if len(files) <= _MAX_REPO_INVENTORY_FILES:
                 inventory["files"] = files
                 return inventory
@@ -11522,6 +11715,7 @@ class PlanningRunDriver:
         request_text: str = "",
         evidence_chars: int | Callable[[], int] = MAX_EVIDENCE_CHARS,
         test_roots: Sequence[str] = (),
+        reference_paths: Sequence[str] = (),
     ) -> list[dict[str, Any]] | None:
         """Where this feature's own words already occur in the repository.
 
@@ -11617,6 +11811,13 @@ class PlanningRunDriver:
         already looked up and says so in ``partial``: it is a part read,
         not an unreadable repository. Only a repository that answered no
         search at all is ``unavailable``.
+
+        REFERENCE MATERIAL (17 October 2026). Windows from the project's
+        declared reference folders (``reference_paths``) are kept, labelled
+        as reference material, and at most
+        :data:`~forge.planning.code_evidence.MAX_REFERENCE_WINDOWS` of them
+        are shown; see
+        :func:`~forge.planning.code_evidence.choose_windows`.
         """
         reader = reader or LocalCheckoutReader(repo_path)
         try:
@@ -11730,6 +11931,9 @@ class PlanningRunDriver:
                             rank=_how_interesting,
                             texts=texts,
                             spellings=sorted(s for s in spellings if len(s) > 3),
+                            is_reference=lambda path: is_reference_path(
+                                path, reference_paths
+                            ),
                         )
                     except RepositoryUnreadable as exc:
                         # What was found is kept; the windows stop here.
@@ -11777,6 +11981,7 @@ class PlanningRunDriver:
                 # scenario's test; a data file may be a test's cases or code.
                 may_give_way=lambda path: is_documentation(path, test_roots),
                 request_text=request_text,
+                is_reference=lambda path: is_reference_path(path, reference_paths),
             )
             for entry in found:
                 # The keys in the order the plan-writer has always read them.
@@ -11832,6 +12037,7 @@ class PlanningRunDriver:
         reader: Any,
         unavailable: list[str] | None = None,
         partial: list[str] | None = None,
+        reference_paths: Sequence[str] = (),
     ) -> list[dict[str, Any]] | None:
         """The files most likely to hold each set the request names.
 
@@ -11884,7 +12090,12 @@ class PlanningRunDriver:
                         phrase,
                         word,
                         phrase_words,
-                        skip_prefixes=_REPO_INVENTORY_SKIP_PREFIXES,
+                        # A file in a reference folder is never a member of
+                        # the product's set (17 October 2026).
+                        skip_prefixes=(
+                            *_REPO_INVENTORY_SKIP_PREFIXES,
+                            *reference_paths,
+                        ),
                         partial=partial,
                     )
                 )
@@ -11928,6 +12139,7 @@ class PlanningRunDriver:
         partial: list[str] | None = None,
         request_text: str = "",
         ranked_source: bool = False,
+        reference_paths: Sequence[str] = (),
     ) -> dict[str, Any]:
         """Build the 008 ``target_repo_descriptor`` honestly from what forge knows.
 
@@ -11958,6 +12170,13 @@ class PlanningRunDriver:
         gate passed but the real validate rejected (repo has ``tests/health``,
         ``tests/users``, no ``tests/smoke``). Handing the exact roots makes
         prefix-containment == membership so the invention is caught in-session.
+
+        ``reference_paths`` (17 October 2026, prototype-to-factory design 2.2)
+        are the project's declared reference folders, read from the run's
+        record: not product code, so no test folder is found in them, the
+        inventory counts them apart, their code windows are labelled and
+        capped, and no set's candidates come from them. Empty, the
+        descriptor is byte for byte today's.
         """
         # Local import: keep the guardkit-boundary reuse out of the module
         # import graph (target_terminal_tools imports the guardkit run seam).
@@ -12022,6 +12241,13 @@ class PlanningRunDriver:
                     exc,
                 )
                 test_roots = shallow_discover_test_roots(repo_path)
+        if reference_paths:
+            # A test folder inside reference material is not the product's.
+            test_roots = [
+                root
+                for root in test_roots
+                if not is_reference_path(f"{root.rstrip('/')}/", reference_paths)
+            ]
         descriptor: dict[str, Any] = {"repo": target_repo, "test_roots": test_roots}
         # The repo's own architecture rules, when it keeps a rules file. Before
         # this, the plan-writer was never shown them, and two features built the
@@ -12039,7 +12265,10 @@ class PlanningRunDriver:
         # repository can be read, absent otherwise, and planning unchanged when
         # it is absent (see :meth:`_read_repository_inventory`).
         repository_inventory = PlanningRunDriver._read_repository_inventory(
-            repo_path, reader=reader, unavailable=reasons
+            repo_path,
+            reader=reader,
+            unavailable=reasons,
+            reference_paths=reference_paths,
         )
         if repository_inventory is not None:
             descriptor["repository_inventory"] = repository_inventory
@@ -12060,7 +12289,11 @@ class PlanningRunDriver:
 
         def sets_then_window_share() -> int:
             searched["sets"] = PlanningRunDriver._sets_the_request_names(
-                request_text, reader=reader, unavailable=reasons, partial=partial
+                request_text,
+                reader=reader,
+                unavailable=reasons,
+                partial=partial,
+                reference_paths=reference_paths,
             )
             set_lines_chars = sum(
                 len(line)
@@ -12079,6 +12312,7 @@ class PlanningRunDriver:
             request_text=request_text,
             evidence_chars=sets_then_window_share,
             test_roots=test_roots,
+            reference_paths=reference_paths,
         )
         if "sets" not in searched:
             # No word to look for, or the search could not run: the set

@@ -35,7 +35,14 @@ import re
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 # ---------------------------------------------------------------------------
 # Default values (anchored to ASSUM-001..005)
@@ -995,6 +1002,18 @@ class PlanningConfig(BaseModel):
             "working-copy paths. Used for handoff to local build."
         ),
     )
+    git_door: str | None = Field(
+        default=None,
+        description=(
+            "The Git door (17 October 2026): one http://<address>:<port>/ base, "
+            "the address of the door on the factory's own machine that reads "
+            "private repositories with a read-only token, so the sandbox holds "
+            "none. Declared before fetch_addresses, which may then hold "
+            "<this base><owner>/<name>.git for a project (forge register-repo "
+            "--via-git-door writes it). Unset by default: every fetch address "
+            "must be https, as before."
+        ),
+    )
     fetch_addresses: dict[str, str] = Field(
         default_factory=dict,
         description=(
@@ -1100,10 +1119,30 @@ class PlanningConfig(BaseModel):
             )
         return self
 
+    @field_validator("git_door")
+    @classmethod
+    def _git_door_is_one_http_base(cls, value: str | None) -> str | None:
+        """Exactly http://<address>:<port>/, or unset (17 October 2026)."""
+        if value is None:
+            return None
+        from forge.network_git import git_door_problem
+
+        problem = git_door_problem(value)
+        if problem:
+            raise ValueError(
+                "planning.git_door must be exactly http://<address>:<port>/: "
+                f"{problem} (the value is not repeated here)"
+            )
+        return value
+
     @field_validator("fetch_addresses")
     @classmethod
-    def _fetch_addresses_are_plain_https(cls, value: dict[str, str]) -> dict[str, str]:
-        """Each key is an 'org/name' and each address a plain https:// one.
+    def _fetch_addresses_are_plain_https(
+        cls, value: dict[str, str], info: ValidationInfo
+    ) -> dict[str, str]:
+        """Each key is an 'org/name' and each address a plain https:// one,
+        or (17 October 2026) the declared Git door followed by
+        '<owner>/<name>.git'.
 
         The refusal names the project, never the address: what was written
         may hold a credential.
@@ -1112,14 +1151,15 @@ class PlanningConfig(BaseModel):
 
         from forge.network_git import check_fetch_address
 
+        door = (info.data or {}).get("git_door")
         for key, address in value.items():
             if not re.match(r"^[A-Za-z0-9._-]+/[A-Za-z0-9._-]+$", str(key)):
                 raise ValueError(
                     f"planning.fetch_addresses has a key {key!r} that is not 'org/name'"
                 )
             # The same check every fetch makes (forge.network_git): a plain
-            # https:// address.
-            problem = check_fetch_address(str(address))
+            # https:// address, or one through the declared Git door.
+            problem = check_fetch_address(str(address), git_door=door)
             if problem:
                 raise ValueError(f"planning.fetch_addresses for {key}: {problem}")
         return {str(k): str(v).strip() for k, v in value.items()}

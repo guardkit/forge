@@ -64,7 +64,9 @@ __all__ = [
     "DeclaredMemory",
     "DeclaredPath",
     "DeclaredProjectDocuments",
+    "DeclaredReference",
     "PLAYER_ALLOWED_KEYS",
+    "REFERENCE_KEY",
     "LAUNCH_KEY",
     "MAX_DECLARATION_BYTES",
     "MAX_DECLARATION_DEPTH",
@@ -78,6 +80,7 @@ __all__ = [
     "read_declared_launch_settings",
     "read_declared_memory",
     "read_declared_project_documents",
+    "read_declared_reference",
 ]
 
 
@@ -668,6 +671,143 @@ def read_declared_project_documents(
     return (
         DeclaredProjectDocuments(
             instructions=lists["instructions"], documents=lists["required_documents"]
+        ),
+        None,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Reference material: folders that are not product code (17 October 2026)
+# ---------------------------------------------------------------------------
+#
+# Prototype-to-factory design, section 2.2. A project may keep material in its
+# repository that its builds read but never build on: a signed-off copy of a
+# prototype, for example. It says so in the same file, read at the same
+# commit:
+#
+#     reference:
+#       paths: ["reference/"]                 # folders, each ending in '/'
+#       signed_off: "reference/record.yaml"   # optional: the version record
+#       request_words: ["prototype"]          # optional: words that mark a
+#                                             # request that must name a file
+#
+# Opt-in: a project without the block is read exactly as before. A block that
+# is present is held to these three keys, and a malformed one is refused in
+# one plain sentence, as the other declarations are. Nothing here knows any
+# stack or tool; the words are the project's own data.
+
+#: The block's name in ``.guardkit/config.yaml``.
+REFERENCE_KEY: str = "reference"
+
+#: The keys the block may hold.
+REFERENCE_ALLOWED_KEYS: frozenset[str] = frozenset(
+    {"paths", "signed_off", "request_words"}
+)
+
+
+@dataclass(frozen=True)
+class DeclaredReference:
+    """The ``reference`` block as declared, or nothing (no ``paths``)."""
+
+    paths: tuple[str, ...] = ()
+    signed_off: str | None = None
+    request_words: tuple[str, ...] = ()
+
+    @property
+    def declared(self) -> bool:
+        return bool(self.paths)
+
+
+def _plain_parts(value: str) -> list[str] | None:
+    """The path's parts, or ``None`` when it is absolute or has an empty,
+    ``.`` or ``..`` part (a reference path is compared as written, so it
+    must be written plainly)."""
+    if not value or value.startswith(("/", "\\")) or "\\" in value:
+        return None
+    parts = value.split("/")
+    if any(part in ("", ".", "..") for part in parts):
+        return None
+    return parts
+
+
+def read_declared_reference(
+    content: str | None,
+) -> tuple[DeclaredReference, str | None]:
+    """The project's ``reference`` block — or ``(empty, why)``.
+
+    Absent (or empty) means nothing is declared and nothing is judged. A
+    file that does not parse is the memory reader's refusal, not this one's.
+    Never raises.
+    """
+    empty = DeclaredReference()
+    if not content:
+        return empty, None
+    data, why_not = _parse(content)
+    if why_not is not None or data is None:
+        return empty, None
+    block = data.get(REFERENCE_KEY)
+    if block is None:
+        return empty, None
+    where = f"in {DECLARATION_PATH}"
+    if not isinstance(block, dict):
+        return empty, (
+            f"`{REFERENCE_KEY}` {where} is not a set of settings; it may hold "
+            f"{sorted(REFERENCE_ALLOWED_KEYS)}"
+        )
+    unknown = sorted(str(key) for key in set(block) - REFERENCE_ALLOWED_KEYS)
+    if unknown:
+        return empty, (
+            f"`{REFERENCE_KEY}` {where} has unknown keys {unknown}; the allowed "
+            f"keys are {sorted(REFERENCE_ALLOWED_KEYS)}"
+        )
+    raw_paths = block.get("paths")
+    if not isinstance(raw_paths, list) or not raw_paths:
+        return empty, (
+            f"`{REFERENCE_KEY}.paths` {where} must list at least one folder, "
+            f"written like \"reference/\""
+        )
+    paths: list[str] = []
+    for index, value in enumerate(raw_paths):
+        parts = (
+            _plain_parts(value[:-1])
+            if isinstance(value, str) and value.endswith("/")
+            else None
+        )
+        if parts is None:
+            return empty, (
+                f"`{REFERENCE_KEY}.paths[{index}]` {where} ({value!r}) is not a "
+                f"folder inside the repository written plainly: it must be "
+                f"repository-relative, end with '/', and have no empty, '.' "
+                f"or '..' parts"
+            )
+        if value not in paths:
+            paths.append(value)
+    signed_off = block.get("signed_off")
+    if signed_off is not None:
+        if not isinstance(signed_off, str) or _plain_parts(signed_off) is None:
+            return empty, (
+                f"`{REFERENCE_KEY}.signed_off` {where} ({signed_off!r}) is not a "
+                f"file inside the repository written plainly: it must be "
+                f"repository-relative and have no empty, '.' or '..' parts"
+            )
+    raw_words = block.get("request_words")
+    words: list[str] = []
+    if raw_words is not None:
+        if not isinstance(raw_words, list):
+            return empty, (
+                f"`{REFERENCE_KEY}.request_words` {where} is not a list of words"
+            )
+        for index, value in enumerate(raw_words):
+            if not isinstance(value, str) or not value.strip():
+                return empty, (
+                    f"`{REFERENCE_KEY}.request_words[{index}]` {where} is not "
+                    f"a word"
+                )
+            if value.strip() not in words:
+                words.append(value.strip())
+    return (
+        DeclaredReference(
+            paths=tuple(paths), signed_off=signed_off, request_words=tuple(words)
         ),
         None,
     )

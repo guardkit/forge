@@ -4301,10 +4301,38 @@ def _fetch_address_of(payload: dict[str, Any]) -> tuple[str | None, str | None]:
         return None, None
     if not isinstance(sent, str):
         return None, "'fetch_address' must be a string"
-    problem = check_fetch_address(sent)
+    door, error = _git_door_of(payload)
+    if error:
+        return None, error
+    problem = check_fetch_address(sent, git_door=door)
     if problem:
         return None, problem
     return sent.strip(), None
+
+
+def _git_door_of(payload: dict[str, Any]) -> tuple[str | None, str | None]:
+    """The request's ``git_door``, checked: ``(door, None)``, ``(None, None)``
+    when none was sent, or ``(None, sentence)``.
+
+    The coordinator sends its declared Git door (``planning.git_door``, 17
+    October 2026) beside the fetch address, so an address through the door
+    is taken here exactly as the coordinator's own settings took it. Like the
+    address, it is never read from this sandbox's own settings file.
+    """
+    from forge.network_git import git_door_problem
+
+    sent = payload.get("git_door")
+    if sent is None or (isinstance(sent, str) and not sent.strip()):
+        return None, None
+    if not isinstance(sent, str):
+        return None, "'git_door' must be a string"
+    problem = git_door_problem(sent)
+    if problem:
+        return None, (
+            f"'git_door' is not an http://<address>:<port>/ address: {problem} "
+            "(the value is not repeated here)"
+        )
+    return sent, None
 
 
 def process_git_remote_start_point_request(
@@ -4348,6 +4376,7 @@ def process_git_remote_start_point_request(
     fetch_address, error = _fetch_address_of(payload)
     if error:
         return 400, {"error": error}
+    git_door, _ = _git_door_of(payload)
     from forge.deploy.candidate_tree import fetch_remote_start_point
 
     try:
@@ -4357,6 +4386,7 @@ def process_git_remote_start_point_request(
                 str(branch) if branch else None,
                 fetch_address=fetch_address,
                 repo=str(payload.get("repo") or "") or None,
+                git_door=git_door,
             )
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
@@ -7642,7 +7672,8 @@ class _CommitTree:
 
 
 def _open_commit_tree(
-    repo_path: Path, commit: Any, fetch_address: str | None = None
+    repo_path: Path, commit: Any, fetch_address: str | None = None,
+    git_door: str | None = None,
 ) -> tuple[_CommitTree | None, tuple[int, dict[str, Any]] | None]:
     """The commit's tree, or the refusal already shaped. Fetches the
     project's recorded address (``fetch_address``) once when the commit is
@@ -7673,7 +7704,9 @@ def _open_commit_tree(
             from forge.deploy.candidate_tree import fetch_remote_start_point
 
             answer = _run_coroutine(
-                fetch_remote_start_point(repo_path, None, fetch_address=fetch_address)
+                fetch_remote_start_point(
+                    repo_path, None, fetch_address=fetch_address, git_door=git_door
+                )
             )
             fetched = (
                 f"; its remote was fetched and {answer.branch} is at {answer.commit}"
@@ -7739,7 +7772,10 @@ def _code_at_commit(
     fetch_address, error = _fetch_address_of(payload)
     if error:
         return 400, {"error": error}
-    tree, refusal = _open_commit_tree(repo_path, payload.get("commit"), fetch_address)
+    git_door, _ = _git_door_of(payload)
+    tree, refusal = _open_commit_tree(
+        repo_path, payload.get("commit"), fetch_address, git_door
+    )
     if refusal is not None or tree is None:
         return refusal or (500, {"error": "the sidecar could not read the commit"})
     try:

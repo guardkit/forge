@@ -464,6 +464,52 @@ def test_bad_model_door_route_refuses_before_anything_is_written(inventory,monke
     assert {p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}==before
 
 
+def test_without_a_git_door_port_the_rules_are_todays(inventory,monkeypatch):
+    """17 October 2026: no GIT_DOOR_PORT in the env file, no Git door rule."""
+    config,path,args=inventory
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
+    assert [x for x in allowed if x.startswith('192.0.2.10')]==['192.0.2.10:8900','192.0.2.10:30824','192.0.2.10:30823']
+    receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert receipt['git_door_rule'] is None
+
+
+def test_the_git_door_rule_is_one_gateway_port_beside_the_model_door(inventory,monkeypatch):
+    """17 October 2026: with GIT_DOOR_PORT set, the sandbox is given the Git
+    door's one port, exactly as the model door's, and the receipt records it."""
+    config,path,args=inventory;edit_env(config,{'GIT_DOOR_PORT':'30825'})
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    import yaml
+    rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
+    assert rules.count('192.0.2.10:30825')==1
+    allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
+    assert allowed.count('192.0.2.10:30825')==1 and '192.0.2.10:30823' in allowed
+    assert not any(x in ('*','192.0.2.10') or '/' in x for x in allowed)
+    receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert receipt['git_door_rule']=='192.0.2.10:30825'
+
+
+@pytest.mark.parametrize('change,message',[
+    ({'GIT_DOOR_PORT':'door'},'GIT_DOOR_PORT is not a port number'),
+    ({'GIT_DOOR_PORT':'0'},'GIT_DOOR_PORT is not a port number'),
+    ({'GIT_DOOR_PORT':'65536'},'GIT_DOOR_PORT is not a port number'),
+    ({'GIT_DOOR_PORT':'192.0.2.10:30825'},'GIT_DOOR_PORT is not a port number'),
+    ({'GIT_DOOR_PORT':'8900'},"GIT_DOOR_PORT equals the answer-service, memory or model door's port"),
+    ({'GIT_DOOR_PORT':'30824'},"GIT_DOOR_PORT equals the answer-service, memory or model door's port"),
+    ({'GIT_DOOR_PORT':'30823'},"GIT_DOOR_PORT equals the answer-service, memory or model door's port"),
+    ({'GIT_DOOR_PORT':'30822'},"GIT_DOOR_PORT equals the answer-service, memory or model door's port"),
+])
+def test_bad_git_door_route_refuses_before_anything_is_written(inventory,monkeypatch,capsys,tmp_path,change,message):
+    config,path,args=inventory;edit_env(config,change)
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before route validation'))
+    before={p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert m.main(args)==2
+    assert message in capsys.readouterr().err
+    assert {p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}==before
+
+
 def test_plan_shows_answer_and_memory_mcp_rules(inventory):
     config,path,args=inventory
     result=subprocess.run([sys.executable,str(SCRIPT),*args,'--plan'],capture_output=True,text=True,env={'PATH':'/does-not-exist'})

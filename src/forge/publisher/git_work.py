@@ -667,6 +667,29 @@ class TheProjectsCommits:
             branch_tip=listed.get(f"refs/heads/{branch}"),
         )
 
+    def the_key_reads_the_remote(self) -> GitSaid:
+        """``git ls-remote`` of the remote named origin, with this route's own
+        credential and nothing written anywhere (17 October 2026): the first
+        half of "confirmed private" (:mod:`forge.publisher.private_remote`)."""
+        transport = the_remote_transport(self._route.remote)
+        if transport is None:
+            return GitSaid(
+                ok=False,
+                said=(
+                    "the remote is not an https:// or SSH address, so the "
+                    "publisher will not read it"
+                ),
+            )
+        return self._git(
+            "ls-remote",
+            "--",
+            self._route.remote,
+            "HEAD",
+            transport=transport,
+            with_credential=True,
+            git_dir=False,
+        )
+
     def is_in(self, ancestor: str, descendant: str) -> bool | None:
         """Is ``ancestor`` part of ``descendant``? ``None`` = git could not say."""
         done = run_network_git(

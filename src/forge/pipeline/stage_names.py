@@ -94,6 +94,8 @@ STAGE_PLAIN_NAMES: dict[str, str] = {
     "planned-handoff": "handing the plan over",
     "target-terminal-enter": "starting the machine chain",
     "project-documents": "reading the project's documents",
+    "reference-material": "reading the project's reference material",
+    "prepared-admission": "admitting the feature planned elsewhere",
     "feature-spec-complete": "finishing the spec",
     "feature-spec-draft": "writing the spec",
     "feature-spec-digest-review": "reading the spec digest",

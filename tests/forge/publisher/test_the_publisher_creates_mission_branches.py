@@ -705,3 +705,88 @@ class TestTheCoordinatorAsksOverTheWire:
         )
         assert answer["published"] is True
         assert "created" not in answer
+
+
+# ---------------------------------------------------------------------------
+# With private_only on, a mission branch gets the same two private checks a
+# send gets: refused from the start for a route found public at start-up, and
+# checked again immediately before the push (missions joined to the private
+# repositories change, 17 October 2026).
+
+
+class _Lookup:
+    """The anonymous visibility lookup, answering in turn, counting each ask."""
+
+    def __init__(self, *answers: int) -> None:
+        self.answers = list(answers)
+        self.asked: list[tuple[str, str]] = []
+
+    def __call__(self, owner: str, name: str) -> int | None:
+        self.asked.append((owner, name))
+        return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
+
+
+@pytest.fixture()
+def as_github(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Each bare remote stands for a made-up GitHub repository of its name;
+    the key read is still the real ``git ls-remote`` against it."""
+    from forge.publisher import private_remote
+
+    real = private_remote.confirmed_private
+
+    def as_if_on_github(remote: str, **kw: Any):  # noqa: ANN202
+        name = Path(str(remote)).name.removesuffix(".git")
+        return real(f"git@github.com:example-owner/{name}.git", **kw)
+
+    monkeypatch.setattr(the_service, "confirmed_private", as_if_on_github)
+
+
+def _private_only(world: dict[str, Any], *, on: bool, lookup: Any) -> Publisher:
+    import dataclasses
+
+    settings = dataclasses.replace(world["settings"], private_only=on)
+    return Publisher(settings, visibility_lookup=lookup)
+
+
+def _never(owner: str, name: str) -> int | None:
+    raise AssertionError("with private_only off nothing is looked up")
+
+
+class TestPrivateOnly:
+    def test_off_nothing_is_looked_up(self, world: dict[str, Any]) -> None:
+        answer = _private_only(world, on=False, lookup=_never).create_mission_branch(
+            _ask(world)
+        )
+        assert answer.created is True, answer.refusal
+
+    def test_on_a_confirmed_private_route_is_created_and_asked_twice(
+        self, world: dict[str, Any], as_github: None
+    ) -> None:
+        lookup = _Lookup(404)
+        answer = _private_only(world, on=True, lookup=lookup).create_mission_branch(
+            _ask(world)
+        )
+        assert answer.created is True, answer.refusal
+        assert len(lookup.asked) == 2, "once at start, once before the push"
+
+    def test_on_a_public_route_is_refused_from_the_start(
+        self, world: dict[str, Any], as_github: None
+    ) -> None:
+        answer = _private_only(world, on=True, lookup=_Lookup(200)).create_mission_branch(
+            _ask(world)
+        )
+        assert answer.created is False
+        assert answer.refusal_kind == the_service.NOT_CONFIRMED_PRIVATE
+        assert _the_remote_branch(world["project"]["bare"]) is None
+
+    def test_on_a_route_that_turned_public_is_refused_before_the_push(
+        self, world: dict[str, Any], as_github: None
+    ) -> None:
+        lookup = _Lookup(404, 200)
+        answer = _private_only(world, on=True, lookup=lookup).create_mission_branch(
+            _ask(world)
+        )
+        assert answer.created is False
+        assert answer.refusal_kind == the_service.NOT_CONFIRMED_PRIVATE
+        assert _the_remote_branch(world["project"]["bare"]) is None
+        assert len(lookup.asked) == 2
