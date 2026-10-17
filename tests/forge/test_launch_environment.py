@@ -58,6 +58,7 @@ PARENT = {
     "GUARDKIT_ARCH_CONFORMANCE_BLOCKING": "1",
     "GUARDKIT_ZERO_TEST_BLOCKING": "1",
     "GUARDKIT_BOOT_SMOKE_BLOCKING": "1",
+    "GUARDKIT_SECURITY_CHECK_BLOCKING": "1",
     "FLEET_MEMORY_ENABLED": "true",
     "FLEET_MEMORY_MCP_URL": "http://memory-door:31822/mcp",
     "FLEET_MEMORY_PG_DSN": "postgresql://somewhere/memory",
@@ -125,8 +126,12 @@ def test_the_list_is_short() -> None:
 
     Raised from 38 to 39 on 14 October 2026 for FLEET_MEMORY_MCP_URL, the
     memory door a build in the sandbox reads and writes memory through now
-    that no database address or bus password is handed in there."""
-    assert len(LAUNCH_SETTINGS) <= 39
+    that no database address or bus password is handed in there.
+
+    Raised from 39 to 40 on 17 October 2026 for GUARDKIT_SECURITY_CHECK_BLOCKING,
+    the security check's operator switch, off today, which must travel when it is
+    turned on rather than be dropped silently as the first switch once was."""
+    assert len(LAUNCH_SETTINGS) <= 40
 
 
 def test_the_list_names_no_language_framework_or_product() -> None:
@@ -245,6 +250,7 @@ OPERATOR_SWITCHES = (
     "GUARDKIT_ARCH_CONFORMANCE_BLOCKING",
     "GUARDKIT_ZERO_TEST_BLOCKING",
     "GUARDKIT_BOOT_SMOKE_BLOCKING",
+    "GUARDKIT_SECURITY_CHECK_BLOCKING",
 )
 
 
@@ -272,7 +278,11 @@ def test_a_switch_nobody_turned_on_is_not_invented() -> None:
     parent = {
         name: value
         for name, value in PARENT.items()
-        if name not in ("GUARDKIT_ZERO_TEST_BLOCKING", "GUARDKIT_BOOT_SMOKE_BLOCKING")
+        if name not in (
+            "GUARDKIT_ZERO_TEST_BLOCKING",
+            "GUARDKIT_BOOT_SMOKE_BLOCKING",
+            "GUARDKIT_SECURITY_CHECK_BLOCKING",
+        )
     }
 
     env = build_launch_env(parent=parent, memory_project="widget_shop")
@@ -280,6 +290,7 @@ def test_a_switch_nobody_turned_on_is_not_invented() -> None:
     assert env["GUARDKIT_ARCH_CONFORMANCE_BLOCKING"] == "1"
     assert "GUARDKIT_ZERO_TEST_BLOCKING" not in env
     assert "GUARDKIT_BOOT_SMOKE_BLOCKING" not in env
+    assert "GUARDKIT_SECURITY_CHECK_BLOCKING" not in env
 
 
 # ---------------------------------------------------------------------------
