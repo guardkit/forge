@@ -829,8 +829,9 @@ def _rule_error(root):
 @pytest.mark.asyncio
 async def test_a_file_opengrep_could_not_parse_keeps_its_earlier_findings(lab: Lab) -> None:
     """Review 3, F5: a parse error for a file, and no result for it, does not
-    mark that file's earlier code finding gone; it is said, not posted alone."""
-    lab.add("org/app", {"app/run.py": "import subprocess\nsubprocess.call(c, shell=True)\n"})
+    mark that file's earlier code finding gone. Review 4, F5: the file newly
+    not fully checked posts once; the same file the next night does not."""
+    lab.add("org/app", {"package-lock.json": LOCK, "app/run.py": "import subprocess\nsubprocess.call(c, shell=True)\n"})
     lab.model.answer = lambda prompt: '{"real": false}'
     await run_sweep(lab.deps())
     posted = len(lab.slack.lines)
@@ -843,12 +844,52 @@ async def test_a_file_opengrep_could_not_parse_keeps_its_earlier_findings(lab: L
     (after,) = [e for e in _state(lab)["findings"].values() if e["kind"] == "code"]
     assert after["status"] == "not-real"
     assert report.projects[0].code_partial == {"app/run.py": "PartialParsing"}
-    assert len(lab.slack.lines) == posted  # not on its own a reason to post
+    assert len(lab.slack.lines) == posted + 1
+    assert lab.slack.lines[-1] == (
+        "Nightly security check: app — 1 file not fully checked for code patterns "
+        "(the scanner could not parse all of it, 1 of them new)."
+    )
     history = json.loads((lab.folder / "history.jsonl").read_text().splitlines()[-1])
     assert history["projects"]["org/app"]["code_not_fully_checked"] == [
         {"file": "app/run.py", "error": "PartialParsing"}
     ]
+    assert history["projects"]["org/app"]["code_not_fully_checked_new"] == ["app/run.py"]
     assert "unexpected" not in (lab.folder / "history.jsonl").read_text()
+
+    # The same file the next night: not news on its own.
+    await run_sweep(lab.deps())
+    assert len(lab.slack.lines) == posted + 1
+
+
+@pytest.mark.asyncio
+async def test_the_weekly_line_never_says_all_clear_while_files_were_not_fully_checked(lab: Lab) -> None:
+    """Review 4, F5 (d), file-specific case on the weekly day."""
+    lab.add("org/app", {"package-lock.json": LOCK, "app/run.py": "x = 1\n"})
+    lab.scanners.opengrep_errors = [_partial_parsing("app/run.py")]
+    lab.now[0] = lab.now[0] - timedelta(days=1)  # a Sunday: the file is new then
+    await run_sweep(lab.deps(weekly_all_clear="monday"))
+    lab.now[0] = lab.now[0] + timedelta(days=1)  # Monday, the weekly day
+    await run_sweep(lab.deps(weekly_all_clear="monday"))
+    assert lab.slack.lines[-1] == (
+        "Nightly security check, weekly: app — nothing new; 1 file not fully checked "
+        "for code patterns (the scanner could not parse all of it)."
+    )
+    assert "all clear" not in lab.slack.lines[-1]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("weekly", [None, "monday"])
+async def test_a_code_scan_that_could_not_complete_always_posts(lab: Lab, weekly) -> None:
+    """Review 4, F5 (a): a whole-scan error posts every night, normal or weekly
+    day, and is never called all clear."""
+    lab.add("org/app", {"package-lock.json": LOCK, "app/run.py": "x = 1\n"})
+    lab.scanners.opengrep_errors = [_rule_error]
+    for _ in range(2):
+        await run_sweep(lab.deps(weekly_all_clear=weekly))
+    assert lab.slack.lines == [
+        "Nightly security check: app — code patterns not fully checked "
+        "(the scanner reported an error)."
+    ] * 2
 
 
 @pytest.mark.asyncio

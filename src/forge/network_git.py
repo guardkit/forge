@@ -813,6 +813,7 @@ def fetch_default_branch_copy(
     *,
     copies_root: Path,
     timeout: float = _DEFAULT_TIMEOUT_S,
+    git_door: Optional[str] = None,
 ) -> StartPoint:
     """The remote's default branch at ``address``, with its whole history,
     fetched into the factory's own bare copy under ``copies_root``. Never
@@ -828,10 +829,14 @@ def fetch_default_branch_copy(
 
     ``branch`` and ``commit`` name what was fetched; otherwise ``refusal``
     is one plain sentence (git's own words are never kept).
+
+    ``git_door`` is the declared Git door, when there is one, exactly as for
+    :func:`fetch_start_point`: a door address is fetched over ``http`` with
+    no credential, and only an address of exactly that door is taken.
     """
     if not str(address or "").strip():
         return StartPoint(refusal=no_fetch_address_sentence(None))
-    problem = check_fetch_address(address)
+    problem = check_fetch_address(address, git_door=git_door)
     if problem:
         return StartPoint(refusal=problem)
     address = str(address).strip()

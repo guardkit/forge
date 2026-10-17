@@ -146,6 +146,10 @@ class SweepState:
 
     findings: dict[str, dict[str, Any]] = field(default_factory=dict)
     last_all_clear: str | None = None
+    #: The files the code scanner could not fully check on each project's last
+    #: scan (shown paths only), so a file newly on that list is news and the
+    #: same files every night are not (Codex implementation review 4, F5).
+    code_partial: dict[str, list[str]] = field(default_factory=dict)
 
     def entries_for(self, project: str) -> Iterator[tuple[str, dict[str, Any]]]:
         for fingerprint, entry in self.findings.items():
@@ -186,7 +190,17 @@ def load_state(folder: Path) -> SweepState:
         if isinstance(entry, dict) and entry.get("status") in STATUSES
     }
     last = data.get("last_all_clear")
-    return SweepState(findings=findings, last_all_clear=str(last) if isinstance(last, str) else None)
+    partial_raw = data.get("code_partial")
+    partial = {
+        str(project): [str(path) for path in paths if isinstance(path, str)]
+        for project, paths in (partial_raw.items() if isinstance(partial_raw, dict) else [])
+        if isinstance(paths, list)
+    }
+    return SweepState(
+        findings=findings,
+        last_all_clear=str(last) if isinstance(last, str) else None,
+        code_partial=partial,
+    )
 
 
 def save_state(folder: Path, state: SweepState) -> None:
@@ -196,6 +210,7 @@ def save_state(folder: Path, state: SweepState) -> None:
             "version": STATE_VERSION,
             "findings": state.findings,
             "last_all_clear": state.last_all_clear,
+            "code_partial": state.code_partial,
         },
         sort_keys=True,
         indent=1,

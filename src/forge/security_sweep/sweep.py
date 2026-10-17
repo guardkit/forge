@@ -188,6 +188,9 @@ class ProjectResult:
     #: their own a reason to post (they recur every night).
     code_partial: dict[str, str] = field(default_factory=dict)
     code_scan_incomplete: bool = False
+    #: Files on tonight's not-fully-checked list that were not on the last
+    #: scan's: news (Codex implementation review 4, F5).
+    code_partial_new: list[str] = field(default_factory=list)
 
     @property
     def has_news(self) -> bool:
@@ -199,7 +202,17 @@ class ProjectResult:
             or self.new
             or self.drafted_row is not None
             or self.pending
+            # A code scan that could not complete always posts; files the
+            # scanner could not parse post only when newly so, because some
+            # files fail to parse every night (review 4, F5).
+            or self.code_scan_incomplete
+            or self.code_partial_new
         )
+
+    @property
+    def not_fully_checked(self) -> bool:
+        """Whether anything was not fully checked, so no 'all clear' is said."""
+        return bool(self.code_scan_incomplete or self.code_partial)
 
     def history(self) -> dict[str, Any]:
         out: dict[str, Any] = {
@@ -230,6 +243,8 @@ class ProjectResult:
             ]
         if self.code_scan_incomplete:
             out["code_scan_incomplete"] = True
+        if self.code_partial_new:
+            out["code_not_fully_checked_new"] = self.code_partial_new[:20]
         for name in ("symlinks_skipped", "submodules_skipped", "settings_left_out", "too_large"):
             values = getattr(self, name)
             if values:
@@ -305,9 +320,10 @@ def _project_phrase(result: ProjectResult, name: str) -> str:
     if result.code_scan_incomplete:
         parts.append("code patterns not fully checked (the scanner reported an error)")
     elif result.code_partial:
+        newly = f", {len(result.code_partial_new)} of them new" if result.code_partial_new else ""
         parts.append(
             f"{_plural(len(result.code_partial), 'file', 'files')} not fully checked "
-            "for code patterns (the scanner could not parse all of it)"
+            f"for code patterns (the scanner could not parse all of it{newly})"
         )
     if result.too_large:
         parts.append(
@@ -325,6 +341,9 @@ def _project_phrase(result: ProjectResult, name: str) -> str:
         )
     if not parts:
         parts.append("nothing new")
+    elif not result.has_news and result.not_fully_checked and len(parts) == 1:
+        # Only the not-fully-checked note: say plainly that nothing is new.
+        return f"{name} — nothing new; " + parts[0]
     return f"{name} — " + ", ".join(parts)
 
 
@@ -346,7 +365,10 @@ def slack_line(report: RunReport, *, all_clear_day: bool) -> str | None:
     if not news and not all_clear_day:
         return None
     phrases = [_project_phrase(r, names[r.project]) for r in report.projects]
-    if not news:
+    if not news and any(r.not_fully_checked for r in report.projects):
+        # Never "all clear" while something was not fully checked (review 4, F5).
+        head = "Nightly security check, weekly: "
+    elif not news:
         head = "Nightly security check, weekly all clear: "
     else:
         head = "Nightly security check: "
@@ -548,7 +570,7 @@ async def _sweep_project(
         await _scan_dependencies(deps, project, tree, work, result, current, checked)
         await _scan_secrets(deps, project, tree, work, key, files, result, current, checked, secret_lines)
         await _count_history(deps, mirror.path, work, result)
-        await _scan_code(deps, project, tree, work, key, files, catalogue, result, current, checked)
+        await _scan_code(deps, project, tree, work, key, files, catalogue, result, current, checked, state)
 
         new = _update_statuses(deps, project, state, rows, current, checked, result)
         await _sort_pending(deps, state, current, files, secret_lines, result, budget)
@@ -661,7 +683,7 @@ async def _count_history(deps, mirror: Path, work: Path, result: ProjectResult) 
         result.not_checked[PART_HISTORY] = "the secret scanner's report could not be read"
 
 
-async def _scan_code(deps, project, tree, work, key, files, catalogue, result, current, checked) -> None:
+async def _scan_code(deps, project, tree, work, key, files, catalogue, result, current, checked, state) -> None:
     missing = deps.setup.missing("opengrep")
     if missing:
         result.not_checked[PART_CODE] = missing
@@ -687,6 +709,9 @@ async def _scan_code(deps, project, tree, work, key, files, catalogue, result, c
     # from it is marked gone tonight (Codex implementation review 3, F5).
     result.code_partial = {shown(path): kind for path, kind in sorted(gaps.files.items())}
     result.code_scan_incomplete = gaps.incomplete
+    before = set(state.code_partial.get(project, []))
+    result.code_partial_new = sorted(set(result.code_partial) - before)
+    state.code_partial[project] = sorted(result.code_partial)
     if not gaps.incomplete:
         checked.add(TOOL_OPENGREP)
     for loc in locations:

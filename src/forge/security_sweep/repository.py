@@ -73,10 +73,20 @@ class Mirror:
     refusal: str | None = None
 
 
-def fetch_mirror(address: str, mirrors_root: Path, *, timeout: float = 600.0) -> Mirror:
-    """Fetch the default branch of ``address`` into the sweep's own mirror."""
+def fetch_mirror(
+    address: str,
+    mirrors_root: Path,
+    *,
+    timeout: float = 600.0,
+    git_door: str | None = None,
+) -> Mirror:
+    """Fetch the default branch of ``address`` into the sweep's own mirror.
+
+    ``git_door`` is the coordinator's declared Git door (``planning.git_door``),
+    when there is one; without it only plain https addresses are fetched.
+    """
     point = network_git.fetch_default_branch_copy(
-        address, copies_root=mirrors_root, timeout=timeout
+        address, copies_root=mirrors_root, timeout=timeout, git_door=git_door
     )
     if point.refusal or not point.commit:
         return Mirror(refusal=point.refusal or "the project could not be fetched")

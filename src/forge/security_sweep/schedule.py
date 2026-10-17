@@ -24,6 +24,7 @@ during a sweep, the sweep finishes the project it is on and stops.
 from __future__ import annotations
 
 import asyncio
+import functools
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -198,6 +199,7 @@ def compose_sweep(
     from forge.adapters.sqlite import connect_writer
     from forge.planning.work_queue_store import WorkQueueStore
 
+    from .repository import fetch_mirror
     from .scanners import ScannerSetup
     from .sorting import default_asker
     from .state import sweep_folder
@@ -223,6 +225,11 @@ def compose_sweep(
         is_idle=is_idle,
         asker=asker,
         asker_missing=why_not or "the model is not configured",
+        # The coordinator's declared Git door, threaded to every fetch exactly
+        # as its other fetches take it (Codex implementation review 4, F6).
+        fetch=functools.partial(
+            fetch_mirror, git_door=getattr(forge_config.planning, "git_door", None)
+        ),
         merge_executor_enabled=bool(
             getattr(getattr(forge_config, "merge_executor", None), "enabled", False)
         ),

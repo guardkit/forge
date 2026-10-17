@@ -447,3 +447,53 @@ class TestSettingsInheritedFromAnExtensionBlock:
         text = ('version: "3.8"\n' + SAFE_INHERITED) if with_version else SAFE_INHERITED
         (target / "compose.yaml").write_text(text)
         assert _opengrep(target) == []
+
+
+class TestTheGitDoor:
+    """Review 4, F6: the coordinator's declared Git door reaches the sweep's
+    fetch, exactly as its other fetches take it."""
+
+    def _door_repo(self, netlab: NetLab) -> tuple[str, str]:
+        served = netlab.good.parent
+        shutil.copytree(netlab.good, served / "org" / "app.git")
+        door = netlab.http.url("")  # http://127.0.0.1:<port>/
+        return door, f"{door}org/app.git"
+
+    def test_a_door_address_is_fetched_through_the_composed_sweep(
+        self, tmp_path: Path, netlab: NetLab, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge import network_git
+        from forge.adapters.sqlite import connect as sqlite_connect
+        from forge.config.models import ForgeConfig
+        from forge.lifecycle import migrations
+        from forge.security_sweep.schedule import compose_sweep
+
+        # https only, as in production: the door alone lets this http address in.
+        monkeypatch.setattr(network_git, "FETCH_TRANSPORTS", ("https",))
+        door, address = self._door_repo(netlab)
+        db = tmp_path / "forge.db"
+        cx = sqlite_connect.connect_writer(db)
+        migrations.apply_at_boot(cx)
+        cx.close()
+        config = ForgeConfig(
+            permissions={"filesystem": {"allowlist": []}},
+            planning={"git_door": door, "fetch_addresses": {"org/app": address}},
+            security_sweep={"enabled": True},
+        )
+
+        async def publish(text: str) -> None:
+            return None
+
+        deps, _ = compose_sweep(config, db_path=db, publish=publish)
+        got = deps.fetch(deps.projects["org/app"], tmp_path / "mirrors")
+        assert got.refusal is None and got.commit == netlab.good_commit
+
+    def test_an_unrelated_http_address_is_still_refused_with_a_door(self, tmp_path: Path) -> None:
+        got = fetch_mirror(
+            "http://192.0.2.9:9999/org/app.git", tmp_path, git_door="http://192.0.2.1:8418/"
+        )
+        assert got.refusal and "Git door" in got.refusal
+
+    def test_without_a_door_the_sweep_stays_https_only(self, tmp_path: Path) -> None:
+        got = fetch_mirror("http://192.0.2.1:8418/org/app.git", tmp_path)
+        assert got.refusal and "https://" in got.refusal
