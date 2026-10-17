@@ -204,3 +204,48 @@ async def test_the_pin_and_the_preview_base_are_one_read(
     assert reads == []
     assert preview.requests[0].preview_base_sha == fetched
     assert preview.requests[0].expect_main_sha == fetched
+
+
+@pytest.mark.asyncio
+async def test_an_offer_with_a_preview_reads_the_target_once(
+    config: ForgeConfig,
+    pool: SqliteLifecyclePersistence,  # noqa: F811
+    repo_root: Path,  # noqa: F811
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The whole offer, with a preview: one read of the target branch, and the
+    card's pin is the very commit the preview was joined onto."""
+    from forge.pipeline import merge_join
+
+    _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+    fetched = _somebody_lands_on_main(repo_root)
+    reads: list[Any] = []
+    real = merge_join.target_branch_now
+
+    async def counted(*args: Any, **kwargs: Any) -> Any:
+        reads.append(1)
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(merge_join, "target_branch_now", counted)
+    preview = _OnePreview()
+
+    async def _nothing(*_a: Any) -> None:
+        return None
+
+    service = MergeOfferService(
+        config=config,
+        pool=pool,
+        pipeline_publisher=SimpleNamespace(publish_build_paused=_nothing),
+        raw_publish=_nothing,
+        review_preview=preview,
+    )
+
+    assert await service.offer(build_id=BUILD_ID, feature_id=FEATURE_ID, card_words=_words)
+
+    offer = [
+        s for s in pool.read_stages(BUILD_ID)
+        if s.target_identifier == MERGE_OFFER_TARGET_IDENTIFIER
+    ][0].details[MERGE_OFFER_DETAILS_KEY]
+    assert len(reads) == 1
+    assert len(preview.requests) == 1
+    assert offer["expect_main_sha"] == preview.requests[0].preview_base_sha == fetched
