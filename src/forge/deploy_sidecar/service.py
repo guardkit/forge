@@ -224,6 +224,7 @@ from forge.deploy.review_preview import (
     PREVIEW_ROUTES_NEEDING_THE_SWITCH,
     IssuedPreviewValues,
     issued_preview_refusal,
+    sandbox_preview,
     serve_preview_operation,
 )
 from forge.deploy_sidecar.deploy_executor import (
@@ -4780,7 +4781,15 @@ def process_preview_request(
                 "a review preview on, so none is started here"
             )
         }
-    ports = frozenset(slot.port for slot in preview.slots) if switched_on else frozenset()
+    ports: frozenset[int] = frozenset()
+    if switched_on:
+        # The link check reaches the ports this sandbox publishes for the
+        # repository's previews: its own preview_ports when its entry names
+        # them (one sandbox per project, 18 October 2026), else the profile's.
+        from forge.config.sandboxes import sandboxes_of
+
+        own, _refused = sandbox_preview(str(payload.get("repo") or ""), preview, sandboxes_of(config))
+        ports = frozenset(slot.port for slot in own.slots) if own is not None else frozenset()
     return serve_preview_operation(route, payload, repo_path=repo_path, slot_ports=ports)
 
 

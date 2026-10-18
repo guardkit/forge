@@ -1011,6 +1011,42 @@ class SandboxEntry(BaseModel):
             "list does. Empty (the default): no priors are read for its builds."
         ),
     )
+    preview_ports: list[int] = Field(
+        default_factory=list,
+        description=(
+            "The review-preview ports this sandbox publishes on its machine "
+            "(one sandbox per project, 18 October 2026): register-repo writes "
+            "slot k's 8950+10k and 8951+10k here, in the coordinator's and the "
+            "sandbox's settings, for a sandbox of its own. They replace the "
+            "published ports a repository's deploy profile names (a profile "
+            "cannot know which sandbox it lands in): preview slot i uses the "
+            "i-th port and keeps the profile's internal port, there are as many "
+            "slots as the smaller of the two counts, and the card's link names "
+            "this port. So a preview never listens on a port its sandbox does "
+            "not publish, and a card's link never opens another sandbox's "
+            "preview. Empty (the default): the shared sandbox, whose previews "
+            "use the ports its projects' profiles name, as before; a sandbox "
+            "with a Git door of its own must name them."
+        ),
+    )
+
+    @field_validator("preview_ports")
+    @classmethod
+    def _preview_ports_are_ports(cls, value: list[int]) -> list[int]:
+        """Each a port number from 1 to 65535, none twice."""
+        ports: list[int] = []
+        for raw in value:
+            if isinstance(raw, bool) or not isinstance(raw, int) or not 1 <= raw <= 65535:
+                raise ValueError(
+                    "each of a sandbox's preview_ports must be a port number from "
+                    f"1 to 65535; got {raw!r}"
+                )
+            if raw in ports:
+                raise ValueError(
+                    f"a sandbox's preview_ports name {raw} twice; each preview port once"
+                )
+            ports.append(raw)
+        return ports
 
     @field_validator("memory_projects")
     @classmethod
@@ -1287,6 +1323,26 @@ class PlanningConfig(BaseModel):
                         f"planning.sandboxes grants the memory name {name} to both "
                         f"{other} and {key}; a memory name belongs to one repository, "
                         "so take it out of one of the two entries"
+                    )
+        return self
+
+    @model_validator(mode="after")
+    def _a_preview_port_belongs_to_one_sandbox(self) -> "PlanningConfig":
+        """Two sandboxes never name the same preview port (18 October 2026).
+
+        Every sandbox publishes its previews on the same machine, so one port
+        is one sandbox's: a port named by two sandboxes would let a card's
+        link open the other sandbox's preview.
+        """
+        owners: dict[int, str] = {}
+        for key, entry in self.sandboxes.items():
+            for port in entry.preview_ports:
+                other = owners.setdefault(port, entry.name)
+                if other != entry.name:
+                    raise ValueError(
+                        f"planning.sandboxes gives sandboxes {other} and {entry.name} "
+                        f"the same preview port {port} (at {key}); each sandbox has "
+                        "preview ports of its own"
                     )
         return self
 
