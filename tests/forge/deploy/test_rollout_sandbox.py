@@ -920,7 +920,8 @@ def test_a_slot_whose_env_file_disagrees_with_its_slot_refuses_before_anything(i
 
 
 @pytest.mark.parametrize('rule,words', [
-    ('192.0.2.10:31852', 'not one of its own doors'),
+    ('192.0.2.10:31852', "another project's Git door or memory door"),
+    ('198.51.100.9:31840', "another project's Git door or memory door"),
     ('192.0.2.0/24', 'a wildcard or an address range'),
     ('0.0.0.0/0', 'a wildcard or an address range'),
     ('*', 'a wildcard or an address range'),
@@ -949,7 +950,8 @@ def test_slots_run_from_one_to_nineteen(inventory, capsys, slot):
 @pytest.mark.parametrize('rule,words', [
     ('192.0.2.10:4222', "the bus's or the model router's port"),
     ('198.51.100.9:4000', "the bus's or the model router's port"),
-    ('192.0.2.10:31852', 'not one of its own doors'),
+    ('192.0.2.10:31852', "another project's Git door or memory door"),
+    ('198.51.100.9:31840', "another project's Git door or memory door"),
     ('192.0.2.10:30824', 'not one of its own doors'),
 ])
 def test_a_slot_profile_rule_for_another_door_the_bus_or_the_router_refuses(inventory, monkeypatch, capsys, rule, words):
@@ -1058,3 +1060,27 @@ def test_a_one_sandbox_inventory_still_needs_its_project_and_env_file(inventory,
     config, path, args = inventory
     assert m.main(['--config', str(path), '--plan']) == 2
     assert 'name the project and env file explicitly' in capsys.readouterr().err
+
+
+def test_the_shared_sandbox_can_never_be_a_slot_entry(inventory, capsys):
+    """Codex R1: a slot entry named after the shared sandbox is refused before anything."""
+    config, path, args = inventory
+    make_slot(config, path)
+    config['sandbox']['name'] = 'api-test-deploy'
+    path.write_text(json.dumps(config))
+    assert m.main([*args, '--plan']) == 2
+    assert 'is the shared sandbox and cannot carry a slot' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('change', [{'MODEL_DOOR_PORT': '4000'}, {'MODEL_DOOR_PORT': '4222'}, {'MODEL_DOOR_PORT': '31845'}])
+def test_a_shared_service_port_set_to_the_bus_the_router_or_another_door_refuses(inventory, monkeypatch, capsys, change):
+    """Codex R2: the generated rules are checked as well as the profile's."""
+    config, path, args = inventory
+    make_slot(config, path)
+    edit_env(config, change)
+    b = Boundary(config, monkeypatch)
+    assert m.main(args) == 2
+    error = capsys.readouterr().err
+    assert "the bus's or the model router's port" in error or "another project's Git door or memory door" in error
+    assert not b.files
+    assert not any(x[:2] == ['sbx', 'stop'] for x in b.argv())

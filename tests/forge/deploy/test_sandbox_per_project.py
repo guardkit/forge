@@ -175,6 +175,37 @@ class TestAProjectsOwnSandbox:
         assert "Refusing" in result.stdout
         assert sbx == [] and other == []
 
+    def test_the_shared_sandbox_is_never_made_a_slot_sandbox(self, slot_repo, tmp_path):
+        """Codex R1: refused before any sbx, docker or systemctl call."""
+        result, sbx, other = _drive(slot_repo, tmp_path, "prepare", SANDBOX_NAME="api-test-deploy",
+                                    SBX_LS="api-test-deploy running")
+        assert result.returncode == 2
+        assert "is the shared sandbox" in result.stdout
+        assert sbx == [] and other == []
+
+    @pytest.mark.parametrize("change,words", [
+        ({"SANDBOX_MODEL_DOOR_PORT": "4000"}, "the bus's or the model router's"),
+        ({"SANDBOX_ANSWER_PORT": "4222"}, "the bus's or the model router's"),
+        ({"SANDBOX_EMBEDDER_PORT": "31852"}, "another project's Git door or memory door"),
+        ({"SANDBOX_MODEL_DOOR_PORT": "31832"}, "another project's Git door or memory door"),
+        ({"SANDBOX_ALLOW_NETWORK": "pypi.org,mirror.example.test:31845"}, "another project's Git door or memory door"),
+        ({"SANDBOX_ANSWER_PORT": "31823"}, "would share a port"),
+        ({"SANDBOX_EMBEDDER_PORT": "31831"}, "would share a port"),
+    ])
+    def test_the_whole_policy_is_checked_before_any_call(self, slot_repo, tmp_path, change, words):
+        """Codex R2: generated rules as well as the project's, overrides included."""
+        result, sbx, other = _drive(slot_repo, tmp_path, "prepare", **change)
+        assert result.returncode == 2, result.stdout
+        assert words in result.stdout
+        assert sbx == [] and other == []
+
+    def test_a_valid_shared_service_override_still_works(self, slot_repo, tmp_path):
+        result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_MODEL_DOOR_PORT="31900",
+                                SANDBOX_EMBEDDER_PORT="9100")
+        assert result.returncode == 0, result.stdout + result.stderr
+        allowed = [line for line in sbx if line.startswith("policy allow ")][0]
+        assert f"{GATEWAY}:31900" in allowed and f"{GATEWAY}:9100" in allowed
+
     def test_the_receipts_are_mounted_at_runtime_and_checked(self, slot_repo, tmp_path):
         _, _, receipts, _ = slot_repo
         result, sbx, _ = _drive(slot_repo, tmp_path, "prepare")

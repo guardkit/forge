@@ -227,6 +227,12 @@ SLOT_GIT_DOOR_BASE=31830
 SLOT_MEMORY_DOOR_BASE=31850
 # The two gateway services a project's own sandbox may never reach.
 NEVER_FROM_A_SLOT_PORTS=(4222 4000)
+# The highest slot. From slot 20 the Git door (31830 + k) would meet the
+# memory door of slot k - 20 (31850 + k).
+SLOT_MAX=19
+# The shared sandbox, which is never made, given doors or given a project's
+# receipts by this shape (one sandbox per project, Codex R1).
+SHARED_SANDBOX_NAMES=(api-test-deploy)
 
 is_a_slot_sandbox() { [[ -n "${SANDBOX_SLOT}" ]]; }
 
@@ -246,9 +252,15 @@ a_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (($1 < 65536)); }
 SLOT_PUBLISHES=()
 SLOT_DOOR_RULES=()
 if is_a_slot_sandbox; then
+  for shared in "${SHARED_SANDBOX_NAMES[@]}"; do
+    if [[ "${SANDBOX_NAME}" == "${shared}" ]]; then
+      log "FATAL: ${SANDBOX_NAME} is the shared sandbox, and SANDBOX_SLOT makes a project's own sandbox. Give the project a sandbox name of its own; the shared sandbox gets no door rules and no project's receipts from this script. Refusing to deploy."
+      exit 2
+    fi
+  done
   # Slots stop at 19: from slot 20 the Git door (31830 + k) would meet the
   # memory door of slot k - 20 (31850 + k).
-  if [[ ! "${SANDBOX_SLOT}" =~ ^([1-9]|1[0-9])$ ]]; then
+  if [[ ! "${SANDBOX_SLOT}" =~ ^[1-9][0-9]?$ ]] || ((10#${SANDBOX_SLOT} > SLOT_MAX)); then
     log "FATAL: SANDBOX_SLOT is '${SANDBOX_SLOT}', and a project's own sandbox takes a slot from 1 to 19 (slot 0 is the shared sandbox, which is not made this way; from 20 the door ports would collide). Refusing to deploy."
     exit 2
   fi
@@ -333,6 +345,35 @@ if is_a_slot_sandbox; then
     kept_rules+=("${rule}")
   done
   SANDBOX_ALLOW_NETWORK="$(IFS=','; printf '%s' "${kept_rules[*]:+${kept_rules[*]},}${SLOT_DOOR_RULES[*]}")"
+  # THE WHOLE POLICY, CHECKED BEFORE ANYTHING IS CALLED (Codex R2): the
+  # generated rules as well as the project's, so a shared-service port set to
+  # the bus's, the router's or another project's door is refused too. No rule
+  # may name the bus or the router, or a port in the two project-door ranges
+  # other than this slot's own two, and the five gateway rules must be five
+  # different ports.
+  own_git_door=$((SLOT_GIT_DOOR_BASE + 10#${SANDBOX_SLOT}))
+  own_memory_door=$((SLOT_MEMORY_DOOR_BASE + 10#${SANDBOX_SLOT}))
+  IFS=',' read -r -a whole_policy <<<"${SANDBOX_ALLOW_NETWORK}"
+  for rule in "${whole_policy[@]}"; do
+    [[ "${rule}" =~ :([0-9]+)$ ]] || continue
+    rule_port=$((10#${BASH_REMATCH[1]}))
+    for never in "${NEVER_FROM_A_SLOT_PORTS[@]}"; do
+      if ((rule_port == never)); then
+        log "FATAL: the policy for ${SANDBOX_NAME} would name port ${never} (${rule}), which is the bus's or the model router's. Check SANDBOX_MODEL_DOOR_PORT, SANDBOX_ANSWER_PORT, SANDBOX_EMBEDDER_PORT and SANDBOX_ALLOW_NETWORK. Refusing to deploy."
+        exit 2
+      fi
+    done
+    if (( (rule_port > SLOT_GIT_DOOR_BASE && rule_port <= SLOT_GIT_DOOR_BASE + SLOT_MAX && rule_port != own_git_door) ||
+          (rule_port > SLOT_MEMORY_DOOR_BASE && rule_port <= SLOT_MEMORY_DOOR_BASE + SLOT_MAX && rule_port != own_memory_door) )); then
+      log "FATAL: the policy for ${SANDBOX_NAME} would name port ${rule_port} (${rule}), which is another project's Git door or memory door. Slot ${SANDBOX_SLOT} reaches only ${own_git_door} and ${own_memory_door}. Refusing to deploy."
+      exit 2
+    fi
+  done
+  gateway_ports="$(printf '%s\n' "${SLOT_DOOR_RULES[@]##*:}" | sort -u | wc -l)"
+  if ((gateway_ports != ${#SLOT_DOOR_RULES[@]})); then
+    log "FATAL: two of the doors for ${SANDBOX_NAME} would share a port (${SLOT_DOOR_RULES[*]}). Give the model door, the answer service and the embedder ports of their own. Refusing to deploy."
+    exit 2
+  fi
 fi
 
 # True when the profile asked for the sandbox to carry the factory's services.

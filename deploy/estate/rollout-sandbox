@@ -258,6 +258,9 @@ SLOT_MEMORY_DOOR_BASE = 31850
 SLOT_HELPER_BASE = 8925
 SLOT_RUNNER_BASE = 8924
 NEVER_FROM_A_SLOT_PORTS = (4222, 4000)
+SLOT_MAX = 19
+# The shared sandbox is never a slot entry (Codex R1).
+SHARED_SANDBOX_NAMES = ('api-test-deploy',)
 
 
 def slot_of(sandbox):
@@ -265,8 +268,9 @@ def slot_of(sandbox):
     if 'slot' not in sandbox:
         return None
     slot = sandbox['slot']
+    require(sandbox.get('name') not in SHARED_SANDBOX_NAMES, f'{sandbox.get("name")} is the shared sandbox and cannot carry a slot; give the project a sandbox of its own')
     # 19 at most: from slot 20 the Git door (31830+k) meets slot k-20's memory door (31850+k).
-    require(type(slot) is int and 1 <= slot <= 19, 'sandbox.slot must be a whole number from 1 to 19; slot 0 is the shared sandbox, which carries no slot entry, and from 20 the door ports would collide')
+    require(type(slot) is int and 1 <= slot <= SLOT_MAX, 'sandbox.slot must be a whole number from 1 to 19; slot 0 is the shared sandbox, which carries no slot entry, and from 20 the door ports would collide')
     return slot
 
 
@@ -584,6 +588,13 @@ class Rollout:
             host, _, port = rule.rpartition(':') if re.fullmatch(r'.*:[0-9]+', rule) else (rule, '', '')
             require(not (port and int(port) in NEVER_FROM_A_SLOT_PORTS),
                     f'{self.s["name"]} is a project\'s own sandbox and its rules name {rule}, the bus\'s or the model router\'s port; take it out of its profile')
+            # Codex R2: no other project's door, wherever the rule came from.
+            if port:
+                number = int(port)
+                other_git = SLOT_GIT_DOOR_BASE < number <= SLOT_GIT_DOOR_BASE + SLOT_MAX and number != SLOT_GIT_DOOR_BASE + self.slot
+                other_memory = SLOT_MEMORY_DOOR_BASE < number <= SLOT_MEMORY_DOOR_BASE + SLOT_MAX and number != SLOT_MEMORY_DOOR_BASE + self.slot
+                require(not (other_git or other_memory),
+                        f'{self.s["name"]} is slot {self.slot} and its rules name {rule}, another project\'s Git door or memory door; take it out')
             require(host != gateway or rule in allowed,
                     f'{self.s["name"]} is a project\'s own sandbox and its rules name {rule} on the gateway, which is not one of its own doors or the shared services; take it out of its profile')
         require(self.git_door in profile['rules'] and self.memory_mcp in profile['rules'],
