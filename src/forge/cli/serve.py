@@ -1220,6 +1220,7 @@ def bind_production_dispatch_chain(
                             land=_merge_consumer.land_mission_feature,
                             resume_merge=_merge_consumer.resume_mission_merge,
                             reconcile=_merge_consumer.reconcile_mission_landing,
+                            release_hold=_merge_consumer.release_a_settled_hold,
                             git_surface=compose_merge_git_surface(forge_config),
                             tree_reader_for=compose_merge_check_reader(forge_config),
                             feature_routing_gate=feature_routing_gate,

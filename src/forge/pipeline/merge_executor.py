@@ -1384,6 +1384,63 @@ def _write_the_refusal_down_for(
 # ---------------------------------------------------------------------------
 
 
+async def retire_join_working_folders(
+    git: Any, record: Any, repo_root: Path, join_as: str
+) -> tuple[list[dict[str, Any]], bool]:
+    """Remove every join attempt's working folder; ``(what happened, an answer was lost)``.
+
+    THE BRANCH IS LEFT ALONE. Only the working FOLDER goes. Every joined
+    commit of every attempt stays exactly where it is, on the branch its own
+    attempt named, which is what "kept until the record's end" was protecting
+    — a folder is scaffolding, a commit is the work.
+
+    WHERE EACH JOIN'S FOLDER REALLY IS (15 October 2026, FEAT-D267): the
+    join's "done" line carries the path the venue answered with, which for a
+    sandboxed repository is the sandbox's own path. An attempt with no such
+    line falls back to this side's path. A folder the venue ANSWERED it did
+    not remove is a folder left behind; only a removal whose answer was lost
+    (``None``, or an exception) counts as an answer lost.
+    """
+    retired: list[dict[str, Any]] = []
+    lost = False
+    highest = int(getattr(record, "attempt", 0) or 0) if record is not None else 0
+    joined_at: dict[int, str] = {}
+    for line in getattr(record, "lines", ()) or ():
+        where = str((line.detail or {}).get("working_folder") or "").strip()
+        if line.kind == LINE_DONE and line.step == STEP_JOIN and where:
+            joined_at[int(line.attempt)] = where
+    for attempt_number in range(1, max(highest, 1) + 1):
+        folder = joined_at.get(attempt_number) or working_folder_path(
+            repo_root, join_as, attempt_number
+        )
+        try:
+            removed = await git.remove_working_folder(folder)
+        except Exception as exc:  # noqa: BLE001 — never costs a result
+            lost = True
+            retired.append(
+                {
+                    "attempt": attempt_number,
+                    "folder": folder,
+                    "removed": False,
+                    "answered": False,
+                    "detail": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            continue
+        if removed is None:
+            lost = True
+        retired.append(
+            {
+                "attempt": attempt_number,
+                "folder": folder,
+                "removed": bool(removed),
+                "answered": removed is not None,
+                "branch_kept": integration_branch(join_as, attempt_number),
+            }
+        )
+    return retired, lost
+
+
 class MissionMergeRefused(RuntimeError):
     """A mission's own merge was asked to run after a stop was requested."""
 
@@ -5749,61 +5806,16 @@ async def execute_merge_deploy(
         because the design keeps each joined commit under a name of its own
         until the build's record reaches its end, and no earlier version could
         reach it. The end is reachable now: the joined commit is on the remote
-        and what was checked is running.
-
-        THE BRANCH IS LEFT ALONE. Only the working FOLDER goes. Every joined
-        commit of every attempt stays exactly where it is, on the branch its
-        own attempt named, which is what "kept until the record's end" was
-        protecting — a folder is scaffolding, a commit is the work.
+        and what was checked is running. The work is
+        :func:`retire_join_working_folders`, shared with the recovery of a
+        settled record whose hold was never put down.
         """
         nonlocal a_leg_did_not_complete
-        retired: list[dict[str, Any]] = []
-        highest = int(getattr(record, "attempt", 0) or 0) if record is not None else 0
-        # WHERE EACH JOIN'S FOLDER REALLY IS (15 October 2026, FEAT-D267): the
-        # join's "done" line carries the path the venue answered with, which
-        # for a sandboxed repository is the sandbox's own path. That is the
-        # folder retired and the one the receipt names. An attempt with no
-        # such line falls back to this side's path. Either way the sandbox
-        # venue sends only the folder's own name, and the sandbox builds its
-        # own path from it (8 October 2026).
-        joined_at: dict[int, str] = {}
-        for line in getattr(record, "lines", ()) or ():
-            where = str((line.detail or {}).get("working_folder") or "").strip()
-            if line.kind == LINE_DONE and line.step == STEP_JOIN and where:
-                joined_at[int(line.attempt)] = where
-        for attempt_number in range(1, max(highest, 1) + 1):
-            folder = joined_at.get(attempt_number) or working_folder_path(
-                repo_root, join_as, attempt_number
-            )
-            try:
-                removed = await git.remove_working_folder(folder)
-            except Exception as exc:  # noqa: BLE001 — never costs a result
-                a_leg_did_not_complete = True
-                retired.append(
-                    {
-                        "attempt": attempt_number,
-                        "folder": folder,
-                        "removed": False,
-                        "answered": False,
-                        "detail": f"{type(exc).__name__}: {exc}",
-                    }
-                )
-                continue
-            # A folder the venue ANSWERED it did not remove is a folder left
-            # behind, not work still running: the receipt says so and the
-            # hold is put down, as for the retained worktree (a986459c). Only
-            # a removal whose answer was lost (``None``) keeps the hold.
-            if removed is None:
-                a_leg_did_not_complete = True
-            retired.append(
-                {
-                    "attempt": attempt_number,
-                    "folder": folder,
-                    "removed": bool(removed),
-                    "answered": removed is not None,
-                    "branch_kept": integration_branch(join_as, attempt_number),
-                }
-            )
+        retired, an_answer_was_lost = await retire_join_working_folders(
+            git, record, repo_root, join_as
+        )
+        if an_answer_was_lost:
+            a_leg_did_not_complete = True
         return retired
 
     try:
@@ -7359,6 +7371,62 @@ class MergeApprovalConsumer:
             return "nothing to do"
         async with self._lock_for(row.repo):
             return await self._settle_by_looking(row, mission, Path(repo_root_raw))
+
+    async def release_a_settled_hold(self, build_id: str) -> str:
+        """Put down the hold of a mission feature's record the press settled and never released.
+
+        Codex implementation round 2, R2. The press writes its result, then
+        cleans up, then puts its lease down; a coordinator that stops between
+        the result and the release leaves a settled record still held, which
+        nothing else revisits and which keeps a stopped mission from draining
+        (and the router and rollout blocked). Under the repository's lock and
+        the record's own lease rules — a live lease is never touched; an
+        expired one is taken over with a new turn — the clean-up the press
+        runs after a result is run again (the join's working folders retired,
+        branches kept, :func:`retire_join_working_folders`), and the hold is
+        put down on that turn. The outcome is already settled, so nothing is
+        sent again. A removal whose answer was lost keeps the new hold, which
+        lapses and is tried again. Answers "released", "held", "kept" or
+        "nothing to do".
+        """
+        from forge.lifecycle.mission_builds import mission_of_build
+
+        belongs = mission_of_build(self._deps.pool, build_id)
+        row = self._deps.pool.get_build_row(build_id)
+        if belongs is None or not belongs.is_feature or row is None:
+            return "nothing to do"
+        repo_root_raw = self._deps.config.planning.target_repo_paths.get(row.repo)
+        if not repo_root_raw:
+            return "nothing to do"
+        store = PublicationRecordStore(self._deps.pool.connection)
+        async with self._lock_for(row.repo):
+            record = store.read(build_id)
+            if not record.recorded or not record.result or not record.lease_holder:
+                return "nothing to do"
+            now = self._deps.clock()
+            if record.lease_is_live(now):
+                return "held"
+            holder = f"settled-hold-release:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+            grant = store.take_lease(build_id=build_id, holder=holder, now=now)
+            if grant is None:
+                return "held"
+            git = git_surface_for(self._deps, row.repo, Path(repo_root_raw))
+            retired, lost = await retire_join_working_folders(
+                git, store.read(build_id), Path(repo_root_raw), row.feature_id
+            )
+            logger.info(
+                "merge-executor: %s's settled record kept its hold after the "
+                "coordinator stopped; the join folders were looked at again (%s)",
+                build_id,
+                retired,
+            )
+            if lost:
+                return "kept"
+            if not store.release_lease(
+                build_id=build_id, turn=grant.turn, holder=holder, now=self._deps.clock()
+            ):
+                return "held"
+            return "released"
 
     async def _settle_by_looking(self, row: Any, mission: Any, repo_root: Path) -> str:
         """Settle this build's publication record from the remote. Its answer.

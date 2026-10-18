@@ -251,6 +251,10 @@ class MissionFinishDeps:
     #: whose publication record never settled is settled by looking at the
     #: remote (section 11). ``None`` settles nothing.
     reconcile: Callable[[str], Awaitable[Any]] | None = None
+    #: ``MergeApprovalConsumer.release_a_settled_hold``: a settled record whose
+    #: hold the press never put down (it stopped after its result) is released
+    #: once the hold has expired (R2). ``None`` releases nothing.
+    release_hold: Callable[[str], Awaitable[Any]] | None = None
     feature_routing_gate: Any | None = None
     feature_routing_required: bool = False
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
@@ -318,6 +322,12 @@ async def finish_ready_missions(
         _resuming.add(build_id)
         started.append(build_id)
         task = asyncio.create_task(_resume_guarded(deps, build_id, decided=decided))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
+    for build_id in _holds_to_release(deps, cx):
+        _resuming.add(build_id)
+        started.append(build_id)
+        task = asyncio.create_task(_release_guarded(deps, build_id))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
     for build_id in _landings_to_reconcile(deps, cx):
@@ -455,6 +465,60 @@ def _landings_to_reconcile(deps: MissionFinishDeps, cx: Any) -> list[str]:
         for (build_id,) in rows
         if str(build_id) not in _resuming and not records.read(str(build_id)).lease_is_live(now)
     ]
+
+
+def _holds_to_release(deps: MissionFinishDeps, cx: Any) -> list[str]:
+    """Mission features whose settled publication record still has an expired hold.
+
+    Codex implementation round 2, R2: the press puts its lease down only
+    after its clean-up, so a coordinator that stopped between the result and
+    the release leaves a record with a result and a holder. Whatever the
+    attempt's state and whether or not a report exists, while the mission is
+    active. A live, unexpired lease is never offered for release.
+    """
+    if deps.release_hold is None:
+        return []
+    from forge.lifecycle.missions import ACTIVE_MISSION_STATUSES
+    from forge.pipeline.publication_record import PublicationRecordStore
+
+    marks = ", ".join("?" for _ in ACTIVE_MISSION_STATUSES)
+    try:
+        rows = cx.execute(
+            "SELECT b.build_id FROM builds AS b "
+            "JOIN missions AS m ON m.id = b.mission_id "
+            "JOIN publication_records AS p ON p.build_id = b.build_id "
+            f"WHERE b.mission_role = ? AND m.status IN ({marks}) "
+            "AND p.result IS NOT NULL "
+            "AND p.lease_holder IS NOT NULL AND trim(p.lease_holder) <> '' "
+            "ORDER BY b.queued_at ASC",
+            (MISSION_ROLE_FEATURE, *ACTIVE_MISSION_STATUSES),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — a read never stops the queue
+        logger.warning("missions: could not look for settled holds (%s)", exc)
+        return []
+    records = PublicationRecordStore(cx)
+    now = deps.clock()
+    return [
+        str(build_id)
+        for (build_id,) in rows
+        if str(build_id) not in _resuming and not records.read(str(build_id)).lease_is_live(now)
+    ]
+
+
+async def _release_guarded(deps: MissionFinishDeps, build_id: str) -> None:
+    try:
+        assert deps.release_hold is not None
+        said = await deps.release_hold(build_id)
+        logger.info("missions: %s's settled record, its hold looked at again: %s", build_id, said)
+    except Exception as exc:  # noqa: BLE001 — logged; tried again next pass
+        logger.error(
+            "missions: putting %s's settled hold down raised (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+    finally:
+        _resuming.discard(build_id)
 
 
 async def _reconcile_guarded(deps: MissionFinishDeps, build_id: str) -> None:
@@ -1199,6 +1263,7 @@ def compose_mission_finisher(
     land: Callable[[str], Awaitable[Any]] | None = None,
     resume_merge: Callable[[str], Awaitable[Any]] | None = None,
     reconcile: Callable[[str], Awaitable[Any]] | None = None,
+    release_hold: Callable[[str], Awaitable[Any]] | None = None,
     git_surface: Callable[[str, Path], Any] | None = None,
     tree_reader_for: Callable[[str, Path], Any] | None = None,
     feature_routing_gate: Any | None = None,
@@ -1244,6 +1309,7 @@ def compose_mission_finisher(
         land=land,
         resume_merge=resume_merge,
         reconcile=reconcile,
+        release_hold=release_hold,
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
     )

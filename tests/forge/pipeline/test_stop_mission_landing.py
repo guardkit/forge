@@ -855,3 +855,111 @@ class TestASettlementIsNeverLeftHeld:
         assert record.lease_holder == "merge-press:live"
         assert record.lease_expires_at == live_until
         assert _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER) == []
+
+
+# ---------------------------------------------------------------------------
+# Codex implementation round 2, R2: the ordinary press stopping after its result
+# ---------------------------------------------------------------------------
+
+
+class TestAPressThatStoppedAfterItsResult:
+    async def _the_press_stops_after_its_result(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> MergeApprovalConsumer:
+        """A landing decided before the stop, pressed to its result, and the
+        coordinator gone before the press put its hold down."""
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        _planned(pool)
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(config_on, pool, repo_root)
+        consumer = MergeApprovalConsumer(deps)
+        assert consumer._decide_landing(
+            B_BUILD, mission_id=MISSION_ID, decided_by="x", request_id=f"merge-{B_BUILD}"
+        )
+        _stop(pool)
+        with monkeypatch.context() as stopped:
+            stopped.setattr(
+                PublicationRecordStore, "release_lease", lambda self, **_k: False
+            )
+            outcome = await consumer.land_mission_feature(B_BUILD)
+        assert outcome is not None and outcome.status == "PASSED"
+        record = _record(pool)
+        assert record.result == RESULT_PUBLISHED_TO_MISSION_BRANCH
+        assert record.lease_holder  # the hold was never put down
+        return MergeApprovalConsumer(deps)  # the coordinator, restarted
+
+    def _finisher(self, config_on: ForgeConfig, pool: SqliteLifecyclePersistence, consumer: Any) -> Any:  # noqa: F811
+        deps = _resuming_deps(config_on, pool, consumer)
+        deps.reconcile = consumer.reconcile_mission_landing
+        deps.release_hold = consumer.release_a_settled_hold
+        return deps
+
+    @pytest.mark.asyncio
+    async def test_its_expired_hold_is_put_down_and_the_mission_drains(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from forge.lifecycle.feature_routing import router_restart_blockers
+        from tests.forge.deploy.test_rollout_quiesce_back import q, r
+
+        restarted = await self._the_press_stops_after_its_result(
+            config_on, pool, repo_root, monkeypatch
+        )
+        pool.connection.execute(
+            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), B_BUILD),
+        )
+        # The coordinator's ticks: the mission step first, then the finisher.
+        step = _step(pool)
+        await step.run_once()
+        store = MissionStore(pool.connection)
+        assert store.attempt_by_correlation_id(B_CID).status == "LANDED"
+        assert store.get(MISSION_ID).status == "RUNNING"  # held open by the hold
+        assert any(b.startswith("publication-held:") for b in router_restart_blockers(pool.connection))
+        await mission_finish.finish_ready_missions(
+            self._finisher(config_on, pool, restarted), wait=True
+        )
+        record = _record(pool)
+        assert record.lease_holder is None and record.result == RESULT_PUBLISHED_TO_MISSION_BRANCH
+        await step.run_once()
+
+        mission = store.get(MISSION_ID)
+        assert mission.status == "NOT_MERGED"
+        assert mission.closed_reason.endswith("; 1 landed on the branch, 0 did not")
+        assert not any(
+            b.startswith(("mission:", "publication-")) for b in router_restart_blockers(pool.connection)
+        )
+        ledger = Path(pool.connection.execute("PRAGMA database_list").fetchone()[2])
+        problems = q.work_problems(r.ledger_state(ledger))
+        assert [x for x in problems if x["table"] in ("publication_records", "missions")] == []
+
+    @pytest.mark.asyncio
+    async def test_a_live_hold_at_the_same_point_is_left_alone(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        restarted = await self._the_press_stops_after_its_result(
+            config_on, pool, repo_root, monkeypatch
+        )
+        held = _record(pool)
+        assert held.lease_is_live(datetime.now(UTC))
+        await mission_finish.finish_ready_missions(
+            self._finisher(config_on, pool, restarted), wait=True
+        )
+        await _step(pool).run_once()
+
+        record = _record(pool)
+        assert record.lease_holder == held.lease_holder
+        assert record.lease_expires_at == held.lease_expires_at
+        assert MissionStore(pool.connection).get(MISSION_ID).status == "RUNNING"
