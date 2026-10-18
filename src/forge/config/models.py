@@ -286,6 +286,19 @@ class ApprovalConfig(BaseModel):
             "loudly (extra='forbid')."
         ),
     )
+    additional_approvers: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Other ``decided_by`` identities whose answer to a card counts as "
+            "well as the card's expected approver (Linear front door, 18 "
+            "October 2026) — e.g. ``linear:<user id>`` for someone answering "
+            "from Linear, or another person's Slack member id. Matched "
+            "verbatim, like ``expected_approver``. It applies to every card: "
+            "build gates, planning cards, merge cards and mission plan cards. "
+            "Empty (the default) changes nothing: only the expected approver "
+            "may answer. The first answer still wins."
+        ),
+    )
 
     @model_validator(mode="after")
     def _validate_default_not_above_max(self) -> ApprovalConfig:

@@ -67,7 +67,11 @@ from nats_core.topics import Topics
 from pydantic import ValidationError
 
 from forge.config.models import ApprovalConfig
-from forge.gating.identity import derive_request_id, parse_request_id
+from forge.gating.identity import (
+    derive_request_id,
+    is_accepted_approver,
+    parse_request_id,
+)
 
 if TYPE_CHECKING:  # pragma: no cover - import-time only
     from forge.pipeline import BuildContext, PipelineLifecycleEmitter
@@ -242,7 +246,8 @@ class ApprovalSubscriberDeps:
         expected_approver: Deployment's expected ``decided_by`` value.
             ``None`` → permissive mode (single-deployment dev). When
             set, only responses whose ``decided_by`` matches this
-            string can resume the build (Group E ``@security``).
+            string, or one of ``config.additional_approvers``, can
+            resume the build (Group E ``@security``).
         project: Optional NATS multi-tenancy project scope. ``None`` →
             no scoping; otherwise the subject is wrapped via
             :meth:`Topics.for_project`.
@@ -726,7 +731,10 @@ class ApprovalSubscriber:
         # cannot poison the dedup buffer for a legitimate request_id
         # by impersonating the responder identity.
         expected = self._deps.expected_approver
-        if expected is not None and payload.decided_by != expected:
+        additional = getattr(self._deps.config, "additional_approvers", ())
+        if expected is not None and not is_accepted_approver(
+            payload.decided_by, expected, additional
+        ):
             logger.warning(
                 "approval_subscriber: unrecognised responder %r "
                 "(expected %r) build_id=%s request_id=%s — anomaly, "

@@ -1536,6 +1536,9 @@ async def compose_planning_consumer_and_dispatch(
                 state_machine=state_machine,
                 approval_publisher=pause_publisher,
                 subscriber_factory=subscriber_factory,
+                # Identities accepted on a planning card as well as the run's
+                # pinned approver (empty = only the pinned approver).
+                additional_approvers=tuple(config.approval.additional_approvers),
                 dispatch_product_owner=dispatch_product_owner,
                 second_opinion_provider=second_opinion,
                 git_runner=planning_git_runner,

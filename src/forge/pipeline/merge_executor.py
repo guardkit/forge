@@ -142,6 +142,7 @@ from forge.deploy.candidate_tree import (
     InContainerCandidateGit,
 )
 from forge.deploy.stage import assertion_in_words
+from forge.gating.identity import is_accepted_approver
 from forge.lifecycle.persistence import StageLogEntry
 from forge.pipeline.check_join import (
     CheckJoinAnswer,
@@ -6410,7 +6411,10 @@ class MergeApprovalConsumer:
             )
             return
         expected = getattr(self._deps.config.approval, "expected_approver", None)
-        if expected is not None and payload.decided_by != expected:
+        additional = getattr(self._deps.config.approval, "additional_approvers", ())
+        if expected is not None and not is_accepted_approver(
+            payload.decided_by, expected, additional
+        ):
             logger.warning(
                 "merge-executor: refusing %s — decided_by %r is not the "
                 "expected approver",
