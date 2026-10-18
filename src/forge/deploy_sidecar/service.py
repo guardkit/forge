@@ -11,6 +11,7 @@ Design of record: docs/factory-deploy-execution-surface-design-2026-07-16.md §1
 The narrow contract:
 
     GET  /healthz -> {"status": "healthy", "rev": "git-<sha>"}
+    GET  /busy    -> {"busy": bool, "executing": [{route, repo, seconds}]}
     POST /run  {repo, script, env, timeout_seconds, cwd?}
               -> {exit_code, output_tail, cwd}
     POST /run  {repo, driver, args, env, timeout_seconds, cwd?}
@@ -3338,6 +3339,9 @@ def process_guardkit_merge_request(
 # ---------------------------------------------------------------------------
 
 #: The three routes.
+#: ``GET /busy`` — the requests this helper is executing now (stage S2).
+BUSY_ROUTE: str = "/busy"
+
 GIT_WRITE_TREE_ROUTE: str = "/git/prepare-branch-and-write-tree"
 GIT_READ_FILE_ROUTE: str = "/git/read-file-from-branch"
 GIT_REV_PARSE_ROUTE: str = "/git/rev-parse"
@@ -8324,6 +8328,15 @@ class _SidecarServer(ThreadingHTTPServer):
         project_runner: MergeRunner = run_project_program,
     ) -> None:
         super().__init__(server_address, handler_cls)
+        # WHAT THIS HELPER IS EXECUTING NOW (one sandbox per project, stage S2,
+        # design 2.3a, Codex S2 round 4): every POST from the moment it is
+        # routed until its answer is written, in this process only. ``GET
+        # /busy`` lists them, and the sandbox starter asks it immediately
+        # before every stop, so a request whose answer was lost is never
+        # stopped under while it still runs.
+        self.executing: dict[int, dict[str, Any]] = {}
+        self.executing_lock = threading.Lock()
+        self._next_request = 0
         self.config_loader = config_loader
         self.script_runner = script_runner
         # TWO RUNNERS, NOT ONE (13 October 2026). ``merge_runner`` starts the
@@ -8344,6 +8357,40 @@ class _SidecarServer(ThreadingHTTPServer):
         # at all, and a request that owns a target is refused in plain words
         # rather than run ungated.
         self.deploy_executor = deploy_executor
+
+    def begin_request(self, route: str, payload: Any) -> int:
+        """Note a request as executing; the number to end it with."""
+        repo = payload.get("repo") if isinstance(payload, dict) else None
+        with self.executing_lock:
+            self._next_request += 1
+            number = self._next_request
+            self.executing[number] = {
+                "route": route,
+                "repo": str(repo)[:200] if isinstance(repo, str) else None,
+                "started": time.monotonic(),
+            }
+        return number
+
+    def end_request(self, number: int) -> None:
+        with self.executing_lock:
+            self.executing.pop(number, None)
+
+    def busy_answer(self) -> dict[str, Any]:
+        """``GET /busy``: the requests executing now, oldest first. Read-only:
+        the route and repository of each and how long it has run, nothing a
+        request carried beyond those."""
+        now = time.monotonic()
+        with self.executing_lock:
+            entries = sorted(self.executing.items())
+        listed = [
+            {
+                "route": entry["route"],
+                "repo": entry["repo"],
+                "seconds": round(max(0.0, now - entry["started"]), 1),
+            }
+            for _number, entry in entries
+        ]
+        return {"busy": bool(listed), "executing": listed}
 
 
 class DeploySidecarHandler(BaseHTTPRequestHandler):
@@ -8370,6 +8417,9 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 self._write_json(
                     200, {"status": "healthy", "rev": SIDECAR_CODE_VERSION}
                 )
+                return
+            if self.path.split("?", 1)[0] == BUSY_ROUTE:
+                self._write_json(200, self.server.busy_answer())  # type: ignore[attr-defined]
                 return
             self._write_json(404, {"error": f"no such path: {self.path}"})
         except Exception as exc:  # noqa: BLE001 — never crash the server
@@ -8419,132 +8469,140 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._write_json(400, {"error": f"invalid JSON body: {exc}"})
                 return
+            number = self.server.begin_request(route, payload)  # type: ignore[attr-defined]
             try:
-                config = self.server.config_loader()  # type: ignore[attr-defined]
-            except SidecarConfigError as exc:
-                self._write_json(500, {"error": str(exc)})
-                return
-            if route == "/guardkit-merge":
-                status, body = process_guardkit_merge_request(
-                    payload,
-                    config=config,
-                    merge_runner=self.server.merge_runner,  # type: ignore[attr-defined]
-                )
-            elif route == GIT_WRITE_TREE_ROUTE:
-                status, body = process_git_write_tree_request(
-                    payload,
-                    config=config,
-                    check_runner=self.server.check_runner,  # type: ignore[attr-defined]
-                    worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
-                )
-            elif route == GIT_READ_FILE_ROUTE:
-                status, body = process_git_read_file_request(
-                    payload,
-                    config=config,
-                    worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
-                )
-            elif route == GIT_REV_PARSE_ROUTE:
-                status, body = process_git_rev_parse_request(payload, config=config)
-            elif route == GIT_LIST_FILES_ON_BRANCH_ROUTE:
-                status, body = process_git_list_files_on_branch_request(
-                    payload, config=config
-                )
-            elif route == GIT_REMOTE_START_POINT_ROUTE:
-                status, body = process_git_remote_start_point_request(
-                    payload, config=config
-                )
-            elif route == GIT_READ_FILE_AT_COMMIT_ROUTE:
-                status, body = process_git_read_file_at_commit_request(
-                    payload, config=config
-                )
-            elif route == GIT_LIST_TREE_AT_COMMIT_ROUTE:
-                status, body = process_git_list_tree_at_commit_request(
-                    payload, config=config
-                )
-            elif route == GIT_IS_ANCESTOR_ROUTE:
-                status, body = process_git_is_ancestor_request(payload, config=config)
-            elif route == GIT_CANDIDATE_TREE_ROUTE:
-                status, body = process_git_candidate_tree_request(
-                    payload, config=config
-                )
-            elif route == GIT_CANDIDATE_TREE_REMOVE_ROUTE:
-                status, body = process_git_candidate_tree_remove_request(
-                    payload, config=config
-                )
-            elif route == GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE:
-                status, body = process_git_autobuild_worktree_inspect_request(
-                    payload, config=config
-                )
-            elif route == GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE:
-                status, body = process_git_autobuild_worktree_retire_request(
-                    payload, config=config
-                )
-            elif route == GIT_SOURCE_BRANCH_ROUTE:
-                status, body = process_git_source_branch_request(
-                    payload, config=config
-                )
-            elif route == GIT_WORKTREE_ADD_ROUTE:
-                status, body = process_git_worktree_add_request(
-                    payload, config=config
-                )
-            elif route == STAMPS_EVIDENCE_ROUTE:
-                status, body = process_stamps_evidence_request(
-                    payload,
-                    config=config,
-                    worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
-                )
-            elif route == GIT_WORKTREE_REMOVE_ROUTE:
-                status, body = process_git_worktree_remove_request(
-                    payload, config=config
-                )
-            elif route == GIT_WORKTREE_COMMIT_COUNT_ROUTE:
-                status, body = process_git_worktree_commit_count_request(
-                    payload, config=config
-                )
-            elif route == GIT_WORKTREE_CHANGED_FILES_ROUTE:
-                status, body = process_git_worktree_changed_files_request(
-                    payload, config=config
-                )
-            elif route == GIT_BRANCH_SCOPE_ROUTE:
-                status, body = process_git_branch_scope_request(
-                    payload, config=config
-                )
-            elif route == RECEIPTS_EXPORT_ROUTE:
-                status, body = process_receipts_export_request(payload, config=config)
-            elif route == CODE_LIST_FILES_ROUTE:
-                status, body = process_code_list_files_request(
-                    payload, config=config
-                )
-            elif route == CODE_READ_FILE_ROUTE:
-                status, body = process_code_read_file_request(payload, config=config)
-            elif route == CODE_IMPORTS_ROUTE:
-                status, body = process_code_imports_request(payload, config=config)
-            elif route == CODE_SEARCH_ROUTE:
-                status, body = process_code_search_request(payload, config=config)
-            elif route == CODE_QUERY_ROUTE:
-                status, body = process_code_query_request(payload, config=config)
-            elif route in PREVIEW_ROUTES:
-                status, body = process_preview_request(route, payload, config=config)
-            elif route == GUARDKIT_LEG_ROUTE:
-                status, body = process_guardkit_leg_request(
-                    payload,
-                    config=config,
-                    leg_runner=self.server.merge_runner,  # type: ignore[attr-defined]
-                )
-            else:
-                status, body = process_run_request(
-                    payload,
-                    config=config,
-                    script_runner=self.server.script_runner,  # type: ignore[attr-defined]
-                    # The project's own programs: never the merge runner,
-                    # which hands its child the factory's credentials.
-                    command_runner=self.server.project_runner,  # type: ignore[attr-defined]
-                    deploy_executor=self.server.deploy_executor,  # type: ignore[attr-defined]
-                )
-            self._write_json(status, body)
+                self._answer_post(route, payload)
+            finally:
+                self.server.end_request(number)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001 — never crash the server
             logger.exception("sidecar POST handler error")
             self._safe_500(exc)
+
+    def _answer_post(self, route: str, payload: Any) -> None:
+        """Route one POST and write its answer (counted on ``/busy`` meanwhile)."""
+        try:
+            config = self.server.config_loader()  # type: ignore[attr-defined]
+        except SidecarConfigError as exc:
+            self._write_json(500, {"error": str(exc)})
+            return
+        if route == "/guardkit-merge":
+            status, body = process_guardkit_merge_request(
+                payload,
+                config=config,
+                merge_runner=self.server.merge_runner,  # type: ignore[attr-defined]
+            )
+        elif route == GIT_WRITE_TREE_ROUTE:
+            status, body = process_git_write_tree_request(
+                payload,
+                config=config,
+                check_runner=self.server.check_runner,  # type: ignore[attr-defined]
+                worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
+            )
+        elif route == GIT_READ_FILE_ROUTE:
+            status, body = process_git_read_file_request(
+                payload,
+                config=config,
+                worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
+            )
+        elif route == GIT_REV_PARSE_ROUTE:
+            status, body = process_git_rev_parse_request(payload, config=config)
+        elif route == GIT_LIST_FILES_ON_BRANCH_ROUTE:
+            status, body = process_git_list_files_on_branch_request(
+                payload, config=config
+            )
+        elif route == GIT_REMOTE_START_POINT_ROUTE:
+            status, body = process_git_remote_start_point_request(
+                payload, config=config
+            )
+        elif route == GIT_READ_FILE_AT_COMMIT_ROUTE:
+            status, body = process_git_read_file_at_commit_request(
+                payload, config=config
+            )
+        elif route == GIT_LIST_TREE_AT_COMMIT_ROUTE:
+            status, body = process_git_list_tree_at_commit_request(
+                payload, config=config
+            )
+        elif route == GIT_IS_ANCESTOR_ROUTE:
+            status, body = process_git_is_ancestor_request(payload, config=config)
+        elif route == GIT_CANDIDATE_TREE_ROUTE:
+            status, body = process_git_candidate_tree_request(
+                payload, config=config
+            )
+        elif route == GIT_CANDIDATE_TREE_REMOVE_ROUTE:
+            status, body = process_git_candidate_tree_remove_request(
+                payload, config=config
+            )
+        elif route == GIT_AUTOBUILD_WORKTREE_INSPECT_ROUTE:
+            status, body = process_git_autobuild_worktree_inspect_request(
+                payload, config=config
+            )
+        elif route == GIT_AUTOBUILD_WORKTREE_RETIRE_ROUTE:
+            status, body = process_git_autobuild_worktree_retire_request(
+                payload, config=config
+            )
+        elif route == GIT_SOURCE_BRANCH_ROUTE:
+            status, body = process_git_source_branch_request(
+                payload, config=config
+            )
+        elif route == GIT_WORKTREE_ADD_ROUTE:
+            status, body = process_git_worktree_add_request(
+                payload, config=config
+            )
+        elif route == STAMPS_EVIDENCE_ROUTE:
+            status, body = process_stamps_evidence_request(
+                payload,
+                config=config,
+                worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
+            )
+        elif route == GIT_WORKTREE_REMOVE_ROUTE:
+            status, body = process_git_worktree_remove_request(
+                payload, config=config
+            )
+        elif route == GIT_WORKTREE_COMMIT_COUNT_ROUTE:
+            status, body = process_git_worktree_commit_count_request(
+                payload, config=config
+            )
+        elif route == GIT_WORKTREE_CHANGED_FILES_ROUTE:
+            status, body = process_git_worktree_changed_files_request(
+                payload, config=config
+            )
+        elif route == GIT_BRANCH_SCOPE_ROUTE:
+            status, body = process_git_branch_scope_request(
+                payload, config=config
+            )
+        elif route == RECEIPTS_EXPORT_ROUTE:
+            status, body = process_receipts_export_request(payload, config=config)
+        elif route == CODE_LIST_FILES_ROUTE:
+            status, body = process_code_list_files_request(
+                payload, config=config
+            )
+        elif route == CODE_READ_FILE_ROUTE:
+            status, body = process_code_read_file_request(payload, config=config)
+        elif route == CODE_IMPORTS_ROUTE:
+            status, body = process_code_imports_request(payload, config=config)
+        elif route == CODE_SEARCH_ROUTE:
+            status, body = process_code_search_request(payload, config=config)
+        elif route == CODE_QUERY_ROUTE:
+            status, body = process_code_query_request(payload, config=config)
+        elif route in PREVIEW_ROUTES:
+            status, body = process_preview_request(route, payload, config=config)
+        elif route == GUARDKIT_LEG_ROUTE:
+            status, body = process_guardkit_leg_request(
+                payload,
+                config=config,
+                leg_runner=self.server.merge_runner,  # type: ignore[attr-defined]
+            )
+        else:
+            status, body = process_run_request(
+                payload,
+                config=config,
+                script_runner=self.server.script_runner,  # type: ignore[attr-defined]
+                # The project's own programs: never the merge runner,
+                # which hands its child the factory's credentials.
+                command_runner=self.server.project_runner,  # type: ignore[attr-defined]
+                deploy_executor=self.server.deploy_executor,  # type: ignore[attr-defined]
+            )
+        self._write_json(status, body)
 
     def _safe_500(self, exc: Exception) -> None:
         try:
@@ -8668,6 +8726,7 @@ __all__ = [
     "ENV_ALLOWLIST_BASE",
     "OUTPUT_TAIL_CHARS",
     "SIDECAR_CODE_VERSION",
+    "BUSY_ROUTE",
     "MERGE_TIMEOUT_DEFAULT",
     "MERGE_TIMEOUT_MAX",
     "MERGE_TIMEOUT_EXIT_CODE",
