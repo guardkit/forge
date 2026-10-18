@@ -70,7 +70,6 @@ __all__ = [
     "PublicationRecord",
     "PublicationRecordStore",
     "StoredOutcome",
-    "mark_outcome_reported",
     "a_report_names_the_press",
     "REPORT_PRESS_TURN_KEY",
     "ensure_outcome_table",
@@ -160,17 +159,22 @@ def default_lease_seconds() -> int:
     return 1800
 
 
-#: The press's own record of how it ended (18 October 2026), one row per
-#: build, outside the migration ladder: made where it is needed and at the
-#: coordinator's boot, so the schema version stays as it is.
 #: One row per build, for the LATEST press on its record (press lease
-#: recovery, 18 October 2026). A press makes it afresh in the same
-#: transaction that takes its lease (``turn`` is that press's turn); the
-#: press's result write marks ``result_written`` in the same transaction as
-#: the result, with what might still be standing at that moment; the press
-#: writes its ending into ``outcome_json``; and the report row marks
-#: ``reported_at`` in the same transaction as the report. A recovery that
-#: takes the record over later changes none of it but ``reported_at``.
+#: recovery, 18 October 2026), outside the migration ladder: made where it is
+#: needed and at the coordinator's boot, so the schema version stays as it is.
+#:
+#: A press makes the row afresh in the same transaction that takes its lease
+#: (``turn`` is that press's turn); its result write marks ``result_written``
+#: in the result's own transaction, with what might still be standing then;
+#: the press writes its ending into ``outcome_json``. Then ONE idempotent
+#: finishing routine (``merge_executor.finish_the_press``), run by the press
+#: and by the recovery alike, does every bookkeeping step for that turn, each
+#: one first asking whether it is already done — the report row (a report
+#: naming this ``press_turn``), the bus message (``bus_sent_at``), the build
+#: row's ending, the repair row (``repair_at``), a mission landing's warning
+#: (``warning_json``/``warning_delivered_at``), the release — and only then
+#: sets ``finished_at``. A stop between any two steps leaves the rest to the
+#: next pass.
 _OUTCOME_TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS publication_outcomes ("
     "build_id TEXT PRIMARY KEY, "
@@ -180,17 +184,28 @@ _OUTCOME_TABLE_SQL = (
     "recorded_at TEXT NOT NULL, "
     "result_written INTEGER NOT NULL DEFAULT 0, "
     "standing_json TEXT, "
-    "reported_at TEXT)"
+    "bus_sent_at TEXT, "
+    "repair_at TEXT, "
+    "warning_json TEXT, "
+    "warning_delivered_at TEXT, "
+    "finished_at TEXT)"
 )
 
-
-#: Columns added after the table was first made, each added where missing
-#: (coach follow-up, 18 October 2026), so an older table shape can never make
-#: a result write, a write-down or a report mark refuse.
+#: Columns added after the table was first made, each added where missing,
+#: so an older table shape can never make a result write or a mark refuse.
 _OUTCOME_COLUMNS_ADDED: tuple[tuple[str, str], ...] = (
     ("result_written", "INTEGER NOT NULL DEFAULT 0"),
     ("standing_json", "TEXT"),
-    ("reported_at", "TEXT"),
+    ("bus_sent_at", "TEXT"),
+    ("repair_at", "TEXT"),
+    ("warning_json", "TEXT"),
+    ("warning_delivered_at", "TEXT"),
+    ("finished_at", "TEXT"),
+)
+
+#: The marks :meth:`PublicationRecordStore.mark_outcome` may write.
+_OUTCOME_MARKS: frozenset[str] = frozenset(
+    {"bus_sent_at", "repair_at", "warning_json", "warning_delivered_at", "finished_at"}
 )
 
 #: The report detail that names the press whose ending a merge report is.
@@ -211,9 +226,8 @@ def a_report_names_the_press(
     cx: sqlite3.Connection, *, build_id: str, turn: int
 ) -> bool:
     """Is a merge report on this build's record that names the press of
-    ``turn`` (its ``press_turn`` detail)? So a report whose mark could not be
-    written still counts as that press's ending reported. ``False`` on a
-    ledger with no stage log."""
+    ``turn`` (its ``press_turn`` detail)? The finishing routine's own check
+    for its first step. ``False`` on a ledger with no stage log."""
     try:
         return (
             cx.execute(
@@ -233,35 +247,22 @@ def _no_outcome_table(exc: sqlite3.Error) -> bool:
     return "no such table" in str(exc).lower()
 
 
-def mark_outcome_reported(
-    cx: sqlite3.Connection, *, build_id: str, turn: int, now: datetime
-) -> None:
-    """Mark the press of ``turn``'s ending as reported, inside the caller's
-    transaction (the one that writes the report row). Never raises for a
-    ledger with no such table: nothing was written down there to mark."""
-    try:
-        cx.execute(
-            "UPDATE publication_outcomes SET reported_at = ? "
-            "WHERE build_id = ? AND turn = ?",
-            (now.isoformat(), str(build_id), int(turn)),
-        )
-    except sqlite3.OperationalError as exc:
-        if not _no_outcome_table(exc):
-            raise
-
-
 @dataclass(frozen=True)
 class StoredOutcome:
     """The latest press's row: its turn, attempt, written-down ending (``{}``
     until written), whether its result was written, what might still have
-    been standing then, and when its ending was reported (``None``: not)."""
+    been standing then, and each finishing mark (``None``: not yet)."""
 
     turn: int
     attempt_id: str | None
     outcome: dict[str, Any]
     result_written: bool = False
     standing: dict[str, Any] = field(default_factory=dict)
-    reported_at: str | None = None
+    bus_sent_at: str | None = None
+    repair_at: str | None = None
+    warning: dict[str, Any] = field(default_factory=dict)
+    warning_delivered_at: str | None = None
+    finished_at: str | None = None
 
 
 class Replaced(RuntimeError):
@@ -607,6 +608,7 @@ class PublicationRecordStore:
         target_branch: str | None = None,
         starts_a_press: bool = False,
         refuse_if_an_ending_is_owed: bool = False,
+        expected_turn: int | None = None,
     ) -> LeaseGrant | None:
         """Take this build's record, or answer ``None`` because someone holds it.
 
@@ -616,11 +618,15 @@ class PublicationRecordStore:
         earlier press's ending, result mark and report mark go with it. A
         recovery taking the record over passes False and changes none of it.
 
-        ``refuse_if_an_ending_is_owed``: an ordinary build's new press, which
-        is refused (``last_refusal`` = ``"an-ending-is-owed"``) while the
-        latest press's result is written and its ending not yet reported, so
-        its recovery reports it first. A mission's own resume re-presses such
-        a record by design (its pick-up settles it) and does not pass it.
+        ``refuse_if_an_ending_is_owed``: a new press, refused
+        (``last_refusal`` = ``"an-ending-is-owed"``) while the latest press's
+        result is written and its finishing not yet done, so the recovery
+        finishes it first.
+
+        ``expected_turn`` (compare and swap): the take succeeds only while the
+        record is still on that turn (``last_refusal`` = ``"moved-on"``), so a
+        recovery that read the record and then took it can never act on a
+        record another worker moved on in between.
 
         One transaction, and the turn number goes up by one inside it, on a
         first take and on a takeover alike. A takeover is only possible once
@@ -644,6 +650,9 @@ class PublicationRecordStore:
                     """,
                     (str(build_id),),
                 ).fetchone()
+                if row is None and expected_turn is not None:
+                    self.last_refusal = "moved-on"
+                    return None
                 if row is None:
                     self._cx.execute(
                         """
@@ -676,6 +685,9 @@ class PublicationRecordStore:
                         expires_at=expires,
                     )
                 current_turn = int(row[0] or 0)
+                if expected_turn is not None and current_turn != int(expected_turn):
+                    self.last_refusal = "moved-on"
+                    return None
                 current_holder = _as_text(row[1])
                 expiry = _parse_time(row[2])
                 held_by_another = (
@@ -728,10 +740,11 @@ class PublicationRecordStore:
             return None
 
     def _an_ending_is_owed(self, build_id: str) -> bool:
-        """Is this build's latest press's result written and not yet reported?"""
+        """Is this build's latest press's result written and its finishing
+        not yet done (no ``finished_at``)?"""
         try:
             row = self._cx.execute(
-                "SELECT turn, result_written, reported_at FROM publication_outcomes "
+                "SELECT turn, result_written, finished_at FROM publication_outcomes "
                 "WHERE build_id = ?",
                 (str(build_id),),
             ).fetchone()
@@ -739,16 +752,15 @@ class PublicationRecordStore:
             return False
         if row is None or not row[1] or row[2] is not None:
             return False
-        return not a_report_names_the_press(self._cx, build_id=build_id, turn=int(row[0]))
+        return True
 
     def _a_press_begins(self, build_id: str, turn: int, stamp: str) -> None:
         """Inside :meth:`take_lease`'s transaction: this press's row, afresh."""
         ensure_outcome_table(self._cx)
         self._cx.execute(
             "INSERT OR REPLACE INTO publication_outcomes "
-            "(build_id, turn, attempt_id, outcome_json, recorded_at, "
-            "result_written, standing_json, reported_at) "
-            "VALUES (?, ?, NULL, '{}', ?, 0, NULL, NULL)",
+            "(build_id, turn, attempt_id, outcome_json, recorded_at, result_written) "
+            "VALUES (?, ?, NULL, '{}', ?, 0)",
             (str(build_id), int(turn), stamp),
         )
 
@@ -828,16 +840,14 @@ class PublicationRecordStore:
         Press lease recovery (18 October 2026): one record result covers
         several different reports, so the ending itself is kept, on the
         press's own row, and a recovery reports from it through the press's
-        own report path. Only while the record is still on this press's turn,
-        held by it or put down by it on that turn (a refusal before the join
-        settles and releases in one write), and only onto the row this press
-        began. ``False`` when nothing was written (replaced, or no row).
+        own report path. Only while the record is still on this press's turn
+        and held by it, and only onto the row this press began. ``False`` when nothing was written (replaced, or no row).
         """
         try:
             with self._transaction():
                 held = self._cx.execute(
                     "SELECT 1 FROM publication_records WHERE build_id = ? AND turn = ? "
-                    "AND (lease_holder = ? OR lease_holder IS NULL)",
+                    "AND lease_holder = ?",
                     (str(build_id), int(turn), str(holder)),
                 ).fetchone()
                 if held is None:
@@ -867,11 +877,12 @@ class PublicationRecordStore:
         try:
             row = self._cx.execute(
                 "SELECT turn, attempt_id, outcome_json, result_written, standing_json, "
-                "reported_at FROM publication_outcomes WHERE build_id = ?",
+                "bus_sent_at, repair_at, warning_json, warning_delivered_at, finished_at "
+                "FROM publication_outcomes WHERE build_id = ?",
                 (str(build_id),),
             ).fetchone()
         except sqlite3.OperationalError as exc:
-            if _no_outcome_table(exc):
+            if _no_outcome_table(exc) or "no such column" in str(exc).lower():
                 return None
             raise
         if row is None:
@@ -890,8 +901,43 @@ class PublicationRecordStore:
             outcome=decoded(row[2]),
             result_written=bool(row[3]),
             standing=decoded(row[4]),
-            reported_at=row[5],
+            bus_sent_at=row[5],
+            repair_at=row[6],
+            warning=decoded(row[7]),
+            warning_delivered_at=row[8],
+            finished_at=row[9],
         )
+
+    def mark_outcome(self, *, build_id: str, turn: int, **marks: Any) -> bool:
+        """Write finishing marks onto the press of ``turn``'s row.
+
+        Each mark is a fact about that press's own bookkeeping; the row is
+        keyed by the press's turn, so a mark can never land on another
+        press's row. A dict is stored as JSON. ``False`` when no row matched.
+        """
+        unknown = set(marks) - _OUTCOME_MARKS
+        if unknown:
+            raise KeyError(f"{sorted(unknown)} are not finishing marks")
+        values = [
+            json.dumps(v, sort_keys=True, default=str) if isinstance(v, dict) else v
+            for v in marks.values()
+        ]
+        columns = ", ".join(f"{name} = ?" for name in marks)
+        try:
+            with self._transaction():
+                changed = self._cx.execute(
+                    f"UPDATE publication_outcomes SET {columns} "
+                    "WHERE build_id = ? AND turn = ?",
+                    (*values, str(build_id), int(turn)),
+                ).rowcount
+        except sqlite3.Error as exc:
+            logger.warning(
+                "publication record: %s's finishing mark could not be written (%s)",
+                build_id,
+                exc,
+            )
+            return False
+        return changed == 1
 
     def settle(
         self, *, build_id: str, turn: int, holder: str, now: datetime, result: str

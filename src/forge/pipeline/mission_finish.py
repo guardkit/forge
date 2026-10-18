@@ -510,12 +510,23 @@ def _settled_landings_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
     from forge.pipeline.publication_record import PublicationRecordStore
 
     marks = ", ".join("?" for _ in ACTIVE_MISSION_STATUSES)
+    # A result a PRESS wrote is its finishing routine's (press lease
+    # recovery); this path keeps the results a reconciliation settled.
+    not_a_presss = (
+        "AND NOT EXISTS (SELECT 1 FROM publication_outcomes AS o "
+        "WHERE o.build_id = b.build_id AND o.result_written = 1) "
+        if cx.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'publication_outcomes'"
+        ).fetchone()
+        else ""
+    )
     try:
         rows = cx.execute(
             "SELECT b.build_id FROM builds AS b "
             "JOIN missions AS m ON m.id = b.mission_id "
             "JOIN publication_records AS p ON p.build_id = b.build_id "
             f"WHERE b.mission_role = ? AND m.status IN ({marks}) "
+            f"{not_a_presss}"
             "AND p.result IS NOT NULL "
             "AND (NOT EXISTS (SELECT 1 FROM stage_log AS r WHERE r.build_id = b.build_id "
             "AND r.target_identifier = ?) "
@@ -537,76 +548,43 @@ def _settled_landings_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
 
 
 def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
-    """Ordinary builds whose press stopped after its result, with no live lease.
+    """Every press whose result is written and whose finishing is not done.
 
-    Press lease recovery (18 October 2026). Every press begins its own
-    ``publication_outcomes`` row with its lease, and marks its result there
-    in the result's own transaction and its report in the report's. So the
-    work is exactly: a build outside a mission (a mission's landings and
-    merge have their own recovery) whose record has a result THIS press
-    wrote, and either no report marked yet, or a hold still on it that was
-    not kept on purpose. A record whose press began no row (written before
-    this, or an approval refused before any press) is never offered, and
-    neither is one whose report is marked and whose hold is down.
+    Press lease recovery (Codex round 1, 18 October 2026): every press begins
+    its own ``publication_outcomes`` row with its lease and marks its result
+    there in the result's own transaction; its finishing routine sets the
+    row's ``finished_at`` only after every bookkeeping step. So the work is
+    exactly a row with a result written, no ``finished_at``, on a record that
+    still has its result and holds no live lease — any build, mission or not.
+    A record no press of today began has no row and is never offered.
     """
     if deps.finish_settled_press is None:
         return []
-    from forge.lifecycle.missions import builds_record_missions
-    from forge.pipeline.merge_executor import press_kept_on_purpose
-    from forge.pipeline.publication_record import (
-        PublicationRecordStore,
-        a_report_names_the_press,
-    )
+    from forge.pipeline.publication_record import PublicationRecordStore
 
     try:
         if cx.execute(
             "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'publication_outcomes'"
         ).fetchone() is None:
             return []
-        # A ledger from before missions has no mission column: every build
-        # on it is an ordinary one.
-        outside_a_mission = (
-            "b.mission_id IS NULL AND " if builds_record_missions(cx) else ""
-        )
         rows = cx.execute(
             "SELECT p.build_id FROM publication_records AS p "
             "JOIN builds AS b ON b.build_id = p.build_id "
             "JOIN publication_outcomes AS o ON o.build_id = p.build_id "
-            f"WHERE {outside_a_mission}"
-            "p.result IS NOT NULL AND o.result_written = 1 "
-            "AND ((o.reported_at IS NULL AND NOT EXISTS ("
-            "SELECT 1 FROM stage_log AS r WHERE r.build_id = p.build_id "
-            "AND r.target_identifier = 'merge_deploy_executor' "
-            "AND json_valid(r.details_json) "
-            "AND json_extract(r.details_json, '$.press_turn') = o.turn)) "
-            "OR (p.lease_holder IS NOT NULL AND trim(p.lease_holder) <> '')) "
+            "WHERE p.result IS NOT NULL AND o.result_written = 1 "
+            "AND o.finished_at IS NULL "
             "ORDER BY b.queued_at ASC"
         ).fetchall()
     except Exception as exc:  # noqa: BLE001 — a read never stops the queue
-        logger.warning("merge: could not look for presses that stopped (%s)", exc)
+        logger.warning("merge: could not look for presses to finish (%s)", exc)
         return []
     records = PublicationRecordStore(cx)
     now = deps.clock()
-    due: list[str] = []
-    for (build_id,) in rows:
-        build_id = str(build_id)
-        if build_id in _resuming:
-            continue
-        record = records.read(build_id)
-        if record.lease_is_live(now):
-            continue
-        written = records.read_outcome(build_id)
-        if (
-            written is not None
-            and (
-                written.reported_at is not None
-                or a_report_names_the_press(cx, build_id=build_id, turn=written.turn)
-            )
-            and press_kept_on_purpose(record, written)
-        ):
-            continue  # reported, and its hold is a person's to look at
-        due.append(build_id)
-    return due
+    return [
+        str(build_id)
+        for (build_id,) in rows
+        if str(build_id) not in _resuming and not records.read(str(build_id)).lease_is_live(now)
+    ]
 
 
 async def _finish_settled_press_guarded(deps: MissionFinishDeps, build_id: str) -> None:
@@ -625,44 +603,23 @@ async def _finish_settled_press_guarded(deps: MissionFinishDeps, build_id: str) 
         _resuming.discard(build_id)
 
 
-def _left_standing_sentences(pool: Any, *, build_id: str | None = None, mission_id: str | None = None) -> list[str]:
-    """The sentences a landing wrote when it left something standing: one
-    build's, or every feature build's of one mission, oldest first."""
-    from forge.pipeline.merge_executor import MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER
-
+def _left_standing_sentences(pool: Any, *, mission_id: str) -> list[str]:
+    """The warnings a mission's landings recorded when they left something
+    standing (their press rows' ``warning_json``), for its merge card."""
     cx = getattr(pool, "connection", None)
     if cx is None:
         return []
-    where, args = (
-        ("s.build_id = ?", (str(build_id),))
-        if build_id is not None
-        else ("b.mission_id = ?", (str(mission_id),))
-    )
     try:
         rows = cx.execute(
-            "SELECT json_extract(s.details_json, '$.sentence') FROM stage_log AS s "
-            "JOIN builds AS b ON b.build_id = s.build_id "
-            f"WHERE s.target_identifier = ? AND {where} ORDER BY s.id ASC",
-            (MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER, *args),
+            "SELECT json_extract(o.warning_json, '$.sentence') FROM publication_outcomes AS o "
+            "JOIN builds AS b ON b.build_id = o.build_id "
+            "WHERE b.mission_id = ? AND o.warning_json IS NOT NULL ORDER BY b.queued_at ASC",
+            (str(mission_id),),
         ).fetchall()
     except Exception as exc:  # noqa: BLE001 — a read never stops the queue
-        logger.warning("missions: could not read what was left standing (%s)", exc)
+        logger.debug("missions: no warnings to read for %s (%s)", mission_id, exc)
         return []
     return [str(r[0]) for r in rows if r[0]]
-
-
-async def _say_what_was_left_standing(deps: MissionFinishDeps, build_id: str) -> None:
-    """One plain line in the mission's thread (the person already sees it)."""
-    from forge.lifecycle.mission_builds import mission_of_build
-
-    belongs = mission_of_build(deps.pool, build_id)
-    if belongs is None:
-        return
-    mission = MissionStore(deps.pool.connection, clock=deps.clock).get(belongs.mission_id)
-    if mission is None:
-        return
-    for sentence in _left_standing_sentences(deps.pool, build_id=build_id)[-1:]:
-        await _say(deps, mission, sentence)
 
 
 async def _finish_settled_guarded(deps: MissionFinishDeps, build_id: str) -> None:
@@ -670,10 +627,6 @@ async def _finish_settled_guarded(deps: MissionFinishDeps, build_id: str) -> Non
         assert deps.finish_settled is not None
         said = await deps.finish_settled(build_id)
         logger.info("missions: %s's settled landing, its bookkeeping finished: %s", build_id, said)
-        from forge.pipeline.merge_executor import LANDING_LEFT_SOMETHING_STANDING
-
-        if said == LANDING_LEFT_SOMETHING_STANDING:
-            await _say_what_was_left_standing(deps, build_id)
     except Exception as exc:  # noqa: BLE001 — logged; tried again next pass
         logger.error(
             "missions: finishing %s's settled landing raised (%s: %s)",
@@ -1465,6 +1418,14 @@ def compose_mission_finisher(
             "jarvis.notification.slack", envelope.model_dump_json().encode("utf-8")
         )
 
+    async def tell(mission_id: str, message: str) -> bool:
+        """One line in a mission's thread; True once it was handed over."""
+        mission = MissionStore(pool.connection).get(mission_id)
+        if mission is None:
+            return False
+        await notify(mission, message)
+        return True
+
     deps = MissionFinishDeps(
         pool=pool,
         config=forge_config,
@@ -1487,4 +1448,7 @@ def compose_mission_finisher(
     # What was composed, for the test that the production wiring binds each
     # recovery to the merge consumer's own method.
     finisher.deps = deps  # type: ignore[attr-defined]
+    #: Says one line in a mission's thread, for the merge press's finishing
+    #: routine (``MergeExecutorDeps.tell_mission``, installed at boot).
+    finisher.tell = tell  # type: ignore[attr-defined]
     return finisher

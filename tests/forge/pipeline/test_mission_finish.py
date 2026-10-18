@@ -1860,11 +1860,7 @@ class TestTheCardSaysWhatALandingLeftStanding:
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
     ) -> None:
-        from forge.lifecycle.persistence import StageLogEntry
-        from forge.pipeline.merge_executor import (
-            MISSION_LANDING_LEFT_STANDING_STAGE_LABEL,
-            MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER,
-        )
+        import json
 
         main_tip = _git(repo_root, "rev-parse", "main")
         a_running_mission(pool, keys=("B", "C"), base_commit=main_tip)
@@ -1874,20 +1870,13 @@ class TestTheCardSaysWhatALandingLeftStanding:
             "FEAT-MX1 landed, but its check's candidate j-abc may still be "
             "standing; remove it with the project's own teardown step."
         )
-        now = datetime.now(UTC)
-        pool.record_stage(
-            StageLogEntry(
-                build_id=B_BUILD,
-                stage_label=MISSION_LANDING_LEFT_STANDING_STAGE_LABEL,
-                target_kind="local_tool",
-                target_identifier=MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER,
-                status="SKIPPED",
-                started_at=now,
-                completed_at=now,
-                duration_secs=0.0,
-                details={"sentence": sentence, "mission_id": MISSION_ID},
-            )
+        # The warning B's press row carries (the finishing routine keeps it
+        # there before it says it in the thread).
+        pool.connection.execute(
+            "UPDATE publication_outcomes SET warning_json = ? WHERE build_id = ?",
+            (json.dumps({"sentence": sentence, "mission_id": MISSION_ID}), B_BUILD),
         )
+        pool.connection.commit()
         service, wire = _offer_service(config_on, pool)
         deps, _thread = _finish_deps(config_on, pool, offer=service.offer)
         assert await finish_ready_mission(deps, MISSION_ID) == "offered"

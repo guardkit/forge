@@ -273,14 +273,40 @@ def _stop_after_the_ending_is_written_down(crash: pytest.MonkeyPatch, which: int
     crash.setattr(PublicationRecordStore, "record_outcome", written_then_gone)
 
 
+#: The finishing routine's steps, in order (``merge_executor.finish_the_press``).
+FINISH_STEPS = (
+    "_finish_the_report_row",
+    "_finish_the_bus_message",
+    "_finish_the_build_row",
+    "_finish_the_repair_row",
+    "_finish_the_warning",
+    "_finish_the_release",
+)
+
+
+def _stop_after_step(crash: pytest.MonkeyPatch, name: str) -> None:
+    """The coordinator stops right after one finishing step has done its work."""
+    import inspect
+
+    real = getattr(merge_executor, name)
+
+    if inspect.iscoroutinefunction(real):
+
+        async def done_then_gone(*args: Any, **kwargs: Any) -> Any:
+            await real(*args, **kwargs)
+            raise _TheCoordinatorStopped()
+
+    else:
+
+        def done_then_gone(*args: Any, **kwargs: Any) -> Any:  # type: ignore[misc]
+            real(*args, **kwargs)
+            raise _TheCoordinatorStopped()
+
+    crash.setattr(merge_executor, name, done_then_gone)
+
+
 def _stop_after_the_report(crash: pytest.MonkeyPatch) -> None:
-    real = merge_executor.publish_the_press_report
-
-    async def reported_then_gone(*args: Any, **kwargs: Any) -> Any:
-        await real(*args, **kwargs)
-        raise _TheCoordinatorStopped()
-
-    crash.setattr(merge_executor, "publish_the_press_report", reported_then_gone)
+    _stop_after_step(crash, "_finish_the_report_row")
 
 
 async def _the_press_stops(config, pool, repo_root, ending, stop):  # noqa: ANN001, F811
@@ -435,49 +461,21 @@ class TestStoppedAfterTheEndingWasWrittenDown:
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
-        tmp_path: Path,
         ending: str,
     ) -> None:
-        """The report made from the ending written down is the press's own
-        report: every field and every word, only its timings differ. The
-        uninterrupted press reports; the recovery's path is then run from what
-        that press wrote down, on a ledger of its own, and the two compared."""
-        import dataclasses
-        import sqlite3
-
-        from forge.adapters.sqlite import connect as sqlite_connect
-        from forge.lifecycle import migrations
-        from tests.forge.pipeline.test_merge_executor import _FakePublisher
-
+        """The report made from the ending the press wrote down is the press's
+        own report: every field and every word, only its timings differ."""
         outcome, deps, *_ = await _uninterrupted(
             config_with_publication_on, pool, repo_root, ending
         )
         pressed = deps.pipeline_publisher.reports[-1].model_dump(mode="json")
         written = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
-        assert written is not None
-
-        other_root = tmp_path / "recovered"
-        other_root.mkdir()
-        cx: sqlite3.Connection = sqlite_connect.connect_writer(other_root / "forge.db")
-        migrations.apply_at_boot(cx)
-        other = SqliteLifecyclePersistence(connection=cx)
-        _ensure_build(other, build_id=BUILD_ID, feature_id=FEATURE_ID)
-        bus = _FakePublisher()
-        said = written.outcome
-        await merge_executor.publish_the_press_report(
-            dataclasses.replace(deps, pool=other, pipeline_publisher=bus),
-            build_id=BUILD_ID,
-            feature_id=said["feature_id"],
-            correlation_id=said["correlation_id"],
-            outcome=merge_executor.outcome_from_stored(said),
-            started=datetime.fromisoformat(said["started_at"]),
-            receipts_dir=other_root / "receipts",
-            dry_run=False,
-            merge_execution_attempt_id=written.attempt_id,
-            digest_warning=said["digest_warning"],
-            reported_turn=written.turn,
+        recovered_ending = merge_executor.the_stopped_presss_ending(
+            deps, pool.get_build_row(BUILD_ID), _record(pool), written, kept=None
         )
-        recovered = bus.reports[-1].model_dump(mode="json")
+        recovered = merge_executor._the_report_payload(
+            recovered_ending, completed=datetime.now(UTC), dry_run=False, press_turn=written.turn
+        ).model_dump(mode="json")
         timings = {"completed_at", "duration_secs"}
         assert {k: v for k, v in recovered.items() if k not in timings} == {
             k: v for k, v in pressed.items() if k not in timings
@@ -505,16 +503,16 @@ class TestStoppedAfterTheReport:
         deps, publisher, deploy = await _the_press_stops(
             config_with_publication_on, pool, repo_root, ending, _stop_after_the_report
         )
-        assert len(_reports(pool)) == 1  # the press reported
+        assert len(_reports(pool)) == 1  # the press wrote its report row
+        assert deps.pipeline_publisher.reports == []  # and stopped before the bus
         sent = _what_was_sent(publisher, deploy)
-        bus_before = len(deps.pipeline_publisher.reports)
         _expire(pool)
         await _passes(config_with_publication_on, pool, deps, times=2)
 
         reports = _reports(pool)
         assert len(reports) == 1 and reports[0].status == status  # not twice
         assert reports[0].details["result"] == word
-        assert len(deps.pipeline_publisher.reports) == bus_before
+        assert len(deps.pipeline_publisher.reports) == 1  # sent once, by the recovery
         assert _build(pool)[0] == build_ending
         assert repairs == ([word] if repairs_it else [])  # filed once, by the press
         assert _what_was_sent(publisher, deploy) == sent
@@ -582,7 +580,9 @@ class TestTheUninterruptedPress:
         assert written is not None and written.turn == _record(pool).turn
         assert written.outcome["outcome"]["result"] == word
         assert written.attempt_id == ATTEMPT
-        assert written.result_written and written.reported_at is not None
+        assert written.result_written and written.finished_at is not None
+        assert written.bus_sent_at is not None
+        assert (written.repair_at is not None) == repairs_it
         assert written.outcome["cleanup_done"] is True and written.outcome["kept_because"] is None
         _expire(pool)
         await _passes(config_with_publication_on, pool, deps)
@@ -602,26 +602,28 @@ class TestTheReportOrder:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         holders_at_report: list[str | None] = []
-        real = merge_executor.publish_the_press_report
+        real = merge_executor._finish_the_report_row
 
-        async def watched(*args: Any, **kwargs: Any) -> Any:
+        def watched(*args: Any, **kwargs: Any) -> Any:
             holders_at_report.append(_record(pool).lease_holder)
-            return await real(*args, **kwargs)
+            return real(*args, **kwargs)
 
-        monkeypatch.setattr(merge_executor, "publish_the_press_report", watched)
+        monkeypatch.setattr(merge_executor, "_finish_the_report_row", watched)
         await _uninterrupted(config_with_publication_on, pool, repo_root, "merged-and-running")
         assert len(holders_at_report) == 1 and holders_at_report[0]
         assert _record(pool).lease_holder is None
 
 
-class TestAMissionBuildIsNotThisPathsToFinish:
+class TestAMissionLandingIsFinishedByTheSameRoutine:
     @pytest.mark.asyncio
-    async def test_a_mission_feature_record_is_left_to_its_own_recovery(
+    async def test_the_landing_path_leaves_a_presss_result_to_it(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
     ) -> None:
+        """A result a press wrote is never the mission landing path's: that
+        path keeps only the results a reconciliation settled."""
         deps, *_ = await _the_press_stops(
             config_with_publication_on,
             pool,
@@ -636,11 +638,9 @@ class TestAMissionBuildIsNotThisPathsToFinish:
         )
         pool.connection.commit()
         _expire(pool)
-        held = _record(pool)
-        await _passes(config_with_publication_on, pool, deps)
-        assert _reports(pool) == []
-        assert _record(pool).lease_holder == held.lease_holder
-        assert await MergeApprovalConsumer(deps).finish_a_settled_press(BUILD_ID) == "nothing to do"
+        assert await MergeApprovalConsumer(deps).finish_a_settled_landing(BUILD_ID) == "nothing to do"
+        finisher = _finisher(config_with_publication_on, pool, MergeApprovalConsumer(deps))
+        assert mission_finish._settled_presses_to_finish(finisher, pool.connection) == [BUILD_ID]
 
 
 class TestATakenOverPressDoesNotReportTwice:
@@ -677,8 +677,7 @@ class TestATakenOverPressDoesNotReportTwice:
 
 
 class TestEachGuardOnItsOwn:
-    """The selector and the recovery each refuse on their own, so neither
-    depends on the other to leave a live hold or a mission's record alone."""
+    """The selector and the recovery each refuse a live hold on their own."""
 
     @pytest.mark.asyncio
     async def test_the_selector_offers_no_live_hold(
@@ -708,26 +707,6 @@ class TestEachGuardOnItsOwn:
         held = _record(pool)
         assert await MergeApprovalConsumer(deps).finish_a_settled_press(BUILD_ID) == "held"
         assert (_record(pool).lease_holder, _record(pool).turn) == (held.lease_holder, held.turn)
-
-    @pytest.mark.asyncio
-    async def test_the_selector_offers_no_mission_build(
-        self,
-        config_with_publication_on: ForgeConfig,
-        pool: SqliteLifecyclePersistence,  # noqa: F811
-        repo_root: Path,  # noqa: F811
-    ) -> None:
-        deps, *_ = await _the_press_stops(
-            config_with_publication_on, pool, repo_root, "merged-and-running", _stop_after_the_report
-        )
-        _expire(pool)
-        pool.connection.execute("PRAGMA foreign_keys = OFF")
-        pool.connection.execute(
-            "UPDATE builds SET mission_id = 'MIS-1', mission_role = 'feature' WHERE build_id = ?",
-            (BUILD_ID,),
-        )
-        pool.connection.commit()
-        finisher = _finisher(config_with_publication_on, pool, MergeApprovalConsumer(deps))
-        assert mission_finish._settled_presses_to_finish(finisher, pool.connection) == []
 
     @pytest.mark.asyncio
     async def test_an_ending_is_written_down_only_by_the_holder_on_its_turn(
@@ -890,10 +869,11 @@ class TestAHoldKeptOnPurposeStaysKept:
         written = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
         assert written.outcome["kept_because"]
         legs = len(deploy.calls)
+        assert written.finished_at  # finished, with the hold kept for a person
         _expire(pool)
         finisher = _finisher(config_with_publication_on, pool, MergeApprovalConsumer(deps))
         assert mission_finish._settled_presses_to_finish(finisher, pool.connection) == []
-        assert await MergeApprovalConsumer(deps).finish_a_settled_press(BUILD_ID) == "kept"
+        assert await MergeApprovalConsumer(deps).finish_a_settled_press(BUILD_ID) == "nothing to do"
         await _passes(config_with_publication_on, pool, deps, times=2)
         after = _record(pool)
         assert (after.lease_holder, after.turn) == (held.lease_holder, held.turn)
@@ -981,6 +961,7 @@ class TestTheProductionWiring:
         )
         assert finisher.deps.finish_settled_press == consumer.finish_a_settled_press
         assert finisher.deps.finish_settled == consumer.finish_a_settled_landing
+        assert callable(finisher.tell)
 
     def test_serve_passes_the_consumers_method(self) -> None:
         import ast
@@ -998,6 +979,14 @@ class TestTheProductionWiring:
         given = {k.arg: ast.unparse(k.value) for k in calls[0].keywords}
         assert given["finish_settled_press"] == "_merge_consumer.finish_a_settled_press"
         assert given["finish_settled"] == "_merge_consumer.finish_a_settled_landing"
+        # The finishing routine says a landing's warning through the finisher's line.
+        installs = [
+            ast.unparse(node.args[0])
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and getattr(node.func, "attr", None) == "install_mission_teller"
+        ]
+        assert installs == ["_finisher.tell"]
 
 
 class TestTwoProcesses:
@@ -1025,18 +1014,18 @@ class TestTwoProcesses:
             return written
 
         grants: list[Any] = []
-        real_report = merge_executor.publish_the_press_report
+        real_report = merge_executor._finish_the_report_row
 
-        async def another_process_tries(*args: Any, **kwargs: Any) -> Any:
+        def another_process_tries(*args: Any, **kwargs: Any) -> Any:
             grants.append(
                 PublicationRecordStore(pool.connection).take_lease(
                     build_id=BUILD_ID, holder="settled-press:elsewhere", now=datetime.now(UTC)
                 )
             )
-            return await real_report(*args, **kwargs)
+            return real_report(*args, **kwargs)
 
         monkeypatch.setattr(PublicationRecordStore, "record_outcome", written_then_lapsed)
-        monkeypatch.setattr(merge_executor, "publish_the_press_report", another_process_tries)
+        monkeypatch.setattr(merge_executor, "_finish_the_report_row", another_process_tries)
         await _press(deps, repo_root)
         assert grants == [None]  # the renewed hold refused it
         assert len(_reports(pool)) == 1
@@ -1061,13 +1050,13 @@ class TestTheRecoverysOwnOrder:
         )
         _expire(pool)
         holders: list[str | None] = []
-        real = merge_executor.publish_the_press_report
+        real = merge_executor._finish_the_report_row
 
-        async def watched(*args: Any, **kwargs: Any) -> Any:
+        def watched(*args: Any, **kwargs: Any) -> Any:
             holders.append(_record(pool).lease_holder)
-            return await real(*args, **kwargs)
+            return real(*args, **kwargs)
 
-        monkeypatch.setattr(merge_executor, "publish_the_press_report", watched)
+        monkeypatch.setattr(merge_executor, "_finish_the_report_row", watched)
         await _passes(config_with_publication_on, pool, deps)
         assert len(holders) == 1 and str(holders[0]).startswith("settled-press:")
         assert _record(pool).lease_holder is None
@@ -1193,15 +1182,17 @@ class TestARefusalBeforeTheJoin:
         self._no_target_branch(pool)
         deps, publisher, deploy = _deps(config_with_publication_on, pool, "merged-and-running")
         with pytest.MonkeyPatch.context() as crash:
-            async def gone(*_a: Any, **_k: Any) -> Any:
+            def gone(*_a: Any, **_k: Any) -> Any:
                 raise _TheCoordinatorStopped()
 
-            crash.setattr(merge_executor, "publish_the_press_report", gone)
+            crash.setattr(merge_executor, "_finish_the_report_row", gone)
             with pytest.raises(_TheCoordinatorStopped):
                 await _press(deps, repo_root)
         record = _record(pool)
-        assert record.result and record.lease_holder is None and _reports(pool) == []
+        # THE REFUSAL KEEPS ITS LEASE through its finishing (Codex round 1, R3).
+        assert record.result and record.lease_holder and _reports(pool) == []
         assert f"merge-approved-pending:{BUILD_ID}" in _blocked(pool)[0]
+        _expire(pool)
         await _passes(config_with_publication_on, pool, deps, times=2)
         reports = _reports(pool)
         assert [r.details["result"] for r in reports] == ["merge-refused"]
@@ -1225,7 +1216,8 @@ class TestARefusalBeforeTheJoin:
         deps, *_ = _deps(config_with_publication_on, pool, "merged-and-running")
         await _press(deps, repo_root)
         assert len(_reports(pool)) == 1
-        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).reported_at
+        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).finished_at
+        assert _record(pool).lease_holder is None
         finisher = _finisher(config_with_publication_on, pool, MergeApprovalConsumer(deps))
         assert mission_finish._settled_presses_to_finish(finisher, pool.connection) == []
 
@@ -1314,7 +1306,7 @@ class TestASecondPressOnTheSameRecord:
         deps, *_ = _deps(config, pool, "merged-and-running")
         first = await _press(deps, repo_root)
         assert first.result == "merge-refused"
-        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).reported_at
+        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).finished_at
         pool.connection.execute(
             "UPDATE builds SET target_branch = 'main', status = 'RUNNING' WHERE build_id = ?",
             (BUILD_ID,),
@@ -1335,7 +1327,7 @@ class TestASecondPressOnTheSameRecord:
             with pytest.raises(_TheCoordinatorStopped):
                 await _press(deps, repo_root)
         written = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
-        assert written.turn == _record(pool).turn and written.reported_at is None
+        assert written.turn == _record(pool).turn and written.finished_at is None
         _expire(pool)
         await _passes(config_with_publication_on, pool, deps)
         assert [r.details["result"] for r in _reports(pool)] == [
@@ -1416,12 +1408,12 @@ class TestATurnedAwayConsumerPress:
 # ---------------------------------------------------------------------------
 
 
-class TestAMarkThatCannotBeWritten:
-    """Follow-up 1: a report names its press's turn, so a "reported" mark that
-    could not be written still leaves exactly one report."""
+class TestAStepThatCannotBeWritten:
+    """A step whose own record could not be written is done again on the next
+    pass, and its check stops anything being done twice."""
 
     @pytest.mark.asyncio
-    async def test_one_report_across_several_passes(
+    async def test_a_report_row_that_could_not_be_written_is_written_next_pass(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -1438,53 +1430,29 @@ class TestAMarkThatCannotBeWritten:
             "merged-deploy-failed",
             lambda crash: _stop_after_the_ending_is_written_down(crash, 2),
         )
+        real = pool.record_stage
+        failed = {"n": 0}
+
+        def locked_once(entry: Any) -> None:
+            if entry.target_identifier == merge_executor.MERGE_REPORT_TARGET_IDENTIFIER and not failed["n"]:
+                failed["n"] += 1
+                raise sqlite3.OperationalError("database is locked")
+            real(entry)
+
+        monkeypatch.setattr(pool, "record_stage", locked_once)
+        _expire(pool)
+        await _passes(config_with_publication_on, pool, deps)
+        assert _reports(pool) == []  # the row could not be written
         written = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
-        bus_before = len(deps.pipeline_publisher.reports)
-
-        def locked(*_a: Any, **_k: Any) -> None:
-            raise sqlite3.OperationalError("database is locked")
-
-        monkeypatch.setattr(merge_executor, "mark_outcome_reported", locked)
-        _expire(pool)
-        await _passes(config_with_publication_on, pool, deps, times=3)
-
+        assert written.finished_at is None  # so it is not finished
+        for _ in range(3):  # its hold lapses, and the next passes finish it
+            _expire(pool)
+            await _passes(config_with_publication_on, pool, deps)
         reports = _reports(pool)
-        assert len(reports) == 1
-        assert reports[0].details["press_turn"] == written.turn
-        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).reported_at is None
-        assert len(deps.pipeline_publisher.reports) == bus_before + 1
+        assert len(reports) == 1 and reports[0].details["press_turn"] == written.turn
+        assert len(deps.pipeline_publisher.reports) == 1
         assert repairs == ["merged-deploy-failed"]
-        finisher = _finisher(config_with_publication_on, pool, MergeApprovalConsumer(deps))
-        assert mission_finish._settled_presses_to_finish(finisher, pool.connection) == []
-        _everything_is_clear(pool, a_repair=True)
-
-    @pytest.mark.asyncio
-    async def test_a_press_that_reported_without_its_mark_and_stopped_holding(
-        self,
-        config_with_publication_on: ForgeConfig,
-        pool: SqliteLifecyclePersistence,  # noqa: F811
-        repo_root: Path,  # noqa: F811
-        repairs: list[str],
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        """The press's own report lost its mark, then the coordinator stopped
-        before the release: the recovery puts the hold down and reports
-        nothing more."""
-        import sqlite3
-
-        def locked(*_a: Any, **_k: Any) -> None:
-            raise sqlite3.OperationalError("database is locked")
-
-        monkeypatch.setattr(merge_executor, "mark_outcome_reported", locked)
-        deps, *_ = await _the_press_stops(
-            config_with_publication_on, pool, repo_root, "merged-deploy-failed", _stop_after_the_report
-        )
-        assert len(_reports(pool)) == 1 and _record(pool).lease_holder
-        _expire(pool)
-        await _passes(config_with_publication_on, pool, deps, times=3)
-        assert len(_reports(pool)) == 1
-        assert repairs == ["merged-deploy-failed"]
-        assert _record(pool).lease_holder is None
+        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).finished_at
         _everything_is_clear(pool, a_repair=True)
 
     @pytest.mark.asyncio
@@ -1506,7 +1474,7 @@ class TestAMarkThatCannotBeWritten:
         assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
         assert _record(pool).result == RESULT_MERGED_AND_RUNNING
         written = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
-        assert written.result_written and written.reported_at
+        assert written.result_written and written.finished_at
 
 
 class TestANewMergeWordWhileAnEndingIsOwed:
@@ -1580,30 +1548,233 @@ class TestTheCoachsSurvivors:
         await _passes(config_with_publication_on, pool, deps, times=2)
         assert (_record(pool).lease_holder, _record(pool).turn) == (held.lease_holder, held.turn)
 
+
+
+# ---------------------------------------------------------------------------
+# Codex round 1: ONE idempotent finishing routine, keyed by the press's turn
+# ---------------------------------------------------------------------------
+
+
+class TestAStopAfterEachFinishingStep:
+    """A stop after any finishing step leaves the rest to the next pass, which
+    does only those: every step happens exactly once."""
+
     @pytest.mark.asyncio
-    async def test_a_refusal_taken_over_by_another_process_before_its_report(
+    @pytest.mark.parametrize("step", FINISH_STEPS)
+    async def test_each_step_happens_exactly_once(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        repairs: list[str],
+        step: str,
+    ) -> None:
+        deps, publisher, deploy = await _the_press_stops(
+            config_with_publication_on,
+            pool,
+            repo_root,
+            "merged-deploy-failed",
+            lambda crash: _stop_after_step(crash, step),
+        ) if step != "_finish_the_release" else await self._stopped_after_the_release(
+            config_with_publication_on, pool, repo_root
+        )
+        sent = _what_was_sent(publisher, deploy)
+        held = _record(pool)
+        # A LIVE HOLD IS NEVER TOUCHED: a pass before the hold runs out does nothing.
+        if held.lease_holder:
+            await _passes(config_with_publication_on, pool, deps)
+            assert (_record(pool).lease_holder, _record(pool).turn) == (held.lease_holder, held.turn)
+        for _ in range(3):
+            _expire(pool)
+            await _passes(config_with_publication_on, pool, deps)
+
+        assert len(_reports(pool)) == 1
+        assert len(deps.pipeline_publisher.reports) == 1
+        assert _build(pool)[0] == "FAILED"
+        assert repairs == ["merged-deploy-failed"]
+        assert _what_was_sent(publisher, deploy) == sent  # nothing sent to the remote again
+        assert _record(pool).lease_holder is None
+        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).finished_at
+        finisher = _finisher(config_with_publication_on, pool, MergeApprovalConsumer(deps))
+        assert mission_finish._settled_presses_to_finish(finisher, pool.connection) == []
+        _everything_is_clear(pool, a_repair=True)
+
+    async def _stopped_after_the_release(self, config, pool, repo_root):  # noqa: ANN001, F811
+        """Released, then the coordinator gone before ``finished_at``."""
+        _a_journey_waiting_on_its_press(pool)
+        deps, publisher, deploy = _deps(config, pool, "merged-deploy-failed")
+        with pytest.MonkeyPatch.context() as crash:
+            _stop_after_step(crash, "_finish_the_release")
+            with pytest.raises(_TheCoordinatorStopped):
+                await _press(deps, repo_root)
+        assert _record(pool).lease_holder is None
+        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).finished_at is None
+        return deps, publisher, deploy
+
+
+class TestOwnershipByCompareAndSwap:
+    def test_a_take_on_a_turn_that_moved_on_is_refused(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+    ) -> None:
+        _a_journey_waiting_on_its_press(pool)
+        store = PublicationRecordStore(pool.connection)
+        now = datetime.now(UTC)
+        first = store.take_lease(build_id=BUILD_ID, holder="a", now=now)
+        assert store.release_lease(build_id=BUILD_ID, turn=first.turn, holder="a", now=now)
+        assert store.take_lease(
+            build_id=BUILD_ID, holder="b", now=now, expected_turn=first.turn - 1
+        ) is None
+        assert store.last_refusal == "moved-on"
+        grant = store.take_lease(build_id=BUILD_ID, holder="b", now=now, expected_turn=first.turn)
+        assert grant is not None and grant.turn == first.turn + 1
+
+    @pytest.mark.asyncio
+    async def test_two_recoveries_on_two_connections_finish_it_once(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        repairs: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Recovery B, on its own connection, finishes the press between
+        recovery A's read and A's take; A then does nothing at all."""
+        import asyncio
+        import dataclasses
+        import threading
+
+        from forge.adapters.sqlite import connect as sqlite_connect
+        from tests.forge.pipeline.test_merge_executor import _FakePublisher
+
+        deps, *_ = await _the_press_stops(
+            config_with_publication_on,
+            pool,
+            repo_root,
+            "merged-deploy-failed",
+            lambda crash: _stop_after_the_ending_is_written_down(crash, 2),
+        )
+        _expire(pool)
+        ledger = Path(pool.connection.execute("PRAGMA database_list").fetchone()[2])
+        bus_b = _FakePublisher()
+        answers: dict[str, Any] = {}
+
+        def recovery_b() -> None:
+            other = SqliteLifecyclePersistence(connection=sqlite_connect.connect_writer(ledger))
+            consumer_b = MergeApprovalConsumer(
+                dataclasses.replace(deps, pool=other, pipeline_publisher=bus_b)
+            )
+            answers["b"] = asyncio.run(consumer_b.finish_a_settled_press(BUILD_ID))
+
+        real_take = PublicationRecordStore.take_lease
+        raced = {"done": False}
+
+        def b_gets_there_first(self: Any, **kwargs: Any) -> Any:
+            if not raced["done"] and kwargs.get("expected_turn") is not None:
+                raced["done"] = True
+                runner = threading.Thread(target=recovery_b)
+                runner.start()
+                runner.join()
+            return real_take(self, **kwargs)
+
+        monkeypatch.setattr(PublicationRecordStore, "take_lease", b_gets_there_first)
+        turn_before = _record(pool).turn
+        answers["a"] = await MergeApprovalConsumer(deps).finish_a_settled_press(BUILD_ID)
+
+        assert answers["b"] == "finished"
+        assert answers["a"] == "held"  # its compare and swap found the turn moved on
+        assert len(_reports(pool)) == 1
+        assert len(bus_b.reports) == 1 and deps.pipeline_publisher.reports == []
+        assert repairs == ["merged-deploy-failed"]
+        record = _record(pool)
+        assert record.lease_holder is None and record.turn == turn_before + 1
+        _everything_is_clear(pool, a_repair=True)
+
+
+class TestTheRecoveryReReadsAfterTakingTheRecord:
+    @pytest.mark.asyncio
+    async def test_a_press_that_finished_on_its_own_turn_in_between_is_left_alone(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """The press's own refusal settles and puts its lease down in one
-        write; a recovery in another process that takes the record before the
-        press reports owns the report, and the press does not write one."""
+        """The press outlived its lease and finished on its own turn between
+        the recovery's read and its take (so the turn did not move): the
+        recovery's re-read sees it finished and puts its own lease down."""
+        deps, *_ = await _the_press_stops(
+            config_with_publication_on,
+            pool,
+            repo_root,
+            "merged-and-running",
+            lambda crash: _stop_after_step(crash, "_finish_the_repair_row"),
+        )
+        _expire(pool)
+        press = _record(pool)
+        real_take = PublicationRecordStore.take_lease
+
+        def the_press_finishes_first(self: Any, **kwargs: Any) -> Any:
+            if kwargs.get("expected_turn") is not None:
+                store = PublicationRecordStore(pool.connection)
+                assert store.release_lease(
+                    build_id=BUILD_ID, turn=press.turn, holder=press.lease_holder, now=datetime.now(UTC)
+                )
+                assert store.mark_outcome(
+                    build_id=BUILD_ID, turn=press.turn, finished_at=datetime.now(UTC).isoformat()
+                )
+            return real_take(self, **kwargs)
+
+        monkeypatch.setattr(PublicationRecordStore, "take_lease", the_press_finishes_first)
+        said = await MergeApprovalConsumer(deps).finish_a_settled_press(BUILD_ID)
+        assert said == "nothing to do"
+        assert _record(pool).lease_holder is None
+        assert len(_reports(pool)) == 1
+
+
+class TestARefusalReportsUnderItsOwnLease:
+    @pytest.mark.asyncio
+    async def test_a_takeover_while_its_bus_message_is_on_its_way_is_refused(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """Codex round 1, R3: the press's own refusal keeps its lease through
+        finishing, so another process trying to take the record while the
+        refusal's bus message is suspended is refused."""
+        import asyncio
+
         _a_journey_waiting_on_its_press(pool)
         TestARefusalBeforeTheJoin._no_target_branch(pool)
         deps, *_ = _deps(config_with_publication_on, pool, "merged-and-running")
-        real = PublicationRecordStore.record_outcome
+        let_go = asyncio.Event()
+        takes: list[Any] = []
 
-        def written_then_taken(self: Any, **kwargs: Any) -> bool:
-            written = real(self, **kwargs)
-            assert PublicationRecordStore(pool.connection).take_lease(
-                build_id=BUILD_ID, holder="settled-press:elsewhere", now=datetime.now(UTC)
-            )
-            return written
+        class _ASuspendedBus:
+            def __init__(self) -> None:
+                self.reports: list[Any] = []
 
-        monkeypatch.setattr(PublicationRecordStore, "record_outcome", written_then_taken)
-        await _press(deps, repo_root)
-        assert _reports(pool) == [] and deps.pipeline_publisher.reports == []
-        assert _record(pool).lease_holder == "settled-press:elsewhere"
+            async def publish_stage_complete(self, payload: Any) -> None:
+                takes.append(
+                    PublicationRecordStore(pool.connection).take_lease(
+                        build_id=BUILD_ID, holder="settled-press:elsewhere", now=datetime.now(UTC)
+                    )
+                )
+                await let_go.wait()
+                self.reports.append(payload)
+
+        import dataclasses
+
+        deps = dataclasses.replace(deps, pipeline_publisher=_ASuspendedBus())
+        pressing = asyncio.create_task(_press(deps, repo_root))
+        while not takes:
+            await asyncio.sleep(0)
+        let_go.set()
+        outcome = await pressing
+        assert outcome.result == "merge-refused"
+        assert takes == [None]  # its live, owned lease refused the takeover
+        assert len(_reports(pool)) == 1 and len(deps.pipeline_publisher.reports) == 1
+        assert _record(pool).lease_holder is None
+        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).finished_at
