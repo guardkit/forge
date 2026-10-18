@@ -1432,6 +1432,25 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
         serve_module.feature_routing_gate = None
         serve_module.feature_routing_required = False
 
+    # Step 4.5 — one sandbox per project, stage S2 (design 2.3a): the sandbox
+    # gate, when planning.sandbox_starter.url is set and a sandbox entry says
+    # idle_stop. Every entry point that reaches a managed sandbox takes it;
+    # with none installed (the default) every one passes straight through.
+    from forge.sandbox_gate.gate import build_sandbox_gate, install_gate
+
+    gate = build_sandbox_gate(
+        forge_config,
+        connection=lambda: sqlite_pool.connection,
+    )
+    install_gate(gate)
+    serve_module.sandbox_gate = gate
+    if gate is not None:
+        logger.info(
+            "forge-serve: the sandbox gate manages %s (idle stops after %d minutes)",
+            ", ".join(gate.names),
+            forge_config.planning.sandbox_starter.idle_minutes,
+        )
+
     # Step 5 — eagerly construct the middleware. ImportErrors / wiring
     # bugs raise here, before the daemon attaches its consumer.
     # TASK-FORGE-FRR-F010J: thread the langgraph-runner sidecar URL

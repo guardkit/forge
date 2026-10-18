@@ -372,9 +372,17 @@ class MissionStep:
     # -- 3 ----------------------------------------------------------------
 
     async def admit(self, mission: Mission) -> bool:
-        """Admit every attempt that may start. False once the factory is full."""
-        from forge.planning.work_queue_loop import Admission
+        """Admit every attempt that may start. False once the factory is full.
 
+        A mission whose project's sandbox is not ready (one sandbox per
+        project, stage S2, design 2.3a) admits nothing this tick and answers
+        True, so the other missions still go: its sandbox is being started and
+        its attempts stay WAITING. With no sandbox gate installed it is today's.
+        """
+        from forge.planning.work_queue_loop import Admission
+        from forge.sandbox_gate.gate import current_gate
+
+        gate = current_gate()
         for attempt in self._missions.attempts(mission.id):
             if attempt.status != "WAITING":
                 continue
@@ -382,6 +390,11 @@ class MissionStep:
                 continue
             if self._count_in_flight() >= self._max_in_flight:
                 return False
+            if gate is not None and not gate.admits(mission.target_repo):
+                line = f"mission {mission.id} is waiting for its sandbox to start"
+                if gate.say_once(mission.target_repo, line):
+                    logger.info("missions: %s", line)
+                return True
             if not self._missions.admit_attempt(
                 attempt.correlation_id,
                 max_in_flight=self._max_in_flight,

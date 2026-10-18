@@ -143,6 +143,13 @@ REVIEW_PREVIEW_SWEEP_SECONDS: int = 300
 # the sweep out entirely.
 security_sweep_config: Any | None = None
 
+# The sandbox gate (one sandbox per project, stage S2, design 2.3a): set by
+# ``bind_production_serve`` when ``planning.sandbox_starter.url`` is set and a
+# sandbox entry says ``idle_stop``. The serve loop then brings up every
+# managed sandbox with unfinished work before recovery runs, and polls the
+# starter beside the daemon. ``None`` (the default) leaves both steps out.
+sandbox_gate: Any | None = None
+
 # stdlib ``logging`` format chosen for daemon-grep readability across
 # replicas: ISO-8601 timestamp, level, logger name, message. If the
 # project ever moves to structlog/JSON, ``_configure_logging`` is the
@@ -3062,6 +3069,22 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
         await register_on_boot(fleet_client)
         logger.info("forge-serve: fleet registration published agent_id=%s", AGENT_ID)
 
+        # Step 1.75 — one sandbox per project, stage S2 (design 2.3a): before
+        # recovery, the planning re-arm, the bridge's reconnect and the
+        # interrupt-and-relaunch of recovered builds, every managed sandbox
+        # the ledger shows unfinished work for is brought up, so recovery
+        # always finds a ready sandbox. Never raises; nothing without a gate.
+        if sandbox_gate is not None:
+            try:
+                await sandbox_gate.boot()
+            except Exception as exc:  # noqa: BLE001 — never blocks boot
+                logger.error(
+                    "forge-serve: bringing up managed sandboxes at start-up "
+                    "failed (%s: %s); recovery goes on",
+                    type(exc).__name__,
+                    exc,
+                )
+
         # Step 2 + 3 — ASSUM-009 / F1: BOTH reconciliations must run
         # before the durable consumer attaches, so a redelivered
         # envelope cannot land on an unreconciled history view.
@@ -3156,6 +3179,17 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
                         merge_card_keeper,
                     ),
                     name="forge-serve-review-preview-sweep",
+                )
+            )
+
+        # Step 5.65 — the sandbox gate's once-a-minute look at the starter
+        # (redeploys after a start, idle stops), beside the daemon and
+        # cancelled with it. Only when a gate is installed.
+        if sandbox_gate is not None:
+            tasks.add(
+                asyncio.create_task(
+                    sandbox_gate.run_forever(sandbox_gate.poll_seconds),
+                    name="forge-serve-sandbox-gate",
                 )
             )
 

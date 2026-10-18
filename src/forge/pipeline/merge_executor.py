@@ -124,6 +124,7 @@ closes COMPLETE before the card is ever offered, is untouched.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import copy
 import json
 import logging
@@ -133,7 +134,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from nats_core.events import ApprovalResponsePayload, StageCompletePayload
 from pydantic import ValidationError
@@ -7294,6 +7295,21 @@ class MergeApprovalConsumer:
         (``MergeExecutorDeps.tell_mission``), installed at boot."""
         self._deps.tell_mission = tell
 
+    @contextlib.asynccontextmanager
+    async def _pressing(self, repo: str, purpose: str) -> AsyncIterator[None]:
+        """The repository's press lock, with its sandbox started first.
+
+        One sandbox per project, stage S2 (design 2.3a): a press reaches the
+        project's own sandbox, which may have been stopped while idle, so it
+        takes the sandbox's gate before the lock and waits for start-up rather
+        than failing. With no sandbox gate installed this is exactly the lock.
+        """
+        from forge.sandbox_gate.gate import using
+
+        async with using(repo, purpose=purpose):
+            async with self._lock_for(repo):
+                yield
+
     async def handle_envelope(self, envelope: Any) -> None:
         """The full authz chain — every arm refuses quietly-but-loudly."""
         try:
@@ -7773,7 +7789,7 @@ class MergeApprovalConsumer:
         expected_preview_tree: str | None,
         join_name: str | None,
     ) -> None:
-        async with self._lock_for(repo):
+        async with self._pressing(repo, f"the merge press for {build_id}"):
             ended = "approval failed: the merge press raised"
             try:
                 outcome = await execute_merge_deploy(
@@ -8102,7 +8118,7 @@ class MergeApprovalConsumer:
         self._record_landing_requested(row)
         self._landing_now.add(build_id)
         try:
-            async with self._lock_for(row.repo):
+            async with self._pressing(row.repo, f"the mission landing of {build_id}"):
                 if _a_landing_has_reported(self._deps.pool, build_id):
                     return None
                 # A PRESS THAT STOPPED AFTER ITS RESULT IS FINISHED, NOT
@@ -8285,7 +8301,7 @@ class MergeApprovalConsumer:
         repo_root_raw = self._deps.config.planning.target_repo_paths.get(row.repo)
         if mission is None or not repo_root_raw:
             return "nothing to do"
-        async with self._lock_for(row.repo):
+        async with self._pressing(row.repo, f"settling the landing of {build_id}"):
             return await self._settle_by_looking(row, mission, Path(repo_root_raw))
 
     async def finish_a_settled_landing(self, build_id: str) -> str:
@@ -8326,7 +8342,7 @@ class MergeApprovalConsumer:
         if not repo_root_raw:
             return "nothing to do"
         store = PublicationRecordStore(self._deps.pool.connection)
-        async with self._lock_for(row.repo):
+        async with self._pressing(row.repo, f"finishing the landing of {build_id}"):
             record = store.read(build_id)
             if not record.recorded or not record.result:
                 return "nothing to do"

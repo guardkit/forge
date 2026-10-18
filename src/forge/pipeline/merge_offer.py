@@ -2473,6 +2473,40 @@ class MergeOfferService:
         changed_files: Sequence[Any] | None = None,
         on_refusal: Callable[[str, bool], None] | None = None,
     ) -> bool:
+        """:meth:`_offer`, with the project's own sandbox held up while it runs.
+
+        One sandbox per project, stage S2 (design 2.3a): the offer reads main
+        and the merge check through the project's sandbox and prepares its
+        preview there, between the build's end and the card's row, when the
+        ledger shows nothing else open. With no sandbox gate installed this is
+        exactly :meth:`_offer`.
+        """
+        from forge.sandbox_gate.gate import current_gate, using
+
+        repo = None
+        if current_gate() is not None:
+            row = self._pool.get_build_row(build_id)
+            repo = getattr(row, "repo", None) if row is not None else None
+        async with using(repo, purpose=f"the merge offer for {build_id}"):
+            return await self._offer(
+                build_id=build_id,
+                feature_id=feature_id,
+                card_words=card_words,
+                extra_details=extra_details,
+                changed_files=changed_files,
+                on_refusal=on_refusal,
+            )
+
+    async def _offer(
+        self,
+        *,
+        build_id: str,
+        feature_id: str,
+        card_words: Callable[[str, str | None], str],
+        extra_details: Mapping[str, Any] | None = None,
+        changed_files: Sequence[Any] | None = None,
+        on_refusal: Callable[[str, bool], None] | None = None,
+    ) -> bool:
         """Latch the offer and put ONE merge card in front of the owner.
 
         This is the whole card — the durable row the merge press matches on,

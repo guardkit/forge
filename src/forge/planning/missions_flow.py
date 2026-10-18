@@ -637,7 +637,14 @@ class MissionFlow:
             return
         self._starting.add(mission.id)
         try:
-            await self._start_branch(mission)
+            # THE PROJECT'S OWN SANDBOX IS STARTED FIRST when it may have been
+            # stopped (one sandbox per project, stage S2, design 2.3a): before
+            # any helper call, on approval and on every tend. With no sandbox
+            # gate installed this is nothing at all.
+            from forge.sandbox_gate.gate import using
+
+            async with using(mission.target_repo, purpose=f"mission {mission.id}'s branch start"):
+                await self._start_branch(mission)
         finally:
             self._starting.discard(mission.id)
 

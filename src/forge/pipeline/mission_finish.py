@@ -368,7 +368,7 @@ async def finish_ready_missions(
             continue
         _in_progress.add(mission.id)
         started.append(mission.id)
-        task = asyncio.create_task(_finish_guarded(deps, mission.id))
+        task = asyncio.create_task(_finish_guarded(deps, mission.id, mission.target_repo))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
     if wait:
@@ -676,9 +676,19 @@ async def _resume_guarded(
         _resuming.discard(build_id)
 
 
-async def _finish_guarded(deps: MissionFinishDeps, mission_id: str) -> None:
+async def _finish_guarded(
+    deps: MissionFinishDeps, mission_id: str, repo: str | None = None
+) -> None:
+    from forge.sandbox_gate.gate import using
+
     try:
-        await finish_ready_mission(deps, mission_id)
+        # The project's own sandbox is started first when it may have been
+        # stopped (one sandbox per project, stage S2, design 2.3a): the
+        # mission's card, its frozen source and its press all reach it. With
+        # no sandbox gate installed this is nothing at all. A landing carried
+        # on is gated by the press it goes through.
+        async with using(repo, purpose=f"finishing mission {mission_id}"):
+            await finish_ready_mission(deps, mission_id)
     except Exception as exc:  # noqa: BLE001 — logged, tried again next tick
         logger.error(
             "missions: finishing %s raised (%s: %s); it is tried again on the "

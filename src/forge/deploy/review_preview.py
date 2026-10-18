@@ -2014,10 +2014,17 @@ class ReviewPreviewService:
 
     async def prepare(self, req: PreviewRequest) -> "ReviewEvidence":
         """Prepare the preview and its evidence. Never raises for expected failures."""
+        from forge.sandbox_gate.gate import using
+
         now = self._clock()
         run_id = self._run_id_factory()
         try:
-            return await self._prepare(req, now=now, run_id=run_id)
+            # The project's own sandbox is started first when it may have been
+            # stopped (one sandbox per project, stage S2, design 2.3a). With
+            # no sandbox gate installed this is nothing at all; once the lease
+            # exists it keeps the sandbox up by itself.
+            async with using(req.project, purpose=f"the preview for {req.build_id}"):
+                return await self._prepare(req, now=now, run_id=run_id)
         except Exception as exc:  # noqa: BLE001 — the offer must always get a record
             logger.exception("review preview: preparing %s raised", req.build_id)
             return self._record(
