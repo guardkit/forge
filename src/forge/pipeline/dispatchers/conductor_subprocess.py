@@ -63,6 +63,7 @@ import json
 import logging
 import uuid
 from pathlib import Path
+from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Mapping
 
 from forge.pipeline.dispatchers.subprocess_dispatcher import (
@@ -78,7 +79,9 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "LEG_BUDGET_ARGV",
+    "LEG_OUTER_MARGIN_SECONDS",
     "leg_budget_args",
+    "leg_stage_timeout",
     "make_conductor_subprocess_dispatcher",
     "mint_stage_correlation_id",
     "with_review_verification",
@@ -167,6 +170,80 @@ def leg_budget_args(*, stage: StageClass, leg_budgets: Any) -> list[str]:
             continue
         args.extend([flag, str(value)])
     return args
+
+
+#: THE MARGIN EACH LEG'S OUTER TRIPWIRE KEEPS OVER ITS OWN BUDGET (18 October
+#: 2026). The outer subprocess timeout must stay ABOVE the budget the leg was
+#: given on its argv, or the coordinator kills a leg that is still inside its
+#: own budget and the leg never writes its receipt. These are the margins the
+#: fixed floors already kept over the legs' largest budgets: the review floor
+#: of 1860s sits 60s over a 1800s ``--sdk-timeout``, and the work floor of
+#: 1800s sits 180s over the work leg's 1620s ``--leg-budget``.
+#:
+#: The defect this closes: the fix-journey profile was raised to
+#: ``leg_sdk_timeout_seconds: 3600`` while the review leg's outer wall stayed
+#: at 1860s, so the review was cut off at 31 minutes with exit 124.
+LEG_OUTER_MARGIN_SECONDS: Mapping[StageClass, int] = MappingProxyType(
+    {
+        StageClass.TASK_REVIEW: 60,
+        StageClass.TASK_WORK: 180,
+    }
+)
+
+#: The budget fields each leg's own clock is bounded by. The review leg has
+#: one (its model-call budget); the work leg runs under its loop-level clock
+#: AND its per-invocation model budget, and the larger of the two is the one
+#: the outer wall must clear.
+_LEG_INNER_BUDGET_FIELDS: Mapping[StageClass, tuple[str, ...]] = MappingProxyType(
+    {
+        StageClass.TASK_REVIEW: ("leg_sdk_timeout_seconds",),
+        StageClass.TASK_WORK: ("leg_budget_seconds", "leg_sdk_timeout_seconds"),
+    }
+)
+
+
+def _usable_leg_value(leg_budgets: Any, field_name: str) -> int | None:
+    """A ``leg_*`` value exactly as :func:`leg_budget_args` would thread it.
+
+    A value that function drops (absent, not a positive whole number, or a
+    ``bool``) never reaches the leg, so it must not move the outer wall
+    either. Quiet on purpose: :func:`leg_budget_args` already logs the drop.
+    """
+    value = getattr(leg_budgets, field_name, None)
+    if value is None or isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if value >= 1 else None
+
+
+def leg_stage_timeout(*, stage: StageClass, floor: int, leg_budgets: Any) -> int:
+    """The outer subprocess tripwire for one fix-journey leg.
+
+    The rule: ``max(floor, largest budget the leg was given + margin)``.
+
+    * Review leg: ``max(floor, leg_sdk_timeout_seconds + 60)``.
+    * Work leg: ``max(floor, max(leg_budget_seconds,
+      leg_sdk_timeout_seconds) + 180)``.
+
+    ``floor`` is the per-stage number the composition already selected (the
+    fixed constants in ``forge.cli._serve_conductor``), so a profile with no
+    leg budgets, or budgets under the floor, keeps today's number exactly.
+    A stage with no entry in the margin table (anything not a fix-journey
+    leg) keeps ``floor`` too, since no leg budget is ever put on its argv.
+    """
+    margin = LEG_OUTER_MARGIN_SECONDS.get(stage)
+    if margin is None or leg_budgets is None:
+        return floor
+    budgets = [
+        value
+        for value in (
+            _usable_leg_value(leg_budgets, name)
+            for name in _LEG_INNER_BUDGET_FIELDS.get(stage, ())
+        )
+        if value is not None
+    ]
+    if not budgets:
+        return floor
+    return max(floor, max(budgets) + margin)
 
 
 def with_review_verification(
@@ -519,6 +596,11 @@ def make_conductor_subprocess_dispatcher(
                 extras.extend(["--model", leg_model])
             budget_args = leg_budget_args(stage=stage, leg_budgets=leg_budgets)
             extras.extend(budget_args)
+            # The outer wall follows the budget the leg was just given: it
+            # must stay above it, or the leg is killed inside its own budget.
+            stage_timeout = leg_stage_timeout(
+                stage=stage, floor=stage_timeout, leg_budgets=leg_budgets
+            )
         extra_args: list[str] | None = extras or None
 
         logger.info(

@@ -25,6 +25,7 @@ import pytest
 
 from forge.pipeline.dispatchers.conductor_subprocess import (
     LEG_BUDGET_ARGV,
+    leg_stage_timeout,
     make_conductor_subprocess_dispatcher,
     mint_stage_correlation_id,
 )
@@ -712,6 +713,102 @@ class TestArgvByteIdentityWithNoLegBudgets:
         )
 
         assert budgeted == baseline + ["--sdk-timeout", "300"]
+
+
+class TestTheOuterWallFollowsTheLegsBudget:
+    """18 October 2026: a review leg given 3600s was killed at 1860s.
+
+    The fix-journey profile set ``leg_sdk_timeout_seconds: 3600`` while the
+    review leg's outer tripwire stayed fixed at 1860s, so the coordinator
+    killed the review (exit 124) half way through its own budget. The outer
+    wall now follows the budget the leg is given, and keeps the fixed number
+    as its floor.
+    """
+
+    _FLOORS = {StageClass.TASK_REVIEW: 1860, StageClass.TASK_WORK: 1800}
+
+    async def _timeouts(self, leg_budgets: Any) -> tuple[int, int]:
+        dispatch = _RecordingDispatch()
+        adapter = _adapter(
+            dispatch,
+            timeout_seconds_by_stage=self._FLOORS,
+            leg_budgets=leg_budgets,
+        )
+        await adapter(stage=StageClass.TASK_REVIEW, build_id=BUILD_ID)
+        await adapter(
+            stage=StageClass.TASK_WORK,
+            build_id=BUILD_ID,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX007-A", review_history_index=0),
+        )
+        return (
+            dispatch.calls[0]["timeout_seconds"],
+            dispatch.calls[1]["timeout_seconds"],
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_3600s_review_budget_gets_an_outer_wall_above_it(self) -> None:
+        review, work = await self._timeouts(_Budgets(leg_sdk_timeout_seconds=3600))
+
+        assert review == 3660
+        assert review > 3600
+        # The work leg's model budget is 3600 too, so its wall clears it.
+        assert work == 3780
+
+    @pytest.mark.asyncio
+    async def test_no_budgets_keep_exactly_the_fixed_numbers(self) -> None:
+        assert await self._timeouts(None) == (1860, 1800)
+        assert await self._timeouts(_Budgets()) == (1860, 1800)
+        assert await self._timeouts(object()) == (1860, 1800)
+
+    @pytest.mark.asyncio
+    async def test_budgets_under_the_floor_keep_the_floor(self) -> None:
+        budgets = _Budgets(leg_sdk_timeout_seconds=1500, leg_budget_seconds=1620)
+
+        assert await self._timeouts(budgets) == (1860, 1800)
+
+    @pytest.mark.asyncio
+    async def test_the_work_wall_clears_the_larger_of_its_two_budgets(self) -> None:
+        review, work = await self._timeouts(
+            _Budgets(leg_sdk_timeout_seconds=900, leg_budget_seconds=5000)
+        )
+
+        assert work == 5180
+        # The loop clock is a work-leg-only flag; the review keeps its floor.
+        assert review == 1860
+
+    @pytest.mark.asyncio
+    async def test_a_value_the_argv_drops_does_not_move_the_wall(self) -> None:
+        budgets = _Budgets(
+            leg_sdk_timeout_seconds="3600",  # type: ignore[arg-type]
+            leg_budget_seconds=True,  # type: ignore[arg-type]
+        )
+
+        assert await self._timeouts(budgets) == (1860, 1800)
+
+    def test_a_stage_that_is_not_a_fix_journey_leg_keeps_its_floor(self) -> None:
+        budgets = _Budgets(leg_sdk_timeout_seconds=3600, leg_budget_seconds=3600)
+
+        assert (
+            leg_stage_timeout(
+                stage=StageClass.AUTOBUILD, floor=600, leg_budgets=budgets
+            )
+            == 600
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_adapter_line_reports_the_effective_wall(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        caplog.set_level("INFO")
+
+        await self._timeouts(_Budgets(leg_sdk_timeout_seconds=3600))
+
+        lines = [
+            r.getMessage()
+            for r in caplog.records
+            if "conductor dispatcher adapter: task-review" in r.getMessage()
+        ]
+        assert lines and "timeout=3660s" in lines[0]
 
 
 class TestStageLogWriterBinding:

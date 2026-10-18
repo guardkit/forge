@@ -96,6 +96,13 @@ logger = logging.getLogger(__name__)
 # inner-under-outer discipline is load-bearing — on an outer timeout the
 # parser discards even a perfect marker block, so the leg dies silently.
 
+#: These two numbers are FLOORS (18 October 2026). When a build's budget
+#: profile gives a leg a larger budget than its floor can clear, the
+#: dispatcher raises that leg's outer wall to the leg's budget plus a fixed
+#: margin, per dispatch, from the same profile it puts on the leg's argv
+#: (``leg_stage_timeout`` in ``forge.pipeline.dispatchers.conductor_subprocess``).
+#: A profile with no ``leg_*`` budgets keeps exactly these numbers.
+#:
 #: Outer tripwire for a ``task-review`` leg. Its inner budget is 480s.
 CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS: int = 1860  # 2026-09-09: the review leg's model budget is profile-driven (leg_sdk_timeout_seconds, now up to 1800s on the workhorse) and the outer wall must exceed it. Today's eight real reviews on this task ran 191, 221, 312, 326, 358, 675, 723 and 903 seconds on an idle box with the model warm — the tail is long, and a review that runs past its budget costs the owner a whole tap
 

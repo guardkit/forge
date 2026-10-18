@@ -610,10 +610,10 @@ class BudgetGuards(BaseModel):
             "Per-invocation model budget for ONE fix-journey leg (seconds), "
             "threaded as '--sdk-timeout <n>'. ``None`` (the default) emits "
             "nothing and each leg keeps its own default (480s review / 420s "
-            "work). BOTH leg kinds declare this flag. Keep it under the "
-            "leg's outer subprocess tripwire (600s review / 1800s work) or "
-            "the inner-under-outer margin that lets a timed-out leg write an "
-            "honest receipt instead of being SIGKILLed is gone."
+            "work). BOTH leg kinds declare this flag. The leg's outer "
+            "subprocess tripwire is raised to stay above it (review: this "
+            "value + 60s; work: the larger of this and leg_budget_seconds "
+            "+ 180s), so a timed-out leg can still write an honest receipt."
         ),
     )
     leg_budget_seconds: int | None = Field(
@@ -624,8 +624,9 @@ class BudgetGuards(BaseModel):
             "threaded as '--leg-budget <n>'. ``None`` (the default) emits "
             "nothing and the leg keeps its own default of 1620s. WORK LEGS "
             "ONLY — 'guardkit task-review' does not declare --leg-budget. "
-            "Keep it under the 1800s work-stage tripwire for the same "
-            "inner-under-outer reason as the SDK timeout."
+            "The work leg's outer tripwire is raised to stay at least 180s "
+            "above it, for the same inner-under-outer reason as the SDK "
+            "timeout."
         ),
     )
 
