@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -165,6 +166,9 @@ class FakeEstate:
         #: File modes, by volume name or sandbox path, as ``stat -c %a`` says them.
         self.modes: dict[str, str] = {"forge.yaml": "640", SANDBOX_SETTINGS: "600"}
         self.clones: dict[str, str] = {}
+        #: Folders made inside the sandbox -> their mode (a sandbox of its
+        #: own's runtime folders, 18 October 2026).
+        self.sandbox_folders: dict[str, str] = {}
         #: The sandbox the commands go to and the clone git is asked about
         #: (a sandbox of its own's tests change both, 17 October 2026).
         self.sandbox_name = SANDBOX
@@ -301,6 +305,13 @@ class FakeEstate:
             self.sandbox_files[command[4]] = input
             self.modes[command[4]] = "600"
             self.writes.append(f"sandbox:{command[4]}")
+            return _ok()
+        if command[:2] == ["sh", "-c"] and command[2] == register_repo._MAKE_FOLDERS:
+            # Folders made and kept owner-only, idempotently (18 October 2026).
+            assert command[3] == "register-repo" and command[4:]
+            for folder in command[4:]:
+                self.sandbox_folders[folder] = "700"
+                self.writes.append(f"folder:{folder}")
             return _ok()
         if command[:2] == ["sh", "-c"]:
             assert interactive and input is not None
@@ -635,7 +646,9 @@ def test_without_publish_the_publisher_is_not_touched_or_named(estate, publisher
     assert result.exit_code == 0
     assert publisher_file.read_bytes() == before
     assert sorted(os.listdir(publisher_file.parent)) == ["settings.json"]
-    assert "--wait forge-publisher" in result.output  # started with the rest, before the coordinator
+    # Its routes did not change, so it is neither restarted nor named.
+    assert "The publisher's routes did not change; it is not restarted." in result.output
+    assert "forge-publisher" not in result.output
     assert "routes did not change" in result.output
     assert "grep 'publisher: settings'" not in result.output
 
@@ -753,24 +766,92 @@ def test_a_route_without_a_key_asked_again_with_one_is_refused(
 def test_the_sequence_closes_intake_before_the_drained_check_and_restarts_nothing(estate, publisher_file):
     result = _run("--publish", "--publisher-settings", str(publisher_file))
     lines = _lines(result)
-    close = next(i for i, l in enumerate(lines) if "dc stop front-door bus-gateway gateway-watch" in l)
-    check = next(i for i, l in enumerate(lines) if "forge register-repo --check-drained" in l)
-    stop_all = next(i for i, l in enumerate(lines) if l.strip() == "dc stop")
-    swap = next(i for i, l in enumerate(lines) if f"forge.yaml.{LEAF}-pending /s/forge.yaml" in l)
-    supervisor = next(i for i, l in enumerate(lines) if "dc up -d sandbox-runner" in l)
-    publisher = next(i for i, l in enumerate(lines) if "dc up -d --wait forge-publisher" in l)
-    rest = next(i for i, l in enumerate(lines) if "dc config --services" in l)
-    door = max(i for i, l in enumerate(lines) if "dc up -d front-door bus-gateway gateway-watch" in l)
-    assert close < check < stop_all < swap < supervisor < publisher < rest < door
+    intake = "forge-estate-front-door-1 forge-estate-bus-gateway-1 forge-estate-gateway-watch-1"
+    close = next(i for i, line in enumerate(lines) if line.strip() == f"docker stop {intake}")
+    checks = [i for i, line in enumerate(lines) if line.strip().startswith("forge register-repo --check-drained")]
+    swap = next(i for i, line in enumerate(lines) if f"forge.yaml.{LEAF}-pending /s/forge.yaml" in line)
+    supervisor = next(i for i, line in enumerate(lines) if line.strip() == "docker restart forge-estate-sandbox-runner-1")
+    publisher = next(i for i, line in enumerate(lines) if line.strip() == "&& docker restart forge-estate-forge-publisher-1")
+    route = next(i for i, line in enumerate(lines) if "grep 'publisher: settings'" in line)
+    coordinator = next(i for i, line in enumerate(lines) if line.strip() == "&& docker restart forge-estate-coordinator-1")
+    reopen = max(i for i, line in enumerate(lines) if line.strip() == f"docker start {intake}")
+    dispatch = next(i for i, line in enumerate(lines) if f"autobuild dispatch: {KEY} has a sandbox" in line)
+    # A drained check before the swap, again before the publisher's restart
+    # and again before the coordinator's (S1 window, 18 October 2026).
+    assert len(checks) == 3
+    assert close < checks[0] < swap < supervisor < checks[1] < publisher < route
+    assert route < checks[2] < coordinator < reopen < dispatch
     # Every docker/sbx call the command itself made was a read or a staged write.
     for call in estate.calls:
         assert "compose" not in call and "restart" not in call and "stop" not in call
 
 
+def test_each_restart_is_explicit_because_up_does_not_recreate_on_a_settings_change(estate, publisher_file):
+    """``docker compose up -d --no-deps <svc>`` leaves a container whose only
+    change is a mounted settings file as it was (S1 window, 18 October 2026),
+    so nothing printed relies on it."""
+    output = _run("--publish", "--publisher-settings", str(publisher_file)).output
+    assert "docker compose" not in output.replace("'docker compose up -d' does not recreate", "")
+    assert "dc " not in output and "dc()" not in output
+    assert "docker restart forge-estate-forge-publisher-1" in output
+    assert "docker restart forge-estate-coordinator-1" in output
+
+
+def _restart_commands(lines: list[str]) -> list[str]:
+    """Each printed drained check joined with its continuation line(s)."""
+    commands = []
+    for index, line in enumerate(lines):
+        if not line.strip().startswith("forge register-repo --check-drained"):
+            continue
+        parts = [line.strip()]
+        while parts[-1].endswith("\\"):
+            parts[-1] = parts[-1][:-1].rstrip()
+            index += 1
+            parts.append(lines[index].strip())
+        if any("docker restart" in part for part in parts):
+            commands.append(" ".join(parts))
+    return commands
+
+
+@pytest.mark.parametrize("drained_exit, restarted", [(1, False), (2, False), (0, True)])
+def test_a_drained_check_that_does_not_pass_stops_its_restart(estate, publisher_file, tmp_path, drained_exit, restarted):
+    """Codex review of the S1 window fixes, R1: each drained check and its
+    restart are ONE command, so pasting it restarts nothing unless the check
+    exits 0. Each printed command is run with stand-ins for forge and docker."""
+    lines = _lines(_run("--publish", "--publisher-settings", str(publisher_file)))
+    commands = _restart_commands(lines)
+    assert len(commands) == 2
+    assert "forge-estate-forge-publisher-1" in commands[0] and "forge-estate-coordinator-1" in commands[1]
+    bin_dir = tmp_path / "stand-ins"
+    bin_dir.mkdir()
+    log = tmp_path / "docker.log"
+    (bin_dir / "forge").write_text(f"#!/bin/sh\nexit {drained_exit}\n")
+    (bin_dir / "docker").write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+    for stand_in in bin_dir.iterdir():
+        stand_in.chmod(0o755)
+    for command in commands:
+        done = subprocess.run(
+            ["sh", "-c", command], env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert (done.returncode == 0) is restarted
+    said = log.read_text().splitlines() if log.exists() else []
+    if restarted:
+        assert said == ["restart forge-estate-forge-publisher-1", "restart forge-estate-coordinator-1"]
+    else:
+        assert said == []
+
+
+def test_without_a_publisher_change_only_the_coordinator_is_restarted(estate):
+    lines = _lines(_run())
+    assert "(e) The publisher's routes did not change; it is not restarted." in lines
+    assert not [line for line in lines if "forge-publisher" in line]
+    assert [line for line in lines if line.strip() == "&& docker restart forge-estate-coordinator-1"]
+
+
 def test_the_swap_is_one_command_that_checks_all_three_files_before_copying_any(estate, publisher_file):
     lines = _lines(_run("--publish", "--publisher-settings", str(publisher_file)))
-    start = next(i for i, l in enumerate(lines) if l.startswith("(d)")) + 1
-    end = next(i for i, l in enumerate(lines) if l.startswith("(e)"))
+    start = next(i for i, l in enumerate(lines) if l.startswith("(c)")) + 1
+    end = next(i for i, l in enumerate(lines) if l.startswith("(d)"))
     chain = lines[start:end]
     assert len(chain) == 6
     assert all(l.rstrip().endswith("\\") for l in chain[:-1]) and not chain[-1].rstrip().endswith("\\")
@@ -809,7 +890,11 @@ def test_the_sequence_uses_the_estate_s_own_files_when_named(estate, tmp_path):
     )
     assert result.exit_code == 0, result.output
     assert f"--env-file {estate_env}" in result.output
-    assert f". {run_dir / 'secrets.env'};" in result.output
+    # The plaintext secrets file was retired on 13 October 2026: nothing
+    # printed sources one; the estate's own start script is named by its role.
+    assert "secrets.env" not in result.output and "set -a" not in result.output
+    assert not re.search(r"(^|[;(]\s*)\. ", result.output, re.M)
+    assert "<the estate's start script>" in result.output
     assert "/srv/forge-abc/deploy/estate/estate-check" in result.output
     assert "not-printed" not in result.output
     assert f"{SANDBOX_SETTINGS}.{LEAF}-pending" in estate.sandbox_files

@@ -39,6 +39,9 @@ PUBLISH = "198.51.100.2"
 
 FAKE_SBX = """#!/usr/bin/env bash
 printf '%s\\n' "$*" >> "$SBX_LOG"
+# The disk sizes sbx reads from its own settings at creation.
+[ "$1" = create ] && printf 'docker=%s workspace=%s\\n' \\
+  "${DOCKER_SANDBOXES_DOCKER_SIZE-unset}" "${DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE-unset}" >> "$SBX_LOG.disks"
 case "$1" in
   ls) printf '%s\\n' "${SBX_LS:-}" ;;
   policy) [ "$2 $3" = "check network" ] && exit 1 ;;
@@ -147,6 +150,41 @@ class TestAProjectsOwnSandbox:
         result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_MEMORY="6g", SANDBOX_CPUS="3")
         assert result.returncode == 0, result.stdout + result.stderr
         assert "--memory 6g --cpus 3" in [line for line in sbx if line.startswith("create ")][0]
+
+    def test_its_disks_are_made_big_enough_for_real_builds_by_default(self, slot_repo, tmp_path):
+        """S1 window, 18 October 2026: sbx's default Docker disk left 2.1 GB
+        free. A slot sandbox is created with a 40g Docker disk and a 60g
+        workspace disk unless its settings say otherwise."""
+        result, _, _ = _drive(slot_repo, tmp_path, "prepare")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _lines(tmp_path / "sbx.log.disks") == ["docker=40g workspace=60g"]
+        assert "a 40g Docker disk and a 60g workspace disk" in result.stdout + result.stderr
+
+    def test_its_disk_sizes_are_settings(self, slot_repo, tmp_path):
+        result, _, _ = _drive(slot_repo, tmp_path, "prepare",
+                              SANDBOX_DOCKER_DISK="80g", SANDBOX_WORKSPACE_DISK="2048m",
+                              DOCKER_SANDBOXES_DOCKER_SIZE="1g")
+        assert result.returncode == 0, result.stdout + result.stderr
+        # The script's own value wins over one already in the environment.
+        assert _lines(tmp_path / "sbx.log.disks") == ["docker=80g workspace=2048m"]
+
+    @pytest.mark.parametrize("setting, value", [
+        ("SANDBOX_DOCKER_DISK", "40"), ("SANDBOX_DOCKER_DISK", "40gb"), ("SANDBOX_DOCKER_DISK", "-1g"),
+        ("SANDBOX_DOCKER_DISK", "511m"), ("SANDBOX_DOCKER_DISK", "0g"),
+        ("SANDBOX_WORKSPACE_DISK", "0m"), ("SANDBOX_WORKSPACE_DISK", "1.5g"),
+        ("SANDBOX_WORKSPACE_DISK", "60g;x"),
+    ])
+    def test_a_disk_size_that_is_not_one_is_refused_before_anything_is_made(self, slot_repo, tmp_path, setting, value):
+        result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", **{setting: value})
+        assert result.returncode == 2
+        assert setting in result.stdout + result.stderr
+        assert not [line for line in sbx if line.startswith(("create ", "policy allow "))]
+
+    def test_the_shared_shape_is_created_as_before_with_no_disk_sizes(self, slot_repo, tmp_path):
+        result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_SLOT="",
+                                SANDBOX_NAME="a-shared-shape", SANDBOX_DOCKER_DISK="7g")
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert _lines(tmp_path / "sbx.log.disks") == ["docker=unset workspace=unset"]
 
     def test_the_rules_name_only_its_own_doors_and_the_shared_services(self, slot_repo, tmp_path):
         result, sbx, _ = _drive(slot_repo, tmp_path, "prepare")

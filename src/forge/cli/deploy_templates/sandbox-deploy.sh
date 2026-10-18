@@ -119,6 +119,17 @@
 #     doors come from the slot and from nothing else;
 #   - starts at 4 GiB and 2 processors unless SANDBOX_MEMORY / SANDBOX_CPUS say
 #     otherwise (measured in stage S1 before the size is fixed);
+#   - is created with disks big enough for real builds (S1 window, 18 October
+#     2026: sbx's default Docker disk left 2.1 GB free, too little for a second
+#     release image). SANDBOX_DOCKER_DISK sizes its /var/lib/docker disk
+#     (default 40g, at least 512m) and SANDBOX_WORKSPACE_DISK its clone's disk,
+#     which also holds the build worktrees (default 60g). Each is a whole
+#     number and m or g. sbx sizes them only at creation, from its
+#     DOCKER_SANDBOXES_DOCKER_SIZE and DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE
+#     settings, which this script sets for that one command; the disk files
+#     are sparse, so space is taken only as it is used. An existing sandbox's
+#     disks are never resized here: grow them while it is stopped (the estate's
+#     sandbox restart and disk growth runbook);
 #   - has its own receipts folder (SANDBOX_RECEIPTS_PATH, required): a folder
 #     kept for this project alone on the machine the coordinator runs on,
 #     shared to this machine at the same path, and mounted into this one
@@ -213,6 +224,11 @@ fi
 # --- a project's own sandbox: its slot, its ports and its doors ------------
 SANDBOX_SLOT="${SANDBOX_SLOT:-}"
 SANDBOX_PUBLISH_ADDRESS="${SANDBOX_PUBLISH_ADDRESS:-}"
+# A slot sandbox's two disks, made at creation (see above).
+SANDBOX_DOCKER_DISK="${SANDBOX_DOCKER_DISK:-}"
+SANDBOX_WORKSPACE_DISK="${SANDBOX_WORKSPACE_DISK:-}"
+SLOT_DOCKER_DISK_DEFAULT="40g"
+SLOT_WORKSPACE_DISK_DEFAULT="60g"
 SANDBOX_GATEWAY_ADDRESS="${SANDBOX_GATEWAY_ADDRESS:-}"
 # The shared services a slot sandbox reaches, fixed: no sandbox chooses its own
 # (Codex R2, round 2).
@@ -295,6 +311,18 @@ if is_a_slot_sandbox; then
   fi
   [[ -n "${SANDBOX_MEMORY}" ]] || SANDBOX_MEMORY="4g"
   [[ -n "${SANDBOX_CPUS}" ]] || SANDBOX_CPUS="2"
+  [[ -n "${SANDBOX_DOCKER_DISK}" ]] || SANDBOX_DOCKER_DISK="${SLOT_DOCKER_DISK_DEFAULT}"
+  [[ -n "${SANDBOX_WORKSPACE_DISK}" ]] || SANDBOX_WORKSPACE_DISK="${SLOT_WORKSPACE_DISK_DEFAULT}"
+  for setting in SANDBOX_DOCKER_DISK SANDBOX_WORKSPACE_DISK; do
+    if [[ ! "${!setting}" =~ ^[1-9][0-9]{0,5}[mMgG]$ ]]; then
+      log "FATAL: ${setting} is '${!setting}', and a disk size is a whole number of mebibytes or gibibytes, such as 40g or 2048m. Refusing to deploy."
+      exit 2
+    fi
+  done
+  if [[ "${SANDBOX_DOCKER_DISK}" =~ ^([0-9]+)[mM]$ ]] && ((10#${BASH_REMATCH[1]} < 512)); then
+    log "FATAL: SANDBOX_DOCKER_DISK is '${SANDBOX_DOCKER_DISK}', and sbx makes a sandbox's Docker disk no smaller than 512m. Refusing to deploy."
+    exit 2
+  fi
   slot_offset=$((10 * 10#${SANDBOX_SLOT}))
   SLOT_PUBLISHES=(
     "${SANDBOX_PUBLISH_ADDRESS}:$((SLOT_HELPER_BASE + slot_offset)):8125"
@@ -473,8 +501,11 @@ create_slot_sandbox() {
   if [[ -n "${FORGE_TARGET_OWNER_URL:-}" ]]; then
     argv+=(--env FORGE_TARGET_OWNER_URL)
   fi
-  log "creating sandbox ${SANDBOX_NAME} in slot ${SANDBOX_SLOT} on the factory's clone of ${REPO_ROOT}, with no factory source mounts, ${SANDBOX_MEMORY} and ${SANDBOX_CPUS} processors, ports ${SLOT_PUBLISHES[*]}"
-  "${argv[@]}"
+  log "creating sandbox ${SANDBOX_NAME} in slot ${SANDBOX_SLOT} on the factory's clone of ${REPO_ROOT}, with no factory source mounts, ${SANDBOX_MEMORY} and ${SANDBOX_CPUS} processors, a ${SANDBOX_DOCKER_DISK} Docker disk and a ${SANDBOX_WORKSPACE_DISK} workspace disk, ports ${SLOT_PUBLISHES[*]}"
+  # The disk sizes are sbx's own settings, for this one command only.
+  DOCKER_SANDBOXES_DOCKER_SIZE="${SANDBOX_DOCKER_DISK}" \
+    DOCKER_SANDBOXES_CLONED_WORKSPACE_SIZE="${SANDBOX_WORKSPACE_DISK}" \
+    "${argv[@]}"
 }
 
 # The receipts folder of a slot sandbox: mounted at runtime with `sbx mount`
