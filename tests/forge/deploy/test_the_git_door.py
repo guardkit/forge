@@ -11,8 +11,11 @@ default; that its image is the pinned one; and, in the pinned image with no
 network at all, that its entry shell refuses to start without a usable token
 or allow-list, that HAProxy accepts its settings, and that only git's two
 read requests for a listed repository are passed on, with the caller's
-credential replaced by the door's. **No service, sandbox, GitHub or real
-token is touched**; every token, owner and name is made up.
+credential replaced by the door's. Since one sandbox per project (17
+October 2026) the door listens on one port per sandbox and its allow-list is
+keyed by the port a request arrived on: a repository listed for one port is
+refused on another. **No service, sandbox, GitHub or real token is touched**;
+every token, owner and name is made up.
 """
 
 from __future__ import annotations
@@ -34,6 +37,9 @@ from tests.forge.deploy.test_the_estate_bundle import (
 
 MADE_UP_TOKEN = b"made-up-door-token-TESTONLY\n"
 LISTED = "example-owner/listed-repo"
+#: Two sandboxes' ports, and a repository listed for each.
+PORT_A, PORT_B = 18080, 18081
+OTHER = "example-owner/other-sandboxes-repo"
 
 
 @pytest.fixture(scope="module")
@@ -98,15 +104,30 @@ def test_the_door_holds_its_token_as_a_file_and_is_hardened_like_the_model_door(
 def test_the_door_listens_only_on_the_gateway_address_and_its_own_port(with_the_door):
     example = (ESTATE / ".env.example").read_text()
     gateway = re.search(r"^FACTORY_GATEWAY_ADDRESS=(\S+)$", example, re.M).group(1)
-    port = re.search(r"^GIT_DOOR_PORT=(\S+)$", example, re.M).group(1)
+    port = re.search(r"^GIT_DOOR_PORTS=(\S+)$", example, re.M).group(1)
     door = with_the_door["services"]["git-door"]
     assert door["environment"]["GIT_DOOR_BIND"] == f"{gateway}:{port}"
+    assert port == "31831", "the example's port is slot 1's, 31830 + 1"
     others = {
         re.search(rf"^{name}=(\S+)$", example, re.M).group(1)
         for name in ("MODEL_DOOR_PORT", "FLEET_MEMORY_SANDBOX_PORT", "FLEET_MEMORY_PORT")
     }
     assert port not in others, "the Git door has a gateway port of its own"
     assert "\nGIT_DOOR_BIND=" not in example
+
+
+@pytest.mark.parametrize("settings, bind", [
+    ({"GIT_DOOR_PORTS": "31831,31832"}, "192.0.2.1:31831,31832"),
+    ({"GIT_DOOR_PORTS": "", "GIT_DOOR_PORT": "31825"}, "192.0.2.1:31825"),
+], ids=["one-port-per-sandbox", "the-single-port-of-before"])
+def test_the_door_takes_every_sandbox_s_port_and_still_the_single_one(settings, bind):
+    if shutil.which("docker") is None:
+        pytest.skip("docker is not installed here, so there is nothing to render")
+    from tests.forge.deploy.test_the_estate_bundle import _render
+
+    done = _render(profiles="local-bus,git-door", settings=settings)
+    assert done.returncode == 0, done.stderr
+    assert yaml.safe_load(done.stdout)["services"]["git-door"]["environment"]["GIT_DOOR_BIND"] == bind
 
 
 def test_the_door_image_agrees_with_the_pins_file():
@@ -120,7 +141,9 @@ def test_the_door_image_agrees_with_the_pins_file():
 def test_the_settings_allow_only_the_two_reads_and_log_no_header():
     config = (ESTATE / "git-door.cfg").read_text()
     bind_lines = [ln.strip() for ln in config.splitlines() if ln.strip().startswith("bind ")]
-    assert bind_lines == ['bind "${GIT_DOOR_BIND}"']
+    assert bind_lines == ['bind "${GIT_DOOR_LISTEN}"']
+    assert "http-request set-var(txn.key) dst_port,concat(/,txn.repo)" in config
+    assert "acl listed        var(txn.key) -m str -f" in config
     assert 'http-request set-header Authorization "Basic ${GIT_DOOR_BASIC}"' in config
     assert "http-request del-header Authorization" in config
     assert "capture request header" not in config
@@ -134,8 +157,9 @@ def test_the_settings_allow_only_the_two_reads_and_log_no_header():
 def test_the_estate_readme_documents_the_git_door():
     readme = (ESTATE / "README.md").read_text()
     assert "## The Git door" in readme
-    for needed in ("git-door", "GIT_DOOR_TOKEN", "GIT_DOOR_PORT", "GIT_DOOR_REPOS_FILE",
-                   "git-door.cfg", "--via-git-door", "allow-list", "COMPOSE_PROFILES"):
+    for needed in ("git-door", "GIT_DOOR_TOKEN", "GIT_DOOR_PORTS", "GIT_DOOR_REPOS_FILE",
+                   "git-door.cfg", "--via-git-door", "allow-list", "COMPOSE_PROFILES",
+                   "<port>/<owner>/<name>", "--slot"):
         assert needed in readme, needed
 
 
@@ -156,7 +180,8 @@ def door_entry(with_the_door) -> list[str]:
 
 
 def _run_the_door(door_entry, tmp_path: Path, *command: str, token: bytes | None = MADE_UP_TOKEN,
-                  repos: str | None = f"# the allow-list\n{LISTED}\n", script: str | None = None):
+                  repos: str | None = f"# the allow-list\n{PORT_A}/{LISTED}\n", script: str | None = None,
+                  bind: str = f"127.0.0.1:{PORT_A}"):
     image, *entry = door_entry
     mounts = ["-v", f"{ESTATE / 'git-door.cfg'}:/usr/local/etc/haproxy/git-door.cfg:ro"]
     if token is not None:
@@ -177,7 +202,7 @@ def _run_the_door(door_entry, tmp_path: Path, *command: str, token: bytes | None
     return subprocess.run(
         ["docker", "run", "--rm", "--network", "none", "--cap-drop", "ALL",
          "--security-opt", "no-new-privileges:true",
-         "-e", "GIT_DOOR_BIND=127.0.0.1:18080", *mounts,
+         "-e", f"GIT_DOOR_BIND={bind}", *mounts,
          "--entrypoint", entry[0], image, *entry[1:], *command],
         capture_output=True, text=True, timeout=120,
     )
@@ -195,13 +220,32 @@ def test_the_door_refuses_to_start_without_a_usable_token(door_entry, tmp_path, 
 @pytest.mark.parametrize("repos, said", [
     (None, "no allow-list"),
     ("# only a comment\n\n", "names no repository"),
-    (f"{LISTED}\nnot a repository line\n", "not owner/name"),
-    (f"{LISTED}\nowner/name/extra\n", "not owner/name"),
-], ids=["no-file", "nothing-listed", "a-bad-line", "three-parts"])
+    (f"{PORT_A}/{LISTED}\nnot a repository line\n", "not <port>/<owner>/<name>"),
+    (f"{PORT_A}/{LISTED}\n{PORT_A}/owner/name/extra\n", "not <port>/<owner>/<name>"),
+    (f"{LISTED}\n", "not <port>/<owner>/<name>"),
+    (f"0{PORT_A}/{LISTED}\n", "not <port>/<owner>/<name>"),
+    (f"{PORT_B}/{LISTED}\n", f"names the port {PORT_B}, which the door does not listen on"),
+    (f"{PORT_A}/{LISTED}\n18082/Example-Owner/Listed-Repo\n", "for more than one port"),
+], ids=["no-file", "nothing-listed", "a-bad-line", "four-parts", "no-port-the-old-form",
+        "a-port-written-with-a-zero", "a-port-the-door-does-not-listen-on", "one-repo-two-ports"])
 def test_the_door_refuses_to_start_without_a_usable_allow_list(door_entry, tmp_path, repos, said):
-    done = _run_the_door(door_entry, tmp_path, "true", repos=repos)
+    done = _run_the_door(door_entry, tmp_path, "true", repos=repos, bind=f"127.0.0.1:{PORT_A},18082")
     assert done.returncode != 0
     assert said in done.stderr
+
+
+@pytest.mark.parametrize("bind, said", [
+    (f"127.0.0.1:{PORT_A},{PORT_A}", "named twice"),
+    (f"127.0.0.1:{PORT_A},", "comma-separated list"),
+    (f"127.0.0.1:,{PORT_A}", "comma-separated list"),
+    (f"127.0.0.1:{PORT_A},0{PORT_B}", "not a number from 1 to 65535"),
+    (f"127.0.0.1:{PORT_A},70000", "not a number from 1 to 65535"),
+    ("127.0.0.1:", "it has no port"),
+], ids=["a-port-twice", "a-trailing-comma", "a-leading-comma", "a-leading-zero",
+        "too-big", "no-port"])
+def test_the_door_refuses_a_port_list_that_is_not_plain(door_entry, tmp_path, bind, said):
+    done = _run_the_door(door_entry, tmp_path, "true", bind=bind)
+    assert done.returncode != 0 and said in done.stderr, done.stderr
 
 
 def test_the_door_refuses_to_listen_everywhere(door_entry, tmp_path):
@@ -247,6 +291,34 @@ PROBES = {
 }
 
 
+def test_a_repository_is_read_only_on_its_own_sandbox_s_port(door_entry, tmp_path):
+    """Two sandboxes' ports, one repository listed for each: each repository
+    is passed on through its own port and refused on the other's."""
+    probes = {
+        "a-on-its-own-port": (PORT_A, LISTED, "503"),
+        "a-on-the-other-port": (PORT_B, LISTED, "403"),
+        "b-on-its-own-port": (PORT_B, OTHER, "503"),
+        "b-on-the-other-port": (PORT_A, OTHER, "403"),
+    }
+    lines = ["haproxy -D -f /usr/local/etc/haproxy/git-door.cfg -p /tmp/door.pid 2>/dev/null",
+             "sleep 1"]
+    for name, (port, repo, _) in probes.items():
+        lines.append(
+            f"printf 'GET /{repo}.git/info/refs?service=git-upload-pack HTTP/1.1\\r\\nHost: github.com"
+            f"\\r\\nConnection: close\\r\\n\\r\\n' | nc -w 3 127.0.0.1 {port} | head -1 | sed 's/^/{name} /'"
+        )
+    done = _run_the_door(
+        door_entry, tmp_path, "sh", "/probe.sh", script="\n".join(lines) + "\n",
+        bind=f"127.0.0.1:{PORT_A},{PORT_B}", repos=f"{PORT_A}/{LISTED}\n{PORT_B}/{OTHER}\n",
+    )
+    assert done.returncode == 0, done.stderr
+    answered = {
+        line.split()[0]: line.split()[2]
+        for line in done.stdout.splitlines() if line.strip() and len(line.split()) > 2
+    }
+    assert answered == {name: status for name, (_, _, status) in probes.items()}, done.stdout
+
+
 def test_only_the_two_reads_of_a_listed_repository_are_passed_on(door_entry, tmp_path):
     lines = ["haproxy -D -f /usr/local/etc/haproxy/git-door.cfg -p /tmp/door.pid 2>/dev/null",
              "sleep 1"]
@@ -288,7 +360,7 @@ def test_the_caller_s_credential_is_replaced_by_the_door_s(door_entry, tmp_path)
     ]) + "\n"
     image, *entry = door_entry
     (tmp_path / "git_door_token").write_bytes(MADE_UP_TOKEN)
-    (tmp_path / "git-door.repos").write_text(f"{LISTED}\n")
+    (tmp_path / "git-door.repos").write_text(f"{PORT_A}/{LISTED}\n")
     (tmp_path / "probe.sh").write_text(script)
     for name in ("git_door_token", "git-door.repos", "probe.sh"):
         (tmp_path / name).chmod(0o444)

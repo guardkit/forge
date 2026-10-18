@@ -470,7 +470,7 @@ def compose_merge_git_surface(forge_config: Any) -> Any | None:
     fills it in — this returns ``None`` itself, so nothing is composed and no
     press asks a routing question at all.
     """
-    from forge.config.sandboxes import has_sandboxes, sandbox_for
+    from forge.config.sandboxes import git_door_for, has_sandboxes, sandbox_for
 
     if not has_sandboxes(forge_config):
         return None
@@ -491,8 +491,8 @@ def compose_merge_git_surface(forge_config: Any) -> Any | None:
                 fetch_address=(
                     getattr(forge_config.planning, "fetch_addresses", {}) or {}
                 ).get(str(repo)),
-                # The declared Git door (17 October 2026).
-                git_door=getattr(forge_config.planning, "git_door", None),
+                # The Git door of this repository's own sandbox (17 October 2026).
+                git_door=git_door_for(forge_config, repo),
             )
             logger.info(
                 "forge-serve: %s has a sandbox (%s), so the merge word's own "
@@ -524,7 +524,7 @@ def compose_merge_check_reader(forge_config: Any) -> Any:
     a branch name, and never the working folder.
     """
     from forge.adapters.git.planning_runner import WorktreeGitRunner
-    from forge.config.sandboxes import sandbox_for
+    from forge.config.sandboxes import git_door_for, sandbox_for
     from forge.planning.sidecar_git_runner import SidecarGitRunner
 
     planning = forge_config.planning
@@ -543,7 +543,7 @@ def compose_merge_check_reader(forge_config: Any) -> Any:
         if repo not in per_repo:
             per_repo[repo] = SidecarGitRunner(
                 str(entry.sidecar_url), repo=str(repo), fetch_address=addresses.get(str(repo)),
-                git_door=door,
+                git_door=git_door_for(forge_config, repo),
             )
         return per_repo[repo]
 
@@ -1686,6 +1686,8 @@ def build_conductor_mode_kwargs(
             forward_context_builder,
             source_build_id_reader=failure_pack_source_reader,
             receipts_root=receipts_root,
+            # The source build's own project's receipts (one sandbox per project).
+            repo_reader=lambda build_id: getattr(pool.get_build_row(build_id), "repo", None),
         )
         logger.info(
             "conductor: fix_task_context_builder wired (forward context + "
@@ -3284,6 +3286,12 @@ def serve_cmd(ctx: click.Context) -> None:
     _configure_logging(config.log_level)
     forge_config = _resolve_forge_config_for_serve(ctx)
     _apply_build_limit(config, forge_config)
+    # Each project's own receipts folder (one sandbox per project, design
+    # section 2.2a): every receipts reader and writer here resolves a build's
+    # folder from its repository through forge.receipts.receipts_root_for.
+    from forge.config.sandboxes import use_the_settings_receipts
+
+    use_the_settings_receipts(forge_config)
     global security_sweep_config
     sweep_settings = getattr(forge_config, "security_sweep", None)
     security_sweep_config = (

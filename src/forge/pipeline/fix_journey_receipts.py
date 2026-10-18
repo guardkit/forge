@@ -85,7 +85,9 @@ FIX_JOURNEY_PACK_KIND: str = "fix-journey"
 _STAGE_DIR_RE = re.compile(r"^(?P<seq>\d{3})-(?P<rest>.+)$")
 
 
-def fix_journey_receipts_root(receipts_root: "Path | str | None" = None) -> Path:
+def fix_journey_receipts_root(
+    receipts_root: "Path | str | None" = None, *, repo: "str | None" = None
+) -> Path:
     """Resolve the durable receipts root, with the root injectable.
 
     Args:
@@ -109,11 +111,21 @@ def fix_journey_receipts_root(receipts_root: "Path | str | None" = None) -> Path
             routine path does not read would be the same defect wearing a
             different path.
 
+        repo: The build's repository (one sandbox per project, design
+            section 2.2a): when its sandbox names a receipts folder of its
+            own, that folder (:func:`forge.receipts.receipts_root_for`);
+            otherwise the routine path's resolution above, unchanged.
+
     Returns:
         The receipts root as a :class:`~pathlib.Path`. Never raises.
     """
     if receipts_root is not None:
         return Path(receipts_root).expanduser()
+    from forge.receipts import receipts_root_for
+
+    own = receipts_root_for(repo)
+    if own != receipts_root_for(None):
+        return own
     # Local import: the runner pulls langgraph/yaml at module scope, and
     # this module is imported by the supervisor's composition root.
     from forge.subagents.autobuild_runner import _receipts_root
@@ -229,6 +241,7 @@ def read_failure_pack(
     build_id: str,
     *,
     receipts_root: "Path | str | None" = None,
+    repo: "str | None" = None,
 ) -> FailurePackIndex | None:
     """Read the failure pack a failed build left, or ``None``.
 
@@ -254,7 +267,7 @@ def read_failure_pack(
     )
 
     try:
-        pack_dir = fix_journey_receipts_root(receipts_root) / build_id
+        pack_dir = fix_journey_receipts_root(receipts_root, repo=repo) / build_id
         if not pack_dir.is_dir():
             logger.info(
                 "fix_journey_receipts: no failure pack for build_id=%s at %s",
@@ -381,6 +394,7 @@ def next_stage_key(
     *,
     receipts_root: "Path | str | None" = None,
     suffix: str | None = None,
+    repo: "str | None" = None,
 ) -> str:
     """Return the next ``NNN-stage`` directory name for ``build_id``.
 
@@ -396,7 +410,7 @@ def next_stage_key(
     """
     tail = f"{stage}-{suffix}" if suffix else stage
     try:
-        stages_dir = fix_journey_receipts_root(receipts_root) / build_id / STAGES_DIRNAME
+        stages_dir = fix_journey_receipts_root(receipts_root, repo=repo) / build_id / STAGES_DIRNAME
         highest = 0
         if stages_dir.is_dir():
             for child in stages_dir.iterdir():
@@ -424,6 +438,7 @@ def export_stage_receipts(
     stage_key: str | None = None,
     suffix: str | None = None,
     extra_files: "Mapping[str, str] | None" = None,
+    repo: "str | None" = None,
 ) -> StageReceiptExport:
     """Export one fix-journey stage's receipts, hardened to the owner.
 
@@ -443,11 +458,11 @@ def export_stage_receipts(
     from forge.subagents.autobuild_runner import _RECEIPT_FAMILIES
 
     key = stage_key or next_stage_key(
-        build_id, stage, receipts_root=receipts_root, suffix=suffix
+        build_id, stage, receipts_root=receipts_root, suffix=suffix, repo=repo
     )
     families: list[str] = []
     try:
-        pack_root = fix_journey_receipts_root(receipts_root) / build_id
+        pack_root = fix_journey_receipts_root(receipts_root, repo=repo) / build_id
         dest_root = pack_root / STAGES_DIRNAME / key
         dest_root.mkdir(parents=True, exist_ok=True)
 
@@ -485,7 +500,7 @@ def export_stage_receipts(
             exc,
         )
         dest_fallback = (
-            fix_journey_receipts_root(receipts_root) / build_id / STAGES_DIRNAME / key
+            fix_journey_receipts_root(receipts_root, repo=repo) / build_id / STAGES_DIRNAME / key
         )
         return StageReceiptExport(
             ok=False, stage_key=key, dest=dest_fallback, families=tuple(families)
@@ -506,6 +521,7 @@ def write_fix_journey_failure_pack(
     stage_keys: "tuple[str, ...] | list[str] | None" = None,
     receipts_root: "Path | str | None" = None,
     clock: "Any | None" = None,
+    repo: "str | None" = None,
 ) -> Path | None:
     """Write the fix journey's OWN failure pack index.
 
@@ -528,7 +544,7 @@ def write_fix_journey_failure_pack(
     )
 
     try:
-        pack_root = fix_journey_receipts_root(receipts_root) / build_id
+        pack_root = fix_journey_receipts_root(receipts_root, repo=repo) / build_id
         pack_root.mkdir(parents=True, exist_ok=True)
         manifest_path = pack_root / FAILURE_MANIFEST_NAME
         if manifest_path.exists():

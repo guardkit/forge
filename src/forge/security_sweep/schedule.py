@@ -24,7 +24,6 @@ during a sweep, the sweep finishes the project it is on and stops.
 from __future__ import annotations
 
 import asyncio
-import functools
 import logging
 import sqlite3
 from dataclasses import dataclass
@@ -226,15 +225,31 @@ def compose_sweep(
         asker=asker,
         asker_missing=why_not or "the model is not configured",
         # The coordinator's declared Git door, threaded to every fetch exactly
-        # as its other fetches take it (Codex implementation review 4, F6).
-        fetch=functools.partial(
-            fetch_mirror, git_door=getattr(forge_config.planning, "git_door", None)
-        ),
+        # as its other fetches take it (Codex implementation review 4, F6):
+        # each project's own sandbox's door (one sandbox per project).
+        fetch=_fetch_through_each_project_s_door(forge_config, fetch_mirror),
         merge_executor_enabled=bool(
             getattr(getattr(forge_config, "merge_executor", None), "enabled", False)
         ),
     )
     return deps, is_idle
+
+
+def _fetch_through_each_project_s_door(forge_config: Any, fetch_mirror: Any) -> Any:
+    """``fetch(address, folder)`` given the Git door of the project whose
+    recorded address it is (one sandbox per project, 17 October 2026)."""
+    from forge.config.sandboxes import git_door_for
+
+    doors = {
+        str(address): git_door_for(forge_config, repo)
+        for repo, address in dict(forge_config.planning.fetch_addresses).items()
+    }
+    default = getattr(forge_config.planning, "git_door", None)
+
+    def fetch(address: str, folder: Path) -> Any:
+        return fetch_mirror(address, folder, git_door=doors.get(str(address), default))
+
+    return fetch
 
 
 def compose_nightly_schedule(forge_config: Any, *, db_path: Path, nats_client: Any) -> NightlySchedule:

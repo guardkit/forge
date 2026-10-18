@@ -662,11 +662,18 @@ def _int(value: Any) -> int | None:
     return value if isinstance(value, int) and not isinstance(value, bool) else None
 
 
+def _git_door_for(config: Any, repo: str) -> str | None:
+    """The Git door ``repo``'s fetch address goes through (its own sandbox's)."""
+    from forge.config.sandboxes import git_door_for
+
+    return git_door_for(config, repo)
+
+
 def _default_receipts_root() -> Path:
     try:
-        from forge.receipts import receipts_root
+        from forge.receipts import receipts_root_for
 
-        return receipts_root()
+        return receipts_root_for(None)
     except Exception:  # noqa: BLE001 — the report is then simply not found
         return Path("~/forge-state/receipts").expanduser()
 
@@ -1391,6 +1398,16 @@ async def admit_fix_row(
         )
 
     sidecar = _sidecar_for(config, resolution.name)
+    if receipts_root is None:
+        # The source build's own project's receipts (one sandbox per project,
+        # design section 2.2a): its merge report and failure pack are read
+        # there. A project without a folder of its own reads them exactly as
+        # before.
+        from forge.receipts import receipts_root_for
+
+        own = receipts_root_for(resolution.name)
+        if own != receipts_root_for(None):
+            receipts_root = own
     task_id = _task_id_already_on_row(store, queue_id) or mint_fix_task_id(
         parent_feature,
         existing=(
@@ -1425,7 +1442,8 @@ async def admit_fix_row(
         sidecar_post=sidecar_post,
         merge_ending=_recorded_merge_ending(persistence, source),
         fetch_address=_fetch_address_for(config, resolution.name),
-        git_door=getattr(getattr(config, "planning", None), "git_door", None),
+        # The Git door of this repository's own sandbox (one sandbox per project).
+        git_door=_git_door_for(config, resolution.name),
     )
     base_branch = repair_base.branch
     if base_branch != branch or sidecar is not None:

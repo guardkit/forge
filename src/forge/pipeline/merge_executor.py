@@ -200,7 +200,7 @@ from forge.pipeline.publication_switch import (
     why_publication_is_off,
 )
 from forge.pipeline.publisher_client import ask_the_publisher, the_remote_moved
-from forge.receipts import receipts_root
+from forge.receipts import receipts_root_for
 
 logger = logging.getLogger(__name__)
 
@@ -410,7 +410,16 @@ def _utcnow() -> datetime:
 
 
 def _default_receipts_root() -> Path:
-    return receipts_root()
+    return receipts_root_for(None)
+
+
+def _receipts_root_of(deps: Any, repo: str | None) -> Path:
+    """Where this press writes its receipts: the build's own project's folder
+    (one sandbox per project, design section 2.2a), or the seam a test put
+    in ``receipts_root_fn``."""
+    if deps.receipts_root_fn is _default_receipts_root:
+        return receipts_root_for(repo)
+    return deps.receipts_root_fn()
 
 
 @dataclass(frozen=True)
@@ -1527,7 +1536,7 @@ async def execute_merge_deploy(
         committed = deps.feature_routing_gate.require_committed_success(correlation_id)
         feature_routing_receipt = committed.to_wire()
     started = deps.clock()
-    receipts_dir = deps.receipts_root_fn() / f"merge-{build_id}"
+    receipts_dir = _receipts_root_of(deps, repo) / f"merge-{build_id}"
     # The branch of record for this press (Part M, rules 54 and 55).
     merge_branch = str(merge_branch or "").strip() or None
     branch = branch_to_merge(feature_id, merge_branch)

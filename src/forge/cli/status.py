@@ -53,7 +53,7 @@ from rich.table import Table
 
 from forge.adapters.sqlite.connect import read_only_connect
 from forge.lifecycle.modes import BuildMode
-from forge.receipts import IN_FLIGHT_STATE_NAME, receipts_root
+from forge.receipts import IN_FLIGHT_STATE_NAME, receipts_root_for
 from forge.subagents.build_monitor import resolve_poll_interval_seconds
 from forge.lifecycle.persistence import (
     ACTIVE_STATES,
@@ -202,7 +202,16 @@ def _row_to_status_view(row: sqlite3.Row) -> BuildStatusView:
         mode=BuildMode(raw_mode) if raw_mode else BuildMode.MODE_A,
         terminal_class=str(raw_terminal_class) if raw_terminal_class else None,
         mission_merge_of=mission_merge_of,
+        repo=_repo_of(row),
     )
+
+
+def _repo_of(row: sqlite3.Row) -> str | None:
+    """The row's repository, when the projection named it."""
+    try:
+        return str(row["repo"]) if row["repo"] else None
+    except (IndexError, KeyError):
+        return None
 
 
 #: Columns the projection always names.
@@ -237,6 +246,9 @@ def _status_projection(cx: sqlite3.Connection) -> str:
         projection = f"{projection}, terminal_class"
     if {"mission_id", "mission_role"} <= columns:
         projection = f"{projection}, mission_id, mission_role"
+    if "repo" in columns:
+        # For the build's own project's receipts (one sandbox per project).
+        projection = f"{projection}, repo"
     return projection
 
 
@@ -446,7 +458,7 @@ def _all_terminal(views: Iterable[BuildStatusView]) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _read_in_flight(build_id: str) -> dict[str, Any] | None:
+def _read_in_flight(build_id: str, repo: str | None = None) -> dict[str, Any] | None:
     """Read a running build's in-flight heartbeat, or ``None``.
 
     Written by the build monitor's poll loop into
@@ -457,7 +469,8 @@ def _read_in_flight(build_id: str) -> dict[str, Any] | None:
     lane: ``—``. A status table must never fail over a decoration.
     """
     try:
-        path = receipts_root() / build_id / IN_FLIGHT_STATE_NAME
+        # The build's own project's receipts (one sandbox per project).
+        path = receipts_root_for(repo) / build_id / IN_FLIGHT_STATE_NAME
         raw = path.read_text(encoding="utf-8")
         payload = json.loads(raw)
     except (OSError, ValueError):
@@ -605,7 +618,7 @@ def _build_table(
             # Only ever FILLS an empty cell, and only for a build that could
             # still be running: a completed stage_log entry is a fact, and a
             # heartbeat must not overwrite one.
-            in_flight = _read_in_flight(view.build_id)
+            in_flight = _read_in_flight(view.build_id, view.repo)
             if in_flight is not None:
                 stage_cell = _in_flight_stage_cell(in_flight)
         table.add_row(
@@ -695,7 +708,7 @@ def _serialise_view(view: BuildStatusView) -> dict[str, Any]:
     """
     row = json.loads(view.model_dump_json())
     if view.status not in _TERMINAL_STATES:
-        in_flight = _read_in_flight(view.build_id)
+        in_flight = _read_in_flight(view.build_id, view.repo)
         if in_flight is not None:
             row["in_flight"] = {**in_flight, "stale": _in_flight_is_stale(in_flight)}
     return row

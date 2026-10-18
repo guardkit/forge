@@ -896,7 +896,8 @@ def compose_planning_git_runner(
     runners = {
         repo: SidecarGitRunner(
             entry.sidecar_url, repo=repo, fetch_address=addresses.get(repo),
-            git_door=door,
+            # The door of this repository's own sandbox (17 October 2026).
+            git_door=getattr(entry, "git_door", None) or door,
         )
         for repo, entry in planning.sandboxes.items()
     }
