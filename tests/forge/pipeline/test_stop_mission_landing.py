@@ -858,49 +858,145 @@ class TestASettlementIsNeverLeftHeld:
 
 
 # ---------------------------------------------------------------------------
-# Codex implementation round 2, R2: the ordinary press stopping after its result
+# Codex implementation rounds 2 and 3, R2: a settled landing whose bookkeeping
+# did not finish (the press stopped after its result)
 # ---------------------------------------------------------------------------
 
 
-class TestAPressThatStoppedAfterItsResult:
-    async def _the_press_stops_after_its_result(
+class _TheCoordinatorStopped(BaseException):
+    """The process going away: nothing in the press catches it."""
+
+
+class TestASettledLandingWhoseBookkeepingDidNotFinish:
+    async def _the_press_stops_right_after_its_result(
         self,
         config_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         monkeypatch: pytest.MonkeyPatch,
-    ) -> MergeApprovalConsumer:
-        """A landing decided before the stop, pressed to its result, and the
-        coordinator gone before the press put its hold down."""
+    ) -> Any:
+        """A landing decided before the stop, and the REAL press interrupted the
+        moment it has written "published to the mission branch": no report, no
+        release, the hold still on the record."""
         a_running_mission(pool, keys=("B",))
         a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
         _planned(pool)
         the_mission_branch_on_the_remote(repo_root)
         deps, *_ = press_deps(config_on, pool, repo_root)
-        consumer = MergeApprovalConsumer(deps)
-        assert consumer._decide_landing(
+        assert MergeApprovalConsumer(deps)._decide_landing(
             B_BUILD, mission_id=MISSION_ID, decided_by="x", request_id=f"merge-{B_BUILD}"
         )
         _stop(pool)
-        with monkeypatch.context() as stopped:
-            stopped.setattr(
-                PublicationRecordStore, "release_lease", lambda self, **_k: False
-            )
-            outcome = await consumer.land_mission_feature(B_BUILD)
-        assert outcome is not None and outcome.status == "PASSED"
+        real_record = PublicationRecordStore.record
+
+        def written_then_gone(self: Any, **kwargs: Any) -> bool:
+            written = real_record(self, **kwargs)
+            if kwargs.get("result") == RESULT_PUBLISHED_TO_MISSION_BRANCH:
+                raise _TheCoordinatorStopped()
+            return written
+
+        with monkeypatch.context() as crash:
+            crash.setattr(PublicationRecordStore, "record", written_then_gone)
+            with pytest.raises(_TheCoordinatorStopped):
+                await MergeApprovalConsumer(deps).land_mission_feature(B_BUILD)
         record = _record(pool)
         assert record.result == RESULT_PUBLISHED_TO_MISSION_BRANCH
-        assert record.lease_holder  # the hold was never put down
-        return MergeApprovalConsumer(deps)  # the coordinator, restarted
+        assert record.lease_holder  # held
+        assert _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER) == []  # no report
+        return deps
 
     def _finisher(self, config_on: ForgeConfig, pool: SqliteLifecyclePersistence, consumer: Any) -> Any:  # noqa: F811
         deps = _resuming_deps(config_on, pool, consumer)
         deps.reconcile = consumer.reconcile_mission_landing
-        deps.release_hold = consumer.release_a_settled_hold
+        deps.finish_settled = consumer.finish_a_settled_landing
         return deps
 
+    @staticmethod
+    def _expire(pool: SqliteLifecyclePersistence) -> None:  # noqa: F811
+        pool.connection.execute(
+            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), B_BUILD),
+        )
+
+    @staticmethod
+    def _everything_is_clear(pool: SqliteLifecyclePersistence) -> None:  # noqa: F811
+        from forge.lifecycle.feature_routing import router_restart_blockers
+        from tests.forge.deploy.test_rollout_quiesce_back import q, r
+
+        assert router_restart_blockers(pool.connection) == ()
+        ledger = Path(pool.connection.execute("PRAGMA database_list").fetchone()[2])
+        assert q.work_problems(r.ledger_state(ledger)) == []
+
+    async def _passes(self, config_on, pool, consumer, times: int = 1) -> None:  # noqa: ANN001
+        step = _step(pool)
+        for _ in range(times):
+            await step.run_once()
+            await mission_finish.finish_ready_missions(
+                self._finisher(config_on, pool, consumer), wait=True
+            )
+            await step.run_once()
+
     @pytest.mark.asyncio
-    async def test_its_expired_hold_is_put_down_and_the_mission_drains(
+    async def test_recovery_writes_the_report_then_puts_the_hold_down(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        deps = await self._the_press_stops_right_after_its_result(
+            config_on, pool, repo_root, monkeypatch
+        )
+        self._expire(pool)
+        await self._passes(config_on, pool, MergeApprovalConsumer(deps))
+
+        reports = _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)
+        assert len(reports) == 1 and reports[0].status == "PASSED"
+        decision = _stages(pool, MERGE_DECISION_TARGET_IDENTIFIER)[0]
+        assert reports[0].details["merge_decision"]["execution_attempt_id"] == (
+            decision.details["merge_decision"]["execution_attempt_id"]
+        )
+        assert _record(pool).lease_holder is None
+        mission = MissionStore(pool.connection).get(MISSION_ID)
+        assert mission.status == "NOT_MERGED"
+        assert mission.closed_reason.endswith("; 1 landed on the branch, 0 did not")
+        self._everything_is_clear(pool)
+
+    @pytest.mark.asyncio
+    async def test_a_crash_between_the_report_and_the_release_is_picked_up_next(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        deps = await self._the_press_stops_right_after_its_result(
+            config_on, pool, repo_root, monkeypatch
+        )
+        self._expire(pool)
+        consumer = MergeApprovalConsumer(deps)
+        with monkeypatch.context() as crash:
+            # The recovery's own coordinator stops after the report.
+            crash.setattr(
+                PublicationRecordStore,
+                "release_lease",
+                lambda self, **_k: (_ for _ in ()).throw(RuntimeError("stopped")),
+            )
+            await mission_finish.finish_ready_missions(
+                self._finisher(config_on, pool, consumer), wait=True
+            )
+        assert len(_stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)) == 1
+        assert _record(pool).lease_holder  # taken over, and still held
+        self._expire(pool)
+        await self._passes(config_on, pool, MergeApprovalConsumer(deps))
+
+        assert len(_stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)) == 1  # not twice
+        assert _record(pool).lease_holder is None
+        assert MissionStore(pool.connection).get(MISSION_ID).status == "NOT_MERGED"
+        self._everything_is_clear(pool)
+
+    @pytest.mark.asyncio
+    async def test_a_live_lease_at_that_point_is_left_alone_and_stays_blocked(
         self,
         config_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -908,58 +1004,17 @@ class TestAPressThatStoppedAfterItsResult:
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
         from forge.lifecycle.feature_routing import router_restart_blockers
-        from tests.forge.deploy.test_rollout_quiesce_back import q, r
 
-        restarted = await self._the_press_stops_after_its_result(
-            config_on, pool, repo_root, monkeypatch
-        )
-        pool.connection.execute(
-            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
-            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), B_BUILD),
-        )
-        # The coordinator's ticks: the mission step first, then the finisher.
-        step = _step(pool)
-        await step.run_once()
-        store = MissionStore(pool.connection)
-        assert store.attempt_by_correlation_id(B_CID).status == "LANDED"
-        assert store.get(MISSION_ID).status == "RUNNING"  # held open by the hold
-        assert any(b.startswith("publication-held:") for b in router_restart_blockers(pool.connection))
-        await mission_finish.finish_ready_missions(
-            self._finisher(config_on, pool, restarted), wait=True
-        )
-        record = _record(pool)
-        assert record.lease_holder is None and record.result == RESULT_PUBLISHED_TO_MISSION_BRANCH
-        await step.run_once()
-
-        mission = store.get(MISSION_ID)
-        assert mission.status == "NOT_MERGED"
-        assert mission.closed_reason.endswith("; 1 landed on the branch, 0 did not")
-        assert not any(
-            b.startswith(("mission:", "publication-")) for b in router_restart_blockers(pool.connection)
-        )
-        ledger = Path(pool.connection.execute("PRAGMA database_list").fetchone()[2])
-        problems = q.work_problems(r.ledger_state(ledger))
-        assert [x for x in problems if x["table"] in ("publication_records", "missions")] == []
-
-    @pytest.mark.asyncio
-    async def test_a_live_hold_at_the_same_point_is_left_alone(
-        self,
-        config_on: ForgeConfig,
-        pool: SqliteLifecyclePersistence,  # noqa: F811
-        repo_root: Path,  # noqa: F811
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        restarted = await self._the_press_stops_after_its_result(
+        deps = await self._the_press_stops_right_after_its_result(
             config_on, pool, repo_root, monkeypatch
         )
         held = _record(pool)
         assert held.lease_is_live(datetime.now(UTC))
-        await mission_finish.finish_ready_missions(
-            self._finisher(config_on, pool, restarted), wait=True
-        )
-        await _step(pool).run_once()
+        await self._passes(config_on, pool, MergeApprovalConsumer(deps), times=2)
 
         record = _record(pool)
         assert record.lease_holder == held.lease_holder
         assert record.lease_expires_at == held.lease_expires_at
+        assert _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER) == []
         assert MissionStore(pool.connection).get(MISSION_ID).status == "RUNNING"
+        assert router_restart_blockers(pool.connection) != ()

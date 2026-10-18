@@ -131,6 +131,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Awaitable, Callable
 
 from nats_core.events import ApprovalResponsePayload, StageCompletePayload
@@ -7372,22 +7373,30 @@ class MergeApprovalConsumer:
         async with self._lock_for(row.repo):
             return await self._settle_by_looking(row, mission, Path(repo_root_raw))
 
-    async def release_a_settled_hold(self, build_id: str) -> str:
-        """Put down the hold of a mission feature's record the press settled and never released.
+    async def finish_a_settled_landing(self, build_id: str) -> str:
+        """Finish the bookkeeping of a mission feature's landing whose outcome is settled.
 
-        Codex implementation round 2, R2. The press writes its result, then
-        cleans up, then puts its lease down; a coordinator that stops between
-        the result and the release leaves a settled record still held, which
-        nothing else revisits and which keeps a stopped mission from draining
-        (and the router and rollout blocked). Under the repository's lock and
-        the record's own lease rules — a live lease is never touched; an
-        expired one is taken over with a new turn — the clean-up the press
-        runs after a result is run again (the join's working folders retired,
-        branches kept, :func:`retire_join_working_folders`), and the hold is
-        put down on that turn. The outcome is already settled, so nothing is
-        sent again. A removal whose answer was lost keeps the new hold, which
-        lapses and is tried again. Answers "released", "held", "kept" or
-        "nothing to do".
+        Missions design section 11 (Codex implementation rounds 2 and 3, R2).
+        The press settles its result, then cleans up, writes its report and
+        puts its lease down, in that order; a coordinator that stops anywhere
+        after the result leaves the report missing, the hold kept, or both —
+        and a stopped mission then never drains, with the router and rollout
+        blocked on it. One rule finishes it, in the press's own order, under
+        the repository's lock and the record's lease rules:
+
+        1. **The report**, if missing, is written from the settled outcome:
+           PASSED for "published to the mission branch", FAILED with the
+           recorded reason for anything else; with the decision's own
+           execution-attempt identity; nothing is sent. A report that exists
+           is left alone.
+        2. **The hold**, if its lease has expired, is taken over on a new
+           turn, the press's after-result clean-up is run again (the join's
+           working folders, :func:`retire_join_working_folders`), and the
+           hold is put down on that turn. A removal whose answer was lost
+           keeps the new hold, which lapses and is tried again.
+
+        A live, unexpired lease means a press may still be working: nothing
+        at all is done. Answers "finished", "held", "kept" or "nothing to do".
         """
         from forge.lifecycle.mission_builds import mission_of_build
 
@@ -7401,13 +7410,18 @@ class MergeApprovalConsumer:
         store = PublicationRecordStore(self._deps.pool.connection)
         async with self._lock_for(row.repo):
             record = store.read(build_id)
-            if not record.recorded or not record.result or not record.lease_holder:
+            if not record.recorded or not record.result:
                 return "nothing to do"
-            now = self._deps.clock()
-            if record.lease_is_live(now):
+            if record.lease_is_live(self._deps.clock()):
                 return "held"
-            holder = f"settled-hold-release:{os.getpid()}:{uuid.uuid4().hex[:8]}"
-            grant = store.take_lease(build_id=build_id, holder=holder, now=now)
+            # 1. THE REPORT, from the settled outcome.
+            if not _a_landing_has_reported(self._deps.pool, build_id):
+                self._report_the_settled_landing(row, record)
+            # 2. THE HOLD.
+            if not record.lease_holder:
+                return "finished"
+            holder = f"settled-landing:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+            grant = store.take_lease(build_id=build_id, holder=holder, now=self._deps.clock())
             if grant is None:
                 return "held"
             git = git_surface_for(self._deps, row.repo, Path(repo_root_raw))
@@ -7426,7 +7440,29 @@ class MergeApprovalConsumer:
                 build_id=build_id, turn=grant.turn, holder=holder, now=self._deps.clock()
             ):
                 return "held"
-            return "released"
+            return "finished"
+
+    def _report_the_settled_landing(self, row: Any, record: Any) -> None:
+        """The landing report the press did not get to write, from its settled record."""
+        attempt_id: str | None = None
+        for stage in self._deps.pool.read_stages(row.build_id):
+            if stage.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER:
+                said = (stage.details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}
+                attempt_id = said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY) or attempt_id
+        if record.result == RESULT_PUBLISHED_TO_MISSION_BRANCH:
+            self._landing_reconciled(row, attempt_id, SimpleNamespace(branch=record.target_branch))
+            return
+        reason = next(
+            (
+                str((line.detail or {}).get("refusal"))
+                for line in reversed(record.lines)
+                if line.kind == LINE_DONE and (line.detail or {}).get("refusal")
+            ),
+            f"the merge into {record.target_branch} was settled as {record.result}",
+        )
+        self._landing_failed(
+            row, f"{row.feature_id} did not land: {reason}", attempt_id=attempt_id
+        )
 
     async def _settle_by_looking(self, row: Any, mission: Any, repo_root: Path) -> str:
         """Settle this build's publication record from the remote. Its answer.
@@ -7543,8 +7579,8 @@ class MergeApprovalConsumer:
                     "status": "PASSED",
                     "result": RESULT_WORD_PUBLISHED_TO_MISSION_BRANCH,
                     "detail": (
-                        f"{row.feature_id}'s joined commit was found on "
-                        f"{mission.branch} by looking at the remote, so it landed"
+                        f"{row.feature_id}'s joined commit is on "
+                        f"{mission.branch}, so it landed"
                     ),
                     **(
                         {
