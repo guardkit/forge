@@ -71,6 +71,8 @@ __all__ = [
     "PublicationRecordStore",
     "StoredOutcome",
     "mark_outcome_reported",
+    "a_report_names_the_press",
+    "REPORT_PRESS_TURN_KEY",
     "ensure_outcome_table",
     "Replaced",
     "default_lease_seconds",
@@ -182,9 +184,49 @@ _OUTCOME_TABLE_SQL = (
 )
 
 
+#: Columns added after the table was first made, each added where missing
+#: (coach follow-up, 18 October 2026), so an older table shape can never make
+#: a result write, a write-down or a report mark refuse.
+_OUTCOME_COLUMNS_ADDED: tuple[tuple[str, str], ...] = (
+    ("result_written", "INTEGER NOT NULL DEFAULT 0"),
+    ("standing_json", "TEXT"),
+    ("reported_at", "TEXT"),
+)
+
+#: The report detail that names the press whose ending a merge report is.
+REPORT_PRESS_TURN_KEY: str = "press_turn"
+
+
 def ensure_outcome_table(cx: sqlite3.Connection) -> None:
-    """Create ``publication_outcomes`` if it is missing. Idempotent."""
+    """Create ``publication_outcomes`` if it is missing, and add any column an
+    older shape of it lacks. Idempotent."""
     cx.execute(_OUTCOME_TABLE_SQL)
+    have = {str(row[1]) for row in cx.execute("PRAGMA table_info(publication_outcomes)")}
+    for name, declared in _OUTCOME_COLUMNS_ADDED:
+        if name not in have:
+            cx.execute(f"ALTER TABLE publication_outcomes ADD COLUMN {name} {declared}")
+
+
+def a_report_names_the_press(
+    cx: sqlite3.Connection, *, build_id: str, turn: int
+) -> bool:
+    """Is a merge report on this build's record that names the press of
+    ``turn`` (its ``press_turn`` detail)? So a report whose mark could not be
+    written still counts as that press's ending reported. ``False`` on a
+    ledger with no stage log."""
+    try:
+        return (
+            cx.execute(
+                "SELECT 1 FROM stage_log WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_executor' "
+                "AND json_valid(details_json) "
+                f"AND json_extract(details_json, '$.{REPORT_PRESS_TURN_KEY}') = ? LIMIT 1",
+                (str(build_id), int(turn)),
+            ).fetchone()
+            is not None
+        )
+    except sqlite3.OperationalError:
+        return False
 
 
 def _no_outcome_table(exc: sqlite3.Error) -> bool:
@@ -393,6 +435,10 @@ class PublicationRecordStore:
 
     def __init__(self, connection: sqlite3.Connection) -> None:
         self._cx = connection
+        #: Why the last :meth:`take_lease` answered ``None``: ``"held"`` (a
+        #: live lease), ``"an-ending-is-owed"`` (a stopped press's ending is
+        #: still to be reported), or ``None``.
+        self.last_refusal: str | None = None
 
     @contextmanager
     def _transaction(self):
@@ -560,6 +606,7 @@ class PublicationRecordStore:
         decided_by: str | None = None,
         target_branch: str | None = None,
         starts_a_press: bool = False,
+        refuse_if_an_ending_is_owed: bool = False,
     ) -> LeaseGrant | None:
         """Take this build's record, or answer ``None`` because someone holds it.
 
@@ -568,6 +615,12 @@ class PublicationRecordStore:
         ``publication_outcomes`` row is made afresh for the new turn — any
         earlier press's ending, result mark and report mark go with it. A
         recovery taking the record over passes False and changes none of it.
+
+        ``refuse_if_an_ending_is_owed``: an ordinary build's new press, which
+        is refused (``last_refusal`` = ``"an-ending-is-owed"``) while the
+        latest press's result is written and its ending not yet reported, so
+        its recovery reports it first. A mission's own resume re-presses such
+        a record by design (its pick-up settles it) and does not pass it.
 
         One transaction, and the turn number goes up by one inside it, on a
         first take and on a takeover alike. A takeover is only possible once
@@ -580,6 +633,7 @@ class PublicationRecordStore:
         ttl = int(seconds if seconds is not None else default_lease_seconds())
         expires = (now + timedelta(seconds=ttl)).isoformat()
         stamp = now.isoformat()
+        self.last_refusal = None
         try:
             with self._transaction():
                 row = self._cx.execute(
@@ -631,6 +685,15 @@ class PublicationRecordStore:
                     and expiry > now
                 )
                 if held_by_another:
+                    self.last_refusal = "held"
+                    return None
+                # A NEW PRESS NEVER WIPES AN ENDING STILL OWED (coach
+                # follow-up, 18 October 2026): a press that stopped after its
+                # result, whose hold has run out but whose ending the recovery
+                # has not reported yet, keeps its row. The new press is turned
+                # away and the recovery reports the stopped one first.
+                if refuse_if_an_ending_is_owed and self._an_ending_is_owed(build_id):
+                    self.last_refusal = "an-ending-is-owed"
                     return None
                 changed = self._cx.execute(
                     """
@@ -664,6 +727,20 @@ class PublicationRecordStore:
             )
             return None
 
+    def _an_ending_is_owed(self, build_id: str) -> bool:
+        """Is this build's latest press's result written and not yet reported?"""
+        try:
+            row = self._cx.execute(
+                "SELECT turn, result_written, reported_at FROM publication_outcomes "
+                "WHERE build_id = ?",
+                (str(build_id),),
+            ).fetchone()
+        except sqlite3.OperationalError:
+            return False
+        if row is None or not row[1] or row[2] is not None:
+            return False
+        return not a_report_names_the_press(self._cx, build_id=build_id, turn=int(row[0]))
+
     def _a_press_begins(self, build_id: str, turn: int, stamp: str) -> None:
         """Inside :meth:`take_lease`'s transaction: this press's row, afresh."""
         ensure_outcome_table(self._cx)
@@ -693,8 +770,15 @@ class PublicationRecordStore:
                 (json.dumps(standing, sort_keys=True, default=str), str(build_id), int(turn)),
             )
         except sqlite3.OperationalError as exc:
+            # NEVER COSTS A RESULT: a mark that cannot be written is logged,
+            # and the result stands (the recovery then leaves it alone).
             if not _no_outcome_table(exc):
-                raise
+                logger.warning(
+                    "publication record: %s's result could not be marked as its "
+                    "press's (%s)",
+                    build_id,
+                    exc,
+                )
 
     def renew_lease(
         self, *, build_id: str, turn: int, now: datetime, seconds: int | None = None

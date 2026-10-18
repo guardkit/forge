@@ -986,29 +986,48 @@ class TestASettledLandingWhoseBookkeepingDidNotFinish:
         self._everything_is_clear(pool)
 
     @pytest.mark.asyncio
-    async def test_with_the_candidate_still_standing_the_report_is_written_and_the_hold_kept(
+    async def test_with_the_candidate_still_standing_the_person_is_told_and_the_mission_drains(
         self,
         config_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
+        """Press lease recovery (Rich's coordinator, 18 October 2026): a
+        landing that stopped with its candidate still standing is reported,
+        the mission's thread is told once — the feature, the candidate, how to
+        remove it — and the hold is put down after its usual expiry, so the
+        mission drains."""
         deps = await self._the_press_stops_right_after_its_result(
             config_on, pool, repo_root, monkeypatch, a_candidate_standing=True
         )
-        held = _record(pool)
+        identity = ((_record(pool).checked or {}).get("identity") or {}).get(
+            "handed_to_the_check"
+        )
         self._expire(pool)
-        await self._passes(config_on, pool, MergeApprovalConsumer(deps), times=2)
+        finisher, thread = _finish_deps(config_on, pool, offer=_never_offered)
+        consumer = MergeApprovalConsumer(deps)
+        finisher.land = consumer.land_mission_feature
+        finisher.reconcile = consumer.reconcile_mission_landing
+        finisher.finish_settled = consumer.finish_a_settled_landing
+        mission_finish._resuming.clear()
+        step = _step(pool)
+        for _ in range(2):
+            await step.run_once()
+            await mission_finish.finish_ready_missions(finisher, wait=True)
+            await step.run_once()
 
         reports = _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)
         assert len(reports) == 1 and reports[0].status == "PASSED"
-        after = _record(pool)
-        assert (after.lease_holder, after.turn) == (held.lease_holder, held.turn)
-        from forge.lifecycle.feature_routing import router_restart_blockers
-
-        assert f"publication-held:{B_BUILD}:{held.lease_holder}" in router_restart_blockers(
-            pool.connection
-        )
+        said = [line for _mission, line in thread.lines if "teardown" in line]
+        assert len(said) == 1  # once, however many passes
+        assert said[0].startswith("FEAT-MX1 landed, but its check's candidate ")
+        assert "remove it with the project's own teardown step" in said[0]
+        if identity:
+            assert identity in said[0]
+        assert _record(pool).lease_holder is None
+        assert MissionStore(pool.connection).get(MISSION_ID).status == "NOT_MERGED"
+        self._everything_is_clear(pool)
 
     @pytest.mark.asyncio
     async def test_a_crash_between_the_report_and_the_release_is_picked_up_next(
@@ -1259,7 +1278,7 @@ class _ATeardownThatLeavesItStanding(merge_executor_fakes._FakeDeploy):
 
 class TestALandingsHoldKeptOnPurpose:
     @pytest.mark.asyncio
-    async def test_the_landing_recovery_leaves_it_kept(
+    async def test_the_landing_recovery_says_so_then_puts_it_down(
         self,
         config_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -1280,10 +1299,18 @@ class TestALandingsHoldKeptOnPurpose:
         assert held.lease_holder  # kept by the press: the candidate may be standing
         assert len(_stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)) == 1
         bookkeeping = TestASettledLandingWhoseBookkeepingDidNotFinish()
+        assert await MergeApprovalConsumer(deps).finish_a_settled_landing(B_BUILD) == "held"
         bookkeeping._expire(pool)
-        assert await MergeApprovalConsumer(deps).finish_a_settled_landing(B_BUILD) == "kept"
-        await mission_finish.finish_ready_missions(
-            bookkeeping._finisher(config_on, pool, MergeApprovalConsumer(deps)), wait=True
+        assert (
+            await MergeApprovalConsumer(deps).finish_a_settled_landing(B_BUILD)
+            == merge_executor.LANDING_LEFT_SOMETHING_STANDING
         )
-        after = _record(pool)
-        assert (after.lease_holder, after.turn) == (held.lease_holder, held.turn)
+        assert _record(pool).lease_holder is None
+        noted = _stages(pool, merge_executor.MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER)
+        assert len(noted) == 1
+        assert "FEAT-MX1 landed" in noted[0].details["sentence"]
+        assert len(_stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)) == 1
+
+
+async def _never_offered(**_kwargs: Any) -> bool:
+    raise AssertionError("a stopped mission is not offered")

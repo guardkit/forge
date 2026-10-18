@@ -475,6 +475,7 @@ class TestStoppedAfterTheEndingWasWrittenDown:
             dry_run=False,
             merge_execution_attempt_id=written.attempt_id,
             digest_warning=said["digest_warning"],
+            reported_turn=written.turn,
         )
         recovered = bus.reports[-1].model_dump(mode="json")
         timings = {"completed_at", "duration_secs"}
@@ -1401,8 +1402,208 @@ class TestATurnedAwayConsumerPress:
         ]
         assert len(notes) == 1
         assert notes[0].details[MERGE_DECISION_DETAILS_KEY][MERGE_EXECUTION_ATTEMPT_ID_KEY] == ATTEMPT
+        # Its own stage label: never read as the last "merge-deploy" row.
+        assert notes[0].stage_label == "merge-deploy-turned-away"
         blockers = _blocked(pool)[0]
         assert f"merge-approved-pending:{BUILD_ID}" not in blockers
         # The press holding the record is still owed its own ending.
         assert f"publication-pending:{BUILD_ID}" in blockers
         assert _record(pool).lease_holder == "merge-press:elsewhere"
+
+
+# ---------------------------------------------------------------------------
+# Coach follow-ups (18 October 2026, after acceptance)
+# ---------------------------------------------------------------------------
+
+
+class TestAMarkThatCannotBeWritten:
+    """Follow-up 1: a report names its press's turn, so a "reported" mark that
+    could not be written still leaves exactly one report."""
+
+    @pytest.mark.asyncio
+    async def test_one_report_across_several_passes(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        repairs: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import sqlite3
+
+        deps, *_ = await _the_press_stops(
+            config_with_publication_on,
+            pool,
+            repo_root,
+            "merged-deploy-failed",
+            lambda crash: _stop_after_the_ending_is_written_down(crash, 2),
+        )
+        written = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
+        bus_before = len(deps.pipeline_publisher.reports)
+
+        def locked(*_a: Any, **_k: Any) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(merge_executor, "mark_outcome_reported", locked)
+        _expire(pool)
+        await _passes(config_with_publication_on, pool, deps, times=3)
+
+        reports = _reports(pool)
+        assert len(reports) == 1
+        assert reports[0].details["press_turn"] == written.turn
+        assert PublicationRecordStore(pool.connection).read_outcome(BUILD_ID).reported_at is None
+        assert len(deps.pipeline_publisher.reports) == bus_before + 1
+        assert repairs == ["merged-deploy-failed"]
+        finisher = _finisher(config_with_publication_on, pool, MergeApprovalConsumer(deps))
+        assert mission_finish._settled_presses_to_finish(finisher, pool.connection) == []
+        _everything_is_clear(pool, a_repair=True)
+
+    @pytest.mark.asyncio
+    async def test_a_press_that_reported_without_its_mark_and_stopped_holding(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        repairs: list[str],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The press's own report lost its mark, then the coordinator stopped
+        before the release: the recovery puts the hold down and reports
+        nothing more."""
+        import sqlite3
+
+        def locked(*_a: Any, **_k: Any) -> None:
+            raise sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(merge_executor, "mark_outcome_reported", locked)
+        deps, *_ = await _the_press_stops(
+            config_with_publication_on, pool, repo_root, "merged-deploy-failed", _stop_after_the_report
+        )
+        assert len(_reports(pool)) == 1 and _record(pool).lease_holder
+        _expire(pool)
+        await _passes(config_with_publication_on, pool, deps, times=3)
+        assert len(_reports(pool)) == 1
+        assert repairs == ["merged-deploy-failed"]
+        assert _record(pool).lease_holder is None
+        _everything_is_clear(pool, a_repair=True)
+
+    @pytest.mark.asyncio
+    async def test_an_older_table_shape_gets_its_missing_columns(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        pool.connection.execute(
+            "CREATE TABLE publication_outcomes (build_id TEXT PRIMARY KEY, "
+            "turn INTEGER NOT NULL, attempt_id TEXT, outcome_json TEXT NOT NULL, "
+            "recorded_at TEXT NOT NULL)"
+        )
+        pool.connection.commit()
+        outcome, *_ = await _uninterrupted(
+            config_with_publication_on, pool, repo_root, "merged-and-running"
+        )
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert _record(pool).result == RESULT_MERGED_AND_RUNNING
+        written = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
+        assert written.result_written and written.reported_at
+
+
+class TestANewMergeWordWhileAnEndingIsOwed:
+    """Follow-up 2: in the moments after a stopped press's hold runs out and
+    before the recovery's tick, a new press never wipes the owed ending."""
+
+    @pytest.mark.asyncio
+    async def test_the_new_press_is_turned_away_and_the_ending_is_reported(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        repairs: list[str],
+    ) -> None:
+        deps, publisher, deploy = await _the_press_stops(
+            config_with_publication_on,
+            pool,
+            repo_root,
+            "merged-deploy-failed",
+            lambda crash: _stop_after_the_ending_is_written_down(crash, 2),
+        )
+        before = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
+        sent = _what_was_sent(publisher, deploy)
+        _expire(pool)  # the hold runs out; the recovery's tick has not come yet
+        again = await _cli_press(deps, repo_root)
+        assert again.turned_away
+        assert "ending has not been reported yet" in again.detail
+        assert _reports(pool) == [] and _build(pool)[0] == "RUNNING"
+        after = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
+        assert (after.turn, after.outcome, after.result_written) == (
+            before.turn,
+            before.outcome,
+            before.result_written,
+        )
+        assert _what_was_sent(publisher, deploy) == sent
+        await _passes(config_with_publication_on, pool, deps)
+        assert [r.details["result"] for r in _reports(pool)] == ["merged-deploy-failed"]
+        assert repairs == ["merged-deploy-failed"]
+        assert _build(pool)[0] == "FAILED"
+        _everything_is_clear(pool, a_repair=True)
+
+
+class TestTheCoachsSurvivors:
+    @pytest.mark.asyncio
+    async def test_a_candidate_a_passed_check_left_standing_keeps_the_hold(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """No teardown answered that the candidate the passed check stood up
+        is down (this project cannot name it), so the press keeps its hold,
+        and the recovery leaves it kept."""
+        from tests.forge.pipeline.test_the_merge_word_publishes import (
+            _deps as _deps_naming_nothing,
+            _some_other_refusal,
+        )
+
+        _a_journey_waiting_on_its_press(pool)
+        deps, *_ = _deps_naming_nothing(
+            config_with_publication_on,
+            pool,
+            publisher=_APublisherThatSays([_some_other_refusal("not-allowed", "the remote said no")]),
+        )
+        await _press(deps, repo_root)
+        held = _record(pool)
+        assert held.lease_holder
+        written = PublicationRecordStore(pool.connection).read_outcome(BUILD_ID)
+        assert written.outcome["kept_because"] == "a candidate the check stood up may still be standing"
+        _expire(pool)
+        await _passes(config_with_publication_on, pool, deps, times=2)
+        assert (_record(pool).lease_holder, _record(pool).turn) == (held.lease_holder, held.turn)
+
+    @pytest.mark.asyncio
+    async def test_a_refusal_taken_over_by_another_process_before_its_report(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The press's own refusal settles and puts its lease down in one
+        write; a recovery in another process that takes the record before the
+        press reports owns the report, and the press does not write one."""
+        _a_journey_waiting_on_its_press(pool)
+        TestARefusalBeforeTheJoin._no_target_branch(pool)
+        deps, *_ = _deps(config_with_publication_on, pool, "merged-and-running")
+        real = PublicationRecordStore.record_outcome
+
+        def written_then_taken(self: Any, **kwargs: Any) -> bool:
+            written = real(self, **kwargs)
+            assert PublicationRecordStore(pool.connection).take_lease(
+                build_id=BUILD_ID, holder="settled-press:elsewhere", now=datetime.now(UTC)
+            )
+            return written
+
+        monkeypatch.setattr(PublicationRecordStore, "record_outcome", written_then_taken)
+        await _press(deps, repo_root)
+        assert _reports(pool) == [] and deps.pipeline_publisher.reports == []
+        assert _record(pool).lease_holder == "settled-press:elsewhere"

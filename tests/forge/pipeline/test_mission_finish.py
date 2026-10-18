@@ -1847,3 +1847,50 @@ class TestAnApprovedMergeThatNeverReported:
 
         assert await consumer.resume_mission_merge(build_id) is False
         assert joins.calls == []
+
+
+class TestTheCardSaysWhatALandingLeftStanding:
+    """Press lease recovery (18 October 2026): the sentence a landing wrote
+    when it left something standing is on the mission's merge card too."""
+
+    @pytest.mark.asyncio
+    async def test_the_sentence_is_in_the_card_summary(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.lifecycle.persistence import StageLogEntry
+        from forge.pipeline.merge_executor import (
+            MISSION_LANDING_LEFT_STANDING_STAGE_LABEL,
+            MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER,
+        )
+
+        main_tip = _git(repo_root, "rev-parse", "main")
+        a_running_mission(pool, keys=("B", "C"), base_commit=main_tip)
+        the_mission_branch_on_the_remote(repo_root)
+        store = await _land(config_on, pool, repo_root)
+        sentence = (
+            "FEAT-MX1 landed, but its check's candidate j-abc may still be "
+            "standing; remove it with the project's own teardown step."
+        )
+        now = datetime.now(UTC)
+        pool.record_stage(
+            StageLogEntry(
+                build_id=B_BUILD,
+                stage_label=MISSION_LANDING_LEFT_STANDING_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER,
+                status="SKIPPED",
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={"sentence": sentence, "mission_id": MISSION_ID},
+            )
+        )
+        service, wire = _offer_service(config_on, pool)
+        deps, _thread = _finish_deps(config_on, pool, offer=service.offer)
+        assert await finish_ready_mission(deps, MISSION_ID) == "offered"
+        assert store.get(MISSION_ID).status == "READY"
+        words = wire.cards[0].rationale
+        assert f"Left standing: {sentence}" in words

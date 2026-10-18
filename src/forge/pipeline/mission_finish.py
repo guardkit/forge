@@ -160,6 +160,7 @@ def mission_card_words(
     latest: Mapping[str, MissionAttempt],
     risky: Sequence[str] | None,
     risky_unread: str | None = None,
+    left_standing: Sequence[str] = (),
 ) -> str:
     """The mission merge card's own sentences (design section 7).
 
@@ -203,6 +204,10 @@ def mission_card_words(
             "Look at these first: no changed file touches sign-in, security or "
             "the database."
         )
+    # WHAT A LANDING LEFT STANDING (press lease recovery, 18 October 2026):
+    # the same sentence the mission's thread was given.
+    for sentence in left_standing:
+        lines.append(f"Left standing: {sentence}")
     lines.append(
         "Approve = merge the mission into main and deploy. Reject = nothing "
         "reaches main; the branch is kept."
@@ -548,7 +553,10 @@ def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
         return []
     from forge.lifecycle.missions import builds_record_missions
     from forge.pipeline.merge_executor import press_kept_on_purpose
-    from forge.pipeline.publication_record import PublicationRecordStore
+    from forge.pipeline.publication_record import (
+        PublicationRecordStore,
+        a_report_names_the_press,
+    )
 
     try:
         if cx.execute(
@@ -566,7 +574,11 @@ def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
             "JOIN publication_outcomes AS o ON o.build_id = p.build_id "
             f"WHERE {outside_a_mission}"
             "p.result IS NOT NULL AND o.result_written = 1 "
-            "AND (o.reported_at IS NULL "
+            "AND ((o.reported_at IS NULL AND NOT EXISTS ("
+            "SELECT 1 FROM stage_log AS r WHERE r.build_id = p.build_id "
+            "AND r.target_identifier = 'merge_deploy_executor' "
+            "AND json_valid(r.details_json) "
+            "AND json_extract(r.details_json, '$.press_turn') = o.turn)) "
             "OR (p.lease_holder IS NOT NULL AND trim(p.lease_holder) <> '')) "
             "ORDER BY b.queued_at ASC"
         ).fetchall()
@@ -586,7 +598,10 @@ def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
         written = records.read_outcome(build_id)
         if (
             written is not None
-            and written.reported_at is not None
+            and (
+                written.reported_at is not None
+                or a_report_names_the_press(cx, build_id=build_id, turn=written.turn)
+            )
             and press_kept_on_purpose(record, written)
         ):
             continue  # reported, and its hold is a person's to look at
@@ -610,11 +625,55 @@ async def _finish_settled_press_guarded(deps: MissionFinishDeps, build_id: str) 
         _resuming.discard(build_id)
 
 
+def _left_standing_sentences(pool: Any, *, build_id: str | None = None, mission_id: str | None = None) -> list[str]:
+    """The sentences a landing wrote when it left something standing: one
+    build's, or every feature build's of one mission, oldest first."""
+    from forge.pipeline.merge_executor import MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER
+
+    cx = getattr(pool, "connection", None)
+    if cx is None:
+        return []
+    where, args = (
+        ("s.build_id = ?", (str(build_id),))
+        if build_id is not None
+        else ("b.mission_id = ?", (str(mission_id),))
+    )
+    try:
+        rows = cx.execute(
+            "SELECT json_extract(s.details_json, '$.sentence') FROM stage_log AS s "
+            "JOIN builds AS b ON b.build_id = s.build_id "
+            f"WHERE s.target_identifier = ? AND {where} ORDER BY s.id ASC",
+            (MISSION_LANDING_LEFT_STANDING_TARGET_IDENTIFIER, *args),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — a read never stops the queue
+        logger.warning("missions: could not read what was left standing (%s)", exc)
+        return []
+    return [str(r[0]) for r in rows if r[0]]
+
+
+async def _say_what_was_left_standing(deps: MissionFinishDeps, build_id: str) -> None:
+    """One plain line in the mission's thread (the person already sees it)."""
+    from forge.lifecycle.mission_builds import mission_of_build
+
+    belongs = mission_of_build(deps.pool, build_id)
+    if belongs is None:
+        return
+    mission = MissionStore(deps.pool.connection, clock=deps.clock).get(belongs.mission_id)
+    if mission is None:
+        return
+    for sentence in _left_standing_sentences(deps.pool, build_id=build_id)[-1:]:
+        await _say(deps, mission, sentence)
+
+
 async def _finish_settled_guarded(deps: MissionFinishDeps, build_id: str) -> None:
     try:
         assert deps.finish_settled is not None
         said = await deps.finish_settled(build_id)
         logger.info("missions: %s's settled landing, its bookkeeping finished: %s", build_id, said)
+        from forge.pipeline.merge_executor import LANDING_LEFT_SOMETHING_STANDING
+
+        if said == LANDING_LEFT_SOMETHING_STANDING:
+            await _say_what_was_left_standing(deps, build_id)
     except Exception as exc:  # noqa: BLE001 — logged; tried again next pass
         logger.error(
             "missions: finishing %s's settled landing raised (%s: %s)",
@@ -1080,6 +1139,7 @@ async def _freeze_and_offer(
         latest=latest,
         risky=risky,
         risky_unread=unread,
+        left_standing=_left_standing_sentences(deps.pool, mission_id=mission.id),
     )
     row = deps.pool.get_build_row(build_id)
     landed = [f.key for f in features if _status(latest, f.key) == "LANDED"]

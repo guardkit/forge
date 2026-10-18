@@ -485,6 +485,7 @@ def _router_restart_blockers_snapshot(
         "AND NOT EXISTS ("
         "SELECT 1 FROM stage_log AS turned "
         "WHERE turned.build_id = decided.build_id "
+        "AND turned.stage_label = 'merge-deploy-turned-away' "
         "AND turned.target_identifier = 'merge_deploy_turned_away' "
         "AND turned.id > decided.id "
         "AND json_valid(turned.details_json) AND json_valid(decided.details_json) "
