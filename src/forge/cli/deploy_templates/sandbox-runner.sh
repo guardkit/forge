@@ -1040,25 +1040,50 @@ stop_everything() {
 # container that is created and never started, under one fixed name, labelled
 # with this checkout's state hash. The engine allows one container per name,
 # so taking it is atomic. Both the stop and the start take or confirm it before
-# they stop or remove anything. It is made from the release image already in
-# this engine (never pulled), and this script never removes it.
+# they stop or remove anything. This script never removes it.
+#
+# IT IS MADE FROM AN EMPTY IMAGE OF ITS OWN (S1 window fixes, 18 October
+# 2026). A claim made from a release image kept that image in the engine for
+# good (a container pins its image), so no old release could ever be removed
+# from a sandbox. The claim's image, forge-sandbox-claim:empty, holds nothing:
+# it is made once in this engine by `docker import` of an empty archive (no
+# pull, no network) and kept. A claim made earlier from a release image is
+# still confirmed by its label, as before; to let that release image go,
+# replace the claim while the sandbox is idle (remove it and create it again
+# from the empty image under the same label).
 ENGINE_CLAIM_NAME="forge-sandbox-engine-owner"
 ENGINE_CLAIM_LABEL="forge.sandbox.engine.owner"
+ENGINE_CLAIM_IMAGE="forge-sandbox-claim:empty"
 CHECKOUT_HASH="${STATE_ROOT##*/}"
 CLAIM_REFUSAL=""
+# The claim's empty image, made only when this engine does not hold it yet.
+# What the engine said when it would not make it is left in CLAIM_IMAGE_SAID.
+CLAIM_IMAGE_SAID=""
+make_the_claim_image() {
+  CLAIM_IMAGE_SAID=""
+  if "${DOCKER}" image inspect --format '{{.Id}}' "${ENGINE_CLAIM_IMAGE}" >/dev/null 2>&1; then
+    return 0
+  fi
+  log "making the engine claim's empty image ${ENGINE_CLAIM_IMAGE} in this sandbox's engine (once; nothing is pulled)"
+  CLAIM_IMAGE_SAID="$(head -c 10240 /dev/zero | "${DOCKER}" import - "${ENGINE_CLAIM_IMAGE}" 2>&1 >/dev/null)" &&
+    CLAIM_IMAGE_SAID="" && return 0
+  [[ -n "${CLAIM_IMAGE_SAID}" ]] || CLAIM_IMAGE_SAID="docker import failed and said nothing"
+  return 1
+}
 take_or_confirm_the_engine_claim() {
-  local image="$1" holder="" said="no release image is named (FORGE_IMAGE is not set)" complaint=""
-  if [[ -n "${image}" ]] &&
+  local holder="" said="" complaint=""
+  if make_the_claim_image &&
      said="$("${DOCKER}" create --name "${ENGINE_CLAIM_NAME}" \
        --label "${ENGINE_CLAIM_LABEL}=${CHECKOUT_HASH}" \
-       --pull never --entrypoint true "${image}" 2>&1 >/dev/null)"; then
+       --pull never --entrypoint true "${ENGINE_CLAIM_IMAGE}" 2>&1 >/dev/null)"; then
     log "this checkout (${CHECKOUT_HASH}) now holds this sandbox's engine: ${ENGINE_CLAIM_NAME}"
     return 0
   fi
+  [[ -z "${CLAIM_IMAGE_SAID}" ]] || said="${CLAIM_IMAGE_SAID}"
   # The label is read from the answer alone; a warning on the side is not it.
   complaint="$(mktemp)"
   if ! holder="$("${DOCKER}" container inspect --format "{{index .Config.Labels \"${ENGINE_CLAIM_LABEL}\"}}" "${ENGINE_CLAIM_NAME}" 2>"${complaint}")"; then
-    CLAIM_REFUSAL="this checkout could not create the engine claim from ${image:-no image}: $(printf '%s' "${said}" | tr '\n' ' ' | cut -c1-300). And the engine would not say who holds it: $(tr '\n' ' ' < "${complaint}" | cut -c1-300)"
+    CLAIM_REFUSAL="this checkout could not create the engine claim from ${ENGINE_CLAIM_IMAGE}: $(printf '%s' "${said}" | tr '\n' ' ' | cut -c1-300). And the engine would not say who holds it: $(tr '\n' ' ' < "${complaint}" | cut -c1-300)"
     rm -f "${complaint}"
     return 1
   fi
@@ -1073,7 +1098,7 @@ take_or_confirm_the_engine_claim() {
 
 case "${1:-start}" in
   stop)
-    if ! take_or_confirm_the_engine_claim "${IMAGE}"; then
+    if ! take_or_confirm_the_engine_claim; then
       log "FATAL: ${CLAIM_REFUSAL} Nothing was stopped or removed."
       exit 5
     fi
@@ -1285,7 +1310,7 @@ if [[ "${SANDBOX_RUNNER_BOOTSTRAP_ONLY:-}" == "1" ]]; then
   exit 0
 fi
 
-if ! take_or_confirm_the_engine_claim "${IMAGE_REFERENCE}"; then
+if ! take_or_confirm_the_engine_claim; then
   refuse "${CLAIM_REFUSAL} Nothing was started, stopped or removed. Refusing to start."
 fi
 ENGINE_CLAIM_HELD=1

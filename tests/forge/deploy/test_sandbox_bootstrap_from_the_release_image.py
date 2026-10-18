@@ -330,6 +330,31 @@ def resources():
 
 verb = argv[0] if argv else ""
 
+# THE ENGINE CLAIM'S EMPTY IMAGE (18 October 2026): made by ``import`` of an
+# empty archive and kept apart from the release images, so the questions
+# about those stay as they were. STANDIN_IMPORT_FAILS makes the import fail.
+CLAIM_IMAGE = "forge-sandbox-claim:empty"
+claim_image = state / "claim-image"
+
+if verb == "import":
+    if os.environ.get("STANDIN_IMPORT_FAILS"):
+        print("Error: an import refusal (a stand-in, on purpose)", file=sys.stderr)
+        sys.exit(1)
+    assert argv[-2:] == ["-", CLAIM_IMAGE], argv
+    archive = sys.stdin.buffer.read()
+    assert archive and not archive.strip(b"\\0"), "an empty archive, nothing in it"
+    with claim_image.open("a") as handle:
+        handle.write("imported\\n")
+    print("sha256:an-empty-image")
+    sys.exit(0)
+
+if verb == "image" and argv[1:2] == ["inspect"] and argv[-1] == CLAIM_IMAGE:
+    if claim_image.exists():
+        print("sha256:an-empty-image")
+        sys.exit(0)
+    print("Error: No such image: " + argv[-1], file=sys.stderr)
+    sys.exit(1)
+
 if verb == "image" and len(argv) > 1 and argv[1] == "inspect":
     fmt = ""
     for index, word in enumerate(argv):
@@ -442,7 +467,11 @@ if verb == "create":
         elif word == "--label":
             key, _, value = argv[index + 1].partition("=")
             labels[key] = value
-    if os.environ.get("STANDIN_NO_IMAGE") or resolve(argv[-1]) is None:
+    if argv[-1] == CLAIM_IMAGE:
+        if not claim_image.exists():
+            print("Error: No such image: " + argv[-1], file=sys.stderr)
+            sys.exit(125)
+    elif os.environ.get("STANDIN_NO_IMAGE") or resolve(argv[-1]) is None:
         print("Error: No such image: " + argv[-1], file=sys.stderr)
         sys.exit(125)
     if exists(name):
@@ -3290,6 +3319,7 @@ class TestAContainerThatDiesSaysWhy:
 FIXTURE_OWNER = "guardkit.fixture.owner"
 CLAIM_NAME = "forge-sandbox-engine-owner"
 CLAIM_LABEL = "forge.sandbox.engine.owner"
+CLAIM_IMAGE = "forge-sandbox-claim:empty"
 
 #: The run.sh service that wraps the bootstrap: it runs `stop` and only then
 #: the start, through the sandbox door.
@@ -3604,16 +3634,25 @@ class TestTheStopTakesTheClaimToo:
                              if c.split(" ", 1)[0] in ("stop", "rm"))
         assert claim < first_removal
 
-    def test_a_missing_image_with_no_claim_is_named_with_the_engines_words(
+    def test_a_claim_image_the_engine_will_not_make_is_named_with_its_words(
         self, sandbox
     ):
         _a_container(sandbox, "forge-sandbox-helper")
-        stopped = _run(sandbox, "stop", STANDIN_NO_IMAGE="1")
+        stopped = _run(sandbox, "stop", STANDIN_IMPORT_FAILS="1")
         assert stopped.returncode == 5, stopped.stdout
-        assert f"could not create the engine claim from {IMAGE}" in stopped.stdout
-        assert "No such image" in stopped.stdout
+        assert f"could not create the engine claim from {CLAIM_IMAGE}" in stopped.stdout
+        assert "an import refusal" in stopped.stdout
         _no_stop_or_rm(_calls(sandbox))
         assert (sandbox["state"] / "forge-sandbox-helper").exists()
+        assert _who_holds_the_claim(sandbox) is None
+
+    def test_the_claim_no_longer_needs_the_release_image(self, sandbox):
+        """A stop takes the claim from the empty image, release image or not."""
+        _a_container(sandbox, "forge-sandbox-helper")
+        stopped = _run(sandbox, "stop", STANDIN_NO_IMAGE="1")
+        assert stopped.returncode == 0, stopped.stdout
+        assert _who_holds_the_claim(sandbox) == _checkout_hash(sandbox)
+
 
     def test_a_stop_by_another_checkout_removes_nothing(self, sandbox):
         first = _in_background(sandbox)
@@ -3709,6 +3748,56 @@ class TestTheStopTakesTheClaimToo:
                 _end(stopping)
             if first is not None:
                 _end(first)
+
+
+class TestTheClaimPinsNoRelease:
+    """S1 window fixes, 18 October 2026: a claim made from the release image
+    kept that image in the engine for good. The claim is made from an empty
+    image of its own, made once by import (never pulled)."""
+
+    def test_the_claim_is_created_from_the_empty_image(self, sandbox):
+        process = _in_background(sandbox)
+        try:
+            assert _both_runs(sandbox)
+        finally:
+            _end(process)
+        calls = _calls(sandbox)
+        made = [c for c in calls if c.startswith("create ") and f"--name {CLAIM_NAME}" in c]
+        assert made and all(c.endswith(f"--entrypoint true {CLAIM_IMAGE}") for c in made)
+        assert f"--label {CLAIM_LABEL}={_checkout_hash(sandbox)}" in made[0]
+        assert not [c for c in calls if c.startswith("create ") and IMAGE in c]
+        assert [c for c in calls if c == f"import - {CLAIM_IMAGE}"]
+        assert not [c for c in calls if c.startswith("pull ")]
+        assert _who_holds_the_claim(sandbox) == _checkout_hash(sandbox)
+
+    def test_the_empty_image_is_made_only_once(self, sandbox):
+        for _ in range(3):
+            stopped = _run(sandbox, "stop")
+            assert stopped.returncode == 0, stopped.stdout
+        assert [c for c in _calls(sandbox) if c.startswith("import ")] == [f"import - {CLAIM_IMAGE}"]
+        assert (sandbox["state"] / "claim-image").read_text().splitlines() == ["imported"]
+
+    def test_an_earlier_claim_made_from_a_release_image_is_still_confirmed(self, sandbox):
+        """Made before this change: confirmed by its label, never replaced here."""
+        _the_claim_is_held_by(sandbox, _checkout_hash(sandbox))
+        (sandbox["state"] / (CLAIM_NAME + ".image")).write_text(IMAGE + "\n")
+        process = _in_background(sandbox)
+        try:
+            assert _both_runs(sandbox)
+        finally:
+            _end(process)
+        calls = _calls(sandbox)
+        assert not [c for c in calls if c.startswith(("rm ", "stop ")) and CLAIM_NAME in c]
+        assert (sandbox["state"] / (CLAIM_NAME + ".image")).read_text() == IMAGE + "\n"
+        assert _who_holds_the_claim(sandbox) == _checkout_hash(sandbox)
+
+    def test_another_checkouts_claim_is_still_refused(self, sandbox):
+        _the_claim_is_held_by(sandbox, "c" * 64)
+        stopped = _run(sandbox, "stop")
+        assert stopped.returncode == 5, stopped.stdout
+        assert "held by another checkout" in stopped.stdout and "c" * 64 in stopped.stdout
+        _no_stop_or_rm(_calls(sandbox))
+        assert _who_holds_the_claim(sandbox) == "c" * 64
 
 
 class TestTheSupervisorWaitsForTheOldRunnerToBeGone:
