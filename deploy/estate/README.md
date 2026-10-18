@@ -644,14 +644,20 @@ becomes a sentence, issues sharing a `mission: <name>` label become a mission, a
 are written back to the issues as comments (design: ai-transition `docs/designs/linear-front-door-2026-10-18.md`).
 It only makes outgoing calls to Linear; nothing is exposed.
 
-- **Off unless asked for.** It carries the `linear` profile. Start the estate with `--profile linear` (or
-  `COMPOSE_PROFILES=linear`) to include it; without that, nothing about the estate changes.
+- **Off unless asked for.** It carries the `linear` profile. To include it, **add** `linear` to the env file's
+  `COMPOSE_PROFILES` line rather than passing `--profile` (which replaces the env file's profiles, see the top of
+  `compose.yaml`): local bus `COMPOSE_PROFILES=local-bus,linear`, or `local-bus,sandbox,linear` on a machine that
+  looks after a sandbox; external bus `COMPOSE_PROFILES=linear` (that mode otherwise leaves it empty), or
+  `sandbox,linear`. Without it, nothing about the estate changes. It joins the `factory` network, and the
+  retained bus's network in external mode.
 - **Its key** comes from the child process's environment as `LINEAR_API_KEY`, the same way the Slack tokens do,
   and is handed to the service as a file. On this estate it is kept in fleet-secrets
   `slack-jarvis/linear.enc.env`, so that file joins the others the start reads.
 - **Its settings**, in the env file: `JARVIS_LINEAR_TEAM` (the team's key, for example `FAC`, or its exact name),
   `JARVIS_LINEAR_DEFAULT_REPO`, and `JARVIS_LINEAR_APPROVERS` (`<linear user id>=<identity>,...`: who may answer a
-  card from Linear, and the identity the answer carries). With no team or key the door logs one line and exits,
+  card from Linear, and the identity the answer carries). Optionally `JARVIS_LINEAR_OWNER_IDENTITY`, the identity a
+  Linear request is filed for; empty means the Slack planning originator. With no team or key the door logs one
+  line and exits,
   and `restart: on-failure` leaves it stopped.
 - **What it reads:** Forge's record, read-only (the same mount as the answer service), and its own small state
   volume `linear-door-state`. It is not given the Slack tokens.

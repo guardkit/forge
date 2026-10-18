@@ -1430,12 +1430,19 @@ services:
       # machine, never in this bundle.
       JARVIS_LINEAR_APPROVERS: ${JARVIS_LINEAR_APPROVERS:-}
       JARVIS_LINEAR_POLL_SECONDS: ${JARVIS_LINEAR_POLL_SECONDS:-30}
+      # Optional: the identity a Linear request is filed for. Empty means the
+      # Slack planning originator below, which is what the estate uses.
+      JARVIS_LINEAR_OWNER_IDENTITY: ${JARVIS_LINEAR_OWNER_IDENTITY:-}
       # The owner a Linear request is filed for, so the plan card can still be
       # answered from Slack: the same member id the Slack route files for.
       JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID: ${JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID:?name the Slack member id whose sentences become planning requests, in the env file}
       JARVIS_LINEAR_STATE_DIR: /var/lib/jarvis
       JARVIS_LINEAR_FORGE_DB: /var/lib/forge/forge.db
       JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
+    # On the bus's network like the gateway; the external-bus file adds the
+    # retained bus's network in that mode.
+    networks:
+      - factory
     volumes:
       - linear-door-state:/var/lib/jarvis
       - forge-ledger:/var/lib/forge:ro
