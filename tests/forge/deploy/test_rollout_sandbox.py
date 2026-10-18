@@ -475,20 +475,30 @@ def test_without_a_git_door_port_the_rules_are_todays(inventory,monkeypatch):
     assert receipt['git_door_rule'] is None
 
 
-def test_the_git_door_rule_is_one_gateway_port_beside_the_model_door(inventory,monkeypatch):
-    """17 October 2026: with GIT_DOOR_PORT set, the sandbox is given the Git
-    door's one port, exactly as the model door's, and the receipt records it."""
+def test_the_shared_sandbox_alone_is_refused_a_git_door(inventory,monkeypatch,capsys,tmp_path):
+    """17 October 2026, one sandbox per project (design 2.6, Codex R1): the
+    shared, slotless sandbox never gets a Git door port, even when it is the
+    only sandbox in its inventory. Nothing is called or written."""
     config,path,args=inventory;edit_env(config,{'GIT_DOOR_PORT':'30825'})
+    monkeypatch.setattr(m.subprocess,'run',lambda *a,**k:pytest.fail('external call before route validation'))
+    before={p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert m.main(args)==2
+    assert 'the shared sandbox gets no Git door port' in capsys.readouterr().err
+    assert {p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}==before
+
+
+def test_a_slot_sandbox_gets_its_git_door_rule_once_and_the_receipt_records_it(inventory,monkeypatch):
+    config,path,args=inventory;make_slot(config,path)
     b=Boundary(config,monkeypatch)
     assert m.main(args)==0
     import yaml
     rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
-    assert rules.count('192.0.2.10:30825')==1
+    assert rules.count('192.0.2.10:31831')==1
     allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
-    assert allowed.count('192.0.2.10:30825')==1 and '192.0.2.10:30823' in allowed
+    assert allowed.count('192.0.2.10:31831')==1 and '192.0.2.10:30823' in allowed
     assert not any(x in ('*','192.0.2.10') or '/' in x for x in allowed)
     receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
-    assert receipt['git_door_rule']=='192.0.2.10:30825'
+    assert receipt['git_door_rule']=='192.0.2.10:31831'
 
 
 @pytest.mark.parametrize('change,message',[
@@ -861,3 +871,190 @@ def test_refuses_when_the_sandbox_has_no_settings_file(inventory,monkeypatch,fau
     assert m.main(args)==2
     assert not b.files
     assert not any(x[0]=='bash' or x[:2]==['sbx','stop'] for x in b.argv())
+
+
+# ---------------------------------------------------------------------------
+# One sandbox per project (17 October 2026): a slot entry, and a list of
+# sandboxes each with its own env file and profile.
+# ---------------------------------------------------------------------------
+
+def make_slot(config, path, slot=1):
+    """Turn the fixture's sandbox into slot `slot`'s own sandbox."""
+    k = slot
+    edit_env(config, {'GIT_DOOR_PORT': str(31830 + k), 'FLEET_MEMORY_SANDBOX_PORT': str(31850 + k),
+                      'FORGE_SANDBOX_SIDECAR_URL': f'http://192.0.2.10:{8925 + 10 * k}',
+                      'FORGE_SANDBOX_RUNNER_URL': f'http://192.0.2.10:{8924 + 10 * k}'})
+    source = Path(config['sandbox']['profile_source'])
+    source.write_text(source.read_text()
+                      .replace('127.0.0.1:8925:8125', f'127.0.0.1:{8925 + 10 * k}:8125')
+                      .replace('127.0.0.1:8924:8124', f'127.0.0.1:{8924 + 10 * k}:8124'))
+    config['sandbox']['slot'] = k
+    path.write_text(json.dumps(config))
+
+
+def test_a_slot_sandbox_names_only_its_own_doors_on_the_gateway(inventory, monkeypatch):
+    config, path, args = inventory
+    make_slot(config, path)
+    b = Boundary(config, monkeypatch)
+    assert m.main(args) == 0
+    allowed = next(x for x in b.argv() if x[:4] == ['sbx', 'policy', 'allow', 'network'])[-1].split(',')
+    assert sorted(x for x in allowed if x.startswith('192.0.2.10')) == sorted(
+        ['192.0.2.10:8900', '192.0.2.10:31851', '192.0.2.10:30823', '192.0.2.10:31831'])
+    assert 'example.test:443' in allowed
+
+
+@pytest.mark.parametrize('change,message', [
+    ({'GIT_DOOR_PORT': None}, 'set GIT_DOOR_PORT=31831'),
+    ({'GIT_DOOR_PORT': '31832'}, 'set GIT_DOOR_PORT=31831'),
+    ({'FLEET_MEMORY_SANDBOX_PORT': '30824'}, 'set FLEET_MEMORY_SANDBOX_PORT=31851'),
+    ({'FORGE_SANDBOX_RUNNER_URL': 'http://192.0.2.10:8924'}, 'publishes FORGE_SANDBOX_RUNNER_URL on port 8934'),
+])
+def test_a_slot_whose_env_file_disagrees_with_its_slot_refuses_before_anything(inventory, monkeypatch, capsys, change, message):
+    config, path, args = inventory
+    make_slot(config, path)
+    edit_env(config, change)
+    b = Boundary(config, monkeypatch)
+    assert m.main(args) == 2
+    assert message in capsys.readouterr().err
+    assert not b.calls and not b.files
+
+
+@pytest.mark.parametrize('rule,words', [
+    ('192.0.2.10:31852', 'not one of its own doors'),
+    ('192.0.2.0/24', 'a wildcard or an address range'),
+    ('0.0.0.0/0', 'a wildcard or an address range'),
+    ('*', 'a wildcard or an address range'),
+])
+def test_the_plan_holds_a_slot_to_its_own_doors_too(inventory, capsys, rule, words):
+    config, path, args = inventory
+    make_slot(config, path)
+    source = Path(config['sandbox']['profile_source'])
+    source.write_text(source.read_text().replace('["example.test:443"]', f'["example.test:443", "{rule}"]'))
+    result = subprocess.run([sys.executable, str(SCRIPT), *args, '--plan'], capture_output=True, text=True,
+                            env={'PATH': '/does-not-exist'})
+    assert result.returncode == 2
+    assert words in result.stderr
+
+
+@pytest.mark.parametrize('slot', [0, 20, 99, '1'])
+def test_slots_run_from_one_to_nineteen(inventory, capsys, slot):
+    config, path, args = inventory
+    make_slot(config, path)
+    config['sandbox']['slot'] = slot
+    path.write_text(json.dumps(config))
+    assert m.main([*args, '--plan']) == 2
+    assert 'from 1 to 19' in capsys.readouterr().err
+
+
+@pytest.mark.parametrize('rule,words', [
+    ('192.0.2.10:4222', "the bus's or the model router's port"),
+    ('198.51.100.9:4000', "the bus's or the model router's port"),
+    ('192.0.2.10:31852', 'not one of its own doors'),
+    ('192.0.2.10:30824', 'not one of its own doors'),
+])
+def test_a_slot_profile_rule_for_another_door_the_bus_or_the_router_refuses(inventory, monkeypatch, capsys, rule, words):
+    config, path, args = inventory
+    make_slot(config, path)
+    source = Path(config['sandbox']['profile_source'])
+    source.write_text(source.read_text().replace('["example.test:443"]', f'["example.test:443", "{rule}"]'))
+    b = Boundary(config, monkeypatch)
+    assert m.main(args) == 2
+    assert words in capsys.readouterr().err
+    assert not b.files
+    assert not any(x[:2] == ['sbx', 'stop'] for x in b.argv())
+
+
+def test_a_slot_may_reach_the_embedder_its_memory_names(inventory, monkeypatch):
+    config, path, args = inventory
+    make_slot(config, path)
+    source = Path(config['sandbox']['profile_source'])
+    source.write_text(source.read_text().replace('["example.test:443"]', '["example.test:443", "192.0.2.10:9000"]'))
+    edit_env(config, {'FLEET_MEMORY_EMBED_URL': 'http://192.0.2.10:9000'})
+    Boundary(config, monkeypatch)
+    assert m.main(args) == 0
+
+
+def list_inventory(tmp_path, config, *, shared_receipts=False, legacy_git_door=False):
+    """A two-sandbox list: the fixture's sandbox (slot 1) and a shared legacy one."""
+    other_env = tmp_path / 'shared.env'
+    values = dict(line.split('=', 1) for line in Path(config['env_file']).read_text().splitlines())
+    values.update({'SANDBOX_NAME': 'shared-sandbox', 'FLEET_MEMORY_SANDBOX_PORT': '30824',
+                   'SANDBOX_BOOTSTRAP': '/shared/clone/deploy/sandbox-runner.sh',
+                   'FORGE_SANDBOX_SIDECAR_URL': 'http://192.0.2.10:8925',
+                   'FORGE_SANDBOX_RUNNER_URL': 'http://192.0.2.10:8924',
+                   'SANDBOX_PROJECT_ENV_FILE': str(tmp_path / 'operational' / 'shared-bootstrap.env')})
+    values['SANDBOX_RECEIPTS_PATH'] = config['sandbox']['receipts_path'] if shared_receipts else '/shared/receipts'
+    values.pop('GIT_DOOR_PORT', None)
+    if legacy_git_door:
+        values['GIT_DOOR_PORT'] = '31830'
+    other_env.write_text(''.join(k + '=' + v + '\n' for k, v in values.items()))
+    other = copy.deepcopy(config)
+    other.pop('slot', None)
+    other['sandbox'].pop('slot', None)
+    other.update({'project': 'shared-project', 'env_file': str(other_env)})
+    other['sandbox'].update({'name': 'shared-sandbox', 'clone_path': '/shared/clone',
+                             'script_path': '/shared/clone/deploy/sandbox-runner.sh',
+                             'profile_path': '/shared/clone/deploy/profile.yaml',
+                             'receipts_path': config['sandbox']['receipts_path'] if shared_receipts else '/shared/receipts',
+                             'evidence_dir': str(tmp_path / 'shared-evidence'),
+                             'bootstrap_env_file': str(tmp_path / 'operational' / 'shared-bootstrap.env')})
+    listed = tmp_path / 'inventory-list.json'
+    listed.write_text(json.dumps({'sandboxes': [other, config]}))
+    return listed
+
+
+def test_a_list_plan_plans_every_sandbox_with_its_own_files(inventory, tmp_path, capsys):
+    config, path, args = inventory
+    make_slot(config, path)
+    listed = list_inventory(tmp_path, config)
+    assert m.main(['--config', str(listed), '--plan']) == 0
+    out = capsys.readouterr().out
+    assert '== shared-sandbox (shared-project,' in out and '== owned-sandbox (owned-project,' in out
+    assert 'Git door 192.0.2.10:31831' in out
+    assert out.count('Plan only') == 2
+
+
+def test_a_list_runs_only_the_sandbox_it_is_told_to(inventory, tmp_path, monkeypatch):
+    config, path, args = inventory
+    make_slot(config, path)
+    listed = list_inventory(tmp_path, config)
+    b = Boundary(config, monkeypatch)
+    assert m.main(['--config', str(listed), '--sandbox', 'owned-sandbox', '--stop-legacy']) == 0
+    assert ['sbx', 'stop', 'owned-sandbox'] in b.argv()
+    assert not any('shared-sandbox' in x for x in b.argv())
+
+
+@pytest.mark.parametrize('argv,words', [
+    (['--stop-legacy'], 'needs --sandbox NAME'),
+    (['--sandbox', 'nobody', '--plan'], 'names no sandbox called nobody'),
+])
+def test_a_list_without_a_clear_choice_refuses(inventory, tmp_path, monkeypatch, capsys, argv, words):
+    config, path, args = inventory
+    make_slot(config, path)
+    listed = list_inventory(tmp_path, config)
+    b = Boundary(config, monkeypatch)
+    assert m.main(['--config', str(listed), *argv]) == 2
+    assert words in capsys.readouterr().err
+    assert not b.calls
+
+
+def test_two_sandboxes_sharing_a_receipts_folder_are_refused(inventory, tmp_path, capsys):
+    config, path, args = inventory
+    make_slot(config, path)
+    listed = list_inventory(tmp_path, config, shared_receipts=True)
+    assert m.main(['--config', str(listed), '--plan']) == 2
+    assert 'share the same receipts folder' in capsys.readouterr().err
+
+
+def test_the_shared_sandbox_in_a_list_gets_no_git_door(inventory, tmp_path, capsys):
+    config, path, args = inventory
+    make_slot(config, path)
+    listed = list_inventory(tmp_path, config, legacy_git_door=True)
+    assert m.main(['--config', str(listed), '--plan']) == 2
+    assert 'the shared sandbox gets no Git door port' in capsys.readouterr().err
+
+
+def test_a_one_sandbox_inventory_still_needs_its_project_and_env_file(inventory, capsys):
+    config, path, args = inventory
+    assert m.main(['--config', str(path), '--plan']) == 2
+    assert 'name the project and env file explicitly' in capsys.readouterr().err

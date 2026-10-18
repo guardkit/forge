@@ -308,3 +308,28 @@ def test_privilege_boundary_does_not_hide_client_endpoint_conflicts(probe, name,
     run, state, _, _ = probe
     assert run().returncode == 0
     assert run(read=True, **{name:value}).returncode == 1
+
+
+def test_item_nine_asks_every_listed_sandbox_and_stays_one_item(probe, tmp_path) -> None:
+    """17 October 2026, one sandbox per project: SANDBOX_NAMES adds sandboxes
+    to item 9, which is still one item in the record."""
+    run, state, env_file, env = probe
+    _executable(Path(env['PATH'].split(':')[0]) / 'sbx', '''#!/bin/sh
+case "$1" in
+  ls) printf 'codex-owned-fake-sandbox\\nslot-one-sandbox\\n' ;;
+  exec) if [ "$2" = slot-one-sandbox ] && [ -n "$SLOT_ONE_DOWN" ]; then echo 000; else echo 200; fi ;;
+  *) exit 1 ;;
+esac
+''')
+    env_file.write_text(env_file.read_text() + 'SANDBOX_NAMES=slot-one-sandbox,codex-owned-fake-sandbox\n')
+    passed = run()
+    assert passed.returncode == 0, passed.stdout + passed.stderr
+    receipt = json.loads((state / 'pre-resume.json').read_text())
+    nine = [x for x in receipt['items'] if x['item'] == '9']
+    assert len(nine) == 1 and nine[0]['verdict'] == 'ok'
+    assert "[codex-owned-fake-sandbox]" in nine[0]['said'] and "[slot-one-sandbox]" in nine[0]['said']
+    assert nine[0]['said'].count('[codex-owned-fake-sandbox]') == 1
+    assert run(read=True).returncode == 0
+    failed = run(SLOT_ONE_DOWN='1')
+    assert failed.returncode == 1
+    assert 'NOT PASSED    9' in failed.stdout and "did NOT answer from inside the sandbox 'slot-one-sandbox'" in failed.stdout

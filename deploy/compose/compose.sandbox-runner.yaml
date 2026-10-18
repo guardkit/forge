@@ -107,6 +107,15 @@ services:
       SANDBOX_STOP_TIMEOUT_SECONDS: ${SANDBOX_STOP_TIMEOUT_SECONDS:-45}
       SANDBOX_STOP_ATTEMPTS: ${SANDBOX_STOP_ATTEMPTS:-3}
       SANDBOX_STOP_RETRY_SECONDS: ${SANDBOX_STOP_RETRY_SECONDS:-5}
+      # BEFORE EACH BOOTSTRAP START (17 October 2026, one sandbox per
+      # project): the receipts folder to mount again when a sandbox restart
+      # has lost it, and the release image that must already be in the
+      # sandbox's own engine. Both are off when the env file leaves them out,
+      # which keeps a supervisor written before them exactly as it was. The
+      # image is never imported here: this service has no network and no
+      # machine engine, and the release hands the image in on the machine.
+      SANDBOX_RECEIPTS_MOUNT: ${SANDBOX_RECEIPTS_MOUNT:-}
+      SANDBOX_RELEASE_IMAGE: ${SANDBOX_RELEASE_IMAGE:-}
       # THE CLIENT'S OWN STATE FOLDER. It must be writable and it must be the
       # folder the socket sits under, at exactly the path below. Put the
       # socket anywhere else and the client decides it is talking to a hosted
