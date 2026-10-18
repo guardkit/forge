@@ -202,17 +202,20 @@ class TestTheReasonIsUnchangedOtherwise:
         self, tmp_path: Path, _fresh_receipts_root: Path
     ) -> None:
         """Codex's R3 case: an old ``stopped_because`` record sits on disk, in
-        the receipts pack an earlier run of this build left and in the kept
-        worktree's own record folder, while this run's export carries none.
-        No file is read for the sentence, so the reason is today's."""
+        the receipts pack an earlier run of this build left AND in the kept
+        worktree's own record folder (so this run's export carries it), while
+        this run's GuardKit printed no line. No file is read for the sentence,
+        so the reason is today's."""
         repo, worktree = _dirs(tmp_path)
         old_pack = _fresh_receipts_root / BUILD_ID / ".guardkit" / "autobuild-private"
         old_pack.mkdir(parents=True)
         old_record = {"status": "failed", "reason": SENTENCE, "stopped_because": SENTENCE}
         (old_pack / "feature_check.json").write_text(json.dumps(old_record))
-        # This run's own record (exported by this run) has no such field.
+        # The kept worktree still holds the earlier run's record, field and
+        # all, so this run's own export carries it too (a resumed build in a
+        # kept worktree). This run's GuardKit printed no line.
         (worktree / ".guardkit" / "autobuild-private" / "feature_check.json").write_text(
-            json.dumps({"status": "failed", "reason": "exit=1, expected=0"})
+            json.dumps(old_record)
         )
         guardkit = _fake_guardkit(tmp_path, ["INFO: failed"], exit_code=2)
 
@@ -221,6 +224,13 @@ class TestTheReasonIsUnchangedOtherwise:
         assert _manifest(tmp_path)["reason"] == "guardkit autobuild exit=2"
         assert result["async_tasks"][FEATURE_ID]["error_message"] == _today(worktree)
         assert SENTENCE not in json.dumps(result["async_tasks"][FEATURE_ID])
+        # The stale record did travel in this run's export: only the reason
+        # ignores it.
+        exported = (
+            _fresh_receipts_root / BUILD_ID / ".guardkit" / "autobuild-private"
+            / "feature_check.json"
+        )
+        assert json.loads(exported.read_text())["stopped_because"] == SENTENCE
 
 
 class TestTheLineReader:
