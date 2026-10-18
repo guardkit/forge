@@ -211,6 +211,13 @@ COORDINATOR_PROJECT_RECEIPTS: str = "/var/lib/forge-project-receipts"
 #: its two addresses are the same for every project in the shared sandbox.
 REFERENCE_PROJECT: str = "guardkit/api_test"
 
+#: The lines of a sandbox of its own's coordinator entry that a later release
+#: added, in the order they are written: the memory grant (18 October 2026,
+#: design section 2.4a) and the sandbox's preview ports (18 October 2026). A
+#: project registered before them is given them by running again, and nothing
+#: else in its entry changes.
+ADDED_LATER_ENTRY_KEYS: tuple[str, ...] = ("preview_ports", "memory_projects")
+
 #: The publisher fetches a project's clone from sbx's git daemon, which serves
 #: anything inside the api_test clone (its base path is the clone's parent
 #: folder) and is published on the factory gateway address at this port:
@@ -534,10 +541,17 @@ def _scalar(value: str) -> str:
 
 
 def _entry_value(value: Any) -> str:
-    """One sandbox entry value as YAML: a scalar, or a flow list of scalars."""
+    """One sandbox entry value as YAML: a scalar, or a flow list of scalars
+    (a whole number, such as a preview port, written as a number)."""
     if isinstance(value, (list, tuple)):
-        return "[" + ", ".join(_scalar(str(item)) for item in value) + "]"
+        return "[" + ", ".join(
+            str(item) if _a_whole_number(item) else _scalar(str(item)) for item in value
+        ) + "]"
     return _scalar(value)
+
+
+def _a_whole_number(value: Any) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
 
 
 def _without_empty_flow(line: str) -> str:
@@ -1269,9 +1283,12 @@ def plan_settings_edit(
     sandboxes = _mapping(planning.get("sandboxes"))
     if entry is not None:
         # Every value is text, except a list of memory names (memory_projects,
-        # design section 2.4a), which stays a list of text.
+        # design section 2.4a), which stays a list of text, and a list of
+        # preview ports (preview_ports, 18 October 2026), a list of numbers.
         entry = {
-            k: [str(item) for item in v] if isinstance(v, (list, tuple)) else str(v)
+            k: [item if _a_whole_number(item) else str(item) for item in v]
+            if isinstance(v, (list, tuple))
+            else str(v)
             for k, v in entry.items()
         }
         wanted_keys = tuple(entry)
@@ -1339,27 +1356,32 @@ def plan_settings_edit(
             changed = True
 
         current_entry = sandboxes.get(key)
-        granted_only = (
-            isinstance(current_entry, dict)
-            and "memory_projects" in entry
-            and "memory_projects" not in current_entry
-            and current_entry == {k: v for k, v in entry.items() if k != "memory_projects"}
+        # Lines a later release added to a sandbox of its own's entry: the
+        # memory grant and (18 October 2026) the sandbox's preview ports.
+        missing = (
+            [k for k in ADDED_LATER_ENTRY_KEYS if k in entry and k not in current_entry]
+            if isinstance(current_entry, dict)
+            else []
         )
+        added_only = bool(missing) and current_entry == {
+            k: v for k, v in entry.items() if k not in missing
+        }
         if current_entry == entry:
             steps.append(Step(which, "unchanged", f"sandboxes has {key} in {entry['name']}"))
-        elif granted_only:
-            # A project given its sandbox before the memory grant existed (18
+        elif added_only:
+            # A project given its sandbox before these lines existed (18
             # October 2026): its entry is as this run would write it, without
-            # the grant, so the grant is added to it and nothing else changes.
-            set_mapping_entry(
-                lines, ("planning", "sandboxes", _scalar(key)), "memory_projects",
-                _entry_value(entry["memory_projects"]),
-            )
+            # them, so they are added to it and nothing else changes.
+            for name in missing:
+                set_mapping_entry(
+                    lines, ("planning", "sandboxes", _scalar(key)), name,
+                    _entry_value(entry[name]),
+                )
+                steps.append(Step(
+                    which, "add",
+                    f"sandboxes {key} {name} {', '.join(str(v) for v in entry[name])}",
+                ))
             expected["planning"]["sandboxes"][key] = dict(entry)
-            steps.append(Step(
-                which, "add",
-                f"sandboxes {key} memory_projects {', '.join(entry['memory_projects'])}",
-            ))
             changed = True
         elif current_entry is not None:
             raise Refused(
@@ -1450,12 +1472,20 @@ def _one_project_per_sandbox(
         # the same machine, so one port is one sandbox's whatever the address
         # is written as (an address written as a ${NAME} has no port to read).
         theirs = {_port_of(current.get(f)) for f in ("sidecar_url", "runner_url", "git_door")} - {None}
+        theirs |= set(_ports_of(current.get("preview_ports")))
         for field_name in ("sidecar_url", "runner_url", "git_door"):
             port = _port_of(entry.get(field_name))
             if port is not None and port in theirs:
                 raise Refused(
                     which,
                     f"port {port} ({field_name}) of {entry['name']} is already the sandbox "
+                    f"{current.get('name')}'s (for {other}); pick a slot no sandbox has",
+                )
+        for port in _ports_of(entry.get("preview_ports")):
+            if port in theirs:
+                raise Refused(
+                    which,
+                    f"port {port} (preview_ports) of {entry['name']} is already the sandbox "
                     f"{current.get('name')}'s (for {other}); pick a slot no sandbox has",
                 )
         if "receipts_root" in entry and current.get("receipts_root") == entry["receipts_root"]:
@@ -1478,6 +1508,13 @@ def _one_project_per_sandbox(
                     f"give {key} a memory name of its own in its .guardkit/config.yaml, "
                     "commit it to the default branch, and register again. Nothing was written",
                 )
+
+
+def _ports_of(value: Any) -> list[int]:
+    """The whole numbers in a ``preview_ports`` list, or none."""
+    if not isinstance(value, (list, tuple)):
+        return []
+    return [int(item) for item in value if _a_whole_number(item) or str(item).isdigit()]
 
 
 def _port_of(address: Any) -> int | None:
@@ -2456,7 +2493,7 @@ class Options:
     sandbox_entry: dict[str, str] | None = None
     #: The coordinator's copy of that entry also names the project's own
     #: receipts folder as the coordinator sees it (design section 2.2a).
-    coordinator_entry: dict[str, str] | None = None
+    coordinator_entry: dict[str, Any] | None = None
     #: The sandbox's machine, when it is not this one (--sandbox-ssh).
     sandbox_ssh: str | None = None
 
@@ -2721,9 +2758,16 @@ def resolve_options(
         slot=ports,
         sandbox_entry=sandbox_entry,
         sandbox_ssh=sandbox_ssh,
+        # The coordinator's copy also names the sandbox's own preview ports
+        # (18 October 2026): its previews listen only there, and its cards'
+        # links name them. The sandbox's own file needs neither line.
         coordinator_entry=(
-            {**sandbox_entry, "receipts_root": str(receipts_root).rstrip("/")}
-            if sandbox_entry is not None
+            {
+                **sandbox_entry,
+                "receipts_root": str(receipts_root).rstrip("/"),
+                "preview_ports": list(ports.previews),
+            }
+            if sandbox_entry is not None and ports is not None
             else None
         ),
         route_keys_dir=estate_values.get(ESTATE_ENV_ROUTE_KEYS_DIR) or None,
