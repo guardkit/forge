@@ -124,6 +124,7 @@ closes COMPLETE before the card is ever offered, is untouched.
 from __future__ import annotations
 
 import asyncio
+import copy
 import json
 import logging
 import os
@@ -1071,6 +1072,268 @@ def close_build_row(
     )
 
 
+#: The ending written down for a press whose result was recorded but whose
+#: exact ending was not (press lease recovery, 18 October 2026). It is the one
+#: case the recovery cannot report word for word, so it says so, plainly, and
+#: changes nothing else: no repair row, nothing sent, nothing deployed.
+RESULT_WORD_ENDING_NOT_RECORDED: str = "merge-ending-not-recorded"
+ENDING_NOT_RECORDED_SENTENCE: str = (
+    "The merge stopped after recording its result, and its exact ending was "
+    "not recorded; check the build before retrying."
+)
+
+_OUTCOME_FIELDS: tuple[str, ...] = (
+    "result",
+    "status",
+    "detail",
+    "merged_sha",
+    "failed_step",
+    "verdict",
+    "checks_passed",
+    "checks_total",
+    "deployed_in",
+    "verify_status",
+    "gate_before_merge",
+    "branch",
+    "sandbox_merge",
+)
+
+
+def stored_outcome(
+    outcome: "MergeDeployOutcome",
+    *,
+    feature_id: str,
+    correlation_id: str,
+    started: datetime,
+    receipts_dir: Path,
+    digest_warning: str | None,
+    join_as: str,
+    reports_before: int,
+) -> dict[str, Any]:
+    """The press's ending as it is written down before it is reported.
+
+    Everything :func:`publish_the_press_report` needs, so the recovery reports
+    exactly what the press would have, and derives nothing. ``reports_before``
+    is how many merge reports the build had when it was written down: the
+    press holds the record's lease from then until its report, so one more
+    than that means this ending was reported.
+    """
+    return {
+        "outcome": {name: getattr(outcome, name) for name in _OUTCOME_FIELDS},
+        "feature_id": feature_id,
+        "correlation_id": correlation_id,
+        "started_at": started.isoformat(),
+        "receipts_dir": str(receipts_dir),
+        "digest_warning": digest_warning,
+        "join_as": join_as,
+        "reports_before": int(reports_before),
+    }
+
+
+def outcome_from_stored(said: dict[str, Any]) -> "MergeDeployOutcome":
+    """The ending :func:`stored_outcome` wrote down, exactly as it was."""
+    fields = dict(said.get("outcome") or {})
+    return MergeDeployOutcome(**{name: fields.get(name) for name in _OUTCOME_FIELDS})
+
+
+def merge_reports_on(pool: Any, build_id: str) -> int:
+    """How many merge reports are on this build's record."""
+    return sum(
+        1
+        for stage in pool.read_stages(build_id)
+        if stage.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
+    )
+
+
+def _record_the_report(
+    deps: Any, build_id: str, payload: StageCompletePayload, completed: datetime
+) -> None:
+    """Put the merge report on the build's own record, not only on the bus.
+
+    The published report is a message and the receipt is a file, and
+    neither can be read back by a query. So the same report is also
+    appended to ``stage_log``, with its outcome word at the top level of
+    the details as ``result`` — that is what the self-closed defect rate
+    reads to tell a repair that merged, deployed and stayed green from
+    one that stopped at a red step (``lifecycle/metrics.py``).
+
+    A dry run never gets here: it leaves no durable rows on purpose.
+    Never raises — the bus report and the receipt on disk are the record,
+    and a row that cannot be written must not cost them.
+    """
+    try:
+        deps.pool.record_stage(
+            StageLogEntry(
+                build_id=build_id,
+                stage_label=MERGE_REPORT_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+                status=payload.status,
+                gate_mode=None,
+                started_at=completed,
+                completed_at=completed,
+                duration_secs=float(payload.duration_secs or 0.0),
+                details=payload.model_dump(mode="json"),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 — a row never costs a report
+        logger.error(
+            "merge-executor: could not record the merge report for %s "
+            "(%s: %s) — the published report and the receipt stand",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def _write_the_receipt(
+    receipts_dir: Path, build_id: str, name: str, data: dict[str, Any]
+) -> None:
+    try:
+        receipts_dir.mkdir(parents=True, exist_ok=True)
+        (receipts_dir / name).write_text(
+            json.dumps(data, indent=2, sort_keys=True, default=str),
+            encoding="utf-8",
+        )
+    except OSError as exc:
+        logger.error(
+            "merge-executor: could not write receipt %s for %s (%s)",
+            name,
+            build_id,
+            exc,
+        )
+
+
+async def publish_the_press_report(
+    deps: Any,
+    *,
+    build_id: str,
+    feature_id: str,
+    correlation_id: str,
+    outcome: "MergeDeployOutcome",
+    started: datetime,
+    receipts_dir: Path,
+    dry_run: bool,
+    merge_execution_attempt_id: str | None,
+    digest_warning: str | None,
+    mint_repair: bool = True,
+) -> "MergeDeployOutcome":
+    """Report a press's ending: the one path the press and its recovery share.
+
+    The bus message, the receipt, the report row on the build's record, the
+    build row's ending and, for a red ending, the repair row — in that order,
+    each from ``outcome`` exactly as given. Nothing here talks to the remote.
+    ``mint_repair`` is False only for the recovery's own ending-not-recorded
+    case, which is not a finding about the code.
+    """
+    completed = deps.clock()
+    payload = StageCompletePayload(
+        feature_id=feature_id,
+        build_id=build_id,
+        stage_label=MERGE_REPORT_STAGE_LABEL,
+        target_kind="local_tool",
+        target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+        status=outcome.status,
+        gate_mode=None,
+        coach_score=None,
+        duration_secs=max(0.0, (completed - started).total_seconds()),
+        completed_at=completed.isoformat(),
+        correlation_id=correlation_id,
+        # Additive fields — StageCompletePayload is extra="allow".
+        result=outcome.result,
+        merged_sha=outcome.merged_sha,
+        failed_step=outcome.failed_step,
+        verdict=outcome.verdict,
+        checks_passed=outcome.checks_passed,
+        checks_total=outcome.checks_total,
+        verify_status=outcome.verify_status,
+        detail=outcome.detail,
+        digest_conformance_warning=digest_warning,
+        dry_run=dry_run,
+        # Additive (Part M, rule 55): the branch this press merged, or
+        # would have — truthful for a repair, the feature's own otherwise.
+        branch=outcome.branch,
+        # A consumer-approved press carries the exact durable decision
+        # attempt.  Direct CLI presses deliberately carry no such block,
+        # so their later report cannot settle queued approval work merely
+        # because it shares the build id and happened later.
+        **(
+            {
+                MERGE_DECISION_DETAILS_KEY: {
+                    MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                        MERGE_EXECUTION_ATTEMPT_VERSION
+                    ),
+                    MERGE_EXECUTION_ATTEMPT_ID_KEY: merge_execution_attempt_id,
+                }
+            }
+            if merge_execution_attempt_id is not None
+            else {}
+        ),
+        # Additive, and only when there is something to say: a deploy that
+        # ran nowhere special sends no field at all, so every payload that
+        # was written before Docker Sandboxes existed is unchanged.
+        **({"deployed_in": outcome.deployed_in} if outcome.deployed_in else {}),
+        # Additive (protect-main, rule 40): what the sandbox check found
+        # before the merge, once the check began.
+        **(
+            {"gate_before_merge": outcome.gate_before_merge}
+            if outcome.gate_before_merge is not None
+            else {}
+        ),
+        # Additive (sandbox first, rule 79): where this merge landed and
+        # the exact command that brings it to the operator's checkout —
+        # only for a repository that has a sandbox, so every other
+        # report is byte for byte what it was.
+        **(
+            {"sandbox_merge": outcome.sandbox_merge}
+            if outcome.sandbox_merge
+            else {}
+        ),
+    )
+    if dry_run:
+        logger.info(
+            "merge-executor: dry run — outcome kept to receipts only, "
+            "no stage-complete published for %s",
+            build_id,
+        )
+        _write_the_receipt(
+            receipts_dir, build_id, "merge_deploy_report.json", payload.model_dump(mode="json")
+        )
+        return outcome
+    try:
+        await deps.pipeline_publisher.publish_stage_complete(payload)
+    except Exception as exc:  # noqa: BLE001 — the report is derived truth
+        logger.error(
+            "merge-executor: outcome publish failed for %s (%s) — the "
+            "receipts on disk remain the record",
+            build_id,
+            exc,
+        )
+    _write_the_receipt(
+        receipts_dir, build_id, "merge_deploy_report.json", payload.model_dump(mode="json")
+    )
+    _record_the_report(deps, build_id, payload, completed)
+    # THE BUILD'S ENDING, written by the only thing that knows it. After
+    # the report, so a row that cannot be written can never cost the
+    # report; before the repair row, because the journey ends before its
+    # follow-on begins. A dry run never reaches here — it leaves no
+    # durable rows on purpose — and a row something else already closed
+    # is left exactly as it is.
+    close_build_row(deps.pool, build_id, outcome)
+    # A PRESS THAT FOUND THE CODE WRONG BECOMES A REPAIR JOB (conductor
+    # rewire rule 1). The three red endings are the ones where the merge
+    # itself landed and what came after it went red — the live checks,
+    # the deploy, or the revert — and, since protect-main, the branch
+    # that failed its sandbox check before the merge. A refused merge is
+    # not one of them: nothing changed, so there is nothing to repair.
+    # The dry run is not one either: it changed nothing on purpose.
+    if mint_repair and (
+        outcome.result in RED_MERGE_ENDINGS or outcome.result == "candidate-refused"
+    ):
+        _mint_repair_row(deps.pool, build_id, outcome, feature_id=feature_id)
+    return outcome
+
+
 def git_venue(git: Any, repo_root: Path | str) -> str:
     """Where this press's git happened, as a phrase a sentence can carry.
 
@@ -1815,19 +2078,7 @@ async def execute_merge_deploy(
     _launch_settings_memo: list[tuple[str, ...]] = []
 
     def _write_receipt(name: str, data: dict[str, Any]) -> None:
-        try:
-            receipts_dir.mkdir(parents=True, exist_ok=True)
-            (receipts_dir / name).write_text(
-                json.dumps(data, indent=2, sort_keys=True, default=str),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            logger.error(
-                "merge-executor: could not write receipt %s for %s (%s)",
-                name,
-                build_id,
-                exc,
-            )
+        _write_the_receipt(receipts_dir, build_id, name, data)
 
     def _has_step(target_identifier: str) -> bool:
         """Is this step on the build's record as claimed or done?
@@ -1880,44 +2131,6 @@ async def execute_merge_deploy(
             {"merge_step": {"released": True, "reason": reason}},
         )
 
-    def _record_report(payload: StageCompletePayload, completed: datetime) -> None:
-        """Put the merge report on the build's own record, not only on the bus.
-
-        The published report is a message and the receipt is a file, and
-        neither can be read back by a query. So the same report is also
-        appended to ``stage_log``, with its outcome word at the top level of
-        the details as ``result`` — that is what the self-closed defect rate
-        reads to tell a repair that merged, deployed and stayed green from
-        one that stopped at a red step (``lifecycle/metrics.py``).
-
-        A dry run never gets here: it leaves no durable rows on purpose.
-        Never raises — the bus report and the receipt on disk are the record,
-        and a row that cannot be written must not cost them.
-        """
-        try:
-            deps.pool.record_stage(
-                StageLogEntry(
-                    build_id=build_id,
-                    stage_label=MERGE_REPORT_STAGE_LABEL,
-                    target_kind="local_tool",
-                    target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
-                    status=payload.status,
-                    gate_mode=None,
-                    started_at=completed,
-                    completed_at=completed,
-                    duration_secs=float(payload.duration_secs or 0.0),
-                    details=payload.model_dump(mode="json"),
-                )
-            )
-        except Exception as exc:  # noqa: BLE001 — a row never costs a report
-            logger.error(
-                "merge-executor: could not record the merge report for %s "
-                "(%s: %s) — the published report and the receipt stand",
-                build_id,
-                type(exc).__name__,
-                exc,
-            )
-
     def _gate_for_report() -> dict[str, Any]:
         """The ``gate_before_merge`` block: the spec's six fields plus the
         failing check names and whether the trees matched.
@@ -1948,8 +2161,13 @@ async def execute_merge_deploy(
                 block[key] = gate[key]
         return block
 
-    async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
-        completed = deps.clock()
+    def _the_reports_words(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
+        """The words this press adds to its ending before it is reported.
+
+        Applied ONCE to the ending that is reported (the last guard escapes,
+        so it is not applied twice), and to a copy for the ending written
+        down before the clean-up.
+        """
         conformance_warning = digest_conformance.get("warning")
         if conformance_warning:
             outcome.detail = f"{outcome.detail}\nWARNING: {conformance_warning}"
@@ -1968,109 +2186,75 @@ async def execute_merge_deploy(
         from forge.pipeline.merge_check_reading import card_body
 
         outcome.detail = card_body(outcome.detail)
-        payload = StageCompletePayload(
-            feature_id=feature_id,
-            build_id=build_id,
-            stage_label=MERGE_REPORT_STAGE_LABEL,
-            target_kind="local_tool",
-            target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
-            status=outcome.status,
-            gate_mode=None,
-            coach_score=None,
-            duration_secs=max(0.0, (completed - started).total_seconds()),
-            completed_at=completed.isoformat(),
-            correlation_id=correlation_id,
-            # Additive fields — StageCompletePayload is extra="allow".
-            result=outcome.result,
-            merged_sha=outcome.merged_sha,
-            failed_step=outcome.failed_step,
-            verdict=outcome.verdict,
-            checks_passed=outcome.checks_passed,
-            checks_total=outcome.checks_total,
-            verify_status=outcome.verify_status,
-            detail=outcome.detail,
-            digest_conformance_warning=conformance_warning,
-            dry_run=dry_run,
-            # Additive (Part M, rule 55): the branch this press merged, or
-            # would have — truthful for a repair, the feature's own otherwise.
-            branch=branch,
-            # A consumer-approved press carries the exact durable decision
-            # attempt.  Direct CLI presses deliberately carry no such block,
-            # so their later report cannot settle queued approval work merely
-            # because it shares the build id and happened later.
-            **(
-                {
-                    MERGE_DECISION_DETAILS_KEY: {
-                        MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
-                            MERGE_EXECUTION_ATTEMPT_VERSION
-                        ),
-                        MERGE_EXECUTION_ATTEMPT_ID_KEY: (
-                            merge_execution_attempt_id
-                        ),
-                    }
-                }
-                if merge_execution_attempt_id is not None
-                else {}
-            ),
-            # Additive, and only when there is something to say: a deploy that
-            # ran nowhere special sends no field at all, so every payload that
-            # was written before Docker Sandboxes existed is unchanged.
-            **({"deployed_in": outcome.deployed_in} if outcome.deployed_in else {}),
-            # Additive (protect-main, rule 40): what the sandbox check found
-            # before the merge, once the check began.
-            **(
-                {"gate_before_merge": outcome.gate_before_merge}
-                if outcome.gate_before_merge is not None
-                else {}
-            ),
-            # Additive (sandbox first, rule 79): where this merge landed and
-            # the exact command that brings it to the operator's checkout —
-            # only for a repository that has a sandbox, so every other
-            # report is byte for byte what it was.
-            **(
-                {"sandbox_merge": outcome.sandbox_merge}
-                if outcome.sandbox_merge
-                else {}
-            ),
-        )
-        if dry_run:
-            logger.info(
-                "merge-executor: dry run — outcome kept to receipts only, "
-                "no stage-complete published for %s",
-                build_id,
-            )
-            _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
-            return outcome
+        return outcome
+
+    #: How many merge reports the build had before this press's ending was
+    #: first written down (a list of one, filled once).
+    reports_before: list[int] = []
+
+    def _write_the_ending_down(outcome: MergeDeployOutcome) -> None:
+        """Keep this press's ending on its record's own turn (press lease
+        recovery, 18 October 2026), so a coordinator that stops before the
+        report can be reported for, word for word, through the same path."""
+        if dry_run or not held_turn:
+            return
         try:
-            await deps.pipeline_publisher.publish_stage_complete(payload)
-        except Exception as exc:  # noqa: BLE001 — the report is derived truth
-            logger.error(
-                "merge-executor: outcome publish failed for %s (%s) — the "
-                "receipts on disk remain the record",
+            if not reports_before:
+                reports_before.append(merge_reports_on(deps.pool, build_id))
+            store_here = _publication_store()
+            if store_here is not None:
+                store_here.record_outcome(
+                    build_id=build_id,
+                    turn=held_turn,
+                    holder=worker_name,
+                    now=deps.clock(),
+                    outcome=stored_outcome(
+                        outcome,
+                        feature_id=feature_id,
+                        correlation_id=correlation_id,
+                        started=started,
+                        receipts_dir=receipts_dir,
+                        digest_warning=digest_conformance.get("warning"),
+                        join_as=join_as,
+                        reports_before=reports_before[0],
+                    ),
+                    attempt_id=merge_execution_attempt_id,
+                )
+        except Exception as exc:  # noqa: BLE001 — never costs a result
+            logger.warning(
+                "merge-executor: %s's ending could not be written down (%s: %s)",
                 build_id,
+                type(exc).__name__,
                 exc,
             )
-        _write_receipt("merge_deploy_report.json", payload.model_dump(mode="json"))
-        _record_report(payload, completed)
-        # THE BUILD'S ENDING, written by the only thing that knows it. After
-        # the report, so a row that cannot be written can never cost the
-        # report; before the repair row, because the journey ends before its
-        # follow-on begins. A dry run never reaches here — it leaves no
-        # durable rows on purpose — and a row something else already closed
-        # is left exactly as it is.
-        close_build_row(deps.pool, build_id, outcome)
-        # A PRESS THAT FOUND THE CODE WRONG BECOMES A REPAIR JOB (conductor
-        # rewire rule 1). The three red endings are the ones where the merge
-        # itself landed and what came after it went red — the live checks,
-        # the deploy, or the revert — and, since protect-main, the branch
-        # that failed its sandbox check before the merge. A refused merge is
-        # not one of them: nothing changed, so there is nothing to repair.
-        # The dry run is not one either: it changed nothing on purpose.
-        if not dry_run and (
-            outcome.result in RED_MERGE_ENDINGS or outcome.result == "candidate-refused"
-        ):
-            _mint_repair_row(deps.pool, build_id, outcome, feature_id=feature_id)
-        return outcome
+
+    def _replaced_after_the_result() -> bool:
+        """Has another worker taken this press's record over (a new turn)?"""
+        if dry_run or not held_turn:
+            return False
+        try:
+            store_here = _publication_store()
+            if store_here is None:
+                return False
+            now_record = store_here.read(build_id)
+        except Exception:  # noqa: BLE001 — unknown is not replaced
+            return False
+        return bool(now_record.recorded and now_record.turn != held_turn)
+
+    async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
+        """The ending, already in its report's words, through the shared path."""
+        return await publish_the_press_report(
+            deps,
+            build_id=build_id,
+            feature_id=feature_id,
+            correlation_id=correlation_id,
+            outcome=outcome,
+            started=started,
+            receipts_dir=receipts_dir,
+            dry_run=dry_run,
+            merge_execution_attempt_id=merge_execution_attempt_id,
+            digest_warning=digest_conformance.get("warning"),
+        )
 
     async def _dispatch(leg: str, **extra: Any) -> Any:
         nonlocal a_leg_did_not_complete, something_is_left_standing
@@ -5821,6 +6005,23 @@ async def execute_merge_deploy(
 
     try:
         outcome = await _press()
+        # THE ENDING IS WRITTEN DOWN FIRST (press lease recovery, 18 October
+        # 2026), before the clean-up, in its report's words, on this press's
+        # own turn: a coordinator that stops from here on is reported for
+        # from it, word for word (:meth:`MergeApprovalConsumer.finish_a_settled_press`).
+        # A copy, so the ending itself is put into words exactly once.
+        try:
+            _write_the_ending_down(
+                _the_reports_words(_with_main_copies_said(copy.copy(outcome)))
+            )
+        except Exception as exc:  # noqa: BLE001 — never costs a result
+            logger.warning(
+                "merge-executor: %s's ending could not be put into words "
+                "before the clean-up (%s: %s)",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
     finally:
         # Every ending, the normal ones and a crash alike: the candidate down
         # if it is still standing, and its laid-out tree removed — BEFORE the
@@ -5911,12 +6112,28 @@ async def execute_merge_deploy(
                 build_id,
                 retired.get("detail"),
             )
-    # THE HOLD IS PUT DOWN, now that the clean-up has run, only when the press
+    outcome = _the_reports_words(_with_main_copies_said(outcome))
+    # Written down again now its words are final (what the clean-up left
+    # standing is known), then reported, and only then is the hold put down:
+    # every stop from here on is finished by the recovery from this ending.
+    _write_the_ending_down(outcome)
+    if _replaced_after_the_result():
+        # The hold ran out and the recovery took the record over: it reports
+        # this ending (or will), so this press does not report it twice.
+        logger.warning(
+            "merge-executor: %s's press was taken over after its result; the "
+            "recovery reports its ending",
+            build_id,
+        )
+        return outcome
+    outcome = await _publish_report(outcome)
+    # THE HOLD IS PUT DOWN LAST, after the report (press lease recovery, 18
+    # October 2026: a hold put down before the report left a result nobody
+    # could report), and only when the press
     # ended cleanly and every deploy-stage leg it sent reported complete.
     # Never on a cancellation or a crash (those do not reach here), never by a
     # replaced worker; a release that cannot be written is logged and lapses
     # on its own, like the deployment lock's.
-    outcome = _with_main_copies_said(outcome)
     if (
         held_turn
         and not a_leg_did_not_complete
@@ -5954,7 +6171,7 @@ async def execute_merge_deploy(
             build_id,
             outcome.result,
         )
-    return await _publish_report(outcome)
+    return outcome
 
 
 # ---------------------------------------------------------------------------
@@ -7462,6 +7679,176 @@ class MergeApprovalConsumer:
         )
         self._landing_failed(
             row, f"{row.feature_id} did not land: {reason}", attempt_id=attempt_id
+        )
+
+    async def finish_a_settled_press(self, build_id: str) -> str:
+        """Finish an ordinary build's press that stopped after its result.
+
+        Press lease recovery (18 October 2026). The press writes its result,
+        writes its ending down (:func:`stored_outcome`), cleans up, reports
+        and only then puts its hold down; a coordinator that stops anywhere
+        after the result leaves a held record whose report may be missing,
+        and the router and the rollout idle check wait on it for ever. This
+        finishes it, under the repository's lock and the record's lease rules,
+        once the hold's lease has run out:
+
+        1. The hold is taken over on a new turn, so no second recovery acts.
+        2. **The report**, unless this ending was already reported: from the
+           ending the press wrote down on that same turn, through the press's
+           own report path (:func:`publish_the_press_report`) — the bus
+           message, the receipt, the report row, the build row's ending and,
+           for a red ending, the repair row. Nothing is sent to the remote and
+           nothing is re-derived. With no ending written down (the press
+           stopped between its result and writing it down) the report is the
+           plain FAILED ending :data:`ENDING_NOT_RECORDED_SENTENCE`, with no
+           repair row.
+        3. **The clean-up after the result**, as the press does it: the
+           join's working folders, only once the record has reached its end.
+           A removal whose answer was lost keeps the new hold, which lapses
+           and is tried again.
+        4. The hold is put down.
+
+        A live lease is never touched. Mission builds are not this path's:
+        their landings and merges have their own (``finish_a_settled_landing``,
+        ``resume_mission_merge``). Answers "finished", "held", "kept" or
+        "nothing to do".
+        """
+        from forge.lifecycle.mission_builds import mission_of_build
+
+        if build_id in self._pressing_now:
+            return "held"
+        if mission_of_build(self._deps.pool, build_id) is not None:
+            return "nothing to do"
+        row = self._deps.pool.get_build_row(build_id)
+        if row is None:
+            return "nothing to do"
+        store = PublicationRecordStore(self._deps.pool.connection)
+        record = store.read(build_id)
+        repo = str(record.repo or row.repo or "")
+        async with self._lock_for(repo):
+            record = store.read(build_id)
+            if not record.recorded or not record.result or not record.lease_holder:
+                return "nothing to do"
+            if record.lease_is_live(self._deps.clock()):
+                return "held"
+            # 1. THE HOLD, taken over, so this is the only worker finishing it.
+            holder = f"settled-press:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+            grant = store.take_lease(build_id=build_id, holder=holder, now=self._deps.clock())
+            if grant is None:
+                return "held"
+            written = store.read_outcome(build_id)
+            if written is not None and written.turn != record.turn:
+                written = None  # an earlier press's ending, not this one's
+            join_as = str(
+                ((written.outcome if written else {}) or {}).get("join_as")
+                or row.feature_id
+            )
+            # 2. THE REPORT, once.
+            if not self._the_press_has_reported(build_id, written):
+                await self._report_the_settled_press(row, record, written)
+            # 3. THE CLEAN-UP AFTER THE RESULT, only at the record's end.
+            repo_root_raw = self._deps.config.planning.target_repo_paths.get(repo)
+            if record.result == RESULT_MERGED_AND_RUNNING and repo_root_raw:
+                git = git_surface_for(self._deps, repo, Path(repo_root_raw))
+                retired, lost = await retire_join_working_folders(
+                    git, store.read(build_id), Path(repo_root_raw), join_as
+                )
+                logger.info(
+                    "merge-executor: %s's press stopped after its result; the "
+                    "join folders were looked at again (%s)",
+                    build_id,
+                    retired,
+                )
+                if lost:
+                    return "kept"
+            # 4. THE HOLD, put down.
+            if not store.release_lease(
+                build_id=build_id, turn=grant.turn, holder=holder, now=self._deps.clock()
+            ):
+                return "held"
+            return "finished"
+
+    def _the_press_has_reported(self, build_id: str, written: Any) -> bool:
+        """Was the stopped press's ending already reported?
+
+        With its ending written down: a merge report more than it had then
+        (the press held the record from writing it down to its report, so
+        nothing else reported in between). Without: a report after the
+        build's latest merge decision carrying that decision's attempt, or
+        after it at all when the decision carries none.
+        """
+        stages = self._deps.pool.read_stages(build_id)
+        reports = [s for s in stages if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER]
+        if written is not None:
+            return len(reports) > int((written.outcome or {}).get("reports_before") or 0)
+        attempt_id, after = self._latest_decision(stages)
+        later = [s for s in stages[after + 1 :] if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER]
+        if attempt_id is None:
+            return bool(later)
+        return any(
+            ((s.details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}).get(
+                MERGE_EXECUTION_ATTEMPT_ID_KEY
+            )
+            == attempt_id
+            for s in later
+        )
+
+    @staticmethod
+    def _latest_decision(stages: list[Any]) -> tuple[str | None, int]:
+        """The latest approved merge decision's attempt id, and where it is (-1: none)."""
+        for index in range(len(stages) - 1, -1, -1):
+            stage = stages[index]
+            if (
+                stage.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
+                and stage.status == "PASSED"
+            ):
+                said = (stage.details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}
+                attempt = said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY)
+                return (str(attempt) if attempt else None), index
+        return None, -1
+
+    async def _report_the_settled_press(self, row: Any, record: Any, written: Any) -> None:
+        """The report the stopped press did not get to write, through its own path."""
+        if written is not None:
+            said = written.outcome or {}
+            started = datetime.fromisoformat(str(said.get("started_at")))
+            await publish_the_press_report(
+                self._deps,
+                build_id=row.build_id,
+                feature_id=str(said.get("feature_id") or row.feature_id),
+                correlation_id=str(said.get("correlation_id") or row.correlation_id),
+                outcome=outcome_from_stored(said),
+                started=started,
+                receipts_dir=Path(str(said.get("receipts_dir"))),
+                dry_run=False,
+                merge_execution_attempt_id=written.attempt_id,
+                digest_warning=said.get("digest_warning"),
+            )
+            return
+        # THE ONE CASE THAT CANNOT BE REPORTED WORD FOR WORD: the press stopped
+        # between recording its result and writing its ending down. One record
+        # result covers several endings, so none is guessed: a plain FAILED
+        # ending that says so, and no repair row (it is not a finding about the
+        # code). Nothing is sent and nothing is deployed.
+        attempt_id, _ = self._latest_decision(self._deps.pool.read_stages(row.build_id))
+        now = self._deps.clock()
+        await publish_the_press_report(
+            self._deps,
+            build_id=row.build_id,
+            feature_id=row.feature_id,
+            correlation_id=row.correlation_id,
+            outcome=MergeDeployOutcome(
+                result=RESULT_WORD_ENDING_NOT_RECORDED,
+                status="FAILED",
+                detail=ENDING_NOT_RECORDED_SENTENCE,
+                branch=record.target_branch,
+            ),
+            started=now,
+            receipts_dir=_receipts_root_of(self._deps, row.repo) / f"merge-{row.build_id}",
+            dry_run=False,
+            merge_execution_attempt_id=attempt_id,
+            digest_warning=None,
+            mint_repair=False,
         )
 
     async def _settle_by_looking(self, row: Any, mission: Any, repo_root: Path) -> str:

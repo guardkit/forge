@@ -1221,6 +1221,9 @@ def bind_production_dispatch_chain(
                             resume_merge=_merge_consumer.resume_mission_merge,
                             reconcile=_merge_consumer.reconcile_mission_landing,
                             finish_settled=_merge_consumer.finish_a_settled_landing,
+                            # An ordinary build's press that stopped after
+                            # its result (press lease recovery, 18 October).
+                            finish_settled_press=_merge_consumer.finish_a_settled_press,
                             git_surface=compose_merge_git_surface(forge_config),
                             tree_reader_for=compose_merge_check_reader(forge_config),
                             feature_routing_gate=feature_routing_gate,

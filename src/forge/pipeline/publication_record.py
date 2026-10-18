@@ -69,6 +69,8 @@ __all__ = [
     "PublicationLine",
     "PublicationRecord",
     "PublicationRecordStore",
+    "StoredOutcome",
+    "ensure_outcome_table",
     "Replaced",
     "default_lease_seconds",
 ]
@@ -153,6 +155,33 @@ def default_lease_seconds() -> int:
     once it has answered. Nothing else renews it.
     """
     return 1800
+
+
+#: The press's own record of how it ended (18 October 2026), one row per
+#: build, outside the migration ladder: made where it is needed and at the
+#: coordinator's boot, so the schema version stays as it is.
+_OUTCOME_TABLE_SQL = (
+    "CREATE TABLE IF NOT EXISTS publication_outcomes ("
+    "build_id TEXT PRIMARY KEY, "
+    "turn INTEGER NOT NULL, "
+    "attempt_id TEXT, "
+    "outcome_json TEXT NOT NULL, "
+    "recorded_at TEXT NOT NULL)"
+)
+
+
+def ensure_outcome_table(cx: sqlite3.Connection) -> None:
+    """Create ``publication_outcomes`` if it is missing. Idempotent."""
+    cx.execute(_OUTCOME_TABLE_SQL)
+
+
+@dataclass(frozen=True)
+class StoredOutcome:
+    """A press's written-down ending: the turn it held, its attempt, the outcome."""
+
+    turn: int
+    attempt_id: str | None
+    outcome: dict[str, Any]
 
 
 class Replaced(RuntimeError):
@@ -618,6 +647,79 @@ class PublicationRecordStore:
             assignments={"lease_holder": None, "lease_expires_at": None},
             holder=holder,
         )
+
+    def record_outcome(
+        self,
+        *,
+        build_id: str,
+        turn: int,
+        holder: str,
+        now: datetime,
+        outcome: dict[str, Any],
+        attempt_id: str | None,
+    ) -> bool:
+        """Write down the press's final outcome, before its clean-up and report.
+
+        Press lease recovery (18 October 2026): the press settles its result,
+        cleans up, reports and puts its lease down, and a coordinator that
+        stops between those steps used to leave a result nobody could report
+        — one record result covers several different reports. So the ending
+        itself is kept, for this worker's turn, and a recovery reports from it
+        through the press's own report path. Only on the record's current turn
+        and holder, in one transaction; ``False`` when this worker has been
+        replaced and nothing was written. The table is outside the migration
+        ladder (no schema version bump), made where it is needed.
+        """
+        try:
+            with self._transaction():
+                ensure_outcome_table(self._cx)
+                held = self._cx.execute(
+                    "SELECT 1 FROM publication_records WHERE build_id = ? AND turn = ? "
+                    "AND lease_holder = ?",
+                    (str(build_id), int(turn), str(holder)),
+                ).fetchone()
+                if held is None:
+                    return False
+                self._cx.execute(
+                    "INSERT OR REPLACE INTO publication_outcomes "
+                    "(build_id, turn, attempt_id, outcome_json, recorded_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (
+                        str(build_id),
+                        int(turn),
+                        attempt_id,
+                        json.dumps(outcome, sort_keys=True, default=str),
+                        now.isoformat(),
+                    ),
+                )
+        except sqlite3.Error as exc:
+            logger.warning(
+                "publication record: %s's outcome could not be written (%s)", build_id, exc
+            )
+            return False
+        return True
+
+    def read_outcome(self, build_id: str) -> "StoredOutcome | None":
+        """The outcome a press wrote down for this build, or ``None``."""
+        try:
+            row = self._cx.execute(
+                "SELECT turn, attempt_id, outcome_json FROM publication_outcomes "
+                "WHERE build_id = ?",
+                (str(build_id),),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such table" in str(exc).lower():
+                return None
+            raise
+        if row is None:
+            return None
+        try:
+            decoded = json.loads(row[2])
+        except (TypeError, ValueError):
+            return None
+        if not isinstance(decoded, dict):
+            return None
+        return StoredOutcome(turn=int(row[0]), attempt_id=row[1], outcome=decoded)
 
     def settle(
         self, *, build_id: str, turn: int, holder: str, now: datetime, result: str

@@ -256,6 +256,11 @@ class MissionFinishDeps:
     #: press stopped after its result) is finished from the record (R2).
     #: ``None`` finishes nothing.
     finish_settled: Callable[[str], Awaitable[Any]] | None = None
+    #: ``MergeApprovalConsumer.finish_a_settled_press``: an ORDINARY build's
+    #: press (not a mission's) that stopped after its result, with its hold's
+    #: lease run out, is reported for and its hold put down (press lease
+    #: recovery, 18 October 2026). ``None`` finishes nothing.
+    finish_settled_press: Callable[[str], Awaitable[Any]] | None = None
     feature_routing_gate: Any | None = None
     feature_routing_required: bool = False
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
@@ -313,12 +318,26 @@ async def finish_ready_missions(
     cx = getattr(deps.pool, "connection", None)
     if cx is None:
         return []
+    started: list[str] = []
+    # Ordinary builds first, and whatever the missions tables say: a press
+    # that stopped after its result blocks the router and the rollout's idle
+    # check, mission or no mission.
+    for build_id in _settled_presses_to_finish(deps, cx):
+        _resuming.add(build_id)
+        started.append(build_id)
+        task = asyncio.create_task(_finish_settled_press_guarded(deps, build_id))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
     try:
         missions = MissionStore(cx, clock=deps.clock).list_by_status(_FINISHING_STATES)
     except Exception as exc:  # noqa: BLE001 — a read never stops the queue
         logger.warning("missions: could not list missions to finish (%s)", exc)
-        return []
-    started: list[str] = []
+        missions = None
+    if missions is None:
+        if wait:
+            while _tasks:
+                await asyncio.gather(*list(_tasks), return_exceptions=True)
+        return started
     for build_id, decided in _landings_to_resume(deps, cx):
         _resuming.add(build_id)
         started.append(build_id)
@@ -510,6 +529,62 @@ def _settled_landings_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
         if str(build_id) not in _resuming
         and not settled_records.read(str(build_id)).lease_is_live(now)
     ]
+
+
+def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
+    """Ordinary builds whose press stopped after its result, hold run out.
+
+    Press lease recovery (18 October 2026). The press writes its result,
+    writes its ending down, reports, and puts its hold down LAST, so a
+    coordinator that stopped anywhere after the result leaves a record with a
+    result and a holder. Only builds outside a mission (a mission's landings
+    and merge have their own recovery), and never while the lease is live.
+    """
+    if deps.finish_settled_press is None:
+        return []
+    from forge.lifecycle.missions import builds_record_missions
+    from forge.pipeline.publication_record import PublicationRecordStore
+
+    try:
+        # A ledger from before missions has no mission column: every build
+        # on it is an ordinary one.
+        outside_a_mission = (
+            "b.mission_id IS NULL AND " if builds_record_missions(cx) else ""
+        )
+        rows = cx.execute(
+            "SELECT p.build_id FROM publication_records AS p "
+            "JOIN builds AS b ON b.build_id = p.build_id "
+            f"WHERE {outside_a_mission}"
+            "p.result IS NOT NULL "
+            "AND p.lease_holder IS NOT NULL AND trim(p.lease_holder) <> '' "
+            "ORDER BY b.queued_at ASC"
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — a read never stops the queue
+        logger.warning("merge: could not look for presses that stopped (%s)", exc)
+        return []
+    records = PublicationRecordStore(cx)
+    now = deps.clock()
+    return [
+        str(build_id)
+        for (build_id,) in rows
+        if str(build_id) not in _resuming and not records.read(str(build_id)).lease_is_live(now)
+    ]
+
+
+async def _finish_settled_press_guarded(deps: MissionFinishDeps, build_id: str) -> None:
+    try:
+        assert deps.finish_settled_press is not None
+        said = await deps.finish_settled_press(build_id)
+        logger.info("merge: %s's press stopped after its result, finished: %s", build_id, said)
+    except Exception as exc:  # noqa: BLE001 — logged; tried again next pass
+        logger.error(
+            "merge: finishing %s's stopped press raised (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+    finally:
+        _resuming.discard(build_id)
 
 
 async def _finish_settled_guarded(deps: MissionFinishDeps, build_id: str) -> None:
@@ -1271,6 +1346,7 @@ def compose_mission_finisher(
     resume_merge: Callable[[str], Awaitable[Any]] | None = None,
     reconcile: Callable[[str], Awaitable[Any]] | None = None,
     finish_settled: Callable[[str], Awaitable[Any]] | None = None,
+    finish_settled_press: Callable[[str], Awaitable[Any]] | None = None,
     git_surface: Callable[[str, Path], Any] | None = None,
     tree_reader_for: Callable[[str, Path], Any] | None = None,
     feature_routing_gate: Any | None = None,
@@ -1317,6 +1393,7 @@ def compose_mission_finisher(
         resume_merge=resume_merge,
         reconcile=reconcile,
         finish_settled=finish_settled,
+        finish_settled_press=finish_settled_press,
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
     )

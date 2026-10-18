@@ -1067,8 +1067,15 @@ class TestNoMissionLeavesRunningWithAnUnreportedLanding:
         *,
         stopped: bool,
     ) -> Any:
-        """The REAL press: its lease put down, then the coordinator gone before
-        its report — a settled, released record and no report."""
+        """A settled, released record and no report.
+
+        Before press lease recovery (18 October 2026) the REAL press put its
+        lease down and then reported, so a coordinator gone in between left
+        exactly this. The press now reports before it puts its lease down, so
+        it is made here as that older press left it: the real press stopped
+        at its report, and its hold then put down on its own turn. Records
+        written by the older press are still on ledgers, and the mission's
+        drain must still wait for their report."""
         a_running_mission(pool, keys=("B",))
         a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
         _planned(pool)
@@ -1079,18 +1086,19 @@ class TestNoMissionLeavesRunningWithAnUnreportedLanding:
         )
         if stopped:
             _stop(pool)
-        real_release = PublicationRecordStore.release_lease
 
-        def released_then_gone(self: Any, **kwargs: Any) -> bool:
-            released = real_release(self, **kwargs)
-            if released:
-                raise _TheCoordinatorStopped()
-            return released
+        async def gone_before_the_report(*_a: Any, **_k: Any) -> Any:
+            raise _TheCoordinatorStopped()
 
         with monkeypatch.context() as crash:
-            crash.setattr(PublicationRecordStore, "release_lease", released_then_gone)
+            crash.setattr(merge_executor, "publish_the_press_report", gone_before_the_report)
             with pytest.raises(_TheCoordinatorStopped):
                 await MergeApprovalConsumer(deps).land_mission_feature(B_BUILD)
+        held = _record(pool)
+        assert held.lease_holder  # the press now keeps its hold until after its report
+        assert PublicationRecordStore(pool.connection).release_lease(
+            build_id=B_BUILD, turn=held.turn, holder=held.lease_holder, now=datetime.now(UTC)
+        )
         record = _record(pool)
         assert record.result == RESULT_PUBLISHED_TO_MISSION_BRANCH
         assert record.lease_holder is None  # released

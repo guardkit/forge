@@ -1394,6 +1394,12 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
 
     _ensure_mission_tables(connection)
 
+    # The merge press's written-down endings (press lease recovery, 18
+    # October 2026), outside the ladder for the same reason.
+    from forge.pipeline.publication_record import ensure_outcome_table
+
+    ensure_outcome_table(connection)
+
     # Step 4 — wrap the connection.
     sqlite_pool = SqliteLifecyclePersistence(
         connection=connection, db_path=config.db_path
