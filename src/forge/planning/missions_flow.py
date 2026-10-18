@@ -538,6 +538,8 @@ class MissionFlow:
                     approved = self._missions.get(mission.id)
                     assert approved is not None
                     await self.start_branch(approved)
+                else:
+                    await self._answered_after_a_stop(mission)
                 return
             if decision == "reject":
                 if self._missions.set_status(
@@ -548,8 +550,25 @@ class MissionFlow:
                         f'Mission "{mission.title}" was not started: you rejected '
                         "its plan. Nothing was built.",
                     )
+                else:
+                    await self._answered_after_a_stop(mission)
                 return
             # A defer keeps the card waiting.
+
+    async def _answered_after_a_stop(self, mission: Mission) -> None:
+        """A plan card answered after its mission was stopped (section 11).
+
+        A stop while PROPOSED rejects the mission at once, but its card is
+        still on the screen and its waiter still listening, so the answer
+        that comes later is told, once, that it changes nothing.
+        """
+        current = self._missions.get(mission.id)
+        if current is not None and current.stopping and current.status == "REJECTED":
+            await self._say(
+                current,
+                f'Mission "{current.title}" was stopped before it started, so '
+                "this answer changes nothing. Nothing was built.",
+            )
 
     # -- after Approve: STARTING -------------------------------------------
 

@@ -1078,11 +1078,19 @@ class MissionStore:
                     "nothing was built",
                     mission,
                 )
-            waiting = cx.execute(
-                "SELECT COUNT(*) FROM mission_attempts WHERE mission_id = ? "
-                "AND status = 'WAITING'",
-                (mission_id,),
-            ).fetchone()[0]
+            if mission.status == "STARTING":
+                # Nothing is filed until the branch is confirmed: every feature
+                # is one that won't start.
+                waiting = cx.execute(
+                    "SELECT COUNT(*) FROM mission_features WHERE mission_id = ?",
+                    (mission_id,),
+                ).fetchone()[0]
+            else:
+                waiting = cx.execute(
+                    "SELECT COUNT(*) FROM mission_attempts WHERE mission_id = ? "
+                    "AND status = 'WAITING'",
+                    (mission_id,),
+                ).fetchone()[0]
             cx.execute(
                 "UPDATE missions SET stop_requested_at = ?, stop_requested_by = ? "
                 "WHERE id = ? AND stop_requested_at IS NULL",

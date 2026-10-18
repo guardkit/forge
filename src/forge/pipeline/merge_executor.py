@@ -7362,7 +7362,8 @@ class MergeApprovalConsumer:
         "no record" (nothing was ever sent), "landed" (the record says, or the
         remote shows, the joined commit on the mission branch), "not landed"
         (settled "publication pending", lease released), or "unknown" (held by
-        a live press, or the remote could not be read: nothing written). The
+        a live press, the remote could not be read, or a write was refused
+        because another worker took the record over: nothing claimed). The
         press's own rule: the question is whether the branch CONTAINS the
         joined commit, and only a record that tried a send is read for one.
         """
@@ -7383,13 +7384,16 @@ class MergeApprovalConsumer:
         try:
             record = store.read(row.build_id)
             send_lines = [line for line in record.lines if line.step == STEP_SEND]
+            # Every write is on this worker's turn; one that is refused means
+            # another worker took the record over, so nothing is claimed here.
             if not send_lines or not record.j_commit:
-                store.record(
+                if not store.record(
                     build_id=row.build_id,
                     turn=turn,
                     now=self._deps.clock(),
                     result=RESULT_PUBLICATION_PENDING,
-                )
+                ):
+                    return "unknown"
                 return "not landed"
             git = git_surface_for(self._deps, row.repo, repo_root)
             where = await target_branch_now(
@@ -7407,39 +7411,40 @@ class MergeApprovalConsumer:
                     line.kind == LINE_DONE and line.detail.get("published") is True
                     for line in send_lines
                 )
-                if not published:
-                    store.done(
-                        build_id=row.build_id,
-                        turn=turn,
-                        now=self._deps.clock(),
-                        step=STEP_SEND,
-                        attempt=int(send_lines[-1].attempt or 0),
-                        result={
-                            "ran_on": str(record.j_commit),
-                            "published": True,
-                            "contains_j": True,
-                            "remote_now": str(where.commit),
-                            "found_by_looking": True,
-                            "detail": (
-                                "the send's answer was never recorded; the "
-                                "remote was read and its branch contains the "
-                                "joined commit"
-                            ),
-                        },
-                    )
-                store.record(
+                if not published and not store.done(
+                    build_id=row.build_id,
+                    turn=turn,
+                    now=self._deps.clock(),
+                    step=STEP_SEND,
+                    attempt=int(send_lines[-1].attempt or 0),
+                    result={
+                        "ran_on": str(record.j_commit),
+                        "published": True,
+                        "contains_j": True,
+                        "remote_now": str(where.commit),
+                        "found_by_looking": True,
+                        "detail": (
+                            "the send's answer was never recorded; the remote "
+                            "was read and its branch contains the joined commit"
+                        ),
+                    },
+                ):
+                    return "unknown"
+                if not store.record(
                     build_id=row.build_id,
                     turn=turn,
                     now=self._deps.clock(),
                     result=RESULT_PUBLISHED_TO_MISSION_BRANCH,
-                )
+                ):
+                    return "unknown"
                 return "landed"
-            store.record(
+            if not store.record(
                 build_id=row.build_id,
                 turn=turn,
                 now=self._deps.clock(),
                 result=RESULT_PUBLICATION_PENDING,
-            )
+            ):
+                return "unknown"
             return "not landed"
         finally:
             store.release_lease(

@@ -15,6 +15,7 @@ reconciliation before failing, the finisher) is in
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 from datetime import UTC, datetime
@@ -141,7 +142,8 @@ def test_a_stop_is_recorded_in_starting_running_and_ready(cx, status: str) -> No
         missions.set_status(mission.id, "READY", expected=("RUNNING",))
     answer = missions.request_stop(mission.id, requested_by=RICH)
     assert answer.accepted
-    waiting = 4 if status == "RUNNING" else 0
+    # A STARTING mission has filed nothing yet: every feature won't start.
+    waiting = 0 if status == "READY" else 4
     assert answer.sentence.startswith(f"stop requested; {waiting} waiting feature")
     assert "running work will finish without merging" in answer.sentence
     assert "work already merging into the mission branch will finish" in answer.sentence
@@ -437,3 +439,120 @@ def test_the_command_line_lists_missions_and_refuses_in_merging(cx) -> None:
     listed = CliRunner().invoke(forge_cli, ["mission", "list", "--db", str(db)])
     assert listed.exit_code == 0
     assert listed.output.startswith(f"{mission.id}  MERGING     Tags for notes")
+
+
+# ---------------------------------------------------------------------------
+# Coach round 1
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_stopped_missions_run_is_refused_at_its_start_point_before_any_fetch(
+    tmp_path: Path,
+) -> None:
+    from forge.lifecycle.missions import attempt_correlation_id
+    from forge.planning.states import PlanningState
+    from forge.lifecycle import migrations
+    from forge.planning.run_store import SqlitePlanningRunStore
+    from tests.forge.planning.test_mission_start_point import (
+        MISSION_CID,
+        REPO_KEY,
+        _driver,
+        _mission,
+        _run,
+        _Runner,
+    )
+
+    connection = sqlite3.connect(str(tmp_path / "start.db"))
+    connection.row_factory = sqlite3.Row
+    migrations.apply_at_boot(connection)
+    store = SqlitePlanningRunStore(connection, target_terminal_enabled=True)
+    missions = _mission(store)
+    mission = missions.get_by_correlation_id(MISSION_CID)
+    cid = attempt_correlation_id(MISSION_CID, "A", 1)
+    missions.admit_attempt(cid)
+    _run(store, cid)
+    assert missions.request_stop(mission.id, requested_by="U-RICH").accepted
+    runner = _Runner()
+    driver = _driver(store, tmp_path, runner)
+    assert await driver._start_point(cid, REPO_KEY, "/copies/fixture") is None
+    run = store.get_run(cid)
+    assert run["state"] == PlanningState.FAILED.value
+    assert "was stopped by U-RICH" in run["error"]
+    assert runner.asked == []  # never planned from anywhere
+
+
+def test_an_abandoned_admission_with_a_build_is_left_for_its_build(cx, tmp_path) -> None:
+    missions = _running_mission(cx)
+    run = _Run(cx, tmp_path)
+    assert missions.admit_attempt(_cid("A"))
+    run.build(_cid("A"), "FEAT-AAA1", "QUEUED")  # a build, but no planning run
+    missions.request_stop(_mission(missions).id, requested_by=RICH)
+    assert missions.close_abandoned(_mission(missions).id) == 0
+    assert _statuses(missions)["A1"][0] == "ADMITTED"
+
+
+def test_a_starting_missions_acknowledgement_counts_its_features(cx) -> None:
+    missions = _proposed(cx)
+    mission = _mission(missions)
+    missions.record_approval(mission.id, approved_by=RICH, plan_request_id="req-1")
+    answer = missions.request_stop(mission.id, requested_by=RICH)
+    assert answer.sentence.startswith("stop requested; 4 waiting features won't start")
+
+
+class _AnAnswerLater:
+    """A plan card's subscriber that waits, as the real one does, for an answer."""
+
+    def __init__(self) -> None:
+        self.answer: Any = None
+        self.given = asyncio.Event()
+
+    def __call__(self, _approver: Any, armed: Any) -> "_AnAnswerLater":
+        self._armed = armed
+        return self
+
+    async def await_response(self, _build_id: str, **_kwargs: Any) -> Any:
+        if self._armed is not None:
+            self._armed.set()
+        await self.given.wait()
+        return self.answer
+
+
+@pytest.mark.asyncio
+async def test_a_plan_card_answered_after_a_stop_says_so(cx) -> None:
+    from forge.planning.missions_flow import MissionFlow
+    from tests.forge.planning.test_missions import _answer, _propose, _request_id
+
+    missions = MissionStore(cx)
+    said: list[str] = []
+    later = _AnAnswerLater()
+
+    async def publish_card(_envelope: Any) -> None:
+        return None
+
+    async def notify(_cid: str, message: str, *, parent_request_id: str | None = None) -> None:
+        said.append(message)
+
+    async def remote_tip(_repo: str) -> Any:
+        raise AssertionError("nothing is started")
+
+    flow = MissionFlow(
+        missions,
+        publish_card=publish_card,
+        subscriber_factory=later,
+        notify=notify,
+        read_remote_tip=remote_tip,
+        create_branch=_Publisher(missions, []),
+        approval_wait_seconds=3600,
+    )
+    mission = _propose(flow)
+    await _settle()
+    assert missions.request_stop(mission.id, requested_by=RICH).accepted
+    later.answer = _answer("approve", _request_id(mission.id))
+    later.given.set()
+    await _settle()
+    assert missions.get(mission.id).status == "REJECTED"
+    assert said == [
+        'Mission "Tags for notes" was stopped before it started, so this answer '
+        "changes nothing. Nothing was built."
+    ]
