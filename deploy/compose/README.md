@@ -8,12 +8,13 @@ machine's address, no home path, no checkout and no host network. Everything
 that belongs to a particular machine lives in one file, `.env`, and that file
 is the whole of the difference between a laptop and a cloud machine.
 
-## The four files
+## The files
 
 | File | What it is |
 |---|---|
 | `compose.yaml` | the three services, the network and the volumes |
 | `compose.sandbox-runner.yaml` | one project's sandbox, looked after by a container. Only on a machine that has one; composed alongside `compose.yaml` |
+| `compose.sandbox-starter.yaml` | the sandbox starter: starts, stops and holds the project sandboxes for the coordinator (one sandbox per project, stage S2). Only on the machine that runs the sandboxes; a project of its own |
 | `.env.example` | every setting name the bundle needs, with no machine's values. Copy it to `.env` and fill in the lines marked CHANGE THIS |
 | `settings.example.yaml` | the coordinator's own settings file, with every address written as a `${NAME}`. Copy it onto the read-only settings volume |
 | `README.md` | this page |
@@ -318,3 +319,36 @@ it in the settings file only once that image is running.
    local working-copy path. There is no checkout on the host in this design, so
    the example gives a path inside the container with nothing bound behind it.
    Untangling that coupling is its own small pass.
+
+
+## The sandbox starter
+
+*Added 19 October 2026, one sandbox per project, stage S2.*
+
+`compose.sandbox-starter.yaml` runs `sandbox-starter/starter.py` from the
+release image. It is the one thing that starts and stops a project's
+supervisor container (`forge-sbx-<name>-sandbox-runner-1`): `docker start` to
+start it, never `docker compose up`, and `docker stop -t 210` to stop it, only
+when nothing is held, queued, suspended or still executing in the helper, and
+nothing but the factory's two containers and the recorded deployment is
+running in the sandbox's engine. The program's opening comment lists every
+request it answers.
+
+It holds the machine's Docker socket, which is root-equivalent, as well as the
+sandbox client and its daemon's socket, and it listens only on
+`STARTER_LISTEN_ADDRESS`. It acts only for the names in `STARTER_SANDBOXES`
+and refuses `api-test-deploy` by name.
+
+Its two volumes are handed over once, like the supervisor's:
+
+```
+docker compose -p forge-sandbox-starter --env-file .env -f compose.sandbox-starter.yaml create
+set -a; . ./.env; set +a
+for v in sandbox-starter-state sandbox-starter-client-state; do
+  docker run --rm -v forge-sandbox-starter_$v:/v1 alpine chown "${FACTORY_HOST_UID}:${FACTORY_HOST_GID}" /v1
+done
+```
+
+It never calls the sandbox client in a loop faster than every five seconds,
+and only during a stop: a client asked over and over crashed the machine's
+sign-in keyring on 17 October 2026.

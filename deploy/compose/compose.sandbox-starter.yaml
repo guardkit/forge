@@ -1,0 +1,102 @@
+# ---------------------------------------------------------------------------
+# THE SANDBOX STARTER (one sandbox per project, stage S2, design sections 2.3
+# and 2.3a, 18 October 2026).
+#
+# A small service on the machine that runs the project sandboxes. It starts a
+# project's supervisor container (forge-sbx-<name>-sandbox-runner-1) when work
+# arrives, stops it when the coordinator says the sandbox is idle, keeps it up
+# for an outside command that holds it, and reports its state. The program is
+# deploy/compose/sandbox-starter/starter.py, carried by the release image at
+# /opt/forge/sandbox-starter/starter.py; its opening comment lists every
+# request it answers.
+#
+# A FILE OF ITS OWN, like compose.sandbox-runner.yaml, and a project of its own:
+# a machine has one starter however many sandboxes it looks after.
+#
+#     docker compose -p forge-sandbox-starter --env-file .env \
+#       -f compose.sandbox-starter.yaml up -d
+#
+# WHAT IT HOLDS, DECLARED HERE. This is more than the supervisor holds:
+#   * the machine's Docker socket, to start and stop the supervisor containers.
+#     That socket is root-equivalent on the machine, so it is this service's
+#     one privileged capability, and the service is kept small;
+#   * the sandbox client binary, read-only, and the sandbox daemon's socket,
+#     the same two the supervisor is given, for the sign-in check, `sbx ls`
+#     during a stop, and the one container listing before a stop;
+#   * the file naming each sandbox's two service addresses, read-only;
+#   * two small volumes of its own: the operation log, and the client's state.
+#
+# WHERE IT LISTENS. Only on STARTER_LISTEN_ADDRESS:STARTER_LISTEN_PORT, the
+# machine's direct-link address, for the coordinator on the other machine. It
+# uses the machine's own network so that it can bind that one address and
+# reach each sandbox's helper and runner where they are published. The
+# machine's guard admits only the coordinator's machine to that port, on both
+# the host-input and Docker-forward paths, as the existing ports are guarded.
+#
+# WHAT IT NEVER DOES: `docker compose up` of a supervisor (that would read the
+# Compose files again, and up.sh warns against it), create or remove a sandbox,
+# or act for api-test-deploy, the shared sandbox, which it refuses by name.
+# ---------------------------------------------------------------------------
+
+services:
+
+  sandbox-starter:
+    # The release image, with a different start command. Nothing is built here.
+    image: ${FORGE_IMAGE:?name the release image in the env file - this file never picks one for you}
+    entrypoint: ["python", "-I", "/opt/forge/sandbox-starter/starter.py"]
+    command: []
+
+    # THE HOST USER'S OWN NUMBERS, as for the supervisor: the sandbox daemon's
+    # socket is owner-only. The Docker socket's group is added on top, so the
+    # docker client can speak to the machine's engine.
+    user: "${FACTORY_HOST_UID:?name the uid that owns the sandbox daemon in the env file}:${FACTORY_HOST_GID:?name that user's gid in the env file}"
+    group_add:
+      - "${DOCKER_SOCKET_GID:?name the group id that owns the machine's Docker socket in the env file}"
+
+    restart: unless-stopped
+
+    # NO HEALTH PROBE. The image's own probe curls the coordinator's /healthz,
+    # which this service does not serve, so it would be marked unhealthy for
+    # ever. The coordinator reads GET /status/<name> once a minute instead.
+    healthcheck:
+      disable: true
+
+    # A stop in progress when this container is stopped is cut short, and the
+    # starter's recovery after its next start finds out how it ended (2.3).
+    stop_grace_period: 10s
+
+    network_mode: "host"
+
+    environment:
+      STARTER_LISTEN_ADDRESS: ${STARTER_LISTEN_ADDRESS:?name the direct-link address the starter listens on in the env file}
+      STARTER_LISTEN_PORT: ${STARTER_LISTEN_PORT:?name the port the starter listens on in the env file}
+      # THE ONLY SANDBOXES IT ACTS FOR. api-test-deploy is refused even here.
+      STARTER_SANDBOXES: ${STARTER_SANDBOXES:?name the sandboxes the starter looks after in the env file}
+      STARTER_SETTINGS_FILE: /etc/forge-sandbox-starter/sandboxes.json
+      STARTER_STATE_DIR: /var/lib/forge-sandbox-starter
+      STARTER_SBX: /usr/bin/sbx
+      # The supervisor's own stop allowance (compose.sandbox-runner.yaml).
+      STARTER_STOP_GRACE_SECONDS: ${STARTER_STOP_GRACE_SECONDS:-210}
+      STARTER_READY_LIMIT_SECONDS: ${STARTER_READY_LIMIT_SECONDS:-600}
+      STARTER_DEPLOYED_LIMIT_SECONDS: ${STARTER_DEPLOYED_LIMIT_SECONDS:-900}
+      # Never below 5: the sandbox client is not asked in a fast loop.
+      STARTER_VM_POLL_SECONDS: ${STARTER_VM_POLL_SECONDS:-5}
+      STARTER_VM_STOP_LIMIT_SECONDS: ${STARTER_VM_STOP_LIMIT_SECONDS:-180}
+      # The client's own state folder, the folder its socket sits under, at
+      # exactly this path (see compose.sandbox-runner.yaml for why).
+      SANDBOXES_STORAGE_ROOT: /var/lib/forge-sandbox-client
+
+    volumes:
+      # The operation log: one numbered file of JSON lines per sandbox. Like
+      # the supervisor's client state, a fresh volume belongs to root and this
+      # container is not root: hand both over once, as README.md says.
+      - sandbox-starter-state:/var/lib/forge-sandbox-starter
+      - sandbox-starter-client-state:/var/lib/forge-sandbox-client
+      - ${STARTER_SETTINGS_PATH:?name the file with each sandbox's helper and runner addresses in the env file}:/etc/forge-sandbox-starter/sandboxes.json:ro
+      - ${SBX_BINARY_PATH:?name the sandbox client binary in the env file}:/usr/bin/sbx:ro
+      - ${SANDBOXD_SOCKET_PATH:?name the sandbox daemon's socket in the env file}:/var/lib/forge-sandbox-client/state/sandboxes/sandboxes/sandboxd/sandboxd.sock
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  sandbox-starter-state:
+  sandbox-starter-client-state:

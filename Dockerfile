@@ -776,6 +776,12 @@ RUN python -m guardkitfactory.code_search self-check
 COPY deploy/compose/sandbox-runner/run.sh /opt/forge/sandbox-runner/run.sh
 RUN chmod 0755 /opt/forge/sandbox-runner/run.sh
 
+# The sandbox starter (19 October 2026, one sandbox per project, stage S2). The
+# start command of deploy/compose/compose.sandbox-starter.yaml: a standard-
+# library program that starts and stops the project sandboxes' supervisor
+# containers. A leaf, like the supervisor script above.
+COPY deploy/compose/sandbox-starter/starter.py /opt/forge/sandbox-starter/starter.py
+
 # Create the unprivileged runtime user *before* WORKDIR/COPY-into-home
 # so any files copied later inherit the correct ownership when --chown
 # is used. UID 1000 is mandated by AC-C and the ``id -u`` runtime

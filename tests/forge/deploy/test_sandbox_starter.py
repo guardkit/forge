@@ -1,0 +1,769 @@
+"""One sandbox per project, stage S2: the sandbox starter.
+
+Design: one-sandbox-per-project (17 October 2026), sections 2.3 and 2.3a.
+
+``deploy/compose/sandbox-starter/starter.py`` starts, stops and holds a
+project's supervisor container and reports its state. These tests drive it
+with fake ``docker`` and ``sbx`` programs (first on PATH, and named to the
+starter by their full paths, so the real sandbox client is never reached) and
+a fake helper and runner served from this process. No real sandbox, engine or
+daemon is touched.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import json
+import os
+import sys
+import threading
+import time
+import urllib.error
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[3]
+STARTER_PY = ROOT / "deploy" / "compose" / "sandbox-starter" / "starter.py"
+COMPOSE = ROOT / "deploy" / "compose" / "compose.sandbox-starter.yaml"
+
+_spec = importlib.util.spec_from_file_location("forge_sandbox_starter_under_test", STARTER_PY)
+starter_mod = importlib.util.module_from_spec(_spec)
+sys.modules[_spec.name] = starter_mod
+_spec.loader.exec_module(starter_mod)
+
+NAME = "a-private-project"
+SUPERVISOR = f"forge-sbx-{NAME}-sandbox-runner-1"
+DEPLOYMENT = {"compose_project": "notes-live", "identity_label": "org.example.identity=abc123"}
+
+FAKE_DOCKER = r"""#!/usr/bin/env bash
+S="$FAKE_STATE"
+printf '%s\n' "$*" >> "$S/docker.log"
+case "$1" in
+  inspect)
+    c="${@: -1}"
+    if [ -f "$S/inspect_running_for" ]; then
+      n=$(cat "$S/inspect_running_for")
+      if [ "$n" -gt 0 ]; then echo $((n-1)) > "$S/inspect_running_for"; echo running; exit 0; fi
+    fi
+    [ -f "$S/container" ] || { echo "Error: No such object: $c" >&2; exit 1; }
+    cat "$S/container" ;;
+  start)
+    [ -f "$S/start_sleep" ] && sleep "$(cat "$S/start_sleep")"
+    [ -f "$S/start_fails" ] && { echo "Error response from daemon: it would not start" >&2; exit 1; }
+    echo running > "$S/container" ;;
+  stop)
+    [ -f "$S/stop_sleep" ] && sleep "$(cat "$S/stop_sleep")"
+    echo exited > "$S/container" ;;
+  wait) echo 0 ;;
+  *) echo "unexpected docker $*" >&2; exit 3 ;;
+esac
+"""
+
+FAKE_SBX = r"""#!/usr/bin/env bash
+S="$FAKE_STATE"
+printf '%s\n' "$*" >> "$S/sbx.log"
+case "$1" in
+  ls)
+    [ -f "$S/signed_out" ] && { echo "no valid user session: run sbx login" >&2; exit 1; }
+    c=$(cat "$S/container" 2>/dev/null || echo missing)
+    if [ -f "$S/vm_override" ]; then state=$(cat "$S/vm_override")
+    elif [ "$c" = running ]; then state=running
+    else
+      n=$(cat "$S/vm_stops_after" 2>/dev/null || echo 0)
+      if [ "$n" -gt 0 ]; then echo $((n-1)) > "$S/vm_stops_after"; state=running; else state=stopped; fi
+    fi
+    printf 'SANDBOX              AGENT   STATUS    PORTS\n'
+    printf 'api-test-deploy      shell   running   127.0.0.1:8924->8124/tcp\n'
+    printf '%s    shell   %s\n' "$FAKE_SANDBOX" "$state" ;;
+  exec)
+    shift 2
+    if [ "$1 $2" = "docker ps" ]; then
+      [ -f "$S/exec_fails" ] && { echo "the engine did not answer" >&2; exit 1; }
+      [ -f "$S/ps" ] && cat "$S/ps"
+    fi
+    exit 0 ;;
+  *) echo "unexpected sbx $*" >&2; exit 3 ;;
+esac
+"""
+
+
+class FakeServices:
+    """The helper's /healthz and /busy and the runner's /ok, on one port."""
+
+    def __init__(self):
+        self.answers = {
+            "/healthz": (200, '{"status": "healthy"}'),
+            "/ok": (200, '{"ok":true,"name":"runner"}'),
+            "/busy": (200, '{"executing": []}'),
+        }
+        services = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def do_GET(self):  # noqa: N802
+                status, body = services.answers.get(self.path, (404, "not here"))
+                data = body.encode()
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.server.daemon_threads = True
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+class FakeClock:
+    """A clock that moves only when the starter sleeps."""
+
+    def __init__(self):
+        self.now = 1000.0
+        self.slept: list[float] = []
+        self._lock = threading.Lock()
+
+    def __call__(self) -> float:
+        return self.now
+
+    def wall(self) -> float:
+        return 1_790_000_000.0 + self.now
+
+    def sleep(self, seconds: float) -> None:
+        with self._lock:
+            self.now += seconds
+            self.slept.append(seconds)
+        time.sleep(0.001)
+
+
+@pytest.fixture
+def world(tmp_path, monkeypatch):
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "docker").write_text(FAKE_DOCKER)
+    (fake_bin / "sbx").write_text(FAKE_SBX)
+    for name in ("docker", "sbx"):
+        (fake_bin / name).chmod(0o755)
+    state = tmp_path / "fake-state"
+    state.mkdir()
+    (state / "container").write_text("exited\n")
+    monkeypatch.setenv("PATH", f"{fake_bin}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_STATE", str(state))
+    monkeypatch.setenv("FAKE_SANDBOX", NAME)
+    services = FakeServices()
+
+    class World:
+        pass
+
+    w = World()
+    w.tmp = tmp_path
+    w.bin = fake_bin
+    w.state = state
+    w.services = services
+    w.starters = []
+    w.servers = []
+
+    def settings(deployment=None, **env):
+        table = {NAME: {"helper_url": services.url, "runner_url": services.url}}
+        if deployment:
+            table[NAME]["deployment"] = deployment
+        settings_file = tmp_path / "sandboxes.json"
+        settings_file.write_text(json.dumps(table))
+        base = {
+            "STARTER_LISTEN_ADDRESS": "127.0.0.1",
+            "STARTER_LISTEN_PORT": "0",
+            "STARTER_SANDBOXES": NAME,
+            "STARTER_SETTINGS_FILE": str(settings_file),
+            "STARTER_STATE_DIR": str(tmp_path / "starter-state"),
+            "STARTER_DOCKER": str(fake_bin / "docker"),
+            "STARTER_SBX": str(fake_bin / "sbx"),
+            "STARTER_READY_LIMIT_SECONDS": "3",
+            "STARTER_READY_POLL_SECONDS": "0.05",
+            "STARTER_RECOVERY_POLL_SECONDS": "0.05",
+            "STARTER_CLIENT_TIMEOUT_SECONDS": "20",
+        }
+        base.update(env)
+        return starter_mod.Settings(base)
+
+    def make(deployment=None, clock=None, **env):
+        kwargs = {"say": lambda line: None}
+        if clock is not None:
+            kwargs.update(clock=clock, wall=clock.wall, sleep=clock.sleep)
+        s = starter_mod.Starter(settings(deployment, **env), **kwargs)
+        s.boot()
+        w.starters.append(s)
+        return s
+
+    def http(starter):
+        server = starter_mod.serve(starter, "127.0.0.1", 0)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        w.servers.append(server)
+        return f"http://127.0.0.1:{server.server_address[1]}"
+
+    def lines(name):
+        path = state / name
+        return [line for line in path.read_text().splitlines() if line.strip()] if path.exists() else []
+
+    w.settings = settings
+    w.make = make
+    w.http = http
+    w.lines = lines
+    yield w
+    for server in w.servers:
+        server.shutdown()
+        server.server_close()
+    for s in w.starters:
+        s.close()
+    services.close()
+
+
+def call(base: str, method: str, path: str) -> tuple[int, dict]:
+    request = urllib.request.Request(base + path, method=method, data=b"" if method != "GET" else None)
+    try:
+        with urllib.request.urlopen(request, timeout=30) as answer:
+            return answer.status, json.loads(answer.read())
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read())
+
+
+def in_background(fn, *args, **kwargs):
+    box: dict = {}
+
+    def run():
+        try:
+            box["result"] = fn(*args, **kwargs)
+        except BaseException as exc:  # noqa: BLE001
+            box["error"] = exc
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    box["thread"] = thread
+    return box
+
+
+def wait_for(predicate, seconds: float = 10.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.02)
+    return False
+
+
+def log_entries(world) -> list[dict]:
+    path = world.tmp / "starter-state" / f"{NAME}.jsonl"
+    entries = []
+    for line in path.read_text().splitlines() if path.exists() else []:
+        try:
+            entries.append(json.loads(line))
+        except json.JSONDecodeError:
+            pass  # a line still being written
+    return entries
+
+
+# ---------------------------------------------------------------------------
+
+
+class TestSettings:
+    def test_api_test_deploy_in_the_list_is_refused_at_boot(self, world):
+        with pytest.raises(ValueError, match="api-test-deploy"):
+            world.settings(STARTER_SANDBOXES=f"{NAME} api-test-deploy")
+
+    def test_a_listed_name_without_addresses_is_refused(self, world):
+        with pytest.raises(ValueError, match="no entry"):
+            world.settings(STARTER_SANDBOXES=f"{NAME},another-project")
+
+    def test_the_vm_poll_is_never_below_five_seconds(self, world):
+        assert world.settings(STARTER_VM_POLL_SECONDS="1").vm_poll == 5.0
+
+    def test_the_compose_file_never_composes_up_and_holds_what_it_declares(self):
+        text = COMPOSE.read_text()
+        assert "/opt/forge/sandbox-starter/starter.py" in text
+        assert "/var/run/docker.sock:/var/run/docker.sock" in text
+        assert "/usr/bin/sbx:ro" in text
+        assert "sandboxd.sock" in text
+        assert 'network_mode: "host"' in text
+        source = STARTER_PY.read_text()
+        assert '"compose"' not in source and "'compose'" not in source
+
+    def test_the_release_image_carries_the_program(self):
+        assert (
+            "COPY deploy/compose/sandbox-starter/starter.py /opt/forge/sandbox-starter/starter.py"
+            in (ROOT / "Dockerfile").read_text()
+        )
+
+
+class TestNamesItActsFor:
+    @pytest.mark.parametrize(
+        "method,path",
+        [
+            ("GET", "/status/api-test-deploy"),
+            ("POST", "/start/api-test-deploy"),
+            ("POST", "/stop/api-test-deploy"),
+            ("POST", "/hold/api-test-deploy?owner=estate-check&until=services"),
+            ("POST", "/ready/api-test-deploy"),
+            ("POST", "/suspend/api-test-deploy?reason=x"),
+            ("POST", "/clear/api-test-deploy"),
+        ],
+    )
+    def test_api_test_deploy_is_refused_by_name(self, world, method, path):
+        base = world.http(world.make())
+        status, body = call(base, method, path)
+        assert status == 403
+        assert "api-test-deploy is the shared sandbox" in body["message"]
+        assert world.lines("docker.log") == [] and world.lines("sbx.log") == []
+
+    def test_a_name_not_in_the_list_is_not_found(self, world):
+        base = world.http(world.make())
+        status, body = call(base, "POST", "/start/someone-else")
+        assert status == 404 and "not in this starter's list" in body["message"]
+        assert world.lines("docker.log") == []
+
+
+class TestStart:
+    def test_start_checks_the_sign_in_then_docker_starts_the_supervisor(self, world):
+        base = world.http(world.make())
+        status, body = call(base, "POST", f"/start/{NAME}")
+        assert status == 200, body
+        assert body["readiness"] == "ready" and body["redeploy_pending"] is False
+        assert world.lines("sbx.log") == ["ls"]
+        assert f"start {SUPERVISOR}" in world.lines("docker.log")
+        assert not any("compose" in line for line in world.lines("docker.log"))
+
+    def test_with_a_recorded_deployment_it_reports_a_redeploy_pending(self, world):
+        base = world.http(world.make(deployment=DEPLOYMENT))
+        status, body = call(base, "POST", f"/start/{NAME}")
+        assert status == 200
+        assert body["readiness"] == "services ready, redeploy pending"
+        status, report = call(base, "GET", f"/status/{NAME}")
+        assert report["redeploy_pending"] is True and report["services_ready"] is True
+
+    def test_a_deployment_passed_in_on_the_request_counts(self, world):
+        base = world.http(world.make())
+        status, body = call(
+            base, "POST",
+            f"/start/{NAME}?compose_project=notes-live&identity_label=org.example.identity%3Dabc123",
+        )
+        assert status == 200 and body["redeploy_pending"] is True
+
+    def test_a_lapsed_sign_in_refuses_the_start_plainly(self, world):
+        (world.state / "signed_out").write_text("")
+        base = world.http(world.make())
+        status, body = call(base, "POST", f"/start/{NAME}")
+        assert status == 503
+        assert "sbx login" in body["message"]
+        assert not any(line.startswith("start") for line in world.lines("docker.log"))
+
+    def test_a_helper_that_never_answers_is_named(self, world):
+        world.services.answers["/healthz"] = (503, '{"status": "starting"}')
+        base = world.http(world.make())
+        status, body = call(base, "POST", f"/start/{NAME}")
+        assert status == 503
+        assert "the deploy helper (/healthz)" in body["message"]
+        assert "build runner" not in body["message"]
+
+    def test_a_docker_start_that_fails_says_so(self, world):
+        (world.state / "start_fails").write_text("")
+        base = world.http(world.make())
+        status, body = call(base, "POST", f"/start/{NAME}")
+        assert status == 503 and "docker start" in body["message"]
+
+
+class TestStatus:
+    def test_status_reports_everything_and_never_calls_sbx(self, world):
+        base = world.http(world.make(deployment=DEPLOYMENT))
+        call(base, "POST", f"/start/{NAME}")
+        call(base, "POST", f"/hold/{NAME}?owner=register-repo&until=services")
+        before = world.lines("sbx.log")
+        status, report = call(base, "GET", f"/status/{NAME}")
+        assert status == 200
+        assert world.lines("sbx.log") == before
+        assert report["container"] == {"name": SUPERVISOR, "state": "running"}
+        assert report["vm"]["state"] == "running" and report["vm"]["seen_at"]
+        assert report["operations"]["queued"] == [] and report["operations"]["running"] is None
+        assert report["operations"]["recovering"] == []
+        assert report["operations"]["last"]["outcome"] == "done"
+        assert [h["owner"] for h in report["holds"]] == ["register-repo"]
+        assert report["holds"][0]["age_seconds"] >= 0
+        assert report["managed"] == {"state": "active", "reason": None}
+        assert report["services_ready"] is True
+        assert report["readiness"] == "services ready, redeploy pending"
+        assert report["deployment"] == DEPLOYMENT
+
+    def test_the_operation_log_is_numbered_json_lines(self, world):
+        base = world.http(world.make())
+        call(base, "POST", f"/start/{NAME}")
+        call(base, "POST", f"/stop/{NAME}")
+        call(base, "POST", f"/start/{NAME}")
+        entries = log_entries(world)
+        assert [e["seq"] for e in entries] == list(range(1, len(entries) + 1))
+        queued = [(e["op_id"], e["op"]) for e in entries if e["kind"] == "op-queued"]
+        assert queued == [(1, "start"), (2, "stop"), (3, "start")]
+        assert [e["outcome"] for e in entries if e["kind"] == "op-end"] == ["done"] * 3
+
+
+class TestStop:
+    def test_a_stop_lists_the_engine_stops_the_supervisor_and_polls_sbx_ls(self, world):
+        clock = FakeClock()
+        s = world.make(clock=clock)
+        s.start(NAME)
+        (world.state / "vm_stops_after").write_text("3")
+        result = s.stop(NAME)
+        assert "is stopped" in result["message"]
+        docker = world.lines("docker.log")
+        assert f"stop -t 210 {SUPERVISOR}" in docker
+        assert f"wait {SUPERVISOR}" in docker
+        sbx = world.lines("sbx.log")
+        assert sbx.count(f"exec {NAME} docker ps --format {{{{.Names}}}}\t{{{{.Labels}}}}") == 1
+        # One ls for the start's sign-in, then four during the stop: running
+        # three times, then stopped, five seconds apart and never faster.
+        assert sbx.count("ls") == 5
+        assert clock.slept.count(5.0) == 3
+        assert s.status(NAME)["readiness"] == "stopped"
+
+    def test_the_exec_happens_before_the_stop_and_only_while_running(self, world):
+        s = world.make()
+        s.start(NAME)
+        s.stop(NAME)
+        sbx = world.lines("sbx.log")
+        assert sbx.index(f"exec {NAME} docker ps --format {{{{.Names}}}}\t{{{{.Labels}}}}") < len(sbx) - 1
+        s.stop(NAME)  # already stopped: one ls, no exec, no docker stop
+        assert world.lines("sbx.log")[len(sbx):] == ["ls"]
+        assert sum(1 for line in world.lines("docker.log") if line.startswith("stop")) == 1
+
+    def test_a_vm_that_never_stops_fails_after_the_bound(self, world):
+        clock = FakeClock()
+        s = world.make(clock=clock, STARTER_VM_STOP_LIMIT_SECONDS="30")
+        s.start(NAME)
+        (world.state / "vm_stops_after").write_text("1000")
+        with pytest.raises(starter_mod.Failed, match="VM still shows running"):
+            s.stop(NAME)
+        assert world.lines("sbx.log").count("ls") <= 1 + 30 // 5 + 1
+
+    def test_a_hold_refuses_the_stop(self, world):
+        base = world.http(world.make())
+        call(base, "POST", f"/hold/{NAME}?owner=estate-check&until=services")
+        status, body = call(base, "POST", f"/stop/{NAME}")
+        assert status == 409 and "held open" in body["message"] and "estate-check" in body["message"]
+        assert not any(line.startswith("stop") for line in world.lines("docker.log"))
+
+    def test_suspended_refuses_the_stop(self, world):
+        base = world.http(world.make())
+        call(base, "POST", f"/start/{NAME}")
+        call(base, "POST", f"/suspend/{NAME}?reason=the%20redeploy%20failed%20its%20health%20check")
+        status, body = call(base, "POST", f"/stop/{NAME}")
+        assert status == 409
+        assert "managed: suspended, reason: the redeploy failed its health check" in body["message"]
+
+    def test_an_operation_running_refuses_the_stop(self, world):
+        (world.state / "start_sleep").write_text("1")
+        base = world.http(world.make())
+        box = in_background(call, base, "POST", f"/start/{NAME}")
+        assert wait_for(lambda: world.starters[0].sandboxes[NAME].running is not None)
+        status, body = call(base, "POST", f"/stop/{NAME}")
+        assert status == 409 and "queued or running" in body["message"]
+        box["thread"].join(10)
+        assert box["result"][0] == 200
+
+    def test_a_busy_helper_refuses_the_stop(self, world):
+        base = world.http(world.make())
+        call(base, "POST", f"/start/{NAME}")
+        world.services.answers["/busy"] = (200, '{"executing": [{"route": "/preview", "since": "x"}]}')
+        status, body = call(base, "POST", f"/stop/{NAME}")
+        assert status == 409 and "still executing 1 request" in body["message"]
+        assert not any(line.startswith("stop") for line in world.lines("docker.log"))
+
+    @pytest.mark.parametrize("answer", [(404, "not here"), (200, "not json"), (200, '{"other": 1}')])
+    def test_a_helper_that_does_not_answer_busy_refuses_the_stop(self, world, answer):
+        base = world.http(world.make())
+        call(base, "POST", f"/start/{NAME}")
+        world.services.answers["/busy"] = answer
+        status, body = call(base, "POST", f"/stop/{NAME}")
+        assert status == 409 and "did not answer GET /busy" in body["message"]
+        assert not any(line.startswith("stop") for line in world.lines("docker.log"))
+
+    def test_an_unreachable_helper_refuses_the_stop(self, world):
+        s = world.make()
+        s.start(NAME)
+        world.services.close()
+        with pytest.raises(starter_mod.Refused, match="did not answer GET /busy"):
+            s.stop(NAME)
+
+    def test_a_leftover_build_stack_refuses_the_stop_by_name(self, world):
+        (world.state / "ps").write_text(
+            f"{NAME}-helper\tcom.example=1\n"
+            f"{NAME}-runner\t\n"
+            "notes-live-web-1\tcom.docker.compose.project=notes-live,org.example.identity=abc123\n"
+            "build-7f3a-db-1\tcom.docker.compose.project=build-7f3a\n"
+        )
+        base = world.http(world.make(deployment=DEPLOYMENT))
+        call(base, "POST", f"/start/{NAME}")
+        status, body = call(base, "POST", f"/stop/{NAME}")
+        assert status == 409
+        assert "build-7f3a-db-1 is running" in body["message"]
+        assert "notes-live-web-1" not in body["message"] and f"{NAME}-helper" not in body["message"]
+        assert not any(line.startswith("stop") for line in world.lines("docker.log"))
+
+    def test_the_recorded_deployment_and_the_factorys_two_are_allowed(self, world):
+        (world.state / "ps").write_text(
+            f"{NAME}-helper\t\n{NAME}-runner\t\n"
+            "notes-live-web-1\tcom.docker.compose.project=notes-live,org.example.identity=abc123\n"
+        )
+        s = world.make(deployment=DEPLOYMENT)
+        s.start(NAME)
+        assert "is stopped" in s.stop(NAME)["message"]
+
+    def test_the_right_project_with_another_identity_is_refused(self, world):
+        (world.state / "ps").write_text(
+            "notes-live-web-1\tcom.docker.compose.project=notes-live,org.example.identity=other\n"
+        )
+        s = world.make(deployment=DEPLOYMENT)
+        s.start(NAME)
+        with pytest.raises(starter_mod.Refused, match="notes-live-web-1 is running"):
+            s.stop(NAME)
+
+    def test_an_engine_that_cannot_be_listed_refuses_the_stop(self, world):
+        (world.state / "exec_fails").write_text("")
+        s = world.make()
+        s.start(NAME)
+        with pytest.raises(starter_mod.Refused, match="could not be listed"):
+            s.stop(NAME)
+
+
+class TestHolds:
+    def test_a_hold_starts_a_stopped_sandbox_and_never_expires(self, world):
+        clock = FakeClock()
+        s = world.make(clock=clock)
+        result = s.hold(NAME, "register-repo", "services")
+        assert result["hold_id"].startswith("hold-")
+        assert f"start {SUPERVISOR}" in world.lines("docker.log")
+        clock.now += 3 * 86400  # three days later
+        report = s.status(NAME)
+        assert [h["id"] for h in report["holds"]] == [result["hold_id"]]
+        assert report["holds"][0]["age_seconds"] >= 3 * 86400
+        with pytest.raises(starter_mod.Refused, match="held open"):
+            s.stop(NAME)
+        s.end_hold(result["hold_id"])
+        assert "is stopped" in s.stop(NAME)["message"]
+
+    def test_a_hold_on_a_running_ready_sandbox_starts_nothing(self, world):
+        s = world.make()
+        s.start(NAME)
+        before = world.lines("sbx.log")
+        s.hold(NAME, "estate-check", "services")
+        assert world.lines("sbx.log") == before
+        assert sum(1 for line in world.lines("docker.log") if line.startswith("start")) == 1
+
+    def test_holds_are_kept_across_a_restart(self, world):
+        first = world.make()
+        held = first.hold(NAME, "merge-deploy", "services")
+        first.close()
+        second = world.make()
+        assert [h["owner"] for h in second.status(NAME)["holds"]] == ["merge-deploy"]
+        with pytest.raises(starter_mod.Refused, match="held open"):
+            second.stop(NAME)
+        second.end_hold(held["hold_id"])
+
+    def test_until_deployed_returns_only_after_ready_is_recorded(self, world):
+        base = world.http(world.make(deployment=DEPLOYMENT))
+        box = in_background(call, base, "POST", f"/hold/{NAME}?owner=merge-deploy&until=deployed")
+        assert wait_for(lambda: call(base, "GET", f"/status/{NAME}")[1]["redeploy_pending"])
+        time.sleep(0.3)
+        assert "result" not in box
+        status, body = call(base, "POST", f"/ready/{NAME}")
+        assert status == 200
+        box["thread"].join(10)
+        status, body = box["result"]
+        assert status == 200 and body["readiness"] == "ready" and body["hold_id"]
+
+    def test_until_deployed_ends_the_hold_after_fifteen_minutes(self, world):
+        clock = FakeClock()
+        s = world.make(deployment=DEPLOYMENT, clock=clock)
+        with pytest.raises(starter_mod.Failed, match="within 15 minutes, so the hold has ended") as caught:
+            s.hold(NAME, "merge-deploy", "deployed")
+        assert caught.value.extra["hold_ended"] is True
+        assert s.status(NAME)["holds"] == []
+        assert clock.now >= 1000.0 + 900
+
+    def test_until_deployed_with_no_recorded_deployment_is_services(self, world):
+        s = world.make()
+        assert s.hold(NAME, "merge-deploy", "deployed")["readiness"] == "ready"
+
+    def test_until_deployed_on_a_suspended_sandbox_refuses_at_once(self, world):
+        base = world.http(world.make(deployment=DEPLOYMENT))
+        call(base, "POST", f"/suspend/{NAME}?reason=proxy%20down")
+        status, body = call(base, "POST", f"/hold/{NAME}?owner=merge-deploy&until=deployed")
+        assert status == 409 and "suspended" in body["message"]
+        assert call(base, "GET", f"/status/{NAME}")[1]["holds"] == []
+        assert not any(line.startswith("start") for line in world.lines("docker.log"))
+
+    def test_a_suspension_while_waiting_ends_the_hold(self, world):
+        s = world.make(deployment=DEPLOYMENT)
+        box = in_background(s.hold, NAME, "merge-deploy", "deployed")
+        assert wait_for(lambda: s.status(NAME)["redeploy_pending"])
+        s.suspend(NAME, "keycloak did not answer")
+        box["thread"].join(10)
+        assert isinstance(box["error"], starter_mod.Failed)
+        assert "suspended" in box["error"].message
+        assert s.status(NAME)["holds"] == []
+
+    def test_a_hold_waits_for_a_running_stop_then_starts_again(self, world):
+        (world.state / "stop_sleep").write_text("1")
+        s = world.make()
+        s.start(NAME)
+        stopping = in_background(s.stop, NAME)
+        assert wait_for(lambda: s.status(NAME)["readiness"] == "stopping")
+        result = s.hold(NAME, "register-repo", "services")
+        stopping["thread"].join(10)
+        assert "result" in stopping
+        assert s.status(NAME)["container"]["state"] == "running"
+        assert [h["id"] for h in s.status(NAME)["holds"]] == [result["hold_id"]]
+
+    def test_a_hold_that_lands_before_the_stop_is_delivered_wins(self, world):
+        s = world.make()
+        s.start(NAME)
+        sb = s.sandboxes[NAME]
+        original = s._container_check
+
+        def check_then_a_hold_arrives(target):
+            original(target)
+            with s.lock:
+                sb.holds["hold-racer"] = {"id": "hold-racer", "owner": "register-repo",
+                                          "until": "services", "opened": s.wall()}
+
+        s._container_check = check_then_a_hold_arrives
+        with pytest.raises(starter_mod.Refused, match="held open"):
+            s.stop(NAME)
+        assert not any(line.startswith("stop") for line in world.lines("docker.log"))
+
+    def test_bad_hold_requests_are_refused(self, world):
+        base = world.http(world.make())
+        assert call(base, "POST", f"/hold/{NAME}?until=services")[0] == 400
+        assert call(base, "POST", f"/hold/{NAME}?owner=x")[0] == 400
+        assert call(base, "POST", f"/hold/{NAME}?owner=x&until=forever")[0] == 400
+        assert call(base, "DELETE", "/hold/hold-nothing")[0] == 404
+
+
+class TestCoordinatorRecords:
+    def test_ready_needs_a_running_supervisor(self, world):
+        base = world.http(world.make())
+        status, body = call(base, "POST", f"/ready/{NAME}")
+        assert status == 409 and "not running" in body["message"]
+
+    def test_a_suspension_is_durable_until_cleared(self, world):
+        first = world.make()
+        first.suspend(NAME, "the redeploy's health check failed")
+        first.close()
+        second = world.make()
+        assert second.status(NAME)["managed"] == {
+            "state": "suspended", "reason": "the redeploy's health check failed",
+        }
+        second.start(NAME)
+        with pytest.raises(starter_mod.Refused, match="suspended"):
+            second.stop(NAME)
+        second.clear(NAME)
+        assert second.status(NAME)["managed"]["state"] == "active"
+        assert "is stopped" in second.stop(NAME)["message"]
+
+    def test_a_suspension_needs_a_reason(self, world):
+        base = world.http(world.make())
+        assert call(base, "POST", f"/suspend/{NAME}")[0] == 400
+
+
+class TestRecovery:
+    def test_a_restart_in_the_middle_of_a_stop_waits_for_the_supervisor_to_exit(self, world):
+        (world.state / "stop_sleep").write_text("1.5")
+        first = world.make()
+        first.start(NAME)
+        in_background(first.stop, NAME)
+        assert wait_for(lambda: any(e["kind"] == "stop-delivered" for e in log_entries(world)))
+        first.close()  # the starter "restarts" while docker stop is still running
+        second = world.make()
+        report = second.status(NAME)
+        assert [o["op"] for o in report["operations"]["recovering"]] == ["stop"]
+        with pytest.raises(starter_mod.Refused, match="queued or running"):
+            second.stop(NAME)
+        assert wait_for(lambda: second.status(NAME)["operations"]["recovering"] == [])
+        report = second.status(NAME)
+        assert report["operations"]["unresolved"] is None
+        assert report["operations"]["last"]["outcome"] == "recovered"
+        assert "exited" in report["operations"]["last"]["message"]
+
+    def test_a_start_with_no_end_and_a_running_supervisor_is_recovered_at_once(self, world, tmp_path):
+        state_dir = tmp_path / "starter-state"
+        state_dir.mkdir()
+        (state_dir / f"{NAME}.jsonl").write_text(
+            json.dumps({"seq": 1, "kind": "op-queued", "op_id": 4, "op": "start"}) + "\n"
+            + json.dumps({"seq": 2, "kind": "op-begin", "op_id": 4, "op": "start"}) + "\n"
+            + '{"seq": 3, "kind": "readin'  # cut short by the crash
+        )
+        (world.state / "container").write_text("running\n")
+        s = world.make()
+        assert wait_for(lambda: s.status(NAME)["operations"]["recovering"] == [])
+        assert s.status(NAME)["operations"]["last"]["outcome"] == "recovered"
+        assert s.start(NAME)["operation"] == 5
+
+    def test_past_the_bound_it_is_unresolved_and_refuses_until_cleared(self, world, tmp_path):
+        state_dir = tmp_path / "starter-state"
+        state_dir.mkdir()
+        (state_dir / f"{NAME}.jsonl").write_text(
+            "\n".join(json.dumps(e) for e in [
+                {"seq": 1, "kind": "op-queued", "op_id": 1, "op": "stop"},
+                {"seq": 2, "kind": "op-begin", "op_id": 1, "op": "stop"},
+                {"seq": 3, "kind": "stop-delivered", "op_id": 1},
+            ]) + "\n"
+        )
+        (world.state / "container").write_text("running\n")  # never exits
+        clock = FakeClock()
+        s = world.make(clock=clock, STARTER_RECOVERY_POLL_SECONDS="10")
+        assert wait_for(lambda: s.status(NAME)["operations"]["unresolved"])
+        assert clock.now >= 1000.0 + 240
+        with pytest.raises(starter_mod.Refused, match="unresolved"):
+            s.start(NAME)
+        with pytest.raises(starter_mod.Refused, match="unresolved"):
+            s.stop(NAME)
+        with pytest.raises(starter_mod.Refused, match="unresolved"):
+            s.hold(NAME, "estate-check", "services")
+        s.clear(NAME)
+        assert s.start(NAME)["readiness"] == "ready"
+
+    def test_unresolved_is_kept_across_another_restart(self, world, tmp_path):
+        state_dir = tmp_path / "starter-state"
+        state_dir.mkdir()
+        (state_dir / f"{NAME}.jsonl").write_text(
+            json.dumps({"seq": 1, "kind": "unresolved", "reason": "it could not be told"}) + "\n"
+        )
+        s = world.make()
+        assert s.status(NAME)["operations"]["unresolved"] == "it could not be told"
+        with pytest.raises(starter_mod.Refused, match="POST /clear"):
+            s.start(NAME)
+
+
+class TestTheComposeFileRenders:
+    def test_it_renders_from_the_example_env_with_nothing_of_this_machine(self):
+        import re
+        import shutil
+        import subprocess
+
+        if shutil.which("docker") is None:
+            pytest.skip("docker is not installed here, so there is nothing to render")
+        bare = {k: os.environ[k] for k in ("PATH", "HOME", "DOCKER_CONFIG", "XDG_RUNTIME_DIR") if k in os.environ}
+        done = subprocess.run(
+            ["docker", "compose", "--project-name", "forge-sandbox-starter-check", "--env-file",
+             ".env.example", "--file", "compose.sandbox-starter.yaml", "config"],
+            cwd=COMPOSE.parent, env=bare, capture_output=True, text=True, timeout=120,
+        )
+        assert done.returncode == 0, done.stderr
+        rendered = done.stdout
+        addresses = set(re.findall(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", rendered))
+        assert addresses and all(a.startswith("192.0.2.") for a in addresses), addresses
+        assert "/home/" not in rendered
+        assert "starter.py" in rendered and "network_mode: host" in rendered
