@@ -1627,6 +1627,7 @@ async def compose_planning_consumer_and_dispatch(
             store=store,
             mission_flow=mission_flow,
             missions_enabled=bool(config.missions.enabled),
+            additional_approvers=tuple(config.approval.additional_approvers),
             publish_notification=_notify_in_thread,
             publish_build_queued=_publish_build_queued,
             publish_planning_failed=publish_planning_failed,

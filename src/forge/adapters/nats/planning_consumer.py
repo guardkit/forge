@@ -241,6 +241,9 @@ class PlanningConsumerDeps:
     mission_flow: Any | None = None
     #: Whether ``missions.enabled`` is on.
     missions_enabled: bool = False
+    #: ``approval.additional_approvers``: who besides a mission's sender may
+    #: stop it from Slack, by the same rule as its cards' answers.
+    additional_approvers: tuple[str, ...] = ()
 
     #: Whether ``publish_notification`` can be told which conversation to
     #: answer in. Read from the callable once, here, when the consumer is
@@ -739,8 +742,9 @@ async def _stop_mission(
 ) -> None:
     """Record a stop for a mission and answer in one sentence, in the thread.
 
-    Only the person the mission's cards are for may stop it from Slack (the
-    same rule as for its cards). The request goes through the one function
+    Only the person the mission's cards are for, or one of the factory's
+    additional approvers, may stop it from Slack (the same rule as for its
+    cards' answers, ``is_accepted_approver``). The request goes through the one function
     the command line calls too (:func:`forge.planning.missions_flow.stop_mission`).
     Always acked: a person can type it again. A store failure is not acked.
     """
@@ -767,7 +771,8 @@ async def _stop_mission(
             missions,
             str(command.get("mission_id") or ""),
             requested_by=payload.originating_user,
-            expected_approver=payload.originating_user,
+            approvers_only=True,
+            additional_approvers=deps.additional_approvers,
         )
     except Exception as exc:  # noqa: BLE001 — never lose the request
         logger.error(

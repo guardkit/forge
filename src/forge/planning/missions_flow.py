@@ -88,23 +88,30 @@ def stop_mission(
     mission_id: str,
     *,
     requested_by: str,
-    expected_approver: str | None = None,
+    approvers_only: bool = False,
+    additional_approvers: Sequence[str] = (),
 ) -> StopAnswer:
     """Ask for a mission to stop: the one function Slack and the command line call.
 
     Section 11. Records the request (:meth:`MissionStore.request_stop`) and
     answers in one plain sentence; the coordinator carries it out on its
-    next pass. ``expected_approver`` is the Slack route's rule, the same as
-    for the mission's cards: only the person the mission's cards are for may
-    stop it. The command line passes none.
+    next pass. ``approvers_only`` is the Slack route's rule, the same as for
+    the mission's cards (``is_accepted_approver``): the person the cards are
+    for, or one of ``approval.additional_approvers``. The command line is the
+    operator's route and passes neither.
     """
+    from forge.gating.identity import is_accepted_approver
+
     mission_id = str(mission_id or "").strip().lower()
-    if expected_approver is not None:
+    if approvers_only:
         mission = missions.get(mission_id)
-        if mission is not None and mission.originating_user != expected_approver:
+        if mission is not None and not is_accepted_approver(
+            requested_by, mission.originating_user, additional_approvers
+        ):
             return StopAnswer(
                 False,
-                f"only the person who sent mission {mission_id} can stop it",
+                f"only the person who sent mission {mission_id}, or an approver "
+                "named in the factory's settings, can stop it",
                 mission,
             )
     return missions.request_stop(mission_id, requested_by=requested_by)

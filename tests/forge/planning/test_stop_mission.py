@@ -390,7 +390,10 @@ async def test_only_the_expected_approver_can_stop_a_mission_by_slack(cx) -> Non
     deps = _intake_deps(cx, _FakeFlow(missions), enabled=True, said=said)
     msg = _stop_message(mission.id, user="U-SOMEONE")
     await handle_planning_message(msg, deps)
-    assert msg.acked and said == [f"Only the person who sent mission {mission.id} can stop it."]
+    assert msg.acked and said == [
+        f"Only the person who sent mission {mission.id}, or an approver named in "
+        "the factory's settings, can stop it."
+    ]
     assert missions.get(mission.id).stop_requested_at is None
     msg = _stop_message(mission.id.upper())
     await handle_planning_message(msg, deps)
@@ -420,8 +423,8 @@ async def test_the_command_line_and_slack_call_the_same_function(cx, tmp_path) -
         msg = _stop_message(mission.id)
         await handle_planning_message(msg, _intake_deps(cx, _FakeFlow(missions), enabled=True, said=said))
     assert [c["mission_id"] for c in calls] == [mission.id, mission.id]
-    assert calls[0]["requested_by"] == "operator" and calls[0].get("expected_approver") is None
-    assert calls[1]["requested_by"] == RICH and calls[1]["expected_approver"] == RICH
+    assert calls[0]["requested_by"] == "operator" and not calls[0].get("approvers_only")
+    assert calls[1]["requested_by"] == RICH and calls[1]["approvers_only"] is True
     assert "already asked for by operator" in said[-1]
 
 
@@ -556,3 +559,22 @@ async def test_a_plan_card_answered_after_a_stop_says_so(cx) -> None:
         'Mission "Tags for notes" was stopped before it started, so this answer '
         "changes nothing. Nothing was built."
     ]
+
+
+@pytest.mark.asyncio
+async def test_an_additional_approver_can_stop_a_mission_by_slack_and_a_stranger_cannot(cx) -> None:
+    from dataclasses import replace
+
+    missions = _running_mission(cx)
+    mission = _mission(missions)
+    said: list[str] = []
+    deps = replace(
+        _intake_deps(cx, _FakeFlow(missions), enabled=True, said=said),
+        additional_approvers=("U-COLLEAGUE",),
+    )
+    await handle_planning_message(_stop_message(mission.id, user="U-STRANGER"), deps)
+    assert said[-1].startswith(f"Only the person who sent mission {mission.id}")
+    assert missions.get(mission.id).stop_requested_at is None
+    await handle_planning_message(_stop_message(mission.id, user="U-COLLEAGUE"), deps)
+    assert said[-1].startswith("Stop requested; 4 waiting features won't start")
+    assert missions.get(mission.id).stop_requested_by == "U-COLLEAGUE"
