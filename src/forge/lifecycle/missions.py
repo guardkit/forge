@@ -960,8 +960,9 @@ class MissionStore:
         """A stopping mission whose work has drained → NOT_MERGED. Its reason, or None.
 
         Drained (section 11, step 5): no attempt WAITING or ADMITTED, none of
-        the mission's builds in ``active_build_states``, and none of their
-        publication records unsettled (no result yet, or a lease held). All
+        the mission's builds in ``active_build_states``, none of their
+        publication records unsettled (no result yet, or a lease held), and no
+        landing decision without its report (:meth:`_unreported_landings`). All
         read in the one transaction that closes it, from whatever active state
         it is in. The reason is "stopped by <who> at <when>; <n> landed on the
         branch, <m> did not".
@@ -1003,6 +1004,8 @@ class MissionStore:
                 active, unsettled = 0, 0
             if active or unsettled:
                 return None
+            if self._unreported_landings(cx, mission_id):
+                return None
             latest = self.latest_attempts(mission_id)
             features = self.features(mission_id)
             landed = sum(
@@ -1020,6 +1023,39 @@ class MissionStore:
                 (self._now(), reason, mission_id, row[0]),
             )
         return reason
+
+    @staticmethod
+    def _unreported_landings(cx: sqlite3.Connection, mission_id: str) -> int:
+        """How many of the mission's feature builds have a landing decision and no report.
+
+        THE INVARIANT (Codex implementation round 4, R2): a mission may not
+        leave RUNNING — to NOT_MERGED when it was stopped, or to READY — while
+        any of its landing decisions has no matching report. The press puts
+        its lease down before it reports, so a coordinator that stops between
+        the two leaves a settled record and no report; held here, the mission
+        stays active and the finisher writes that report from the record. The
+        stage names are the press's (``merge_deploy_decision`` and
+        ``merge_deploy_executor``), repeated so this low module imports none.
+        """
+        try:
+            row = cx.execute(
+                "SELECT COUNT(*) FROM builds AS b WHERE b.mission_id = ? "
+                "AND b.mission_role = ? "
+                "AND EXISTS (SELECT 1 FROM stage_log AS d WHERE d.build_id = b.build_id "
+                "AND d.target_identifier = 'merge_deploy_decision') "
+                "AND NOT EXISTS (SELECT 1 FROM stage_log AS r WHERE r.build_id = b.build_id "
+                "AND r.target_identifier = 'merge_deploy_executor')",
+                (mission_id, MISSION_ROLE_FEATURE),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            if "no such" not in str(exc).lower():
+                raise
+            return 0
+        return int(row[0]) if row else 0
+
+    def has_unreported_landings(self, mission_id: str) -> bool:
+        """Has a landing been decided for this mission whose report is not written yet?"""
+        return self._unreported_landings(self._cx, mission_id) > 0
 
     def request_stop(self, mission_id: str, *, requested_by: str) -> "StopAnswer":
         """Ask for a mission to stop. The one function Slack and the command line call.

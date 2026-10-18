@@ -425,11 +425,16 @@ class MissionStep:
     # -- 4 ----------------------------------------------------------------
 
     def mark_ready(self, mission: Mission) -> bool:
-        """RUNNING → READY once nothing is WAITING or ADMITTED."""
+        """RUNNING → READY once nothing is WAITING or ADMITTED, and every landing
+        decided has its report (the invariant of
+        :meth:`MissionStore._unreported_landings`: the finisher writes a missing
+        one from the settled record before the mission may move on)."""
         open_now = [
             a for a in self._missions.attempts(mission.id) if a.status in ("WAITING", "ADMITTED")
         ]
         if open_now or not self._missions.attempts(mission.id):
+            return False
+        if self._missions.has_unreported_landings(mission.id):
             return False
         if self._missions.set_status(mission.id, "READY", expected=("RUNNING",)):
             logger.info("missions: %s is READY — every feature has finished", mission.id)
