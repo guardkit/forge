@@ -48,6 +48,7 @@ from forge.cli._responder import (
     resolve_responder,
 )
 from forge.cli.runtime import build_cli_runtime
+from forge.gating.identity import is_accepted_approver
 from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
 
 __all__ = ["execute_cancel"]
@@ -199,7 +200,9 @@ def _cancel_at_card(
     if request is None:
         return False
 
-    approver = config_expected_approver(_selected_config(ctx))
+    config = _selected_config(ctx)
+    approver = config_expected_approver(config)
+    additional = getattr(getattr(config, "approval", None), "additional_approvers", ())
     signer = resolve_gate_responder(responder, approver=approver)
     if signer is None:
         _refuse(
@@ -209,7 +212,7 @@ def _cancel_at_card(
             "settings file (forge --config /etc/forge/forge.yaml cancel ..., or "
             "set $FORGE_CONFIG_PATH). Nothing was sent."
         )
-    if approver is not None and signer != approver:
+    if approver is not None and not is_accepted_approver(signer, approver, additional):
         _refuse(
             f"{build_id} — its card accepts an answer only from {approver!r}, "
             f"and this cancel would be signed {signer!r}, so the card would "

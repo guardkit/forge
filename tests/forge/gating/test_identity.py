@@ -27,7 +27,7 @@ import string
 import pytest
 
 from forge.gating import derive_request_id as reexported_derive
-from forge.gating.identity import derive_request_id
+from forge.gating.identity import derive_request_id, is_accepted_approver
 
 
 # Characters NATS treats as subject delimiters / wildcards. None of
@@ -330,3 +330,37 @@ class TestModuleImportsAreDomainPure:
             f"identity module must not import {leaked!r}; full import "
             f"set was {imported!r}"
         )
+
+
+# ---------------------------------------------------------------------------
+# is_accepted_approver (Linear front door, 18 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class TestIsAcceptedApprover:
+    def test_the_expected_approver_is_accepted(self) -> None:
+        assert is_accepted_approver("rich", "rich")
+
+    def test_a_listed_additional_approver_is_accepted(self) -> None:
+        assert is_accepted_approver("linear:user-0001", "rich", ["linear:user-0001"])
+
+    def test_an_unlisted_identity_is_refused(self) -> None:
+        assert not is_accepted_approver("linear:user-0002", "rich", ["linear:user-0001"])
+
+    def test_an_empty_list_is_the_old_equality(self) -> None:
+        assert not is_accepted_approver("linear:user-0001", "rich", [])
+        assert not is_accepted_approver("linear:user-0001", "rich")
+
+    def test_matching_is_verbatim(self) -> None:
+        assert not is_accepted_approver("Rich", "rich")
+        assert not is_accepted_approver(" rich", "rich")
+        assert not is_accepted_approver("LINEAR:user-0001", "rich", ["linear:user-0001"])
+
+    def test_an_empty_identity_never_counts(self) -> None:
+        assert not is_accepted_approver("", "")
+        assert not is_accepted_approver("", "rich", [""])
+        assert not is_accepted_approver(None, None)
+
+    def test_none_expected_is_not_permissive_here(self) -> None:
+        # Permissive mode stays the caller's own check.
+        assert not is_accepted_approver("anyone", None)

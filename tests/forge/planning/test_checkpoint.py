@@ -605,3 +605,121 @@ async def test_approval_envelope_carries_po_summary(tmp_db: sqlite3.Connection):
     if request_text_in_payload:
         # If request_text appears, it should be in a validated field, not raw
         assert "validated" in str(payload) or "summary" in str(payload)
+
+
+# ---------------------------------------------------------------------------
+# approval.additional_approvers (Linear front door, 18 October 2026)
+# ---------------------------------------------------------------------------
+
+
+async def _paused_planning_run(
+    tmp_db: sqlite3.Connection, correlation_id: str
+) -> tuple[Any, Any, str]:
+    """A planning run pinned to ``rich``, paused at its product-docs card."""
+    store = SqlitePlanningRunStore(tmp_db)
+    repository, state_machine = build_planning_gate_adapters(store, clock=_fixed_clock)
+    store.record_queued(
+        correlation_id=correlation_id,
+        originating_user="test-user",
+        expected_approver="rich",
+        request_text="test request",
+        triggered_by="test",
+    )
+    store.transition(
+        correlation_id=correlation_id,
+        to_state=PlanningState.RUNNING,
+        actor_identity="test",
+    )
+    plan_run_id = f"plan-{correlation_id}"
+    await checkpoint_product_docs(
+        plan_run_id=plan_run_id,
+        feature_id="FEAT-TEST-001",
+        repository=repository,
+        state_machine=state_machine,
+        publisher=_FakePublisher(),
+        second_opinion_provider=_FakeSecondOpinionProvider(summary_data={"title": "test"}),
+        clock=_fixed_clock,
+    )
+    request_id = derive_request_id(
+        build_id=plan_run_id, stage_label="product_docs", attempt_count=0
+    )
+    return repository, state_machine, request_id
+
+
+def _run_state(tmp_db: sqlite3.Connection, correlation_id: str) -> str:
+    row = tmp_db.execute(
+        "SELECT state FROM planning_runs WHERE correlation_id = ?",
+        (correlation_id,),
+    ).fetchone()
+    assert row is not None
+    return str(row[0])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decided_by", "additional", "outcome", "state"),
+    [
+        ("linear:user-0001", ("linear:user-0001",), "approved", PlanningState.RUNNING),
+        ("linear:user-0002", ("linear:user-0001",), "refused", PlanningState.PAUSED),
+        ("linear:user-0001", (), "refused", PlanningState.PAUSED),
+        ("rich", (), "approved", PlanningState.RUNNING),
+    ],
+)
+async def test_additional_approvers_on_a_planning_card(
+    tmp_db: sqlite3.Connection,
+    decided_by: str,
+    additional: tuple[str, ...],
+    outcome: str,
+    state: PlanningState,
+):
+    """A listed collaborator answers; an unlisted one is refused; empty = as before."""
+    from forge.planning.checkpoint import _dispatch_approval_response
+
+    correlation_id = "test-additional-001"
+    repository, state_machine, request_id = await _paused_planning_run(
+        tmp_db, correlation_id
+    )
+    result = await _dispatch_approval_response(
+        response=ApprovalResponsePayload(
+            request_id=request_id, decision="approve", decided_by=decided_by
+        ),
+        repository=repository,
+        state_machine=state_machine,
+        clock=_fixed_clock,
+        additional_approvers=additional,
+    )
+    assert result == outcome
+    assert _run_state(tmp_db, correlation_id) == state.value
+
+
+@pytest.mark.asyncio
+async def test_first_answer_wins_between_collaborator_and_approver(
+    tmp_db: sqlite3.Connection,
+):
+    """The collaborator's reject lands first; the approver's later approve is refused."""
+    from forge.planning.checkpoint import _dispatch_approval_response
+
+    correlation_id = "test-additional-002"
+    repository, state_machine, request_id = await _paused_planning_run(
+        tmp_db, correlation_id
+    )
+    first = await _dispatch_approval_response(
+        response=ApprovalResponsePayload(
+            request_id=request_id, decision="reject", decided_by="linear:user-0001"
+        ),
+        repository=repository,
+        state_machine=state_machine,
+        clock=_fixed_clock,
+        additional_approvers=("linear:user-0001",),
+    )
+    second = await _dispatch_approval_response(
+        response=ApprovalResponsePayload(
+            request_id=request_id, decision="approve", decided_by="rich"
+        ),
+        repository=repository,
+        state_machine=state_machine,
+        clock=_fixed_clock,
+        additional_approvers=("linear:user-0001",),
+    )
+    assert (first, second) == ("rejected", "refused")
+    assert _run_state(tmp_db, correlation_id) == PlanningState.CANCELLED.value

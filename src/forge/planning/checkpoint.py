@@ -28,11 +28,15 @@ from __future__ import annotations
 import json
 import logging
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Callable, Protocol
+from typing import TYPE_CHECKING, Any, Callable, Protocol, Sequence
 
 from dataclasses import dataclass
 
-from forge.gating.identity import derive_request_id, parse_request_id
+from forge.gating.identity import (
+    derive_request_id,
+    is_accepted_approver,
+    parse_request_id,
+)
 from forge.gating.models import GateDecision, GateMode
 from forge.pipeline.stage_names import plain_stage_name
 from forge.planning.revision import (
@@ -467,6 +471,7 @@ async def _dispatch_approval_response(
     state_machine: StateMachine,
     clock: Callable[[], datetime],
     escalation_context: PlanningEscalationContext | None = None,
+    additional_approvers: Sequence[str] = (),
 ) -> str:
     """Dispatch approval response to appropriate handler.
 
@@ -483,6 +488,9 @@ async def _dispatch_approval_response(
         state_machine: State machine for transitions.
         clock: Clock for timestamps.
         escalation_context: Optional collaborators for the defer branch.
+        additional_approvers: ``approval.additional_approvers`` — identities
+            accepted as well as the run's pinned approver. Empty = only the
+            pinned approver (the behaviour before 18 October 2026).
 
     Returns:
         Outcome discriminator: one of ``"approved"``, ``"rejected"``,
@@ -556,7 +564,7 @@ async def _dispatch_approval_response(
         return "refused"
 
     # AC-004: Validate responder identity against expected_approver
-    if responder != expected_approver:
+    if not is_accepted_approver(responder, expected_approver, additional_approvers):
         logger.warning(
             "_dispatch_approval_response: responder identity mismatch for %s: "
             "got %s, expected %s; run stays PAUSED",

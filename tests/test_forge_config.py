@@ -203,6 +203,7 @@ class TestYamlRoundTrip:
                 "default_wait_seconds": 300,
                 "max_wait_seconds": 3600,
                 "expected_approver": "rich",
+                "additional_approvers": [],
             },
             # ``queue`` was added by TASK-PSM-003 — the round-trip dump now
             # always includes it, so the canonical input dict must declare it

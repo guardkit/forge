@@ -59,7 +59,11 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable, Mapping, Sequence
 
 import yaml
 
-from forge.gating.identity import derive_request_id, parse_request_id
+from forge.gating.identity import (
+    derive_request_id,
+    is_accepted_approver,
+    parse_request_id,
+)
 from forge.lifecycle.identifiers import validate_feature_id
 from forge.lifecycle.missions import mission_membership
 from forge.pipeline.dispatchers.specialist import (
@@ -1783,6 +1787,10 @@ class PlanningDriverDeps:
     dispatch_build_trigger: DispatchBuildTriggerFn | None = None
     feature_routing_gate: Any | None = None
     feature_routing_required: bool = False
+    # ``approval.additional_approvers`` (Linear front door, 18 October 2026):
+    # identities whose answer to a planning card counts as well as the run's
+    # pinned approver. Empty (the default) = only the pinned approver.
+    additional_approvers: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2539,6 +2547,7 @@ class PlanningRunDriver:
                 repository=deps.repository,
                 state_machine=deps.state_machine,
                 clock=deps.clock,
+                additional_approvers=deps.additional_approvers,
                 escalation_context=PlanningEscalationContext(
                     store=deps.store,
                     policy=self._policy(cfg),
@@ -9695,7 +9704,9 @@ class PlanningRunDriver:
                 continue
 
             # Per-run approver pinning (verbatim equality, JNB-101/104).
-            if expected_approver and response.decided_by != expected_approver:
+            if expected_approver and not is_accepted_approver(
+                response.decided_by, expected_approver, deps.additional_approvers
+            ):
                 logger.warning(
                     "planning driver: %s responder mismatch for %s (got %s, "
                     "expected %s); the door stays open",

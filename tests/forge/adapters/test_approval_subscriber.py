@@ -689,6 +689,70 @@ class TestUnrecognisedResponder:
 
 
 # ---------------------------------------------------------------------------
+# approval.additional_approvers (Linear front door, 18 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class TestAdditionalApprovers:
+    """A listed collaborator may answer; nobody else; first answer wins."""
+
+    @staticmethod
+    def _sub(additional: list[str]) -> ApprovalSubscriber:
+        sub = ApprovalSubscriber(
+            _make_deps(
+                expected_approver="rich",
+                config=ApprovalConfig(additional_approvers=additional),
+            )
+        )
+        sub._queues[BUILD_ID] = asyncio.Queue()
+        return sub
+
+    @pytest.mark.asyncio
+    async def test_a_listed_additional_approver_is_accepted(self) -> None:
+        sub = self._sub(["linear:user-0001"])
+        env = _make_envelope(request_id="req-1", decided_by="linear:user-0001")
+        await sub._on_envelope(build_id=BUILD_ID, envelope=env)
+        payload = await asyncio.wait_for(sub._queues[BUILD_ID].get(), timeout=0.1)
+        assert payload.decided_by == "linear:user-0001"
+
+    @pytest.mark.asyncio
+    async def test_an_unlisted_identity_is_still_refused(self) -> None:
+        sub = self._sub(["linear:user-0001"])
+        env = _make_envelope(request_id="req-1", decided_by="linear:user-0002")
+        await sub._on_envelope(build_id=BUILD_ID, envelope=env)
+        assert sub._queues[BUILD_ID].empty()
+        assert "req-1" not in sub._dedup
+
+    @pytest.mark.asyncio
+    async def test_with_an_empty_list_only_the_expected_approver_counts(
+        self,
+    ) -> None:
+        sub = self._sub([])
+        other = _make_envelope(request_id="req-1", decided_by="linear:user-0001")
+        await sub._on_envelope(build_id=BUILD_ID, envelope=other)
+        assert sub._queues[BUILD_ID].empty()
+        rich = _make_envelope(request_id="req-1", decided_by="rich")
+        await sub._on_envelope(build_id=BUILD_ID, envelope=rich)
+        payload = await asyncio.wait_for(sub._queues[BUILD_ID].get(), timeout=0.1)
+        assert payload.decided_by == "rich"
+
+    @pytest.mark.asyncio
+    async def test_first_answer_wins_between_collaborator_and_approver(
+        self,
+    ) -> None:
+        sub = self._sub(["linear:user-0001"])
+        first = _make_envelope(
+            request_id="req-1", decision="reject", decided_by="linear:user-0001"
+        )
+        second = _make_envelope(request_id="req-1", decision="approve", decided_by="rich")
+        await sub._on_envelope(build_id=BUILD_ID, envelope=first)
+        await sub._on_envelope(build_id=BUILD_ID, envelope=second)
+        payload = await asyncio.wait_for(sub._queues[BUILD_ID].get(), timeout=0.1)
+        assert (payload.decided_by, payload.decision) == ("linear:user-0001", "reject")
+        assert sub._queues[BUILD_ID].empty()
+
+
+# ---------------------------------------------------------------------------
 # AC-010 — Refresh-on-timeout per API §7
 # ---------------------------------------------------------------------------
 

@@ -119,6 +119,9 @@ class TestApprovalConfigImmutability:
             "default_wait_seconds",
             "max_wait_seconds",
             "expected_approver",
+            # Added deliberately by the Linear front door design (18 October
+            # 2026): other identities whose answer to a card counts.
+            "additional_approvers",
         }
 
         # Get actual fields from the model

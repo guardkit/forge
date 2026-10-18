@@ -762,6 +762,69 @@ class TestConsumerAuthz:
         assert gk.calls == []
 
 
+def _with_additional_approvers(config: ForgeConfig, approvers: list[str]) -> ForgeConfig:
+    approval = config.approval.model_copy(update={"additional_approvers": approvers})
+    return config.model_copy(update={"approval": approval})
+
+
+class TestAdditionalApprovers:
+    """``approval.additional_approvers`` (Linear front door, 18 October 2026)."""
+
+    COLLABORATOR = "linear:user-0001"
+
+    @pytest.mark.asyncio
+    async def test_a_listed_collaborator_may_say_merge(self, config, pool) -> None:
+        _write_offer(pool)
+        deps, _, gk, _ = _deps(
+            _with_additional_approvers(config, [self.COLLABORATOR]), pool
+        )
+        consumer = MergeApprovalConsumer(deps)
+        await consumer.handle_envelope(_envelope(decided_by=self.COLLABORATOR))
+        await _drain(consumer)
+        assert len(gk.calls) == 1
+        assert MERGE_DECISION_TARGET_IDENTIFIER in _stage_ids(pool)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("decided_by", "approvers"),
+        [("linear:user-0002", [COLLABORATOR]), (COLLABORATOR, [])],
+    )
+    async def test_an_unlisted_identity_is_still_refused(
+        self, config, pool, decided_by: str, approvers: list[str]
+    ) -> None:
+        _write_offer(pool)
+        deps, _, gk, _ = _deps(_with_additional_approvers(config, approvers), pool)
+        consumer = MergeApprovalConsumer(deps)
+        await consumer.handle_envelope(_envelope(decided_by=decided_by))
+        await _drain(consumer)
+        assert gk.calls == []
+        assert MERGE_DECISION_TARGET_IDENTIFIER not in _stage_ids(pool)
+
+    @pytest.mark.asyncio
+    async def test_first_answer_wins_between_collaborator_and_approver(
+        self, config, pool
+    ) -> None:
+        _write_offer(pool)
+        deps, _, gk, dp = _deps(
+            _with_additional_approvers(config, [self.COLLABORATOR]), pool
+        )
+        consumer = MergeApprovalConsumer(deps)
+        await consumer.handle_envelope(
+            _envelope(decision="reject", decided_by=self.COLLABORATOR)
+        )
+        await _drain(consumer)
+        await consumer.handle_envelope(_envelope(decided_by="rich"))
+        await _drain(consumer)
+        assert gk.calls == []
+        assert dp.calls == []
+        decisions = [
+            s
+            for s in pool.read_stages(BUILD_ID)
+            if s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
+        ]
+        assert [d.status for d in decisions] == ["SKIPPED"]
+
+
 class TestConsumerDecisions:
     @pytest.mark.asyncio
     async def test_reject_records_and_reports_skipped(self, config, pool) -> None:
