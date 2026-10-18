@@ -49,9 +49,10 @@ from __future__ import annotations
 
 # AC-007: only standard-library imports — nothing from ``nats_core``,
 # ``nats-py``, or ``langgraph``.
+from collections.abc import Iterable
 from urllib.parse import quote, unquote
 
-__all__ = ["derive_request_id", "parse_request_id"]
+__all__ = ["derive_request_id", "is_accepted_approver", "parse_request_id"]
 
 
 # Characters that are RFC 3986 unreserved but problematic for NATS
@@ -191,3 +192,26 @@ def parse_request_id(request_id: str) -> tuple[str, str, int]:
             f"non-empty; got build_id={build_id!r} stage_label={stage_label!r}"
         )
     return build_id, stage_label, attempt_count
+
+
+def is_accepted_approver(
+    decided_by: str | None,
+    expected: str | None,
+    additional: Iterable[str] = (),
+) -> bool:
+    """True when ``decided_by`` may answer a card pinned to ``expected``.
+
+    The one identity rule every card answer goes through (Linear front door,
+    18 October 2026): the answer counts when ``decided_by`` string-equals the
+    card's expected approver VERBATIM (no trimming, no case folding), or is
+    one of the configured ``approval.additional_approvers``. An empty
+    ``decided_by`` never counts. With no additional approvers this is exactly
+    the old ``decided_by == expected`` comparison.
+
+    Permissive mode (``expected is None`` — any responder accepted) stays the
+    caller's own check, as before; this helper only answers "is this the
+    right person".
+    """
+    if not decided_by:
+        return False
+    return decided_by == expected or decided_by in tuple(additional)

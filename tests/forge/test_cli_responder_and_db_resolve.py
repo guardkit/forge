@@ -181,3 +181,75 @@ class TestPausedCancelThreadsResponder:
             persistence=SimpleNamespace(get_build_row=lambda _b: row)
         )
         assert gate_inject.pending_gate_request(runtime, build_id="b") is None
+
+
+# ---------------------------------------------------------------------------
+# forge cancel at a card: the signer check mirrors the card's own rule,
+# approval.additional_approvers included (Linear front door, 18 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class TestCancelAtCardSignerCheck:
+    COLLABORATOR = "linear:user-0001"
+
+    def _run(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        responder: str,
+        additional: list[str],
+    ) -> list[str]:
+        from forge.cli import _cancel_run as cancel_run
+        from forge.config.models import ForgeConfig
+        from forge.lifecycle.state_machine import BuildState
+
+        sent: list[str] = []
+        monkeypatch.setattr(
+            cancel_run, "pending_gate_request", lambda runtime, *, build_id: object()
+        )
+        monkeypatch.setattr(
+            cancel_run,
+            "send_paused_cancel",
+            lambda *, build_id, request, reason, responder: sent.append(responder),
+        )
+        monkeypatch.setattr(
+            cancel_run, "_status_after_cancel", lambda *a: BuildState.CANCELLED
+        )
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "approval": {
+                    "expected_approver": "rich",
+                    "additional_approvers": additional,
+                },
+            }
+        )
+        assert cancel_run._cancel_at_card(
+            object(),
+            ctx=SimpleNamespace(obj=config),
+            build_id="build-X",
+            reason="stop",
+            responder=responder,
+            confirm_seconds=0,
+            poll_seconds=0,
+        )
+        return sent
+
+    def test_a_listed_collaborator_may_sign_the_cancel(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sent = self._run(
+            monkeypatch, responder=self.COLLABORATOR, additional=[self.COLLABORATOR]
+        )
+        assert sent == [self.COLLABORATOR]
+
+    @pytest.mark.parametrize(
+        ("responder", "additional"),
+        [("linear:user-0002", [COLLABORATOR]), (COLLABORATOR, [])],
+    )
+    def test_an_unlisted_signer_is_refused_before_sending(
+        self, monkeypatch: pytest.MonkeyPatch, responder: str, additional: list[str]
+    ) -> None:
+        with pytest.raises(SystemExit) as exc:
+            self._run(monkeypatch, responder=responder, additional=additional)
+        assert exc.value.code == 2

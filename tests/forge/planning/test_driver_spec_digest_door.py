@@ -398,6 +398,7 @@ def _make_driver(
     git: Any | None = None,
     target_terminal_enabled: bool = True,
     classify: Any | None = None,
+    additional_approvers: tuple[str, ...] = (),
 ) -> _Harness:
     from datetime import UTC, datetime
 
@@ -500,6 +501,7 @@ def _make_driver(
         # THE PROVABILITY CHECK BEFORE THE CARD (Part K): unwired by default —
         # the not-wired path, receipted; the provability tests inject a fake.
         classify_scenarios=classify,
+        additional_approvers=additional_approvers,
     )
     return _Harness(
         PlanningRunDriver(deps),
@@ -1029,6 +1031,125 @@ async def test_a_stranger_and_a_stale_card_are_both_ignored(
         "GATED",
         "timed_out",
     ]
+
+
+# ---------------------------------------------------------------------------
+# approval.additional_approvers (Linear front door, 18 October 2026)
+# ---------------------------------------------------------------------------
+
+_COLLABORATOR = "linear:user-0001"
+
+
+@pytest.mark.asyncio
+async def test_a_listed_collaborator_answers_the_card(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("approve", decided_by=_COLLABORATOR)]
+        ),
+        additional_approvers=(_COLLABORATOR,),
+    )
+
+    await h.driver.drive(CID)
+
+    rows = _events(store, _DIGEST_STAGE)
+    assert [s for s, _d in rows] == ["GATED", "approved"]
+    assert rows[-1][1]["digest_review"]["decided_by"] == _COLLABORATOR
+    assert len(h.ctx["build_triggers"]) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("decided_by", "additional"),
+    [
+        ("linear:user-0002", (_COLLABORATOR,)),  # not on the list
+        (_COLLABORATOR, ()),  # an empty list changes nothing
+    ],
+)
+async def test_an_unlisted_identity_is_still_ignored(
+    store: SqlitePlanningRunStore,
+    decided_by: str,
+    additional: tuple[str, ...],
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve", decided_by=decided_by)]),
+        originator_wait_seconds=1,
+        additional_approvers=additional,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert [status for status, _d in _events(store, _DIGEST_STAGE)] == [
+        "GATED",
+        "timed_out",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("additional", "cleared"),
+    [((_COLLABORATOR,), [_COLLABORATOR]), ((), [])],
+)
+async def test_the_brief_pause_takes_the_list_too(
+    tmp_path: Path, additional: tuple[str, ...], cleared: list[str]
+) -> None:
+    """With the machine chain OFF the brief card is answered through the
+    checkpoint dispatch, and the driver hands it the same list."""
+    cx = sqlite_connect.connect_writer(tmp_path / "off.db")
+    migrations.apply_at_boot(cx)
+    off_store = SqlitePlanningRunStore(cx, target_terminal_enabled=False)
+    _queue(off_store)
+    brief = ApprovalResponsePayload(
+        request_id=derive_request_id(
+            build_id=PLAN_RUN_ID, stage_label="product_docs", attempt_count=0
+        ),
+        decision="approve",
+        decided_by=_COLLABORATOR,
+    )
+    h = _make_driver(
+        off_store,
+        subscriber_factory=SharedScriptFactory([brief]),
+        target_terminal_enabled=False,
+        originator_wait_seconds=1,
+        additional_approvers=additional,
+    )
+
+    await h.driver.drive(CID)
+
+    assert [
+        e["actor_identity"]
+        for e in off_store.list_events(CID)
+        if e["status"] == "checkpoint_cleared"
+    ] == cleared
+
+
+@pytest.mark.asyncio
+async def test_first_answer_wins_between_a_collaborator_and_the_owner(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The collaborator's stop lands first; the owner's later approve is never read."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [
+                _answer("reject", notes="reject", decided_by=_COLLABORATOR),
+                _answer("approve"),
+            ]
+        ),
+        additional_approvers=(_COLLABORATOR,),
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.CANCELLED.value
+    assert len(h.ctx["build_triggers"]) == 0
 
 
 # ---------------------------------------------------------------------------

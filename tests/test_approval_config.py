@@ -150,6 +150,7 @@ class TestApprovalYamlRoundTrip:
                 "default_wait_seconds": 120,
                 "max_wait_seconds": 1800,
                 "expected_approver": "rich",
+                "additional_approvers": [],
             },
             "permissions": {
                 "filesystem": {
@@ -187,6 +188,7 @@ class TestApprovalYamlRoundTrip:
                 "default_wait_seconds": 300,
                 "max_wait_seconds": 3600,
                 "expected_approver": "rich",
+                "additional_approvers": [],
             },
             # ``queue`` was added by TASK-PSM-003 — the round-trip dump now
             # always includes it, so this "all sections" test must declare
@@ -490,3 +492,24 @@ class TestNoForbiddenImports:
             assert f"from {forbidden}" not in source, (
                 f"forge.config.models must not import from {forbidden}"
             )
+
+
+# ---------------------------------------------------------------------------
+# approval.additional_approvers (Linear front door, 18 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class TestAdditionalApprovers:
+    def test_empty_by_default(self) -> None:
+        assert ApprovalConfig().additional_approvers == []
+
+    def test_yaml_list_is_read_verbatim(self) -> None:
+        cfg = ApprovalConfig.model_validate(
+            {"additional_approvers": ["linear:user-0001", "U0SECOND1"]}
+        )
+        assert cfg.additional_approvers == ["linear:user-0001", "U0SECOND1"]
+
+    def test_each_config_gets_its_own_list(self) -> None:
+        a, b = ApprovalConfig(), ApprovalConfig()
+        a.additional_approvers.append("intruder")
+        assert b.additional_approvers == []

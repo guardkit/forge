@@ -637,6 +637,36 @@ answer.
   HTTP, a public address or a tunnel becomes the machine's business and a new
   published port, with its own per-route rule, becomes this bundle's.
 
+## The Linear door (18 October 2026)
+
+An optional service, `linear-door`, that lets the factory take work from a Linear team: an issue moved to Todo
+becomes a sentence, issues sharing a `mission: <name>` label become a mission, and the factory's cards and progress
+are written back to the issues as comments (design: ai-transition `docs/designs/linear-front-door-2026-10-18.md`).
+It only makes outgoing calls to Linear; nothing is exposed.
+
+- **Off unless asked for.** It carries the `linear` profile. To include it, **add** `linear` to the env file's
+  `COMPOSE_PROFILES` line rather than passing `--profile` (which replaces the env file's profiles, see the top of
+  `compose.yaml`): local bus `COMPOSE_PROFILES=local-bus,linear`, or `local-bus,sandbox,linear` on a machine that
+  looks after a sandbox; external bus `COMPOSE_PROFILES=linear` (that mode otherwise leaves it empty), or
+  `sandbox,linear`. Without it, nothing about the estate changes. It joins the `factory` network, and the
+  retained bus's network in external mode.
+- **Its key** comes from the child process's environment as `LINEAR_API_KEY`, the same way the Slack tokens do,
+  and is handed to the service as a file. On this estate it is kept in fleet-secrets
+  `slack-jarvis/linear.enc.env`, so that file joins the others the start reads. The env file defines `LINEAR_API_KEY=` **empty**
+  (see `.env.example`), and the start's own environment, which carries the real key, takes precedence over it. So
+  with the profile on: key present, the door gets it as a file; key absent, the door starts with no key file,
+  logs one line and exits cleanly, and `restart: on-failure` leaves it stopped. (Without that empty line, an
+  absent key would stop Compose creating this one container.) Checked with Compose v5.2.0 on a throwaway project,
+  18 October 2026: undefined, empty-in-env-file, and set-in-process-over-empty-env-file.
+- **Its settings**, in the env file: `JARVIS_LINEAR_TEAM` (the team's key, for example `FAC`, or its exact name),
+  `JARVIS_LINEAR_DEFAULT_REPO`, and `JARVIS_LINEAR_APPROVERS` (`<linear user id>=<identity>,...`: who may answer a
+  card from Linear, and the identity the answer carries). Optionally `JARVIS_LINEAR_OWNER_IDENTITY`, the identity a
+  Linear request is filed for; empty means the Slack planning originator. With no team or key the door logs one
+  line and exits,
+  and `restart: on-failure` leaves it stopped.
+- **What it reads:** Forge's record, read-only (the same mount as the answer service), and its own small state
+  volume `linear-door-state`. It is not given the Slack tokens.
+
 ## Walk (b): a cloud machine
 
 **The same nine steps, the same bundle, the same images.** Only `.env` differs,
