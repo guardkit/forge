@@ -150,6 +150,11 @@ security_sweep_config: Any | None = None
 # starter beside the daemon. ``None`` (the default) leaves both steps out.
 sandbox_gate: Any | None = None
 
+# ``(nats client) -> redeploy route`` for the sandbox gate, set beside it by
+# ``bind_production_serve``; the serve loop installs the route on the gate as
+# soon as the client is connected, before the gate's boot step.
+sandbox_redeploy_factory: Any | None = None
+
 # stdlib ``logging`` format chosen for daemon-grep readability across
 # replicas: ISO-8601 timestamp, level, logger name, message. If the
 # project ever moves to structlog/JSON, ``_configure_logging`` is the
@@ -3076,6 +3081,8 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
         # always finds a ready sandbox. Never raises; nothing without a gate.
         if sandbox_gate is not None:
             try:
+                if sandbox_redeploy_factory is not None:
+                    sandbox_gate.set_redeploy(sandbox_redeploy_factory(client))
                 await sandbox_gate.boot()
             except Exception as exc:  # noqa: BLE001 — never blocks boot
                 logger.error(

@@ -1444,6 +1444,19 @@ def bind_production_serve(config: ServeConfig, forge_config: ForgeConfig) -> Non
     )
     install_gate(gate)
     serve_module.sandbox_gate = gate
+    serve_module.sandbox_redeploy_factory = None
+    if gate is not None:
+        from forge.sandbox_gate.redeploy import compose_redeploy
+
+        def _redeploy_factory(client: Any) -> Any:
+            return compose_redeploy(
+                forge_config=forge_config,
+                sqlite_pool=sqlite_pool,
+                nats_client=client,
+                db_path=config.db_path,
+            )
+
+        serve_module.sandbox_redeploy_factory = _redeploy_factory
     if gate is not None:
         logger.info(
             "forge-serve: the sandbox gate manages %s (idle stops after %d minutes)",

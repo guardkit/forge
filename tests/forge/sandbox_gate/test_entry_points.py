@@ -337,6 +337,9 @@ class _RecordingGate:
     def __init__(self, events: list[str]) -> None:
         self.events = events
 
+    def set_redeploy(self, route: Any) -> None:
+        self.events.append(f"set_redeploy {route}")
+
     async def boot(self) -> list[str]:
         self.events.append("sandbox_gate_boot")
         return [SANDBOX]
@@ -386,7 +389,11 @@ def test_boot_takes_the_gate_before_recovery(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setattr(serve_module, "run_daemon", daemon)
     monkeypatch.setattr(serve_module, "run_healthz_server", healthz)
     monkeypatch.setattr(serve_module, "sandbox_gate", _RecordingGate(events))
+    monkeypatch.setattr(
+        serve_module, "sandbox_redeploy_factory", lambda client: f"route-on-{type(client).__name__}"
+    )
     asyncio.run(serve_module._run_serve(ServeConfig(), SubscriptionState()))
+    assert events.index("set_redeploy route-on-_StubNatsClient") < events.index("sandbox_gate_boot")
     assert events.index("sandbox_gate_boot") < events.index("recovery_reconcile")
     assert events.index("sandbox_gate_boot") < events.index("compose_dispatch_chain")
     assert "sandbox_gate_poll" in events

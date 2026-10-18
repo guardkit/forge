@@ -98,10 +98,16 @@ class SandboxNotReady(Exception):
 
 @dataclass(frozen=True)
 class RedeployOutcome:
-    """What the redeploy route said: back and verified, or why not."""
+    """What the redeploy route said: back and verified, or why not.
+
+    ``retry`` marks a redeploy that did not run for a reason that passes by
+    itself (another holder of the deployment lock): it is asked for again,
+    and management is not suspended for it.
+    """
 
     ok: bool
     sentence: str = ""
+    retry: bool = False
 
 
 #: ``(GET url, timeout seconds) -> (HTTP status, body text)``; raises when the
@@ -141,6 +147,10 @@ class _Slot:
     unmanaged: str | None = None
     #: Lines already said, so a held queue says each once.
     said: set[str] = field(default_factory=set)
+    #: The gate itself started the sandbox in this bring-up: a recorded
+    #: deployment is brought back even if the starter's own settings name
+    #: none and it does not report "redeploy pending".
+    woke_it: bool = False
 
     def __post_init__(self) -> None:
         self.stop_settled.set()
@@ -209,6 +219,13 @@ class SandboxGate:
             self._slots[name] = slot
             for repo in repos:
                 self._by_repo[repo] = slot
+
+    def set_redeploy(
+        self, redeploy: Callable[[str, tuple[str, ...]], Awaitable[RedeployOutcome]] | None
+    ) -> None:
+        """Install the route that brings a recorded deployment back (the
+        coordinator composes it once its message bus is connected)."""
+        self._redeploy = redeploy
 
     # -- what is managed ------------------------------------------------------
 
@@ -420,6 +437,8 @@ class SandboxGate:
                     ok=False,
                     sentence=f"the redeploy raised ({type(exc).__name__}: {exc})",
                 )
+        if outcome.retry and not outcome.ok:
+            return outcome.sentence or "the redeploy is asked for again"
         if outcome.ok:
             answer = await self._starter.ready(slot.name)
             if not answer.ok:
@@ -484,6 +503,8 @@ class SandboxGate:
                     answer = await self._starter.start(
                         slot.name, deployment=self._deployment_for(slot)
                     )
+                    if answer.ok:
+                        slot.woke_it = True
                     why = (
                         f"the starter refused to start {slot.name}: {answer.sentence}"
                         if answer.refused
@@ -497,7 +518,9 @@ class SandboxGate:
                 missing = await self._services_answer(slot)
                 if missing is not None:
                     why = missing
-                elif status.redeploy_pending:
+                elif status.redeploy_pending or (
+                    slot.woke_it and self._has_recorded_deployment(slot)
+                ):
                     not_settled = await self._settle_redeploy(slot)
                     if not_settled is None:
                         self._now_ready(slot)
@@ -522,6 +545,7 @@ class SandboxGate:
             logger.info("sandbox gate: %s is ready", slot.name)
         slot.state = READY
         slot.failure = None
+        slot.woke_it = False
         slot.said.clear()
         slot.idle_since = None
 
