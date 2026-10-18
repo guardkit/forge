@@ -1164,25 +1164,43 @@ def outcome_from_stored(said: dict[str, Any]) -> "MergeDeployOutcome":
     return MergeDeployOutcome(**{name: fields.get(name) for name in _OUTCOME_FIELDS})
 
 
-def landing_left_standing_sentence(feature_id: str, record: Any, kept: str) -> str:
+def landing_left_standing_sentence(
+    feature_id: str, record: Any, kept: str, *, handed: str | None = None
+) -> str:
     """The one plain line for a mission landing that left something standing.
 
     It names the feature and the candidate the check stood up, by the
-    identity handed to the check, and says how it is removed.
+    identity handed to the check (``handed``, else the record's), and says
+    how it is removed. It says the feature LANDED only when the record says
+    it was published to the mission branch (Codex round 3, R9): a press that
+    stopped before publishing — a failed check among them — landed nothing.
     """
-    checked = dict(getattr(record, "checked", None) or {})
-    identity = checked.get("identity") or {}
-    handed = identity.get("handed_to_the_check") if isinstance(identity, dict) else None
-    named = f"candidate {handed}" if handed else "candidate (no identity was recorded for it)"
-    if "answer was lost" in kept:
+    if not handed:
+        checked = dict(getattr(record, "checked", None) or {})
+        identity = checked.get("identity") or {}
+        handed = identity.get("handed_to_the_check") if isinstance(identity, dict) else None
+    named = f"identity {handed}" if handed else "no identity was recorded for it"
+    lost = "answer was lost" in kept
+    if getattr(record, "result", None) == RESULT_PUBLISHED_TO_MISSION_BRANCH:
+        if lost:
+            return (
+                f"{feature_id} landed, but a deploy-stage step for its check got no "
+                f"answer, so its candidate ({named}) may still be standing; remove "
+                "it with the project's own teardown step."
+            )
         return (
-            f"{feature_id} landed, but a deploy-stage step for its check got no "
-            f"answer, so its {named} may still be standing; remove it with the "
+            f"{feature_id} landed, but its check's candidate ({named}) may still "
+            "be standing; remove it with the project's own teardown step."
+        )
+    if lost:
+        return (
+            f"{feature_id}'s check got no answer from a deploy-stage step, so its "
+            f"candidate ({named}) may still be standing; remove it with the "
             "project's own teardown step."
         )
     return (
-        f"{feature_id} landed, but its check's {named} may still be standing; "
-        "remove it with the project's own teardown step."
+        f"{feature_id}'s check left its candidate standing ({named}); remove it "
+        "with the project's own teardown step."
     )
 
 
@@ -1679,14 +1697,20 @@ async def _finish_the_warning(
     because a repeated line is far better than a lost warning."""
     if not ending.warning:
         return STEP_SKIPPED
-    if written is not None and written.warning_delivered_at:
-        return STEP_DONE
-    if store is not None and press_turn and not (written and written.warning):
-        store.mark_outcome(
-            build_id=ending.build_id,
-            turn=press_turn,
-            warning_json={"sentence": ending.warning, "mission_id": ending.mission_id},
+    # TWO SUB-STEPS, each retried until done (Codex round 3, R8): the
+    # sentence kept on the row (the mission's card reads it), and its
+    # delivery. Neither is redone once done.
+    kept_on_the_row = store is None or not press_turn or bool(written and written.warning)
+    if not kept_on_the_row:
+        kept_on_the_row = bool(
+            store.mark_outcome(
+                build_id=ending.build_id,
+                turn=press_turn,
+                warning_json={"sentence": ending.warning, "mission_id": ending.mission_id},
+            )
         )
+    if written is not None and written.warning_delivered_at:
+        return STEP_DONE if kept_on_the_row else STEP_RETRY
     if tell is None:
         return STEP_RETRY
     try:
@@ -1715,7 +1739,7 @@ async def _finish_the_warning(
             warning_delivered_at=deps.clock().isoformat(),
         ):
             return STEP_RETRY
-    return STEP_DONE
+    return STEP_DONE if kept_on_the_row else STEP_RETRY
 
 
 def _finish_the_release(
@@ -2860,7 +2884,10 @@ async def execute_merge_deploy(
         landing = bool(belongs_to is not None and belongs_to.is_feature)
         if kept and landing and store_here is not None:
             ending.warning = landing_left_standing_sentence(
-                feature_id, store_here.read(build_id), kept
+                feature_id,
+                store_here.read(build_id),
+                kept,
+                handed=gate.get("identity_handed_to_the_check"),
             )
             ending.mission_id = belongs_to.mission_id
         said = await finish_the_press(

@@ -1464,6 +1464,129 @@ class TestALandingsWarningIsDeliveredAtLeastOnce:
         bookkeeping._everything_is_clear(pool)
 
 
+class _ACheckThatFailsAndLeavesItStanding(_ATeardownThatLeavesItStanding):
+    """A candidate check that fails, and a teardown that does not take its
+    candidate down: nothing is published, the candidate stays up."""
+
+    def __init__(self) -> None:
+        super().__init__(candidate_outcome="failed")
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        answer = await super().__call__(**kwargs)
+        if kwargs.get("leg") == "candidate_check" and answer is not None:
+            # The failed check says its candidate is still up.
+            answer.detail = {**answer.detail, "candidate": "standing"}
+        return answer
+
+
+class TestTheWarningsSentence:
+    @pytest.mark.asyncio
+    async def test_a_failed_check_is_not_said_to_have_landed(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """Codex round 3, R9: a mission candidate check that failed and left
+        its candidate standing published nothing; its warning names the
+        candidate and never says the feature landed."""
+        from tests.forge.pipeline.test_mission_finish import _Thread
+
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        _planned(pool)
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(
+            config_on, pool, repo_root, deploy=_ACheckThatFailsAndLeavesItStanding()
+        )
+        thread = _Thread()
+        consumer = MergeApprovalConsumer(deps)
+        consumer.install_mission_teller(_a_teller(pool, thread))
+        assert consumer._decide_landing(
+            B_BUILD, mission_id=MISSION_ID, decided_by="x", request_id=f"merge-{B_BUILD}"
+        )
+        await consumer.land_mission_feature(B_BUILD)
+        record = _record(pool)
+        assert record.result != RESULT_PUBLISHED_TO_MISSION_BRANCH
+        lines = [line for _m, line in thread.lines]
+        assert len(lines) == 1, lines
+        assert lines[0].startswith("FEAT-MX1's check left its candidate standing (identity ")
+        assert "landed" not in lines[0]
+        assert lines[0].endswith("remove it with the project's own teardown step.")
+
+    def test_the_wording_follows_the_recorded_result(self) -> None:
+        from types import SimpleNamespace
+
+        sentence = merge_executor.landing_left_standing_sentence
+        published = SimpleNamespace(result=RESULT_PUBLISHED_TO_MISSION_BRANCH, checked={})
+        pending = SimpleNamespace(result=RESULT_PUBLICATION_PENDING, checked={})
+        kept = "a candidate's teardown did not confirm it down"
+        lost = "a deploy-stage leg's answer was lost"
+        assert sentence("F", published, kept, handed="j-1").startswith("F landed, but ")
+        assert sentence("F", published, lost, handed="j-1").startswith("F landed, but ")
+        for why in (kept, lost):
+            said = sentence("F", pending, why, handed="j-1")
+            assert "landed" not in said and "(identity j-1)" in said
+        assert "no identity was recorded" in sentence("F", pending, kept)
+
+
+class TestTheWarningsSentenceIsKeptForTheCard:
+    @pytest.mark.asyncio
+    async def test_a_failed_write_of_the_sentence_is_retried_without_saying_it_again(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """Codex round 3, R8: the sentence could not be kept on the row the
+        first time, though it was said in the thread; later passes keep it,
+        so the mission's card carries it, and it is never said again."""
+        from tests.forge.pipeline.test_mission_finish import _Thread
+
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        _planned(pool)
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(config_on, pool, repo_root, deploy=_ATeardownThatLeavesItStanding())
+        thread = _Thread()
+        tell = _a_teller(pool, thread)
+        consumer = MergeApprovalConsumer(deps)
+        consumer.install_mission_teller(tell)
+        assert consumer._decide_landing(
+            B_BUILD, mission_id=MISSION_ID, decided_by="x", request_id=f"merge-{B_BUILD}"
+        )
+        real_mark = PublicationRecordStore.mark_outcome
+        broken = {"n": 0}
+
+        def the_sentence_fails_twice(self: Any, **kwargs: Any) -> bool:
+            if "warning_json" in kwargs and broken["n"] < 2:
+                broken["n"] += 1
+                return False
+            return real_mark(self, **kwargs)
+
+        bookkeeping = TestASettledLandingWhoseBookkeepingDidNotFinish()
+        with pytest.MonkeyPatch.context() as crash:
+            crash.setattr(PublicationRecordStore, "mark_outcome", the_sentence_fails_twice)
+            await consumer.land_mission_feature(B_BUILD)
+            written = PublicationRecordStore(pool.connection).read_outcome(B_BUILD)
+            assert written.warning == {} and written.warning_delivered_at
+            # The first recovery pass: delivered already, the sentence still
+            # not kept — so it is not finished, and nothing is said again.
+            bookkeeping._expire(pool)
+            await bookkeeping._passes(config_on, pool, MergeApprovalConsumer(deps))
+            written = PublicationRecordStore(pool.connection).read_outcome(B_BUILD)
+            assert written.warning == {} and written.finished_at is None
+        assert mission_finish._left_standing_sentences(pool, mission_id=MISSION_ID) == []
+        for _ in range(3):
+            bookkeeping._expire(pool)
+            await bookkeeping._passes(config_on, pool, MergeApprovalConsumer(deps))
+        written = PublicationRecordStore(pool.connection).read_outcome(B_BUILD)
+        sentences = mission_finish._left_standing_sentences(pool, mission_id=MISSION_ID)
+        assert len(sentences) == 1 and sentences[0].startswith("FEAT-MX1 landed")
+        assert len(tell.deliveries) == 1  # said once, never again
+        assert written.finished_at and _record(pool).lease_holder is None
+
+
 class TestALandingWhoseFinishingIsOwed:
     @pytest.mark.asyncio
     async def test_it_is_not_pressed_again_and_spends_no_attempt(
