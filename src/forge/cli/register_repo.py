@@ -42,9 +42,11 @@ What the command does, in order, saying one plain line per step:
    credential, which is an owner decision), or when a folder is already there
    with a different origin; reused when it is there with the same origin.
 4. **Says what makes it live.** It prints the one-page procedure's own
-   sequence — close intake, confirm drained, stop, swap the staged files in,
-   restart the sandbox supervisor, start the publisher when its routes
-   changed, start the rest, check — and restarts nothing itself.
+   sequence — close intake, confirm drained, swap the staged files in,
+   restart the sandbox supervisor, restart the publisher when its routes
+   changed and then the coordinator (each after the drained check again),
+   reopen intake, check — and restarts nothing itself. Every printed step
+   acts on running containers by name and loads no secrets file.
 
 ``--slot <k>`` (design "One sandbox per project", 17 October 2026) gives the
 project a sandbox of its own instead of the shared one, named after the
@@ -160,6 +162,13 @@ SETTINGS_FILE_NAME: str = "forge.yaml"
 #: procedure does (``docker run --rm -v <volume>:/s alpine ...``).
 VOLUME_HELPER_IMAGE: str = "alpine"
 
+#: How the printed activation names the estate's own start script: each
+#: estate has its own (it hands compose the secrets, e.g. under ``sops
+#: exec-env``), so it is named by its role, never by a file (S1 window, 18
+#: October 2026; the plaintext secrets file it replaced was retired on 13
+#: October).
+ESTATE_START_SCRIPT: str = "<the estate's start script>"
+
 #: The Compose project the estate runs as, and its coordinator container.
 COMPOSE_PROJECT: str = "forge-estate"
 DEFAULT_COORDINATOR_CONTAINER: str = "forge-estate-coordinator-1"
@@ -177,6 +186,13 @@ COORDINATOR_PROJECTS_ROOT: str = "/var/lib/forge/projects"
 #: settings file in it, and the projects folder registered projects live in.
 RUNTIME_FOLDER: str = ".guardkit/tmp/factory-runtime"
 SANDBOX_SETTINGS_IN_CLONE: str = f"{RUNTIME_FOLDER}/forge.yaml"
+
+#: The runtime folders a sandbox of its own's settings name beside its
+#: settings file, as the shared sandbox's do (FORGE_AUTOBUILD_WORKTREE_BASE,
+#: FORGE_DEPLOY_NOTES_DIR and TMPDIR in its env file). Its start-up script
+#: uses them as they are and fails (mktemp) when one is missing, so this
+#: command makes them with the settings file (S1 window, 18 October 2026).
+SANDBOX_RUNTIME_FOLDERS: tuple[str, ...] = ("worktrees", "deploy-notes", "tmp")
 PROJECTS_FOLDER: str = f"{RUNTIME_FOLDER}/projects"
 
 #: Where the coordinator sees each project's own receipts folder (design
@@ -614,6 +630,13 @@ _WRITE_LIKE: str = 'umask 077 && cat > "$1" && chmod "$(stat -c %a "$2")" "$1"'
 #: file, 17 October 2026).
 _CREATE_NEW: str = 'umask 077 && mkdir -p -- "${1%/*}" && set -C && cat > "$1"'
 
+#: Makes each folder it is given ("$@"; kept if it is there), owner-only, and
+#: then checks every one is a folder this user owns.
+_MAKE_FOLDERS: str = (
+    'umask 077 && mkdir -p -- "$@" && chmod 700 -- "$@" && '
+    'for d; do test -d "$d" && test -O "$d" || exit 3; done'
+)
+
 
 @dataclass(frozen=True)
 class VolumeStore:
@@ -750,6 +773,16 @@ class SandboxStore:
             raise Refused("sandbox", f"could not create {name} in {self.sandbox} ({_said(result)})")
         if self.read(name) != text:
             raise Refused("sandbox", f"{name} in {self.sandbox} did not read back as written")
+
+    def make_folders(self, folders: Sequence[str]) -> None:
+        """Make each folder (kept if it is there), mode 0700, as the sandbox user."""
+        result = self.exec("sh", "-c", _MAKE_FOLDERS, "register-repo", *folders)
+        if result.returncode != 0:
+            raise Refused(
+                "sandbox",
+                f"could not make the runtime folders {', '.join(folders)} in {self.sandbox}, "
+                f"each owned by the sandbox user ({_said(result)})",
+            )
 
     def write(self, name: str, text: str, *, like: str) -> None:
         result = self.exec("sh", "-c", _WRITE_LIKE, "register-repo", name, like, input=text)
@@ -2123,8 +2156,6 @@ class Estate:
     """The names the printed sequence uses, concrete wherever they are known."""
 
     env_file: str
-    #: The estate's secrets.env, loaded into compose's environment and never printed.
-    loaded_env_file: str
     estate_check: str
     sandbox: str
     volume: str
@@ -2147,16 +2178,32 @@ def activation_sequence(
     helper_urls: tuple[str, str] | None,
     dry_run: bool,
 ) -> list[str]:
-    """The one-page procedure's own order, for this registration (step 7 a–h)."""
+    """The one-page procedure's own order, for this registration (step 7 a–h).
+
+    Every printed step stops, starts or restarts a running container by name
+    (S1 window, 18 October 2026): that needs no secrets, so nothing printed
+    loads a secrets file, and a restart is explicit because ``docker compose
+    up -d`` does not recreate a container when only its settings files
+    changed. The coordinator stays up until its own restart, so the drained
+    check can be asked again before the publisher and before the coordinator.
+    """
     if coordinator is None and sandbox_file is None and publisher is None:
         if dry_run:
             return ["Activation: nothing would be staged, so there would be nothing to activate."]
         return [f"Activation: nothing is staged — {key} is already in the live settings."]
-    intake = " ".join(INTAKE_SERVICES)
 
     def q(value: str) -> str:
         # A name still to be filled in ("$ESTATE_ENV") stays expandable.
         return f'"{value}"' if value.startswith("$") else shlex.quote(value)
+
+    def container(service: str) -> str:
+        return f"{COMPOSE_PROJECT}-{service}-1"
+
+    intake = " ".join(container(service) for service in INTAKE_SERVICES)
+    drained = (
+        f"forge register-repo --check-drained --settle-seconds {estate.settle_seconds}"
+        f" --coordinator-container {q(estate.coordinator)}"
+    )
 
     # The sandbox's own machine, when it is another (--sandbox-ssh).
     sbx = (
@@ -2165,30 +2212,28 @@ def activation_sequence(
         else "sbx"
     )
 
-    dc = (
-        f'dc() {{ ( set -a; . {q(estate.loaded_env_file)}; set +a; docker compose -p '
-        f'{COMPOSE_PROJECT} --env-file {q(estate.env_file)} "$@" ); }}'
-    )
     lines = [
         ("What would make it live" if dry_run else "What makes it live")
         + " — the one-page stop/start procedure, run by the delivery owner once the factory's owner agrees."
         " This command restarted nothing.",
-        "  The compose form, with the existing secrets loaded and nothing printed:",
-        f"    {dc}",
+        "  Every step stops, starts or restarts a running container by name, which needs no secrets;"
+        " nothing here loads a secrets file. If the estate has to be started afresh, use"
+        f" {ESTATE_START_SCRIPT} (the one its README names), which hands compose its secrets itself."
+        " Each restart is explicit: 'docker compose up -d' does not recreate a container when only"
+        " its settings files changed.",
     ]
-    if any(v.startswith("$") for v in (estate.env_file, estate.loaded_env_file, estate.estate_check)):
+    if any(v.startswith("$") for v in (estate.env_file, estate.estate_check)):
         lines.append(
             "  Set these first (or pass --estate-env-file to have them filled in): ESTATE_ENV = the"
-            " estate env file the factory runs on now; RUN = the folder holding its secrets.env;"
-            " FORGE = the Forge checkout its compose files come from."
+            " estate env file the factory runs on now; FORGE = the Forge checkout its compose files"
+            " come from."
         )
     lines += [
         "(a) Close intake first, so no sentence, queue command or hand-over can arrive"
         " (sessions that publish on the bus directly are asked to hold):",
-        f"    dc stop {intake}",
+        f"    docker stop {intake}",
         "(b) Confirm the factory is drained (reads only):",
-        f"    forge register-repo --check-drained --settle-seconds {estate.settle_seconds}"
-        f" --coordinator-container {q(estate.coordinator)}",
+        f"    {drained}",
         f"    It looks twice, {estate.settle_seconds} seconds apart (consumers, one ledger snapshot,"
         " consumers again, each time), so a message still in a client's buffer is seen.",
         "    Go on only if it exits 0 (rely on the exit status, not the words: \"NOT DRAINED\""
@@ -2196,18 +2241,12 @@ def activation_sequence(
         " merge or deploy unfinished, nothing queued, and zero pending and zero unacknowledged on"
         " both bus consumers; and nothing in the ledger moved between the looks. Any other exit — including anything it could not read — stops here: reopen"
         " intake and activate later:",
-        f"    dc up -d {intake}",
-        "(c) Stop the coordinator and the rest, intake still closed:",
-        "    dc stop",
-        f"    Check: docker ps --filter label=com.docker.compose.project={COMPOSE_PROJECT} -q"
-        " prints nothing, and",
-        f"    {sbx} exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}}' lists neither"
-        f" {estate.sandbox}-helper nor {estate.sandbox}-runner.",
-        "(d) Put the staged settings in place, as ONE command: it first checks that every live file"
+        f"    docker start {intake}",
+        "(c) Put the staged settings in place, as ONE command: it first checks that every live file"
         " is still the one its staged copy was made from, and only then copies any. If a check"
-        " fails nothing is copied: start again as in (g) without swapping and run register-repo"
-        " again. If a copy fails part-way, put the files already copied back from their backups"
-        " before starting:",
+        " fails nothing is copied: reopen intake as in (b) and run register-repo again. If a copy"
+        " fails part-way, put the files already copied back from their backups, then restart as"
+        " below:",
     ]
     checks: list[str] = []
     copies: list[str] = []
@@ -2237,13 +2276,13 @@ def activation_sequence(
         lines.append(f"      && {command}" + (" \\" if index < len(chain) - 1 else ""))
     if estate.slot is None:
         lines += [
-            "(e) Restart the sandbox supervisor and confirm the helper and runner are ready:",
-            f"    dc up -d {SANDBOX_SUPERVISOR_SERVICE}",
+            "(d) Restart the sandbox supervisor and confirm the helper and runner are ready:",
+            f"    docker restart {container(SANDBOX_SUPERVISOR_SERVICE)}",
         ]
     else:
         ports = estate.slot
         lines += [
-            f"(e) Start or restart {estate.sandbox}'s own supervisor (its own Compose project on the"
+            f"(d) Start or restart {estate.sandbox}'s own supervisor (its own Compose project on the"
             " sandbox's machine, one per project) and confirm the helper and runner are ready."
             f" Slot {ports.slot} publishes the runner on {ports.runner}, the helper on {ports.helper},"
             f" the git daemon on {ports.git_daemon} and previews on {ports.previews[0]} and"
@@ -2261,23 +2300,22 @@ def activation_sequence(
         )
     if publisher is not None:
         lines += [
-            "(f) The publisher's routes changed: start it first and confirm it lists the new route:",
-            f"    dc up -d --wait {PUBLISHER_SERVICE}",
-            f"    docker logs {COMPOSE_PROJECT}-{PUBLISHER_SERVICE}-1 2>&1 | grep 'publisher: settings'"
+            "(e) The publisher's routes changed: confirm the factory is still drained (as in (b),"
+            " exit 0 only), then restart the publisher and confirm it lists the new route:",
+            f"    {drained}",
+            f"    docker restart {container(PUBLISHER_SERVICE)}",
+            f"    docker logs {container(PUBLISHER_SERVICE)} 2>&1 | grep 'publisher: settings'"
             f" | grep -F {q(key)}",
         ]
     else:
-        lines.append("(f) The publisher's routes did not change; it starts with the rest.")
-    lines.append(
-        "(g) Start the rest in the procedure's order — the publisher before the coordinator,"
-        " the Slack-facing services last:"
-    )
-    if publisher is None:
-        lines.append(f"    dc up -d --wait {PUBLISHER_SERVICE}")
-    pattern = "|".join(INTAKE_SERVICES)
+        lines.append("(e) The publisher's routes did not change; it is not restarted.")
     lines += [
-        f"    dc up -d $(dc config --services | grep -vxE '{pattern}')",
-        f"    dc up -d {intake}",
+        "(f) Confirm once more that the factory is drained (as in (b), exit 0 only), then restart"
+        " the coordinator, which reads the new settings when it starts:",
+        f"    {drained}",
+        f"    docker restart {q(estate.coordinator)}",
+        "(g) Reopen intake, the Slack-facing services last:",
+        f"    docker start {intake}",
         "(h) Check the services, and that the coordinator lists the new project's sandbox:",
         f"    DOCKER_HOST=unix:///var/run/docker.sock {q(estate.estate_check)} --env-file"
         f" {q(estate.env_file)} --project {COMPOSE_PROJECT} services",
@@ -2567,11 +2605,6 @@ def resolve_options(
         }
 
     env_text = str(estate_env_file) if estate_env_file is not None else "$ESTATE_ENV"
-    # The estate's secrets file sits beside its env file (the one-page
-    # procedure's $RUN/secrets.env); it is loaded, never printed.
-    loaded_env_text = (
-        str(estate_env_file.parent / "secrets.env") if estate_env_file is not None else "$RUN/secrets.env"
-    )
     estate_check = "$FORGE/deploy/estate/estate-check"
     compose = estate_values.get(ESTATE_ENV_COMPOSE_FILE, "")
     first = next((part for part in re.split(r"[:,]", compose) if part.strip()), "")
@@ -2611,7 +2644,6 @@ def resolve_options(
         ),
         estate=Estate(
             env_file=env_text,
-            loaded_env_file=loaded_env_text,
             estate_check=estate_check,
             sandbox=sandbox,
             volume=volume,
@@ -2834,14 +2866,25 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     if create_sandbox_file:
         steps += sandbox_edit.steps
         assert sandbox_edit.staged is not None
+        beside = PurePosixPath(options.sandbox_settings).parent
+        runtime_folders = [str(beside / name) for name in SANDBOX_RUNTIME_FOLDERS]
         if options.dry_run:
             steps.append(Step("sandbox", "would create", sandbox.where(options.sandbox_settings)))
+            steps.append(Step(
+                "sandbox", "would create",
+                f"the runtime folders beside it, owner-only: {', '.join(runtime_folders)}",
+            ))
         else:
             sandbox.create(options.sandbox_settings, sandbox_edit.staged)
             steps.append(Step(
                 "sandbox", "created",
                 f"{sandbox.where(options.sandbox_settings)}, the sandbox's own settings file "
                 "(nothing reads it until the sandbox's services start)",
+            ))
+            sandbox.make_folders(runtime_folders)
+            steps.append(Step(
+                "sandbox", "created",
+                f"the runtime folders its start-up uses, owner-only: {', '.join(runtime_folders)}",
             ))
     else:
         edits.append(
