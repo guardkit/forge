@@ -111,6 +111,13 @@ services:
       - factory
       - retained-bus
 
+  # The Linear door (18 October 2026, profile 'linear') talks to the bus as
+  # jarvis does, so it joins the retained bus's network too.
+  linear-door:
+    networks:
+      - factory
+      - retained-bus
+
 networks:
   # THE RETAINED BUS'S OWN NETWORK, DECLARED AS ONE THAT ALREADY EXISTS.
   #
