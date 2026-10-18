@@ -637,6 +637,25 @@ answer.
   HTTP, a public address or a tunnel becomes the machine's business and a new
   published port, with its own per-route rule, becomes this bundle's.
 
+## The Linear door (18 October 2026)
+
+An optional service, `linear-door`, that lets the factory take work from a Linear team: an issue moved to Todo
+becomes a sentence, issues sharing a `mission: <name>` label become a mission, and the factory's cards and progress
+are written back to the issues as comments (design: ai-transition `docs/designs/linear-front-door-2026-10-18.md`).
+It only makes outgoing calls to Linear; nothing is exposed.
+
+- **Off unless asked for.** It carries the `linear` profile. Start the estate with `--profile linear` (or
+  `COMPOSE_PROFILES=linear`) to include it; without that, nothing about the estate changes.
+- **Its key** comes from the child process's environment as `LINEAR_API_KEY`, the same way the Slack tokens do,
+  and is handed to the service as a file. On this estate it is kept in fleet-secrets
+  `slack-jarvis/linear.enc.env`, so that file joins the others the start reads.
+- **Its settings**, in the env file: `JARVIS_LINEAR_TEAM` (the team's key, for example `FAC`, or its exact name),
+  `JARVIS_LINEAR_DEFAULT_REPO`, and `JARVIS_LINEAR_APPROVERS` (`<linear user id>=<identity>,...`: who may answer a
+  card from Linear, and the identity the answer carries). With no team or key the door logs one line and exits,
+  and `restart: on-failure` leaves it stopped.
+- **What it reads:** Forge's record, read-only (the same mount as the answer service), and its own small state
+  volume `linear-door-state`. It is not given the Slack tokens.
+
 ## Walk (b): a cloud machine
 
 **The same nine steps, the same bundle, the same images.** Only `.env` differs,

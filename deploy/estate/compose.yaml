@@ -1365,6 +1365,87 @@ services:
       - factory
 
   # -------------------------------------------------------------------------
+  # THE LINEAR DOOR (18 October 2026, Linear front door design, ai-transition
+  # docs/designs/linear-front-door-2026-10-18.md). It checks the factory's
+  # Linear team every 30 seconds, sends issues moved to Todo to the factory on
+  # the bus exactly as the Slack route does, and writes cards and progress back
+  # to the issues as comments. It makes only outgoing calls: no port, nothing
+  # public.
+  #
+  # OFF UNLESS ASKED FOR: it carries the 'linear' profile, so an estate started
+  # without '--profile linear' never starts it, and nothing else changes.
+  #
+  # WHAT IT IS GIVEN:
+  #   * the jarvis bus account (the same as the gateway), password as a file;
+  #   * the Linear key, as a file it reads itself (JARVIS_LINEAR_API_KEY_FILE),
+  #     never in its declared environment and never printed;
+  #   * Forge's record, READ-ONLY, the folder and not the one file, exactly as
+  #     the answer service mounts it; it opens it with mode=ro as well;
+  #   * its own small state volume, with itself as the one writer.
+  # It is NOT given the Slack tokens: it never talks to Slack.
+  # -------------------------------------------------------------------------
+  linear-door:
+    profiles: ["linear"]
+    image: ${JARVIS_IMAGE:?name the jarvis image in the env file, e.g. JARVIS_IMAGE=jarvis:2026.09.26-3 - built by ../../scripts/build-release-image.sh with the rest of the release}
+    # on-failure, not unless-stopped: a door with no team or key set logs one
+    # line and exits cleanly, and must then stay stopped.
+    restart: on-failure
+    depends_on:
+      bus-ready:
+        condition: service_completed_successfully
+      coordinator:
+        condition: service_healthy
+    entrypoint:
+      - /bin/sh
+      - -c
+      - |
+        set -eu
+        case "$$JARVIS_NATS_URL" in
+          *@*)
+            echo "the Linear door's bus address carries a credential. Give the address and the account name plainly in the env file; the password comes in as a file." >&2
+            exit 1
+            ;;
+        esac
+        password_file=/run/secrets/jarvis_bus_password
+        if [ ! -s "$$password_file" ]; then
+            echo "the Linear door was given no bus password file; start the estate the way deploy/estate/README.md says." >&2
+            exit 1
+        fi
+        JARVIS_NATS_PASSWORD="$$(cat "$$password_file")"
+        export JARVIS_NATS_PASSWORD
+        exec "$$@"
+      - linear-door
+    command: ["jarvis", "serve-linear"]
+    environment:
+      JARVIS_NATS_URL: ${JARVIS_NATS_URL:?name the bus's address for jarvis in the env file, e.g. nats://nats:4222 - a service name, with no credential in it}
+      JARVIS_NATS_USER: ${JARVIS_NATS_USER:?name the bus account jarvis connects as in the env file}
+      JARVIS_NATS_CLIENT_NAME: linear-door-${FACTORY_INSTANCE:-factory}
+      JARVIS_LINEAR_API_KEY_FILE: /run/secrets/linear_api_key
+      # The Linear team, by its key (for example FAC) or exact name. Unset means
+      # the door logs one line and stops, and compose leaves it stopped.
+      JARVIS_LINEAR_TEAM: ${JARVIS_LINEAR_TEAM:-}
+      JARVIS_LINEAR_DEFAULT_REPO: ${JARVIS_LINEAR_DEFAULT_REPO:-}
+      # <linear user id>=<identity>, comma-separated: who may answer a card from
+      # Linear, and the identity the answer carries. Kept in the env file on the
+      # machine, never in this bundle.
+      JARVIS_LINEAR_APPROVERS: ${JARVIS_LINEAR_APPROVERS:-}
+      JARVIS_LINEAR_POLL_SECONDS: ${JARVIS_LINEAR_POLL_SECONDS:-30}
+      # The owner a Linear request is filed for, so the plan card can still be
+      # answered from Slack: the same member id the Slack route files for.
+      JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID: ${JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID:?name the Slack member id whose sentences become planning requests, in the env file}
+      JARVIS_LINEAR_STATE_DIR: /var/lib/jarvis
+      JARVIS_LINEAR_FORGE_DB: /var/lib/forge/forge.db
+      JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
+    volumes:
+      - linear-door-state:/var/lib/jarvis
+      - forge-ledger:/var/lib/forge:ro
+    secrets:
+      - source: bus-jarvis-password
+        target: jarvis_bus_password
+      - source: linear-api-key
+        target: linear_api_key
+
+  # -------------------------------------------------------------------------
   # THE GATEWAY WATCH — is the Slack door actually carrying traffic?
   # (26 September 2026, rollout step 1, build item E3-e.)
   #
@@ -1667,6 +1748,11 @@ volumes:
   # same as the bus's store.
   gateway-state:
 
+  # THE LINEAR DOOR'S RECORD of what it has sent and written (18 October 2026),
+  # with the door as its one writer. 'down -v' removes it; the door then
+  # rebuilds from the bus queue and Forge's record before sending anything.
+  linear-door-state:
+
   # THE BUS'S OWN CONFIG AND PROVISIONING SCRIPTS, at the pinned commit.
   #
   # It is EXTERNAL because it is made by the build step beside the two images,
@@ -1765,3 +1851,7 @@ secrets:
     environment: JARVIS_SLACK_BOT_TOKEN
   slack-app-token:
     environment: JARVIS_SLACK_APP_TOKEN
+  # The Linear door's key (18 October 2026), read from the same child process
+  # environment as the others; only the 'linear' profile's service uses it.
+  linear-api-key:
+    environment: LINEAR_API_KEY
