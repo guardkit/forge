@@ -1018,3 +1018,34 @@ class TestASettledLandingWhoseBookkeepingDidNotFinish:
         assert _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER) == []
         assert MissionStore(pool.connection).get(MISSION_ID).status == "RUNNING"
         assert router_restart_blockers(pool.connection) != ()
+
+
+class TestARefusedSettlementClaimsNothing:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("on_the_remote", [True, False])
+    async def test_a_refused_settle_reports_nothing_and_puts_its_lease_down(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+        on_the_remote: bool,
+    ) -> None:
+        """Another worker took the record over as the remote was looked at:
+        whichever way the remote answered, nothing is claimed — no result, no
+        report — and the lease taken to look is put down again."""
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(config_on, pool, repo_root)
+        consumer = MergeApprovalConsumer(deps)
+        _a_send_whose_answer_was_lost(pool, repo_root, on_the_remote=on_the_remote)
+        _decided_with_every_attempt_used(consumer, pool, used=3)
+        monkeypatch.setattr(PublicationRecordStore, "settle", lambda self, **_k: False)
+
+        assert await consumer.land_mission_feature(B_BUILD) is None
+
+        record = _record(pool)
+        assert record.result is None
+        assert record.lease_holder is None
+        assert _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER) == []

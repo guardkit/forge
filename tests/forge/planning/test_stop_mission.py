@@ -578,3 +578,76 @@ async def test_an_additional_approver_can_stop_a_mission_by_slack_and_a_stranger
     await handle_planning_message(_stop_message(mission.id, user="U-COLLEAGUE"), deps)
     assert said[-1].startswith("Stop requested; 4 waiting features won't start")
     assert missions.get(mission.id).stop_requested_by == "U-COLLEAGUE"
+
+
+@pytest.mark.asyncio
+async def test_the_approver_list_reaches_the_stop_from_the_real_start_up_wiring(tmp_path: Path) -> None:
+    """``_serve_planning`` hands ``approval.additional_approvers`` to the
+    planning intake, so an extra approver's Slack stop works as started."""
+    from forge.adapters.sqlite import connect as sqlite_connect
+    from forge.cli import _serve_planning
+    from forge.config.models import ForgeConfig
+    from forge.lifecycle import migrations as lifecycle_migrations
+    from tests.cli.test_serve_planning import ESCALATION_APPROVER, FixedClock, JetStreamNats
+
+    db = tmp_path / "forge.db"
+    connection = sqlite_connect.connect_writer(db)
+    lifecycle_migrations.apply_at_boot(connection)
+    config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/srv/forge"]}},
+            "planning": {"enabled": True, "escalation_approver": ESCALATION_APPROVER},
+            "approval": {"additional_approvers": ["U-COLLEAGUE"]},
+        }
+    )
+    seen: list[Any] = []
+
+    async def consume(_subscription: Any, deps: Any) -> None:
+        seen.append(deps)
+
+    with patch.object(_serve_planning, "_consume_planning", consume):
+        result = await _serve_planning.compose_planning_consumer_and_dispatch(
+            db_path=db, nats_client=JetStreamNats(), config=config, clock=FixedClock()
+        )
+        await asyncio.sleep(0)
+    try:
+        assert len(seen) == 1
+        deps = seen[0]
+        assert deps.additional_approvers == ("U-COLLEAGUE",)
+        missions = _running_mission(connection)
+        mission = _mission(missions)
+        said: list[str] = []
+
+        async def notify(_cid: str, message: str, **_kwargs: Any) -> None:
+            said.append(message)
+
+        from dataclasses import replace
+
+        deps = replace(deps, publish_notification=notify)
+        await handle_planning_message(_stop_message(mission.id, user="U-COLLEAGUE"), deps)
+        assert missions.get(mission.id).stop_requested_by == "U-COLLEAGUE"
+    finally:
+        for task in list(result.background_tasks or []):
+            task.cancel()
+        await asyncio.gather(*(result.background_tasks or []), return_exceptions=True)
+        connection.close()
+
+
+@pytest.mark.asyncio
+async def test_the_slack_stop_is_checked_against_who_sent_the_mission_not_who_approved_it(cx) -> None:
+    missions = MissionStore(cx)
+    mission, _ = missions.create_mission(
+        title="Tags for notes",
+        target_repo=REPO,
+        correlation_id=CID,
+        originating_user="U-SENDER",
+        features=_features(),
+    )
+    missions.record_approval(mission.id, approved_by="U-APPROVER", plan_request_id="req-1")
+    missions.start_running(mission.id)
+    said: list[str] = []
+    deps = _intake_deps(cx, _FakeFlow(missions), enabled=True, said=said)
+    await handle_planning_message(_stop_message(mission.id, user="U-APPROVER"), deps)
+    assert missions.get(mission.id).stop_requested_at is None
+    await handle_planning_message(_stop_message(mission.id, user="U-SENDER"), deps)
+    assert missions.get(mission.id).stop_requested_by == "U-SENDER"
