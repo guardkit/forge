@@ -1048,6 +1048,20 @@ class SandboxEntry(BaseModel):
             ports.append(raw)
         return ports
 
+    idle_stop: bool = Field(
+        default=False,
+        description=(
+            "Whether the factory may stop this sandbox when its project has "
+            "been idle, and start it again when work arrives (one sandbox per "
+            "project, stage S2, design section 2.3a, 18 October 2026). Only "
+            "honoured when planning.sandbox_starter.url is set and the starter "
+            "lists the sandbox too. Every repository mapped to one sandbox "
+            "must say the same, and the shared sandbox api-test-deploy is "
+            "never stopped. False (the default): the sandbox is left running "
+            "and nothing about it changes."
+        ),
+    )
+
     @field_validator("memory_projects")
     @classmethod
     def _memory_projects_are_memory_names(cls, value: list[str]) -> list[str]:
@@ -1113,6 +1127,67 @@ class SandboxEntry(BaseModel):
                 f"{problem} (the value is not repeated here)"
             )
         return value
+
+
+class SandboxStarterConfig(BaseModel):
+    """Where the sandbox starter answers, and how the factory uses it (stage
+    S2 of one sandbox per project, design section 2.3a, 18 October 2026).
+
+    The starter is a small service on the sandbox machine that starts, stops
+    and reports on a project's sandbox. The coordinator decides when: it
+    starts a sandbox when work arrives for it and asks the starter to stop
+    one whose project has had nothing open for ``idle_minutes``. Unset
+    ``url`` (the default) switches all of it off: no sandbox is ever started
+    or stopped by the factory, and every path is today's.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    url: str | None = Field(
+        default=None,
+        description=(
+            "The starter's address as the coordinator reaches it "
+            "(http://<address>:<port>). Unset (the default): sandboxes are "
+            "never started or stopped by the factory."
+        ),
+    )
+    idle_minutes: int = Field(
+        default=30,
+        ge=1,
+        description=(
+            "How long a managed sandbox's project must have had nothing open "
+            "before the coordinator asks the starter to stop it."
+        ),
+    )
+    ready_timeout_seconds: int = Field(
+        default=600,
+        ge=10,
+        description=(
+            "How long work waits for a sandbox to start and answer before it "
+            "stops with a plain reason naming the service that did not answer."
+        ),
+    )
+    poll_seconds: int = Field(
+        default=60,
+        ge=5,
+        description=(
+            "How often the coordinator reads the starter's status for each "
+            "managed sandbox, to run a redeploy it is waiting for and to "
+            "decide idle stops."
+        ),
+    )
+
+    @field_validator("url")
+    @classmethod
+    def _url_is_http(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        text = str(value).strip().rstrip("/")
+        if not text.startswith(("http://", "https://")) or len(text) <= len("https://"):
+            raise ValueError(
+                "planning.sandbox_starter.url must be an http:// or https:// address"
+            )
+        return text
 
 
 class PlanningConfig(BaseModel):
@@ -1293,6 +1368,39 @@ class PlanningConfig(BaseModel):
             "Empty by default."
         ),
     )
+
+    sandbox_starter: SandboxStarterConfig = Field(
+        default_factory=SandboxStarterConfig,
+        description=(
+            "The sandbox starter (one sandbox per project, stage S2). Off by "
+            "default: with no url, no sandbox is ever started or stopped by "
+            "the factory."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _idle_stop_is_one_answer_per_sandbox(self) -> "PlanningConfig":
+        """Every repository mapped to one sandbox says the same about idle
+        stops, and the shared sandbox is never stopped (design 2.3a): the
+        sandbox is one thing, so it cannot be both managed and left alone."""
+        from forge.config.sandbox_slots import LEGACY_SANDBOX
+
+        answers: dict[str, tuple[bool, str]] = {}
+        for key, entry in self.sandboxes.items():
+            if entry.idle_stop and entry.name == LEGACY_SANDBOX:
+                raise ValueError(
+                    f"planning.sandboxes gives {key} idle_stop in the shared "
+                    f"sandbox {LEGACY_SANDBOX}, which is never stopped (it hosts "
+                    "an app with an in-memory database); take idle_stop off"
+                )
+            seen = answers.setdefault(entry.name, (entry.idle_stop, key))
+            if seen[0] != entry.idle_stop:
+                raise ValueError(
+                    f"planning.sandboxes maps {seen[1]} and {key} to the sandbox "
+                    f"{entry.name} with different idle_stop settings; one sandbox "
+                    "is managed or not as a whole, so give both the same answer"
+                )
+        return self
 
     @model_validator(mode="after")
     def _sandboxes_name_known_repositories(self) -> "PlanningConfig":
