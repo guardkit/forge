@@ -303,6 +303,43 @@ def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | 
     return " ".join(lines) if lines else None
 
 
+def _memory_grant_of(
+    sqlite_pool: Any, forge_config: Any, build_id: str
+) -> tuple[str | None, tuple[str, ...]]:
+    """``(the build's recorded memory name, its repository's granted names)``.
+
+    The name is the one the ledger recorded on the build
+    (``read_memory_project``); the grant is the ``memory_projects`` of the
+    build's repository's ``planning.sandboxes`` entry (design section 2.4a).
+    Never raises: anything that cannot be read is "no name" or "no grant",
+    and either one means the card reads no priors.
+    """
+    from forge.config.sandboxes import sandbox_for
+
+    name: str | None = None
+    repo: str | None = None
+    try:
+        reader = getattr(sqlite_pool, "read_memory_project", None)
+        name = reader(build_id) if callable(reader) else None
+        row = sqlite_pool.get_build_row(build_id)
+        if row is not None:
+            repo = str(getattr(row, "repo", "") or "").strip() or None
+    except Exception as exc:  # noqa: BLE001 — a card never fails over its priors
+        logger.warning(
+            "maybe_gate_build: the memory name or repository of build_id=%s "
+            "could not be read (%s: %s); its card reads no priors",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+        return None, ()
+    entry = sandbox_for(forge_config, repo) if forge_config is not None else None
+    granted = tuple(
+        str(item) for item in (getattr(entry, "memory_projects", None) or ())
+    )
+    return (str(name).strip() or None) if name else None, granted
+
+
 def advance_to_running(
     sqlite_pool: SqliteLifecyclePersistence,
     build_id: str,
@@ -353,6 +390,7 @@ async def maybe_gate_build(
     feature_id: str,
     correlation_id: str | None,
     clock: Callable[[], datetime],
+    forge_config: Any = None,
 ) -> "GateOutcome | GateDispatchOutcome":
     """Run the pre-dispatch approval gate for one freshly-recorded build.
 
@@ -390,6 +428,10 @@ async def maybe_gate_build(
             approval envelope + build-paused / build-resumed / build-cancelled).
         clock: Injected ``() -> datetime`` (UTC). Clock hygiene — never
             ``datetime.now()``.
+        forge_config: The validated ``ForgeConfig``, for the build's
+            repository's memory grant (its ``planning.sandboxes`` entry's
+            ``memory_projects``, design section 2.4a). ``None`` grants
+            nothing, so the card reads no priors.
 
     Returns:
         A :class:`GateOutcome` when the gate ran to a decision;
@@ -475,6 +517,14 @@ async def maybe_gate_build(
     #    (factually wrong) build-failed and prematurely ack a PAUSED build.
     from forge.adapters.nats.approval_publisher import ApprovalPublishError
 
+    # The card's priors come only from this build's own memory, and only when
+    # its repository was granted that name at registration (design section
+    # 2.4a): the build's recorded name and the repository's grant go to the
+    # reader, which searches nothing otherwise.
+    memory_project, granted_memory_projects = _memory_grant_of(
+        sqlite_pool, forge_config, build_id
+    )
+
     try:
         outcome, _decision = await gate_check(
             deps=deps,
@@ -487,6 +537,8 @@ async def maybe_gate_build(
             criterion_breakdown={},
             detection_findings=[],
             attempt_count=0,
+            memory_project=memory_project,
+            granted_memory_projects=granted_memory_projects,
         )
     except ApprovalPublishError as exc:
         logger.warning(

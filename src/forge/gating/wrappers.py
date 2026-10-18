@@ -79,7 +79,7 @@ using the persisted ``request_id``.
 from __future__ import annotations
 
 import logging
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
@@ -226,6 +226,12 @@ class PriorsReader(Protocol):
     (env-gated at serve compose; degraded composition injects
     :class:`forge.gating.degraded.EmptyPriorsReader`). Tests inject a
     coroutine that returns a deterministic list.
+
+    ``memory_project`` is the memory name recorded on the build being gated
+    and ``granted_memory_projects`` the names its repository was granted at
+    registration (design "One sandbox per project", section 2.4a). A reader
+    that searches anything searches only ``memory_project``, and only when it
+    is one of the granted names; otherwise it returns no priors.
     """
 
     async def read_priors(  # pragma: no cover - protocol stub
@@ -235,6 +241,8 @@ class PriorsReader(Protocol):
         target_identifier: str,
         stage_label: str,
         build_id: str,
+        memory_project: str | None = None,
+        granted_memory_projects: Sequence[str] = (),
     ) -> list[PriorReference]: ...
 
 
@@ -438,6 +446,8 @@ async def gate_check(
     detection_findings: list[DetectionFinding],
     attempt_count: int = 0,
     artefact_paths: tuple[str, ...] = (),
+    memory_project: str | None = None,
+    granted_memory_projects: Sequence[str] = (),
 ) -> tuple[GateOutcome, GateDecision]:
     """Run a single gated stage end-to-end.
 
@@ -475,6 +485,12 @@ async def gate_check(
             re-emission. Used to derive the ``request_id`` and to seed
             the subscriber's refresh loop.
         artefact_paths: Filesystem paths the reviewer should inspect.
+        memory_project: The memory name recorded on the build, or ``None``
+            when it has none. Handed to the priors reader, which reads only
+            this name (design section 2.4a).
+        granted_memory_projects: The names the build's repository was
+            granted at registration. A recorded name not among them reads
+            no priors.
 
     Returns:
         A ``(outcome, decision)`` pair. The decision is the persisted
@@ -499,6 +515,8 @@ async def gate_check(
         target_identifier=target_identifier,
         stage_label=stage_label,
         build_id=build_id,
+        memory_project=memory_project,
+        granted_memory_projects=tuple(granted_memory_projects or ()),
     )
 
     # 2. Read **approved-only** adjustments (F9 / R8).

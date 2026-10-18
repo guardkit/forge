@@ -87,3 +87,18 @@ def test_the_descriptions_are_plain_words() -> None:
     assert "rule " not in description.lower()
     for field in SandboxEntry.model_fields.values():
         assert field.description and "rule " not in field.description.lower()
+
+
+def test_a_sandbox_is_granted_no_memory_by_default() -> None:
+    """Design section 2.4a (18 October 2026): a build's card reads memory only
+    from a name its repository was granted; no list, no names."""
+    assert SandboxEntry.model_validate(ENTRY).memory_projects == []
+
+
+def test_memory_projects_are_names_the_memory_service_accepts() -> None:
+    entry = SandboxEntry.model_validate({**ENTRY, "memory_projects": ["shop_a", "shop_a", "x9"]})
+    assert entry.memory_projects == ["shop_a", "x9"], "a repeated name is kept once"
+    for bad in ("Shop_A", "shop-a", "", "shop a", "a" * 129):
+        with pytest.raises(ValidationError) as caught:
+            SandboxEntry.model_validate({**ENTRY, "memory_projects": [bad]})
+        assert "lower-case letters, digits and underscores" in str(caught.value)

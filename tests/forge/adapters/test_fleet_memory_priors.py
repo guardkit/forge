@@ -47,9 +47,16 @@ _ENV_VARS = (
     "FLEET_MEMORY_EMBED_URL",
     "FLEET_MEMORY_EMBED_MODEL",
     "FLEET_MEMORY_EMBED_DIMS",
-    "FORGE_MEMORY_PROJECT",
+    "FORGE_MEMORY_PROJECT",  # gone (design 2.4a); cleared so a stray one proves nothing
     "FORGE_MEMORY_READ_TIMEOUT_S",
 )
+
+#: The build's own recorded memory name, granted to its repository: the only
+#: shape in which the reader searches at all (design section 2.4a).
+_OWN: dict[str, Any] = {
+    "memory_project": "bench_one",
+    "granted_memory_projects": ("bench_one",),
+}
 
 
 @pytest.fixture(autouse=True)
@@ -247,7 +254,6 @@ class TestFactoryTruthTable:
         monkeypatch.setenv("FLEET_MEMORY_ENABLED", "true")
         monkeypatch.setenv("FLEET_MEMORY_PG_DSN", "postgresql://f@h/db")
         monkeypatch.setenv("FLEET_MEMORY_EMBED_URL", "http://localhost:9000/v1")
-        monkeypatch.setenv("FORGE_MEMORY_PROJECT", "guardkit")
         backend, _log, _calls = _make_backend(
             search=await _search_returning([])
         )
@@ -257,11 +263,9 @@ class TestFactoryTruthTable:
         with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
             reader = build_priors_reader_from_env()
         assert isinstance(reader, FleetMemoryPriorsReader)
-        assert any(
-            "memory: ON (project=guardkit)" in r.message
-            and r.levelno == logging.INFO
-            for r in caplog.records
-        )
+        on_lines = [r.message for r in caplog.records if "memory: ON" in r.message]
+        assert len(on_lines) == 1 and "each build's own memory project" in on_lines[0]
+        assert "guardkit" not in on_lines[0], "there is no default project any more"
 
     @pytest.mark.parametrize(
         "env",
@@ -278,7 +282,6 @@ class TestFactoryTruthTable:
                 "FLEET_MEMORY_ENABLED": "true",
                 "FLEET_MEMORY_PG_DSN": "postgresql://f@h/db",
                 "FLEET_MEMORY_EMBED_URL": "",
-                "FORGE_MEMORY_PROJECT": "",
             },
         ],
     )
@@ -325,6 +328,7 @@ class TestPriorMapping:
             target_identifier="autobuild_runner",
             stage_label="autobuild",
             build_id="build-map-1",
+            **_OWN,
         )
 
         assert len(priors) == 1
@@ -356,6 +360,7 @@ class TestPriorMapping:
             target_identifier="autobuild_runner",
             stage_label="autobuild",
             build_id="build-clamp-1",
+            **_OWN,
         )
 
         assert [p.relevance_score for p in priors] == [1.0, 0.0]
@@ -383,6 +388,7 @@ class TestPriorMapping:
             target_identifier="autobuild_runner",
             stage_label="autobuild",
             build_id="build-redact-1",
+            **_OWN,
         )
 
         summary = priors[0].summary
@@ -413,6 +419,7 @@ class TestPriorMapping:
             target_identifier="autobuild_runner",
             stage_label="autobuild",
             build_id="build-cap-1",
+            **_OWN,
         )
 
         assert len(priors) == 5
@@ -423,7 +430,7 @@ class TestPriorMapping:
         backend, _log, calls = _make_backend(
             search=await _search_returning([])
         )
-        config = _config(project="guardkit", read_timeout_s=5.0)
+        config = _config(read_timeout_s=5.0)
         reader = FleetMemoryPriorsReader(config, backend=backend)
 
         await reader.read_priors(
@@ -431,11 +438,12 @@ class TestPriorMapping:
             target_identifier="autobuild_runner",
             stage_label="autobuild",
             build_id="build-shape-1",
+            **_OWN,
         )
 
         kwargs = _StubRequest.last_kwargs
         assert kwargs is not None
-        assert kwargs["project"] == "guardkit"
+        assert kwargs["project"] == "bench_one", "the build's own granted name only"
         assert kwargs["payload_types"] == ["build_outcome", "warning"]
         assert kwargs["token_budget"] == 2000
         assert kwargs["include_superseded"] is False
@@ -481,6 +489,7 @@ class TestReadResilience:
                     target_identifier="autobuild_runner",
                     stage_label="autobuild",
                     build_id="build-slow-1",
+                    **_OWN,
                 ),
                 timeout=2.0,
             )
@@ -500,6 +509,7 @@ class TestReadResilience:
             target_identifier="autobuild_runner",
             stage_label="autobuild",
             build_id="build-slow-2",
+            **_OWN,
         )
         assert second == []
         assert log.count("open") == 2
@@ -536,6 +546,7 @@ class TestReadResilience:
                 target_identifier="autobuild_runner",
                 stage_label="autobuild",
                 build_id="build-init-1",
+                **_OWN,
             )
 
         assert first == []
@@ -550,6 +561,7 @@ class TestReadResilience:
             target_identifier="autobuild_runner",
             stage_label="autobuild",
             build_id="build-init-2",
+            **_OWN,
         )
         assert second == []
         assert attempts["n"] == 2
@@ -569,6 +581,7 @@ class TestReadResilience:
                 target_identifier="autobuild_runner",
                 stage_label="autobuild",
                 build_id="build-empty-1",
+                **_OWN,
             )
 
         assert priors == []
@@ -587,6 +600,7 @@ class TestReadResilience:
             target_identifier="autobuild_runner",
             stage_label="autobuild",
             build_id="build-close-1",
+            **_OWN,
         )
         await reader.aclose()
         await reader.aclose()
@@ -610,6 +624,7 @@ class TestFirstReadRace:
                 target_identifier="autobuild_runner",
                 stage_label="autobuild",
                 build_id=build_id,
+                **_OWN,
             )
 
         first, second = await asyncio.gather(
@@ -619,3 +634,80 @@ class TestFirstReadRace:
         assert first == [] and second == []
         assert log.count("open") == 1
         assert log.count("enter") == 1
+
+
+class TestOwnProjectOnly:
+    """Design section 2.4a: the reader searches the build's own recorded name,
+    only when the build's repository was granted it, and nothing otherwise."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "memory_project, granted, why",
+        [
+            (None, ("bench_one",), "has no recorded memory name"),
+            ("", ("bench_one",), "has no recorded memory name"),
+            ("bench_one", (), "was granted no memory at registration"),
+            ("bench_two", ("bench_one",), "is not one its repository was granted"),
+            ("guardkit", ("bench_one",), "is not one its repository was granted"),
+        ],
+    )
+    async def test_no_grant_means_no_search_and_one_plain_line(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        memory_project: str | None,
+        granted: tuple[str, ...],
+        why: str,
+    ) -> None:
+        searched: list[Any] = []
+
+        async def _search(request: Any, _store: Any) -> list[Any]:
+            searched.append(request)
+            return [_item("build_outcome:bench_one:TASK_X")]
+
+        backend, log, settings_calls = _make_backend(search=_search)
+        reader = FleetMemoryPriorsReader(_config(), backend=backend)
+
+        with caplog.at_level(logging.INFO, logger=_LOGGER_NAME):
+            priors = await reader.read_priors(
+                target_kind="subagent",
+                target_identifier="autobuild_runner",
+                stage_label="autobuild",
+                build_id="build-nogrant-1",
+                memory_project=memory_project,
+                granted_memory_projects=granted,
+            )
+
+        assert priors == []
+        assert searched == [], "the store is not searched"
+        assert log == [] and settings_calls == [], "the store is not even opened"
+        lines = [r for r in caplog.records if "build-nogrant-1" in r.getMessage()]
+        assert len(lines) == 1 and lines[0].levelno == logging.INFO
+        assert why in lines[0].getMessage()
+
+    @pytest.mark.asyncio
+    async def test_the_old_setting_has_no_effect(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("FLEET_MEMORY_ENABLED", "true")
+        monkeypatch.setenv("FLEET_MEMORY_PG_DSN", "postgresql://f@h/db")
+        monkeypatch.setenv("FLEET_MEMORY_EMBED_URL", "http://localhost:9000/v1")
+        monkeypatch.setenv("FORGE_MEMORY_PROJECT", "guardkit")
+        config = load_priors_config_from_env()
+        assert not hasattr(config, "project"), "no project is configured for the reader"
+        requests: list[Any] = []
+
+        async def _search(request: Any, _store: Any) -> list[Any]:
+            requests.append(request.kwargs["project"])
+            return []
+
+        backend, _log, _calls = _make_backend(search=_search)
+        reader = FleetMemoryPriorsReader(config, backend=backend)
+        await reader.read_priors(
+            target_kind="subagent",
+            target_identifier="autobuild_runner",
+            stage_label="autobuild",
+            build_id="build-oldsetting-1",
+            memory_project="bench_one",
+            granted_memory_projects=("bench_one",),
+        )
+        assert requests == ["bench_one"]

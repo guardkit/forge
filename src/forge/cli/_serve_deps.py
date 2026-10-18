@@ -1950,6 +1950,7 @@ def _build_dispatch_build(
             feature_id=payload.feature_id,
             correlation_id=payload.correlation_id,
             clock=clock,
+            forge_config=forge_config,
         )
 
         if outcome in (

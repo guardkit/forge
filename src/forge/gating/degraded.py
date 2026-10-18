@@ -28,6 +28,7 @@ snapshot (a corrupt / legacy row on the rearm path).
 from __future__ import annotations
 
 import json
+from collections.abc import Sequence
 from datetime import datetime
 from typing import Callable
 
@@ -128,6 +129,8 @@ class EmptyPriorsReader:
         target_identifier: str,
         stage_label: str,
         build_id: str,
+        memory_project: str | None = None,
+        granted_memory_projects: Sequence[str] = (),
     ) -> list[PriorReference]:
         return []
 

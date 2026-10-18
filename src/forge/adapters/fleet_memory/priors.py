@@ -24,13 +24,18 @@ Constraints this module carries
   the daemon loop; it BREAKS if gate_check ever moves to a worker
   thread — at that point mirror guardkit's per-thread client factory
   (``FleetMemoryClientFactory``) instead of sharing this reader.
-* **Project scoping — the revisit trigger.** Reads are scoped to
-  ``FORGE_MEMORY_PROJECT`` (default ``"guardkit"``), matching where the
-  factory's build outcomes land today. THE trigger: when per-repo write
-  scoping (``GUARDKIT_MEMORY_PROJECT`` set at dispatch) starts landing
-  outcome rows OUTSIDE the ``guardkit`` project, revisit
-  ``FORGE_MEMORY_PROJECT`` — a correct per-repo read needs the build's
-  repo threaded into ``gate_check``, which it is not today.
+* **Project scoping — each build's own project only** (design "One
+  sandbox per project", section 2.4a, 18 October 2026). A read searches
+  exactly one fleet-memory project: the memory name recorded on the build
+  being gated (``builds.memory_project``), and only when that name is one
+  its repository was granted at registration (the ``memory_projects`` of
+  its ``planning.sandboxes`` entry, written by ``register-repo``). A build
+  with no recorded name, a repository with no grant, or a name the
+  repository was not granted reads nothing and searches nothing, with one
+  plain INFO line saying why. There is no default project and no shared
+  shelf to fall back to: the old ``guardkit`` default (and the
+  ``FORGE_MEMORY_PROJECT`` setting that overrode it) put every project's
+  card on the same five records, and is gone.
 * **Auto-approve bound.** Priors are *evidence*, never a mode input:
   today the gate's reasoning callable is
   :func:`forge.gating.degraded.degraded_dispatch_gate_model`, which
@@ -59,6 +64,7 @@ import asyncio
 import logging
 import os
 from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, Callable
 
 from forge.gating.models import GateTargetKind, PriorReference
@@ -109,8 +115,6 @@ class FleetMemoryPriorsConfig:
         embed_dims: Embedding vector dimensions. Default matches the
             live 1024-dim corpus — a wrong value silently mis-embeds
             the query against the rebuilt corpus.
-        project: Fleet-memory project namespace the gate reads. See the
-            module docstring's project-scoping revisit trigger.
         read_timeout_s: Deadline for one whole gate read, lazy connect
             included.
     """
@@ -120,7 +124,6 @@ class FleetMemoryPriorsConfig:
     embed_url: str = ""
     embed_model: str = "embed"
     embed_dims: int = 1024
-    project: str = "guardkit"
     read_timeout_s: float = 10.0
 
 
@@ -193,8 +196,6 @@ def load_priors_config_from_env() -> FleetMemoryPriorsConfig:
         embed_model=os.environ.get("FLEET_MEMORY_EMBED_MODEL", "embed").strip()
         or "embed",
         embed_dims=_int_env("FLEET_MEMORY_EMBED_DIMS", 1024),
-        project=os.environ.get("FORGE_MEMORY_PROJECT", "guardkit").strip()
-        or "guardkit",
         read_timeout_s=_float_env("FORGE_MEMORY_READ_TIMEOUT_S", 10.0),
     )
 
@@ -258,6 +259,34 @@ def _to_prior_reference(item: Any) -> PriorReference | None:
     )
 
 
+def memory_grant_refusal(
+    memory_project: str | None, granted_memory_projects: Sequence[str]
+) -> str | None:
+    """Why a build's card may not read memory, in one plain clause, or ``None``.
+
+    The rule of design section 2.4a: a card reads only its own project's
+    memory, and only a name its repository was granted at registration. A
+    project's declaration names the memory it wants but grants nothing (any
+    repository can declare any name), so the build's recorded name has to be
+    on the repository's list as well.
+    """
+    name = str(memory_project or "").strip()
+    granted = tuple(str(item).strip() for item in (granted_memory_projects or ()))
+    if not name:
+        return "the build has no recorded memory name"
+    if not any(granted):
+        return (
+            f"the build's repository was granted no memory at registration, so "
+            f"its recorded name {name} is not read"
+        )
+    if name not in granted:
+        return (
+            f"the build's recorded memory name {name} is not one its repository "
+            f"was granted at registration ({', '.join(g for g in granted if g)})"
+        )
+    return None
+
+
 class FleetMemoryPriorsReader:
     """Fleet-memory implementation of the ``PriorsReader`` protocol.
 
@@ -297,17 +326,35 @@ class FleetMemoryPriorsReader:
         target_identifier: str,
         stage_label: str,
         build_id: str,
+        memory_project: str | None = None,
+        granted_memory_projects: Sequence[str] = (),
     ) -> list[PriorReference]:
         """Read up to five priors for one gated stage; never raises.
+
+        Only ``memory_project`` is searched, and only when it is one of
+        ``granted_memory_projects`` (the build's repository's grant, design
+        section 2.4a). Otherwise nothing is searched — the store is not even
+        opened — and one plain INFO line says why.
 
         The whole body (lazy store open included) runs under the
         configured deadline. Timeout/cancellation and any other failure
         discard the store handle — the next gate read reconnects fresh —
         and return ``[]`` so the gate proceeds without priors.
         """
+        why_not = memory_grant_refusal(memory_project, granted_memory_projects)
+        if why_not is not None:
+            logger.info(
+                "fleet-memory priors: no priors for build_id=%s and memory was "
+                "not searched: %s",
+                build_id,
+                why_not,
+            )
+            return []
+        assert memory_project is not None  # memory_grant_refusal said so
         try:
             return await asyncio.wait_for(
                 self._read(
+                    project=memory_project.strip(),
                     target_kind=target_kind,
                     target_identifier=target_identifier,
                     stage_label=stage_label,
@@ -341,6 +388,7 @@ class FleetMemoryPriorsReader:
     async def _read(
         self,
         *,
+        project: str,
         target_kind: GateTargetKind,
         target_identifier: str,
         stage_label: str,
@@ -350,7 +398,7 @@ class FleetMemoryPriorsReader:
         backend = self._backend
         assert backend is not None  # _open_store resolved it
         request = backend.request_cls(
-            project=self._config.project,
+            project=project,
             query=f"{target_kind} {target_identifier} {stage_label} outcome",
             payload_types=list(_PAYLOAD_TYPES),
             token_budget=_TOKEN_BUDGET,
@@ -363,7 +411,8 @@ class FleetMemoryPriorsReader:
             # the production level (the ruling-3 receipt bar), and silence
             # here is indistinguishable from the read never running.
             logger.info(
-                "fleet-memory priors: 0 priors matched for %s %s at %s",
+                "fleet-memory priors: 0 priors matched in %s for %s %s at %s",
+                project,
                 target_kind,
                 target_identifier,
                 stage_label,
@@ -377,8 +426,9 @@ class FleetMemoryPriorsReader:
             if prior is not None:
                 priors.append(prior)
         logger.info(
-            "fleet-memory priors: %d prior(s) matched for %s %s at %s",
+            "fleet-memory priors: %d prior(s) matched in %s for %s %s at %s",
             len(priors),
+            project,
             target_kind,
             target_identifier,
             stage_label,
@@ -440,8 +490,8 @@ def build_priors_reader_from_env(
     * OFF → :class:`~forge.gating.degraded.EmptyPriorsReader` + WARNING.
     * ON but ``fleet_memory`` not importable (the forge ``memory``
       extra) → :class:`EmptyPriorsReader` + ERROR (DEGRADED).
-    * ON → :class:`FleetMemoryPriorsReader` + INFO naming project and
-      deadline.
+    * ON → :class:`FleetMemoryPriorsReader` + INFO saying whose memory
+      is read (each build's own granted project) and the deadline.
 
     ``fleet_memory`` is imported ONLY on the ON path, so the default
     OFF composition never requires the extra to be installed.
@@ -471,8 +521,9 @@ def build_priors_reader_from_env(
         )
         return EmptyPriorsReader()
     logger.info(
-        "memory: ON (project=%s) — priors read at gate time, %ss deadline",
-        config.project,
+        "memory: ON — priors read at gate time from each build's own memory "
+        "project, only when its repository was granted that name at "
+        "registration (planning.sandboxes memory_projects), %ss deadline",
         config.read_timeout_s,
     )
     return FleetMemoryPriorsReader(config, backend=backend)
@@ -484,4 +535,5 @@ __all__ = [
     "FleetMemoryPriorsReader",
     "build_priors_reader_from_env",
     "load_priors_config_from_env",
+    "memory_grant_refusal",
 ]

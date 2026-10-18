@@ -947,6 +947,38 @@ class SandboxEntry(BaseModel):
             "Unset: the single receipts root, as before."
         ),
     )
+    memory_projects: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The fleet-memory project names this repository's builds may read "
+            "outside the sandbox (design section 2.4a, 18 October 2026): the "
+            "priors on a build's approval card are read only when the build's "
+            "recorded memory name is one of these. register-repo writes the "
+            "project's declared name here when it gives the project a sandbox "
+            "of its own, the same name it puts on that sandbox's memory door "
+            "line. A project's own declaration does not grant a name; this "
+            "list does. Empty (the default): no priors are read for its builds."
+        ),
+    )
+
+    @field_validator("memory_projects")
+    @classmethod
+    def _memory_projects_are_memory_names(cls, value: list[str]) -> list[str]:
+        """Each entry is a name the memory service accepts: ^[a-z0-9_]+$."""
+        import re
+
+        names: list[str] = []
+        for raw in value:
+            name = str(raw)
+            if not re.fullmatch(r"[a-z0-9_]+", name) or len(name) > 128:
+                raise ValueError(
+                    "each of a sandbox's memory_projects must be a memory project "
+                    "name of lower-case letters, digits and underscores (at most "
+                    f"128 characters); {name[:40]!r} is not"
+                )
+            if name not in names:
+                names.append(name)
+        return names
 
     @field_validator("sidecar_url", "runner_url")
     @classmethod
