@@ -79,6 +79,9 @@ STOPPED = "stopped"
 STOPPING = "stopping"
 UNKNOWN = "unknown"
 
+#: Supervisor container states that mean it is not running.
+EXITED = ("exited", "dead", "created", "missing")
+
 #: The fewest seconds between two `sbx ls` calls during a stop.
 MIN_VM_POLL_SECONDS = 5.0
 
@@ -106,6 +109,10 @@ class Failed(Refused):
     """The request was tried and did not succeed, in one plain sentence."""
 
     status = HTTPStatus.SERVICE_UNAVAILABLE
+
+
+class Unresolved(Failed):
+    """A stop was sent and could not be seen through; the sandbox is unresolved."""
 
 
 def _iso(seconds: float) -> str:
@@ -285,11 +292,12 @@ class Sandbox:
 
 class Starter:
     def __init__(self, settings: Settings, *, clock=time.monotonic, wall=time.time,
-                 sleep=time.sleep, say=None):
+                 sleep=time.sleep, wait=None, say=None):
         self.settings = settings
         self.clock = clock
         self.wall = wall
         self.sleep = sleep
+        self.wait = wait or (lambda event, seconds: event.wait(seconds))
         self.say = say or (lambda line: print(f"sandbox-starter: {line}", flush=True))
         self.lock = threading.RLock()
         self.sandboxes = {name: Sandbox(s, self.lock) for name, s in settings.sandboxes.items()}
@@ -309,63 +317,91 @@ class Starter:
             return entry
 
     def _replay(self, sb: Sandbox) -> None:
+        """Read the sandbox's log back. Fails closed on anything but a cut-off last line.
+
+        Every record is written as one line ending in a newline and fsynced
+        before the request it belongs to is answered or acted on. So a final
+        line without its newline was never acknowledged: it is cut off here,
+        back to the end of the last whole line, and fsynced, before anything
+        else is accepted. Anything else wrong with the log is damage this
+        service cannot judge, and it refuses to start.
+        """
         sb.log_path = os.path.join(self.settings.state_dir, f"{sb.name}.jsonl")
         unended: dict[int, dict] = {}
-        if os.path.exists(sb.log_path):
-            with open(sb.log_path, encoding="utf-8") as handle:
-                lines = handle.read().splitlines()
-            for number, line in enumerate(lines, 1):
-                if not line.strip():
-                    continue
-                try:
-                    entry = json.loads(line)
-                except json.JSONDecodeError:
-                    # A line cut short by a crash mid-write. Everything before
-                    # it stands; the operation it was about stays unended and
-                    # is recovered like any other.
-                    self.say(f"{sb.name}: line {number} of the log is not whole and is skipped")
-                    continue
-                sb.next_seq = max(sb.next_seq, int(entry.get("seq", 0)) + 1)
-                kind = entry.get("kind")
-                if kind == "op-queued":
-                    op_id = int(entry["op_id"])
-                    sb.next_op = max(sb.next_op, op_id + 1)
-                    unended[op_id] = {"id": op_id, "op": entry.get("op"), "stop_delivered": False}
-                elif kind == "stop-delivered" and entry.get("op_id") in unended:
-                    unended[entry["op_id"]]["stop_delivered"] = True
-                elif kind == "op-end":
-                    unended.pop(entry.get("op_id"), None)
-                    sb.last_operation = {k: entry.get(k) for k in ("op_id", "op", "outcome", "message", "at")}
-                elif kind == "hold-open":
-                    sb.holds[entry["hold_id"]] = {
-                        "id": entry["hold_id"], "owner": entry.get("owner"),
-                        "until": entry.get("until"), "opened": float(entry.get("opened", 0)),
-                    }
-                elif kind == "hold-close":
-                    sb.holds.pop(entry.get("hold_id"), None)
-                elif kind == "readiness":
-                    sb.readiness = entry.get("state", UNKNOWN)
-                elif kind == "vm":
-                    sb.vm_state = entry.get("state")
-                    sb.vm_seen_at = float(entry.get("seen", 0)) or None
-                    sb.vm_how = entry.get("how")
-                elif kind == "suspend":
-                    sb.suspended = entry.get("reason") or "no reason was given"
-                elif kind == "unresolved":
-                    sb.unresolved = entry.get("reason")
-                elif kind == "clear":
-                    sb.suspended = None
-                    sb.unresolved = None
-                elif kind == "deployment":
-                    sb.deployment_told = entry.get("deployment") or {}
+        if not os.path.exists(sb.log_path):
+            sb.recovering = []
+            return
+        with open(sb.log_path, "rb") as handle:
+            data = handle.read()
+        if data and not data.endswith(b"\n"):
+            keep = data.rfind(b"\n") + 1
+            with open(sb.log_path, "r+b") as handle:
+                handle.truncate(keep)
+                handle.flush()
+                os.fsync(handle.fileno())
+            self.say(
+                f"{sb.name}: the log's last line was cut off by a crash and was never "
+                f"acknowledged; it has been removed ({len(data) - keep} bytes)"
+            )
+            data = data[:keep]
+        for number, raw in enumerate(data.split(b"\n")[:-1] if data else [], 1):
+            try:
+                entry = json.loads(raw.decode("utf-8"))
+                if not isinstance(entry, dict) or not isinstance(entry.get("seq"), int) \
+                        or not isinstance(entry.get("kind"), str):
+                    raise ValueError("not a record")
+                self._apply(sb, entry, unended)
+            except (ValueError, KeyError, TypeError) as exc:
+                raise ValueError(
+                    f"the operation log {sb.log_path} is damaged at line {number} ({exc}), "
+                    "so the starter will not start until a session looks at it"
+                ) from None
         sb.recovering = sorted(unended.values(), key=lambda o: o["id"])
+
+    def _apply(self, sb: Sandbox, entry: dict, unended: dict) -> None:
+        sb.next_seq = max(sb.next_seq, entry["seq"] + 1)
+        kind = entry["kind"]
+        if kind == "op-queued":
+            op_id = int(entry["op_id"])
+            sb.next_op = max(sb.next_op, op_id + 1)
+            unended[op_id] = {"id": op_id, "op": entry["op"], "stop_delivered": False}
+        elif kind == "stop-delivered" and entry.get("op_id") in unended:
+            unended[entry["op_id"]]["stop_delivered"] = True
+        elif kind == "op-end":
+            unended.pop(entry.get("op_id"), None)
+            sb.last_operation = {k: entry.get(k) for k in ("op_id", "op", "outcome", "message", "at")}
+        elif kind == "hold-open":
+            sb.holds[entry["hold_id"]] = {
+                "id": entry["hold_id"], "owner": entry.get("owner"),
+                "until": entry.get("until"), "opened": float(entry.get("opened", 0)),
+            }
+        elif kind == "hold-close":
+            sb.holds.pop(entry.get("hold_id"), None)
+        elif kind == "readiness":
+            sb.readiness = entry.get("state", UNKNOWN)
+        elif kind == "vm":
+            sb.vm_state = entry.get("state")
+            sb.vm_seen_at = float(entry.get("seen", 0)) or None
+            sb.vm_how = entry.get("how")
+        elif kind == "suspend":
+            sb.suspended = entry.get("reason") or "no reason was given"
+        elif kind == "unresolved":
+            sb.unresolved = entry.get("reason")
+        elif kind == "clear":
+            sb.suspended = None
+            sb.unresolved = None
+        elif kind == "deployment":
+            sb.deployment_told = entry.get("deployment") or {}
 
     # -- life cycle ---------------------------------------------------------
 
     def boot(self) -> None:
         os.makedirs(self.settings.state_dir, exist_ok=True)
+        # Every log is read back (and a cut-off last line removed) before any
+        # sandbox's queue starts, so a damaged log stops the whole service.
         for sb in self.sandboxes.values():
             self._replay(sb)
+        for sb in self.sandboxes.values():
             if sb.recovering:
                 ids = ", ".join(str(o["id"]) for o in sb.recovering)
                 self.say(f"{sb.name}: operation(s) {ids} have no recorded end; recovering")
@@ -401,7 +437,8 @@ class Starter:
                 outcome, message = "done", (op.result or {}).get("message", "")
             except Refused as exc:
                 op.error = exc
-                outcome = "failed" if isinstance(exc, Failed) else "refused"
+                outcome = ("unresolved" if isinstance(exc, Unresolved)
+                           else "failed" if isinstance(exc, Failed) else "refused")
                 message = exc.message
             except Exception as exc:  # noqa: BLE001 - reported, never swallowed
                 op.error = Failed(f"the {op.kind} stopped on an unexpected error: {exc!r}")
@@ -508,8 +545,7 @@ class Starter:
                 data = json.loads(answer.read(65536).decode("utf-8", "replace"))
         except (urllib.error.URLError, OSError, ValueError):
             return None
-        if isinstance(data, list):
-            return data
+        # Only an object whose "executing" is a list counts as an answer.
         if isinstance(data, dict) and isinstance(data.get("executing"), list):
             return data["executing"]
         return None
@@ -699,6 +735,13 @@ class Starter:
                 raise Refused(why)
             self._set_readiness(sb, STOPPING)
             self._record(sb, "stop-delivered", op_id=op.id)
+        # FROM HERE ON THE OPERATION STAYS OPEN, blocking every other operation
+        # for this sandbox, until the supervisor has exited AND sbx ls shows the
+        # VM stopped. A docker command that fails or gives no answer says
+        # nothing about the shutdown it started, which may still be running.
+        # Past the bounds the sandbox is unresolved until a session clears it.
+        exit_deadline = self.clock() + self.settings.stop_grace + self.settings.margin
+        said = ""
         if state == "running":
             grace = self.settings.stop_grace
             rc, out = self._run(
@@ -706,62 +749,92 @@ class Starter:
                 grace + self.settings.margin,
             )
             if rc != 0:
-                self._set_readiness(sb, UNKNOWN)
-                raise Failed(f"docker stop {sb.settings.supervisor} did not finish ({out[:200] or 'no output'})")
-            rc, out = self._run([self.settings.docker, "wait", sb.settings.supervisor], self.settings.margin)
-            if rc != 0:
-                self._set_readiness(sb, UNKNOWN)
-                raise Failed(f"docker wait {sb.settings.supervisor} did not confirm it exited ({out[:200] or 'no output'})")
+                said = f"docker stop gave {out[:200] or 'no output'}; "
+                self.say(f"{sb.name}: docker stop did not answer cleanly ({out[:200]}); waiting for the supervisor to exit")
+            rc, out = self._run(
+                [self.settings.docker, "wait", sb.settings.supervisor],
+                max(1.0, min(self.settings.margin, exit_deadline - self.clock())),
+            )
+        self._see_the_stop_through(sb, exit_deadline, said)
+        self._set_readiness(sb, STOPPED)
+        return {"message": f"{sb.name} is stopped: its supervisor has exited and its VM shows stopped"}
 
-        deadline = self.clock() + self.settings.vm_stop_limit
+    def _see_the_stop_through(self, sb: Sandbox, exit_deadline: float, said: str = "") -> None:
+        """Wait, bounded, for the supervisor to exit and then the VM to stop; else unresolved."""
+        while True:
+            state = self._container_state(sb)
+            if state in EXITED:
+                break
+            if self.clock() >= exit_deadline:
+                self._unresolve(
+                    sb,
+                    f"{said}the supervisor container {sb.settings.supervisor} was still {state} "
+                    f"{int(self.settings.stop_grace + self.settings.margin)}s after its stop was sent",
+                )
+            self.sleep(self.settings.recovery_poll)
+        vm_deadline = self.clock() + self.settings.vm_stop_limit
         while True:
             worked, vm = self._sbx_ls(sb)
             if worked and vm in ("stopped", "not listed"):
-                break
-            if self.clock() >= deadline:
-                self._set_readiness(sb, UNKNOWN)
-                raise Failed(
-                    f"the supervisor of {sb.name} has exited but the VM still shows "
-                    f"{vm if worked else 'no answer (' + vm + ')'} after "
-                    f"{int(self.settings.vm_stop_limit)}s"
+                return
+            if self.clock() >= vm_deadline:
+                self._unresolve(
+                    sb,
+                    f"{said}the supervisor of {sb.name} has exited but its VM still showed "
+                    f"{vm if worked else 'no answer (' + vm + ')'} "
+                    f"{int(self.settings.vm_stop_limit)}s later",
                 )
             self.sleep(self.settings.vm_poll)
-        self._set_readiness(sb, STOPPED)
-        return {"message": f"{sb.name} is stopped: its supervisor has exited and its VM shows {vm}"}
+
+    def _unresolve(self, sb: Sandbox, reason: str) -> None:
+        with self.lock:
+            sb.unresolved = reason
+            self._record(sb, "unresolved", reason=reason)
+            self._set_readiness(sb, UNKNOWN)
+        self.say(f"{sb.name}: unresolved: {reason}")
+        raise Unresolved(self._unresolved_sentence(sb))
 
     # -- recovery after a restart -------------------------------------------
 
     def _run_recover(self, sb: Sandbox) -> dict:
         with self.lock:
             pending = list(sb.recovering)
+        ids = ", ".join(str(o["id"]) for o in pending)
         delivered = any(o["stop_delivered"] for o in pending)
         bound = self.settings.stop_grace + self.settings.margin
         deadline = self.clock() + bound
-        while True:
-            state = self._container_state(sb)
-            if state in ("exited", "dead", "created"):
-                found, readiness = f"the supervisor container is {state}", UNKNOWN
-                break
-            if state == "running" and not delivered:
-                found = "the supervisor container is running and no stop was delivered"
-                readiness = None
-                break
-            if self.clock() >= deadline:
-                reason = (
-                    f"after a restart of the starter, operation(s) "
-                    f"{', '.join(str(o['id']) for o in pending)} had no recorded end and, "
-                    f"{int(bound)}s later, the supervisor container is {state}"
-                    + (" with a stop delivered" if delivered else "")
-                )
-                with self.lock:
-                    sb.unresolved = reason
-                    self._record(sb, "unresolved", reason=reason)
-                    for o in pending:
-                        self._record(sb, "op-end", op_id=o["id"], op=o["op"], outcome="unresolved", message=reason)
-                    sb.recovering = []
-                self.say(f"{sb.name}: {reason}")
-                return {"message": reason}
-            self.sleep(self.settings.recovery_poll)
+        try:
+            if delivered:
+                # A stop was sent before the restart: see it through exactly as
+                # the stop itself would have, supervisor exit and VM stop both.
+                self._see_the_stop_through(
+                    sb, deadline, f"after a restart of the starter, with operation(s) {ids} unended, ")
+                found, readiness = "the supervisor container has exited and its VM shows stopped", STOPPED
+            else:
+                while True:
+                    state = self._container_state(sb)
+                    if state in EXITED:
+                        found, readiness = f"the supervisor container is {state}", UNKNOWN
+                        break
+                    if state == "running":
+                        found = "the supervisor container is running and no stop was delivered"
+                        readiness = None
+                        break
+                    if self.clock() >= deadline:
+                        self._unresolve(
+                            sb,
+                            f"after a restart of the starter, operation(s) {ids} had no recorded "
+                            f"end and, {int(bound)}s later, the supervisor container is {state}",
+                        )
+                    self.sleep(self.settings.recovery_poll)
+        except Unresolved:
+            with self.lock:
+                for o in pending:
+                    self._record(sb, "op-end", op_id=o["id"], op=o["op"], outcome="unresolved", message=sb.unresolved)
+                sb.recovering = []
+                sb.last_operation = {"op_id": pending[-1]["id"], "op": pending[-1]["op"],
+                                     "outcome": "unresolved", "message": sb.unresolved}
+            return {"message": sb.unresolved}
         with self.lock:
             for o in pending:
                 self._record(sb, "op-end", op_id=o["id"], op=o["op"], outcome="recovered", message=found)
@@ -864,32 +937,48 @@ class Starter:
             sb.holds[hold_id] = {"id": hold_id, "owner": owner, "until": until, "opened": opened}
             self._record(sb, "hold-open", hold_id=hold_id, owner=owner, until=until, opened=opened)
             quiet = not sb.busy()
+        # ONE DEADLINE for a hold until deployed, from the moment the hold is
+        # taken, across waiting in the queue, the start and the redeploy's
+        # confirmation, with the suspension checked throughout. With no
+        # recorded deployment, deployed is the same as services.
+        deployed = until == "deployed" and sb.deployment() is not None
+        deadline = started + self.settings.deployed_limit
+
+        def checkpoint() -> None:
+            with self.lock:
+                if hold_id not in sb.holds:
+                    raise Failed(f"hold {hold_id} was ended while it waited for {sb.name}")
+                if deployed and sb.suspended:
+                    raise Failed(
+                        f"{sb.name} became managed: suspended, reason: {sb.suspended}, while "
+                        "the hold waited for its recorded deployment"
+                    )
+            if deployed and self.clock() >= deadline:
+                limit = self.settings.deployed_limit
+                said = f"{int(limit // 60)} minutes" if limit % 60 == 0 else f"{int(limit)} seconds"
+                raise Failed(
+                    f"{sb.name}'s recorded deployment was not confirmed back by the coordinator "
+                    f"within {said} of the hold being taken, so the hold has ended"
+                )
+
         try:
+            checkpoint()
             if quiet and self._container_state(sb) == "running" and all(self._services(sb)):
                 readiness = self._services_answered(sb, woke=False)
             else:
-                readiness = self._finish(self._start_or_join(sb))["readiness"]
-            if until == "services" or not sb.deployment():
+                op = self._start_or_join(sb)
+                while not self.wait(op.done, 1.0):
+                    checkpoint()
+                readiness = self._finish(op)["readiness"]
+            if not deployed:
                 return {"hold_id": hold_id, "readiness": readiness,
                         "message": f"{sb.name} is held for {owner}: services ready"}
-            deadline = started + self.settings.deployed_limit
             while True:
+                checkpoint()
                 with self.lock:
-                    if hold_id not in sb.holds:
-                        raise Failed(f"hold {hold_id} was ended while it waited for {sb.name}'s redeploy")
-                    if sb.suspended:
-                        raise Failed(
-                            f"{sb.name} became managed: suspended, reason: {sb.suspended}, while "
-                            "the hold waited for its redeploy"
-                        )
                     if sb.readiness == READY:
                         return {"hold_id": hold_id, "readiness": READY,
                                 "message": f"{sb.name} is held for {owner}: its recorded deployment is back"}
-                if self.clock() >= deadline:
-                    raise Failed(
-                        f"the coordinator did not record {sb.name}'s redeploy as ready within "
-                        f"{int(self.settings.deployed_limit // 60)} minutes, so the hold has ended"
-                    )
                 self.sleep(1.0)
         except Refused as exc:
             with self.lock:
@@ -1034,7 +1123,11 @@ def main() -> int:
         print(f"sandbox-starter: FATAL: {exc}. Nothing was started.", file=sys.stderr, flush=True)
         return 2
     starter = Starter(settings)
-    starter.boot()
+    try:
+        starter.boot()
+    except (ValueError, OSError) as exc:
+        print(f"sandbox-starter: FATAL: {exc}. Nothing was started.", file=sys.stderr, flush=True)
+        return 2
     server = serve(starter, settings.listen_address, settings.listen_port)
     starter.say(
         f"listening on {settings.listen_address}:{settings.listen_port} for "

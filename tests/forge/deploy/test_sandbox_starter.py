@@ -51,11 +51,21 @@ case "$1" in
     [ -f "$S/container" ] || { echo "Error: No such object: $c" >&2; exit 1; }
     cat "$S/container" ;;
   start)
+    # Started while a stop is still under way: the thing that must never happen.
+    if [ "$(cat "$S/inspect_running_for" 2>/dev/null || echo 0)" -gt 0 ] ||
+       [ "$(cat "$S/vm_stops_after" 2>/dev/null || echo 0)" -gt 0 ]; then
+      echo "started while the stop was still under way" >> "$S/midstop"
+    fi
     [ -f "$S/start_sleep" ] && sleep "$(cat "$S/start_sleep")"
     [ -f "$S/start_fails" ] && { echo "Error response from daemon: it would not start" >&2; exit 1; }
     echo running > "$S/container" ;;
   stop)
     [ -f "$S/stop_sleep" ] && sleep "$(cat "$S/stop_sleep")"
+    if [ -f "$S/stop_fails" ]; then
+      # The answer is lost; the shutdown it started goes on (or never ends).
+      [ -f "$S/stop_never_exits" ] || echo exited > "$S/container"
+      echo "Error: context deadline exceeded" >&2; exit 1
+    fi
     echo exited > "$S/container" ;;
   wait) echo 0 ;;
   *) echo "unexpected docker $*" >&2; exit 3 ;;
@@ -143,6 +153,13 @@ class FakeClock:
             self.slept.append(seconds)
         time.sleep(0.001)
 
+    def wait(self, event, seconds: float) -> bool:
+        if event.wait(0.001):
+            return True
+        with self._lock:
+            self.now += seconds
+        return False
+
 
 @pytest.fixture
 def world(tmp_path, monkeypatch):
@@ -196,7 +213,7 @@ def world(tmp_path, monkeypatch):
     def make(deployment=None, clock=None, **env):
         kwargs = {"say": lambda line: None}
         if clock is not None:
-            kwargs.update(clock=clock, wall=clock.wall, sleep=clock.sleep)
+            kwargs.update(clock=clock, wall=clock.wall, sleep=clock.sleep, wait=clock.wait)
         s = starter_mod.Starter(settings(deployment, **env), **kwargs)
         s.boot()
         w.starters.append(s)
@@ -444,9 +461,10 @@ class TestStop:
         s = world.make(clock=clock, STARTER_VM_STOP_LIMIT_SECONDS="30")
         s.start(NAME)
         (world.state / "vm_stops_after").write_text("1000")
-        with pytest.raises(starter_mod.Failed, match="VM still shows running"):
+        with pytest.raises(starter_mod.Unresolved, match="unresolved"):
             s.stop(NAME)
         assert world.lines("sbx.log").count("ls") <= 1 + 30 // 5 + 1
+        assert "VM still showed running" in s.status(NAME)["operations"]["unresolved"]
 
     def test_a_hold_refuses_the_stop(self, world):
         base = world.http(world.make())
@@ -481,7 +499,11 @@ class TestStop:
         assert status == 409 and "still executing 1 request" in body["message"]
         assert not any(line.startswith("stop") for line in world.lines("docker.log"))
 
-    @pytest.mark.parametrize("answer", [(404, "not here"), (200, "not json"), (200, '{"other": 1}')])
+    @pytest.mark.parametrize(
+        "answer",
+        [(404, "not here"), (200, "not json"), (200, '{"other": 1}'), (200, "[]"),
+         (200, '{"executing": "nothing"}'), (500, '{"executing": []}')],
+    )
     def test_a_helper_that_does_not_answer_busy_refuses_the_stop(self, world, answer):
         base = world.http(world.make())
         call(base, "POST", f"/start/{NAME}")
@@ -587,7 +609,9 @@ class TestHolds:
     def test_until_deployed_ends_the_hold_after_fifteen_minutes(self, world):
         clock = FakeClock()
         s = world.make(deployment=DEPLOYMENT, clock=clock)
-        with pytest.raises(starter_mod.Failed, match="within 15 minutes, so the hold has ended") as caught:
+        with pytest.raises(
+            starter_mod.Failed, match="within 15 minutes of the hold being taken, so the hold has ended"
+        ) as caught:
             s.hold(NAME, "merge-deploy", "deployed")
         assert caught.value.extra["hold_ended"] is True
         assert s.status(NAME)["holds"] == []
@@ -767,3 +791,190 @@ class TestTheComposeFileRenders:
         assert addresses and all(a.startswith("192.0.2.") for a in addresses), addresses
         assert "/home/" not in rendered
         assert "starter.py" in rendered and "network_mode: host" in rendered
+
+
+
+def _write_log(world, entries, tail: str = "") -> Path:
+    state_dir = world.tmp / "starter-state"
+    state_dir.mkdir(exist_ok=True)
+    path = state_dir / f"{NAME}.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in entries) + tail)
+    return path
+
+
+A_DELIVERED_STOP = [
+    {"seq": 1, "kind": "op-queued", "op_id": 1, "op": "stop"},
+    {"seq": 2, "kind": "op-begin", "op_id": 1, "op": "stop"},
+    {"seq": 3, "kind": "stop-delivered", "op_id": 1},
+]
+
+
+class TestASentStopIsSeenThrough:
+    """Codex round 1, R1: once a stop is sent, the operation stays open until
+    the supervisor has exited and the VM shows stopped, or it is unresolved."""
+
+    def test_a_lost_answer_mid_shutdown_and_a_hold_never_starts_the_sandbox_mid_stop(self, world):
+        clock = FakeClock()
+        s = world.make(clock=clock)
+        s.start(NAME)
+        (world.state / "stop_fails").write_text("")
+        (world.state / "inspect_running_for").write_text("4")
+        (world.state / "vm_stops_after").write_text("2")
+        stopping = in_background(s.stop, NAME)  # its caller is gone: the answer is lost
+        assert wait_for(lambda: any(e["kind"] == "stop-delivered" for e in log_entries(world)))
+        held = s.hold(NAME, "register-repo", "services")
+        stopping["thread"].join(10)
+        assert not (world.state / "midstop").exists(), (world.state / "midstop").read_text()
+        assert "is stopped" in stopping["result"]["message"]
+        docker = world.lines("docker.log")
+        last_stop = max(i for i, line in enumerate(docker) if line.startswith("stop"))
+        last_start = max(i for i, line in enumerate(docker) if line.startswith("start"))
+        assert last_start > last_stop
+        report = s.status(NAME)
+        assert report["container"]["state"] == "running"
+        assert [h["id"] for h in report["holds"]] == [held["hold_id"]]
+        assert report["operations"]["unresolved"] is None
+
+    def test_a_shutdown_that_never_ends_is_unresolved_and_refuses_everything(self, world):
+        clock = FakeClock()
+        s = world.make(clock=clock, STARTER_RECOVERY_POLL_SECONDS="10")
+        s.start(NAME)
+        (world.state / "stop_fails").write_text("")
+        (world.state / "stop_never_exits").write_text("")
+        with pytest.raises(starter_mod.Unresolved):
+            s.stop(NAME)
+        reason = s.status(NAME)["operations"]["unresolved"]
+        assert "still running 240s after its stop was sent" in reason
+        assert "context deadline exceeded" in reason
+        with pytest.raises(starter_mod.Refused, match="unresolved"):
+            s.hold(NAME, "register-repo", "services")
+        with pytest.raises(starter_mod.Refused, match="unresolved"):
+            s.start(NAME)
+        assert sum(1 for line in world.lines("docker.log") if line.startswith("start")) == 1
+        assert [e["outcome"] for e in log_entries(world) if e["kind"] == "op-end"][-1] == "unresolved"
+
+
+class TestRecoveryFinishesTheVmStop:
+    """Codex round 1, R2."""
+
+    def test_an_exited_supervisor_with_its_vm_still_running_is_seen_to_stopped(self, world):
+        _write_log(world, A_DELIVERED_STOP)
+        (world.state / "container").write_text("exited\n")
+        (world.state / "vm_stops_after").write_text("2")
+        clock = FakeClock()
+        s = world.make(clock=clock)
+        assert wait_for(lambda: s.status(NAME)["operations"]["recovering"] == [])
+        report = s.status(NAME)
+        assert report["operations"]["last"]["outcome"] == "recovered"
+        assert "VM shows stopped" in report["operations"]["last"]["message"]
+        assert report["readiness"] == "stopped"
+        assert world.lines("sbx.log") == ["ls", "ls", "ls"]
+        assert clock.slept.count(5.0) == 2
+        assert not any(line.startswith("exec") for line in world.lines("sbx.log"))
+
+    def test_a_vm_that_never_stops_after_a_restart_is_unresolved(self, world):
+        _write_log(world, A_DELIVERED_STOP)
+        (world.state / "container").write_text("exited\n")
+        (world.state / "vm_override").write_text("running")
+        clock = FakeClock()
+        s = world.make(clock=clock)
+        assert wait_for(lambda: s.status(NAME)["operations"]["unresolved"])
+        assert "VM still showed running 180s later" in s.status(NAME)["operations"]["unresolved"]
+        assert world.lines("sbx.log").count("ls") <= 180 // 5 + 1
+        with pytest.raises(starter_mod.Refused, match="unresolved"):
+            s.start(NAME)
+
+
+class TestTheLogIsWholeOrRefused:
+    """Codex round 1, R3."""
+
+    def test_a_cut_off_tail_twice_then_an_acknowledged_hold_and_suspension_read_back(self, world):
+        first = world.make()
+        first.start(NAME)
+        first.close()
+        path = world.tmp / "starter-state" / f"{NAME}.jsonl"
+        with open(path, "a") as handle:
+            handle.write('{"seq": 99, "kind": "hold-op')
+        second = world.make()
+        second.close()
+        assert path.read_text().endswith("\n")
+        with open(path, "a") as handle:
+            handle.write('{"seq": 99, "kin')
+        third = world.make()
+        held = third.hold(NAME, "estate-check", "services")
+        third.suspend(NAME, "the redeploy's proxy did not answer")
+        third.close()
+        for line in path.read_text().splitlines():
+            json.loads(line)
+        fourth = world.make()
+        report = fourth.status(NAME)
+        assert [h["id"] for h in report["holds"]] == [held["hold_id"]]
+        assert report["managed"] == {"state": "suspended", "reason": "the redeploy's proxy did not answer"}
+
+    @pytest.mark.parametrize(
+        "damage",
+        ['{"seq": 2, "kind": "hold-op\n', "[1, 2]\n", "\n", '{"seq": "two", "kind": "clear"}\n',
+         '{"seq": 2, "kind": "op-queued"}\n'],
+    )
+    def test_damage_before_the_last_line_refuses_to_start(self, world, damage):
+        path = _write_log(world, [{"seq": 1, "kind": "clear"}])
+        with open(path, "a") as handle:
+            handle.write(damage + json.dumps({"seq": 3, "kind": "clear"}) + "\n")
+        before = path.read_bytes()
+        with pytest.raises(ValueError, match="damaged at line 2"):
+            world.make()
+        assert path.read_bytes() == before
+
+    def test_the_program_refuses_to_start_in_one_sentence(self, world):
+        import subprocess
+
+        settings = world.settings()  # writes the settings file
+        path = _write_log(world, [{"seq": 1, "kind": "clear"}], tail="not json\n{}\n")
+        env = dict(os.environ)
+        env.update({
+            "STARTER_LISTEN_ADDRESS": "127.0.0.1", "STARTER_LISTEN_PORT": "0",
+            "STARTER_SANDBOXES": NAME, "STARTER_SETTINGS_FILE": str(world.tmp / "sandboxes.json"),
+            "STARTER_STATE_DIR": str(path.parent),
+            "STARTER_DOCKER": str(world.bin / "docker"), "STARTER_SBX": str(world.bin / "sbx"),
+        })
+        done = subprocess.run([sys.executable, "-I", str(STARTER_PY)], env=env,
+                              capture_output=True, text=True, timeout=30)
+        assert done.returncode == 2
+        assert "damaged at line 2" in done.stderr and "Nothing was started" in done.stderr
+        assert settings.sandboxes[NAME].name == NAME
+
+
+class TestOneDeadlineForADeployedHold:
+    """Codex round 1, R4."""
+
+    def test_a_suspension_during_start_up_ends_the_hold(self, world):
+        (world.state / "start_sleep").write_text("2")
+        s = world.make(deployment=DEPLOYMENT)
+        box = in_background(s.hold, NAME, "merge-deploy", "deployed")
+        assert wait_for(lambda: s.sandboxes[NAME].running is not None)
+        began = time.monotonic()
+        s.suspend(NAME, "keycloak did not answer")
+        box["thread"].join(10)
+        assert time.monotonic() - began < 1.8  # before the start has finished
+        assert isinstance(box["error"], starter_mod.Failed)
+        assert "suspended" in box["error"].message
+        assert box["error"].extra["hold_ended"] is True
+        assert s.status(NAME)["holds"] == []
+        hold_id = box["error"].extra["hold_id"]
+        assert any(e["kind"] == "hold-close" and e["hold_id"] == hold_id for e in log_entries(world))
+
+    def test_a_stop_then_a_start_that_together_pass_the_deadline(self, world):
+        s = world.make(deployment=DEPLOYMENT, STARTER_DEPLOYED_LIMIT_SECONDS="2")
+        s.start(NAME)
+        (world.state / "stop_sleep").write_text("1.2")
+        stopping = in_background(s.stop, NAME)
+        assert wait_for(lambda: any(e["kind"] == "stop-delivered" for e in log_entries(world)))
+        (world.state / "start_sleep").write_text("1.5")
+        began = time.monotonic()
+        with pytest.raises(starter_mod.Failed, match="within 2 seconds of the hold being taken") as caught:
+            s.hold(NAME, "merge-deploy", "deployed")
+        assert time.monotonic() - began < 2.6  # the start (done at about 2.7 s) was not waited for
+        hold_id = caught.value.extra["hold_id"]
+        assert s.status(NAME)["holds"] == []
+        assert any(e["kind"] == "hold-close" and e["hold_id"] == hold_id for e in log_entries(world))
+        stopping["thread"].join(10)
