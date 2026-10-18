@@ -259,6 +259,13 @@ SLOT_HELPER_BASE = 8925
 SLOT_RUNNER_BASE = 8924
 NEVER_FROM_A_SLOT_PORTS = (4222, 4000)
 SLOT_MAX = 19
+# The shared services a slot sandbox reaches are fixed (Codex R2, round 2): no
+# sandbox chooses its own, and none may name the full memory door (31822) or
+# the shared sandbox's door (31824) on the gateway.
+SLOT_MODEL_DOOR_PORT = 31823
+SLOT_ANSWER_PORT = 31821
+SLOT_EMBEDDER_PORT = 9000
+NEVER_ON_THE_GATEWAY_FROM_A_SLOT = (31822, 31824)
 # The shared sandbox is never a slot entry (Codex R1).
 SHARED_SANDBOX_NAMES = ('api-test-deploy',)
 
@@ -416,6 +423,13 @@ class Rollout:
                 f'{s["name"]} is the shared sandbox (no slot), and the shared sandbox gets no Git door port; take GIT_DOOR_PORT out of its env file')
         if self.slot is not None:
             k = self.slot
+            require(self.model_door == f'{gateway}:{SLOT_MODEL_DOOR_PORT}',
+                    f'slot {k} reaches the model door at the fixed port {SLOT_MODEL_DOOR_PORT}; set MODEL_DOOR_PORT={SLOT_MODEL_DOOR_PORT} in its env file')
+            require(self.answer == f'{gateway}:{SLOT_ANSWER_PORT}',
+                    f'slot {k} reaches the answer service at the fixed port {SLOT_ANSWER_PORT}; fix FORGE_TARGET_OWNER_URL in its env file')
+            embed = urlsplit(self.values.get('FLEET_MEMORY_EMBED_URL',''))
+            require(not self.values.get('FLEET_MEMORY_EMBED_URL') or embed.hostname != gateway or embed.port == SLOT_EMBEDDER_PORT,
+                    f'slot {k} reaches the embedder at the fixed port {SLOT_EMBEDDER_PORT}; fix FLEET_MEMORY_EMBED_URL in its env file')
             require(self.git_door == f'{gateway}:{SLOT_GIT_DOOR_BASE + k}',
                     f'slot {k} reads its repositories through Git door port {SLOT_GIT_DOOR_BASE + k}; set GIT_DOOR_PORT={SLOT_GIT_DOOR_BASE + k} in its env file')
             require(self.memory_mcp == f'{gateway}:{SLOT_MEMORY_DOOR_BASE + k}',
@@ -578,9 +592,7 @@ class Rollout:
             return
         gateway = self.values['FACTORY_GATEWAY_ADDRESS']
         allowed = {self.answer, self.memory_mcp, self.model_door, self.git_door}
-        embed = urlsplit(self.values.get('FLEET_MEMORY_EMBED_URL',''))
-        if embed.hostname == gateway:
-            allowed.add(f'{gateway}:{embed.port or (443 if embed.scheme == "https" else 80)}')
+        allowed.add(f'{gateway}:{SLOT_EMBEDDER_PORT}')
         for rule in profile['rules']:
             # The real rollout's rule too (PROFILE): no wildcard and no address range.
             require(rule != '*' and '/' not in rule,
@@ -595,6 +607,8 @@ class Rollout:
                 other_memory = SLOT_MEMORY_DOOR_BASE < number <= SLOT_MEMORY_DOOR_BASE + SLOT_MAX and number != SLOT_MEMORY_DOOR_BASE + self.slot
                 require(not (other_git or other_memory),
                         f'{self.s["name"]} is slot {self.slot} and its rules name {rule}, another project\'s Git door or memory door; take it out')
+            require(not (host == gateway and port and int(port) in NEVER_ON_THE_GATEWAY_FROM_A_SLOT),
+                    f'{self.s["name"]} is a project\'s own sandbox and its rules name {rule}, a memory door that is not its own; take it out')
             require(host != gateway or rule in allowed,
                     f'{self.s["name"]} is a project\'s own sandbox and its rules name {rule} on the gateway, which is not one of its own doors or the shared services; take it out of its profile')
         require(self.git_door in profile['rules'] and self.memory_mcp in profile['rules'],

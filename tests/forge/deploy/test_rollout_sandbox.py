@@ -495,7 +495,7 @@ def test_a_slot_sandbox_gets_its_git_door_rule_once_and_the_receipt_records_it(i
     rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
     assert rules.count('192.0.2.10:31831')==1
     allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
-    assert allowed.count('192.0.2.10:31831')==1 and '192.0.2.10:30823' in allowed
+    assert allowed.count('192.0.2.10:31831')==1 and '192.0.2.10:31823' in allowed
     assert not any(x in ('*','192.0.2.10') or '/' in x for x in allowed)
     receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
     assert receipt['git_door_rule']=='192.0.2.10:31831'
@@ -882,6 +882,7 @@ def make_slot(config, path, slot=1):
     """Turn the fixture's sandbox into slot `slot`'s own sandbox."""
     k = slot
     edit_env(config, {'GIT_DOOR_PORT': str(31830 + k), 'FLEET_MEMORY_SANDBOX_PORT': str(31850 + k),
+                      'MODEL_DOOR_PORT': '31823', 'FORGE_TARGET_OWNER_URL': 'http://192.0.2.10:31821',
                       'FORGE_SANDBOX_SIDECAR_URL': f'http://192.0.2.10:{8925 + 10 * k}',
                       'FORGE_SANDBOX_RUNNER_URL': f'http://192.0.2.10:{8924 + 10 * k}'})
     source = Path(config['sandbox']['profile_source'])
@@ -899,7 +900,7 @@ def test_a_slot_sandbox_names_only_its_own_doors_on_the_gateway(inventory, monke
     assert m.main(args) == 0
     allowed = next(x for x in b.argv() if x[:4] == ['sbx', 'policy', 'allow', 'network'])[-1].split(',')
     assert sorted(x for x in allowed if x.startswith('192.0.2.10')) == sorted(
-        ['192.0.2.10:8900', '192.0.2.10:31851', '192.0.2.10:30823', '192.0.2.10:31831'])
+        ['192.0.2.10:31821', '192.0.2.10:31851', '192.0.2.10:31823', '192.0.2.10:31831'])
     assert 'example.test:443' in allowed
 
 
@@ -922,6 +923,8 @@ def test_a_slot_whose_env_file_disagrees_with_its_slot_refuses_before_anything(i
 @pytest.mark.parametrize('rule,words', [
     ('192.0.2.10:31852', "another project's Git door or memory door"),
     ('198.51.100.9:31840', "another project's Git door or memory door"),
+    ('192.0.2.10:31824', 'a memory door that is not its own'),
+    ('192.0.2.10:31822', 'a memory door that is not its own'),
     ('192.0.2.0/24', 'a wildcard or an address range'),
     ('0.0.0.0/0', 'a wildcard or an address range'),
     ('*', 'a wildcard or an address range'),
@@ -952,6 +955,8 @@ def test_slots_run_from_one_to_nineteen(inventory, capsys, slot):
     ('198.51.100.9:4000', "the bus's or the model router's port"),
     ('192.0.2.10:31852', "another project's Git door or memory door"),
     ('198.51.100.9:31840', "another project's Git door or memory door"),
+    ('192.0.2.10:31824', 'a memory door that is not its own'),
+    ('192.0.2.10:31822', 'a memory door that is not its own'),
     ('192.0.2.10:30824', 'not one of its own doors'),
 ])
 def test_a_slot_profile_rule_for_another_door_the_bus_or_the_router_refuses(inventory, monkeypatch, capsys, rule, words):
@@ -1072,15 +1077,23 @@ def test_the_shared_sandbox_can_never_be_a_slot_entry(inventory, capsys):
     assert 'is the shared sandbox and cannot carry a slot' in capsys.readouterr().err
 
 
-@pytest.mark.parametrize('change', [{'MODEL_DOOR_PORT': '4000'}, {'MODEL_DOOR_PORT': '4222'}, {'MODEL_DOOR_PORT': '31845'}])
-def test_a_shared_service_port_set_to_the_bus_the_router_or_another_door_refuses(inventory, monkeypatch, capsys, change):
-    """Codex R2: the generated rules are checked as well as the profile's."""
+@pytest.mark.parametrize('change,words', [
+    ({'MODEL_DOOR_PORT': '4000'}, 'set MODEL_DOOR_PORT=31823'),
+    ({'MODEL_DOOR_PORT': '4222'}, 'set MODEL_DOOR_PORT=31823'),
+    ({'MODEL_DOOR_PORT': '31845'}, 'set MODEL_DOOR_PORT=31823'),
+    ({'MODEL_DOOR_PORT': '31824'}, 'set MODEL_DOOR_PORT=31823'),
+    ({'FORGE_TARGET_OWNER_URL': 'http://192.0.2.10:31824'}, 'the answer service at the fixed port 31821'),
+    ({'FLEET_MEMORY_EMBED_URL': 'http://192.0.2.10:31824'}, 'the embedder at the fixed port 9000'),
+])
+def test_a_slots_shared_services_are_fixed(inventory, monkeypatch, capsys, change, words):
+    """Codex R2 (round 2): a slot sandbox's shared services are fixed constants;
+    any other value, the shared sandbox's memory door 31824 included, is refused."""
     config, path, args = inventory
     make_slot(config, path)
     edit_env(config, change)
     b = Boundary(config, monkeypatch)
     assert m.main(args) == 2
     error = capsys.readouterr().err
-    assert "the bus's or the model router's port" in error or "another project's Git door or memory door" in error
+    assert words in error
     assert not b.files
     assert not any(x[:2] == ['sbx', 'stop'] for x in b.argv())

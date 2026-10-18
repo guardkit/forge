@@ -184,27 +184,32 @@ class TestAProjectsOwnSandbox:
         assert sbx == [] and other == []
 
     @pytest.mark.parametrize("change,words", [
-        ({"SANDBOX_MODEL_DOOR_PORT": "4000"}, "the bus's or the model router's"),
-        ({"SANDBOX_ANSWER_PORT": "4222"}, "the bus's or the model router's"),
-        ({"SANDBOX_EMBEDDER_PORT": "31852"}, "another project's Git door or memory door"),
-        ({"SANDBOX_MODEL_DOOR_PORT": "31832"}, "another project's Git door or memory door"),
+        ({"SANDBOX_MODEL_DOOR_PORT": "4000"}, "fixed at 31823"),
+        ({"SANDBOX_ANSWER_PORT": "4222"}, "fixed at 31821"),
+        ({"SANDBOX_EMBEDDER_PORT": "31824"}, "fixed at 9000"),
+        ({"SANDBOX_MODEL_DOOR_PORT": "31824"}, "fixed at 31823"),
+        ({"SANDBOX_ANSWER_PORT": "31822"}, "fixed at 31821"),
+        ({"SANDBOX_EMBEDDER_PORT": "31852"}, "fixed at 9000"),
+        ({"SANDBOX_MODEL_DOOR_PORT": "31900"}, "fixed at 31823"),
         ({"SANDBOX_ALLOW_NETWORK": "pypi.org,mirror.example.test:31845"}, "another project's Git door or memory door"),
-        ({"SANDBOX_ANSWER_PORT": "31823"}, "would share a port"),
-        ({"SANDBOX_EMBEDDER_PORT": "31831"}, "would share a port"),
+        ({"SANDBOX_ALLOW_NETWORK": "pypi.org,mirror.example.test:4000"}, "the bus's or the model router's"),
     ])
     def test_the_whole_policy_is_checked_before_any_call(self, slot_repo, tmp_path, change, words):
-        """Codex R2: generated rules as well as the project's, overrides included."""
+        """Codex R2: the shared services are fixed for a slot sandbox, and the
+        project's rules are checked too; refused before any call."""
         result, sbx, other = _drive(slot_repo, tmp_path, "prepare", **change)
         assert result.returncode == 2, result.stdout
         assert words in result.stdout
         assert sbx == [] and other == []
 
-    def test_a_valid_shared_service_override_still_works(self, slot_repo, tmp_path):
-        result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_MODEL_DOOR_PORT="31900",
-                                SANDBOX_EMBEDDER_PORT="9100")
+    def test_naming_the_fixed_value_itself_is_accepted(self, slot_repo, tmp_path):
+        result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_MODEL_DOOR_PORT="31823",
+                                SANDBOX_ANSWER_PORT="31821", SANDBOX_EMBEDDER_PORT="9000")
         assert result.returncode == 0, result.stdout + result.stderr
         allowed = [line for line in sbx if line.startswith("policy allow ")][0]
-        assert f"{GATEWAY}:31900" in allowed and f"{GATEWAY}:9100" in allowed
+        gateway = sorted(r for r in allowed.rsplit(" ", 1)[1].split(",") if r.startswith(GATEWAY + ":"))
+        assert gateway == sorted(f"{GATEWAY}:{p}" for p in (31831, 31851, 31823, 31821, 9000))
+        assert not any(r.endswith((":31822", ":31824")) for r in gateway)
 
     def test_the_receipts_are_mounted_at_runtime_and_checked(self, slot_repo, tmp_path):
         _, _, receipts, _ = slot_repo
@@ -251,7 +256,7 @@ class TestAProjectsOwnSandbox:
         ({"SANDBOX_GATEWAY_ADDRESS": ""}, "SANDBOX_GATEWAY_ADDRESS"),
         ({"SANDBOX_RECEIPTS_PATH": ""}, "SANDBOX_RECEIPTS_PATH"),
         ({"SANDBOX_RUNNER_PUBLISH": "127.0.0.1:8924:8124"}, "Leave both out"),
-        ({"SANDBOX_MODEL_DOOR_PORT": "door"}, "SANDBOX_MODEL_DOOR_PORT"),
+        ({"SANDBOX_MODEL_DOOR_PORT": "door"}, "fixed at 31823"),
     ])
     def test_a_bad_slot_setting_refuses_before_anything(self, slot_repo, tmp_path, change, words):
         result, sbx, other = _drive(slot_repo, tmp_path, "prepare", **change)

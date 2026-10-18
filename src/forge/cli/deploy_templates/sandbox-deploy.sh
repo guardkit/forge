@@ -131,9 +131,10 @@
 #   SANDBOX_PUBLISH_ADDRESS  the address the runner, helper and git daemon are
 #                            published on (the machine's direct-link address)
 #   SANDBOX_GATEWAY_ADDRESS  the address the doors are reached at
-#   SANDBOX_MODEL_DOOR_PORT  the shared model door      (default 31823)
-#   SANDBOX_ANSWER_PORT      the shared answer service  (default 31821)
-#   SANDBOX_EMBEDDER_PORT    the shared embedder        (default 9000)
+#   The three shared services are FIXED for a slot sandbox (Codex R2): the
+#   model door 31823, the answer service 31821 and the embedder 9000.
+#   SANDBOX_MODEL_DOOR_PORT, SANDBOX_ANSWER_PORT and SANDBOX_EMBEDDER_PORT
+#   may be set only to those same numbers; any other value is refused.
 #   SANDBOX_REPO_ROOT        the checkout the clone is made from, when this file
 #                            is run from somewhere other than its deploy/
 #                            folder (default: the folder above this file)
@@ -213,9 +214,14 @@ fi
 SANDBOX_SLOT="${SANDBOX_SLOT:-}"
 SANDBOX_PUBLISH_ADDRESS="${SANDBOX_PUBLISH_ADDRESS:-}"
 SANDBOX_GATEWAY_ADDRESS="${SANDBOX_GATEWAY_ADDRESS:-}"
-SANDBOX_MODEL_DOOR_PORT="${SANDBOX_MODEL_DOOR_PORT:-31823}"
-SANDBOX_ANSWER_PORT="${SANDBOX_ANSWER_PORT:-31821}"
-SANDBOX_EMBEDDER_PORT="${SANDBOX_EMBEDDER_PORT:-9000}"
+# The shared services a slot sandbox reaches, fixed: no sandbox chooses its own
+# (Codex R2, round 2).
+SLOT_MODEL_DOOR_PORT=31823
+SLOT_ANSWER_PORT=31821
+SLOT_EMBEDDER_PORT=9000
+# The two memory ports a slot sandbox may never name on the gateway: the full
+# memory door for the machine's own tools, and the shared sandbox's door.
+NEVER_ON_THE_GATEWAY_FROM_A_SLOT=(31822 31824)
 
 # The slot scheme's bases. Slot k adds 10 times k to each. The same numbers are
 # in forge's register-repo, which writes the coordinator's side of the slot.
@@ -247,7 +253,6 @@ plain_ipv4() {
   [[ "${value}" != 0.* && "${value}" != 127.* && "${value}" != 255.255.255.255 ]]
 }
 
-a_port() { [[ "$1" =~ ^[1-9][0-9]{0,4}$ ]] && (($1 < 65536)); }
 
 SLOT_PUBLISHES=()
 SLOT_DOOR_RULES=()
@@ -276,9 +281,11 @@ if is_a_slot_sandbox; then
     log "FATAL: a slot sandbox reaches its doors at SANDBOX_GATEWAY_ADDRESS, which must be an IPv4 address (not loopback); it is '${SANDBOX_GATEWAY_ADDRESS}'. Refusing to deploy."
     exit 2
   fi
-  for port_name in SANDBOX_MODEL_DOOR_PORT SANDBOX_ANSWER_PORT SANDBOX_EMBEDDER_PORT; do
-    if ! a_port "${!port_name}"; then
-      log "FATAL: ${port_name} is '${!port_name}', which is not a port number. Refusing to deploy."
+  for pair in SANDBOX_MODEL_DOOR_PORT:SLOT_MODEL_DOOR_PORT SANDBOX_ANSWER_PORT:SLOT_ANSWER_PORT SANDBOX_EMBEDDER_PORT:SLOT_EMBEDDER_PORT; do
+    setting="${pair%%:*}"
+    fixed="${pair#*:}"
+    if [[ -n "${!setting:-}" && "${!setting}" != "${!fixed}" ]]; then
+      log "FATAL: ${setting} is '${!setting}', and for a project's own sandbox it is fixed at ${!fixed}. Leave it out. Refusing to deploy."
       exit 2
     fi
   done
@@ -301,9 +308,9 @@ if is_a_slot_sandbox; then
   SLOT_DOOR_RULES=(
     "${SANDBOX_GATEWAY_ADDRESS}:$((SLOT_GIT_DOOR_BASE + 10#${SANDBOX_SLOT}))"
     "${SANDBOX_GATEWAY_ADDRESS}:$((SLOT_MEMORY_DOOR_BASE + 10#${SANDBOX_SLOT}))"
-    "${SANDBOX_GATEWAY_ADDRESS}:${SANDBOX_MODEL_DOOR_PORT}"
-    "${SANDBOX_GATEWAY_ADDRESS}:${SANDBOX_ANSWER_PORT}"
-    "${SANDBOX_GATEWAY_ADDRESS}:${SANDBOX_EMBEDDER_PORT}"
+    "${SANDBOX_GATEWAY_ADDRESS}:${SLOT_MODEL_DOOR_PORT}"
+    "${SANDBOX_GATEWAY_ADDRESS}:${SLOT_ANSWER_PORT}"
+    "${SANDBOX_GATEWAY_ADDRESS}:${SLOT_EMBEDDER_PORT}"
   )
   # The project's own rules may not name the gateway, a wildcard for every
   # address, or the bus's or the router's port: the doors come from the slot.
@@ -359,10 +366,18 @@ if is_a_slot_sandbox; then
     rule_port=$((10#${BASH_REMATCH[1]}))
     for never in "${NEVER_FROM_A_SLOT_PORTS[@]}"; do
       if ((rule_port == never)); then
-        log "FATAL: the policy for ${SANDBOX_NAME} would name port ${never} (${rule}), which is the bus's or the model router's. Check SANDBOX_MODEL_DOOR_PORT, SANDBOX_ANSWER_PORT, SANDBOX_EMBEDDER_PORT and SANDBOX_ALLOW_NETWORK. Refusing to deploy."
+        log "FATAL: the policy for ${SANDBOX_NAME} would name port ${never} (${rule}), which is the bus's or the model router's. Check SANDBOX_ALLOW_NETWORK. Refusing to deploy."
         exit 2
       fi
     done
+    if [[ "${rule%:*}" == "${SANDBOX_GATEWAY_ADDRESS}" ]]; then
+      for never in "${NEVER_ON_THE_GATEWAY_FROM_A_SLOT[@]}"; do
+        if ((rule_port == never)); then
+          log "FATAL: the policy for ${SANDBOX_NAME} would name ${rule}, a memory door that is not this project's (the machine's own tools' door, or the shared sandbox's). Refusing to deploy."
+          exit 2
+        fi
+      done
+    fi
     if (( (rule_port > SLOT_GIT_DOOR_BASE && rule_port <= SLOT_GIT_DOOR_BASE + SLOT_MAX && rule_port != own_git_door) ||
           (rule_port > SLOT_MEMORY_DOOR_BASE && rule_port <= SLOT_MEMORY_DOOR_BASE + SLOT_MAX && rule_port != own_memory_door) )); then
       log "FATAL: the policy for ${SANDBOX_NAME} would name port ${rule_port} (${rule}), which is another project's Git door or memory door. Slot ${SANDBOX_SLOT} reaches only ${own_git_door} and ${own_memory_door}. Refusing to deploy."
