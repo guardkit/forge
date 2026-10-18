@@ -456,6 +456,67 @@ services:
         fi
         FLEET_MEMORY_PG_DSN="$$(cat "$$address_file")"
         export FLEET_MEMORY_PG_DSN
+        # ONE MEMORY DOOR PER SANDBOX (one sandbox per project, 17 October
+        # 2026). With FLEET_MEMORY_SANDBOX_DOORS in the env file the process
+        # opens one narrow door per entry ("<port>:<project>|<project>,..."),
+        # each serving only its own projects, and the single door setting is
+        # taken away (fleet-memory refuses both). The shared sandbox's door
+        # stays 8006, published where it always was; every other door listens
+        # on the port it is published on (31850 + the sandbox's slot), and
+        # FLEET_MEMORY_SANDBOX_DOOR_PORTS, the port or range compose publishes
+        # them on, must name exactly those ports. Each is added to the names
+        # the service answers to. Unset: today's one door on 8006.
+        refuse_the_doors() {
+            echo "the memory service's doors will not do: $$1 (deploy/estate/.env.example, FLEET_MEMORY_SANDBOX_DOORS)." >&2
+            exit 1
+        }
+        a_port() {
+            case "$$1" in ""|0*|*[!0-9]*|??????*) return 1 ;; esac
+            [ "$$1" -ge 1024 ] && [ "$$1" -le 65535 ]
+        }
+        the_door_ports() {
+            # Every door's port but the shared sandbox's 8006, one per line.
+            old_ifs="$$IFS"; IFS=,; set -f; set -- $$1; set +f; IFS="$$old_ifs"
+            for entry in "$$@"; do
+                port="$${entry%%:*}"; port="$$(printf '%s' "$$port" | tr -d '[:space:]')"
+                a_port "$$port" || refuse_the_doors "an entry's port is not a number from 1024 to 65535"
+                [ "$$port" = 8006 ] || echo "$$port"
+            done
+        }
+        the_published_ports() {
+            case "$$1" in
+                *-*) first="$${1%-*}"; last="$${1#*-}" ;;
+                *) first="$$1"; last="$$1" ;;
+            esac
+            a_port "$$first" && a_port "$$last" && [ "$$first" -le "$$last" ] \
+                || refuse_the_doors "FLEET_MEMORY_SANDBOX_DOOR_PORTS is not one port or one range first-last"
+            port="$$first"
+            while [ "$$port" -le "$$last" ]; do echo "$$port"; port=$$((port + 1)); done
+        }
+        doors="$${FLEET_MEMORY_MCP_SANDBOX_DOORS:-}"
+        published="$${FACTORY_MEMORY_DOOR_PORTS:-}"
+        unset FACTORY_MEMORY_DOOR_PORTS
+        if [ -z "$$doors" ]; then
+            unset FLEET_MEMORY_MCP_SANDBOX_DOORS
+            [ -z "$$published" ] || refuse_the_doors "FLEET_MEMORY_SANDBOX_DOOR_PORTS is set and FLEET_MEMORY_SANDBOX_DOORS is not"
+        else
+            unset FLEET_MEMORY_MCP_SANDBOX_PORT
+            # Each list is checked once in this shell (where a refusal stops
+            # the service), then read.
+            the_door_ports "$$doors" >/dev/null
+            own="$$(the_door_ports "$$doors" | sort -n | tr '\n' ' ')"
+            listed=""
+            if [ -n "$$published" ]; then
+                the_published_ports "$$published" >/dev/null
+                listed="$$(the_published_ports "$$published" | sort -n | tr '\n' ' ')"
+            fi
+            [ "$$own" = "$$listed" ] || refuse_the_doors "the doors other than 8006 listen on ($$own) and FLEET_MEMORY_SANDBOX_DOOR_PORTS publishes ($$listed); each door is published on its own port, so the two must name the same ports"
+            for port in $$own; do
+                FLEET_MEMORY_MCP_ALLOWED_HOSTS="$$FLEET_MEMORY_MCP_ALLOWED_HOSTS,$$FACTORY_MEMORY_DOOR_ADDRESS:$$port"
+            done
+            export FLEET_MEMORY_MCP_ALLOWED_HOSTS
+        fi
+        unset FACTORY_MEMORY_DOOR_ADDRESS
         exec "$$@"
       - the-estate-hands-memory-its-database-address-as-a-file
     command: ["python", "-m", "fleet_memory.mcp"]
@@ -471,6 +532,12 @@ services:
       # that takes only build outcomes which replace nothing, off the
       # factory's own shelves. The sandbox reaches this port, not 8005.
       FLEET_MEMORY_MCP_SANDBOX_PORT: "8006"
+      # ONE DOOR PER SANDBOX (17 October 2026), when the env file names them;
+      # the entry shell above then takes the single door setting away, checks
+      # the published ports and adds each door's address to the names below.
+      FLEET_MEMORY_MCP_SANDBOX_DOORS: ${FLEET_MEMORY_SANDBOX_DOORS:-}
+      FACTORY_MEMORY_DOOR_PORTS: ${FLEET_MEMORY_SANDBOX_DOOR_PORTS:-}
+      FACTORY_MEMORY_DOOR_ADDRESS: ${FACTORY_GATEWAY_ADDRESS}
       # WHICH NAMES CALLERS MAY USE. The transport checks the Host header, so
       # every name this service is reached by has to be listed: the service
       # name on the factory network, and the gateway address a sandbox uses.
@@ -505,6 +572,11 @@ services:
       # is for this machine's own tools; the machine's guard admits only the
       # sandbox's machine to this one, and no longer to the one above.
       - "${FACTORY_GATEWAY_ADDRESS}:${FLEET_MEMORY_SANDBOX_PORT}:8006"
+      # One door per sandbox (17 October 2026): every door but the shared
+      # sandbox's, each on the port it listens on (31850 + the sandbox's slot),
+      # as one port or one range. Unset, this line says the line above again,
+      # which compose counts once.
+      - "${FACTORY_GATEWAY_ADDRESS}:${FLEET_MEMORY_SANDBOX_DOOR_PORTS:-${FLEET_MEMORY_SANDBOX_PORT}}:${FLEET_MEMORY_SANDBOX_DOOR_PORTS:-8006}"
     healthcheck:
       # Any HTTP answer proves the server is up; a refused connection is the
       # failure. This is the memory repository's own probe, asked of both
@@ -514,8 +586,13 @@ services:
         - python
         - -c
         - |
-          import urllib.request, urllib.error, sys
-          for port in (8005, 8006):
+          import os, urllib.request, urllib.error, sys
+          doors = os.environ.get("FLEET_MEMORY_MCP_SANDBOX_DOORS", "").strip()
+          ports = [8005] + (
+              [int(entry.split(":", 1)[0]) for entry in doors.split(",") if entry.strip()]
+              if doors else [8006]
+          )
+          for port in ports:
               try:
                   urllib.request.urlopen(f"http://localhost:{port}/mcp/", timeout=5)
               except urllib.error.HTTPError:
@@ -737,9 +814,10 @@ services:
       - -c
       - |
         set -eu
-        # WHERE IT LISTENS: one specific address and a port, never every address of
-        # the machine. GIT_DOOR_BIND is parsed (the same parsing as the
-        # model door's), not matched as text: an IPv4
+        # WHERE IT LISTENS: one specific address and one port per sandbox
+        # ("<address>:<port>,<port>", one sandbox per project, 17 October
+        # 2026), never every address of the machine. GIT_DOOR_BIND is parsed
+        # (the same parsing as the model door's), not matched as text: an IPv4
         # address must be four numbers of 0 to 255, an IPv6 address must be in
         # brackets with at most eight groups of hex, and an address that works out
         # to "unspecified" (0.0.0.0, ::, and every other spelling of them) or to the
@@ -791,26 +869,45 @@ services:
             [ -n "$$nonzero" ] || refuse_the_address "it is the unspecified address, which means every IPv6 address"
             return 0
         }
+        # Each sandbox's port, from the comma-separated list after the address:
+        # every one a number from 1 to 65535 written plainly, none twice. HAProxy
+        # is given "<address>:<port>,<address>:<port>" as GIT_DOOR_LISTEN, and
+        # PORTS keeps the list for the allow-list's check below.
+        the_ports() {
+            case "$$1" in ""|,*|*,|*,,*) refuse_the_address "the ports after the address are not a comma-separated list of numbers" ;; esac
+            old_ifs="$$IFS"; IFS=,; set -f; set -- $$1; set +f; IFS="$$old_ifs"
+            PORTS=""; GIT_DOOR_LISTEN=""
+            for port in "$$@"; do
+                case "$$port" in ""|0*|*[!0-9]*|??????*) refuse_the_address "a port is not a number from 1 to 65535" ;; esac
+                [ "$$port" -le 65535 ] || refuse_the_address "a port is not a number from 1 to 65535"
+                case ",$$PORTS," in *",$$port,"*) refuse_the_address "the port $$port is named twice" ;; esac
+                PORTS="$${PORTS:+$$PORTS,}$$port"
+                GIT_DOOR_LISTEN="$${GIT_DOOR_LISTEN:+$$GIT_DOOR_LISTEN,}$$shown:$$port"
+            done
+        }
         bind="$$GIT_DOOR_BIND"
         case "$$bind" in
             \[*\]:*)
-                host="$${bind%%]:*}"; host="$${host#\[}"; port="$${bind##*]:}"
-                [ "$$bind" = "[$$host]:$$port" ] || refuse_the_address "it is not one [address]:port"
+                host="$${bind%%]:*}"; host="$${host#\[}"; ports="$${bind##*]:}"
+                [ "$$bind" = "[$$host]:$$ports" ] || refuse_the_address "it is not one [address]:port"
                 an_ipv6_address "$$host" || refuse_the_address "the part in brackets is not one IPv6 address"
+                shown="[$$host]"
                 ;;
             *:*:*)
                 refuse_the_address "an IPv6 address must be written in brackets, as [address]:port"
                 ;;
             *:*)
-                host="$${bind%:*}"; port="$${bind##*:}"
+                host="$${bind%:*}"; ports="$${bind##*:}"
                 an_ipv4_address "$$host" || refuse_the_address "the part before the port is not one IPv4 address"
+                shown="$$host"
                 ;;
             *)
                 refuse_the_address "it has no port"
                 ;;
         esac
-        case "$$port" in ""|0*|*[!0-9]*|??????*) refuse_the_address "the port is not a number from 1 to 65535" ;; esac
-        [ "$$port" -le 65535 ] || refuse_the_address "the port is not a number from 1 to 65535"
+        [ -n "$$ports" ] || refuse_the_address "it has no port"
+        the_ports "$$ports"
+        export GIT_DOOR_LISTEN
         token_file=/run/secrets/git_door_token
         if [ ! -s "$$token_file" ]; then
             echo "the Git door was given no token: the estate passes it in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says ('The Git door'), with GIT_DOOR_TOKEN passed in from a child process." >&2
@@ -821,20 +918,34 @@ services:
             echo "the Git door's token file holds no usable token (it is blank, or has spaces or line breaks in it). Make the token again and pass it in as GIT_DOOR_TOKEN, the way deploy/estate/README.md says ('The Git door')." >&2
             exit 1
         fi
-        # THE ALLOW-LIST: a file, one owner/name per line; blank lines and
-        # lines starting with # are left out. Anything else on a line stops
-        # the door, and so does a list with no repository on it.
+        # THE ALLOW-LIST: a file, one <port>/<owner>/<name> per line, the port
+        # being that of the one sandbox that may read the repository; blank
+        # lines and lines starting with # are left out. Anything else on a
+        # line stops the door, and so do a port the door does not listen on,
+        # a repository listed for two ports, and a list with no repository.
         repos=/usr/local/etc/haproxy/git-door.repos
         if [ ! -f "$$repos" ] || [ ! -r "$$repos" ]; then
-            echo "the Git door has no allow-list: GIT_DOOR_REPOS_FILE in the env file must name a readable file of owner/name lines (deploy/estate/README.md, 'The Git door')." >&2
+            echo "the Git door has no allow-list: GIT_DOOR_REPOS_FILE in the env file must name a readable file of <port>/<owner>/<name> lines (deploy/estate/README.md, 'The Git door')." >&2
             exit 1
         fi
-        if grep -v -E '^[[:space:]]*$$|^#|^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$$' "$$repos" >/dev/null; then
-            echo "the Git door's allow-list has a line that is not owner/name (one repository per line, # for a comment)." >&2
+        line='^[1-9][0-9]{0,4}/[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$$'
+        if grep -v -E "^[[:space:]]*$$|^#|$$line" "$$repos" >/dev/null; then
+            echo "the Git door's allow-list has a line that is not <port>/<owner>/<name> (the port of the repository's own sandbox, then the repository; one per line, # for a comment)." >&2
             exit 1
         fi
-        if ! grep -q -E '^[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._-]*$$' "$$repos"; then
+        if ! grep -q -E "$$line" "$$repos"; then
             echo "the Git door's allow-list names no repository, so there is nothing it may read." >&2
+            exit 1
+        fi
+        for listed_port in $$(grep -E "$$line" "$$repos" | cut -d/ -f1 | sort -u); do
+            case ",$$PORTS," in
+                *",$$listed_port,"*) ;;
+                *) echo "the Git door's allow-list names the port $$listed_port, which the door does not listen on (GIT_DOOR_PORTS in the env file)." >&2; exit 1 ;;
+            esac
+        done
+        twice="$$(grep -E "$$line" "$$repos" | cut -d/ -f2- | tr 'A-Z' 'a-z' | sort | uniq -d | head -n 1)"
+        if [ -n "$$twice" ]; then
+            echo "the Git door's allow-list lists $$twice for more than one port; a repository is read by its own sandbox only." >&2
             exit 1
         fi
         # GitHub takes a token as the password of Basic authentication, with
@@ -846,9 +957,11 @@ services:
       - the-estate-hands-the-git-door-its-token-as-a-file
     command: ["haproxy", "-db", "-f", "/usr/local/etc/haproxy/git-door.cfg"]
     environment:
-      # Where it listens: BUILT from the gateway address and the door's port,
+      # Where it listens: BUILT from the gateway address and the door's ports
+      # (one per sandbox, comma-separated, GIT_DOOR_PORTS; the single
+      # GIT_DOOR_PORT of before is still read when GIT_DOOR_PORTS is unset),
       # as the model door's is, and parsed again by the entry shell above.
-      GIT_DOOR_BIND: ${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${GIT_DOOR_PORT:-}
+      GIT_DOOR_BIND: ${FACTORY_GATEWAY_ADDRESS:?name this machine's factory gateway address in the env file}:${GIT_DOOR_PORTS:-${GIT_DOOR_PORT:-}}
     secrets:
       - source: git-door-token
         target: git_door_token

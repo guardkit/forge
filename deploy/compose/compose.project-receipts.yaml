@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# EACH PROJECT'S OWN RECEIPTS, READ BY THE COORDINATOR (17 October 2026, one
+# sandbox per project; design section 2.2a).
+#
+# A project's own sandbox writes its build receipts (failure packs, merge
+# reports, exported records) into a folder of its own on this machine,
+# <FORGE_PROJECT_RECEIPTS_HOST_DIR>/<sandbox name>/, kept apart from the
+# shared receipts folder so that no other sandbox can see it. The coordinator
+# reads and writes them through this one extra mount, beside its existing
+# receipts mount, at /var/lib/forge-project-receipts. A project's entry in the
+# coordinator's settings names its own folder under that path.
+#
+# A FILE OF ITS OWN so that a machine with no project sandbox changes nothing:
+# leave this file off COMPOSE_FILE and the coordinator has exactly the mounts it
+# had. Put it on the end of COMPOSE_FILE, after compose.yaml (or the estate's
+# compose.yaml that includes it), and name the folder in the env file:
+#
+#     FORGE_PROJECT_RECEIPTS_HOST_DIR=/srv/forge-receipts
+#
+# A folder that is not there stops the start rather than being made empty.
+# ---------------------------------------------------------------------------
+
+services:
+  coordinator:
+    volumes:
+      - type: bind
+        source: ${FORGE_PROJECT_RECEIPTS_HOST_DIR:?name the folder that holds each project's own receipts folder in the env file, or leave compose.project-receipts.yaml off COMPOSE_FILE}
+        target: /var/lib/forge-project-receipts
+        bind:
+          create_host_path: false

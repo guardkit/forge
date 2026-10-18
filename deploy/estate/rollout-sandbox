@@ -13,6 +13,18 @@ port, as compose.yaml uses it; FLEET_MEMORY_PORT is the Dell's own tools' door),
 MODEL_DOOR_PORT (the model door's gateway port, as compose.yaml uses it),
 and GIT_DOOR_PORT when it is set (the Git door's gateway port, 17 October
 2026; unset means no Git door rule, as before).
+A sandbox entry may carry `slot` (1 to 19, one sandbox per project, 17 October
+2026): it is then a project's own sandbox, whose env file must give it the
+slot's ports (GIT_DOOR_PORT 31830+slot, FLEET_MEMORY_SANDBOX_PORT 31850+slot,
+helper 8925+10*slot, runner 8924+10*slot) and whose rules may name on the
+gateway only its own two doors, the model door, the answer service and the
+embedder (never the bus or the model router).
+An inventory may instead be {"sandboxes": [<inventory>, ...]}: one entry per
+sandbox, each with its own project, env file and profile. --sandbox NAME picks
+one; --plan without it plans every entry with its own files. The entries may
+share no name, slot, clone, receipts folder, env file or door port, and an
+entry without a slot (the shared legacy sandbox) gets no Git door port, in a
+list or alone.
 The producer profile retains all choices except gateway publish addresses,
 explicit allow-rule replacements, receipts_path and cwd. sandbox.allow_replacements
 maps old host:port entries to env variable NAMES holding replacement host:port.
@@ -238,10 +250,89 @@ finally:
 '''
 
 
+# One sandbox per project (17 October 2026): the slot scheme. Slot k adds k to
+# each door base and 10*k to each published port base. Slot 0 is the shared
+# legacy sandbox, which is not given a slot entry.
+SLOT_GIT_DOOR_BASE = 31830
+SLOT_MEMORY_DOOR_BASE = 31850
+SLOT_HELPER_BASE = 8925
+SLOT_RUNNER_BASE = 8924
+NEVER_FROM_A_SLOT_PORTS = (4222, 4000)
+SLOT_MAX = 19
+# The shared services a slot sandbox reaches are fixed (Codex R2, round 2): no
+# sandbox chooses its own, and none may name the full memory door (31822) or
+# the shared sandbox's door (31824) on the gateway.
+SLOT_MODEL_DOOR_PORT = 31823
+SLOT_ANSWER_PORT = 31821
+SLOT_EMBEDDER_PORT = 9000
+NEVER_ON_THE_GATEWAY_FROM_A_SLOT = (31822, 31824)
+# The shared sandbox is never a slot entry (Codex R1).
+SHARED_SANDBOX_NAMES = ('api-test-deploy',)
+
+
+def slot_of(sandbox):
+    """The entry's slot number, or None for the shared legacy sandbox."""
+    if 'slot' not in sandbox:
+        return None
+    slot = sandbox['slot']
+    require(sandbox.get('name') not in SHARED_SANDBOX_NAMES, f'{sandbox.get("name")} is the shared sandbox and cannot carry a slot; give the project a sandbox of its own')
+    # 19 at most: from slot 20 the Git door (31830+k) meets slot k-20's memory door (31850+k).
+    require(type(slot) is int and 1 <= slot <= SLOT_MAX, 'sandbox.slot must be a whole number from 1 to 19; slot 0 is the shared sandbox, which carries no slot entry, and from 20 the door ports would collide')
+    return slot
+
+
+def inventories(args):
+    """The inventories this run acts on, each with the project and env file it names.
+
+    A plain inventory is one entry, exactly as before. A list inventory is
+    checked as a whole first, so two sandboxes can never be rolled out sharing
+    a folder or a door."""
+    document = json_read(args.config)
+    if not (isinstance(document, dict) and 'sandboxes' in document):
+        require(args.project and args.env_file, 'name the project and env file explicitly (--project, --env-file)')
+        require(not args.sandbox, '--sandbox picks an entry of a list inventory, and this inventory names one sandbox; leave it out')
+        return [(document, args.project, args.env_file, False)]
+    entries = document['sandboxes']
+    require(isinstance(entries, list) and entries and all(isinstance(x, dict) and isinstance(x.get('sandbox'), dict) for x in entries),
+            'sandboxes must be a non-empty list of inventories, each with its own sandbox block')
+    seen = {}
+    for entry in entries:
+        values = load_env(entry['env_file'])
+        slot = slot_of(entry['sandbox'])
+        keys = {'name':entry['sandbox'].get('name'), 'project':entry.get('project'),
+                'env file':str(Path(entry['env_file']).resolve()),
+                'clone':entry['sandbox'].get('clone_path'), 'receipts folder':entry['sandbox'].get('receipts_path'),
+                'slot':slot, 'Git door port':values.get('GIT_DOOR_PORT') or None,
+                'memory door port':values.get('FLEET_MEMORY_SANDBOX_PORT') or None}
+        for what, value in keys.items():
+            if value is None:
+                continue
+            require((what, value) not in seen, f'two sandboxes in the list share the same {what} ({entry["sandbox"].get("name")} and {seen.get((what, value))}); each project needs its own')
+            seen[(what, value)] = entry['sandbox'].get('name')
+        if slot is None:
+            require(not values.get('GIT_DOOR_PORT'), f'{entry["sandbox"].get("name")} is the shared sandbox (no slot), and the shared sandbox gets no Git door port; take GIT_DOOR_PORT out of its env file')
+    if args.sandbox:
+        chosen = [x for x in entries if x['sandbox'].get('name') == args.sandbox]
+        require(len(chosen) == 1, f'the list names no sandbox called {args.sandbox}; pick one it names')
+    else:
+        require(args.plan, 'a list inventory needs --sandbox NAME to act on one sandbox; --plan alone plans them all')
+        chosen = entries
+    result = []
+    for entry in chosen:
+        project = args.project or entry.get('project')
+        env_file = args.env_file or entry.get('env_file')
+        result.append((entry, project, env_file, True))
+    return result
+
+
 class Rollout:
-    def __init__(self, args):
+    def __init__(self, args, config=None, project=None, env_file=None):
         self.args = args
-        self.config = json_read(args.config)
+        self.config = json_read(args.config) if config is None else config
+        self.project = args.project if project is None else project
+        self.env_file = args.env_file if env_file is None else env_file
+        args = argparse.Namespace(**{**vars(args), 'project':self.project, 'env_file':self.env_file})
+        self.args = args
         c = self.config
         require(c.get('project') == args.project, 'project differs from the private inventory; use its explicit project')
         require(str(Path(c['env_file']).resolve()) == str(Path(args.env_file).resolve()),
@@ -323,6 +414,29 @@ class Rollout:
             full_memory = {f'{gateway}:{int(v)}' for v in (self.values.get('FLEET_MEMORY_PORT',''),) if re.fullmatch(r'[1-9][0-9]{0,4}',v)}
             require(self.git_door not in {self.answer, self.memory_mcp, self.model_door} | full_memory,
                     "GIT_DOOR_PORT equals the answer-service, memory or model door's port; give the Git door its own gateway port")
+        # A project's own sandbox: its slot decides its door and published
+        # ports, and the env file must say the same.
+        self.slot = slot_of(s)
+        # The shared sandbox (no slot) never gets a Git door port, so it can
+        # never fetch a private repository (design 2.6, Codex R1).
+        require(self.slot is not None or not self.git_door,
+                f'{s["name"]} is the shared sandbox (no slot), and the shared sandbox gets no Git door port; take GIT_DOOR_PORT out of its env file')
+        if self.slot is not None:
+            k = self.slot
+            require(self.model_door == f'{gateway}:{SLOT_MODEL_DOOR_PORT}',
+                    f'slot {k} reaches the model door at the fixed port {SLOT_MODEL_DOOR_PORT}; set MODEL_DOOR_PORT={SLOT_MODEL_DOOR_PORT} in its env file')
+            require(self.answer == f'{gateway}:{SLOT_ANSWER_PORT}',
+                    f'slot {k} reaches the answer service at the fixed port {SLOT_ANSWER_PORT}; fix FORGE_TARGET_OWNER_URL in its env file')
+            embed = urlsplit(self.values.get('FLEET_MEMORY_EMBED_URL',''))
+            require(not self.values.get('FLEET_MEMORY_EMBED_URL') or embed.hostname != gateway or embed.port == SLOT_EMBEDDER_PORT,
+                    f'slot {k} reaches the embedder at the fixed port {SLOT_EMBEDDER_PORT}; fix FLEET_MEMORY_EMBED_URL in its env file')
+            require(self.git_door == f'{gateway}:{SLOT_GIT_DOOR_BASE + k}',
+                    f'slot {k} reads its repositories through Git door port {SLOT_GIT_DOOR_BASE + k}; set GIT_DOOR_PORT={SLOT_GIT_DOOR_BASE + k} in its env file')
+            require(self.memory_mcp == f'{gateway}:{SLOT_MEMORY_DOOR_BASE + k}',
+                    f'slot {k} reaches its memory through memory door port {SLOT_MEMORY_DOOR_BASE + k}; set FLEET_MEMORY_SANDBOX_PORT={SLOT_MEMORY_DOOR_BASE + k} in its env file')
+            for key, base in (('FORGE_SANDBOX_SIDECAR_URL', SLOT_HELPER_BASE), ('FORGE_SANDBOX_RUNNER_URL', SLOT_RUNNER_BASE)):
+                require(urlsplit(self.values[key]).port == base + 10 * k,
+                        f'slot {k} publishes {key} on port {base + 10 * k}; fix that address in its env file')
         require(isinstance(s.get('allow_replacements',{}),dict), 'allow_replacements must map old rules to env names; fix the inventory')
         for old, name in s.get('allow_replacements',{}).items():
             require(isinstance(old,str) and isinstance(name,str) and re.fullmatch(r'[A-Z_][A-Z0-9_]*',name), 'allow replacement must name an env variable; fix the inventory')
@@ -470,6 +584,36 @@ class Rollout:
         out = self.run(['docker','--context',self.config['docker_context'],'run','--rm','--pull=never','--network=none','--read-only','-i','--entrypoint','python',self.config['runtime_image'],'-c',PROFILE], input=json.dumps(payload)).stdout
         return json.loads(out)
 
+    def check_slot_rules(self, profile):
+        """A project's own sandbox may name on the gateway only its own doors,
+        the model door, the answer service and the embedder; never the bus or
+        the model router, wherever they are."""
+        if self.slot is None:
+            return
+        gateway = self.values['FACTORY_GATEWAY_ADDRESS']
+        allowed = {self.answer, self.memory_mcp, self.model_door, self.git_door}
+        allowed.add(f'{gateway}:{SLOT_EMBEDDER_PORT}')
+        for rule in profile['rules']:
+            # The real rollout's rule too (PROFILE): no wildcard and no address range.
+            require(rule != '*' and '/' not in rule,
+                    f'{self.s["name"]} is a project\'s own sandbox and its rules name {rule}, a wildcard or an address range; name single hosts only')
+            host, _, port = rule.rpartition(':') if re.fullmatch(r'.*:[0-9]+', rule) else (rule, '', '')
+            require(not (port and int(port) in NEVER_FROM_A_SLOT_PORTS),
+                    f'{self.s["name"]} is a project\'s own sandbox and its rules name {rule}, the bus\'s or the model router\'s port; take it out of its profile')
+            # Codex R2: no other project's door, wherever the rule came from.
+            if port:
+                number = int(port)
+                other_git = SLOT_GIT_DOOR_BASE < number <= SLOT_GIT_DOOR_BASE + SLOT_MAX and number != SLOT_GIT_DOOR_BASE + self.slot
+                other_memory = SLOT_MEMORY_DOOR_BASE < number <= SLOT_MEMORY_DOOR_BASE + SLOT_MAX and number != SLOT_MEMORY_DOOR_BASE + self.slot
+                require(not (other_git or other_memory),
+                        f'{self.s["name"]} is slot {self.slot} and its rules name {rule}, another project\'s Git door or memory door; take it out')
+            require(not (host == gateway and port and int(port) in NEVER_ON_THE_GATEWAY_FROM_A_SLOT),
+                    f'{self.s["name"]} is a project\'s own sandbox and its rules name {rule}, a memory door that is not its own; take it out')
+            require(host != gateway or rule in allowed,
+                    f'{self.s["name"]} is a project\'s own sandbox and its rules name {rule} on the gateway, which is not one of its own doors or the shared services; take it out of its profile')
+        require(self.git_door in profile['rules'] and self.memory_mcp in profile['rules'],
+                f'{self.s["name"]} lacks its own Git door or memory door rule; repair the profile rewrite first')
+
     def validate_bootstrap_ports(self, profile):
         # Read the current bundled template's defaults. A project using another
         # inner port must actually forward its matching setting through run.sh.
@@ -535,6 +679,27 @@ class Rollout:
         private_write(self.evidence/'bootstrap-image.env',''.join(name+'='+settings[name]+'\n' for name in names).encode())
         return settings
 
+    def plan_rules(self):
+        """The rules the rollout would set, worked out here without the image,
+        so --plan can hold a slot sandbox to its own doors too. None when this
+        machine's Python cannot read the profile (no yaml)."""
+        try:
+            import yaml
+        except ImportError:
+            return None
+        doc = yaml.safe_load(self.source)
+        require(isinstance(doc, dict) and isinstance(doc.get('sandbox'), dict), 'the producer profile has no sandbox block; fix the profile')
+        replacements = self.s.get('allow_replacements', {})
+        rules = [self.values[replacements[x]] if x in replacements else x for x in doc['sandbox'].get('allow_network', [])]
+        rules = list(dict.fromkeys(rules + [self.answer, self.memory_mcp, self.model_door] + ([self.git_door] if self.git_door else [])))
+        return {'rules': rules}
+
+    def plan_text(self):
+        rules = self.plan_rules() if self.slot is not None else None
+        if rules is not None:
+            self.check_slot_rules(rules)
+        return 'Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+self.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes (answer service '+self.answer+', memory MCP '+self.memory_mcp+', model door '+self.model_door+(', Git door '+self.git_door if self.git_door else '')+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; unmask both stopped units; record evidence.'
+
     def execute(self):
         print('While the sandbox is stopped, nobody may run sbx prune, sbx rm or sbx reset.',flush=True)
         try:
@@ -550,6 +715,7 @@ class Rollout:
             valid_version = False
         require(valid_version, 'sandbox client or server version/state is not the reviewed running v0.42.1 contract; verify its stopped-status contract first')
         profile = self.profile()  # Parse/validate before touching any unit.
+        self.check_slot_rules(profile)
         self.validate_bootstrap_ports(profile)
         settings_path = self.values['FORGE_CONFIG_PATH']
         is_file = self.inside('test','-f',settings_path,check=False).returncode == 0
@@ -658,48 +824,61 @@ class Rollout:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__,formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--config',required=True)
-    parser.add_argument('--env-file',required=True)
-    parser.add_argument('--project',required=True)
+    parser.add_argument('--env-file',help='required for a one-sandbox inventory; for a list, defaults to the chosen entry\'s own')
+    parser.add_argument('--project',help='required for a one-sandbox inventory; for a list, defaults to the chosen entry\'s own')
+    parser.add_argument('--sandbox',help='with a list inventory: the one sandbox to act on')
     parser.add_argument('--secret-env-file',action='append',default=[],help='private literal env input, repeatable; cannot override public names')
     parser.add_argument('--stop-legacy',action='store_true',help='perform the one-time legacy stop, verify, and replacement')
     parser.add_argument('--plan',action='store_true')
     args = parser.parse_args(argv)
     rollout = None
     try:
-        rollout = Rollout(args)
+        chosen = inventories(args)
+        if args.plan and len(chosen) > 1:
+            for config, project, env_file, _ in chosen:
+                print(f'== {config["sandbox"]["name"]} ({project}, {env_file})')
+                rollout = Rollout(args, config, project, env_file)
+                print(rollout.plan_text())
+            return 0
+        config, project, env_file, listed = chosen[0]
+        rollout = Rollout(args, config if listed else None, project, env_file)
         if args.plan:
-            print('Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+rollout.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes (answer service '+rollout.answer+', memory MCP '+rollout.memory_mcp+', model door '+rollout.model_door+(', Git door '+rollout.git_door if rollout.git_door else '')+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; unmask both stopped units; record evidence.')
+            print(rollout.plan_text())
             return 0
         require(args.stop_legacy, 'one-time replacement requires --stop-legacy; inspect --plan before the attended rollout')
         rollout.execute()
         return 0
     except (Refusal,OSError,ValueError,KeyError,TypeError,AttributeError) as exc:
-        if rollout and not args.plan:
-            if rollout.replacement_started and not rollout.complete:
-                # A transport/filesystem failure can interrupt a multi-file install;
-                # keep the current lifecycle if present, and fence all starts.
-                for unit in rollout.units.values():
-                    try:
-                        rollout.systemctl('mask',unit,check=False)
-                    except Refusal:
-                        pass
+        return refusal(rollout, args, exc)
+
+
+def refusal(rollout, args, exc):
+    if rollout and not args.plan:
+        if rollout.replacement_started and not rollout.complete:
+            # A transport/filesystem failure can interrupt a multi-file install;
+            # keep the current lifecycle if present, and fence all starts.
+            for unit in rollout.units.values():
                 try:
-                    private_write(rollout.dropin,EMPTY_STOP.encode())
-                    rollout.systemctl('daemon-reload',check=False)
-                except (Refusal,OSError):
+                    rollout.systemctl('mask',unit,check=False)
+                except Refusal:
                     pass
             try:
-                rollout.save('commands-failed.json',rollout.events)
-            except OSError:
+                private_write(rollout.dropin,EMPTY_STOP.encode())
+                rollout.systemctl('daemon-reload',check=False)
+            except (Refusal,OSError):
                 pass
-        message = str(exc) if isinstance(exc,Refusal) else 'required inventory or evidence is unreadable; inspect the named private config and retain the stopped posture before retrying'
-        if rollout and rollout.replacement_started and not rollout.complete:
-            message += '; current-template/profile installation may be incomplete, so reconcile the private evidence before unmasking either unit'
-        elif rollout and not rollout.replacement_started:
-            message += '; nothing has been replaced, and work may still be running inside it — shall I try again, or put it back as it was and stop for today?'
-        suffix = '' if message.endswith(('?','.','!')) else '.'
-        print('Refusing: '+message.replace('\n',' ')+suffix,file=sys.stderr)
-        return 2
+        try:
+            rollout.save('commands-failed.json',rollout.events)
+        except OSError:
+            pass
+    message = str(exc) if isinstance(exc,Refusal) else 'required inventory or evidence is unreadable; inspect the named private config and retain the stopped posture before retrying'
+    if rollout and rollout.replacement_started and not rollout.complete:
+        message += '; current-template/profile installation may be incomplete, so reconcile the private evidence before unmasking either unit'
+    elif rollout and not rollout.replacement_started:
+        message += '; nothing has been replaced, and work may still be running inside it — shall I try again, or put it back as it was and stop for today?'
+    suffix = '' if message.endswith(('?','.','!')) else '.'
+    print('Refusing: '+message.replace('\n',' ')+suffix,file=sys.stderr)
+    return 2
 
 
 if __name__ == '__main__':

@@ -116,10 +116,15 @@ class FixTaskContextBuilder:
         source_build_id_reader: Callable[[str], str | None] | None = None,
         receipts_root: "Path | str | None" = None,
         review_artefact_paths_reader: Callable[[str, Any], Any] | None = None,
+        repo_reader: Callable[[str], str | None] | None = None,
     ) -> None:
         self._forward = forward_context_builder
         self._source_reader = source_build_id_reader
         self._receipts_root = receipts_root
+        #: ``(build_id) -> its repository``, so the source build's failure
+        #: pack is read from its own project's receipts (one sandbox per
+        #: project, design section 2.2a). Unset: read as before.
+        self._repo_reader = repo_reader
         self._review_artefact_paths_reader = review_artefact_paths_reader
 
     def __call__(
@@ -262,9 +267,13 @@ class FixTaskContextBuilder:
                 resolved = None
             if resolved:
                 source_build_id = resolved
-        return read_failure_pack(
-            source_build_id, receipts_root=self._receipts_root
-        )
+        repo = None
+        if self._receipts_root is None and self._repo_reader is not None:
+            try:
+                repo = self._repo_reader(source_build_id)
+            except Exception:  # noqa: BLE001 — the pack is then read as before
+                repo = None
+        return read_failure_pack(source_build_id, receipts_root=self._receipts_root, repo=repo)
 
 
 # ---------------------------------------------------------------------------
@@ -411,7 +420,7 @@ def _read_json(path: Path) -> Any:
 
 
 def _stage_dirs(
-    build_id: str, receipts_root: "Path | str | None"
+    build_id: str, receipts_root: "Path | str | None", repo: "str | None" = None
 ) -> list[tuple[int, str, Path]]:
     """Return ``(sequence, stage name, directory)`` for one build's stages."""
     from forge.pipeline.fix_journey_receipts import (
@@ -419,7 +428,7 @@ def _stage_dirs(
         fix_journey_receipts_root,
     )
 
-    stages_dir = fix_journey_receipts_root(receipts_root) / build_id / STAGES_DIRNAME
+    stages_dir = fix_journey_receipts_root(receipts_root, repo=repo) / build_id / STAGES_DIRNAME
     found: list[tuple[int, str, Path]] = []
     try:
         if not stages_dir.is_dir():
@@ -586,6 +595,7 @@ def read_prior_review_evidence(
     build_id: str,
     *,
     receipts_root: "Path | str | None" = None,
+    repo: "str | None" = None,
 ) -> PriorReviewEvidence | None:
     """Read what the follow-up review is being asked to verify.
 
@@ -599,7 +609,7 @@ def read_prior_review_evidence(
     Never raises. Unreadable or malformed receipts are the same answer as
     missing ones, said once at INFO.
     """
-    stages = _stage_dirs(build_id, receipts_root)
+    stages = _stage_dirs(build_id, receipts_root, repo)
     if not stages:
         return None
     reviews = [row for row in stages if row[1].startswith("task-review")]
@@ -756,6 +766,7 @@ def build_review_verification_context(
     build_id: str,
     worktree_path: "Path | str | None",
     receipts_root: "Path | str | None" = None,
+    repo: "str | None" = None,
 ) -> dict[str, Any] | None:
     """Return the one extra context entry for a follow-up review, or ``None``.
 
@@ -768,7 +779,7 @@ def build_review_verification_context(
     Never raises.
     """
     try:
-        evidence = read_prior_review_evidence(build_id, receipts_root=receipts_root)
+        evidence = read_prior_review_evidence(build_id, receipts_root=receipts_root, repo=repo)
         if evidence is None:
             return None
         text = render_verify_prior_findings(evidence)

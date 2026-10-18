@@ -732,7 +732,11 @@ def unread_scope(why_not: str) -> ScopeReport:
 
 
 def write_scope_report(
-    build_id: str, report: ScopeReport, *, receipts_dir: "Path | None" = None
+    build_id: str,
+    report: ScopeReport,
+    *,
+    receipts_dir: "Path | None" = None,
+    repo: "str | None" = None,
 ) -> "Path | None":
     """Write the receipt BESIDE the build's own evidence. Never raises.
 
@@ -743,13 +747,14 @@ def write_scope_report(
     it did not write — which is always a logged sentence and never a reason
     to hold up a merge card.
     """
-    from forge.receipts import receipts_root
+    from forge.receipts import receipts_root_for
 
     try:
+        # The build's own project's receipts (one sandbox per project).
         root = (
             Path(receipts_dir)
             if receipts_dir is not None
-            else receipts_root() / str(build_id)
+            else receipts_root_for(repo) / str(build_id)
         )
         if not root.is_dir():
             logger.info(

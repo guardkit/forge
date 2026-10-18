@@ -358,6 +358,10 @@ class BuildStatusView(BaseModel):
     # 2026): set only on a ``mission-merge`` row, so ``forge status`` shows it
     # as the mission's merge rather than as a build of its last feature.
     mission_merge_of: str | None = None
+    # The build's repository (one sandbox per project, 17 October 2026), so
+    # ``forge status`` reads a running build's heartbeat from its own
+    # project's receipts. Left out of every dump, so the JSON is unchanged.
+    repo: str | None = Field(default=None, exclude=True)
 
 
 @dataclass(frozen=True, slots=True)

@@ -2913,6 +2913,8 @@ def make_merge_ready_checkpoint(
             branch=getattr(row, "branch", None),
             worktree_path=getattr(row, "worktree_path", None),
             receipts_root=receipts_root,
+            # The build's own project's receipts (one sandbox per project).
+            repo=getattr(row, "repo", None),
         )
 
     def _red_gate_action(build_id: str, gates: Any) -> Any:
@@ -3705,6 +3707,7 @@ def make_conductor_receipts_exporter(
             worktree_path=worktree_path,
             receipts_root=receipts_root,
             extra_files=extra_files or None,
+            repo=getattr(row, "repo", None),
         )
         return getattr(result, "stage_key", None)
 
@@ -3850,6 +3853,8 @@ def make_conductor_failure_pack_writer(
             worktree_path=getattr(row, "worktree_path", None),
             stage_keys=stage_keys,
             receipts_root=receipts_root,
+            # The build's own project's receipts (one sandbox per project).
+            repo=getattr(row, "repo", None),
         )
 
     return write

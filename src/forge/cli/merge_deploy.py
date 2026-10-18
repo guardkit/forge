@@ -332,7 +332,7 @@ async def _arun(
 
         venue = surface if surface is not None else InContainerCandidateGit(repo_root)
         expect_main_sha = str(await venue.rev_parse(recorded_branch) or "")
-    baseline_failing = read_baseline_failing(row.build_id)
+    baseline_failing = read_baseline_failing(row.build_id, repo=getattr(row, "repo", None))
     # The branch the build made, when the conductor recorded one (a repair).
     merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
     # AN OFFER WITH A REVIEW PREVIEW (web-readiness W7) is pressed here on the

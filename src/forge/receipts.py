@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from typing import Mapping
 
 __all__ = [
     "BOUND_STATE_ROOT",
@@ -41,6 +42,8 @@ __all__ = [
     "RECEIPTS_DIRNAME",
     "RECEIPTS_DIR_ENV",
     "receipts_root",
+    "receipts_root_for",
+    "use_project_receipts",
 ]
 
 
@@ -123,3 +126,34 @@ def receipts_root(*, bound_state_root: Path | None = None) -> Path:
         return Path(DEFAULT_RECEIPTS_DIR).expanduser()
     except (RuntimeError, OSError):  # pragma: no cover — no resolvable HOME
         return Path(DEFAULT_RECEIPTS_DIR)
+
+
+
+#: Each repository's own receipts folder, as the coordinator sees it (one
+#: sandbox per project, design section 2.2a, 17 October 2026): the
+#: ``receipts_root`` of the repository's ``planning.sandboxes`` entry. Set
+#: from the settings when they are loaded
+#: (:func:`forge.config.sandboxes.use_the_settings_receipts`); empty means every
+#: repository's receipts are under :func:`receipts_root`, as before.
+_PROJECT_RECEIPTS: dict[str, Path] = {}
+
+
+def use_project_receipts(roots: Mapping[str, "Path | str"]) -> None:
+    """Replace the repositories' own receipts folders with ``roots``
+    (``org/name`` -> folder). An empty mapping restores today's single root."""
+    _PROJECT_RECEIPTS.clear()
+    _PROJECT_RECEIPTS.update({str(repo): Path(root) for repo, root in roots.items()})
+
+
+def receipts_root_for(repo: "str | None") -> Path:
+    """THE receipts folder of a build of ``repo`` — every coordinator reader
+    and writer of receipts asks this, and nothing else asks
+    :func:`receipts_root` (tests/forge/test_receipts_per_project.py holds
+    that).
+
+    The repository's own folder when its sandbox entry names one (one sandbox
+    per project, 17 October 2026); otherwise, and for a build whose repository
+    is not known, :func:`receipts_root`, exactly as before.
+    """
+    own = _PROJECT_RECEIPTS.get(str(repo or "").strip())
+    return own if own is not None else receipts_root()
