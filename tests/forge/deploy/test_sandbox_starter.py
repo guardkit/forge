@@ -1103,3 +1103,89 @@ class TestTheAlreadyStoppedShortcut:
         with pytest.raises(starter_mod.Refused, match="is unknown, a state the starter does not stop from"):
             s.stop(NAME)
         assert self._stops_sent(world) == []
+
+
+
+ANOTHER = {"compose_project": "notes-live", "identity_label": "org.example.identity=def456"}
+A_PARAMS = "compose_project=notes-live&identity_label=org.example.identity%3Dabc123"
+B_PARAMS = "compose_project=notes-live&identity_label=org.example.identity%3Ddef456"
+
+
+class TestReadyBelongsToOneDeploymentIdentity:
+    """Codex round 4, R7."""
+
+    def test_a_deployment_supplied_after_services_only_readiness_needs_a_redeploy(self, world):
+        base = world.http(world.make())
+        assert call(base, "POST", f"/start/{NAME}")[1]["readiness"] == "ready"
+        status, body = call(base, "POST", f"/hold/{NAME}?owner=estate-check&until=services&{A_PARAMS}")
+        assert status == 200 and body["readiness"] == "services ready, redeploy pending"
+        report = call(base, "GET", f"/status/{NAME}")[1]
+        assert report["redeploy_pending"] is True and report["ready_confirmed_for"] is None
+        assert any(e["kind"] == "readiness" and e.get("why") for e in log_entries(world))
+
+    def test_a_changed_confirmed_identity_needs_a_redeploy_and_ready_for_the_new_one(self, world):
+        base = world.http(world.make())
+        call(base, "POST", f"/start/{NAME}?{A_PARAMS}")
+        assert call(base, "POST", f"/ready/{NAME}")[1]["confirmed_for"] == DEPLOYMENT
+        assert call(base, "GET", f"/status/{NAME}")[1]["readiness"] == "ready"
+        call(base, "POST", f"/start/{NAME}?{B_PARAMS}")
+        report = call(base, "GET", f"/status/{NAME}")[1]
+        assert report["readiness"] == "services ready, redeploy pending"
+        # A ready naming the old identity is refused; one naming the new is recorded.
+        status, body = call(base, "POST", f"/ready/{NAME}?{A_PARAMS}")
+        assert status == 409 and "nothing was recorded" in body["message"]
+        assert call(base, "GET", f"/status/{NAME}")[1]["redeploy_pending"] is True
+        status, body = call(base, "POST", f"/ready/{NAME}?{B_PARAMS}")
+        assert status == 200 and body["confirmed_for"] == ANOTHER
+        assert call(base, "GET", f"/status/{NAME}")[1]["ready_confirmed_for"] == ANOTHER
+
+    def test_a_deployed_hold_waits_for_ready_for_the_new_identity(self, world):
+        s = world.make(deployment=DEPLOYMENT)
+        s.start(NAME)
+        s.ready(NAME)
+        box = in_background(s.hold, NAME, "merge-deploy", "deployed",
+                            starter_mod._told_deployment({"compose_project": ["notes-live"],
+                                                          "identity_label": ["org.example.identity=def456"]}))
+        time.sleep(0.5)
+        assert "result" not in box and "error" not in box
+        assert s.status(NAME)["redeploy_pending"] is True
+        s.ready(NAME)
+        box["thread"].join(10)
+        assert box["result"]["readiness"] == "ready"
+
+    def test_an_unchanged_confirmed_identity_stays_ready(self, world):
+        base = world.http(world.make(deployment=DEPLOYMENT))
+        call(base, "POST", f"/start/{NAME}")
+        call(base, "POST", f"/ready/{NAME}")
+        readiness_records = sum(1 for e in log_entries(world) if e["kind"] == "readiness")
+        status, body = call(base, "POST", f"/hold/{NAME}?owner=estate-check&until=services&{A_PARAMS}")
+        assert body["readiness"] == "ready"
+        call(base, "POST", f"/start/{NAME}?{A_PARAMS}")
+        report = call(base, "GET", f"/status/{NAME}")[1]
+        assert report["readiness"] == "ready" and report["ready_confirmed_for"] == DEPLOYMENT
+        assert sum(1 for e in log_entries(world) if e["kind"] == "readiness") == readiness_records
+
+    def test_the_invalidation_survives_a_restart(self, world):
+        first = world.make()
+        first.start(NAME, DEPLOYMENT)
+        first.ready(NAME)
+        first.start(NAME, ANOTHER)
+        assert first.status(NAME)["redeploy_pending"] is True
+        first.close()
+        second = world.make()
+        report = second.status(NAME)
+        assert report["readiness"] == "services ready, redeploy pending"
+        assert report["deployment"] == ANOTHER
+        second.ready(NAME)
+        second.close()
+        third = world.make()
+        report = third.status(NAME)
+        assert report["readiness"] == "ready" and report["ready_confirmed_for"] == ANOTHER
+
+    def test_a_settings_file_naming_another_deployment_invalidates_at_start_up(self, world):
+        first = world.make(deployment=DEPLOYMENT)
+        first.start(NAME)
+        first.ready(NAME)
+        first.close()
+        second = world.make(deployment=ANOTHER)
+        assert second.status(NAME)["readiness"] == "services ready, redeploy pending"

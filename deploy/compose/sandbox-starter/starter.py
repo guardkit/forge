@@ -19,7 +19,9 @@ does exactly these things, only for the names in STARTER_SANDBOXES:
                              keeps the sandbox up for an outside command;
                              starts it when stopped
     DELETE /hold/<id>        ends a hold
-    POST   /ready/<name>     the coordinator records the redeploy as ready
+    POST   /ready/<name>     the coordinator records the redeploy as ready,
+                             for the sandbox's current deployment identity
+                             (which it may name, and must then match)
     POST   /suspend/<name>?reason=..
                              the coordinator records a failed redeploy: no
                              stop is accepted until a session clears it
@@ -279,6 +281,7 @@ class Sandbox:
         self.suspended: str | None = None
         self.unresolved: str | None = None
         self.readiness = UNKNOWN
+        self.ready_for: dict | None = None  # the identity "ready" was confirmed for
         self.vm_state: str | None = None
         self.vm_seen_at: float | None = None
         self.vm_how: str | None = None
@@ -406,6 +409,7 @@ class Starter:
             sb.holds.pop(entry.get("hold_id"), None)
         elif kind == "readiness":
             sb.readiness = entry.get("state", UNKNOWN)
+            sb.ready_for = entry.get("confirmed_for") or None
         elif kind == "vm":
             sb.vm_state = entry.get("state")
             sb.vm_seen_at = float(entry.get("seen", 0)) or None
@@ -429,6 +433,9 @@ class Starter:
         for sb in self.sandboxes.values():
             self._replay(sb)
         for sb in self.sandboxes.values():
+            # The settings file may name another deployment than the one a
+            # recorded "ready" was confirmed for.
+            self._reconcile_confirmation(sb, "the deployment identity differs from the one ready was confirmed for")
             if sb.recovering:
                 ids = ", ".join(str(o["id"]) for o in sb.recovering)
                 self.say(f"{sb.name}: operation(s) {ids} have no recorded end; recovering")
@@ -579,17 +586,38 @@ class Starter:
 
     # -- readiness bookkeeping ---------------------------------------------
 
-    def _set_readiness(self, sb: Sandbox, state: str) -> None:
+    # "ready" is always ready FOR ONE DEPLOYMENT IDENTITY (none for a sandbox
+    # with only its services): it is recorded with the identity it was
+    # confirmed for, and it counts only while that is still the sandbox's
+    # deployment. A new or changed identity invalidates it durably.
+
+    def _set_readiness(self, sb: Sandbox, state: str, why: str | None = None) -> None:
         with self.lock:
-            if sb.readiness != state:
-                sb.readiness = state
-                self._record(sb, "readiness", state=state)
+            confirmed_for = sb.deployment() if state == READY else None
+            if sb.readiness != state or sb.ready_for != confirmed_for:
+                sb.readiness, sb.ready_for = state, confirmed_for
+                extra = {"why": why} if why else {}
+                self._record(sb, "readiness", state=state, confirmed_for=confirmed_for, **extra)
+
+    def _confirmed(self, sb: Sandbox) -> bool:
+        with self.lock:
+            return sb.readiness == READY and sb.ready_for == sb.deployment()
+
+    def _reconcile_confirmation(self, sb: Sandbox, why: str) -> None:
+        """The deployment identity may have changed: re-judge what readiness means."""
+        with self.lock:
+            if sb.readiness == READY and sb.ready_for != sb.deployment():
+                self._set_readiness(sb, REDEPLOY_PENDING if sb.deployment() else READY, why)
+            elif sb.readiness == REDEPLOY_PENDING and sb.deployment() is None:
+                self._set_readiness(sb, READY, why)
 
     def _services_answered(self, sb: Sandbox, woke: bool) -> str:
         """Both services answer. A wake (or an unknown state) needs a redeploy."""
         with self.lock:
             if woke or sb.readiness not in (READY, REDEPLOY_PENDING):
                 self._set_readiness(sb, REDEPLOY_PENDING if sb.deployment() else READY)
+            else:
+                self._reconcile_confirmation(sb, "the deployment identity changed")
             return sb.readiness
 
     def _note_deployment(self, sb: Sandbox, told) -> None:
@@ -597,8 +625,12 @@ class Starter:
             return
         with self.lock:
             if sb.deployment_told != told:
+                before = sb.deployment()
                 sb.deployment_told = told
                 self._record(sb, "deployment", deployment=told)
+                if sb.deployment() != before:
+                    self._reconcile_confirmation(
+                        sb, "the deployment identity was supplied or changed, so its redeploy must be confirmed again")
 
     # -- start --------------------------------------------------------------
 
@@ -949,6 +981,7 @@ class Starter:
                 "services_ready": helper and runner,
                 "services": {"helper": helper, "runner": runner},
                 "readiness": sb.readiness,
+                "ready_confirmed_for": sb.ready_for if sb.readiness == READY else None,
                 "redeploy_pending": sb.readiness == REDEPLOY_PENDING,
                 "deployment": sb.deployment(),
             }
@@ -1032,7 +1065,7 @@ class Starter:
             while True:
                 checkpoint()
                 with self.lock:
-                    if sb.readiness == READY:
+                    if self._confirmed(sb):
                         return {"hold_id": hold_id, "readiness": READY,
                                 "message": f"{sb.name} is held for {owner}: its recorded deployment is back"}
                 self.sleep(1.0)
@@ -1054,13 +1087,22 @@ class Starter:
                     return {"sandbox": sb.name, "message": f"hold {hold_id} on {sb.name} has ended"}
         raise Refused(f"there is no open hold {hold_id}", HTTPStatus.NOT_FOUND)
 
-    def ready(self, name: str) -> dict:
+    def ready(self, name: str, told=None) -> dict:
+        """The coordinator confirms the redeploy. When it names the identity it
+        redeployed, that must be the sandbox's current one."""
         sb = self.sandbox(name)
         if self._container_state(sb) != "running":
             raise Refused(f"{sb.name}'s supervisor is not running, so its redeploy cannot be ready")
         with self.lock:
+            current = sb.deployment()
+            if told is not None and (told or None) != current:
+                raise Refused(
+                    f"the ready names {told or 'no deployment'} but {sb.name}'s recorded deployment is "
+                    f"{current or 'none'}, so nothing was recorded"
+                )
             self._set_readiness(sb, READY)
-        return {"readiness": READY, "message": f"{sb.name} is recorded as ready"}
+        return {"readiness": READY, "confirmed_for": current,
+                "message": f"{sb.name} is recorded as ready"}
 
     def suspend(self, name: str, reason: str) -> dict:
         sb = self.sandbox(name)
@@ -1139,7 +1181,7 @@ def make_handler(starter: Starter):
                 elif method == "DELETE" and verb == "hold":
                     result = starter.end_hold(name)
                 elif method == "POST" and verb == "ready":
-                    result = starter.ready(name)
+                    result = starter.ready(name, _told_deployment(query))
                 elif method == "POST" and verb == "suspend":
                     result = starter.suspend(name, one("reason"))
                 elif method == "POST" and verb == "clear":
