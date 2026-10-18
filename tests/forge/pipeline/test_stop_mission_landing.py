@@ -59,6 +59,7 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     pool,
     repo_root,
 )
+from tests.forge.pipeline import test_merge_executor as merge_executor_fakes
 from tests.forge.pipeline.test_mission_finish import _finish_deps, _land
 from tests.forge.pipeline.test_mission_landing import (  # noqa: F401 - fixtures
     B_BUILD,
@@ -867,6 +868,16 @@ class _TheCoordinatorStopped(BaseException):
     """The process going away: nothing in the press catches it."""
 
 
+class _ACheckThatLeavesNothingStanding(merge_executor_fakes._FakeDeploy):
+    """A candidate check that answers with nothing left standing."""
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        answer = await super().__call__(**kwargs)
+        if kwargs.get("leg") == "candidate_check" and answer is not None:
+            answer.detail = {**answer.detail, "candidate": "absent"}
+        return answer
+
+
 class TestASettledLandingWhoseBookkeepingDidNotFinish:
     async def _the_press_stops_right_after_its_result(
         self,
@@ -874,15 +885,27 @@ class TestASettledLandingWhoseBookkeepingDidNotFinish:
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
         monkeypatch: pytest.MonkeyPatch,
+        *,
+        a_candidate_standing: bool = False,
     ) -> Any:
         """A landing decided before the stop, and the REAL press interrupted the
         moment it has written "published to the mission branch": no report, no
-        release, the hold still on the record."""
+        release, the hold still on the record.
+
+        Press lease recovery (coach round, item 2): a press stopped there
+        with the candidate its check stood up still standing keeps its hold
+        for a person, so these cases use a check that leaves nothing standing
+        unless ``a_candidate_standing`` says otherwise."""
         a_running_mission(pool, keys=("B",))
         a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
         _planned(pool)
         the_mission_branch_on_the_remote(repo_root)
-        deps, *_ = press_deps(config_on, pool, repo_root)
+        deps, *_ = press_deps(
+            config_on,
+            pool,
+            repo_root,
+            deploy=None if a_candidate_standing else _ACheckThatLeavesNothingStanding(),
+        )
         assert MergeApprovalConsumer(deps)._decide_landing(
             B_BUILD, mission_id=MISSION_ID, decided_by="x", request_id=f"merge-{B_BUILD}"
         )
@@ -961,6 +984,31 @@ class TestASettledLandingWhoseBookkeepingDidNotFinish:
         assert mission.status == "NOT_MERGED"
         assert mission.closed_reason.endswith("; 1 landed on the branch, 0 did not")
         self._everything_is_clear(pool)
+
+    @pytest.mark.asyncio
+    async def test_with_the_candidate_still_standing_the_report_is_written_and_the_hold_kept(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        deps = await self._the_press_stops_right_after_its_result(
+            config_on, pool, repo_root, monkeypatch, a_candidate_standing=True
+        )
+        held = _record(pool)
+        self._expire(pool)
+        await self._passes(config_on, pool, MergeApprovalConsumer(deps), times=2)
+
+        reports = _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)
+        assert len(reports) == 1 and reports[0].status == "PASSED"
+        after = _record(pool)
+        assert (after.lease_holder, after.turn) == (held.lease_holder, held.turn)
+        from forge.lifecycle.feature_routing import router_restart_blockers
+
+        assert f"publication-held:{B_BUILD}:{held.lease_holder}" in router_restart_blockers(
+            pool.connection
+        )
 
     @pytest.mark.asyncio
     async def test_a_crash_between_the_report_and_the_release_is_picked_up_next(
@@ -1190,3 +1238,52 @@ class TestNoMissionLeavesRunningWithAnUnreportedLanding:
         assert _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)[0].status == "PASSED"
         await step.run_once()
         assert store.get(MISSION_ID).status == "READY"
+
+
+# ---------------------------------------------------------------------------
+# Press lease recovery, coach round item 2: a landing runs the candidate
+# check too, so its press can keep its hold ON PURPOSE (a teardown that did
+# not confirm the candidate down); the landing recovery never puts that down
+# ---------------------------------------------------------------------------
+
+
+class _ATeardownThatLeavesItStanding(merge_executor_fakes._FakeDeploy):
+    async def __call__(self, **kwargs: Any) -> Any:
+        if kwargs.get("leg") == "candidate_down":
+            self.calls.append(kwargs)
+            return SimpleNamespace(
+                confirmed=True, outcome="failed", verdict=None, detail={"candidate": "standing"}
+            )
+        return await super().__call__(**kwargs)
+
+
+class TestALandingsHoldKeptOnPurpose:
+    @pytest.mark.asyncio
+    async def test_the_landing_recovery_leaves_it_kept(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        _planned(pool)
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(config_on, pool, repo_root, deploy=_ATeardownThatLeavesItStanding())
+        consumer = MergeApprovalConsumer(deps)
+        assert consumer._decide_landing(
+            B_BUILD, mission_id=MISSION_ID, decided_by="x", request_id=f"merge-{B_BUILD}"
+        )
+        await consumer.land_mission_feature(B_BUILD)
+        held = _record(pool)
+        assert held.result == RESULT_PUBLISHED_TO_MISSION_BRANCH
+        assert held.lease_holder  # kept by the press: the candidate may be standing
+        assert len(_stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)) == 1
+        bookkeeping = TestASettledLandingWhoseBookkeepingDidNotFinish()
+        bookkeeping._expire(pool)
+        assert await MergeApprovalConsumer(deps).finish_a_settled_landing(B_BUILD) == "kept"
+        await mission_finish.finish_ready_missions(
+            bookkeeping._finisher(config_on, pool, MergeApprovalConsumer(deps)), wait=True
+        )
+        after = _record(pool)
+        assert (after.lease_holder, after.turn) == (held.lease_holder, held.turn)

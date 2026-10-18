@@ -70,6 +70,7 @@ __all__ = [
     "PublicationRecord",
     "PublicationRecordStore",
     "StoredOutcome",
+    "mark_outcome_reported",
     "ensure_outcome_table",
     "Replaced",
     "default_lease_seconds",
@@ -160,13 +161,24 @@ def default_lease_seconds() -> int:
 #: The press's own record of how it ended (18 October 2026), one row per
 #: build, outside the migration ladder: made where it is needed and at the
 #: coordinator's boot, so the schema version stays as it is.
+#: One row per build, for the LATEST press on its record (press lease
+#: recovery, 18 October 2026). A press makes it afresh in the same
+#: transaction that takes its lease (``turn`` is that press's turn); the
+#: press's result write marks ``result_written`` in the same transaction as
+#: the result, with what might still be standing at that moment; the press
+#: writes its ending into ``outcome_json``; and the report row marks
+#: ``reported_at`` in the same transaction as the report. A recovery that
+#: takes the record over later changes none of it but ``reported_at``.
 _OUTCOME_TABLE_SQL = (
     "CREATE TABLE IF NOT EXISTS publication_outcomes ("
     "build_id TEXT PRIMARY KEY, "
     "turn INTEGER NOT NULL, "
     "attempt_id TEXT, "
-    "outcome_json TEXT NOT NULL, "
-    "recorded_at TEXT NOT NULL)"
+    "outcome_json TEXT NOT NULL DEFAULT '{}', "
+    "recorded_at TEXT NOT NULL, "
+    "result_written INTEGER NOT NULL DEFAULT 0, "
+    "standing_json TEXT, "
+    "reported_at TEXT)"
 )
 
 
@@ -175,13 +187,39 @@ def ensure_outcome_table(cx: sqlite3.Connection) -> None:
     cx.execute(_OUTCOME_TABLE_SQL)
 
 
+def _no_outcome_table(exc: sqlite3.Error) -> bool:
+    return "no such table" in str(exc).lower()
+
+
+def mark_outcome_reported(
+    cx: sqlite3.Connection, *, build_id: str, turn: int, now: datetime
+) -> None:
+    """Mark the press of ``turn``'s ending as reported, inside the caller's
+    transaction (the one that writes the report row). Never raises for a
+    ledger with no such table: nothing was written down there to mark."""
+    try:
+        cx.execute(
+            "UPDATE publication_outcomes SET reported_at = ? "
+            "WHERE build_id = ? AND turn = ?",
+            (now.isoformat(), str(build_id), int(turn)),
+        )
+    except sqlite3.OperationalError as exc:
+        if not _no_outcome_table(exc):
+            raise
+
+
 @dataclass(frozen=True)
 class StoredOutcome:
-    """A press's written-down ending: the turn it held, its attempt, the outcome."""
+    """The latest press's row: its turn, attempt, written-down ending (``{}``
+    until written), whether its result was written, what might still have
+    been standing then, and when its ending was reported (``None``: not)."""
 
     turn: int
     attempt_id: str | None
     outcome: dict[str, Any]
+    result_written: bool = False
+    standing: dict[str, Any] = field(default_factory=dict)
+    reported_at: str | None = None
 
 
 class Replaced(RuntimeError):
@@ -521,8 +559,15 @@ class PublicationRecordStore:
         repo: str | None = None,
         decided_by: str | None = None,
         target_branch: str | None = None,
+        starts_a_press: bool = False,
     ) -> LeaseGrant | None:
         """Take this build's record, or answer ``None`` because someone holds it.
+
+        ``starts_a_press`` (press lease recovery, 18 October 2026): a merge
+        press beginning, so in the same transaction this build's
+        ``publication_outcomes`` row is made afresh for the new turn — any
+        earlier press's ending, result mark and report mark go with it. A
+        recovery taking the record over passes False and changes none of it.
 
         One transaction, and the turn number goes up by one inside it, on a
         first take and on a takeover alike. A takeover is only possible once
@@ -568,6 +613,8 @@ class PublicationRecordStore:
                             stamp,
                         ),
                     )
+                    if starts_a_press:
+                        self._a_press_begins(build_id, 1, stamp)
                     return LeaseGrant(
                         build_id=str(build_id),
                         holder=str(holder),
@@ -598,6 +645,8 @@ class PublicationRecordStore:
                 ).rowcount
                 if changed != 1:
                     return None
+                if starts_a_press:
+                    self._a_press_begins(build_id, current_turn + 1, stamp)
                 return LeaseGrant(
                     build_id=str(build_id),
                     holder=str(holder),
@@ -614,6 +663,38 @@ class PublicationRecordStore:
                 exc,
             )
             return None
+
+    def _a_press_begins(self, build_id: str, turn: int, stamp: str) -> None:
+        """Inside :meth:`take_lease`'s transaction: this press's row, afresh."""
+        ensure_outcome_table(self._cx)
+        self._cx.execute(
+            "INSERT OR REPLACE INTO publication_outcomes "
+            "(build_id, turn, attempt_id, outcome_json, recorded_at, "
+            "result_written, standing_json, reported_at) "
+            "VALUES (?, ?, NULL, '{}', ?, 0, NULL, NULL)",
+            (str(build_id), int(turn), stamp),
+        )
+
+    def _mark_the_result(self, build_id: str, turn: int) -> None:
+        """Inside a result write's transaction: the press of ``turn`` wrote
+        it, with what it says might still be standing (``result_context``,
+        set by the press on its own store; nothing otherwise)."""
+        context = getattr(self, "result_context", None)
+        standing: dict[str, Any] = {}
+        if callable(context):
+            try:
+                standing = dict(context() or {})
+            except Exception:  # noqa: BLE001 — never costs a result
+                standing = {"unknown": True}
+        try:
+            self._cx.execute(
+                "UPDATE publication_outcomes SET result_written = 1, standing_json = ? "
+                "WHERE build_id = ? AND turn = ?",
+                (json.dumps(standing, sort_keys=True, default=str), str(build_id), int(turn)),
+            )
+        except sqlite3.OperationalError as exc:
+            if not _no_outcome_table(exc):
+                raise
 
     def renew_lease(
         self, *, build_id: str, turn: int, now: datetime, seconds: int | None = None
@@ -658,40 +739,38 @@ class PublicationRecordStore:
         outcome: dict[str, Any],
         attempt_id: str | None,
     ) -> bool:
-        """Write down the press's final outcome, before its clean-up and report.
+        """Write down the press's ending, before its clean-up and its report.
 
-        Press lease recovery (18 October 2026): the press settles its result,
-        cleans up, reports and puts its lease down, and a coordinator that
-        stops between those steps used to leave a result nobody could report
-        — one record result covers several different reports. So the ending
-        itself is kept, for this worker's turn, and a recovery reports from it
-        through the press's own report path. Only on the record's current turn
-        and holder, in one transaction; ``False`` when this worker has been
-        replaced and nothing was written. The table is outside the migration
-        ladder (no schema version bump), made where it is needed.
+        Press lease recovery (18 October 2026): one record result covers
+        several different reports, so the ending itself is kept, on the
+        press's own row, and a recovery reports from it through the press's
+        own report path. Only while the record is still on this press's turn,
+        held by it or put down by it on that turn (a refusal before the join
+        settles and releases in one write), and only onto the row this press
+        began. ``False`` when nothing was written (replaced, or no row).
         """
         try:
             with self._transaction():
-                ensure_outcome_table(self._cx)
                 held = self._cx.execute(
                     "SELECT 1 FROM publication_records WHERE build_id = ? AND turn = ? "
-                    "AND lease_holder = ?",
+                    "AND (lease_holder = ? OR lease_holder IS NULL)",
                     (str(build_id), int(turn), str(holder)),
                 ).fetchone()
                 if held is None:
                     return False
-                self._cx.execute(
-                    "INSERT OR REPLACE INTO publication_outcomes "
-                    "(build_id, turn, attempt_id, outcome_json, recorded_at) "
-                    "VALUES (?, ?, ?, ?, ?)",
+                changed = self._cx.execute(
+                    "UPDATE publication_outcomes SET outcome_json = ?, attempt_id = ?, "
+                    "recorded_at = ? WHERE build_id = ? AND turn = ?",
                     (
+                        json.dumps(outcome, sort_keys=True, default=str),
+                        attempt_id,
+                        now.isoformat(),
                         str(build_id),
                         int(turn),
-                        attempt_id,
-                        json.dumps(outcome, sort_keys=True, default=str),
-                        now.isoformat(),
                     ),
-                )
+                ).rowcount
+                if changed != 1:
+                    return False
         except sqlite3.Error as exc:
             logger.warning(
                 "publication record: %s's outcome could not be written (%s)", build_id, exc
@@ -700,26 +779,35 @@ class PublicationRecordStore:
         return True
 
     def read_outcome(self, build_id: str) -> "StoredOutcome | None":
-        """The outcome a press wrote down for this build, or ``None``."""
+        """The latest press's row for this build, or ``None``."""
         try:
             row = self._cx.execute(
-                "SELECT turn, attempt_id, outcome_json FROM publication_outcomes "
-                "WHERE build_id = ?",
+                "SELECT turn, attempt_id, outcome_json, result_written, standing_json, "
+                "reported_at FROM publication_outcomes WHERE build_id = ?",
                 (str(build_id),),
             ).fetchone()
         except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
+            if _no_outcome_table(exc):
                 return None
             raise
         if row is None:
             return None
-        try:
-            decoded = json.loads(row[2])
-        except (TypeError, ValueError):
-            return None
-        if not isinstance(decoded, dict):
-            return None
-        return StoredOutcome(turn=int(row[0]), attempt_id=row[1], outcome=decoded)
+
+        def decoded(text: Any) -> dict[str, Any]:
+            try:
+                value = json.loads(text or "{}")
+            except (TypeError, ValueError):
+                return {}
+            return value if isinstance(value, dict) else {}
+
+        return StoredOutcome(
+            turn=int(row[0]),
+            attempt_id=row[1],
+            outcome=decoded(row[2]),
+            result_written=bool(row[3]),
+            standing=decoded(row[4]),
+            reported_at=row[5],
+        )
 
     def settle(
         self, *, build_id: str, turn: int, holder: str, now: datetime, result: str
@@ -781,6 +869,11 @@ class PublicationRecordStore:
                     """,
                     values,
                 ).rowcount
+                # A RESULT IS MARKED AS THIS PRESS'S, in the same transaction
+                # (press lease recovery): a result left by an earlier press is
+                # then never mistaken for this one's.
+                if changed == 1 and assignments.get("result"):
+                    self._mark_the_result(str(build_id), int(turn))
         except sqlite3.Error as exc:
             logger.warning(
                 "publication record: %s could not be written (%s)", build_id, exc

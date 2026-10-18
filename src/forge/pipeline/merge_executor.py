@@ -128,6 +128,7 @@ import copy
 import json
 import logging
 import os
+import sqlite3
 import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -196,6 +197,7 @@ from forge.pipeline.publication_record import (
     STEP_SEND,
     PublicationRecordStore,
     default_lease_seconds,
+    mark_outcome_reported,
 )
 from forge.pipeline.publication_switch import (
     publication_is_switched_on,
@@ -1108,15 +1110,11 @@ def stored_outcome(
     receipts_dir: Path,
     digest_warning: str | None,
     join_as: str,
-    reports_before: int,
 ) -> dict[str, Any]:
     """The press's ending as it is written down before it is reported.
 
     Everything :func:`publish_the_press_report` needs, so the recovery reports
-    exactly what the press would have, and derives nothing. ``reports_before``
-    is how many merge reports the build had when it was written down: the
-    press holds the record's lease from then until its report, so one more
-    than that means this ending was reported.
+    exactly what the press would have, and derives nothing.
     """
     return {
         "outcome": {name: getattr(outcome, name) for name in _OUTCOME_FIELDS},
@@ -1126,7 +1124,6 @@ def stored_outcome(
         "receipts_dir": str(receipts_dir),
         "digest_warning": digest_warning,
         "join_as": join_as,
-        "reports_before": int(reports_before),
     }
 
 
@@ -1136,17 +1133,41 @@ def outcome_from_stored(said: dict[str, Any]) -> "MergeDeployOutcome":
     return MergeDeployOutcome(**{name: fields.get(name) for name in _OUTCOME_FIELDS})
 
 
-def merge_reports_on(pool: Any, build_id: str) -> int:
-    """How many merge reports are on this build's record."""
-    return sum(
-        1
-        for stage in pool.read_stages(build_id)
-        if stage.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER
-    )
+def press_kept_on_purpose(record: Any, written: Any) -> str | None:
+    """Why a stopped press's hold is kept on purpose, or ``None``.
+
+    Press lease recovery (coach round, item 2): the press keeps its hold
+    after a deploy-stage leg whose answer was lost or with a candidate that
+    may be standing (15 October 2026), and the router reads a kept holder as
+    active or ambiguous for exactly that reason; a recovery must not put it
+    down. Read from the press's own row: its decision after the clean-up;
+    before the clean-up (it stopped part-way), what might still be standing
+    then; with no ending written down, what might be standing when its result
+    was written. A record with no holder keeps nothing.
+    """
+    if not getattr(record, "lease_holder", None):
+        return None
+    said = dict(getattr(written, "outcome", None) or {})
+    if said.get("cleanup_done"):
+        kept = said.get("kept_because")
+        return str(kept) if kept else None
+    flags = said if said.get("outcome") else dict(getattr(written, "standing", None) or {})
+    if flags.get("unknown"):
+        return "what the press had standing could not be recorded"
+    if flags.get("leg_unanswered"):
+        return "a deploy-stage leg's answer was lost"
+    if flags.get("candidate_may_stand"):
+        return "the press stopped before its clean-up, and a candidate may still be standing"
+    return None
 
 
 def _record_the_report(
-    deps: Any, build_id: str, payload: StageCompletePayload, completed: datetime
+    deps: Any,
+    build_id: str,
+    payload: StageCompletePayload,
+    completed: datetime,
+    *,
+    reported_turn: int | None = None,
 ) -> None:
     """Put the merge report on the build's own record, not only on the bus.
 
@@ -1157,25 +1178,49 @@ def _record_the_report(
     reads to tell a repair that merged, deployed and stayed green from
     one that stopped at a red step (``lifecycle/metrics.py``).
 
+    ``reported_turn`` is the press whose written-down ending this report is
+    (press lease recovery, 18 October 2026): its row is marked reported IN
+    THE SAME TRANSACTION as the report row, so a recovery never reports it a
+    second time and never mistakes another press's report for it. A pool
+    that cannot do that writes the plain row.
+
     A dry run never gets here: it leaves no durable rows on purpose.
     Never raises — the bus report and the receipt on disk are the record,
     and a row that cannot be written must not cost them.
     """
+    entry = StageLogEntry(
+        build_id=build_id,
+        stage_label=MERGE_REPORT_STAGE_LABEL,
+        target_kind="local_tool",
+        target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+        status=payload.status,
+        gate_mode=None,
+        started_at=completed,
+        completed_at=completed,
+        duration_secs=float(payload.duration_secs or 0.0),
+        details=payload.model_dump(mode="json"),
+    )
     try:
-        deps.pool.record_stage(
-            StageLogEntry(
-                build_id=build_id,
-                stage_label=MERGE_REPORT_STAGE_LABEL,
-                target_kind="local_tool",
-                target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
-                status=payload.status,
-                gate_mode=None,
-                started_at=completed,
-                completed_at=completed,
-                duration_secs=float(payload.duration_secs or 0.0),
-                details=payload.model_dump(mode="json"),
-            )
-        )
+        if reported_turn and _ledger_of(deps.pool) is not None:
+            try:
+                deps.pool.record_stage(
+                    entry,
+                    and_then=lambda cx: mark_outcome_reported(
+                        cx, build_id=build_id, turn=reported_turn, now=completed
+                    ),
+                )
+                return
+            except (TypeError, sqlite3.Error) as exc:
+                # A pool without the same-transaction step, or a mark that
+                # could not be written: the plain row, so the report stands.
+                logger.warning(
+                    "merge-executor: %s's report could not mark its ending "
+                    "reported (%s: %s) — writing the report alone",
+                    build_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        deps.pool.record_stage(entry)
     except Exception as exc:  # noqa: BLE001 — a row never costs a report
         logger.error(
             "merge-executor: could not record the merge report for %s "
@@ -1217,6 +1262,7 @@ async def publish_the_press_report(
     merge_execution_attempt_id: str | None,
     digest_warning: str | None,
     mint_repair: bool = True,
+    reported_turn: int | None = None,
 ) -> "MergeDeployOutcome":
     """Report a press's ending: the one path the press and its recovery share.
 
@@ -1312,7 +1358,7 @@ async def publish_the_press_report(
     _write_the_receipt(
         receipts_dir, build_id, "merge_deploy_report.json", payload.model_dump(mode="json")
     )
-    _record_the_report(deps, build_id, payload, completed)
+    _record_the_report(deps, build_id, payload, completed, reported_turn=reported_turn)
     # THE BUILD'S ENDING, written by the only thing that knows it. After
     # the report, so a row that cannot be written can never cost the
     # report; before the repair row, because the journey ends before its
@@ -1569,8 +1615,14 @@ def _write_the_refusal_down_for(
     decided_by: str,
     target_branch: str | None,
     refusal: str,
-) -> None:
+    starts_a_press: bool = False,
+) -> int | None:
     """One row for this build, saying the merge word was given and refused.
+
+    Answers the turn the refusal was written on, or ``None``. ``starts_a_press``
+    is the press's own refusal (it is reported, so its ending is written down
+    and its report marked on that turn, press lease recovery); an approval the
+    consumer refused before any press is not, and is never reported.
 
     Used where the press stops BEFORE it would otherwise have taken the
     lease — no branch of the remote was ever written down for this build,
@@ -1587,7 +1639,7 @@ def _write_the_refusal_down_for(
     same rule as everywhere else.
     """
     if store is None:
-        return
+        return None
     try:
         grant = store.take_lease(
             build_id=build_id,
@@ -1597,6 +1649,7 @@ def _write_the_refusal_down_for(
             repo=repo,
             decided_by=decided_by,
             target_branch=target_branch,
+            starts_a_press=starts_a_press,
         )
         if grant is None:
             logger.warning(
@@ -1606,7 +1659,7 @@ def _write_the_refusal_down_for(
                 build_id,
                 refusal,
             )
-            return
+            return None
         store.done(
             build_id=build_id,
             turn=grant.turn,
@@ -1633,6 +1686,7 @@ def _write_the_refusal_down_for(
             lease_holder=None,
             lease_expires_at=None,
         )
+        return grant.turn
     except Exception as exc:  # noqa: BLE001 — a record never costs a press
         logger.warning(
             "merge-executor: %s's refusal could not be written onto its "
@@ -1641,6 +1695,7 @@ def _write_the_refusal_down_for(
             type(exc).__name__,
             exc,
         )
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1999,6 +2054,9 @@ async def execute_merge_deploy(
     # so the hold is kept for those too. Whatever is kept lapses on its own.
     # ``held_turn`` is the turn this press took the lease on; 0 = none.
     held_turn = 0
+    # The turn this press's own refusal before the join was written on (it
+    # settles and puts the lease down in one write): a list of one, or empty.
+    refusal_turn: list[int] = []
     # Set when a deploy-stage leg got no answer (it raised, or the stage says
     # a step's request got none), or a candidate tree's removal was not
     # confirmed done, or a join's working folder's removal or the retained
@@ -2188,38 +2246,63 @@ async def execute_merge_deploy(
         outcome.detail = card_body(outcome.detail)
         return outcome
 
-    #: How many merge reports the build had before this press's ending was
-    #: first written down (a list of one, filled once).
-    reports_before: list[int] = []
+    def _ending_turn() -> int:
+        """The turn this press's ending belongs to: its hold's, or its own
+        refusal's (written and put down in one write). 0: none."""
+        return held_turn or (refusal_turn[0] if refusal_turn else 0)
 
-    def _write_the_ending_down(outcome: MergeDeployOutcome) -> None:
-        """Keep this press's ending on its record's own turn (press lease
-        recovery, 18 October 2026), so a coordinator that stops before the
-        report can be reported for, word for word, through the same path."""
-        if dry_run or not held_turn:
+    def _why_the_hold_is_kept(outcome: MergeDeployOutcome) -> str | None:
+        """Why this press keeps its hold after its clean-up, or ``None``.
+
+        The 15 October 2026 rules: a deploy-stage leg with no answer, a
+        candidate a teardown did not confirm down, a candidate a passed check
+        left standing, or a record that could not be written. One place, for
+        the press's own release and for the ending it writes down.
+        """
+        if a_leg_did_not_complete:
+            return "a deploy-stage leg's answer was lost"
+        if something_is_left_standing:
+            return "a candidate's teardown did not confirm it down"
+        if candidate_standing:
+            return "a candidate the check stood up may still be standing"
+        if outcome.failed_step == "record":
+            return "the publication record could not be written"
+        return None
+
+    def _write_the_ending_down(outcome: MergeDeployOutcome, *, cleanup_done: bool) -> None:
+        """Keep this press's ending on its own row (press lease recovery, 18
+        October 2026), so a coordinator that stops before the report can be
+        reported for, word for word, through the same path — with whether
+        the clean-up had run, and what the hold's decision is or would be."""
+        turn = _ending_turn()
+        if dry_run or not turn:
             return
         try:
-            if not reports_before:
-                reports_before.append(merge_reports_on(deps.pool, build_id))
             store_here = _publication_store()
-            if store_here is not None:
-                store_here.record_outcome(
-                    build_id=build_id,
-                    turn=held_turn,
-                    holder=worker_name,
-                    now=deps.clock(),
-                    outcome=stored_outcome(
-                        outcome,
-                        feature_id=feature_id,
-                        correlation_id=correlation_id,
-                        started=started,
-                        receipts_dir=receipts_dir,
-                        digest_warning=digest_conformance.get("warning"),
-                        join_as=join_as,
-                        reports_before=reports_before[0],
-                    ),
-                    attempt_id=merge_execution_attempt_id,
-                )
+            if store_here is None:
+                return
+            said = stored_outcome(
+                outcome,
+                feature_id=feature_id,
+                correlation_id=correlation_id,
+                started=started,
+                receipts_dir=receipts_dir,
+                digest_warning=digest_conformance.get("warning"),
+                join_as=join_as,
+            )
+            said["cleanup_done"] = cleanup_done
+            said["kept_because"] = (
+                _why_the_hold_is_kept(outcome) if held_turn else None
+            )
+            said.update(_what_may_be_standing())
+            store_here.record_outcome(
+                build_id=build_id,
+                turn=turn,
+                holder=worker_name,
+                now=deps.clock(),
+                outcome=said,
+                attempt_id=merge_execution_attempt_id,
+            )
         except Exception as exc:  # noqa: BLE001 — never costs a result
             logger.warning(
                 "merge-executor: %s's ending could not be written down (%s: %s)",
@@ -2228,18 +2311,35 @@ async def execute_merge_deploy(
                 exc,
             )
 
-    def _replaced_after_the_result() -> bool:
-        """Has another worker taken this press's record over (a new turn)?"""
-        if dry_run or not held_turn:
-            return False
+    def _still_this_presss_record() -> bool:
+        """Is the record still on this press's turn, so it may report?
+
+        A held record is RENEWED on its turn (Codex/coach round, item 4): a
+        recovery in another process that took it over has raised the turn,
+        so the renewal is refused and this press leaves the report to it; a
+        renewal that succeeds means the report is written under a live hold.
+        A refusal's record (put down on its turn) is read. No record here at
+        all (a dry run, a stand-in pool): nothing can take it over.
+        """
+        if dry_run:
+            return True
+        turn = _ending_turn()
+        if not turn:
+            return True
         try:
             store_here = _publication_store()
             if store_here is None:
-                return False
+                return True
+            if held_turn:
+                return bool(
+                    store_here.renew_lease(
+                        build_id=build_id, turn=held_turn, now=deps.clock()
+                    )
+                )
             now_record = store_here.read(build_id)
         except Exception:  # noqa: BLE001 — unknown is not replaced
-            return False
-        return bool(now_record.recorded and now_record.turn != held_turn)
+            return True
+        return not (now_record.recorded and now_record.turn != turn)
 
     async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         """The ending, already in its report's words, through the shared path."""
@@ -2254,6 +2354,7 @@ async def execute_merge_deploy(
             dry_run=dry_run,
             merge_execution_attempt_id=merge_execution_attempt_id,
             digest_warning=digest_conformance.get("warning"),
+            reported_turn=_ending_turn() or None,
         )
 
     async def _dispatch(leg: str, **extra: Any) -> Any:
@@ -2780,8 +2881,25 @@ async def execute_merge_deploy(
         return None
 
     def _publication_store() -> Any:
-        """The publication record's store (:func:`_publication_store_for`)."""
-        return _publication_store_for(deps, build_id)
+        """The publication record's store (:func:`_publication_store_for`).
+
+        Each one knows what this press might still have standing, so a result
+        it writes is marked with it in the same transaction (press lease
+        recovery): a press that stops right after its result is never
+        released by a recovery while a candidate may be standing."""
+        made = _publication_store_for(deps, build_id)
+        if made is not None:
+            try:
+                made.result_context = _what_may_be_standing
+            except Exception:  # noqa: BLE001 — a stand-in store that refuses attributes
+                pass
+        return made
+
+    def _what_may_be_standing() -> dict[str, Any]:
+        return {
+            "candidate_may_stand": bool(candidate_standing or something_is_left_standing),
+            "leg_unanswered": bool(a_leg_did_not_complete),
+        }
 
     def _cannot_join(sentence: str) -> MergeDeployOutcome:
         """Nothing could be joined, so nothing happened. The branch is kept."""
@@ -2797,7 +2915,7 @@ async def execute_merge_deploy(
         *, store: Any, target_branch: str | None, refusal: str
     ) -> None:
         """This press's refusal, on its record (:func:`_write_the_refusal_down_for`)."""
-        _write_the_refusal_down_for(
+        refused_on = _write_the_refusal_down_for(
             store,
             deps=deps,
             build_id=build_id,
@@ -2807,7 +2925,10 @@ async def execute_merge_deploy(
             decided_by=decided_by,
             target_branch=target_branch,
             refusal=refusal,
+            starts_a_press=True,
         )
+        if refused_on:
+            refusal_turn[:] = [refused_on]
 
     # -----------------------------------------------------------------------
     # THE SEND, and the three endings it can have
@@ -4579,6 +4700,7 @@ async def execute_merge_deploy(
                 repo=repo,
                 decided_by=decided_by,
                 target_branch=target_branch,
+                starts_a_press=True,
             )
             if grant is None:
                 current = store.read(build_id)
@@ -6012,7 +6134,8 @@ async def execute_merge_deploy(
         # A copy, so the ending itself is put into words exactly once.
         try:
             _write_the_ending_down(
-                _the_reports_words(_with_main_copies_said(copy.copy(outcome)))
+                _the_reports_words(_with_main_copies_said(copy.copy(outcome))),
+                cleanup_done=False,
             )
         except Exception as exc:  # noqa: BLE001 — never costs a result
             logger.warning(
@@ -6116,8 +6239,8 @@ async def execute_merge_deploy(
     # Written down again now its words are final (what the clean-up left
     # standing is known), then reported, and only then is the hold put down:
     # every stop from here on is finished by the recovery from this ending.
-    _write_the_ending_down(outcome)
-    if _replaced_after_the_result():
+    _write_the_ending_down(outcome, cleanup_done=True)
+    if not _still_this_presss_record():
         # The hold ran out and the recovery took the record over: it reports
         # this ending (or will), so this press does not report it twice.
         logger.warning(
@@ -6134,15 +6257,7 @@ async def execute_merge_deploy(
     # Never on a cancellation or a crash (those do not reach here), never by a
     # replaced worker; a release that cannot be written is logged and lapses
     # on its own, like the deployment lock's.
-    if (
-        held_turn
-        and not a_leg_did_not_complete
-        and not something_is_left_standing
-        # A candidate a passed check left standing for the promote, with no
-        # teardown that answered it is down (15 October 2026).
-        and not candidate_standing
-        and outcome.failed_step != "record"
-    ):
+    if held_turn and _why_the_hold_is_kept(outcome) is None:
         try:
             release_store = _publication_store()
             if release_store is not None and not release_store.release_lease(
@@ -7612,8 +7727,10 @@ class MergeApprovalConsumer:
            hold is put down on that turn. A removal whose answer was lost
            keeps the new hold, which lapses and is tried again.
 
-        A live, unexpired lease means a press may still be working: nothing
-        at all is done. Answers "finished", "held", "kept" or "nothing to do".
+        A hold the press kept ON PURPOSE (:func:`press_kept_on_purpose`) is
+        never put down here. A live, unexpired lease means a press may still
+        be working: nothing at all is done. Answers "finished", "held",
+        "kept" or "nothing to do".
         """
         from forge.lifecycle.mission_builds import mission_of_build
 
@@ -7637,6 +7754,21 @@ class MergeApprovalConsumer:
             # 2. THE HOLD.
             if not record.lease_holder:
                 return "finished"
+            # A HOLD THE PRESS KEPT ON PURPOSE STAYS KEPT (press lease
+            # recovery, coach round, item 2): a landing runs the candidate
+            # check too, so a teardown that did not confirm the candidate down,
+            # or a leg whose answer was lost, keeps the hold for a person.
+            written = store.read_outcome(build_id)
+            if written is not None and written.result_written:
+                kept = press_kept_on_purpose(record, written)
+                if kept:
+                    logger.warning(
+                        "merge-executor: %s's landing is reported and its hold "
+                        "is kept on purpose (%s)",
+                        build_id,
+                        kept,
+                    )
+                    return "kept"
             holder = f"settled-landing:{os.getpid()}:{uuid.uuid4().hex[:8]}"
             grant = store.take_lease(build_id=build_id, holder=holder, now=self._deps.clock())
             if grant is None:
@@ -7684,34 +7816,37 @@ class MergeApprovalConsumer:
     async def finish_a_settled_press(self, build_id: str) -> str:
         """Finish an ordinary build's press that stopped after its result.
 
-        Press lease recovery (18 October 2026). The press writes its result,
-        writes its ending down (:func:`stored_outcome`), cleans up, reports
-        and only then puts its hold down; a coordinator that stops anywhere
-        after the result leaves a held record whose report may be missing,
-        and the router and the rollout idle check wait on it for ever. This
-        finishes it, under the repository's lock and the record's lease rules,
-        once the hold's lease has run out:
+        Press lease recovery (18 October 2026). The press takes its lease and
+        begins its own ``publication_outcomes`` row in one transaction, marks
+        its result there in the result's own transaction, writes its ending
+        down, cleans up, reports (marking the row reported in the report's
+        transaction) and only then puts its hold down. A coordinator that
+        stops anywhere after the result leaves a record whose report may be
+        missing, whose hold may be kept, or both. This finishes it, under the
+        repository's lock, once no live lease is on the record:
 
-        1. The hold is taken over on a new turn, so no second recovery acts.
-        2. **The report**, unless this ending was already reported: from the
-           ending the press wrote down on that same turn, through the press's
-           own report path (:func:`publish_the_press_report`) — the bus
-           message, the receipt, the report row, the build row's ending and,
-           for a red ending, the repair row. Nothing is sent to the remote and
-           nothing is re-derived. With no ending written down (the press
-           stopped between its result and writing it down) the report is the
-           plain FAILED ending :data:`ENDING_NOT_RECORDED_SENTENCE`, with no
-           repair row.
-        3. **The clean-up after the result**, as the press does it: the
-           join's working folders, only once the record has reached its end.
-           A removal whose answer was lost keeps the new hold, which lapses
-           and is tried again.
-        4. The hold is put down.
+        1. Only a result THIS press wrote (``result_written`` on its row):
+           a result an earlier press left, under a press that stopped before
+           writing its own, is not this path's, and nothing is done.
+        2. The record is taken over on a new turn, so no second recovery
+           acts — even on a record whose hold was already put down (a
+           refusal before the join settles and releases in one write).
+        3. **The report**, unless the row says it was reported: from the
+           ending written down, through the press's own report path
+           (:func:`publish_the_press_report`), nothing sent to the remote and
+           nothing re-derived; with none written down, the plain FAILED
+           ending :data:`ENDING_NOT_RECORDED_SENTENCE`, no repair row. Either
+           way the row is marked reported with the report row.
+        4. **A hold kept on purpose stays kept** (:func:`press_kept_on_purpose`):
+           a candidate that may be standing, or a leg whose answer was lost,
+           is a person's to look at, so the hold is left to lapse and the
+           router keeps treating the record as held.
+        5. Otherwise the clean-up after the result, as the press does it (the
+           join's working folders, only at the record's end), and the hold is
+           put down. A removal whose answer was lost keeps the hold.
 
-        A live lease is never touched. Mission builds are not this path's:
-        their landings and merges have their own (``finish_a_settled_landing``,
-        ``resume_mission_merge``). Answers "finished", "held", "kept" or
-        "nothing to do".
+        A live lease is never touched. Mission builds are not this path's.
+        Answers "finished", "held", "kept" or "nothing to do".
         """
         from forge.lifecycle.mission_builds import mission_of_build
 
@@ -7727,27 +7862,34 @@ class MergeApprovalConsumer:
         repo = str(record.repo or row.repo or "")
         async with self._lock_for(repo):
             record = store.read(build_id)
-            if not record.recorded or not record.result or not record.lease_holder:
+            if not record.recorded or not record.result:
                 return "nothing to do"
             if record.lease_is_live(self._deps.clock()):
                 return "held"
-            # 1. THE HOLD, taken over, so this is the only worker finishing it.
+            written = store.read_outcome(build_id)
+            if written is None or not written.result_written:
+                return "nothing to do"
+            kept = press_kept_on_purpose(record, written)
+            reported = written.reported_at is not None
+            if reported and (kept or not record.lease_holder):
+                return "kept" if kept else "nothing to do"
             holder = f"settled-press:{os.getpid()}:{uuid.uuid4().hex[:8]}"
             grant = store.take_lease(build_id=build_id, holder=holder, now=self._deps.clock())
             if grant is None:
                 return "held"
-            written = store.read_outcome(build_id)
-            if written is not None and written.turn != record.turn:
-                written = None  # an earlier press's ending, not this one's
-            join_as = str(
-                ((written.outcome if written else {}) or {}).get("join_as")
-                or row.feature_id
-            )
-            # 2. THE REPORT, once.
-            if not self._the_press_has_reported(build_id, written):
-                await self._report_the_settled_press(row, record, written)
-            # 3. THE CLEAN-UP AFTER THE RESULT, only at the record's end.
+            if not reported:
+                await self._report_the_settled_press(row, record, written, kept)
+            if kept:
+                logger.warning(
+                    "merge-executor: %s's press stopped after its result and "
+                    "its hold is kept on purpose (%s); it is reported, and the "
+                    "hold is left for a person",
+                    build_id,
+                    kept,
+                )
+                return "kept"
             repo_root_raw = self._deps.config.planning.target_repo_paths.get(repo)
+            join_as = str((written.outcome or {}).get("join_as") or row.feature_id)
             if record.result == RESULT_MERGED_AND_RUNNING and repo_root_raw:
                 git = git_surface_for(self._deps, repo, Path(repo_root_raw))
                 retired, lost = await retire_join_working_folders(
@@ -7761,36 +7903,73 @@ class MergeApprovalConsumer:
                 )
                 if lost:
                     return "kept"
-            # 4. THE HOLD, put down.
             if not store.release_lease(
                 build_id=build_id, turn=grant.turn, holder=holder, now=self._deps.clock()
             ):
                 return "held"
             return "finished"
 
-    def _the_press_has_reported(self, build_id: str, written: Any) -> bool:
-        """Was the stopped press's ending already reported?
-
-        With its ending written down: a merge report more than it had then
-        (the press held the record from writing it down to its report, so
-        nothing else reported in between). Without: a report after the
-        build's latest merge decision carrying that decision's attempt, or
-        after it at all when the decision carries none.
-        """
-        stages = self._deps.pool.read_stages(build_id)
-        reports = [s for s in stages if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER]
-        if written is not None:
-            return len(reports) > int((written.outcome or {}).get("reports_before") or 0)
-        attempt_id, after = self._latest_decision(stages)
-        later = [s for s in stages[after + 1 :] if s.target_identifier == MERGE_REPORT_TARGET_IDENTIFIER]
-        if attempt_id is None:
-            return bool(later)
-        return any(
-            ((s.details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}).get(
-                MERGE_EXECUTION_ATTEMPT_ID_KEY
+    async def _report_the_settled_press(
+        self, row: Any, record: Any, written: Any, kept: str | None
+    ) -> None:
+        """The report the stopped press did not get to write, through its own
+        path, marked reported on that press's row in the same transaction."""
+        said = written.outcome or {}
+        standing_note = (
+            "The factory stopped before its clean-up finished, so the candidate "
+            "it checked may still be standing; the hold is kept until a person "
+            "looks."
+            if kept and not said.get("cleanup_done")
+            else None
+        )
+        if said.get("outcome"):
+            outcome = outcome_from_stored(said)
+            if standing_note:
+                outcome.detail = f"{outcome.detail}\n{standing_note}"
+            await publish_the_press_report(
+                self._deps,
+                build_id=row.build_id,
+                feature_id=str(said.get("feature_id") or row.feature_id),
+                correlation_id=str(said.get("correlation_id") or row.correlation_id),
+                outcome=outcome,
+                started=datetime.fromisoformat(str(said.get("started_at"))),
+                receipts_dir=Path(str(said.get("receipts_dir"))),
+                dry_run=False,
+                merge_execution_attempt_id=written.attempt_id,
+                digest_warning=said.get("digest_warning"),
+                reported_turn=written.turn,
             )
-            == attempt_id
-            for s in later
+            return
+        # THE ONE CASE THAT CANNOT BE REPORTED WORD FOR WORD: the press stopped
+        # between recording its result and writing its ending down. One record
+        # result covers several endings, so none is guessed: a plain FAILED
+        # ending that says so, and no repair row (it is not a finding about the
+        # code). Nothing is sent and nothing is deployed.
+        attempt_id, _ = self._latest_decision(self._deps.pool.read_stages(row.build_id))
+        now = self._deps.clock()
+        detail = ENDING_NOT_RECORDED_SENTENCE
+        if standing_note:
+            detail = f"{detail}\n{standing_note}"
+        await publish_the_press_report(
+            self._deps,
+            build_id=row.build_id,
+            feature_id=row.feature_id,
+            correlation_id=row.correlation_id,
+            outcome=MergeDeployOutcome(
+                result=RESULT_WORD_ENDING_NOT_RECORDED,
+                status="FAILED",
+                detail=detail,
+                branch=branch_to_merge(
+                    row.feature_id, _merge_branch_of_record(self._deps.pool, row.build_id)
+                ),
+            ),
+            started=now,
+            receipts_dir=_receipts_root_of(self._deps, row.repo) / f"merge-{row.build_id}",
+            dry_run=False,
+            merge_execution_attempt_id=attempt_id,
+            digest_warning=None,
+            mint_repair=False,
+            reported_turn=written.turn,
         )
 
     @staticmethod
@@ -7806,50 +7985,6 @@ class MergeApprovalConsumer:
                 attempt = said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY)
                 return (str(attempt) if attempt else None), index
         return None, -1
-
-    async def _report_the_settled_press(self, row: Any, record: Any, written: Any) -> None:
-        """The report the stopped press did not get to write, through its own path."""
-        if written is not None:
-            said = written.outcome or {}
-            started = datetime.fromisoformat(str(said.get("started_at")))
-            await publish_the_press_report(
-                self._deps,
-                build_id=row.build_id,
-                feature_id=str(said.get("feature_id") or row.feature_id),
-                correlation_id=str(said.get("correlation_id") or row.correlation_id),
-                outcome=outcome_from_stored(said),
-                started=started,
-                receipts_dir=Path(str(said.get("receipts_dir"))),
-                dry_run=False,
-                merge_execution_attempt_id=written.attempt_id,
-                digest_warning=said.get("digest_warning"),
-            )
-            return
-        # THE ONE CASE THAT CANNOT BE REPORTED WORD FOR WORD: the press stopped
-        # between recording its result and writing its ending down. One record
-        # result covers several endings, so none is guessed: a plain FAILED
-        # ending that says so, and no repair row (it is not a finding about the
-        # code). Nothing is sent and nothing is deployed.
-        attempt_id, _ = self._latest_decision(self._deps.pool.read_stages(row.build_id))
-        now = self._deps.clock()
-        await publish_the_press_report(
-            self._deps,
-            build_id=row.build_id,
-            feature_id=row.feature_id,
-            correlation_id=row.correlation_id,
-            outcome=MergeDeployOutcome(
-                result=RESULT_WORD_ENDING_NOT_RECORDED,
-                status="FAILED",
-                detail=ENDING_NOT_RECORDED_SENTENCE,
-                branch=record.target_branch,
-            ),
-            started=now,
-            receipts_dir=_receipts_root_of(self._deps, row.repo) / f"merge-{row.build_id}",
-            dry_run=False,
-            merge_execution_attempt_id=attempt_id,
-            digest_warning=None,
-            mint_repair=False,
-        )
 
     async def _settle_by_looking(self, row: Any, mission: Any, repo_root: Path) -> str:
         """Settle this build's publication record from the remote. Its answer.

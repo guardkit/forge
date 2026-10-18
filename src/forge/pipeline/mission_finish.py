@@ -532,20 +532,29 @@ def _settled_landings_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
 
 
 def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
-    """Ordinary builds whose press stopped after its result, hold run out.
+    """Ordinary builds whose press stopped after its result, with no live lease.
 
-    Press lease recovery (18 October 2026). The press writes its result,
-    writes its ending down, reports, and puts its hold down LAST, so a
-    coordinator that stopped anywhere after the result leaves a record with a
-    result and a holder. Only builds outside a mission (a mission's landings
-    and merge have their own recovery), and never while the lease is live.
+    Press lease recovery (18 October 2026). Every press begins its own
+    ``publication_outcomes`` row with its lease, and marks its result there
+    in the result's own transaction and its report in the report's. So the
+    work is exactly: a build outside a mission (a mission's landings and
+    merge have their own recovery) whose record has a result THIS press
+    wrote, and either no report marked yet, or a hold still on it that was
+    not kept on purpose. A record whose press began no row (written before
+    this, or an approval refused before any press) is never offered, and
+    neither is one whose report is marked and whose hold is down.
     """
     if deps.finish_settled_press is None:
         return []
     from forge.lifecycle.missions import builds_record_missions
+    from forge.pipeline.merge_executor import press_kept_on_purpose
     from forge.pipeline.publication_record import PublicationRecordStore
 
     try:
+        if cx.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'publication_outcomes'"
+        ).fetchone() is None:
+            return []
         # A ledger from before missions has no mission column: every build
         # on it is an ordinary one.
         outside_a_mission = (
@@ -554,9 +563,11 @@ def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
         rows = cx.execute(
             "SELECT p.build_id FROM publication_records AS p "
             "JOIN builds AS b ON b.build_id = p.build_id "
+            "JOIN publication_outcomes AS o ON o.build_id = p.build_id "
             f"WHERE {outside_a_mission}"
-            "p.result IS NOT NULL "
-            "AND p.lease_holder IS NOT NULL AND trim(p.lease_holder) <> '' "
+            "p.result IS NOT NULL AND o.result_written = 1 "
+            "AND (o.reported_at IS NULL "
+            "OR (p.lease_holder IS NOT NULL AND trim(p.lease_holder) <> '')) "
             "ORDER BY b.queued_at ASC"
         ).fetchall()
     except Exception as exc:  # noqa: BLE001 — a read never stops the queue
@@ -564,11 +575,23 @@ def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
         return []
     records = PublicationRecordStore(cx)
     now = deps.clock()
-    return [
-        str(build_id)
-        for (build_id,) in rows
-        if str(build_id) not in _resuming and not records.read(str(build_id)).lease_is_live(now)
-    ]
+    due: list[str] = []
+    for (build_id,) in rows:
+        build_id = str(build_id)
+        if build_id in _resuming:
+            continue
+        record = records.read(build_id)
+        if record.lease_is_live(now):
+            continue
+        written = records.read_outcome(build_id)
+        if (
+            written is not None
+            and written.reported_at is not None
+            and press_kept_on_purpose(record, written)
+        ):
+            continue  # reported, and its hold is a person's to look at
+        due.append(build_id)
+    return due
 
 
 async def _finish_settled_press_guarded(deps: MissionFinishDeps, build_id: str) -> None:
@@ -1401,4 +1424,7 @@ def compose_mission_finisher(
     async def finisher() -> list[str]:
         return await finish_ready_missions(deps)
 
+    # What was composed, for the test that the production wiring binds each
+    # recovery to the merge consumer's own method.
+    finisher.deps = deps  # type: ignore[attr-defined]
     return finisher

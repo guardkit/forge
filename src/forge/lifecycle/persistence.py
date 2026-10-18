@@ -1115,13 +1115,22 @@ class SqliteLifecyclePersistence:
     # Write API — record_stage
     # ------------------------------------------------------------------
 
-    def record_stage(self, entry: StageLogEntry) -> None:
+    def record_stage(
+        self,
+        entry: StageLogEntry,
+        *,
+        and_then: Callable[[sqlite3.Connection], None] | None = None,
+    ) -> None:
         """Append a row to the ``stage_log`` table.
 
         Used by dispatchers, the cancel/skip handler (via
         :class:`SqliteStageSkipRecorder`) and the per-turn supervisor
         recorder. The ``details`` dict is JSON-encoded into the
         ``details_json`` column.
+
+        ``and_then`` runs in the SAME transaction, after the insert and
+        before the commit (the merge press marks its written-down ending as
+        reported this way, 18 October 2026); if it raises, nothing is written.
         """
         if not isinstance(entry, StageLogEntry):
             raise TypeError(
@@ -1153,8 +1162,10 @@ class SqliteLifecyclePersistence:
                     json.dumps(entry.details, sort_keys=True, default=str),
                 ),
             )
+            if and_then is not None:
+                and_then(self._cx)
             self._cx.execute("COMMIT;")
-        except sqlite3.Error:
+        except BaseException:
             try:
                 self._cx.execute("ROLLBACK;")
             except sqlite3.Error:  # pragma: no cover
