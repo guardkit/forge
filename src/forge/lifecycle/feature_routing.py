@@ -476,6 +476,23 @@ def _router_restart_blockers_snapshot(
         "json_extract(CASE WHEN json_valid(decided.details_json) "
         "THEN decided.details_json ELSE '{}' END, "
         "'$.merge_decision.execution_attempt_id')"
+        ") "
+        # A PRESS A LIVE HOLD TURNED AWAY (18 October 2026) did nothing and
+        # never will: another press, or its recovery, owns the build's ending.
+        # Its note under this decision's exact attempt says so, so the router
+        # does not wait for it. It is not a merge report and settles nothing
+        # else.
+        "AND NOT EXISTS ("
+        "SELECT 1 FROM stage_log AS turned "
+        "WHERE turned.build_id = decided.build_id "
+        "AND turned.target_identifier = 'merge_deploy_turned_away' "
+        "AND turned.id > decided.id "
+        "AND json_valid(turned.details_json) AND json_valid(decided.details_json) "
+        "AND length(json_extract(decided.details_json, "
+        "'$.merge_decision.execution_attempt_id')) = 32 "
+        "AND json_extract(turned.details_json, "
+        "'$.merge_decision.execution_attempt_id') = "
+        "json_extract(decided.details_json, '$.merge_decision.execution_attempt_id')"
         ")"
     )
     for decision_id, build_id in connection.execute(approved_query):

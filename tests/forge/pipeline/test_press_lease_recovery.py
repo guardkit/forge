@@ -841,18 +841,21 @@ class TestAnotherReportOnTheBuildIsNotThisOne:
             ending,
             lambda crash: _stop_after_the_ending_is_written_down(crash, 2),
         )
+        bus_before = len(deps.pipeline_publisher.reports)
         second = await _cli_press(deps, repo_root)
-        assert second.result == "merge-refused"
-        assert [r.details["result"] for r in _reports(pool)] == ["merge-refused"]
+        # TURNED AWAY: a no-op for the build — no report, no bus message, the
+        # build row still RUNNING, the record still the stopped press's.
+        assert second.turned_away and second.result == "merge-refused"
+        assert "another worker" in second.detail
+        assert _reports(pool) == []
+        assert len(deps.pipeline_publisher.reports) == bus_before
+        assert _build(pool)[0] == "RUNNING"
         _expire(pool)
         await _passes(config_with_publication_on, pool, deps, times=2)
 
         results = [r.details["result"] for r in _reports(pool)]
-        assert results == ["merge-refused", word]
-        # The build row was already closed FAILED by the turned-away press's
-        # own report (behaviour from before this change, recorded in the build
-        # record as a separate defect); the recovery leaves a closed row alone.
-        assert _build(pool)[0] == "FAILED"
+        assert results == [word]
+        assert _build(pool)[0] == build_ending  # COMPLETE when the merge landed
         assert repairs == ([word] if repairs_it else [])
         assert _record(pool).lease_holder is None
         _everything_is_clear(pool, a_repair=repairs_it)
@@ -1368,3 +1371,38 @@ class TestASecondPressOnTheSameRecord:
         assert await MergeApprovalConsumer(deps).finish_a_settled_press(BUILD_ID) == "nothing to do"
         assert (_record(pool).lease_holder, _record(pool).turn) == (held.lease_holder, held.turn)
         assert len(_reports(pool)) == 1
+
+
+class TestATurnedAwayConsumerPress:
+    @pytest.mark.asyncio
+    async def test_its_note_settles_only_its_own_decision_for_the_router(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """A press with an approved decision's attempt, turned away by a live
+        hold, writes no report and does not close the build; its note under
+        that attempt is all the router needs, and nothing else reads it."""
+        _a_journey_waiting_on_its_press(pool)
+        PublicationRecordStore(pool.connection).take_lease(
+            build_id=BUILD_ID, holder="merge-press:elsewhere", now=datetime.now(UTC)
+        )
+        deps, publisher, deploy = _deps(config_with_publication_on, pool, "merged-and-running")
+        assert f"merge-approved-pending:{BUILD_ID}" in _blocked(pool)[0]
+        outcome = await _press(deps, repo_root)
+        assert outcome.turned_away
+        assert _reports(pool) == [] and deps.pipeline_publisher.reports == []
+        assert _build(pool)[0] == "RUNNING"
+        assert publisher.asked == [] and deploy.calls == []
+        notes = [
+            s for s in pool.read_stages(BUILD_ID)
+            if s.target_identifier == merge_executor.MERGE_TURNED_AWAY_TARGET_IDENTIFIER
+        ]
+        assert len(notes) == 1
+        assert notes[0].details[MERGE_DECISION_DETAILS_KEY][MERGE_EXECUTION_ATTEMPT_ID_KEY] == ATTEMPT
+        blockers = _blocked(pool)[0]
+        assert f"merge-approved-pending:{BUILD_ID}" not in blockers
+        # The press holding the record is still owed its own ending.
+        assert f"publication-pending:{BUILD_ID}" in blockers
+        assert _record(pool).lease_holder == "merge-press:elsewhere"

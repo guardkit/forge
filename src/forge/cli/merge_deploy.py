@@ -427,13 +427,28 @@ async def _arun(
                 else {}
             ),
         )
-        if previewed and not dry_run and preview_service is not None:
+        # A press a live hold turned away did nothing: the preview, like the
+        # build's ending, belongs to the press that holds the record.
+        if (
+            previewed
+            and not dry_run
+            and preview_service is not None
+            and not getattr(outcome, "turned_away", False)
+        ):
             await _release_quietly(
                 preview_service, row, f"approval ended: {outcome.result}"
             )
     finally:
         await closer()
 
+    if getattr(outcome, "turned_away", False):
+        # TURNED AWAY (18 October 2026): a plain refusal for the person who
+        # asked, and nothing else — no report, no ending for the build.
+        click.echo(
+            f"merge-deploy {row.feature_id} @ {row.repo}: refused — "
+            f"{outcome.detail}"
+        )
+        return 1
     # The branch is named only when it is not the feature's own (Part M,
     # rule 55), so a feature build's line reads exactly as before.
     named = (

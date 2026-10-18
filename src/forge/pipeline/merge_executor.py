@@ -253,6 +253,11 @@ REQUEST_ID_PREFIX: str = "merge-"
 
 #: Durable decision row (written BEFORE any act — the double-run fence).
 MERGE_DECISION_TARGET_IDENTIFIER: str = "merge_deploy_decision"
+#: A press turned away by a live hold leaves this note, and only this note,
+#: when it carries an approved decision's attempt: it is not a merge report
+#: (nothing reads it as an ending), and it is what tells the router that
+#: decision's press is not still to run.
+MERGE_TURNED_AWAY_TARGET_IDENTIFIER: str = "merge_deploy_turned_away"
 
 #: Durable per-step claim rows, written BEFORE each irreversible act.
 MERGE_STEP_MERGE_TARGET_IDENTIFIER: str = "merge_deploy_merge"
@@ -497,6 +502,12 @@ class MergeDeployOutcome:
     #: ``None`` for every repository that has none, whose report carries no
     #: such field at all.
     sandbox_merge: dict[str, Any] | None = None
+    #: TURNED AWAY by a live hold (press lease recovery, 18 October 2026):
+    #: another press, or the recovery, is working on this build's record, so
+    #: this press did nothing and its ending is not the build's. It is never
+    #: reported, never closes the build row and never touches the record; the
+    #: person who asked is told, and nothing else. Never on the report.
+    turned_away: bool = False
 
 
 @dataclass
@@ -2340,6 +2351,66 @@ async def execute_merge_deploy(
         except Exception:  # noqa: BLE001 — unknown is not replaced
             return True
         return not (now_record.recorded and now_record.turn != turn)
+
+    def _turned_away(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
+        """A press a live hold turned away: a no-op for this build.
+
+        Not reported (no bus message, no report receipt, no report row), the
+        build row and the publication record left exactly as they are, no
+        repair row: the press that holds the record, or the recovery, owns
+        the build's ending. Its own receipt says what happened; the caller
+        tells the person who asked. A consumer press carrying an approved
+        decision's attempt leaves a note under that attempt, so the router
+        does not wait for a press that will never run.
+        """
+        outcome = _the_reports_words(outcome)
+        logger.warning(
+            "merge-executor: %s's merge word was turned away — %s",
+            build_id,
+            outcome.detail,
+        )
+        _write_receipt(
+            "merge_deploy_turned_away.json",
+            {
+                "step": "turned-away",
+                "detail": outcome.detail,
+                "attempt_id": merge_execution_attempt_id,
+                "at": deps.clock().isoformat(),
+            },
+        )
+        if not dry_run and merge_execution_attempt_id is not None:
+            now = deps.clock()
+            try:
+                deps.pool.record_stage(
+                    StageLogEntry(
+                        build_id=build_id,
+                        stage_label=MERGE_REPORT_STAGE_LABEL,
+                        target_kind="local_tool",
+                        target_identifier=MERGE_TURNED_AWAY_TARGET_IDENTIFIER,
+                        status="SKIPPED",
+                        gate_mode=None,
+                        started_at=now,
+                        completed_at=now,
+                        duration_secs=0.0,
+                        details={
+                            "detail": outcome.detail,
+                            MERGE_DECISION_DETAILS_KEY: {
+                                MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                                    MERGE_EXECUTION_ATTEMPT_VERSION
+                                ),
+                                MERGE_EXECUTION_ATTEMPT_ID_KEY: merge_execution_attempt_id,
+                            },
+                        },
+                    )
+                )
+            except Exception as exc:  # noqa: BLE001 — a note never costs anything
+                logger.error(
+                    "merge-executor: %s's turned-away note could not be written (%s: %s)",
+                    build_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        return outcome
 
     async def _publish_report(outcome: MergeDeployOutcome) -> MergeDeployOutcome:
         """The ending, already in its report's words, through the shared path."""
@@ -4704,11 +4775,14 @@ async def execute_merge_deploy(
             )
             if grant is None:
                 current = store.read(build_id)
-                return _cannot_join(
+                turned = _cannot_join(
                     f"another worker ({current.lease_holder or 'unnamed'}) is "
                     f"already working on {named}'s publication record, so this "
-                    "one left it alone. Nothing was merged."
+                    "one left it alone. Nothing was merged, and that press's "
+                    "ending is the build's."
                 )
+                turned.turned_away = True
+                return turned
             turn = grant.turn
             held_turn = grant.turn
             record = store.read(build_id)
@@ -6150,6 +6224,8 @@ async def execute_merge_deploy(
         # if it is still standing, and its laid-out tree removed — BEFORE the
         # report goes out, so the report never says "torn down" ahead of time.
         await _cleanup()
+    if outcome.turned_away:
+        return _turned_away(outcome)
     # THE RECORD'S END, and the only place anything the press made is removed.
     # It is reachable now: the joined commit is on the remote's recorded
     # branch and what was checked is running, confirmed from the identity the
@@ -7234,6 +7310,16 @@ class MergeApprovalConsumer:
                     **({"join_name": join_name} if join_name else {}),
                 )
                 ended = f"approval ended: {getattr(outcome, 'result', None)}"
+                if getattr(outcome, "turned_away", False):
+                    # Another press holds the record: its ending, and the
+                    # preview's release, are that press's (18 October 2026).
+                    logger.warning(
+                        "merge-executor: the approved press of %s was turned "
+                        "away by a live hold; nothing was done and the preview "
+                        "is left to the press that holds the record",
+                        build_id,
+                    )
+                    return
             except Exception as exc:  # noqa: BLE001 — the task must not die silent
                 logger.error(
                     "merge-executor: executor raised (%s) for build %s — see "
