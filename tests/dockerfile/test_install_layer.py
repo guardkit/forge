@@ -1102,6 +1102,15 @@ class TestTheWebToolchain:
             "/tmp/node.tar.xz",
         ),
         (
+            # npm 11 over Node's bundled npm 10.9.8 (18 October 2026): the
+            # registry tarball, pinned and checked like the archives.
+            "NODE_NPM",
+            "11.21.0",
+            "783e7c92bf73b442fb800c2d6ef3921e86da8894a700fed45140e37916877482",
+            "https://registry.npmjs.org/npm/-/npm-${NODE_NPM_VERSION}.tgz",
+            "/tmp/npm.tgz",
+        ),
+        (
             "GO",
             "1.26.9",
             "4a97373d49fcacdcf3694fea368a500b00ee3e963974f3e7514132717632f052",
@@ -1239,7 +1248,7 @@ class TestTheWebToolchain:
             '"staticcheck ${STATICCHECK_VERSION} (0.8.1)"',
         ):
             assert check in run, f"the self-check must include: {check}"
-        assert re.search(r"^ARG\s+NODE_NPM_VERSION=10\.9\.8\s*$", runtime_body, re.MULTILINE)
+        assert re.search(r"^ARG\s+NODE_NPM_VERSION=11\.21\.0\s*$", runtime_body, re.MULTILINE)
 
     def test_the_self_check_finds_the_chromium_binaries_playwright_installs(
         self, dockerfile_text: str

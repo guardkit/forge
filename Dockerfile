@@ -456,13 +456,23 @@ RUN mkdir -p /opt/code-search/bin \
 # two builds write to.
 # ---------------------------------------------------------------------------
 
-# Node 22, with the npm it ships, under /usr/local (node, npm, npx and corepack
-# land in /usr/local/bin). The archive's three top-level text files are left
-# out so they do not litter /usr/local.
+# Node 22 under /usr/local (node, npm, npx and corepack land in
+# /usr/local/bin). The archive's three top-level text files are left out so
+# they do not litter /usr/local.
 ARG NODE_VERSION=22.23.2
 ARG NODE_SHA256=fff4078c5def658577f92c88db7db3bc0072924bfb93fe52c1e744a54e94abb8
-# The npm that Node 22.23.2 ships — checked by the self-check, not chosen.
-ARG NODE_NPM_VERSION=10.9.8
+# npm 11, laid over the npm 10.9.8 that Node 22.23.2 ships (18 October 2026).
+# npm 10.9.8 crashes with "Cannot read properties of null (reading
+# 'edgesOut')" when it resolves Vitest 4.1 beside Vite 8, so a project could
+# not upgrade Vitest in this image. 11.21.0 is the newest npm 11 release that
+# was at least 14 days old on that day (published 30 September 2026); it
+# supports Node ^20.17.0 || >=22.9.0. The registry tarball is pinned by the
+# sha256 recorded here, which was checked against the registry's own sha512
+# integrity record for npm 11.21.0. It carries all of npm's dependencies, so
+# it is unpacked in place of the bundled copy and nothing runs to install it;
+# the npm and npx links in /usr/local/bin already point into that folder.
+ARG NODE_NPM_VERSION=11.21.0
+ARG NODE_NPM_SHA256=783e7c92bf73b442fb800c2d6ef3921e86da8894a700fed45140e37916877482
 RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-arm64.tar.xz" \
         -o /tmp/node.tar.xz \
     && echo "${NODE_SHA256}  /tmp/node.tar.xz" | sha256sum --check --strict - \
@@ -475,7 +485,16 @@ RUN curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-l
     && ln -s /usr/local/bin/node /usr/bin/node \
     && ln -s /usr/local/bin/npm /usr/bin/npm \
     && ln -s /usr/local/bin/npx /usr/bin/npx \
-    && /usr/bin/node --version | grep -qx "v${NODE_VERSION}"
+    && /usr/bin/node --version | grep -qx "v${NODE_VERSION}" \
+    && curl -fsSL "https://registry.npmjs.org/npm/-/npm-${NODE_NPM_VERSION}.tgz" \
+        -o /tmp/npm.tgz \
+    && echo "${NODE_NPM_SHA256}  /tmp/npm.tgz" | sha256sum --check --strict - \
+    && rm -rf /usr/local/lib/node_modules/npm \
+    && mkdir /usr/local/lib/node_modules/npm \
+    && tar --extract --gzip --file /tmp/npm.tgz --directory /usr/local/lib/node_modules/npm \
+        --strip-components=1 --no-same-owner \
+    && rm -f /tmp/npm.tgz \
+    && test "$(/usr/bin/npm --version)" = "${NODE_NPM_VERSION}"
 
 # Go 1.26 in /usr/local/go. `go` finds its root by resolving its own link, so
 # the /usr/bin links are enough. GOTOOLCHAIN=local is written into Go's own
