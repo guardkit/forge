@@ -372,6 +372,27 @@ async def test_an_internal_port_that_is_one_of_the_sandbox_s_ports_is_refused(
     assert estate.venues[PRIVATE].calls == []
 
 
+@pytest.mark.asyncio
+async def test_an_internal_port_on_the_sandbox_s_unused_published_port_is_refused(
+    estate: Estate,
+) -> None:
+    """Codex R1: a one-slot profile keeps only 8960, but its internal port is
+    8961, which the sandbox still publishes. Refused before anything starts."""
+    estate.profiles[PRIVATE] = _profile("private", (8950,), internal=(8961,))
+    assert await estate.service.has_room(PRIVATE, build_id="build-p1", make_room=True)
+    refused = await estate.service.prepare(_request(PRIVATE, "build-p1", "FEAT-9001"))
+    assert refused.state == "failed"
+    assert refused.failure_reason == (
+        "acme/private-notes's deploy profile gives a preview internal port 8961, "
+        "which its sandbox private-notes publishes as a preview port, so no preview "
+        "is started; the profile's internal ports must differ from its sandbox's "
+        "preview ports"
+    )
+    assert estate.venues[PRIVATE].calls == []
+    assert estate.dispatch.calls == []
+    assert estate.store.live() == []
+
+
 # ---------------------------------------------------------------------------
 # The production composition, and the sandbox's own link check
 
@@ -414,15 +435,21 @@ async def test_the_production_service_takes_the_ports_from_planning_sandboxes(
 
 
 @pytest.mark.parametrize(
-    "repo, entry, ports",
+    "repo, entry, profile_slots, ports",
     [
-        (PRIVATE, PRIVATE_ENTRY, {8960, 8961}),
-        (SHARED, SHARED_ENTRY, {8950, 8951}),
-        (LATE, LATE_ENTRY, set()),
+        (PRIVATE, PRIVATE_ENTRY, None, {8960, 8961}),
+        (SHARED, SHARED_ENTRY, None, {8950, 8951}),
+        (LATE, LATE_ENTRY, None, set()),
+        # Codex R1: one slot whose internal port is the unused 8961: none.
+        (PRIVATE, PRIVATE_ENTRY, ((8950,), (8961,)), set()),
     ],
 )
 def test_the_sandbox_s_link_check_reaches_the_ports_its_previews_use(
-    monkeypatch: pytest.MonkeyPatch, repo: str, entry: SandboxEntry, ports: set[int]
+    monkeypatch: pytest.MonkeyPatch,
+    repo: str,
+    entry: SandboxEntry,
+    profile_slots: Any,
+    ports: set[int],
 ) -> None:
     """Inside the sandbox, the link check is allowed exactly the ports the
     coordinator gives the previews: the sandbox's own when it names them."""
@@ -435,9 +462,12 @@ def test_the_sandbox_s_link_check_reaches_the_ports_its_previews_use(
         return 200, {}
 
     monkeypatch.setattr(service, "sidecar_is_inside_sandbox", lambda: True)
-    monkeypatch.setattr(
-        service, "profile_at_commit", lambda path: (_profile("p", (8950, 8951)), None)
+    profile = (
+        _profile("p", profile_slots[0], internal=profile_slots[1])
+        if profile_slots
+        else _profile("p", (8950, 8951))
     )
+    monkeypatch.setattr(service, "profile_at_commit", lambda path: (profile, None))
     monkeypatch.setattr(service, "serve_preview_operation", capture)
     config = SimpleNamespace(
         planning=PlanningConfig.model_validate(

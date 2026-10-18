@@ -441,8 +441,9 @@ def sandbox_preview(
       the profile's slot count and the sandbox's port count, and the link is
       always ``https://<review_preview.public_host>:<that port>`` (a
       ``public_url`` in the profile names a port the profile cannot know, so
-      it is not used). An internal port equal to one of those ports is
-      refused, since both would listen in one machine;
+      it is not used). An internal port of a kept slot equal to ANY of the
+      sandbox's preview ports, used by a slot or not, is refused, since the
+      sandbox publishes that port;
     * a sandbox of its own (one with a Git door of its own) that names none
       is refused: its ports are not recorded, so none is safe to use;
     * any other sandbox (the shared one) keeps the profile exactly as it is,
@@ -465,7 +466,9 @@ def sandbox_preview(
             PreviewSlot(port=port, internal_port=slot.internal_port)
             for slot, port in zip(preview.slots, own)
         )
-        published = {slot.port for slot in slots}
+        # Every port the sandbox publishes, used by a slot or not (Codex R1):
+        # an internal listener on any of them would be published too.
+        published = set(own)
         inside = [slot.internal_port for slot in slots if slot.internal_port in published]
         if inside:
             return None, (
