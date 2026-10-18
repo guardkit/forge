@@ -11,6 +11,11 @@
 # distributions, replace these exact pins, then require pip check plus exact
 # source/package inventory audits before accepting the rebuilt image. Nested
 # vendored *.dist-info metadata is not an installed top-level distribution.
+#
+# 18 October 2026, security update: pyjwt 2.14.0 -> 2.15.0, pip 26.0.1 -> 26.2
+# and multidict 6.8.0 -> 6.9.1 replaced in place to clear OSV advisories (each
+# the lowest release clearing them, at least 14 days old). The rebuilt image
+# passed pip check and its top-level inventory matched these pins exactly.
 agent-client-protocol==0.12.1
 aiofile==3.12.3
 aiohappyeyeballs==2.7.1
@@ -115,7 +120,7 @@ mcp==1.30.0
 mdit-py-plugins==0.6.1
 mdurl==0.1.2
 more-itertools==11.1.0
-multidict==6.8.0
+multidict==6.9.1
 nats-py==2.16.0
 numpy==2.5.3
 openai==3.15.0
@@ -133,7 +138,7 @@ packaging==26.3
 pathable==0.6.0
 pathspec==1.1.1
 pillow==12.3.0
-pip==26.0.1
+pip==26.2
 platformdirs==4.11.10
 prometheus-client==0.26.0
 prompt-toolkit==3.0.53
@@ -150,7 +155,7 @@ pydantic==2.13.5
 pydantic-core==2.46.5
 pydantic-settings==2.15.0
 pygments==2.21.0
-pyjwt==2.14.0
+pyjwt==2.15.0
 pyperclip==1.11.0
 python-dateutil==2.9.0.post0
 python-dotenv==1.2.3
