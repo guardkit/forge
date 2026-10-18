@@ -241,6 +241,9 @@ class PlanningConsumerDeps:
     mission_flow: Any | None = None
     #: Whether ``missions.enabled`` is on.
     missions_enabled: bool = False
+    #: ``approval.additional_approvers``: who besides a mission's sender may
+    #: stop it from Slack, by the same rule as its cards' answers.
+    additional_approvers: tuple[str, ...] = ()
 
     #: Whether ``publish_notification`` can be told which conversation to
     #: answer in. Read from the callable once, here, when the consumer is
@@ -731,6 +734,72 @@ async def _start_mission(
     await msg.ack()
 
 
+async def _stop_mission(
+    msg: _MsgLike,
+    deps: PlanningConsumerDeps,
+    payload: Any,
+    command: Mapping[str, Any],
+) -> None:
+    """Record a stop for a mission and answer in one sentence, in the thread.
+
+    Only the person the mission's cards are for, or one of the factory's
+    additional approvers, may stop it from Slack (the same rule as for its
+    cards' answers, ``is_accepted_approver``). The request goes through the one function
+    the command line calls too (:func:`forge.planning.missions_flow.stop_mission`).
+    Always acked: a person can type it again. A store failure is not acked.
+    """
+    from forge.lifecycle.missions import MissionStore
+    from forge.planning.missions_flow import stop_mission
+
+    correlation_id = payload.correlation_id
+    flow = deps.mission_flow
+    missions = getattr(flow, "missions", None)
+    if missions is None:
+        connection = getattr(deps.store, "_connection", None)
+        missions = MissionStore(connection) if connection is not None else None
+    if missions is None:
+        await _notify_best_effort(
+            deps,
+            correlation_id,
+            "That mission was not stopped: this factory cannot read its missions.",
+            parent_request_id=payload.parent_request_id,
+        )
+        await msg.ack()
+        return
+    try:
+        answer = stop_mission(
+            missions,
+            str(command.get("mission_id") or ""),
+            requested_by=payload.originating_user,
+            approvers_only=True,
+            additional_approvers=deps.additional_approvers,
+        )
+    except Exception as exc:  # noqa: BLE001 — never lose the request
+        logger.error(
+            "planning_consumer: recording a stop for %r raised (%s); "
+            "requesting redelivery",
+            command.get("mission_id"),
+            exc,
+        )
+        await _nak_or_leave_unacked(msg, correlation_id)
+        return
+    logger.info(
+        "planning_consumer: stop of mission %r from %s: %s (%s)",
+        command.get("mission_id"),
+        payload.originating_user,
+        "recorded" if answer.accepted else "refused",
+        answer.sentence,
+    )
+    sentence = answer.sentence[:1].upper() + answer.sentence[1:]
+    await _notify_best_effort(
+        deps,
+        correlation_id,
+        sentence if sentence.endswith(".") else sentence + ".",
+        parent_request_id=payload.parent_request_id,
+    )
+    await msg.ack()
+
+
 # ---------------------------------------------------------------------------
 # Correlation ID validation
 # ---------------------------------------------------------------------------
@@ -853,6 +922,11 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
     # it is not one of the queue's verbs: it is taken here, like ``build``.
     if command is not None and command.get("verb") == "mission":
         await _start_mission(msg, deps, payload, command)
+        return
+    # Stopping one (section 11): a request recorded here and carried out by
+    # the coordinator; answered in the thread like a mission.
+    if command is not None and command.get("verb") == "stop-mission":
+        await _stop_mission(msg, deps, payload, command)
         return
 
     # --- 3b. Resolve the repository the sentence named (rule 3) ----------

@@ -1219,6 +1219,8 @@ def bind_production_dispatch_chain(
                             nats_client=client,
                             land=_merge_consumer.land_mission_feature,
                             resume_merge=_merge_consumer.resume_mission_merge,
+                            reconcile=_merge_consumer.reconcile_mission_landing,
+                            finish_settled=_merge_consumer.finish_a_settled_landing,
                             git_surface=compose_merge_git_surface(forge_config),
                             tree_reader_for=compose_merge_check_reader(forge_config),
                             feature_routing_gate=feature_routing_gate,

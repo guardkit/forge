@@ -162,11 +162,14 @@ def work_problems(state):
                     or row.get('pending_approval_request_id') is not None
                         and not completed_terminal_planning_approval(row))
                 or table=='work_queue'
+                # The router's rule (feature_routing.router_restart_blockers,
+                # missions design section 11, Codex round 3 R8): a publication
+                # record is active work only while its result is empty (the
+                # outcome is not known yet, so it is recoverable) or its lease
+                # is held. A released record with a result is history.
                 or table=='publication_records' and (
-                    row.get('result') not in ('merged into the remote and running','published to the mission branch')
-                    # A mission feature's record keeps its mission-branch result
-                    # for ever: finished, unless a press still holds its lease.
-                    or row.get('result')=='published to the mission branch' and bool(row.get('lease_holder')))
+                    row.get('result') is None
+                    or bool(str(row.get('lease_holder') or '').strip()))
                 or table=='missions'
                 or table=='deployment_targets' and bool(row.get('holder_build')))
             if active:result.append({'table':table,'row':row})

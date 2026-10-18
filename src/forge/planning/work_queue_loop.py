@@ -1087,6 +1087,7 @@ class WorkQueueLoop:
                 failure_reason=self._mission_failure_reason,
                 clock=self._clock,
                 before=tend_missions,
+                notify=self._tell_a_mission,
             )
         # What the loop has already said, so it does not say it every ten
         # seconds: the number it was last holding at, the set of repair
@@ -1119,6 +1120,14 @@ class WorkQueueLoop:
         await run_finishing_step()
         await self.ask_hold_or_go()
         await self.take_next()
+
+    async def _tell_a_mission(self, mission: Any, message: str) -> None:
+        """One line in a mission's own thread."""
+        anchor = getattr(mission, "parent_request_id", None)
+        if anchor is None or not self._notify_takes_thread:
+            await self._notify(mission.correlation_id, message)
+        else:
+            await self._notify(mission.correlation_id, message, parent_request_id=anchor)
 
     def _mission_failure_reason(self, run: Any, state: str, correlation_id: str) -> str:
         """Why a mission attempt's planning run ended badly, in the queue's words."""

@@ -218,7 +218,10 @@ def test_marker_alone_blocks_before_restore_and_legacy_reopen(estate,monkeypatch
     with pytest.raises(r.Refusal):recovery.reopen()
 
 def test_work_questions_keep_detail_and_not_yet():
-    state={'work_state':{'publication_records':{'status':'observed','rows':[{'result':'publication pending','build_id':'b','turn':2}]},'deployment_targets':{'status':'NOT-YET','introduced_in':16},'planning_runs':{'status':'observed','rows':[{'state':'FEATURE_PLAN'}]}}}
+    # A record with no result yet is active work (the router's rule since
+    # 18 October 2026, missions design section 11): a released "publication
+    # pending" record would not be.
+    state={'work_state':{'publication_records':{'status':'observed','rows':[{'result':None,'build_id':'b','turn':2}]},'deployment_targets':{'status':'NOT-YET','introduced_in':16},'planning_runs':{'status':'observed','rows':[{'state':'FEATURE_PLAN'}]}}}
     assert [x['table'] for x in q.work_problems(state)]==['publication_records','planning_runs']
 
 def test_moved_tag_refuses_with_actual_id_evidence(estate,monkeypatch):
@@ -1356,3 +1359,48 @@ def test_a_mission_branch_record_a_press_still_holds_is_active(tmp_path):
 def test_a_ledger_without_mission_tables_reads_as_before(tmp_path):
     db=tmp_path/'plain.db';connection=connect_writer(db);apply_at_boot(connection);connection.close()
     assert 'missions' not in r.ledger_state(db)['work_state']
+
+
+# The same records through both readers (missions design, section 11, Codex
+# round 3 R8): the router's restart blockers and rollout quiescing's work list
+# must agree on which publication records, and which missions, are still work.
+_PUBLICATIONS = [
+    # (build id, result, lease holder): only no-result-yet and held are work.
+    ('build-unknown', None, None),
+    ('build-pending-released', 'publication pending', None),
+    ('build-pending-held', 'publication pending', 'merge-press:1'),
+    ('build-mission-branch', 'published to the mission branch', None),
+    ('build-mission-branch-held', 'published to the mission branch', 'landing-reconcile:2'),
+    ('build-deployment-pending', 'published, deployment pending', None),
+    ('build-running', 'merged into the remote and running', None),
+]
+
+
+def _the_same_records(tmp_path, mission_status):
+    from forge.lifecycle import missions
+    db=tmp_path/(mission_status.lower()+'-parity.db');connection=connect_writer(db);apply_at_boot(connection)
+    missions.ensure_tables(connection)
+    connection.execute("INSERT INTO missions (id,title,target_repo,branch,status,correlation_id,originating_user,created_at,stop_requested_at,stop_requested_by) "
+                       "VALUES ('m-0000bb','Tags','guardkit/fixture','mission/m-0000bb',?,'thread-2','U1','2026-10-18T10:00:00+00:00','2026-10-18T11:00:00+00:00','U1')",(mission_status,))
+    for build_id,result,holder in _PUBLICATIONS:
+        connection.execute("INSERT INTO publication_records (build_id,result,lease_holder,lease_expires_at) VALUES (?,?,?,?)",
+                           (build_id,result,holder,'2026-10-18T12:00:00+00:00' if holder else None))
+    connection.commit();connection.close()
+    return db
+
+
+@pytest.mark.parametrize('mission_status',['RUNNING','NOT_MERGED'])
+def test_the_router_and_quiescing_read_publication_records_the_same_way(tmp_path,mission_status):
+    import sqlite3 as _sqlite3
+    from forge.lifecycle.feature_routing import router_restart_blockers
+    db=_the_same_records(tmp_path,mission_status)
+    connection=_sqlite3.connect(db)
+    blockers=router_restart_blockers(connection);connection.close()
+    router_publications={b.split(':')[1] for b in blockers if b.startswith(('publication-pending:','publication-held:'))}
+    router_missions={b.split(':')[1] for b in blockers if b.startswith('mission:')}
+    problems=q.work_problems(r.ledger_state(db))
+    quiesce_publications={x['row']['build_id'] for x in problems if x['table']=='publication_records'}
+    quiesce_missions={x['row']['id'] for x in problems if x['table']=='missions'}
+    assert router_publications==quiesce_publications=={'build-unknown','build-pending-held','build-mission-branch-held'}
+    expected_missions={'m-0000bb'} if mission_status=='RUNNING' else set()
+    assert router_missions==quiesce_missions==expected_missions

@@ -3206,6 +3206,13 @@ class PlanningRunDriver:
             problem = f"its mission ({attempt.mission_id}) is not on record"
         elif mission.status != "RUNNING":
             problem = f"its mission {mission.id} is {mission.status}, not running"
+        elif mission.stopping:
+            # A stop was asked for (section 11): the run is refused at its
+            # mission check, and the attempt closes from this refusal.
+            problem = (
+                f"its mission {mission.id} was stopped by "
+                f"{mission.stop_requested_by} at {mission.stop_requested_at}"
+            )
         elif attempt.status != "ADMITTED":
             problem = f"its mission attempt is {attempt.status}, not admitted"
         elif mission.target_repo != target_repo:
