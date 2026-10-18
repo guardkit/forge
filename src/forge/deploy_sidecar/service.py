@@ -244,6 +244,7 @@ from forge.launch_environment import (
     declared_setting_refusal,
     project_program_note,
 )
+from forge.leg_time_limits import LEG_TIMEOUT_MAX
 from forge.memory.redaction import scrub_process_output
 from forge.pipeline.deployment_identity import declared_identity
 from forge.planning.declared_memory import (
@@ -5730,8 +5731,9 @@ LEG_SUBCOMMANDS: tuple[str, ...] = ("task-review", "task-work")
 #: A leg's own time limits. The default matches the conductor's work-stage
 #: tripwire; the cap is longer than either tripwire so an operator who widens
 #: a leg's budget in a profile is not silently cut back here.
+#: The cap lives in ``forge.leg_time_limits`` so config loading can refuse a
+#: leg budget whose outer limit would be longer than it.
 LEG_TIMEOUT_DEFAULT: float = 1800.0
-LEG_TIMEOUT_MAX: float = 7200.0
 
 #: How many argument tokens a leg may carry, and how long one may be. The
 #: forward context rides as text pairs, so these are generous; they exist so

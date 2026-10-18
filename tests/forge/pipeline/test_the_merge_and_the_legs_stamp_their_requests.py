@@ -61,7 +61,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
-from forge.cli._serve_conductor import make_conductor_guardkit_run_chooser
+from forge.cli._serve_conductor import (
+    CONDUCTOR_STAGE_TIMEOUT_SECONDS,
+    make_conductor_guardkit_run_chooser,
+)
 from forge.config.models import ForgeConfig
 from forge.deploy_sidecar.service import COORDINATOR_OWNER_ENV, build_server
 from forge.lifecycle import migrations
@@ -538,6 +541,8 @@ async def _a_leg(
     stage: StageClass = StageClass.TASK_REVIEW,
     feature_routing_gate: Any | None = None,
     feature_routing_required: bool = False,
+    leg_budgets: Any = None,
+    fix_task: Any = None,
 ) -> Any:
     """One fix-journey leg, chooser and dispatcher both the real ones."""
     pool = _APoolOfOneRow(row)
@@ -556,8 +561,17 @@ async def _a_leg(
         correlation_id_minter=lambda **_kw: "corr-leg",
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
+        # The production floors, but only for the test that names budgets, so
+        # every other leg in this file is dispatched exactly as before.
+        timeout_seconds_by_stage=(
+            CONDUCTOR_STAGE_TIMEOUT_SECONDS if leg_budgets is not None else None
+        ),
+        leg_budgets=leg_budgets,
     )
-    return await dispatcher(stage=stage, build_id=row.build_id, feature_id=None)
+    extra: dict[str, Any] = {} if fix_task is None else {"fix_task": fix_task}
+    return await dispatcher(
+        stage=stage, build_id=row.build_id, feature_id=None, **extra
+    )
 
 
 async def _never_in_the_container(**_kwargs: Any) -> Any:  # pragma: no cover
@@ -677,6 +691,41 @@ class TestAJourneysLegStampsItsOwnRequest:
         assert sent[0]["build"] == BUILD_ID
         assert "declared_at" not in sent[0]
         assert "by_hand" not in sent[0]
+
+    @pytest.mark.asyncio
+    async def test_a_3600s_budget_reaches_the_sidecar_with_its_own_outer_limit(
+        self, project, start_commit, helper
+    ) -> None:
+        """18 October 2026: the outer limit follows the leg's budget onto the
+        wire to the sandbox helper — 3660 for review, 3780 for work — and both
+        are inside the helper's ceiling, so neither is cut back there."""
+        from forge.config.models import BudgetGuards
+        from forge.leg_time_limits import LEG_TIMEOUT_MAX
+        from forge.pipeline.mode_c_planner import FixTaskRef
+
+        worktree = _a_journey_worktree(project)
+        row = _Row(
+            build_id=BUILD_ID,
+            repo=REPO,
+            start_commit=start_commit,
+            worktree_path=str(worktree),
+        )
+        budgets = BudgetGuards(leg_max_turns=3, leg_sdk_timeout_seconds=3600)
+        config = _config(project, sandbox_url=helper.url)
+
+        await _a_leg(config=config, row=row, leg_budgets=budgets)
+        await _a_leg(
+            config=config,
+            row=row,
+            stage=StageClass.TASK_WORK,
+            leg_budgets=budgets,
+            fix_task=FixTaskRef(fix_task_id="TASK-FIX-A", review_history_index=0),
+        )
+
+        sent = helper.only("/guardkit-leg")
+        assert [r["subcommand"] for r in sent] == ["task-review", "task-work"]
+        assert [r["timeout_seconds"] for r in sent] == [3660.0, 3780.0]
+        assert all(r["timeout_seconds"] <= LEG_TIMEOUT_MAX for r in sent)
 
     def test_and_the_real_helper_refuses_it_rather_than_reading_at_its_own_head(
         self, project, monkeypatch, tmp_path

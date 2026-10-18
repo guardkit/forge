@@ -66,6 +66,10 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Mapping
 
+from forge.leg_time_limits import (
+    REVIEW_LEG_OUTER_MARGIN_SECONDS,
+    WORK_LEG_OUTER_MARGIN_SECONDS,
+)
 from forge.pipeline.dispatchers.subprocess_dispatcher import (
     MODE_C_STAGES,
     StageDispatchResult,
@@ -183,10 +187,13 @@ def leg_budget_args(*, stage: StageClass, leg_budgets: Any) -> list[str]:
 #: The defect this closes: the fix-journey profile was raised to
 #: ``leg_sdk_timeout_seconds: 3600`` while the review leg's outer wall stayed
 #: at 1860s, so the review was cut off at 31 minutes with exit 124.
+#: The numbers themselves live in ``forge.leg_time_limits``, which config
+#: loading reads too, to refuse a budget whose limit the sandbox helper
+#: would cut back.
 LEG_OUTER_MARGIN_SECONDS: Mapping[StageClass, int] = MappingProxyType(
     {
-        StageClass.TASK_REVIEW: 60,
-        StageClass.TASK_WORK: 180,
+        StageClass.TASK_REVIEW: REVIEW_LEG_OUTER_MARGIN_SECONDS,
+        StageClass.TASK_WORK: WORK_LEG_OUTER_MARGIN_SECONDS,
     }
 )
 

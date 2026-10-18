@@ -44,6 +44,12 @@ from pydantic import (
     model_validator,
 )
 
+from forge.leg_time_limits import (
+    LEG_TIMEOUT_MAX,
+    REVIEW_LEG_OUTER_MARGIN_SECONDS,
+    WORK_LEG_OUTER_MARGIN_SECONDS,
+)
+
 # ---------------------------------------------------------------------------
 # Default values (anchored to ASSUM-001..005)
 # ---------------------------------------------------------------------------
@@ -629,6 +635,50 @@ class BudgetGuards(BaseModel):
             "timeout."
         ),
     )
+
+    @model_validator(mode="after")
+    def _leg_budgets_fit_the_helpers_ceiling(self) -> BudgetGuards:
+        """Refuse a leg budget whose outer limit the sandbox helper would cut.
+
+        Each repair leg's outer limit is its budget plus a margin (60 seconds
+        for a review leg, 180 for a work leg). The sandbox helper cuts any
+        leg's wall back to :data:`~forge.leg_time_limits.LEG_TIMEOUT_MAX`, so
+        a budget whose limit would be longer than that is refused here, where
+        the owner can see it, rather than cut short in the middle of a leg.
+        """
+        checks = (
+            # (field, value, leg, margin) — the model budget is given to both
+            # legs, the loop budget to the work leg only.
+            (
+                "leg_sdk_timeout_seconds",
+                self.leg_sdk_timeout_seconds,
+                "work",
+                WORK_LEG_OUTER_MARGIN_SECONDS,
+            ),
+            (
+                "leg_sdk_timeout_seconds",
+                self.leg_sdk_timeout_seconds,
+                "review",
+                REVIEW_LEG_OUTER_MARGIN_SECONDS,
+            ),
+            (
+                "leg_budget_seconds",
+                self.leg_budget_seconds,
+                "work",
+                WORK_LEG_OUTER_MARGIN_SECONDS,
+            ),
+        )
+        for field_name, value, leg, margin in checks:
+            if value is None or value + margin <= LEG_TIMEOUT_MAX:
+                continue
+            raise ValueError(
+                f"{field_name} is {value} seconds, which is too long: a {leg} "
+                f"leg's outer limit would be {value + margin} seconds (this "
+                f"setting plus {margin}), and the sandbox helper allows a leg "
+                f"at most {LEG_TIMEOUT_MAX:g} seconds. The largest value "
+                f"{field_name} can have is {int(LEG_TIMEOUT_MAX) - margin}."
+            )
+        return self
 
     @property
     def caps_enabled(self) -> bool:
