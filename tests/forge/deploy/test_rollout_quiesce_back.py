@@ -218,7 +218,10 @@ def test_marker_alone_blocks_before_restore_and_legacy_reopen(estate,monkeypatch
     with pytest.raises(r.Refusal):recovery.reopen()
 
 def test_work_questions_keep_detail_and_not_yet():
-    state={'work_state':{'publication_records':{'status':'observed','rows':[{'result':'publication pending','build_id':'b','turn':2}]},'deployment_targets':{'status':'NOT-YET','introduced_in':16},'planning_runs':{'status':'observed','rows':[{'state':'FEATURE_PLAN'}]}}}
+    # A record with no result yet is active work (the router's rule since
+    # 18 October 2026, missions design section 11): a released "publication
+    # pending" record would not be.
+    state={'work_state':{'publication_records':{'status':'observed','rows':[{'result':None,'build_id':'b','turn':2}]},'deployment_targets':{'status':'NOT-YET','introduced_in':16},'planning_runs':{'status':'observed','rows':[{'state':'FEATURE_PLAN'}]}}}
     assert [x['table'] for x in q.work_problems(state)]==['publication_records','planning_runs']
 
 def test_moved_tag_refuses_with_actual_id_evidence(estate,monkeypatch):

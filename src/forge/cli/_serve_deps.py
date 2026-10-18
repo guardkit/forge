@@ -2387,17 +2387,43 @@ def _mission_build_gate_decision(
     if membership is None:
         return None
     mission, attempt, _feature = membership
+    refusal: str | None = None
     if mission is None:
-        raise MissionBuildRefused(
+        refusal = (
             f"this build is part of mission {attempt.mission_id}, which is not "
             "on record, so it was not started"
         )
-    if mission.status != "RUNNING":
-        raise MissionBuildRefused(
+    elif mission.status != "RUNNING":
+        refusal = (
             f"this build is part of mission {mission.id}, which is "
             f"{mission.status.lower().replace('_', ' ')} rather than running, so "
             "it was not started"
         )
+    elif mission.stopping:
+        # A stop was asked for (section 11): the build is refused at its
+        # mission check, before any decision row.
+        refusal = (
+            f"this build is part of mission {mission.id}, which was stopped by "
+            f"{mission.stop_requested_by} at {mission.stop_requested_at}, so it "
+            "was not started"
+        )
+    if refusal is not None:
+        # The refusal ENDS the build and its attempt, so the mission does not
+        # wait for ever on a row left QUEUED (the consumer only publishes and
+        # acks a raised refusal): the row is FAILED with the sentence, and the
+        # attempt closes FAILED from it.
+        from forge.lifecycle.missions import MissionStore
+
+        fail_mode_c_build(
+            sqlite_pool,
+            build_id,
+            summary=refusal,
+            what="a mission build refused at its mission check",
+            log=logger,
+        )
+        if connection is not None:
+            MissionStore(connection).mark_failed(attempt.correlation_id, refusal)
+        raise MissionBuildRefused(refusal)
     decision = {
         "mission_id": mission.id,
         "decided_by": f"mission {mission.id} (approved by {mission.approved_by})",

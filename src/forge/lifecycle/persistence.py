@@ -1424,8 +1424,11 @@ class SqliteLifecyclePersistence:
         queued_at: datetime,
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
-    ) -> str:
+    ) -> str | None:
         """The mission's own merge build: one ``builds`` row, one transaction.
+
+        ``None``, with nothing written, for a mission with a stop asked for
+        (section 11) and no merge build yet.
 
         Missions design, section 7. The merge card and the press are keyed by
         a build, so at READY the mission gets a row of its own, never the last
@@ -1469,6 +1472,15 @@ class SqliteLifecyclePersistence:
             if existing is not None:
                 self._cx.execute("COMMIT;")
                 return str(existing[0])
+            # A STOP ASKED FOR FIRST (missions design, section 11): read in
+            # this same transaction, so a stop that commits before it leaves
+            # no merge build, and a stop after it is refused by the request.
+            stopping = self._cx.execute(
+                "SELECT stop_requested_at FROM missions WHERE id = ?", (mission_id,)
+            ).fetchone()
+            if stopping is not None and stopping[0] is not None:
+                self._cx.execute("COMMIT;")
+                return None
             # The usual shape; a second that is already taken moves on one.
             while True:
                 build_id = derive_build_id(feature_id, moment)

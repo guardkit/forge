@@ -39,6 +39,7 @@ from forge.lifecycle.missions import (
     Mission,
     MissionFeature,
     MissionStore,
+    StopAnswer,
     attempt_correlation_id,
 )
 
@@ -51,6 +52,7 @@ __all__ = [
     "MissionFlow",
     "ROUTING_NOT_SET_UP",
     "mission_build_id",
+    "stop_mission",
     "plan_card_rationale",
     "validate_mission",
     "waves",
@@ -79,6 +81,33 @@ _RESEND_SECONDS: float = 60.0
 _ARM_TIMEOUT_SECONDS: float = 30.0
 
 _KEY = re.compile(MISSION_KEY_PATTERN)
+
+
+def stop_mission(
+    missions: MissionStore,
+    mission_id: str,
+    *,
+    requested_by: str,
+    expected_approver: str | None = None,
+) -> StopAnswer:
+    """Ask for a mission to stop: the one function Slack and the command line call.
+
+    Section 11. Records the request (:meth:`MissionStore.request_stop`) and
+    answers in one plain sentence; the coordinator carries it out on its
+    next pass. ``expected_approver`` is the Slack route's rule, the same as
+    for the mission's cards: only the person the mission's cards are for may
+    stop it. The command line passes none.
+    """
+    mission_id = str(mission_id or "").strip().lower()
+    if expected_approver is not None:
+        mission = missions.get(mission_id)
+        if mission is not None and mission.originating_user != expected_approver:
+            return StopAnswer(
+                False,
+                f"only the person who sent mission {mission_id} can stop it",
+                mission,
+            )
+    return missions.request_stop(mission_id, requested_by=requested_by)
 
 
 def mission_build_id(mission_id: str) -> str:
@@ -534,6 +563,9 @@ class MissionFlow:
         and makes no second seed. One that is UNKNOWN or FAILED is never
         retried (the gate's seed-once rule): the mission becomes NOT_STARTED.
         """
+        current = self._missions.get(mission.id)
+        if current is not None and current.stopping:
+            return False  # a stop was asked for: no seed, no branch; it drains
         unable = self.cannot_start_reason()
         if unable is not None:
             # The factory is set up differently from when the card went out (a
@@ -619,8 +651,10 @@ class MissionFlow:
         )
         outcome = str(getattr(answer, "outcome", "unreachable"))
         if outcome == "created":
-            self._missions.file_first_attempts(mission.id)
-            if self._missions.set_status(mission.id, "RUNNING", expected=("STARTING",)):
+            # The move to RUNNING and the attempts are one transaction that
+            # checks STARTING and no stop asked for (section 11): a branch
+            # answer that arrives after a stop files nothing.
+            if self._missions.start_running(mission.id) is not None:
                 self._last_sent.pop(mission.id, None)
                 await self._say(
                     mission,
@@ -668,6 +702,8 @@ class MissionFlow:
             self._start_waiting(mission, republish=True)
         now = self._clock()
         for mission in self._missions.list_by_status(("STARTING",)):
+            if mission.stopping:
+                continue  # a stopped mission asks for no branch; it drains
             last = self._last_sent.get(mission.id)
             if last is not None and (now - last).total_seconds() < _RESEND_SECONDS:
                 continue

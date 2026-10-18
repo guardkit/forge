@@ -375,6 +375,10 @@ RESULT_WORD_MISSION_LANDING_FAILED: str = "mission-landing-failed"
 #: still counts). At ``publication.send_attempts`` started presses with no
 #: report, the build gets a FAILED landing report instead of another press.
 MISSION_LANDING_ATTEMPT_TARGET_IDENTIFIER: str = "mission_landing_attempt"
+#: One stage row when a clean mission feature is asked to land, written before
+#: the landing waits for the repository's lock (the decision row is made
+#: inside it, section 11): the durable proof of a clean finish a restart reads.
+MISSION_LANDING_REQUEST_TARGET_IDENTIFIER: str = "mission_landing_requested"
 MISSION_LANDING_STAGE_LABEL: str = "mission landing"
 
 #: One stage row per RESUMED press of an approved mission merge into main
@@ -1379,6 +1383,10 @@ def _write_the_refusal_down_for(
 # ---------------------------------------------------------------------------
 
 
+class MissionMergeRefused(RuntimeError):
+    """A mission's own merge was asked to run after a stop was requested."""
+
+
 async def execute_merge_deploy(
     *,
     deps: MergeExecutorDeps,
@@ -1529,6 +1537,23 @@ async def execute_merge_deploy(
         deploy = False
     if belongs_to is not None and belongs_to.is_merge:
         join_name = mission_join_name(belongs_to.mission_id)
+        # DEFENSIVE (section 11): a mission's own merge is never pressed once
+        # a stop was asked for. The request is refused once a merge build
+        # exists, so this combination should never happen.
+        ledger = _ledger_of(deps.pool)
+        stop = (
+            ledger.execute(
+                "SELECT stop_requested_at, stop_requested_by FROM missions WHERE id = ?",
+                (belongs_to.mission_id,),
+            ).fetchone()
+            if ledger is not None
+            else None
+        )
+        if stop is not None and stop[0] is not None:
+            raise MissionMergeRefused(
+                f"{build_id} is the merge of mission {belongs_to.mission_id}, which "
+                f"was stopped by {stop[1]} at {stop[0]}, so it is not pressed"
+            )
     feature_routing_receipt: dict[str, object] | None = None
     if deps.feature_routing_required:
         if deps.feature_routing_gate is None:
@@ -7076,7 +7101,7 @@ class MergeApprovalConsumer:
         pressed again (``None``), and one whose decision is recorded but whose
         press never reported is carried on.
         """
-        from forge.lifecycle.mission_builds import landing_attempt_id, mission_of_build
+        from forge.lifecycle.mission_builds import mission_of_build
         from forge.lifecycle.missions import MissionStore
 
         belongs = mission_of_build(self._deps.pool, build_id)
@@ -7094,6 +7119,13 @@ class MergeApprovalConsumer:
         if _a_landing_has_reported(self._deps.pool, build_id):
             logger.info(
                 "merge-executor: %s's landing has already reported — not pressed again",
+                build_id,
+            )
+            return None
+        if build_id in self._landing_now:
+            logger.info(
+                "merge-executor: %s is being landed by this coordinator right now — "
+                "not twice",
                 build_id,
             )
             return None
@@ -7135,43 +7167,46 @@ class MergeApprovalConsumer:
                 mission.branch,
             )
             return None
+        # THE CLEAN FINISH IS WRITTEN DOWN BEFORE WAITING FOR THE LOCK: the
+        # decision row is now made inside the lock (section 11), and a landing
+        # can wait there behind a sibling's press. This row is the durable
+        # fact that the build was asked to land with every task passed, so a
+        # restart meanwhile carries the landing on rather than failing it.
+        self._record_landing_requested(row)
         self._landing_now.add(build_id)
         try:
-            # THE DECISION ROW FIRST, before waiting for the repository's
-            # lock: it is the durable fact that this build was asked to land.
-            # One row per build: an existing one is reused, with its attempt.
-            decided = [
-                s
-                for s in self._deps.pool.read_stages(build_id)
-                if s.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER
-            ]
-            attempt_id = landing_attempt_id(build_id)
-            if decided:
-                said = (decided[-1].details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}
-                attempt_id = str(said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY) or attempt_id)
-            else:
-                self._deps.pool.record_stage(
-                    _decision_entry(
-                        build_id=build_id,
-                        decision="approve",
-                        decided_by=decided_by,
-                        request_id=request_id,
-                        now=self._deps.clock(),
-                        attempt_id=attempt_id,
-                    )
-                )
             async with self._lock_for(row.repo):
                 if _a_landing_has_reported(self._deps.pool, build_id):
+                    return None
+                # ONE ATOMIC BOUNDARY (section 11, Codex round 2 R1): inside
+                # the repository's lock, one transaction re-reads the
+                # mission's stop request and creates or reuses the decision
+                # row. A stop that commits first means no new decision and no
+                # press; a decision that commits first goes ahead.
+                attempt_id = self._decide_landing(
+                    build_id,
+                    mission_id=mission.id,
+                    decided_by=decided_by,
+                    request_id=request_id,
+                )
+                if attempt_id is None:
+                    self._landing_failed(
+                        row,
+                        f"{row.feature_id} was not merged into its mission's "
+                        f"branch {mission.branch}: mission stopped",
+                    )
                     return None
                 allowed = _how_many_attempts(self._deps.config)
                 started = self._landing_attempts(build_id)
                 if started >= allowed:
-                    self._landing_failed(
+                    await self._give_up_landing(
                         row,
+                        mission,
+                        Path(repo_root_raw),
+                        attempt_id,
                         f"{row.feature_id} could not be landed on "
                         f"{mission.branch}: its press was started {started} "
                         f"times and never reported",
-                        attempt_id=attempt_id,
                     )
                     return None
                 started += 1
@@ -7205,18 +7240,277 @@ class MergeApprovalConsumer:
                         build_id,
                     )
                     if started >= allowed:
-                        self._landing_failed(
+                        await self._give_up_landing(
                             row,
+                            mission,
+                            Path(repo_root_raw),
+                            attempt_id,
                             f"{row.feature_id} could not be landed on "
                             f"{mission.branch}: the press stopped with "
                             f"{type(exc).__name__} on all {allowed} attempts "
                             f"({_one_line(str(exc))[:200]})",
-                            attempt_id=attempt_id,
                         )
                     return None
                 return outcome
         finally:
             self._landing_now.discard(build_id)
+
+    def _decide_landing(
+        self, build_id: str, *, mission_id: str, decided_by: str, request_id: str
+    ) -> str | None:
+        """Create or reuse the landing's decision row; ``None`` if the mission stopped first.
+
+        One ``BEGIN IMMEDIATE`` transaction (section 11, round 2 R1): an
+        existing decision row is reused with its attempt id, whatever the
+        stop says — a landing already decided goes on to its end. With no
+        decision row, the mission's ``stop_requested_at`` is read in the same
+        transaction, and a stop means no decision is created.
+        """
+        from forge.lifecycle.card_revisions import immediate_transaction, insert_stage_row
+        from forge.lifecycle.mission_builds import landing_attempt_id
+
+        cx = self._deps.pool.connection
+        attempt_id = landing_attempt_id(build_id)
+        with immediate_transaction(cx):
+            decided = cx.execute(
+                "SELECT details_json FROM stage_log WHERE build_id = ? "
+                "AND target_identifier = ? ORDER BY id DESC LIMIT 1",
+                (build_id, MERGE_DECISION_TARGET_IDENTIFIER),
+            ).fetchone()
+            if decided is not None:
+                try:
+                    details = json.loads(decided[0] or "{}")
+                except ValueError:
+                    details = {}
+                said = (details.get(MERGE_DECISION_DETAILS_KEY) or {}) if isinstance(details, dict) else {}
+                return str(said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY) or attempt_id)
+            stop = cx.execute(
+                "SELECT stop_requested_at FROM missions WHERE id = ?", (mission_id,)
+            ).fetchone()
+            if stop is not None and stop[0] is not None:
+                return None
+            insert_stage_row(
+                cx,
+                _decision_entry(
+                    build_id=build_id,
+                    decision="approve",
+                    decided_by=decided_by,
+                    request_id=request_id,
+                    now=self._deps.clock(),
+                    attempt_id=attempt_id,
+                ),
+            )
+        return attempt_id
+
+    async def _give_up_landing(
+        self,
+        row: Any,
+        mission: Any,
+        repo_root: Path,
+        attempt_id: str | None,
+        reason: str,
+    ) -> None:
+        """The landing's bound was reached: reconcile with the remote BEFORE failing.
+
+        Section 11, Codex round 2 R4, for every mission: a send may have
+        reached the remote on the last allowed attempt before its answer was
+        recorded. So for a build with a publication record the remote is read
+        first: if the mission branch contains the joined commit, the record is
+        settled as published and the landing reports PASSED; if it does not,
+        the record is settled "publication pending" (lease released) and the
+        landing reports FAILED; if the remote cannot be read, nothing is
+        written and the next pass tries again — an uncertain outcome is never
+        turned into FAILED. A build with no record had no send: FAILED.
+        """
+        settled = await self._settle_by_looking(row, mission, repo_root)
+        if settled == "landed":
+            self._landing_reconciled(row, attempt_id, mission)
+        elif settled in ("not landed", "no record"):
+            self._landing_failed(row, reason, attempt_id=attempt_id)
+        else:
+            logger.warning(
+                "merge-executor: %s's landing could not be settled by looking at "
+                "the remote — nothing is written; tried again on the next pass",
+                row.build_id,
+            )
+
+    async def reconcile_mission_landing(self, build_id: str) -> str:
+        """Settle a reported landing whose publication record is still unsettled.
+
+        Section 11: recovery re-checks a mission feature whose landing has a
+        report but whose record has no result yet (a press that reported and
+        never settled, from before this rule). Under the repository's lock;
+        answers "landed", "not landed", "unknown", or "nothing to do".
+        """
+        from forge.lifecycle.mission_builds import mission_of_build
+        from forge.lifecycle.missions import MissionStore
+
+        belongs = mission_of_build(self._deps.pool, build_id)
+        row = self._deps.pool.get_build_row(build_id)
+        if belongs is None or not belongs.is_feature or row is None:
+            return "nothing to do"
+        mission = MissionStore(self._deps.pool.connection).get(belongs.mission_id)
+        repo_root_raw = self._deps.config.planning.target_repo_paths.get(row.repo)
+        if mission is None or not repo_root_raw:
+            return "nothing to do"
+        async with self._lock_for(row.repo):
+            return await self._settle_by_looking(row, mission, Path(repo_root_raw))
+
+    async def _settle_by_looking(self, row: Any, mission: Any, repo_root: Path) -> str:
+        """Settle this build's publication record from the remote. Its answer.
+
+        "no record" (nothing was ever sent), "landed" (the record says, or the
+        remote shows, the joined commit on the mission branch), "not landed"
+        (settled "publication pending", lease released), or "unknown" (held by
+        a live press, or the remote could not be read: nothing written). The
+        press's own rule: the question is whether the branch CONTAINS the
+        joined commit, and only a record that tried a send is read for one.
+        """
+        store = PublicationRecordStore(self._deps.pool.connection)
+        record = store.read(row.build_id)
+        if not record.recorded:
+            return "no record"
+        if record.result:
+            return "landed" if record.result == RESULT_PUBLISHED_TO_MISSION_BRANCH else "not landed"
+        now = self._deps.clock()
+        if record.lease_is_live(now):
+            return "unknown"
+        holder = f"landing-reconcile:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+        grant = store.take_lease(build_id=row.build_id, holder=holder, now=now)
+        if grant is None:
+            return "unknown"
+        turn = grant.turn
+        try:
+            record = store.read(row.build_id)
+            send_lines = [line for line in record.lines if line.step == STEP_SEND]
+            if not send_lines or not record.j_commit:
+                store.record(
+                    build_id=row.build_id,
+                    turn=turn,
+                    now=self._deps.clock(),
+                    result=RESULT_PUBLICATION_PENDING,
+                )
+                return "not landed"
+            git = git_surface_for(self._deps, row.repo, repo_root)
+            where = await target_branch_now(
+                git,
+                recorded_branch=record.target_branch or mission.branch,
+                mission_branch=mission.branch,
+            )
+            if not where.ok:
+                return "unknown"
+            contains = await git.is_ancestor(str(record.j_commit), str(where.commit))
+            if contains is None:
+                return "unknown"
+            if contains:
+                published = any(
+                    line.kind == LINE_DONE and line.detail.get("published") is True
+                    for line in send_lines
+                )
+                if not published:
+                    store.done(
+                        build_id=row.build_id,
+                        turn=turn,
+                        now=self._deps.clock(),
+                        step=STEP_SEND,
+                        attempt=int(send_lines[-1].attempt or 0),
+                        result={
+                            "ran_on": str(record.j_commit),
+                            "published": True,
+                            "contains_j": True,
+                            "remote_now": str(where.commit),
+                            "found_by_looking": True,
+                            "detail": (
+                                "the send's answer was never recorded; the "
+                                "remote was read and its branch contains the "
+                                "joined commit"
+                            ),
+                        },
+                    )
+                store.record(
+                    build_id=row.build_id,
+                    turn=turn,
+                    now=self._deps.clock(),
+                    result=RESULT_PUBLISHED_TO_MISSION_BRANCH,
+                )
+                return "landed"
+            store.record(
+                build_id=row.build_id,
+                turn=turn,
+                now=self._deps.clock(),
+                result=RESULT_PUBLICATION_PENDING,
+            )
+            return "not landed"
+        finally:
+            store.release_lease(
+                build_id=row.build_id, turn=turn, holder=holder, now=self._deps.clock()
+            )
+
+    def _landing_reconciled(self, row: Any, attempt_id: str | None, mission: Any) -> None:
+        """A PASSED landing report for a landing found on the remote by looking."""
+        if _a_landing_has_reported(self._deps.pool, row.build_id):
+            return
+        now = self._deps.clock()
+        self._deps.pool.record_stage(
+            StageLogEntry(
+                build_id=row.build_id,
+                stage_label=MERGE_REPORT_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+                status="PASSED",
+                gate_mode=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={
+                    "feature_id": row.feature_id,
+                    "build_id": row.build_id,
+                    "correlation_id": row.correlation_id,
+                    "status": "PASSED",
+                    "result": RESULT_WORD_PUBLISHED_TO_MISSION_BRANCH,
+                    "detail": (
+                        f"{row.feature_id}'s joined commit was found on "
+                        f"{mission.branch} by looking at the remote, so it landed"
+                    ),
+                    **(
+                        {
+                            MERGE_DECISION_DETAILS_KEY: {
+                                MERGE_EXECUTION_ATTEMPT_VERSION_KEY: (
+                                    MERGE_EXECUTION_ATTEMPT_VERSION
+                                ),
+                                MERGE_EXECUTION_ATTEMPT_ID_KEY: attempt_id,
+                            }
+                        }
+                        if attempt_id is not None
+                        else {}
+                    ),
+                },
+            )
+        )
+
+    def _record_landing_requested(self, row: Any) -> None:
+        """One durable row saying the landing was asked for after a clean finish."""
+        if any(
+            s.target_identifier
+            in (MISSION_LANDING_REQUEST_TARGET_IDENTIFIER, MERGE_DECISION_TARGET_IDENTIFIER)
+            for s in self._deps.pool.read_stages(row.build_id)
+        ):
+            return
+        now = self._deps.clock()
+        self._deps.pool.record_stage(
+            StageLogEntry(
+                build_id=row.build_id,
+                stage_label=MISSION_LANDING_STAGE_LABEL,
+                target_kind="local_tool",
+                target_identifier=MISSION_LANDING_REQUEST_TARGET_IDENTIFIER,
+                status="SKIPPED",
+                gate_mode=None,
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={"mission_landing_requested": {"tasks_failed": 0}},
+            )
+        )
 
     def _landing_attempts(self, build_id: str) -> int:
         """How many landing presses were started for this build, durably."""

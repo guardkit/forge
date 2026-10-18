@@ -247,6 +247,10 @@ class MissionFinishDeps:
     #: the decision) is pressed again through the approved press's own locked
     #: entry. ``None`` resumes nothing.
     resume_merge: Callable[[str], Awaitable[Any]] | None = None
+    #: ``MergeApprovalConsumer.reconcile_mission_landing``: a reported landing
+    #: whose publication record never settled is settled by looking at the
+    #: remote (section 11). ``None`` settles nothing.
+    reconcile: Callable[[str], Awaitable[Any]] | None = None
     feature_routing_gate: Any | None = None
     feature_routing_required: bool = False
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
@@ -316,7 +320,15 @@ async def finish_ready_missions(
         task = asyncio.create_task(_resume_guarded(deps, build_id, decided=decided))
         _tasks.add(task)
         task.add_done_callback(_tasks.discard)
+    for build_id in _landings_to_reconcile(deps, cx):
+        _resuming.add(build_id)
+        started.append(build_id)
+        task = asyncio.create_task(_reconcile_guarded(deps, build_id))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
     for mission in missions:
+        if mission.stopping:
+            continue  # a stopped mission is never offered; it drains
         if mission.id in _in_progress:
             continue
         _in_progress.add(mission.id)
@@ -341,11 +353,14 @@ def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[tuple[str, boo
     A build whose landing reported is never pressed again; one whose press
     keeps raising is given a FAILED landing report by the press's own bound.
 
-    THE DECISION ROW IS THE ONLY DURABLE PROOF OF A CLEAN FINISH. The offer
-    hook writes it only after the build's own terminal event said no task
-    failed; the ledger keeps no failed-task count. So a build with a decision
-    row is pressed, and one without (the hook never ran) is handed over with
-    its count unknown, which gives it a FAILED landing report and no press.
+    THE DECISION ROW, OR THE LANDING REQUEST ROW, IS THE ONLY DURABLE PROOF OF
+    A CLEAN FINISH. The offer hook asks for the landing only after the build's
+    own terminal event said no task failed, and the request row is written
+    then, before the landing waits for the repository's lock (the decision is
+    made inside it, section 11); the ledger keeps no failed-task count. So a
+    build with either row is pressed, and one with neither (the hook never
+    ran) is handed over with its count unknown, which gives it a FAILED
+    landing report and no press.
     Answers ``(build id, has a decision row)``.
     """
     if deps.land is None:
@@ -353,6 +368,7 @@ def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[tuple[str, boo
     from forge.pipeline.merge_executor import (
         MERGE_DECISION_TARGET_IDENTIFIER,
         MERGE_REPORT_TARGET_IDENTIFIER,
+        MISSION_LANDING_REQUEST_TARGET_IDENTIFIER,
     )
     from forge.pipeline.publication_record import PublicationRecordStore
 
@@ -360,7 +376,7 @@ def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[tuple[str, boo
         rows = cx.execute(
             "SELECT b.build_id, COALESCE(b.completed_at, b.queued_at), "
             "EXISTS (SELECT 1 FROM stage_log AS d WHERE d.build_id = b.build_id "
-            "AND d.target_identifier = ?) "
+            "AND d.target_identifier IN (?, ?)) "
             "FROM builds AS b "
             "JOIN missions AS m ON m.id = b.mission_id "
             "JOIN mission_attempts AS a ON a.correlation_id = b.correlation_id "
@@ -369,7 +385,12 @@ def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[tuple[str, boo
             "AND NOT EXISTS (SELECT 1 FROM stage_log AS r WHERE r.build_id = b.build_id "
             "AND r.target_identifier = ?) "
             "ORDER BY b.queued_at ASC",
-            (MERGE_DECISION_TARGET_IDENTIFIER, MISSION_ROLE_FEATURE, MERGE_REPORT_TARGET_IDENTIFIER),
+            (
+                MERGE_DECISION_TARGET_IDENTIFIER,
+                MISSION_LANDING_REQUEST_TARGET_IDENTIFIER,
+                MISSION_ROLE_FEATURE,
+                MERGE_REPORT_TARGET_IDENTIFIER,
+            ),
         ).fetchall()
     except Exception as exc:  # noqa: BLE001 — a read never stops the queue
         logger.warning("missions: could not look for landings to resume (%s)", exc)
@@ -394,6 +415,62 @@ def _landings_to_resume(deps: MissionFinishDeps, cx: Any) -> list[tuple[str, boo
             continue
         due.append((build_id, bool(decided)))
     return due
+
+
+def _landings_to_reconcile(deps: MissionFinishDeps, cx: Any) -> list[str]:
+    """Mission features with a landing report but an unsettled publication record.
+
+    Section 11, R4: a press that reported but left its record with no result
+    (it tried a send whose answer was lost) is re-checked against the remote
+    by the press's own reconciliation, so the mission never drains, or
+    counts a feature as not landed, on an outcome nobody knows. Only for
+    missions still active, and never while a press holds the record's lease.
+    """
+    if deps.reconcile is None:
+        return []
+    from forge.lifecycle.missions import ACTIVE_MISSION_STATUSES
+    from forge.pipeline.merge_executor import MERGE_REPORT_TARGET_IDENTIFIER
+    from forge.pipeline.publication_record import PublicationRecordStore
+
+    marks = ", ".join("?" for _ in ACTIVE_MISSION_STATUSES)
+    try:
+        rows = cx.execute(
+            "SELECT b.build_id FROM builds AS b "
+            "JOIN missions AS m ON m.id = b.mission_id "
+            "JOIN publication_records AS p ON p.build_id = b.build_id "
+            f"WHERE b.mission_role = ? AND m.status IN ({marks}) "
+            "AND p.result IS NULL "
+            "AND EXISTS (SELECT 1 FROM stage_log AS r WHERE r.build_id = b.build_id "
+            "AND r.target_identifier = ?) "
+            "ORDER BY b.queued_at ASC",
+            (MISSION_ROLE_FEATURE, *ACTIVE_MISSION_STATUSES, MERGE_REPORT_TARGET_IDENTIFIER),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — a read never stops the queue
+        logger.warning("missions: could not look for landings to settle (%s)", exc)
+        return []
+    records = PublicationRecordStore(cx)
+    now = deps.clock()
+    return [
+        str(build_id)
+        for (build_id,) in rows
+        if str(build_id) not in _resuming and not records.read(str(build_id)).lease_is_live(now)
+    ]
+
+
+async def _reconcile_guarded(deps: MissionFinishDeps, build_id: str) -> None:
+    try:
+        assert deps.reconcile is not None
+        said = await deps.reconcile(build_id)
+        logger.info("missions: %s's unsettled landing, looked at again: %s", build_id, said)
+    except Exception as exc:  # noqa: BLE001 — logged; tried again next pass
+        logger.error(
+            "missions: settling %s's landing raised (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+    finally:
+        _resuming.discard(build_id)
 
 
 async def _resume_guarded(
@@ -507,6 +584,11 @@ async def _say(deps: MissionFinishDeps, mission: Mission, message: str) -> None:
         )
 
 
+def _stopping(store: MissionStore, mission_id: str) -> bool:
+    current = store.get(mission_id)
+    return current is not None and current.stopping
+
+
 def _confirmed_landings(
     cx: Any, mission: Mission, latest: Mapping[str, MissionAttempt]
 ) -> list[_Landing]:
@@ -571,7 +653,15 @@ def _confirmed_landings(
 async def _offer_the_mission(
     deps: MissionFinishDeps, store: MissionStore, mission: Mission
 ) -> str:
-    """READY with no merge build yet: check, freeze, record, offer."""
+    """READY with no merge build yet: check, freeze, record, offer.
+
+    A stop asked for (section 11) is checked again at each step that commits
+    something — the frozen tip, the merge build, the offer — each in its own
+    transaction, so a stop that lands while this is paused (fetching, say)
+    leaves nothing recorded after it and no card.
+    """
+    if mission.stopping:
+        return "stopping"
     features = store.features(mission.id)
     latest = store.latest_attempts(mission.id)
     if not any(_status(latest, f.key) == "LANDED" for f in features):
@@ -663,6 +753,8 @@ async def _offer_the_mission(
             )
 
     if not store.set_final_commit(mission.id, tip):
+        if _stopping(store, mission.id):
+            return "stopping"  # a stop arrived first: nothing is recorded
         return await _not_merged(
             deps,
             store,
@@ -686,6 +778,8 @@ async def _offer_the_mission(
         memory_project=deps.pool.read_memory_project(last.build_id),
         launch_settings=deps.pool.read_launch_settings(last.build_id),
     )
+    if build_id is None:
+        return "stopping"  # a stop arrived first: no merge build, no card
     refreshed = store.get(mission.id) or mission
     return await _freeze_and_offer(
         deps,
@@ -805,6 +899,9 @@ async def _freeze_and_offer(
         for s in deps.pool.read_stages(build_id)
     ):
         return "offered"
+    if _stopping(store, mission.id):
+        # Never expected: the request is refused once the merge build exists.
+        return "stopping"
     risky, unread = await _the_risky_files(
         deps, repo=repo, repo_root=repo_root, base=mission.base_commit, tip=tip
     )
@@ -1101,6 +1198,7 @@ def compose_mission_finisher(
     nats_client: Any,
     land: Callable[[str], Awaitable[Any]] | None = None,
     resume_merge: Callable[[str], Awaitable[Any]] | None = None,
+    reconcile: Callable[[str], Awaitable[Any]] | None = None,
     git_surface: Callable[[str, Path], Any] | None = None,
     tree_reader_for: Callable[[str, Path], Any] | None = None,
     feature_routing_gate: Any | None = None,
@@ -1145,6 +1243,7 @@ def compose_mission_finisher(
         tree_reader_for=tree_reader_for,
         land=land,
         resume_merge=resume_merge,
+        reconcile=reconcile,
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
     )

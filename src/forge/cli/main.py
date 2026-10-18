@@ -54,6 +54,7 @@ from forge.cli import repo_paths as _repo_paths
 from forge.cli import review_gate as _review_gate
 from forge.cli import runbook as _runbook
 from forge.cli import security_sweep as _security_sweep
+from forge.cli import mission as _mission
 from forge.cli import serve as _serve
 from forge.cli import skip as _skip
 from forge.cli import status as _status
@@ -138,6 +139,7 @@ main.add_command(_review_gate.review_gate_cmd)
 main.add_command(_register_repo.register_repo_cmd)
 main.add_command(_repo_paths.repo_paths_cmd)
 main.add_command(_security_sweep.security_sweep_cmd)
+main.add_command(_mission.mission_cmd)
 
 
 __all__ = ["CliRuntime", "build_cli_runtime", "main"]

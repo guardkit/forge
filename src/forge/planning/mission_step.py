@@ -75,6 +75,16 @@ def landing_was_a_conflict(connection: sqlite3.Connection, build_id: str) -> boo
     return refusal.startswith(_CONFLICT_SENTENCE_START)
 
 
+def _publication_unsettled(connection: sqlite3.Connection, build_id: str) -> bool:
+    """Has this build's publication record tried a send and not settled yet?"""
+    from forge.pipeline.publication_record import STEP_SEND
+
+    record = PublicationRecordStore(connection).read(build_id)
+    if not record.recorded or record.result:
+        return False
+    return any(line.step == STEP_SEND for line in record.lines)
+
+
 def mission_landing(
     connection: sqlite3.Connection, correlation_id: str, *, now: datetime | None = None
 ) -> tuple[str, str | None]:
@@ -97,6 +107,14 @@ def mission_landing(
     if build is None:
         return answer, None
     build_id, error = str(build[0]), build[1]
+    if answer in (wq.DID_NOT_LAND, wq.NOT_PUBLISHED) and _publication_unsettled(
+        connection, build_id
+    ):
+        # AN UNCERTAIN OUTCOME IS NEVER TURNED INTO FAILED (section 11, R4): a
+        # press that tried a send and left its record with no result may have
+        # landed. The press settles it by looking at the remote (recovery
+        # re-checks it), and until then the attempt waits.
+        return wq.NOT_LANDED_YET, None
     if answer == wq.DID_NOT_LAND and landing_was_a_conflict(connection, build_id):
         return CONFLICT, CONFLICT_REASON
     reason = str(error) if error else None
@@ -141,11 +159,13 @@ class MissionStep:
         failure_reason: Callable[[Any, str, str], str],
         clock: Callable[[], datetime],
         before: Callable[[], Awaitable[None]] | None = None,
+        notify: Callable[[Mission, str], Awaitable[None]] | None = None,
     ) -> None:
         """``failure_reason(run, state, correlation_id)`` is the loop's own
         wording for a planning run that ended badly; ``before`` is the mission
         flow's tending of PROPOSED and STARTING missions (cards to re-arm,
-        branches to ask for again), run first."""
+        branches to ask for again), run first; ``notify(mission, message)``
+        says one line in the mission's thread (a stop asked for, and its end)."""
         self._missions = missions
         self._planning_run = planning_run
         self._count_in_flight = count_in_flight
@@ -154,6 +174,10 @@ class MissionStep:
         self._failure_reason = failure_reason
         self._clock = clock
         self._before = before
+        self._notify = notify
+        #: Stops this process has already said were asked for, so the thread
+        #: gets the line once (once more after a restart, at most).
+        self._stop_said: set[str] = set()
 
     async def run_once(self) -> None:
         """Tend, then recover, close, hold, admit and mark READY, mission by mission."""
@@ -162,7 +186,13 @@ class MissionStep:
                 await self._before()
             except Exception:  # noqa: BLE001 — never stop the loop
                 logger.exception("missions: tending proposed and starting missions failed")
+        try:
+            await self.apply_stops()
+        except sqlite3.Error as exc:
+            logger.warning("missions: stops could not be applied this tick (%s)", exc)
         for mission in self._missions.list_by_status(("RUNNING",)):
+            if mission.stopping:
+                continue  # applied above: nothing is recovered or held for it
             try:
                 self.recover(mission)
                 self.close(mission)
@@ -176,10 +206,72 @@ class MissionStep:
                 )
                 continue
         for mission in self._missions.list_by_status(("RUNNING",)):
+            if mission.stopping:
+                continue  # nothing new starts for a stopping mission
             if not await self.admit(mission):
                 break  # the factory is full; nothing else may start this tick
         for mission in self._missions.list_by_status(("RUNNING",)):
-            self.mark_ready(mission)
+            if not mission.stopping:
+                self.mark_ready(mission)
+
+    # -- a stop asked for (section 11) -------------------------------------
+
+    async def apply_stops(self) -> list[str]:
+        """Carry out every stop asked for, in the design's order. Returns the
+        ids of the missions that ended this pass.
+
+        1. Nothing new starts: every WAITING attempt is HELD in one
+           transaction (and admission, the put-back, the rebuild and the
+           branch answer each check the stop in their own).
+        2. An ADMITTED attempt with no planning run and no build is closed
+           FAILED, not put back.
+        3. Running work is left to end: its attempt is closed from its own
+           ending, as on any tick (and planning and the build gate refuse a
+           stopped mission's run at their next check).
+        4. Landings settle in the press, under the repository's lock.
+        5. Once nothing is waiting, admitted, building or unsettled, the
+           mission ends NOT_MERGED with who stopped it, when, and what landed.
+        """
+        from forge.lifecycle.persistence import ACTIVE_STATES
+
+        ended: list[str] = []
+        active_builds = sorted(state.value for state in ACTIVE_STATES)
+        for mission in self._missions.list_stopping():
+            if mission.status == "MERGING":
+                continue  # never asked for in MERGING; nothing to drain here
+            self._missions.hold_for_stop(mission.id)
+            self._missions.close_abandoned(mission.id)
+            if mission.status == "RUNNING":
+                self.close(mission)
+            if mission.id not in self._stop_said:
+                self._stop_said.add(mission.id)
+                await self._say(
+                    mission,
+                    f'Mission "{mission.title}" is stopping (asked by '
+                    f"{mission.stop_requested_by}): nothing new will start, and "
+                    "work already running will finish without being merged into "
+                    "main.",
+                )
+            reason = self._missions.close_drained(
+                mission.id, active_build_states=active_builds
+            )
+            if reason is not None:
+                ended.append(mission.id)
+                logger.info("missions: %s is NOT_MERGED — %s", mission.id, reason)
+                await self._say(
+                    mission,
+                    f'Mission "{mission.title}" has stopped: {reason}. Nothing '
+                    f"reached main and the branch {mission.branch} is kept.",
+                )
+        return ended
+
+    async def _say(self, mission: Mission, message: str) -> None:
+        if self._notify is None:
+            return
+        try:
+            await self._notify(mission, message)
+        except Exception as exc:  # noqa: BLE001 — a line never costs a state
+            logger.warning("missions: could not tell %s's thread (%s)", mission.id, exc)
 
     # -- 0 ----------------------------------------------------------------
 
