@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import copy
 import json
+import posixpath
 import tempfile
 from pathlib import Path, PurePosixPath
 from typing import Any, Sequence
@@ -102,6 +103,32 @@ def _locate_key(lines: Sequence[str], parent: Sequence[str], key: str):
         if found is not None:
             return found
     return None
+
+
+def _comments_inside(lines: Sequence[str], parent: Sequence[str], key: str) -> list[int]:
+    """The 1-based numbers of the comment lines inside ``key``'s entry: the
+    lines :func:`_remove_entry` would delete with it."""
+    block = _locate_key(lines, parent, key)
+    if block is None or block.last_content_child is None:
+        return []
+    return [
+        index + 1 for index in range(block.key_line + 1, block.last_content_child)
+        if lines[index].strip().startswith("#")
+    ]
+
+
+def _normal(path: str) -> str:
+    """A path as the factory compares it: ``.``, ``..``, doubled and trailing
+    slashes taken out (lexically: these paths are inside containers)."""
+    return posixpath.normpath(str(path).strip())
+
+
+def _covers(allowed: str, path: str) -> bool:
+    """Does the allowlist entry ``allowed`` let the factory reach ``path``
+    (the same path, or one under it)? The pipeline's own check is
+    ``Path.resolve`` then ``is_relative_to``."""
+    a, p = _normal(allowed), _normal(path)
+    return p == a or p.startswith(a.rstrip("/") + "/")
 
 
 def _remove_entry(lines: list[str], parent: Sequence[str], key: str) -> bool:
@@ -202,6 +229,18 @@ def plan_settings_removal(
     crlf = "\n" in text and text.count("\r\n") == text.count("\n")
     plain = text.replace("\r\n", "\n") if crlf else text
     lines = plain.split("\n")
+    # A comment inside an entry would go with it (Codex review R2): refused,
+    # naming the lines, before anything is deleted.
+    for section in ("sandboxes", "target_repo_paths", "fetch_addresses"):
+        inside = _comments_inside(lines, ("planning", section), key)
+        if inside:
+            raise Refused(
+                which,
+                f"planning.{section}'s entry for {key} has comment lines inside it (line"
+                f"{'s' if len(inside) > 1 else ''} {', '.join(map(str, inside))} of its forge.yaml), "
+                "which removing the entry would delete; move or delete them by hand, then run "
+                "again. Nothing was written",
+            )
     expected = copy.deepcopy(data)
     steps: list[Step] = []
     try:
@@ -218,7 +257,9 @@ def plan_settings_removal(
             del expected["planning"]["target_repo_paths"][key]
             steps.append(Step(which, "remove", f"target_repo_paths {key} -> {path}"))
             _drop_if_empty(lines, expected, ("planning", "target_repo_paths"))
-            users = sorted(k for k, v in repo_paths.items() if k != key and v == path)
+            # Kept while another repository's path is the same folder or one
+            # under it, however spelled (Codex review R1).
+            users = sorted(k for k, v in repo_paths.items() if k != key and _covers(str(path), str(v)))
             if path in allowlist and users:
                 steps.append(Step(which, "keep", f"allowlist {path}: {', '.join(users)} still uses it"))
             elif path in allowlist and _remove_item(lines, ("permissions", "filesystem", "allowlist"), str(path)):

@@ -2433,7 +2433,26 @@ def activation_sequence(
         lines.append(
             f"    curl -sf {q(sidecar.rstrip('/') + '/healthz')} && curl -sf {q(runner.rstrip('/') + '/ok')}"
         )
-    if publisher is not None:
+    publisher_container = container(PUBLISHER_SERVICE)
+    if publisher is not None and removing:
+        # The route must be ABSENT from the settings the publisher loaded on
+        # THIS start (Codex review of unregister-repo, R3): only log lines
+        # since the restart are read, the last settings line must be there
+        # (it started), and it must not hold the route's key.
+        route = q(json.dumps(key) + ": {")
+        lines += [
+            "(e) The publisher's routes changed: confirm the factory is still drained and restart"
+            " the publisher, as ONE command, so it restarts only if the check exits 0 (otherwise"
+            " reopen intake as in (b) and activate later):",
+            f"    {drained} \\",
+            "      && publisher_since=$(date -u +%Y-%m-%dT%H:%M:%SZ) \\",
+            f"      && docker restart {publisher_container}",
+            f"    Then, in the same shell, confirm it started again and that the settings it loaded have"
+            f" no route for {key}; this prints those settings and exits 0 only then:",
+            f"    docker logs --since \"$publisher_since\" {publisher_container} 2>&1 | grep 'publisher: settings'"
+            f" | tail -n 1 | grep -vF -- {route}",
+        ]
+    elif publisher is not None:
         lines += [
             "(e) The publisher's routes changed: confirm the factory is still drained and restart"
             " the publisher, as ONE command, so it restarts only if the check exits 0 (otherwise"
@@ -2450,6 +2469,7 @@ def activation_sequence(
         " reads the new settings when it starts, as ONE command, so it restarts only if the check"
         " exits 0 (otherwise reopen intake as in (b) and activate later):",
         f"    {drained} \\",
+        *(["      && coordinator_since=$(date -u +%Y-%m-%dT%H:%M:%SZ) \\"] if removing else []),
         f"      && docker restart {q(estate.coordinator)}",
         "(g) Reopen intake, the Slack-facing services last:",
         f"    docker start {intake}",
@@ -2461,8 +2481,9 @@ def activation_sequence(
     listed = q(f"autobuild dispatch: {key} has a sandbox")
     if removing:
         lines.append(
-            f"    docker logs --since 10m {q(estate.coordinator)} 2>&1 | grep -cF {listed}"
-            "  (0: no longer listed since the restart)"
+            f"    docker logs --since \"$coordinator_since\" {q(estate.coordinator)} 2>&1 | grep -F {listed}"
+            "  (in the same shell as (f); it should print nothing: the coordinator no longer has the"
+            " project's sandbox)"
         )
     else:
         lines.append(f"    docker logs {q(estate.coordinator)} 2>&1 | grep -F {listed}")

@@ -15,7 +15,9 @@ from __future__ import annotations
 
 import datetime
 import os
+import subprocess
 
+import pytest
 import yaml
 from click.testing import CliRunner
 
@@ -323,3 +325,104 @@ def test_no_name_is_refused_in_one_sentence(estate):  # noqa: F811
     result = CliRunner().invoke(main, ["unregister-repo"], catch_exceptions=False)
     assert result.exit_code == 1 and "name the repository" in result.output
     assert estate.writes == []
+
+
+# ---------------------------------------------------------------------------
+# Codex review round 1
+
+
+def _with_inner_repository(estate, path: str) -> None:  # noqa: F811
+    """Another repository mapped at ``path`` in the live coordinator file."""
+    estate.volume["forge.yaml"] = estate.volume["forge.yaml"].replace(
+        "    checkouts/api_test: /var/lib/forge/projects/api_test\n",
+        f"    checkouts/api_test: /var/lib/forge/projects/api_test\n    guardkit/inner: {path}\n",
+    )
+
+
+@pytest.mark.parametrize("path", [
+    f"/var/lib/forge/projects/{LEAF}/inner",
+    f"/var/lib/forge/projects/{LEAF}/",
+    f"/var/lib/forge/projects/./{LEAF}",
+    f"/var/lib/forge//projects/{LEAF}/sub/../inner",
+])
+def test_r1_an_allowlist_entry_another_repository_is_under_stays(estate, path):  # noqa: F811
+    assert _register(KEY).exit_code == 0
+    _activate(estate, LEAF, SANDBOX_SETTINGS)
+    _with_inner_repository(estate, path)
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+    assert result.exit_code == 0, result.output
+    staged = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-unregister-pending"])
+    assert f"/var/lib/forge/projects/{LEAF}" in staged["permissions"]["filesystem"]["allowlist"]
+    assert KEY not in staged["planning"]["target_repo_paths"]
+    assert "guardkit/inner still uses it" in result.output
+
+
+def test_r1_a_sibling_whose_name_only_starts_the_same_does_not_keep_it(estate):  # noqa: F811
+    assert _register(KEY).exit_code == 0
+    _activate(estate, LEAF, SANDBOX_SETTINGS)
+    _with_inner_repository(estate, f"/var/lib/forge/projects/{LEAF}-two")
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+    assert result.exit_code == 0, result.output
+    staged = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-unregister-pending"])
+    assert f"/var/lib/forge/projects/{LEAF}" not in staged["permissions"]["filesystem"]["allowlist"]
+
+
+def test_r2_a_comment_inside_the_entry_is_refused_naming_its_line(estate):  # noqa: F811
+    assert _register(KEY).exit_code == 0
+    _activate(estate, LEAF, SANDBOX_SETTINGS)
+    lines = estate.volume["forge.yaml"].split("\n")
+    at = lines.index(f"    {KEY}:") + 2
+    lines.insert(at, "      # Why this project has the shared sandbox.")
+    estate.volume["forge.yaml"] = "\n".join(lines)
+    estate.writes.clear()
+
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+
+    assert result.exit_code == 1
+    assert f"planning.sandboxes's entry for {KEY} has comment lines inside it (line {at + 1} " in result.output
+    assert estate.writes == []
+
+
+def test_r2_comments_around_the_entry_are_kept(estate):  # noqa: F811
+    assert _register(KEY).exit_code == 0
+    _activate(estate, LEAF, SANDBOX_SETTINGS)
+    estate.volume["forge.yaml"] = estate.volume["forge.yaml"].replace(
+        f"    {KEY}:\n      name:", f"    # Added for the bench.\n    {KEY}:\n      name:"
+    )
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+    assert result.exit_code == 0, result.output
+    staged = estate.volume[f"forge.yaml.{LEAF}-unregister-pending"]
+    assert "    # Added for the bench.\n" in staged and "# A note after the last sandbox." in staged
+
+
+def _check_line(output: str, marker: str) -> str:
+    """The pipeline after ``docker logs ... 2>&1 |`` on the printed line with ``marker``."""
+    line = next(line for line in output.splitlines() if marker in line)
+    return line.split("2>&1 |", 1)[1]
+
+
+def test_r3_the_unregister_sequence_checks_the_route_is_gone_after_the_restart(estate, publisher_file):  # noqa: F811
+    assert _register(KEY, "--publish", "--publisher-settings", str(publisher_file)).exit_code == 0
+    _activate(estate, LEAF, SANDBOX_SETTINGS, publisher_file)
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS, "--publisher-settings", str(publisher_file))
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "lists the new route" not in out
+    assert "publisher_since=$(date -u +%Y-%m-%dT%H:%M:%SZ)" in out
+    assert 'docker logs --since "$publisher_since" forge-estate-forge-publisher-1' in out
+    assert "coordinator_since=$(date -u" in out and 'docker logs --since "$coordinator_since"' in out
+    # The restart comes after the drained check and the time mark, in one command.
+    lines = out.splitlines()
+    mark = next(i for i, line in enumerate(lines) if "publisher_since=$(" in line)
+    assert "--check-drained" in lines[mark - 1] and "docker restart forge-estate-forge-publisher-1" in lines[mark + 1]
+
+    # The check itself, run on made-up log lines.
+    check = _check_line(out, "$publisher_since")
+    gone = 'publisher: settings {"projects": {"guardkit/api_test": {"source": "x"}}}\n'
+    there = f'publisher: settings {{"projects": {{"{KEY}": {{"source": "x"}}}}}}\n'
+    def runs(log: str) -> int:
+        return subprocess.run(["bash", "-c", check], input=log, text=True, capture_output=True).returncode
+    assert runs(gone) == 0, "started, and the route is gone"
+    assert runs(there) == 1, "the route is still in the settings it loaded"
+    assert runs("") == 1, "no settings line since the restart: it did not start"
+    assert runs(there + gone) == 0, "only the newest settings line counts"
