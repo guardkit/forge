@@ -2881,6 +2881,38 @@ def check_confirmed_private(options: Options) -> Step:
 
 
 def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
+    """:func:`_register`, holding the sandbox open when the starter manages it.
+
+    One sandbox per project, stage S2 (design 2.3a): a sandbox the
+    coordinator's settings mark ``idle_stop`` may be stopped while idle, and
+    this command runs outside the coordinator, so before it touches the
+    sandbox it takes a hold at the starter (``until=services``: it needs only
+    the helper and runner) and ends it afterwards. A hold that cannot be taken
+    refuses the command in one plain sentence. Any other sandbox: unchanged.
+    """
+    from forge.sandbox_gate.holds import HoldRefused, managed_in_settings, starter_hold
+
+    text = VolumeStore(options.volume, run).read(SETTINGS_FILE_NAME)
+    try:
+        settings = yaml.safe_load(text) if text else None
+    except yaml.YAMLError:
+        settings = None  # _register refuses an unreadable file in its own words
+    url = managed_in_settings(settings if isinstance(settings, dict) else None, options.sandbox)
+    if url is None:
+        return _register(options, run, steps)
+    try:
+        with starter_hold(
+            url, options.sandbox, command="forge register-repo", until="services"
+        ):
+            steps.append(
+                Step("sandbox", "ok", f"{options.sandbox} is held open at the sandbox starter for this command")
+            )
+            return _register(options, run, steps)
+    except HoldRefused as exc:
+        raise Refused("sandbox", str(exc)) from None
+
+
+def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     """Steps 1–7: report lines go into ``steps``; returns the printed sequence.
 
     Every check and every read comes before the first write, so a refusal from

@@ -232,6 +232,16 @@ def _resolve_build_row(pool: Any, feature_id: str, build_id: str | None) -> Any:
 async def _arun(
     config: ForgeConfig, feature_id: str, build_id: str | None, dry_run: bool
 ) -> int:
+    """:func:`_arun_holding`, with any hold it takes ended on every way out."""
+    import contextlib
+
+    with contextlib.ExitStack() as holds:
+        return await _arun_holding(holds, config, feature_id, build_id, dry_run)
+
+
+async def _arun_holding(
+    holds: Any, config: ForgeConfig, feature_id: str, build_id: str | None, dry_run: bool
+) -> int:
     from forge.pipeline.merge_executor import (
         MergeExecutorDeps,
         _publication_store_for,
@@ -286,6 +296,27 @@ async def _arun(
             f"planning.target_repo_paths. Known keys: {known}"
         )
     repo_root = Path(paths[row.repo])
+
+    # A PROJECT'S OWN SANDBOX MAY BE STOPPED WHILE IDLE (one sandbox per
+    # project, stage S2, design 2.3a). This command runs outside the
+    # coordinator, so it holds the sandbox open at the starter before touching
+    # it, until the coordinator has brought any recorded deployment back: it
+    # deploys, so it never competes with a wake's redeploy. Nothing for a
+    # sandbox that is not managed.
+    from forge.sandbox_gate.holds import HoldRefused, hold_for_config
+
+    try:
+        holds.enter_context(
+            hold_for_config(
+                config,
+                row.repo,
+                command="forge merge-deploy",
+                until="deployed",
+                connection=getattr(pool, "connection", None),
+            )
+        )
+    except HoldRefused as exc:
+        raise click.ClickException(str(exc)) from exc
 
     # WHERE this repository's git happens (sandbox first, rule 89): inside its
     # sandbox when it has one, in this process when it has not.

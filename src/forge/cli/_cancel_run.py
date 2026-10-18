@@ -149,10 +149,8 @@ def execute_cancel(
     # runner from the configuration this command was given, else the global
     # runner); the runner's own cancel handler stops everything it owns.
     # Best effort — the cancel itself proceeds either way.
-    if build.status not in TERMINAL_STATES and not asyncio.run(
-        interrupt_recorded_run(
-            runtime.persistence, _selected_config(ctx), build.build_id
-        )
+    if build.status not in TERMINAL_STATES and not _interrupt_holding_the_sandbox(
+        runtime, _selected_config(ctx), build.build_id
     ):
         click.echo(
             f"forge cancel: {build.build_id} — could not reach its runner; "
@@ -168,6 +166,42 @@ def execute_cancel(
     )
     click.echo(f"Cancelled {build.build_id}: {outcome.status.value}")
     click.echo(outcome.rationale)
+
+
+def _interrupt_holding_the_sandbox(runtime: Any, config: Any, build_id: str) -> bool:
+    """Interrupt the recorded run, holding its sandbox open meanwhile.
+
+    One sandbox per project, stage S2 (design 2.3a): a sandbox the starter
+    manages may be stopped while idle, and this command runs outside the
+    coordinator, so it holds the sandbox open at the starter (``until=
+    services``) while it reaches the runner. A sandbox with an unfinished
+    build is never stopped, so this only matters after a restart; a hold that
+    cannot be taken refuses the cancel in one sentence. Any other sandbox:
+    unchanged.
+    """
+    from forge.sandbox_gate.holds import HoldRefused, hold_for_config
+
+    connection = getattr(runtime.persistence, "connection", None)
+    try:
+        row = connection.execute(
+            "SELECT repo FROM builds WHERE build_id = ?", (build_id,)
+        ).fetchone() if connection is not None else None
+        repo = str(row[0]) if row is not None and row[0] else None
+    except Exception:  # noqa: BLE001 — the interrupt reads it again itself
+        repo = None
+    try:
+        with hold_for_config(
+            config,
+            repo,
+            command="forge cancel",
+            until="services",
+            connection=connection,
+        ):
+            return asyncio.run(
+                interrupt_recorded_run(runtime.persistence, config, build_id)
+            )
+    except HoldRefused as exc:
+        _refuse(f"{build_id} — {exc}")
 
 
 def _refuse(message: str) -> NoReturn:

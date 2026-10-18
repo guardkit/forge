@@ -48,6 +48,10 @@
 #                     sandbox is uniquely stopped and leave item 9 unchecked
 #   SANDBOX_NAMES in the env file lists further sandboxes (one per project);
 #                     item 9 then asks each of them as well as SANDBOX_NAME
+#   SANDBOX_STARTER_URL and STARTER_SANDBOXES in the env file name the sandbox
+#                     starter and the sandboxes it manages; item 9 holds such a
+#                     sandbox open while it asks, and reports a stopped one as
+#                     "stopped (managed)" without waking it
 #   --items           print the item list and stop
 # ---------------------------------------------------------------------------
 set -uo pipefail
@@ -1494,6 +1498,75 @@ probe_one_sandbox() {
     fi
 }
 
+# BEGIN managed sandbox probe
+# A SANDBOX THE STARTER MANAGES (one sandbox per project, stage S2, design
+# 2.3a, 18 October 2026). The starter stops a project's own sandbox while its
+# project is idle and starts it when work arrives. SANDBOX_STARTER_URL in the
+# env file is the starter's address and STARTER_SANDBOXES the names it manages
+# (its own list). For such a sandbox this check never wakes it: a stopped one
+# is reported "stopped (managed)" and not asked. A running one is held open at
+# the starter for the probe (until=services) and the hold is ended after, so
+# an idle stop cannot land in the middle of it. Without an answer from the
+# starter the sandbox is not touched. Any hold older than a day is reported,
+# so a session can look and end it: holds never expire by themselves.
+starter_manages() {
+    local name="$1" url list
+    url="$(get SANDBOX_STARTER_URL)"
+    list=" $(get STARTER_SANDBOXES | tr ',' ' ') "
+    [ -n "${url}" ] || return 1
+    case "${list}" in *" ${name} "*) return 0 ;; esac
+    return 1
+}
+
+probe_managed_sandbox() {
+    local name="$1" url status facts container old note answer hold_id
+    url="$(get SANDBOX_STARTER_URL)"
+    url="${url%/}"
+    if ! status="$(curl -sf --max-time 30 "${url}/status/${name}" 2>/dev/null)"; then
+        found fail "the sandbox '${name}' is started and stopped by the sandbox starter, and the starter at ${url} did not answer, so the sandbox was not touched."
+        return
+    fi
+    facts="$(printf '%s' "${status}" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+state = (d.get("container") or {}).get("state") or "unknown"
+old = [h for h in d.get("holds") or [] if int(h.get("age_seconds") or 0) > 86400]
+print(state, ";".join("%s(%s)" % (h.get("id"), str(h.get("owner") or "").replace(" ", "_")) for h in old) or "-")
+' 2>/dev/null)"
+    read -r container old <<< "${facts}"
+    if [ -z "${container}" ]; then
+        found fail "the sandbox starter's status for '${name}' could not be read, so the sandbox was not touched."
+        return
+    fi
+    note=""
+    if [ -n "${old}" ] && [ "${old}" != "-" ]; then
+        note=" A hold older than a day is open at the starter for '${name}' (${old}); holds never expire, so a session should look and end it (DELETE /hold/<id>)."
+    fi
+    if [ "${container}" != "running" ]; then
+        found unchecked "stopped (managed): the sandbox '${name}' is stopped by the sandbox starter while its project is idle, so it was not woken to be asked.${note}"
+        return
+    fi
+    answer="$(curl -s --max-time 700 -X POST "${url}/hold/${name}?owner=estate-check&until=services" 2>/dev/null)"
+    hold_id="$(printf '%s' "${answer}" | python3 -c 'import json, sys; print(json.load(sys.stdin).get("hold_id") or "")' 2>/dev/null)"
+    if [ -z "${hold_id}" ]; then
+        found fail "the sandbox '${name}' is started and stopped by the sandbox starter, and it could not be held open for this check (${answer:-no answer}), so it was not touched.${note}"
+        return
+    fi
+    probe_one_sandbox "${name}"
+    curl -s --max-time 30 -X DELETE "${url}/hold/${hold_id}" >/dev/null 2>&1
+    ONE_SAID="${ONE_SAID}${note}"
+}
+
+probe_sandbox() {
+    local name="$1"
+    if [ -n "${name}" ] && [ "${name}" != "${RETAINED_SANDBOX}" ] && starter_manages "${name}"; then
+        probe_managed_sandbox "${name}"
+    else
+        probe_one_sandbox "${name}"
+    fi
+}
+# END managed sandbox probe
+
 # ITEM 9 OVER EVERY SANDBOX (17 October 2026, one sandbox per project). The
 # sandboxes are SANDBOX_NAME, as before, and any others SANDBOX_NAMES lists
 # (space or comma separated). With only SANDBOX_NAME, the item is word for word
@@ -1505,14 +1578,14 @@ check_from_inside_a_sandbox() {
     first="$(get SANDBOX_NAME)"
     others="$(get SANDBOX_NAMES)"
     if [ -z "${others}" ]; then
-        probe_one_sandbox "${first}"
+        probe_sandbox "${first}"
         "${ONE_VERDICT}" 9 "${ONE_SAID}"
         return
     fi
     for name in ${first} ${others//,/ }; do
         case "${listed}" in *" ${name} "*) continue ;; esac
         listed="${listed}${name} "
-        probe_one_sandbox "${name}"
+        probe_sandbox "${name}"
         case "${ONE_VERDICT}" in
             fail) verdict="fail" ;;
             unchecked) [ "${verdict}" = "fail" ] || verdict="unchecked" ;;
