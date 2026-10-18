@@ -388,17 +388,19 @@ the same pinned image as the model door's, held to `estate-pins.conf`.
    port>/`, written as the address itself (`forge register-repo --slot <k>`
    writes it). The single `planning.git_door` is for an
    estate with one sandbox, and is left unset once any sandbox has its own.
-6. The same entry names the sandbox's own review-preview ports,
-   `preview_ports: [8950+10k, 8951+10k]` (`register-repo --slot <k>` writes
-   them; running it again adds them to an entry registered before 18 October
-   2026 and changes nothing else). A preview of that repository listens only
-   on those ports, and its card's link is `https://<review_preview.public_host>:<port>`.
-   A deploy profile whose preview slots name any other port is refused with a
-   plain reason; so is a sandbox of its own whose entry names none. The shared
-   sandbox names none and keeps its profiles' ports, except a port another
-   sandbox names. Whatever serves `public_host` must forward each slot's two
-   preview ports to the sandbox machine's loopback, as it does the shared
-   sandbox's 8950 and 8951.
+6. The same entry, in the coordinator's and the sandbox's settings, names the
+   sandbox's own review-preview ports, `preview_ports: [8950+10k, 8951+10k]`
+   (`register-repo --slot <k>` writes them; running it again adds them to an
+   entry registered before 18 October 2026 and changes nothing else). They
+   replace the published ports in the project's deploy profile, which cannot
+   know its sandbox: preview slot *i* uses the *i*-th port with the profile's
+   own internal port, there are as many slots as the smaller of the two
+   counts, and the card's link is `https://<review_preview.public_host>:<port>`.
+   A sandbox of its own whose entry names none is refused with a plain reason.
+   The shared sandbox names none and keeps its profiles' ports, except a port
+   another sandbox names. Whatever serves `public_host` must forward each
+   slot's two preview ports to the sandbox machine's loopback, as it does the
+   shared sandbox's 8950 and 8951.
 
 **Adding a repository.** In this order, because register-repo reads the
 repository through the door and stops if the door refuses it:

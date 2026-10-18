@@ -135,7 +135,7 @@ __all__ = [
     "UnavailableReviewPreview",
     "build_review_preview_service",
     "is_slots_busy",
-    "sandbox_preview_port_refusal",
+    "sandbox_preview",
     "serve_preview_operation",
     "slots_busy_reason",
 ]
@@ -420,52 +420,67 @@ def _ports_text(ports: Sequence[int]) -> str:
     return ", ".join(named[:-1]) + f" and {named[-1]}"
 
 
-def sandbox_preview_port_refusal(
+def sandbox_preview(
     project: str,
     preview: "DeployPreview",
     sandboxes: Mapping[str, Any],
-) -> str | None:
-    """Why ``project``'s previews may not use its profile's ports, or None.
+) -> "tuple[DeployPreview | None, str | None]":
+    """``project``'s preview with its own sandbox's slots, or ``(None, why)``.
 
     One sandbox per project (18 October 2026): every sandbox publishes its
     previews on the same machine, and a card's link opens
     ``https://<public host>:<port>``, so a preview listening on a port its own
     sandbox does not publish is unreachable, and its link opens whichever
-    sandbox does publish that port. The rule, with ``sandboxes`` the
-    ``planning.sandboxes`` mapping (repository key to entry):
+    sandbox does publish that port. A project's profile cannot know which
+    sandbox it lands in, so the sandbox decides the published ports. With
+    ``sandboxes`` the ``planning.sandboxes`` mapping (repository key to entry):
 
-    * a sandbox that names its own ``preview_ports`` previews only on them:
-      every port the project's profile gives a slot must be one of them;
+    * a sandbox that names its own ``preview_ports`` replaces the profile's
+      published ports with them: slot *i* uses ``preview_ports[i]`` and keeps
+      the profile's internal port, there are as many slots as the smaller of
+      the profile's slot count and the sandbox's port count, and the link is
+      always ``https://<review_preview.public_host>:<that port>`` (a
+      ``public_url`` in the profile names a port the profile cannot know, so
+      it is not used). An internal port equal to one of those ports is
+      refused, since both would listen in one machine;
     * a sandbox of its own (one with a Git door of its own) that names none
       is refused: its ports are not recorded, so none is safe to use;
-    * any other sandbox (the shared one) uses its profiles' ports as before,
-      except a port another sandbox names as its own.
+    * any other sandbox (the shared one) keeps the profile exactly as it is,
+      except that a port another sandbox names as its own is refused.
 
-    A repository with no sandbox entry answers None here; the preparation
-    refuses it on its own terms.
+    A repository with no sandbox entry keeps the profile as it is; the
+    preparation refuses it on its own terms.
     """
+    from dataclasses import replace as _replace
+
+    from forge.deploy.profile import PreviewSlot
+
     entry = sandboxes.get(project)
     if entry is None:
-        return None
+        return preview, None
     name = str(getattr(entry, "name", "") or "")
-    wanted = [int(slot.port) for slot in preview.slots]
     own = [int(p) for p in (getattr(entry, "preview_ports", None) or [])]
     if own:
-        wrong = [p for p in wanted if p not in own]
-        if wrong:
-            return (
-                f"{project}'s deploy profile gives its preview port "
-                f"{_ports_text(wrong)}, but its sandbox {name} publishes previews "
-                f"only on {_ports_text(own)}, so no preview is started; the "
-                "profile's preview slots must use its sandbox's ports"
+        slots = tuple(
+            PreviewSlot(port=port, internal_port=slot.internal_port)
+            for slot, port in zip(preview.slots, own)
+        )
+        published = {slot.port for slot in slots}
+        inside = [slot.internal_port for slot in slots if slot.internal_port in published]
+        if inside:
+            return None, (
+                f"{project}'s deploy profile gives a preview internal port "
+                f"{_ports_text(inside)}, which its sandbox {name} publishes as a "
+                "preview port, so no preview is started; the profile's internal "
+                "ports must differ from its sandbox's preview ports"
             )
-        return None
+        return _replace(preview, slots=slots), None
     if getattr(entry, "git_door", None):
-        return (
+        return None, (
             f"{project}'s sandbox {name} has no preview ports recorded in the "
-            "coordinator's settings, so no preview is started (it would listen "
-            "on a port the sandbox may not publish); register the project again "
-            "with forge register-repo --slot to record them"
+            "settings, so no preview is started (it would listen on a port the "
+            "sandbox may not publish); register the project again with forge "
+            "register-repo --slot to record them"
         )
     taken: dict[int, str] = {}
     for other in sandboxes.values():
@@ -474,15 +489,15 @@ def sandbox_preview_port_refusal(
             continue
         for port in getattr(other, "preview_ports", None) or []:
             taken.setdefault(int(port), other_name)
-    clashes = [p for p in wanted if p in taken]
+    clashes = [int(slot.port) for slot in preview.slots if int(slot.port) in taken]
     if clashes:
         owner = taken[clashes[0]]
-        return (
+        return None, (
             f"{project}'s deploy profile gives its preview port "
             f"{_ports_text(clashes)}, which the sandbox {owner} publishes for its "
             f"own previews, so no preview is started in {name}"
         )
-    return None
+    return preview, None
 
 
 def _new_lease_id() -> str:
@@ -1809,7 +1824,7 @@ class ReviewPreviewService:
         self._store = store
         #: ``planning.sandboxes`` (18 October 2026), asked at each preparation:
         #: a sandbox's previews use only that sandbox's own preview ports
-        #: (:func:`sandbox_preview_port_refusal`). ``None`` checks nothing.
+        #: (:func:`sandbox_preview`). ``None`` keeps every profile as it is.
         self._sandboxes = sandboxes
         #: ``review_preview.max_app_ttl_minutes`` (16 October 2026): a cap on
         #: a preview's lifetime below the profile's whole hours, for a proof
@@ -1876,7 +1891,8 @@ class ReviewPreviewService:
         _profile, preview, unreadable = await asyncio.to_thread(self._preview_of, project)
         if unreadable is not None or preview is None:
             return True
-        if self._port_refusal(project, preview) is not None:
+        preview, refused = self._sandbox_preview(project, preview)
+        if refused is not None or preview is None:
             # Its ports are refused: the preparation runs and says so.
             return True
         return self._store.has_room(
@@ -1912,11 +1928,13 @@ class ReviewPreviewService:
         except Exception:  # noqa: BLE001 — a release never raises
             logger.exception("review preview: releasing run %s raised", run_id)
 
-    def _port_refusal(self, project: str, preview: "DeployPreview") -> str | None:
-        """Why this project's previews may not use its profile's ports, or None."""
+    def _sandbox_preview(
+        self, project: str, preview: "DeployPreview"
+    ) -> "tuple[DeployPreview | None, str | None]":
+        """The preview with its sandbox's own slots, or ``(None, why)``."""
         if self._sandboxes is None:
-            return None
-        return sandbox_preview_port_refusal(project, preview, self._sandboxes() or {})
+            return preview, None
+        return sandbox_preview(project, preview, self._sandboxes() or {})
 
     def _public_url_of(self, slot: "PreviewSlot") -> str | None:
         """Where a reviewer opens this slot: the profile's own ``public_url``
@@ -2032,9 +2050,12 @@ class ReviewPreviewService:
             return early(f"could not read the deploy profile ({unreadable})")
         if profile is None or preview is None:
             return early("the project's deploy profile has no preview switched on")
-        refused_ports = self._port_refusal(req.project, preview)
-        if refused_ports is not None:
-            return early(refused_ports)
+        # The sandbox's own published ports replace the profile's (18 October
+        # 2026); from here on every slot, port and link is the sandbox's.
+        own_preview, refused_ports = self._sandbox_preview(req.project, preview)
+        if refused_ports is not None or own_preview is None:
+            return early(refused_ports or "the preview has no slots in its sandbox")
+        preview = own_preview
         for preview_slot in preview.slots:
             if self._public_url_of(preview_slot) is None:
                 return early(

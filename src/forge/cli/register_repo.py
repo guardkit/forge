@@ -211,7 +211,7 @@ COORDINATOR_PROJECT_RECEIPTS: str = "/var/lib/forge-project-receipts"
 #: its two addresses are the same for every project in the shared sandbox.
 REFERENCE_PROJECT: str = "guardkit/api_test"
 
-#: The lines of a sandbox of its own's coordinator entry that a later release
+#: The lines of a sandbox of its own's entries that a later release
 #: added, in the order they are written: the memory grant (18 October 2026,
 #: design section 2.4a) and the sandbox's preview ports (18 October 2026). A
 #: project registered before them is given them by running again, and nothing
@@ -2490,7 +2490,7 @@ class Options:
     #: settings files are given (name, helper, runner, Git door). ``None`` =
     #: the shared sandbox, whose entry is copied from api_test's.
     slot: SlotPorts | None = None
-    sandbox_entry: dict[str, str] | None = None
+    sandbox_entry: dict[str, Any] | None = None
     #: The coordinator's copy of that entry also names the project's own
     #: receipts folder as the coordinator sees it (design section 2.2a).
     coordinator_entry: dict[str, Any] | None = None
@@ -2712,7 +2712,7 @@ def resolve_options(
         port = DEFAULT_GIT_EXPORT_PORT if git_export_port is None else git_export_port
         publish_source = f"git://{gateway}:{port}/{clone_folder}/{PROJECTS_FOLDER}/{leaf}"
 
-    sandbox_entry: dict[str, str] | None = None
+    sandbox_entry: dict[str, Any] | None = None
     if ports is not None:
         address = (sandbox_address or _env_value(estate_values, ESTATE_ENV_SANDBOX_ADDRESS) or gateway).strip()
         if not _a_plain_address(address):
@@ -2730,6 +2730,10 @@ def resolve_options(
             "sidecar_url": f"http://{address}:{ports.helper}",
             "runner_url": f"http://{address}:{ports.runner}",
             "git_door": f"http://{gateway}:{ports.git_door}/",
+            # The sandbox's own preview ports (18 October 2026), in both
+            # files: the coordinator gives its previews these ports and
+            # links, and the sandbox's link check reaches only these.
+            "preview_ports": list(ports.previews),
         }
 
     env_text = str(estate_env_file) if estate_env_file is not None else "$ESTATE_ENV"
@@ -2758,16 +2762,9 @@ def resolve_options(
         slot=ports,
         sandbox_entry=sandbox_entry,
         sandbox_ssh=sandbox_ssh,
-        # The coordinator's copy also names the sandbox's own preview ports
-        # (18 October 2026): its previews listen only there, and its cards'
-        # links name them. The sandbox's own file needs neither line.
         coordinator_entry=(
-            {
-                **sandbox_entry,
-                "receipts_root": str(receipts_root).rstrip("/"),
-                "preview_ports": list(ports.previews),
-            }
-            if sandbox_entry is not None and ports is not None
+            {**sandbox_entry, "receipts_root": str(receipts_root).rstrip("/")}
+            if sandbox_entry is not None
             else None
         ),
         route_keys_dir=estate_values.get(ESTATE_ENV_ROUTE_KEYS_DIR) or None,

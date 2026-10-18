@@ -6,12 +6,14 @@ shared sandbox's port, because every preview took its ports from its
 project's deploy profile. Its preview listened on a port its sandbox does not
 publish, and its card's link opened the shared sandbox's preview instead.
 
-The rule these tests hold to (:func:`sandbox_preview_port_refusal`): a
-sandbox that names its own ``preview_ports`` previews only on them, so its
-slots never come from another sandbox's pool; a profile naming any other port
-is refused in plain words before anything starts; a sandbox of its own that
-names none is refused; and the shared sandbox keeps its profiles' ports
-exactly as before, except a port another sandbox names as its own.
+The rule these tests hold to (:func:`sandbox_preview`): a project's profile
+cannot know which sandbox it lands in, so a sandbox that names its own
+``preview_ports`` REPLACES the profile's published ports with them. Slot *i*
+uses ``preview_ports[i]`` and keeps the profile's internal port; there are as
+many slots as the smaller of the two counts; the card's link names the
+sandbox's port. A sandbox of its own that names none is refused; the shared
+sandbox keeps its profiles exactly as before, except a port another sandbox
+names as its own. The sandbox's own link check reaches the same ports.
 
 Everything is a fake: the venues, the deploy dispatch and the clock (the
 same fakes as ``test_review_preview.py``). Every name and address is made up.
@@ -36,7 +38,7 @@ from forge.deploy.review_preview import (
     ReviewPreviewService,
     build_review_preview_service,
     is_slots_busy,
-    sandbox_preview_port_refusal,
+    sandbox_preview,
 )
 from forge.lifecycle import migrations
 from tests.forge.deploy.test_review_preview import (
@@ -77,9 +79,11 @@ LATE_ENTRY = SandboxEntry(
 SANDBOXES = {SHARED: SHARED_ENTRY, PRIVATE: PRIVATE_ENTRY, LATE: LATE_ENTRY}
 
 
-def _profile(env_id: str, ports: tuple[int, int]):
-    """A profile with two slots and no public_url, so the link comes from
-    ``review_preview.public_host`` and the slot's port."""
+def _profile(env_id: str, ports: tuple[int, ...], *, internal: tuple[int, ...] | None = None, **extra: Any):
+    """A profile with one slot per port and no public_url, so the link comes
+    from ``review_preview.public_host`` and the slot's port. Internal ports
+    are 10000 above the published ones unless given."""
+    inside = internal or tuple(port + 10000 for port in ports)
     return parse_deploy_profile(
         {
             "env_id": env_id,
@@ -87,8 +91,8 @@ def _profile(env_id: str, ports: tuple[int, int]):
             "preview": {
                 "enabled": True,
                 "slots": [
-                    {"port": ports[0], "internal_port": ports[0] + 10000},
-                    {"port": ports[1], "internal_port": ports[1] + 10000},
+                    {"port": port, "internal_port": inner, **extra}
+                    for port, inner in zip(ports, inside)
                 ],
             },
         }
@@ -126,7 +130,8 @@ class Estate:
         self.dispatch = FakeDispatch()
         self.profiles = {
             SHARED: _profile("shared", (8950, 8951)),
-            PRIVATE: _profile("private", (8960, 8961)),
+            # As the live fixture: its profile names the shared ports.
+            PRIVATE: _profile("private", (8950, 8951)),
             LATE: _profile("late", (8970, 8971)),
         }
         self.store = PreviewLeaseStore(connection)
@@ -173,6 +178,7 @@ def _link(evidence: Any) -> str:
 async def test_two_sandboxes_previewing_at_once_each_get_their_own_port_and_slot(
     estate: Estate,
 ) -> None:
+    """Both profiles name 8950/8951; the project in slot 1 previews on 8960."""
     shared, private = await asyncio.gather(
         estate.service.prepare(_request(SHARED, "build-s1", "FEAT-5001")),
         estate.service.prepare(_request(PRIVATE, "build-p1", "FEAT-9001")),
@@ -185,13 +191,31 @@ async def test_two_sandboxes_previewing_at_once_each_get_their_own_port_and_slot
     # The card links name those ports, never the other sandbox's.
     assert _link(shared) == f"https://{PUBLIC_HOST}:8950/"
     assert _link(private) == f"https://{PUBLIC_HOST}:8960/"
-    # The private project's preview listens on its sandbox's published port,
-    # and its link check asks that port, in its own sandbox only.
+    # The project is handed its sandbox's published port and the profile's own
+    # internal port, and its link check asks that port, in its own sandbox.
     (up, _journey) = estate.calls_for(PRIVATE)
     assert up["issued_env"]["FACTORY_PREVIEW_PORT"] == "8960"
+    assert up["issued_env"]["FACTORY_PREVIEW_INTERNAL_PORT"] == "18950"
     assert up["issued_env"]["FACTORY_PREVIEW_URL"] == f"https://{PUBLIC_HOST}:8960"
+    assert up["issued_env"]["COMPOSE_PROJECT_NAME"] == "private-pv0"
     assert [port for _lease, port, _token in estate.venues[PRIVATE].named("probe")] == [8960]
     assert [port for _lease, port, _token in estate.venues[SHARED].named("probe")] == [8950]
+
+
+@pytest.mark.asyncio
+async def test_a_slot_one_project_previews_on_8960_while_the_shared_one_holds_8950(
+    estate: Estate,
+) -> None:
+    """The live case: a shared preview is ready on 8950 when the slot-1
+    project, whose profile still names 8950 and 8951, asks for one."""
+    assert (await estate.service.prepare(_request(SHARED, "build-s1", "FEAT-5001"))).state == "ready"
+    private = await estate.service.prepare(_request(PRIVATE, "build-p1", "FEAT-9001"))
+    assert private.state == "ready", private.failure_reason
+    assert private.app_url == f"https://{PUBLIC_HOST}:8960/?preview=the-right-token"
+    assert sorted((lease.project, lease.port) for lease in estate.store.live()) == [
+        (PRIVATE, 8960),
+        (SHARED, 8950),
+    ]
 
 
 @pytest.mark.asyncio
@@ -209,11 +233,49 @@ async def test_a_full_sandbox_never_takes_or_blocks_another_sandbox_s_slots(
         f"https://{PUBLIC_HOST}:8961/",
     )
     # Now both are full, and each names only its own holders.
+    assert not await estate.service.has_room(PRIVATE, build_id="build-p3", make_room=False)
     third = await estate.service.prepare(_request(PRIVATE, "build-p3", "FEAT-9003"))
     assert third.state == "failed" and is_slots_busy(third.failure_reason)
     assert third.failure_reason == "both preview slots are in use by FEAT-9001 and FEAT-9002"
     ports = sorted(lease.port for lease in estate.store.live())
     assert ports == [8950, 8951, 8960, 8961]
+
+
+# ---------------------------------------------------------------------------
+# How many slots
+
+
+@pytest.mark.asyncio
+async def test_a_profile_with_more_slots_than_the_sandbox_has_ports_gets_only_as_many(
+    estate: Estate,
+) -> None:
+    estate.profiles[PRIVATE] = _profile("private", (8950, 8951, 8952))
+    previews = [
+        await estate.service.prepare(_request(PRIVATE, f"build-p{n}", f"FEAT-900{n}"))
+        for n in (1, 2, 3)
+    ]
+    assert [p.state for p in previews] == ["ready", "ready", "failed"]
+    assert [_link(p) for p in previews[:2]] == [
+        f"https://{PUBLIC_HOST}:8960/",
+        f"https://{PUBLIC_HOST}:8961/",
+    ]
+    assert previews[2].failure_reason == "both preview slots are in use by FEAT-9001 and FEAT-9002"
+    assert sorted(lease.port for lease in estate.store.live()) == [8960, 8961]
+
+
+def test_a_profile_with_fewer_slots_than_the_sandbox_has_ports_keeps_its_count() -> None:
+    own, refused = sandbox_preview(PRIVATE, _profile("p", (8950,)).preview, SANDBOXES)
+    assert refused is None
+    assert [(s.port, s.internal_port) for s in own.slots] == [(8960, 18950)]
+
+
+def test_a_profile_s_public_url_is_not_used_in_a_sandbox_of_its_own() -> None:
+    """It names a port the profile cannot know; the link comes from the
+    coordinator's public host and the sandbox's port."""
+    profile = _profile("p", (8950, 8951), public_url="https://preview.example.test:8950")
+    own, refused = sandbox_preview(PRIVATE, profile.preview, SANDBOXES)
+    assert refused is None
+    assert [(s.port, s.public_url) for s in own.slots] == [(8960, None), (8961, None)]
 
 
 # ---------------------------------------------------------------------------
@@ -250,10 +312,16 @@ async def test_the_shared_sandbox_previews_exactly_as_without_the_rule(
     ]
 
 
-def test_the_shared_sandbox_keeps_its_profile_s_ports() -> None:
-    assert sandbox_preview_port_refusal(SHARED, _profile("s", (8950, 8951)).preview, SANDBOXES) is None
-    # Any port nobody claims, as before.
-    assert sandbox_preview_port_refusal(SHARED, _profile("s", (9950, 9951)).preview, SANDBOXES) is None
+def test_the_shared_sandbox_keeps_its_profile_exactly() -> None:
+    for ports in ((8950, 8951), (9950, 9951)):
+        preview = _profile("s", ports, public_url=f"https://preview.example.test:{ports[0]}").preview
+        own, refused = sandbox_preview(SHARED, preview, SANDBOXES)
+        assert refused is None and own is preview, "the very same profile, untouched"
+
+
+def test_a_repository_without_a_sandbox_entry_keeps_its_profile() -> None:
+    preview = _profile("x", (8950, 8951)).preview
+    assert sandbox_preview("acme/elsewhere", preview, SANDBOXES) == (preview, None)
 
 
 # ---------------------------------------------------------------------------
@@ -261,52 +329,15 @@ def test_the_shared_sandbox_keeps_its_profile_s_ports() -> None:
 
 
 @pytest.mark.asyncio
-async def test_a_profile_naming_ports_its_sandbox_does_not_publish_is_refused_plainly(
-    estate: Estate,
-) -> None:
-    """The live case: the project's profile still names the shared ports."""
-    held = await estate.service.prepare(_request(SHARED, "build-s1", "FEAT-5001"))
-    assert held.state == "ready"
-    estate.profiles[PRIVATE] = _profile("private", (8950, 8951))
-
-    # A Rebuild press is not told "busy": the preparation runs and says why.
-    assert await estate.service.has_room(PRIVATE, build_id="build-p1", make_room=True)
-    refused = await estate.service.prepare(_request(PRIVATE, "build-p1", "FEAT-9001"))
-
-    assert refused.state == "failed"
-    assert refused.failure_reason == (
-        "acme/private-notes's deploy profile gives its preview port 8950 and 8951, "
-        "but its sandbox private-notes publishes previews only on 8960 and 8961, so "
-        "no preview is started; the profile's preview slots must use its sandbox's ports"
-    )
-    assert refused.app_url is None
-    # Nothing was joined, held or started in the private sandbox, and the
-    # shared sandbox's preview on 8950 is untouched.
-    assert estate.venues[PRIVATE].calls == []
-    assert [(lease.project, lease.port, lease.state) for lease in estate.store.live()] == [
-        (SHARED, 8950, "ready")
-    ]
-    assert estate.calls_for(PRIVATE) == []
-
-
-@pytest.mark.asyncio
-async def test_one_port_outside_the_sandbox_s_ports_is_refused(estate: Estate) -> None:
-    estate.profiles[PRIVATE] = _profile("private", (8960, 8962))
-    refused = await estate.service.prepare(_request(PRIVATE, "build-p1", "FEAT-9001"))
-    assert refused.state == "failed"
-    assert "preview port 8962," in refused.failure_reason
-    assert "only on 8960 and 8961" in refused.failure_reason
-
-
-@pytest.mark.asyncio
 async def test_a_sandbox_of_its_own_without_recorded_ports_is_refused(estate: Estate) -> None:
+    assert await estate.service.has_room(LATE, build_id="build-l1", make_room=True)
     refused = await estate.service.prepare(_request(LATE, "build-l1", "FEAT-7001"))
     assert refused.state == "failed"
     assert refused.failure_reason == (
         "acme/registered-before's sandbox registered-before has no preview ports "
-        "recorded in the coordinator's settings, so no preview is started (it would "
-        "listen on a port the sandbox may not publish); register the project again "
-        "with forge register-repo --slot to record them"
+        "recorded in the settings, so no preview is started (it would listen on a "
+        "port the sandbox may not publish); register the project again with forge "
+        "register-repo --slot to record them"
     )
     assert estate.venues[LATE].calls == []
     assert estate.store.live() == []
@@ -325,12 +356,24 @@ async def test_the_shared_sandbox_may_not_take_another_sandbox_s_port(estate: Es
     assert estate.venues[SHARED].calls == []
 
 
-def test_a_repository_without_a_sandbox_entry_is_left_to_the_preparation() -> None:
-    assert sandbox_preview_port_refusal("acme/elsewhere", _profile("x", (8950, 8951)).preview, SANDBOXES) is None
+@pytest.mark.asyncio
+async def test_an_internal_port_that_is_one_of_the_sandbox_s_ports_is_refused(
+    estate: Estate,
+) -> None:
+    estate.profiles[PRIVATE] = _profile("private", (8950, 8951), internal=(8961, 18951))
+    refused = await estate.service.prepare(_request(PRIVATE, "build-p1", "FEAT-9001"))
+    assert refused.state == "failed"
+    assert refused.failure_reason == (
+        "acme/private-notes's deploy profile gives a preview internal port 8961, "
+        "which its sandbox private-notes publishes as a preview port, so no preview "
+        "is started; the profile's internal ports must differ from its sandbox's "
+        "preview ports"
+    )
+    assert estate.venues[PRIVATE].calls == []
 
 
 # ---------------------------------------------------------------------------
-# The production composition reads planning.sandboxes
+# The production composition, and the sandbox's own link check
 
 
 @pytest.mark.asyncio
@@ -355,12 +398,54 @@ async def test_the_production_service_takes_the_ports_from_planning_sandboxes(
             max_app_ttl_minutes=None,
         ),
     )
-    service = build_review_preview_service(
-        config, connection=connection, deploy_dispatcher=FakeDispatch()
-    )
-    # The profile is read from the sandbox in production; here it is the
-    # live case's profile, naming the shared sandbox's ports.
+    dispatch = FakeDispatch()
+    service = build_review_preview_service(config, connection=connection, deploy_dispatcher=dispatch)
+    # The profile and the venue are the sandbox's in production; here the
+    # profile is the live case's, naming the shared sandbox's ports.
+    venue = FakeVenue()
     service._profile_reader = lambda project: _profile("private", (8950, 8951))
-    refused = await service.prepare(_request(PRIVATE, "build-p1", "FEAT-9001"))
-    assert refused.state == "failed"
-    assert "publishes previews only on 8960 and 8961" in refused.failure_reason
+    service._venue_for = lambda project: venue
+    service._repo_paths = {PRIVATE: "/clone"}
+    service._token_factory = lambda: "the-right-token"
+    evidence = await service.prepare(_request(PRIVATE, "build-p1", "FEAT-9001"))
+    assert evidence.state == "ready", evidence.failure_reason
+    assert _link(evidence) == f"https://{PUBLIC_HOST}:8960/"
+    assert dispatch.calls[0]["issued_env"]["FACTORY_PREVIEW_PORT"] == "8960"
+
+
+@pytest.mark.parametrize(
+    "repo, entry, ports",
+    [
+        (PRIVATE, PRIVATE_ENTRY, {8960, 8961}),
+        (SHARED, SHARED_ENTRY, {8950, 8951}),
+        (LATE, LATE_ENTRY, set()),
+    ],
+)
+def test_the_sandbox_s_link_check_reaches_the_ports_its_previews_use(
+    monkeypatch: pytest.MonkeyPatch, repo: str, entry: SandboxEntry, ports: set[int]
+) -> None:
+    """Inside the sandbox, the link check is allowed exactly the ports the
+    coordinator gives the previews: the sandbox's own when it names them."""
+    from forge.deploy_sidecar import service
+
+    seen: dict[str, Any] = {}
+
+    def capture(route, payload, *, repo_path, slot_ports):
+        seen["ports"] = set(slot_ports)
+        return 200, {}
+
+    monkeypatch.setattr(service, "sidecar_is_inside_sandbox", lambda: True)
+    monkeypatch.setattr(
+        service, "profile_at_commit", lambda path: (_profile("p", (8950, 8951)), None)
+    )
+    monkeypatch.setattr(service, "serve_preview_operation", capture)
+    config = SimpleNamespace(
+        planning=PlanningConfig.model_validate(
+            {"target_repo_paths": {repo: "/clone"}, "sandboxes": {repo: entry.model_dump()}}
+        )
+    )
+    status, _body = service.process_preview_request(
+        "/preview/probe", {"repo": repo, "lease_id": "pv000000000001"}, config=config
+    )
+    assert status == 200
+    assert seen["ports"] == ports

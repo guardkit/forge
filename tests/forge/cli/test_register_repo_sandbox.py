@@ -59,20 +59,16 @@ ENTRY = {
     "sidecar_url": f"http://{SANDBOX_ADDRESS}:8935",
     "runner_url": f"http://{SANDBOX_ADDRESS}:8934",
     "git_door": DOOR,
+    #: The sandbox's own preview ports, slot 1's 8960 and 8961 (18 October
+    #: 2026), in both files.
+    "preview_ports": [8960, 8961],
 }
 #: The project's own receipts folder, as the coordinator sees it (design
 #: section 2.2a): in the coordinator's entry only.
 RECEIPTS = f"/var/lib/forge-project-receipts/{LEAF}"
 #: And the memory name the project declares (GOOD_CONFIG: bench_one), granted
 #: to it in the coordinator's entry only (design section 2.4a).
-#: And (18 October 2026) the sandbox's own preview ports, slot 1's 8960 and
-#: 8961, also in the coordinator's entry only.
-COORDINATOR_ENTRY = {
-    **ENTRY,
-    "receipts_root": RECEIPTS,
-    "preview_ports": [8960, 8961],
-    "memory_projects": ["bench_one"],
-}
+COORDINATOR_ENTRY = {**ENTRY, "receipts_root": RECEIPTS, "memory_projects": ["bench_one"]}
 
 
 @pytest.fixture
@@ -685,8 +681,11 @@ def test_the_coordinator_entry_names_the_slot_s_own_preview_ports_and_loads(own)
     entry = yaml.safe_load(staged)["planning"]["sandboxes"][KEY]
     assert SandboxEntry.model_validate(entry).preview_ports == [8960, 8961]
     assert "preview_ports" not in yaml.safe_load(staged)["planning"]["sandboxes"]["guardkit/api_test"]
-    sandbox = yaml.safe_load(own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"])
-    assert "preview_ports" not in sandbox["planning"]["sandboxes"][KEY], "the coordinator holds them"
+    sandbox_staged = own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"]
+    assert "preview_ports: [8960, 8961]" in sandbox_staged, "the sandbox's link check reads them"
+    assert SandboxEntry.model_validate(
+        yaml.safe_load(sandbox_staged)["planning"]["sandboxes"][KEY]
+    ).preview_ports == [8960, 8961]
 
 
 def test_slot_two_names_its_own_preview_ports(own):
@@ -705,12 +704,18 @@ def test_a_sandbox_registered_before_its_preview_ports_and_grant_is_given_both_a
         if "memory_projects" not in line and "preview_ports" not in line
     )
     own.volume["forge.yaml"] = before
-    own.sandbox_files[OWN_SETTINGS] = own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"]
+    sandbox_before = "\n".join(
+        line for line in own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"].split("\n")
+        if "preview_ports" not in line
+    )
+    own.sandbox_files[OWN_SETTINGS] = sandbox_before
     again = _run_own()
     assert again.exit_code == 0, again.output
     after = yaml.safe_load(own.volume[f"forge.yaml.{LEAF}-pending"])
     assert after["planning"]["sandboxes"][KEY] == COORDINATOR_ENTRY
-    assert f"sandboxes {KEY} preview_ports 8960, 8961" in again.output
+    sandbox_after = yaml.safe_load(own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"])
+    assert sandbox_after["planning"]["sandboxes"][KEY] == ENTRY
+    assert again.output.count(f"sandboxes {KEY} preview_ports 8960, 8961") == 2, "one per file"
     assert f"sandboxes {KEY} memory_projects bench_one" in again.output
     removed = {k: v for k, v in after.items() if k != "planning"}
     assert removed == {k: v for k, v in yaml.safe_load(before).items() if k != "planning"}
