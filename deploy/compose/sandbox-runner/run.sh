@@ -100,6 +100,17 @@
 #                           sandboxd.sock. Put it anywhere else and the client
 #                           quietly decides it is talking to a hosted service
 #                           and complains about authentication.
+#   SANDBOX_RECEIPTS_MOUNT  The project's receipts folder, mounted again
+#                           before each bootstrap start when a restart has
+#                           lost it. Unset: not looked at.
+#   SANDBOX_RELEASE_IMAGE   The release image that must be in the sandbox's
+#                           own engine before the bootstrap starts. Unset: not
+#                           looked at. Never imported here.
+#   SANDBOX_NOT_READY_WAIT_SECONDS
+#                           How long a refusal of those two waits before it
+#                           exits (default 300), so the restart policy does not
+#                           call the sandbox client in a tight loop. A stop
+#                           signal ends the wait.
 #
 # EXIT. 0 after a clean stop. 2 when a required setting is missing, or when
 # SANDBOX_ENV_NAMES would hand something credential-shaped into the sandbox —
@@ -450,6 +461,98 @@ release_the_hold() {
   log "released this service's hold on ${NAME}"
 }
 
+# BEFORE EVERY BOOTSTRAP START: THE SANDBOX MUST BE READY FOR IT (17 October
+# 2026, one sandbox per project). Two things do not come back by themselves
+# when a sandbox restarts, and the bootstrap cannot fix either from inside:
+#
+#   SANDBOX_RECEIPTS_MOUNT  the project's own receipts folder, by its path on
+#                           the machine, which is also its path inside. It is a
+#                           runtime mount (`sbx mount`), which a sandbox keeps a
+#                           record of but does not make again after a restart.
+#                           When it is not a mount point inside, it is mounted
+#                           again here, and checked.
+#   SANDBOX_RELEASE_IMAGE   the release image the bootstrap runs, by the name it
+#                           has inside the sandbox's own engine. When it is not
+#                           there, nothing is started: this service has no
+#                           network and no machine engine, so it never imports
+#                           an image. The release hands it in, on the machine,
+#                           with deploy/estate/hand-release-image-to-sandbox.sh.
+#
+# Both are off when unset, which is how a supervisor written before them keeps
+# working exactly as it did. A refusal exits 2 with one sentence, after ending
+# this service's own sessions; the stop just before it has already worked, so
+# nothing is left running inside.
+SANDBOX_NOT_READY=""
+the_sandbox_is_ready_for_the_bootstrap() {
+  local receipts="${SANDBOX_RECEIPTS_MOUNT:-}" image="${SANDBOX_RELEASE_IMAGE:-}"
+  SANDBOX_NOT_READY=""
+  if [[ -n "${receipts}" ]]; then
+    if [[ "${receipts}" != /* || "${receipts}" == *"/../"* || "${receipts}" == *"/.." ]]; then
+      SANDBOX_NOT_READY="SANDBOX_RECEIPTS_MOUNT must be the receipts folder's absolute path on this machine (it is the same path inside ${NAME}), and it is not"
+      return 1
+    fi
+    if "${CLIENT_CALL[@]}" mountpoint -q "${receipts}" >/dev/null 2>&1; then
+      log "the receipts folder ${receipts} is mounted inside ${NAME}"
+    else
+      log "the receipts folder ${receipts} is not mounted inside ${NAME} (a restart does not bring it back); mounting it again"
+      # shellcheck disable=SC2086
+      if ! "${CLIENT}" ${SANDBOX_CLIENT_ARGUMENTS:-} mount "${NAME}" "${receipts}" >/dev/null 2>&1 ||
+         ! "${CLIENT_CALL[@]}" mountpoint -q "${receipts}" >/dev/null 2>&1; then
+        SANDBOX_NOT_READY="the receipts folder ${receipts} could not be mounted inside ${NAME}, and the bootstrap would refuse without it. Check that the folder exists on this machine, then mount it by hand with: sbx mount ${NAME} ${receipts}"
+        return 1
+      fi
+      log "the receipts folder ${receipts} is mounted inside ${NAME} again"
+    fi
+  fi
+  if [[ -n "${image}" ]]; then
+    if [[ -n "${FORGE_IMAGE:-}" && "${FORGE_IMAGE}" != "${image}" ]]; then
+      SANDBOX_NOT_READY="SANDBOX_RELEASE_IMAGE names ${image}, but the bootstrap would be handed FORGE_IMAGE=${FORGE_IMAGE}. They must name the same release image. Fix the supervisor's settings"
+      return 1
+    fi
+    if ! "${CLIENT_CALL[@]}" docker image inspect --format '{{.Id}}' "${image}" >/dev/null 2>&1; then
+      SANDBOX_NOT_READY="the release image ${image} is not in the sandbox ${NAME}'s own Docker engine, or that engine did not answer. This service never imports an image. Hand it in on the machine with deploy/estate/hand-release-image-to-sandbox.sh ${NAME}, then restart this service"
+      return 1
+    fi
+    log "the release image ${image} is in ${NAME}'s own engine"
+  fi
+  return 0
+}
+
+# THE REFUSAL WAITS BEFORE IT EXITS. Under the restart policy every exit
+# comes straight back and asks the sandbox client again, and a client asked
+# over and over in a tight loop is what crashed the machine's sign-in keyring
+# before (no sandbox client calls in a fast loop). So the refusal waits,
+# without calling anything, for SANDBOX_NOT_READY_WAIT_SECONDS (default 300),
+# and a stop signal cuts the wait short.
+NOT_READY_WAIT_SECONDS="${SANDBOX_NOT_READY_WAIT_SECONDS:-300}"
+refuse_because_the_sandbox_is_not_ready() {
+  if [[ -n "${KEEPER_PID}" ]]; then
+    release_the_hold
+  fi
+  end_the_local_sessions
+  log "FATAL: ${SANDBOX_NOT_READY}. Nothing was started inside ${NAME}."
+  if [[ ! "${NOT_READY_WAIT_SECONDS}" =~ ^[0-9]+$ ]]; then
+    NOT_READY_WAIT_SECONDS=300
+  fi
+  if ((STOPPING == 0 && NOT_READY_WAIT_SECONDS > 0)); then
+    log "waiting ${NOT_READY_WAIT_SECONDS}s before exiting, so the restart policy does not ask the sandbox client again straight away; a stop ends the wait"
+    # One second at a time, so a stop that arrives at any moment (even just
+    # before a wait begins) ends the wait within a second, and no sleep of
+    # this service is left behind holding its output open.
+    local waited=0
+    while ((STOPPING == 0 && waited < NOT_READY_WAIT_SECONDS)); do
+      nap 1
+      waited=$((waited + 1))
+    done
+  fi
+  if ((STOPPING == 1)); then
+    log "asked to stop while refusing; nothing was started"
+    log "stopped"
+    exit 0
+  fi
+  exit 2
+}
+
 on_stop_signal() {
   if ((STOPPING == 1)); then return; fi
   STOPPING=1
@@ -476,6 +579,7 @@ if ((STOPPING == 1)); then
   log "stopped"
   exit 0
 fi
+the_sandbox_is_ready_for_the_bootstrap || refuse_because_the_sandbox_is_not_ready
 start_keeper
 start_bootstrap
 
@@ -494,6 +598,7 @@ while ((STOPPING == 0)); do
     # running in there: the same stop, and it has to have worked.
     require_the_work_inside_to_stop || give_up_because_the_stop_failed
     ((STOPPING == 1)) && break
+    the_sandbox_is_ready_for_the_bootstrap || refuse_because_the_sandbox_is_not_ready
     start_keeper
     start_bootstrap
     continue
@@ -517,6 +622,7 @@ while ((STOPPING == 0)); do
     ((STOPPING == 1)) && break
     nap "${RESTART_SECONDS}"
     ((STOPPING == 1)) && break
+    the_sandbox_is_ready_for_the_bootstrap || refuse_because_the_sandbox_is_not_ready
     start_bootstrap
   elif [[ "${died}" == "${KEEPER_PID}" ]]; then
     # Only the hold is opened again here. The bootstrap's own session is still

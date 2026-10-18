@@ -46,6 +46,8 @@
 #                     estate was started from
 #   --retained-sandbox NAME  with services or --pre-resume, verify the selected
 #                     sandbox is uniquely stopped and leave item 9 unchecked
+#   SANDBOX_NAMES in the env file lists further sandboxes (one per project);
+#                     item 9 then asks each of them as well as SANDBOX_NAME
 #   --items           print the item list and stop
 # ---------------------------------------------------------------------------
 set -uo pipefail
@@ -68,7 +70,7 @@ while [ $# -gt 0 ]; do
         --for-image)   EXPECT_IMAGE="${2:?--for-image needs a tag or an image id}"; shift 2 ;;
         --retained-sandbox) RETAINED_SANDBOX="${2:?--retained-sandbox needs a name}"; shift 2 ;;
         --items)       MODE="items"; shift ;;
-        --help|-h)     sed -n '2,49p' "${BASH_SOURCE[0]}"; exit 0 ;;
+        --help|-h)     sed -n '2,51p' "${BASH_SOURCE[0]}"; exit 0 ;;
         *)             printf 'estate-check: unknown argument "%s". Try --help.\n' "$1" >&2; exit 2 ;;
     esac
 done
@@ -1433,21 +1435,26 @@ check_bus_storage() {
 # pass. With no sandbox named, or none of that name on this machine, it says so
 # and counts as NOT PASSED — the gate is met when this runs for real.
 # ---------------------------------------------------------------------------
-check_from_inside_a_sandbox() {
-    local name gateway port url out
-    name="$(get SANDBOX_NAME)"
+# One sandbox's answer, kept rather than printed, so that several sandboxes
+# can be reported as the one item 9 (17 October 2026, one sandbox per project).
+ONE_VERDICT=""
+ONE_SAID=""
+found() { ONE_VERDICT="$1"; ONE_SAID="$2"; }
+
+probe_one_sandbox() {
+    local name="$1" gateway port url out
     gateway="$(get FACTORY_GATEWAY_ADDRESS)"
     port="$(get FORGE_ANSWER_PORT)"
     url="http://${gateway}:${port}/recorded?build=a-build-nobody-ever-queued"
 
-    if [ -n "${RETAINED_SANDBOX}" ]; then
+    if [ -n "${RETAINED_SANDBOX}" ] && [ "${name}" = "${RETAINED_SANDBOX}" ]; then
         local listing result count status
         if ! command -v sbx >/dev/null 2>&1; then
-            fail 9 "the sandbox tool is missing; stopped status for retained sandbox '${name}' is unproved."
+            found fail "the sandbox tool is missing; stopped status for retained sandbox '${name}' is unproved."
             return
         fi
         if ! listing="$(sbx ls --json 2>/dev/null)"; then
-            fail 9 "the sandbox listing failed; stopped status for retained sandbox '${name}' is unproved."
+            found fail "the sandbox listing failed; stopped status for retained sandbox '${name}' is unproved."
             return
         fi
         result="$(printf '%s' "${listing}" | jq -er --arg name "${name}" '
@@ -1455,36 +1462,64 @@ check_from_inside_a_sandbox() {
                and all(.sandboxes[]; type == "object" and (.name | type) == "string" and (.status | type) == "string")
             then [.sandboxes[] | select(.name == $name)] | [length, (if length == 1 then .[0].status else "" end)] | @tsv
             else empty end' 2>/dev/null)" || {
-            fail 9 "the sandbox JSON listing is unreadable; stopped status for retained sandbox '${name}' is unproved."
+            found fail "the sandbox JSON listing is unreadable; stopped status for retained sandbox '${name}' is unproved."
             return
         }
         IFS=$'\t' read -r count status <<< "${result}"
         if [ "${count}" != "1" ] || [ "${status}" != "stopped" ]; then
-            fail 9 "retained sandbox '${name}' is absent, duplicated or not stopped in the actual sandbox listing; no local probe was run."
+            found fail "retained sandbox '${name}' is absent, duplicated or not stopped in the actual sandbox listing; no local probe was run."
             return
         fi
-        unchecked 9 "the local sandbox '${name}' is retained and stopped; its route was not probed here. Prove the answer-service route from the active-host sandbox before migration acceptance."
+        found unchecked "the local sandbox '${name}' is retained and stopped; its route was not probed here. Prove the answer-service route from the active-host sandbox before migration acceptance."
         return
     fi
 
     if [ -z "${name}" ]; then
-        unchecked 9 "the env file names no sandbox (SANDBOX_NAME is empty), so nothing could be asked from inside one. Until this runs for real the route from a sandbox to the answer service is unproven, and a deploy helper inside a sandbox refuses every deploy that names a commit."
+        found unchecked "the env file names no sandbox (SANDBOX_NAME is empty), so nothing could be asked from inside one. Until this runs for real the route from a sandbox to the answer service is unproven, and a deploy helper inside a sandbox refuses every deploy that names a commit."
         return
     fi
     if ! command -v sbx >/dev/null 2>&1; then
-        unchecked 9 "the sandbox tool is not on this machine, so nothing could be asked from inside the sandbox '${name}'."
+        found unchecked "the sandbox tool is not on this machine, so nothing could be asked from inside the sandbox '${name}'."
         return
     fi
     if ! sbx ls 2>/dev/null | grep -qw -- "${name}"; then
-        unchecked 9 "there is no sandbox called '${name}' on this machine, so the route from inside one to the answer service at ${url} was not tried."
+        found unchecked "there is no sandbox called '${name}' on this machine, so the route from inside one to the answer service at ${url} was not tried."
         return
     fi
     out="$(sbx exec "${name}" -- curl -s -o /dev/null --max-time 10 -w '%{http_code}' "${url}" 2>/dev/null | tail -1)"
     if [ "${out}" = "200" ]; then
-        ok 9 "the answer service answers from inside the sandbox '${name}', at ${url} — the one route across the sandbox boundary that every planned deploy depends on."
+        found ok "the answer service answers from inside the sandbox '${name}', at ${url} — the one route across the sandbox boundary that every planned deploy depends on."
     else
-        fail 9 "the answer service did NOT answer from inside the sandbox '${name}' at ${url} (it said ${out:-nothing}). A deploy helper in there will refuse every deploy that names a commit, which is the safe side and which stops the factory deploying."
+        found fail "the answer service did NOT answer from inside the sandbox '${name}' at ${url} (it said ${out:-nothing}). A deploy helper in there will refuse every deploy that names a commit, which is the safe side and which stops the factory deploying."
     fi
+}
+
+# ITEM 9 OVER EVERY SANDBOX (17 October 2026, one sandbox per project). The
+# sandboxes are SANDBOX_NAME, as before, and any others SANDBOX_NAMES lists
+# (space or comma separated). With only SANDBOX_NAME, the item is word for word
+# what it was. With more, it is still ONE item: a failure anywhere fails it, a
+# sandbox that could not be asked leaves it not checked, and the sentence says
+# what each sandbox answered. --retained-sandbox still names SANDBOX_NAME.
+check_from_inside_a_sandbox() {
+    local first others name verdict="ok" said="" listed=" "
+    first="$(get SANDBOX_NAME)"
+    others="$(get SANDBOX_NAMES)"
+    if [ -z "${others}" ]; then
+        probe_one_sandbox "${first}"
+        "${ONE_VERDICT}" 9 "${ONE_SAID}"
+        return
+    fi
+    for name in ${first} ${others//,/ }; do
+        case "${listed}" in *" ${name} "*) continue ;; esac
+        listed="${listed}${name} "
+        probe_one_sandbox "${name}"
+        case "${ONE_VERDICT}" in
+            fail) verdict="fail" ;;
+            unchecked) [ "${verdict}" = "fail" ] || verdict="unchecked" ;;
+        esac
+        said="${said}${said:+ }[${name}] ${ONE_SAID}"
+    done
+    "${verdict}" 9 "every sandbox was asked in turn: ${said}"
 }
 
 # ---------------------------------------------------------------------------

@@ -94,6 +94,54 @@
 #   it is removed and created again, attended: `sbx` cannot add a clone, a
 #   mount or a port to a sandbox that already exists.
 #
+# A PROJECT'S OWN SANDBOX (17 October 2026, one sandbox per project; design
+# docs/designs/one-sandbox-per-project-2026-10-17.md in the estate's records).
+# Every project builds in a sandbox of its own, which reaches only its own
+# repositories and its own memory. SANDBOX_SLOT switches that shape on; without
+# it everything above is exactly as it was. A slot sandbox:
+#   - is created on the factory's own clone of this checkout (--clone), with
+#     NONE of the five factory source mounts: the factory runs from the release
+#     image, not from source;
+#   - is given its own block of ports from the slot number k:
+#       build runner   PUBLISH_ADDRESS:(8924 + 10k) -> 8124
+#       deploy helper  PUBLISH_ADDRESS:(8925 + 10k) -> 8125
+#       git daemon     PUBLISH_ADDRESS:(8918 + 10k) -> 9418
+#       two previews   127.0.0.1:(8950 + 10k) and 127.0.0.1:(8951 + 10k),
+#                      the same number inside and out
+#     Slot 0 is the shared sandbox's block (api-test-deploy), which is not
+#     made by this shape; a slot sandbox is 1 or more;
+#   - may reach only its own two doors and the three shared services on the
+#     gateway: its Git door at (31830 + k), its memory door at (31850 + k), the
+#     model door, the answer service and the embedder. Never the bus or the
+#     model router. The project's own rules (package sources, github.com:443)
+#     come from SANDBOX_ALLOW_NETWORK as before, and a rule there that names
+#     the gateway address, or the bus's or the router's port, is refused: the
+#     doors come from the slot and from nothing else;
+#   - starts at 4 GiB and 2 processors unless SANDBOX_MEMORY / SANDBOX_CPUS say
+#     otherwise (measured in stage S1 before the size is fixed);
+#   - has its own receipts folder (SANDBOX_RECEIPTS_PATH, required): a folder
+#     kept for this project alone on the machine the coordinator runs on,
+#     shared to this machine at the same path, and mounted into this one
+#     sandbox at runtime with `sbx mount`, because a restart does not bring a
+#     runtime mount back (the supervisor's run.sh mounts it again too);
+#   - is looked after by its own Compose supervisor (`up.sh <name> <version>`
+#     on the machine), so no host unit is ever started for it.
+#   SANDBOX_SLOT             the slot number, 1 to 19 (from 20 the Git door
+#                            ports would meet the memory door ports)
+#   SANDBOX_PUBLISH_ADDRESS  the address the runner, helper and git daemon are
+#                            published on (the machine's direct-link address)
+#   SANDBOX_GATEWAY_ADDRESS  the address the doors are reached at
+#   The three shared services are FIXED for a slot sandbox (Codex R2): the
+#   model door 31823, the answer service 31821 and the embedder 9000.
+#   SANDBOX_MODEL_DOOR_PORT, SANDBOX_ANSWER_PORT and SANDBOX_EMBEDDER_PORT
+#   may be set only to those same numbers; any other value is refused.
+#   SANDBOX_REPO_ROOT        the checkout the clone is made from, when this file
+#                            is run from somewhere other than its deploy/
+#                            folder (default: the folder above this file)
+# Run it as `sandbox-deploy.sh prepare` to create the sandbox, set its rules
+# and mount its receipts without running deploy/deploy.sh (a new project may
+# have none yet). With no argument it deploys, as it always has.
+#
 # BEFORE THIS CAN WORK the sandbox daemon must already be running for this user
 # (`sbx daemon start -d --policy balanced`), the Docker sign-in must have been
 # done once on this box, and forge-sandbox-keeper@.service (and, for a sandbox
@@ -112,10 +160,24 @@ set -euo pipefail
 # sandbox, so it is what we hand to `sbx` for both the mount and the working
 # directory of the inner run.
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+log() { printf '[sandbox-deploy.sh] %s\n' "$*"; }
+if [[ -n "${SANDBOX_REPO_ROOT:-}" ]]; then
+  if [[ "${SANDBOX_REPO_ROOT}" != /* || ! -d "${SANDBOX_REPO_ROOT}" ]]; then
+    log "FATAL: SANDBOX_REPO_ROOT names ${SANDBOX_REPO_ROOT}, which is not an absolute path to a folder. Name the project's checkout, or leave the setting out to use the folder above this file. Refusing to deploy."
+    exit 2
+  fi
+  REPO_ROOT="$(cd "${SANDBOX_REPO_ROOT}" && pwd)"
+else
+  REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+fi
 cd "${REPO_ROOT}"
 
-log() { printf '[sandbox-deploy.sh] %s\n' "$*"; }
+# What to do: deploy (no argument, as always), or only prepare the sandbox.
+ACTION="${1:-deploy}"
+case "${ACTION}" in
+  deploy|prepare) ;;
+  *) log "FATAL: the only argument this script takes is 'prepare' (create the sandbox, set its rules and mount its receipts, and deploy nothing). It was given '${ACTION}'. Refusing."; exit 2 ;;
+esac
 
 # --- settings from the environment ------------------------------------------
 SANDBOX_NAME="${SANDBOX_NAME:-}"
@@ -148,9 +210,191 @@ if [[ -z "${SANDBOX_NAME}" ]]; then
   exit 2
 fi
 
+# --- a project's own sandbox: its slot, its ports and its doors ------------
+SANDBOX_SLOT="${SANDBOX_SLOT:-}"
+SANDBOX_PUBLISH_ADDRESS="${SANDBOX_PUBLISH_ADDRESS:-}"
+SANDBOX_GATEWAY_ADDRESS="${SANDBOX_GATEWAY_ADDRESS:-}"
+# The shared services a slot sandbox reaches, fixed: no sandbox chooses its own
+# (Codex R2, round 2).
+SLOT_MODEL_DOOR_PORT=31823
+SLOT_ANSWER_PORT=31821
+SLOT_EMBEDDER_PORT=9000
+# The two memory ports a slot sandbox may never name on the gateway: the full
+# memory door for the machine's own tools, and the shared sandbox's door.
+NEVER_ON_THE_GATEWAY_FROM_A_SLOT=(31822 31824)
+
+# The slot scheme's bases. Slot k adds 10 times k to each. The same numbers are
+# in forge's register-repo, which writes the coordinator's side of the slot.
+SLOT_RUNNER_BASE=8924
+SLOT_HELPER_BASE=8925
+SLOT_GIT_DAEMON_BASE=8918
+SLOT_PREVIEW_BASES=(8950 8951)
+SLOT_GIT_DOOR_BASE=31830
+SLOT_MEMORY_DOOR_BASE=31850
+# The two gateway services a project's own sandbox may never reach.
+NEVER_FROM_A_SLOT_PORTS=(4222 4000)
+# The highest slot. From slot 20 the Git door (31830 + k) would meet the
+# memory door of slot k - 20 (31850 + k).
+SLOT_MAX=19
+# The shared sandbox, which is never made, given doors or given a project's
+# receipts by this shape (one sandbox per project, Codex R1).
+SHARED_SANDBOX_NAMES=(api-test-deploy)
+
+is_a_slot_sandbox() { [[ -n "${SANDBOX_SLOT}" ]]; }
+
+# A dotted IPv4 address, not loopback, not 0.0.0.0. Used for the two addresses
+# a slot sandbox is given; anything else is refused with a sentence.
+plain_ipv4() {
+  local value="$1" part
+  [[ "${value}" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]] || return 1
+  for part in "${BASH_REMATCH[@]:1}"; do
+    ((10#${part} <= 255)) || return 1
+  done
+  [[ "${value}" != 0.* && "${value}" != 127.* && "${value}" != 255.255.255.255 ]]
+}
+
+
+SLOT_PUBLISHES=()
+SLOT_DOOR_RULES=()
+if is_a_slot_sandbox; then
+  for shared in "${SHARED_SANDBOX_NAMES[@]}"; do
+    if [[ "${SANDBOX_NAME}" == "${shared}" ]]; then
+      log "FATAL: ${SANDBOX_NAME} is the shared sandbox, and SANDBOX_SLOT makes a project's own sandbox. Give the project a sandbox name of its own; the shared sandbox gets no door rules and no project's receipts from this script. Refusing to deploy."
+      exit 2
+    fi
+  done
+  # Slots stop at 19: from slot 20 the Git door (31830 + k) would meet the
+  # memory door of slot k - 20 (31850 + k).
+  if [[ ! "${SANDBOX_SLOT}" =~ ^[1-9][0-9]?$ ]] || ((10#${SANDBOX_SLOT} > SLOT_MAX)); then
+    log "FATAL: SANDBOX_SLOT is '${SANDBOX_SLOT}', and a project's own sandbox takes a slot from 1 to 19 (slot 0 is the shared sandbox, which is not made this way; from 20 the door ports would collide). Refusing to deploy."
+    exit 2
+  fi
+  if [[ -n "${SANDBOX_SIDECAR_PUBLISH}${SANDBOX_RUNNER_PUBLISH}" ]]; then
+    log "FATAL: SANDBOX_SLOT gives this sandbox its ports, and SANDBOX_SIDECAR_PUBLISH or SANDBOX_RUNNER_PUBLISH names some as well. Leave both out for a slot sandbox. Refusing to deploy."
+    exit 2
+  fi
+  if ! plain_ipv4 "${SANDBOX_PUBLISH_ADDRESS}"; then
+    log "FATAL: a slot sandbox publishes its runner, helper and git daemon on SANDBOX_PUBLISH_ADDRESS, which must be this machine's direct-link IPv4 address (not loopback); it is '${SANDBOX_PUBLISH_ADDRESS}'. Refusing to deploy."
+    exit 2
+  fi
+  if ! plain_ipv4 "${SANDBOX_GATEWAY_ADDRESS}"; then
+    log "FATAL: a slot sandbox reaches its doors at SANDBOX_GATEWAY_ADDRESS, which must be an IPv4 address (not loopback); it is '${SANDBOX_GATEWAY_ADDRESS}'. Refusing to deploy."
+    exit 2
+  fi
+  for pair in SANDBOX_MODEL_DOOR_PORT:SLOT_MODEL_DOOR_PORT SANDBOX_ANSWER_PORT:SLOT_ANSWER_PORT SANDBOX_EMBEDDER_PORT:SLOT_EMBEDDER_PORT; do
+    setting="${pair%%:*}"
+    fixed="${pair#*:}"
+    if [[ -n "${!setting:-}" && "${!setting}" != "${!fixed}" ]]; then
+      log "FATAL: ${setting} is '${!setting}', and for a project's own sandbox it is fixed at ${!fixed}. Leave it out. Refusing to deploy."
+      exit 2
+    fi
+  done
+  if [[ -z "${SANDBOX_RECEIPTS_PATH}" || "${SANDBOX_RECEIPTS_PATH}" != /* ]]; then
+    log "FATAL: a slot sandbox has its own receipts folder, and SANDBOX_RECEIPTS_PATH must name it by its absolute path on this machine. Refusing to deploy."
+    exit 2
+  fi
+  [[ -n "${SANDBOX_MEMORY}" ]] || SANDBOX_MEMORY="4g"
+  [[ -n "${SANDBOX_CPUS}" ]] || SANDBOX_CPUS="2"
+  slot_offset=$((10 * 10#${SANDBOX_SLOT}))
+  SLOT_PUBLISHES=(
+    "${SANDBOX_PUBLISH_ADDRESS}:$((SLOT_HELPER_BASE + slot_offset)):8125"
+    "${SANDBOX_PUBLISH_ADDRESS}:$((SLOT_RUNNER_BASE + slot_offset)):8124"
+    "${SANDBOX_PUBLISH_ADDRESS}:$((SLOT_GIT_DAEMON_BASE + slot_offset)):9418"
+  )
+  for preview_base in "${SLOT_PREVIEW_BASES[@]}"; do
+    SLOT_PUBLISHES+=("127.0.0.1:$((preview_base + slot_offset)):$((preview_base + slot_offset))")
+  done
+  # Its own two doors, then the three shared services, all on the gateway.
+  SLOT_DOOR_RULES=(
+    "${SANDBOX_GATEWAY_ADDRESS}:$((SLOT_GIT_DOOR_BASE + 10#${SANDBOX_SLOT}))"
+    "${SANDBOX_GATEWAY_ADDRESS}:$((SLOT_MEMORY_DOOR_BASE + 10#${SANDBOX_SLOT}))"
+    "${SANDBOX_GATEWAY_ADDRESS}:${SLOT_MODEL_DOOR_PORT}"
+    "${SANDBOX_GATEWAY_ADDRESS}:${SLOT_ANSWER_PORT}"
+    "${SANDBOX_GATEWAY_ADDRESS}:${SLOT_EMBEDDER_PORT}"
+  )
+  # The project's own rules may not name the gateway, a wildcard for every
+  # address, or the bus's or the router's port: the doors come from the slot.
+  project_rules=()
+  if [[ -n "${SANDBOX_ALLOW_NETWORK}" ]]; then
+    IFS=',' read -r -a project_rules <<<"${SANDBOX_ALLOW_NETWORK}"
+  fi
+  kept_rules=()
+  for rule in "${project_rules[@]}"; do
+    [[ -n "${rule}" ]] || continue
+    if [[ "${rule}" =~ [[:space:]] ]]; then
+      log "FATAL: SANDBOX_ALLOW_NETWORK holds a rule with a space in it ('${rule}'). Write each rule as host, host:port or scheme://host, with no spaces. Refusing to deploy."
+      exit 2
+    fi
+    rule_host="${rule#*://}"
+    if [[ "${rule_host}" == */* ]]; then
+      log "FATAL: SANDBOX_ALLOW_NETWORK holds '${rule}', which names an address range or a path. A project's own sandbox may reach only named hosts, one rule each. Refusing to deploy."
+      exit 2
+    fi
+    rule_port=""
+    if [[ "${rule_host}" =~ :([0-9]+)$ ]]; then
+      rule_port="${BASH_REMATCH[1]}"
+    fi
+    rule_host="${rule_host%:*}"
+    if [[ "${rule}" == "*" || "${rule_host}" == "*" ]]; then
+      log "FATAL: SANDBOX_ALLOW_NETWORK holds a rule for every address ('${rule}'), and a project's own sandbox may reach only what is named. Refusing to deploy."
+      exit 2
+    fi
+    if [[ "${rule_host}" == "${SANDBOX_GATEWAY_ADDRESS}" ]]; then
+      log "FATAL: SANDBOX_ALLOW_NETWORK names the gateway (${rule}). A slot sandbox reaches the gateway only through its own doors, which come from its slot; take that rule out. Refusing to deploy."
+      exit 2
+    fi
+    for never in "${NEVER_FROM_A_SLOT_PORTS[@]}"; do
+      if [[ "${rule_port}" == "${never}" ]]; then
+        log "FATAL: SANDBOX_ALLOW_NETWORK names port ${never} (${rule}), which is the bus's or the model router's. A project's own sandbox reaches neither; take that rule out. Refusing to deploy."
+        exit 2
+      fi
+    done
+    kept_rules+=("${rule}")
+  done
+  SANDBOX_ALLOW_NETWORK="$(IFS=','; printf '%s' "${kept_rules[*]:+${kept_rules[*]},}${SLOT_DOOR_RULES[*]}")"
+  # THE WHOLE POLICY, CHECKED BEFORE ANYTHING IS CALLED (Codex R2): the
+  # generated rules as well as the project's, so a shared-service port set to
+  # the bus's, the router's or another project's door is refused too. No rule
+  # may name the bus or the router, or a port in the two project-door ranges
+  # other than this slot's own two, and the five gateway rules must be five
+  # different ports.
+  own_git_door=$((SLOT_GIT_DOOR_BASE + 10#${SANDBOX_SLOT}))
+  own_memory_door=$((SLOT_MEMORY_DOOR_BASE + 10#${SANDBOX_SLOT}))
+  IFS=',' read -r -a whole_policy <<<"${SANDBOX_ALLOW_NETWORK}"
+  for rule in "${whole_policy[@]}"; do
+    [[ "${rule}" =~ :([0-9]+)$ ]] || continue
+    rule_port=$((10#${BASH_REMATCH[1]}))
+    for never in "${NEVER_FROM_A_SLOT_PORTS[@]}"; do
+      if ((rule_port == never)); then
+        log "FATAL: the policy for ${SANDBOX_NAME} would name port ${never} (${rule}), which is the bus's or the model router's. Check SANDBOX_ALLOW_NETWORK. Refusing to deploy."
+        exit 2
+      fi
+    done
+    if [[ "${rule%:*}" == "${SANDBOX_GATEWAY_ADDRESS}" ]]; then
+      for never in "${NEVER_ON_THE_GATEWAY_FROM_A_SLOT[@]}"; do
+        if ((rule_port == never)); then
+          log "FATAL: the policy for ${SANDBOX_NAME} would name ${rule}, a memory door that is not this project's (the machine's own tools' door, or the shared sandbox's). Refusing to deploy."
+          exit 2
+        fi
+      done
+    fi
+    if (( (rule_port > SLOT_GIT_DOOR_BASE && rule_port <= SLOT_GIT_DOOR_BASE + SLOT_MAX && rule_port != own_git_door) ||
+          (rule_port > SLOT_MEMORY_DOOR_BASE && rule_port <= SLOT_MEMORY_DOOR_BASE + SLOT_MAX && rule_port != own_memory_door) )); then
+      log "FATAL: the policy for ${SANDBOX_NAME} would name port ${rule_port} (${rule}), which is another project's Git door or memory door. Slot ${SANDBOX_SLOT} reaches only ${own_git_door} and ${own_memory_door}. Refusing to deploy."
+      exit 2
+    fi
+  done
+  gateway_ports="$(printf '%s\n' "${SLOT_DOOR_RULES[@]##*:}" | sort -u | wc -l)"
+  if ((gateway_ports != ${#SLOT_DOOR_RULES[@]})); then
+    log "FATAL: two of the doors for ${SANDBOX_NAME} would share a port (${SLOT_DOOR_RULES[*]}). Give the model door, the answer service and the embedder ports of their own. Refusing to deploy."
+    exit 2
+  fi
+fi
+
 # True when the profile asked for the sandbox to carry the factory's services.
+# A slot sandbox always does: its slot gives it both ports.
 carries_the_factory() {
-  [[ -n "${SANDBOX_SIDECAR_PUBLISH}" && -n "${SANDBOX_RUNNER_PUBLISH}" ]]
+  is_a_slot_sandbox || [[ -n "${SANDBOX_SIDECAR_PUBLISH}" && -n "${SANDBOX_RUNNER_PUBLISH}" ]]
 }
 
 if [[ -n "${SANDBOX_SIDECAR_PUBLISH}" || -n "${SANDBOX_RUNNER_PUBLISH}" ]] && ! carries_the_factory; then
@@ -196,7 +440,67 @@ check_factory_mounts() {
   done
 }
 
+# A project's own sandbox: its own clone, no factory source mounts, its slot's
+# ports, and its own settings. The receipts folder is mounted afterwards, at
+# runtime (mount_the_receipts below), the same way the supervisor mounts it
+# again after a restart.
+create_slot_sandbox() {
+  if ! git -C "${REPO_ROOT}" rev-parse --git-dir >/dev/null 2>&1; then
+    log "FATAL: a slot sandbox is made on the factory's own clone of ${REPO_ROOT}, and that folder is not a git checkout. Clone the project there first, or point SANDBOX_REPO_ROOT at its checkout. Refusing to create the sandbox."
+    exit 2
+  fi
+  if [[ -n "${SANDBOX_ENV_FILE}" && ! -f "${SANDBOX_ENV_FILE}" ]]; then
+    log "FATAL: SANDBOX_ENV_FILE names ${SANDBOX_ENV_FILE}, and there is no such file. Render it first or leave the setting out. Refusing to create the sandbox."
+    exit 2
+  fi
+  local argv=(sbx create shell "${REPO_ROOT}" --name "${SANDBOX_NAME}" --clone
+    --memory "${SANDBOX_MEMORY}" --cpus "${SANDBOX_CPUS}")
+  local entry
+  if [[ -n "${SANDBOX_PUBLISH}" ]]; then
+    local -a publishes=()
+    IFS=',' read -r -a publishes <<<"${SANDBOX_PUBLISH}"
+    for entry in "${publishes[@]}"; do
+      [[ -n "${entry}" ]] && argv+=(--publish "${entry}")
+    done
+  fi
+  for entry in "${SLOT_PUBLISHES[@]}"; do
+    argv+=(-p "${entry}")
+  done
+  if [[ -n "${SANDBOX_ENV_FILE}" ]]; then
+    argv+=(--env-file "${SANDBOX_ENV_FILE}")
+  fi
+  argv+=(--env SANDBOX_RECEIPTS_PATH)
+  if [[ -n "${FORGE_TARGET_OWNER_URL:-}" ]]; then
+    argv+=(--env FORGE_TARGET_OWNER_URL)
+  fi
+  log "creating sandbox ${SANDBOX_NAME} in slot ${SANDBOX_SLOT} on the factory's clone of ${REPO_ROOT}, with no factory source mounts, ${SANDBOX_MEMORY} and ${SANDBOX_CPUS} processors, ports ${SLOT_PUBLISHES[*]}"
+  "${argv[@]}"
+}
+
+# The receipts folder of a slot sandbox: mounted at runtime with `sbx mount`
+# when it is not already a mount point inside, then checked.
+mount_the_receipts() {
+  if sbx exec "${SANDBOX_NAME}" mountpoint -q "${SANDBOX_RECEIPTS_PATH}" >/dev/null 2>&1; then
+    log "the receipts folder ${SANDBOX_RECEIPTS_PATH} is already mounted inside ${SANDBOX_NAME}"
+    return 0
+  fi
+  if [[ ! -d "${SANDBOX_RECEIPTS_PATH}" ]]; then
+    log "FATAL: SANDBOX_RECEIPTS_PATH names ${SANDBOX_RECEIPTS_PATH}, and there is no such folder on this machine. Make this project's own receipts folder first. Nothing was deployed."
+    exit 2
+  fi
+  log "mounting this project's own receipts folder ${SANDBOX_RECEIPTS_PATH} inside ${SANDBOX_NAME}"
+  sbx mount "${SANDBOX_NAME}" "${SANDBOX_RECEIPTS_PATH}"
+  if ! sbx exec "${SANDBOX_NAME}" mountpoint -q "${SANDBOX_RECEIPTS_PATH}" >/dev/null 2>&1; then
+    log "FATAL: sbx mount answered, but ${SANDBOX_RECEIPTS_PATH} is still not a mount point inside ${SANDBOX_NAME}. Nothing was deployed."
+    exit 2
+  fi
+}
+
 create_sandbox() {
+  if is_a_slot_sandbox; then
+    create_slot_sandbox
+    return
+  fi
   local argv=(sbx create shell "${REPO_ROOT}")
   if carries_the_factory; then
     if [[ -n "${SANDBOX_ENV_FILE}" && ! -f "${SANDBOX_ENV_FILE}" ]]; then
@@ -399,8 +703,11 @@ main() {
   log "repo_root=${REPO_ROOT} sandbox=${SANDBOX_NAME}"
 
   # Asked before anything is created, started or deployed, so a refusal here
-  # changes nothing.
-  who_looks_after_the_sandbox
+  # changes nothing. A slot sandbox is never looked after by a host unit, so
+  # nothing is asked about one.
+  if ! is_a_slot_sandbox; then
+    who_looks_after_the_sandbox
+  fi
 
   if sandbox_exists; then
     log "sandbox ${SANDBOX_NAME} already exists"
@@ -414,7 +721,10 @@ main() {
     allow_network
   fi
 
-  if [[ "${SUPERVISOR_CONTAINER}" == present ]]; then
+  if is_a_slot_sandbox; then
+    mount_the_receipts
+    log "slot ${SANDBOX_SLOT}: ${SANDBOX_NAME} is looked after by its own Compose supervisor (up.sh ${SANDBOX_NAME} <version> on this machine), so no host unit is started"
+  elif [[ "${SUPERVISOR_CONTAINER}" == present ]]; then
     log "a container labelled ${SUPERVISOR_LABEL}=${SANDBOX_NAME} is on this machine's Docker engine: the estate's Compose supervisor looks after this sandbox, so neither ${KEEPER_UNIT} nor ${RUNNER_UNIT} is started"
   else
     if [[ "${KEEPER_STATE}" == masked ]]; then
@@ -434,10 +744,15 @@ main() {
     fi
   fi
 
+  if [[ "${ACTION}" == prepare ]]; then
+    log "prepared ${SANDBOX_NAME}; nothing was deployed (prepare)"
+    exit 0
+  fi
+
   local rc=0
   run_deploy_inside || rc=$?
   log "deploy/deploy.sh inside ${SANDBOX_NAME} exited ${rc}"
   exit "${rc}"
 }
 
-main "$@"
+main
