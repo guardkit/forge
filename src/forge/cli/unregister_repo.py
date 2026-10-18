@@ -16,8 +16,10 @@ printed stop/start sequence, and nothing else:
 Each file is edited by deleting lines, so every other line, comments
 included, is kept; a key register-repo had to create (``fetch_addresses:``,
 say) goes too once nothing is left under it. Each changed file is staged
-beside the live one as ``<file>.<leaf>-unregister-pending`` with a dated backup
-``<file>.bak-<date>-pre-unregister-<leaf>``, exactly as register-repo stages,
+beside the live one as ``<file>.<owner>+<name>-unregister-pending`` with a dated
+backup ``<file>.bak-<date>-pre-unregister-<owner>+<name>``, as register-repo stages
+(named by owner too, since two owners may share a name; neither is ever
+overwritten by a later run),
 and the printed sequence makes it live. Nothing live is changed and nothing is
 restarted.
 
@@ -105,16 +107,45 @@ def _locate_key(lines: Sequence[str], parent: Sequence[str], key: str):
     return None
 
 
-def _comments_inside(lines: Sequence[str], parent: Sequence[str], key: str) -> list[int]:
-    """The 1-based numbers of the comment lines inside ``key``'s entry: the
-    lines :func:`_remove_entry` would delete with it."""
-    block = _locate_key(lines, parent, key)
-    if block is None or block.last_content_child is None:
-        return []
-    return [
-        index + 1 for index in range(block.key_line + 1, block.last_content_child)
-        if lines[index].strip().startswith("#")
-    ]
+class _Line(str):
+    """One line of the file, remembering its line number, so the lines an
+    edit deletes can be named afterwards."""
+
+    number: int
+
+    def __new__(cls, text: str, number: int) -> "_Line":
+        line = super().__new__(cls, text)
+        line.number = number
+        return line
+
+
+#: Where a quoted YAML scalar can begin: at the start of a value.
+_VALUE_START = set(":-[{,")
+
+
+def _has_comment(line: str) -> bool:
+    """Does the line carry a YAML comment: whole-line, or a ``#`` after
+    whitespace and outside single or double quotes (Codex review R2)?"""
+    if line.lstrip().startswith("#"):
+        return True
+    quote: str | None = None
+    previous, last, escaped = " ", "", False
+    for char in line:
+        if quote is not None:
+            if escaped:
+                escaped = False
+            elif quote == '"' and char == "\\":
+                escaped = True
+            elif char == quote:
+                quote, last = None, char
+        elif char in "'\"" and (last == "" or last in _VALUE_START):
+            quote = char
+        elif char == "#" and previous in " \t":
+            return True
+        elif not char.isspace():
+            last = char
+        previous = char
+    return False
 
 
 def _normal(path: str) -> str:
@@ -228,19 +259,8 @@ def plan_settings_removal(
 
     crlf = "\n" in text and text.count("\r\n") == text.count("\n")
     plain = text.replace("\r\n", "\n") if crlf else text
-    lines = plain.split("\n")
-    # A comment inside an entry would go with it (Codex review R2): refused,
-    # naming the lines, before anything is deleted.
-    for section in ("sandboxes", "target_repo_paths", "fetch_addresses"):
-        inside = _comments_inside(lines, ("planning", section), key)
-        if inside:
-            raise Refused(
-                which,
-                f"planning.{section}'s entry for {key} has comment lines inside it (line"
-                f"{'s' if len(inside) > 1 else ''} {', '.join(map(str, inside))} of its forge.yaml), "
-                "which removing the entry would delete; move or delete them by hand, then run "
-                "again. Nothing was written",
-            )
+    original = plain.split("\n")
+    lines: list[str] = [_Line(text, number) for number, text in enumerate(original, start=1)]
     expected = copy.deepcopy(data)
     steps: list[Step] = []
     try:
@@ -273,6 +293,18 @@ def plan_settings_removal(
     except YamlEditRefused as exc:
         raise Refused(which, str(exc)) from None
 
+    # No comment goes with a deleted line (Codex review R2, round 2): any line
+    # to be deleted that carries one, whole-line or inline, is refused by
+    # number before anything is staged.
+    kept = {line.number for line in lines if isinstance(line, _Line)}
+    commented = [n for n, text in enumerate(original, start=1) if n not in kept and _has_comment(text)]
+    if commented:
+        raise Refused(
+            which,
+            f"removing {key} would delete a comment (line{'s' if len(commented) > 1 else ''} "
+            f"{', '.join(map(str, commented))} of its forge.yaml); move or delete "
+            f"{'them' if len(commented) > 1 else 'it'} by hand, then run again. Nothing was written",
+        )
     found = dict(entry) if isinstance(entry, dict) else {}
     if not steps:
         return YamlEdit(which, text, None, [Step(which, "unchanged", f"nothing of {key} in it")], found)
@@ -424,7 +456,11 @@ def unregister(
             raise Refused("publisher", f"could not read the publisher's settings file {publisher_settings}")
         publisher_edit = plan_publisher_removal(publisher_text, key=key)
 
-    # Every read is done and nothing refused: now stage.
+    # The staged copies and backups are named by owner AND name (coach
+    # review C2): two repositories may share a short name (guardkit/api_test
+    # and another owner's api_test), and one's copy must never replace the
+    # other's. "+" cannot appear in either part, so no two names meet.
+    tag = f"{org}+{leaf}"
     staged: dict[str, Staged | None] = {"coordinator": None, "sandbox": None, "publisher": None}
     plans: list[tuple[Any, Any, str, str | None, str | None]] = [
         (coordinator_edit, volume, SETTINGS_FILE_NAME, None, None),
@@ -433,18 +469,36 @@ def unregister(
     if publisher_edit is not None:
         live = str(publisher_settings)
         plans.append((publisher_edit, host, live, str(Path(live).parent), live))
+    # An earlier run's staged copy or backup is never overwritten (C2): each
+    # is checked, for every file, before the first write.
+    for edit, store, live, _folder, _like in plans:
+        if edit.staged is None:
+            continue
+        which = getattr(edit, "which", "publisher")
+        pending, backup = _pending_name(live, tag, ACTION), _backup_name(live, tag, action=ACTION)
+        for there, wanted in ((pending, edit.staged), (backup, edit.original)):
+            found = store.read(there)
+            if found is not None and found != wanted:
+                raise Refused(
+                    which,
+                    f"{store.where(there)} is already there from an earlier run and holds something "
+                    "else; this command never overwrites a staged copy or a backup, so move it "
+                    "away (after putting back anything it is needed for), then run again. "
+                    "Nothing was written",
+                )
+    # Every read is done and nothing refused: now stage.
     for edit, store, live, folder, like in plans:
         which = getattr(edit, "which", "publisher")
         steps += edit.steps
         if edit.staged is None:
             continue
         line, where = stage(
-            store, which=which, live=live, folder=folder, leaf=leaf, original=edit.original,
+            store, which=which, live=live, folder=folder, leaf=tag, original=edit.original,
             staged=edit.staged, dry_run=dry_run, like=like, action=ACTION,
         )
         steps.append(line)
         staged[which] = where or Staged(
-            live, _pending_name(live, leaf, ACTION), _backup_name(live, leaf, action=ACTION)
+            live, _pending_name(live, tag, ACTION), _backup_name(live, tag, action=ACTION)
         )
     if publisher_edit is None:
         steps.append(Step(
@@ -483,13 +537,15 @@ def unregister(
             f"GIT_DOOR_REPOS_FILE names (and {slot.git_door} out of GIT_DOOR_PORTS) and restart "
             "the Git door; this command does not edit the estate's files",
         ))
-    default = _mapping(_mapping(yaml.safe_load(coordinator_text)).get("planning")).get("default_target_repo")
-    if default == key:
-        steps.append(Step(
-            "coordinator", "note",
-            f"planning.default_target_repo still names {key}, so a request naming no repository "
-            "will be refused until it names another; change that line by hand",
-        ))
+    # Said for each file that names it (coach review C3).
+    for which, text in (("coordinator", coordinator_text), ("sandbox", sandbox_text)):
+        default = _mapping(_mapping(yaml.safe_load(text)).get("planning")).get("default_target_repo")
+        if default == key:
+            steps.append(Step(
+                which, "note",
+                f"its planning.default_target_repo still names {key}, so a request naming no "
+                "repository will be refused until it names another; change that line by hand",
+            ))
 
     env_text, estate_check = estate_names(estate_values, estate_env_file)
     urls = (str(entry.get("sidecar_url", "")), str(entry.get("runner_url", "")))

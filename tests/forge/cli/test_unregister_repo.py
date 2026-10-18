@@ -45,6 +45,8 @@ from tests.forge.cli.test_register_repo_sandbox import (  # noqa: F401
 
 API_TEST = "guardkit/api_test"
 B_KEY = "guardkit/bench-two"
+#: How unregister-repo names its staged copies and backups: owner and name.
+TAG = "guardkit+bench-one"
 C_KEY = "guardkit/bench-three"
 
 
@@ -73,7 +75,9 @@ def _unregister(key: str, *args: str):
 
 
 def _activate(estate, leaf: str, settings: str, publisher=None, *, removing=False):  # noqa: F811
-    """Put the staged copies in place, as step (c) of the printed sequence does."""
+    """Put the staged copies in place, as step (c) of the printed sequence does.
+    ``leaf`` is the short name for register-repo's copies, owner+name for
+    unregister-repo's."""
     suffix = f"{leaf}-unregister-pending" if removing else f"{leaf}-pending"
     estate.volume["forge.yaml"] = estate.volume.get(f"forge.yaml.{suffix}", estate.volume["forge.yaml"])
     estate.sandbox_files[settings] = estate.sandbox_files.get(f"{settings}.{suffix}", estate.sandbox_files[settings])
@@ -113,7 +117,7 @@ def test_register_then_unregister_leaves_every_file_as_it_was(estate, publisher_
     result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS, "--publisher-settings", str(publisher_file))
     assert result.exit_code == 0, result.output
     assert _live(estate, SANDBOX_SETTINGS, publisher_file) == registered, "nothing live is changed"
-    _activate(estate, LEAF, SANDBOX_SETTINGS, publisher_file, removing=True)
+    _activate(estate, TAG, SANDBOX_SETTINGS, publisher_file, removing=True)
 
     assert _live(estate, SANDBOX_SETTINGS, publisher_file) == before
     # The sandbox and the factory's clone in it are left as they are.
@@ -121,7 +125,7 @@ def test_register_then_unregister_leaves_every_file_as_it_was(estate, publisher_
     assert f"the factory's clone {CLONE_PATH}" in result.output
     # Dated backups of the live text, named for this command.
     stamp = datetime.date.today().strftime("%Y%m%d")
-    backup = f"bak-{stamp}-pre-unregister-{LEAF}"
+    backup = f"bak-{stamp}-pre-unregister-{TAG}"
     assert estate.volume[f"forge.yaml.{backup}"] == registered[0]
     assert estate.sandbox_files[f"{SANDBOX_SETTINGS}.{backup}"] == registered[2]
     assert (publisher_file.parent / f"settings.json.{backup}").read_bytes() == registered[4][0]
@@ -140,7 +144,7 @@ def test_register_then_unregister_a_sandbox_of_its_own_leaves_every_file_as_it_w
 
     result = _unregister(KEY, "--sandbox-clone", WORKSPACE, "--publisher-settings", str(publisher_file))
     assert result.exit_code == 0, result.output
-    _activate(own, LEAF, OWN_SETTINGS, publisher_file, removing=True)
+    _activate(own, TAG, OWN_SETTINGS, publisher_file, removing=True)
 
     assert _live(own, OWN_SETTINGS, publisher_file) == before
     assert "with its memory grant bench_one" in result.output
@@ -219,7 +223,7 @@ def test_unregistering_one_of_two_leaves_exactly_the_other(estate, publisher_fil
     _activate(estate, "bench-two", SANDBOX_SETTINGS, publisher_file)
     result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS, "--publisher-settings", str(publisher_file))
     assert result.exit_code == 0, result.output
-    _activate(estate, LEAF, SANDBOX_SETTINGS, publisher_file, removing=True)
+    _activate(estate, TAG, SANDBOX_SETTINGS, publisher_file, removing=True)
 
     assert _live(estate, SANDBOX_SETTINGS, publisher_file) == b_only
     coordinator = yaml.safe_load(estate.volume["forge.yaml"])
@@ -234,7 +238,7 @@ def test_a_path_another_repository_uses_stays_on_the_allowlist(estate):  # noqa:
     _activate(estate, "bench-two", SANDBOX_SETTINGS)
     result = _unregister(API_TEST, "--sandbox-settings", SANDBOX_SETTINGS)
     assert result.exit_code == 0, result.output
-    staged = yaml.safe_load(estate.volume["forge.yaml.api_test-unregister-pending"])
+    staged = yaml.safe_load(estate.volume["forge.yaml.guardkit+api_test-unregister-pending"])
     assert "/var/lib/forge/projects/api_test" in staged["permissions"]["filesystem"]["allowlist"]
     assert staged["planning"]["target_repo_paths"]["checkouts/api_test"] == "/var/lib/forge/projects/api_test"
     assert API_TEST not in staged["planning"]["sandboxes"] and B_KEY in staged["planning"]["sandboxes"]
@@ -259,7 +263,7 @@ def test_another_sandbox_of_its_own_keeps_its_entry_and_its_memory_grant(own):  
     own.sandbox_name, own.clone_root = LEAF, WORKSPACE
     result = _unregister(KEY, "--sandbox-clone", WORKSPACE)
     assert result.exit_code == 0, result.output
-    _activate(own, LEAF, OWN_SETTINGS, removing=True)
+    _activate(own, TAG, OWN_SETTINGS, removing=True)
 
     planning = yaml.safe_load(own.volume["forge.yaml"])["planning"]
     assert KEY not in planning["sandboxes"] and planning["sandboxes"][B_KEY] == b_entry
@@ -291,7 +295,7 @@ def test_after_api_test_is_out_a_new_registration_copies_another_one(estate):  #
 
     with_a = (estate.volume["forge.yaml"], estate.sandbox_files[SANDBOX_SETTINGS])
     assert _unregister(API_TEST, "--sandbox-settings", SANDBOX_SETTINGS).exit_code == 0
-    _activate(estate, "api_test", SANDBOX_SETTINGS, removing=True)
+    _activate(estate, "guardkit+api_test", SANDBOX_SETTINGS, removing=True)
     a_lines = [_removed(with_a[0], estate.volume["forge.yaml"]),
                _removed(with_a[1], estate.sandbox_files[SANDBOX_SETTINGS])]
 
@@ -351,7 +355,7 @@ def test_r1_an_allowlist_entry_another_repository_is_under_stays(estate, path): 
     _with_inner_repository(estate, path)
     result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
     assert result.exit_code == 0, result.output
-    staged = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-unregister-pending"])
+    staged = yaml.safe_load(estate.volume[f"forge.yaml.{TAG}-unregister-pending"])
     assert f"/var/lib/forge/projects/{LEAF}" in staged["permissions"]["filesystem"]["allowlist"]
     assert KEY not in staged["planning"]["target_repo_paths"]
     assert "guardkit/inner still uses it" in result.output
@@ -363,7 +367,7 @@ def test_r1_a_sibling_whose_name_only_starts_the_same_does_not_keep_it(estate): 
     _with_inner_repository(estate, f"/var/lib/forge/projects/{LEAF}-two")
     result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
     assert result.exit_code == 0, result.output
-    staged = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-unregister-pending"])
+    staged = yaml.safe_load(estate.volume[f"forge.yaml.{TAG}-unregister-pending"])
     assert f"/var/lib/forge/projects/{LEAF}" not in staged["permissions"]["filesystem"]["allowlist"]
 
 
@@ -379,7 +383,7 @@ def test_r2_a_comment_inside_the_entry_is_refused_naming_its_line(estate):  # no
     result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
 
     assert result.exit_code == 1
-    assert f"planning.sandboxes's entry for {KEY} has comment lines inside it (line {at + 1} " in result.output
+    assert f"removing {KEY} would delete a comment (line {at + 1} of its forge.yaml)" in result.output
     assert estate.writes == []
 
 
@@ -391,7 +395,7 @@ def test_r2_comments_around_the_entry_are_kept(estate):  # noqa: F811
     )
     result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
     assert result.exit_code == 0, result.output
-    staged = estate.volume[f"forge.yaml.{LEAF}-unregister-pending"]
+    staged = estate.volume[f"forge.yaml.{TAG}-unregister-pending"]
     assert "    # Added for the bench.\n" in staged and "# A note after the last sandbox." in staged
 
 
@@ -426,3 +430,116 @@ def test_r3_the_unregister_sequence_checks_the_route_is_gone_after_the_restart(e
     assert runs(there) == 1, "the route is still in the settings it loaded"
     assert runs("") == 1, "no settings line since the restart: it did not start"
     assert runs(there + gone) == 0, "only the newest settings line counts"
+
+
+# ---------------------------------------------------------------------------
+# Codex review round 2 (R2): an inline comment on any line to be deleted
+
+
+def _registered(estate):  # noqa: F811
+    assert _register(KEY).exit_code == 0
+    _activate(estate, LEAF, SANDBOX_SETTINGS)
+    estate.writes.clear()
+
+
+@pytest.mark.parametrize("old, new", [
+    # On a child value of the sandbox entry.
+    ('      runner_url: "${FORGE_SANDBOX_RUNNER_URL}"\n  fetch_addresses:',
+     '      runner_url: "${FORGE_SANDBOX_RUNNER_URL}"  # its runner\n  fetch_addresses:'),
+    # On a scalar mapping entry.
+    (f"    {KEY}: /var/lib/forge/projects/{LEAF}\n",
+     f"    {KEY}: /var/lib/forge/projects/{LEAF}  # the bench\n"),
+    # On an allowlist item.
+    (f"      - /var/lib/forge/projects/{LEAF}\n",
+     f"      - /var/lib/forge/projects/{LEAF} # the bench\n"),
+])
+def test_r2_an_inline_comment_on_a_line_to_be_deleted_is_refused(estate, old, new):  # noqa: F811
+    _registered(estate)
+    live = estate.volume["forge.yaml"]
+    assert live.count(old) == 1, old
+    estate.volume["forge.yaml"] = live.replace(old, new)
+    number = estate.volume["forge.yaml"].split("\n").index(new.split("\n")[0]) + 1
+
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+
+    assert result.exit_code == 1
+    assert f"would delete a comment (line {number} of its forge.yaml)" in result.output
+    assert estate.writes == []
+    assert not [name for name in estate.volume if "unregister" in name]
+
+
+@pytest.mark.parametrize("value", ["'/var/lib/forge/projects/#'", '"/var/lib/forge/projects/a #b"'])
+def test_r2_a_hash_inside_quotes_is_not_a_comment(estate, value):  # noqa: F811
+    _registered(estate)
+    estate.volume["forge.yaml"] = estate.volume["forge.yaml"].replace(
+        f"    {KEY}: /var/lib/forge/projects/{LEAF}\n", f"    {KEY}: {value}\n"
+    )
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+    assert result.exit_code == 0, result.output
+    staged = yaml.safe_load(estate.volume[f"forge.yaml.{TAG}-unregister-pending"])
+    assert KEY not in staged["planning"]["target_repo_paths"]
+
+
+def test_r2_what_counts_as_a_comment():
+    from forge.cli.unregister_repo import _has_comment
+
+    for line in ("  # whole", "x: y # inline", "- /a\t# tab", "x: it's # still", 'x: "a" # after',
+                 "x: 'it''s' # after"):
+        assert _has_comment(line), line
+    for line in ("x: '#'", 'x: "a #b"', "x: a#b", 'x: "a \\" #b"', "- '/srv/#x'", "x: [a, '#']"):
+        assert not _has_comment(line), line
+
+
+# ---------------------------------------------------------------------------
+# Coach review: C2 (two owners, one short name) and C3 (the sandbox's default)
+
+
+def test_c2_two_repositories_with_one_short_name_keep_their_own_copies(estate):  # noqa: F811
+    other = f"other/{LEAF}"
+    _registered(estate)
+    estate.clones.clear()  # the shared projects folder holds one clone per short name
+    assert _register(other).exit_code == 0
+    _activate(estate, LEAF, SANDBOX_SETTINGS)
+    live = estate.volume["forge.yaml"]
+
+    first = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+    second = _unregister(other, "--sandbox-settings", SANDBOX_SETTINGS)
+
+    assert first.exit_code == 0 and second.exit_code == 0, first.output + second.output
+    stamp = datetime.date.today().strftime("%Y%m%d")
+    mine = yaml.safe_load(estate.volume[f"forge.yaml.{TAG}-unregister-pending"])["planning"]
+    theirs = yaml.safe_load(estate.volume[f"forge.yaml.other+{LEAF}-unregister-pending"])["planning"]
+    assert KEY not in mine["sandboxes"] and other in mine["sandboxes"]
+    assert other not in theirs["sandboxes"] and KEY in theirs["sandboxes"]
+    for tag in (TAG, f"other+{LEAF}"):
+        assert estate.volume[f"forge.yaml.bak-{stamp}-pre-unregister-{tag}"] == live
+        assert estate.sandbox_files[f"{SANDBOX_SETTINGS}.bak-{stamp}-pre-unregister-{tag}"] == \
+            estate.sandbox_files[SANDBOX_SETTINGS]
+
+
+def test_c2_an_earlier_staged_copy_or_backup_is_never_overwritten(estate):  # noqa: F811
+    _registered(estate)
+    assert _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS).exit_code == 0
+    again = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+    assert again.exit_code == 0 and "already staged" in again.output, "the same run again is fine"
+
+    # The live file changes; the earlier staged copy no longer matches.
+    estate.volume["forge.yaml"] = estate.volume["forge.yaml"].replace("enabled: true", "enabled: true\n  # x", 1)
+    before = (dict(estate.volume), dict(estate.sandbox_files))
+    estate.writes.clear()
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+    assert result.exit_code == 1
+    assert "never overwrites a staged copy or a backup" in result.output
+    assert estate.writes == [] and (estate.volume, estate.sandbox_files) == before
+
+
+def test_c3_the_default_repository_is_said_for_each_file_that_names_it(estate):  # noqa: F811
+    assert _register(B_KEY).exit_code == 0
+    _activate(estate, "bench-two", SANDBOX_SETTINGS)
+    estate.sandbox_files[SANDBOX_SETTINGS] = estate.sandbox_files[SANDBOX_SETTINGS].replace(
+        "  enabled: true\n", f"  enabled: true\n  default_target_repo: {API_TEST}\n", 1
+    )
+    result = _unregister(API_TEST, "--sandbox-settings", SANDBOX_SETTINGS)
+    assert result.exit_code == 0, result.output
+    notes = [line for line in result.output.splitlines() if "default_target_repo still names" in line]
+    assert [line.split()[0] for line in notes] == ["coordinator", "sandbox"]
