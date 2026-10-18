@@ -1418,12 +1418,27 @@ def compose_mission_finisher(
             "jarvis.notification.slack", envelope.model_dump_json().encode("utf-8")
         )
 
-    async def tell(mission_id: str, message: str) -> bool:
-        """One line in a mission's thread; True once it was handed over."""
+    async def tell(mission_id: str, message: str, delivery_id: str | None = None) -> bool:
+        """One line in a mission's thread; True once it was handed over.
+
+        ``delivery_id`` is the line's stable identity, sent as the envelope's
+        ``message_id``: Jarvis's thread consumer drops a repeat of one
+        ``message_id`` (in its own process, for five minutes), so a repeat of
+        this warning inside that window shows once."""
         mission = MissionStore(pool.connection).get(mission_id)
         if mission is None:
             return False
-        await notify(mission, message)
+        envelope = build_planning_notification_envelope(
+            correlation_id=mission.correlation_id,
+            message=message,
+            level="info",
+            target_user=mission.originating_user,
+        )
+        if delivery_id:
+            envelope = envelope.model_copy(update={"message_id": delivery_id})
+        await nats_client.publish(
+            "jarvis.notification.slack", envelope.model_dump_json().encode("utf-8")
+        )
         return True
 
     deps = MissionFinishDeps(

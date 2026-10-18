@@ -1956,3 +1956,37 @@ class TestTheCardSaysWhatALandingLeftStanding:
         assert store.get(MISSION_ID).status == "READY"
         words = wire.cards[0].rationale
         assert f"Left standing: {sentence}" in words
+
+
+class TestTheMissionTellerCarriesTheDeliveryId:
+    @pytest.mark.asyncio
+    async def test_the_envelope_message_id_is_the_stable_delivery_id(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+    ) -> None:
+        """Codex round 2, R4: Jarvis's thread consumer drops a repeat of one
+        envelope ``message_id``; the finisher's line carries the warning's
+        stable delivery id there."""
+        import json
+        from types import SimpleNamespace
+
+        a_running_mission(pool, keys=("B",))
+        sent: list[tuple[str, bytes]] = []
+
+        class _Bus:
+            async def publish(self, subject: str, data: bytes) -> None:
+                sent.append((subject, data))
+
+        finisher = mission_finish.compose_mission_finisher(
+            forge_config=config_on,
+            pool=pool,
+            offer_service=SimpleNamespace(offer=None),
+            nats_client=_Bus(),
+        )
+        assert await finisher.tell(MISSION_ID, "a line", "build-x:3:landing-warning") is True
+        assert await finisher.tell(MISSION_ID, "a line", "build-x:3:landing-warning") is True
+        assert [subject for subject, _ in sent] == ["jarvis.notification.slack"] * 2
+        ids = [json.loads(data)["message_id"] for _, data in sent]
+        assert ids == ["build-x:3:landing-warning"] * 2
+        assert await finisher.tell("no-such-mission", "a line", "x") is False

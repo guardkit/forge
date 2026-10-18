@@ -564,11 +564,11 @@ class MergeExecutorDeps:
     #: has none runs with no record at all and says so in the log, which is
     #: the same fact as a build whose record reads "not recorded".
     publication_store: Callable[[], Any] | None = None
-    #: Says one line in a mission's thread: ``async (mission_id, sentence) ->
-    #: delivered``. Installed at boot from the mission finisher (press lease
+    #: Says one line in a mission's thread: ``async (mission_id, sentence,
+    #: delivery_id) -> delivered``. Installed at boot from the mission finisher (press lease
     #: recovery); ``None`` delivers nothing, and the finishing routine then
     #: leaves a mission landing's warning for the next pass.
-    tell_mission: Callable[[str, str], Awaitable[bool]] | None = None
+    tell_mission: Callable[..., Awaitable[bool]] | None = None
     feature_routing_gate: Any | None = None
     feature_routing_required: bool = False
     #: HOW THE SEND IS ASKED FOR — ``async (config, request) -> answer``.
@@ -828,8 +828,12 @@ def _mint_repair_row(
     outcome: "MergeDeployOutcome",
     *,
     feature_id: str | None = None,
-) -> None:
+) -> str:
     """File one repair row for a press that found the code wrong. Never raises.
+
+    Answers "skipped" when this ending files none on purpose, "attempted"
+    otherwise: the filer swallows its own failures, so the caller reads the
+    queue to know whether the row is there (Codex round 2, R7).
 
     Three endings file one: the merge landed and the checks after it went
     red (the three ``RED_MERGE_ENDINGS``), and — protect-main — the branch
@@ -863,7 +867,7 @@ def _mint_repair_row(
             feature_id or build_id,
             belongs.mission_id,
         )
-        return
+        return "skipped"
     gate = outcome.gate_before_merge or {}
     if outcome.result == "merged-verify-failed" and outcome.verify_status != "failed":
         logger.info(
@@ -871,14 +875,14 @@ def _mint_repair_row(
             "filed — a person must look at the check itself",
             feature_id or build_id,
         )
-        return
+        return "skipped"
     if outcome.result == "candidate-refused" and not gate.get("ran"):
         logger.info(
             "merge-executor: the sandbox check for %s could not run, so no "
             "repair was filed — a person must look at the check itself",
             feature_id or build_id,
         )
-        return
+        return "skipped"
     if (
         outcome.result == "merged-deploy-failed"
         and outcome.failed_step == "promote"
@@ -890,7 +894,7 @@ def _mint_repair_row(
             "must be sent again",
             feature_id or build_id,
         )
-        return
+        return "skipped"
     try:
         from forge.pipeline.fix_row_producer import (
             SOURCE_CANDIDATE_REFUSED,
@@ -915,7 +919,7 @@ def _mint_repair_row(
                 checks_total=total if isinstance(total, int) else None,
                 failing_checks=gate.get("failed_checks") or None,
             )
-            return
+            return "attempted"
         maybe_mint_fix_row(
             pool=pool,
             build_id=build_id,
@@ -930,6 +934,7 @@ def _mint_repair_row(
             type(exc).__name__,
             exc,
         )
+    return "attempted"
 
 
 #: WHAT THE GATE SAW, ON THE SENTENCE A PERSON READS (2026-09-12). A refusal
@@ -1274,7 +1279,7 @@ def the_stopped_presss_ending(
             ),
             started=deps.clock(),
             receipts_dir=_receipts_root_of(deps, row.repo) / f"merge-{row.build_id}",
-            attempt_id=_the_latest_decisions_attempt(deps.pool, row.build_id),
+            attempt_id=written.attempt_id,
             digest_warning=None,
             mint_repair=False,
         )
@@ -1295,7 +1300,7 @@ def the_stopped_presss_ending(
         ),
         started=deps.clock(),
         receipts_dir=_receipts_root_of(deps, row.repo) / f"merge-{row.build_id}",
-        attempt_id=_the_latest_decisions_attempt(deps.pool, row.build_id),
+        attempt_id=written.attempt_id,
         digest_warning=None,
         mint_repair=False,
     )
@@ -1308,16 +1313,6 @@ def _an_ending_is_owed(pool: Any, build_id: str) -> bool:
         return False
     store = PublicationRecordStore(cx)
     return _a_press_is_owed_its_finishing(store.read(build_id), store.read_outcome(build_id))
-
-
-def _the_latest_decisions_attempt(pool: Any, build_id: str) -> str | None:
-    """The latest approved merge decision's attempt id, or ``None``."""
-    for stage in reversed(pool.read_stages(build_id)):
-        if stage.target_identifier == MERGE_DECISION_TARGET_IDENTIFIER and stage.status == "PASSED":
-            said = (stage.details or {}).get(MERGE_DECISION_DETAILS_KEY) or {}
-            attempt = said.get(MERGE_EXECUTION_ATTEMPT_ID_KEY)
-            return str(attempt) if attempt else None
-    return None
 
 
 def _record_the_report(
@@ -1560,54 +1555,132 @@ async def _finish_the_bus_message(
         )
 
 
-def _finish_the_build_row(deps: Any, ending: PressEnding) -> None:
+#: What a finishing step answers (Codex round 2, R7): done, nothing to do
+#: (intentionally skipped), or not done and to be tried again next pass. A
+#: step is never taken as done on its own say-so: its durable result is read.
+STEP_DONE = "done"
+STEP_SKIPPED = "skipped"
+STEP_RETRY = "retry"
+
+_TERMINAL_BUILD_STATES: frozenset[str] = frozenset({"COMPLETE", "FAILED", "CANCELLED", "SKIPPED"})
+
+
+def _the_build_rows_state(pool: Any, build_id: str) -> str | None:
+    try:
+        row = pool.get_build_row(build_id)
+    except Exception:  # noqa: BLE001 — unknown is not terminal
+        return ""
+    if row is None:
+        return None
+    status = getattr(row, "status", None)
+    return str(getattr(status, "value", status) or "")
+
+
+def _finish_the_build_row(deps: Any, ending: PressEnding) -> str:
     """Step 3: the build row's ending, unless the row is already terminal.
 
     THE BUILD'S ENDING, written by the only thing that knows it. After the
     report, so a row that cannot be written can never cost the report;
     before the repair row, because the journey ends before its follow-on
-    begins. :func:`close_build_row` leaves a terminal row exactly as it is.
-    """
+    begins. :func:`close_build_row` leaves a terminal row exactly as it is,
+    and can degrade without saying so, so the row itself is read after it:
+    terminal is done; an ending this seam does not write, or no row at all,
+    is nothing to do; anything else is tried again next pass."""
+    if _the_build_rows_state(deps.pool, ending.build_id) in _TERMINAL_BUILD_STATES:
+        return STEP_DONE
+    if str(ending.outcome.status or "").upper() not in ("PASSED", "FAILED"):
+        return STEP_SKIPPED
     close_build_row(deps.pool, ending.build_id, ending.outcome)
+    state = _the_build_rows_state(deps.pool, ending.build_id)
+    if state is None:
+        return STEP_SKIPPED
+    return STEP_DONE if state in _TERMINAL_BUILD_STATES else STEP_RETRY
+
+
+def _a_repair_row_is_filed(pool: Any, build_id: str) -> bool:
+    from forge.pipeline.fix_row_producer import fix_correlation_id
+
+    cx = _ledger_of(pool)
+    if cx is None:
+        return False
+    try:
+        return (
+            cx.execute(
+                "SELECT 1 FROM work_queue WHERE correlation_id = ? AND kind = 'fix' LIMIT 1",
+                (fix_correlation_id(build_id),),
+            ).fetchone()
+            is not None
+        )
+    except Exception:  # noqa: BLE001 — unknown is not filed
+        return False
 
 
 def _finish_the_repair_row(
     deps: Any, store: Any, ending: PressEnding, press_turn: int | None, written: Any,
-) -> None:
+) -> str:
     """Step 4: the repair row for a red ending, unless done for this turn.
 
     A PRESS THAT FOUND THE CODE WRONG BECOMES A REPAIR JOB (conductor rewire
     rule 1): the three red endings, and a candidate the check refused. A
     refused merge is not one of them: nothing changed, so there is nothing
-    to repair. The repair producer itself finds a row already filed."""
+    to repair. The filer and its producer swallow their failures, so the
+    queue itself is read after them: a repair row for this build is done;
+    one the filer decided not to file (or a repair journey's own build) is
+    nothing to do; otherwise it is tried again next pass, and ``repair_at``
+    is written only once it is done or not needed."""
     outcome = ending.outcome
     if not ending.mint_repair or not (
         outcome.result in RED_MERGE_ENDINGS or outcome.result == "candidate-refused"
     ):
-        return
+        return STEP_SKIPPED
     if written is not None and written.repair_at:
-        return
-    _mint_repair_row(deps.pool, ending.build_id, outcome, feature_id=ending.feature_id)
+        return STEP_DONE
+    filed = _mint_repair_row(deps.pool, ending.build_id, outcome, feature_id=ending.feature_id)
+    if filed == "skipped" or _a_repair_row_is_filed(deps.pool, ending.build_id):
+        answer = STEP_SKIPPED if filed == "skipped" else STEP_DONE
+    elif _a_repair_journey(deps.pool, ending.build_id):
+        answer = STEP_SKIPPED  # a repair of a repair would go round in a circle
+    else:
+        return STEP_RETRY
     if store is not None and press_turn:
         store.mark_outcome(
             build_id=ending.build_id, turn=press_turn, repair_at=deps.clock().isoformat()
         )
+    return answer
+
+
+def _a_repair_journey(pool: Any, build_id: str) -> bool:
+    try:
+        from forge.pipeline.fix_row_producer import _is_fix_journey
+
+        row = pool.get_build_row(build_id)
+        return bool(row is not None and _is_fix_journey(row))
+    except Exception:  # noqa: BLE001 — unknown is not a repair journey
+        return False
+
+
+def landing_warning_delivery_id(build_id: str, press_turn: int | None) -> str:
+    """The stable identity of one landing's warning, carried on every delivery
+    of it (Codex round 2, R4), so a consumer that drops repeats of one id can
+    drop a repeat of this warning."""
+    return f"{build_id}:{int(press_turn or 0)}:landing-warning"
 
 
 async def _finish_the_warning(
     deps: Any, store: Any, ending: PressEnding, press_turn: int | None,
     written: Any, tell: Any,
-) -> bool:
+) -> str:
     """Step 5: a mission landing's warning in its thread, until delivered.
 
     The sentence is kept on the row first (the mission's card reads it),
-    then delivered; a delivery that fails, or no way to deliver here, is
-    tried again on the next pass. True once delivered, or when there is
-    nothing to say."""
+    then delivered with its stable delivery id; a delivery that fails, or no
+    way to deliver here, is tried again on the next pass. AT LEAST ONCE, on
+    purpose: a stop between the delivery and its mark delivers it again,
+    because a repeated line is far better than a lost warning."""
     if not ending.warning:
-        return True
+        return STEP_SKIPPED
     if written is not None and written.warning_delivered_at:
-        return True
+        return STEP_DONE
     if store is not None and press_turn and not (written and written.warning):
         store.mark_outcome(
             build_id=ending.build_id,
@@ -1615,9 +1688,15 @@ async def _finish_the_warning(
             warning_json={"sentence": ending.warning, "mission_id": ending.mission_id},
         )
     if tell is None:
-        return False
+        return STEP_RETRY
     try:
-        delivered = bool(await tell(ending.mission_id, ending.warning))
+        delivered = bool(
+            await tell(
+                ending.mission_id,
+                ending.warning,
+                landing_warning_delivery_id(ending.build_id, press_turn),
+            )
+        )
     except Exception as exc:  # noqa: BLE001 — tried again next pass
         logger.warning(
             "merge-executor: %s's warning could not be said in its mission's "
@@ -1627,24 +1706,46 @@ async def _finish_the_warning(
             exc,
         )
         delivered = False
-    if delivered and store is not None and press_turn:
-        store.mark_outcome(
+    if not delivered:
+        return STEP_RETRY
+    if store is not None and press_turn:
+        if not store.mark_outcome(
             build_id=ending.build_id,
             turn=press_turn,
             warning_delivered_at=deps.clock().isoformat(),
-        )
-    return delivered
+        ):
+            return STEP_RETRY
+    return STEP_DONE
 
 
 def _finish_the_release(
-    deps: Any, store: Any, build_id: str, lease_turn: int, holder: str
+    deps: Any, store: Any, build_id: str, press_turn: int, lease_turn: int,
+    holder: str, *, release: bool,
 ) -> bool:
-    """Step 6: the hold, put down — last."""
+    """Step 6, last: the hold put down (unless kept on purpose) AND
+    ``finished_at`` set, in one transaction, while this worker still owns the
+    record (Codex round 2, R6)."""
     return bool(
-        store.release_lease(
-            build_id=build_id, turn=lease_turn, holder=holder, now=deps.clock()
+        store.finish_outcome(
+            build_id=build_id,
+            press_turn=press_turn,
+            lease_turn=lease_turn,
+            holder=holder,
+            now=deps.clock(),
+            release=release,
         )
     )
+
+
+def _put_down_a_lease_taken_for_nothing(
+    deps: Any, store: Any, build_id: str, lease_turn: int, holder: str, hold: str
+) -> None:
+    """The press was already finished: the lease this worker took for it is
+    put down again, so it is never left stranded (R6) — unless the finished
+    press's hold is one kept on purpose, which stays held."""
+    if hold == HOLD_KEEP:
+        return
+    store.release_lease(build_id=build_id, turn=lease_turn, holder=holder, now=deps.clock())
 
 
 async def finish_the_press(
@@ -1667,9 +1768,14 @@ async def finish_the_press(
     ``press_turn`` keys the press's row. The lease is renewed first: a
     caller that no longer owns the record does nothing at all.
 
+    Every step answers done, skipped or retry, read from its durable result;
+    ``finished_at`` is set only when every step is done or skipped. A step to
+    retry leaves the row unfinished, the hold put down as usual, so the next
+    pass does it (and nothing already done).
+
     Answers "finished", "kept" (finished, the hold kept for a person),
-    "waiting" (not finished: a warning still to deliver, or a hold kept
-    until its expiry), or "replaced".
+    "waiting" (not finished: a step to retry, a warning still to deliver, or
+    a hold kept until its expiry), or "replaced".
     """
     written = None
     if store is not None:
@@ -1681,33 +1787,40 @@ async def finish_the_press(
         if written is None or written.turn != press_turn:
             return "replaced"
         if written.finished_at:
+            _put_down_a_lease_taken_for_nothing(
+                deps, store, ending.build_id, int(lease_turn or 0), str(holder), hold
+            )
             return "finished"
     completed = deps.clock()
     payload = _the_report_payload(
         ending, completed=completed, dry_run=False, press_turn=press_turn
     )
-    # A ROW THAT COULD NOT BE WRITTEN NEVER COSTS THE REPORT: the steps after
-    # it still run (each its own check), the hold is put down as usual, and
-    # finishing is left unmarked, so the next pass writes the row and redoes
-    # nothing else.
-    row_written = _finish_the_report_row(deps, store, ending, press_turn, payload, completed)
+    # A STEP THAT COULD NOT BE DONE NEVER COSTS THE OTHERS: every step still
+    # runs (each its own check), and finishing is left unmarked, so the next
+    # pass does that step and redoes nothing else.
+    steps = [STEP_DONE if _finish_the_report_row(
+        deps, store, ending, press_turn, payload, completed
+    ) else STEP_RETRY]
     await _finish_the_bus_message(deps, store, ending, press_turn, written, payload)
-    _finish_the_build_row(deps, ending)
-    _finish_the_repair_row(deps, store, ending, press_turn, written)
+    steps.append(_finish_the_build_row(deps, ending))
+    steps.append(_finish_the_repair_row(deps, store, ending, press_turn, written))
     told = await _finish_the_warning(deps, store, ending, press_turn, written, tell)
     if store is None:
         return "finished"
-    if not told or hold == HOLD_KEEP_UNTIL_EXPIRY:
+    if told == STEP_RETRY or hold == HOLD_KEEP_UNTIL_EXPIRY:
         return "waiting"
-    if hold == HOLD_RELEASE and not _finish_the_release(
-        deps, store, ending.build_id, int(lease_turn or 0), str(holder)
+    if STEP_RETRY in steps:
+        if hold == HOLD_RELEASE:
+            store.release_lease(
+                build_id=ending.build_id, turn=int(lease_turn or 0), holder=str(holder),
+                now=deps.clock(),
+            )
+        return "waiting"
+    if not _finish_the_release(
+        deps, store, ending.build_id, int(press_turn or 0), int(lease_turn or 0),
+        str(holder), release=hold == HOLD_RELEASE,
     ):
         return "replaced"
-    if not row_written:
-        return "waiting"
-    store.mark_outcome(
-        build_id=ending.build_id, turn=int(press_turn or 0), finished_at=deps.clock().isoformat()
-    )
     return "kept" if hold == HOLD_KEEP else "finished"
 
 
@@ -1960,6 +2073,7 @@ def _write_the_refusal_down_for(
     refusal: str,
     starts_a_press: bool = False,
     refuse_if_an_ending_is_owed: bool = False,
+    attempt_id: str | None = None,
 ) -> int | None:
     """One row for this build, saying the merge word was given and refused.
 
@@ -1997,6 +2111,7 @@ def _write_the_refusal_down_for(
             target_branch=target_branch,
             starts_a_press=starts_a_press,
             refuse_if_an_ending_is_owed=refuse_if_an_ending_is_owed,
+            attempt_id=attempt_id,
         )
         if grant is None:
             logger.warning(
@@ -3348,6 +3463,7 @@ async def execute_merge_deploy(
             refusal=refusal,
             starts_a_press=True,
             refuse_if_an_ending_is_owed=True,
+            attempt_id=merge_execution_attempt_id,
         )
         if refused_on:
             held_turn = refused_on
@@ -5126,6 +5242,7 @@ async def execute_merge_deploy(
                 target_branch=target_branch,
                 starts_a_press=True,
                 refuse_if_an_ending_is_owed=True,
+                attempt_id=merge_execution_attempt_id,
             )
             if grant is None:
                 current = store.read(build_id)
@@ -7130,7 +7247,7 @@ class MergeApprovalConsumer:
     def _lock_for(self, repo: str) -> asyncio.Lock:
         return self._repo_locks.setdefault(repo, asyncio.Lock())
 
-    def install_mission_teller(self, tell: Callable[[str, str], Awaitable[bool]] | None) -> None:
+    def install_mission_teller(self, tell: Callable[..., Awaitable[bool]] | None) -> None:
         """How the finishing routine says a line in a mission's thread
         (``MergeExecutorDeps.tell_mission``), installed at boot."""
         self._deps.tell_mission = tell

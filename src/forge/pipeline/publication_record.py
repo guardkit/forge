@@ -72,6 +72,7 @@ __all__ = [
     "StoredOutcome",
     "a_report_names_the_press",
     "REPORT_PRESS_TURN_KEY",
+    "NO_ATTEMPT",
     "ensure_outcome_table",
     "Replaced",
     "default_lease_seconds",
@@ -207,6 +208,9 @@ _OUTCOME_COLUMNS_ADDED: tuple[tuple[str, str], ...] = (
 _OUTCOME_MARKS: frozenset[str] = frozenset(
     {"bus_sent_at", "repair_at", "warning_json", "warning_delivered_at", "finished_at"}
 )
+
+#: A press no approval asked for (a command line press): its row's attempt.
+NO_ATTEMPT: str = "none"
 
 #: The report detail that names the press whose ending a merge report is.
 REPORT_PRESS_TURN_KEY: str = "press_turn"
@@ -609,6 +613,7 @@ class PublicationRecordStore:
         starts_a_press: bool = False,
         refuse_if_an_ending_is_owed: bool = False,
         expected_turn: int | None = None,
+        attempt_id: str | None = None,
     ) -> LeaseGrant | None:
         """Take this build's record, or answer ``None`` because someone holds it.
 
@@ -622,6 +627,11 @@ class PublicationRecordStore:
         (``last_refusal`` = ``"an-ending-is-owed"``) while the latest press's
         result is written and its finishing not yet done, so the recovery
         finishes it first.
+
+        ``attempt_id``: with ``starts_a_press``, the press's OWN approved
+        attempt, written onto its row in the same transaction (Codex round 2,
+        R5) — :data:`NO_ATTEMPT` for a press no approval asked for (a command
+        line press), so its ending can never borrow another press's attempt.
 
         ``expected_turn`` (compare and swap): the take succeeds only while the
         record is still on that turn (``last_refusal`` = ``"moved-on"``), so a
@@ -677,7 +687,7 @@ class PublicationRecordStore:
                         ),
                     )
                     if starts_a_press:
-                        self._a_press_begins(build_id, 1, stamp)
+                        self._a_press_begins(build_id, 1, stamp, attempt_id)
                     return LeaseGrant(
                         build_id=str(build_id),
                         holder=str(holder),
@@ -721,7 +731,7 @@ class PublicationRecordStore:
                 if changed != 1:
                     return None
                 if starts_a_press:
-                    self._a_press_begins(build_id, current_turn + 1, stamp)
+                    self._a_press_begins(build_id, current_turn + 1, stamp, attempt_id)
                 return LeaseGrant(
                     build_id=str(build_id),
                     holder=str(holder),
@@ -754,14 +764,17 @@ class PublicationRecordStore:
             return False
         return True
 
-    def _a_press_begins(self, build_id: str, turn: int, stamp: str) -> None:
-        """Inside :meth:`take_lease`'s transaction: this press's row, afresh."""
+    def _a_press_begins(
+        self, build_id: str, turn: int, stamp: str, attempt_id: str | None
+    ) -> None:
+        """Inside :meth:`take_lease`'s transaction: this press's row, afresh,
+        with the press's own attempt (or :data:`NO_ATTEMPT`)."""
         ensure_outcome_table(self._cx)
         self._cx.execute(
             "INSERT OR REPLACE INTO publication_outcomes "
             "(build_id, turn, attempt_id, outcome_json, recorded_at, result_written) "
-            "VALUES (?, ?, NULL, '{}', ?, 0)",
-            (str(build_id), int(turn), stamp),
+            "VALUES (?, ?, ?, '{}', ?, 0)",
+            (str(build_id), int(turn), str(attempt_id or NO_ATTEMPT), stamp),
         )
 
     def _mark_the_result(self, build_id: str, turn: int) -> None:
@@ -852,12 +865,13 @@ class PublicationRecordStore:
                 ).fetchone()
                 if held is None:
                     return False
+                # The attempt was written when the press began (R5); it is not
+                # rewritten here.
                 changed = self._cx.execute(
-                    "UPDATE publication_outcomes SET outcome_json = ?, attempt_id = ?, "
+                    "UPDATE publication_outcomes SET outcome_json = ?, "
                     "recorded_at = ? WHERE build_id = ? AND turn = ?",
                     (
                         json.dumps(outcome, sort_keys=True, default=str),
-                        attempt_id,
                         now.isoformat(),
                         str(build_id),
                         int(turn),
@@ -897,7 +911,7 @@ class PublicationRecordStore:
 
         return StoredOutcome(
             turn=int(row[0]),
-            attempt_id=row[1],
+            attempt_id=None if row[1] in (None, NO_ATTEMPT) else str(row[1]),
             outcome=decoded(row[2]),
             result_written=bool(row[3]),
             standing=decoded(row[4]),
@@ -907,6 +921,45 @@ class PublicationRecordStore:
             warning_delivered_at=row[8],
             finished_at=row[9],
         )
+
+    def finish_outcome(
+        self,
+        *,
+        build_id: str,
+        press_turn: int,
+        lease_turn: int,
+        holder: str,
+        now: datetime,
+        release: bool,
+    ) -> bool:
+        """Put the hold down (when ``release``) AND set ``finished_at``, in ONE
+        transaction, and only while this worker still owns the record on
+        ``lease_turn`` (Codex round 2, R6): no other worker can take the
+        record between the release and the mark. ``False`` when it was not
+        this worker's any more, and nothing was changed."""
+        try:
+            with self._transaction():
+                assignments = "lease_holder = NULL, lease_expires_at = NULL, " if release else ""
+                changed = self._cx.execute(
+                    f"UPDATE publication_records SET {assignments}updated_at = ? "
+                    "WHERE build_id = ? AND turn = ? AND lease_holder = ?",
+                    (now.isoformat(), str(build_id), int(lease_turn), str(holder)),
+                ).rowcount
+                if changed != 1:
+                    return False
+                marked = self._cx.execute(
+                    "UPDATE publication_outcomes SET finished_at = ? "
+                    "WHERE build_id = ? AND turn = ?",
+                    (now.isoformat(), str(build_id), int(press_turn)),
+                ).rowcount
+                if marked != 1:
+                    raise sqlite3.IntegrityError("no press row to finish")
+        except sqlite3.Error as exc:
+            logger.warning(
+                "publication record: %s could not be finished (%s)", build_id, exc
+            )
+            return False
+        return True
 
     def mark_outcome(self, *, build_id: str, turn: int, **marks: Any) -> bool:
         """Write finishing marks onto the press of ``turn``'s row.

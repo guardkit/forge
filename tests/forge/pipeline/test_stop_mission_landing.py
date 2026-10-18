@@ -1051,7 +1051,7 @@ class TestASettledLandingWhoseBookkeepingDidNotFinish:
             # The recovery's own coordinator stops after the report.
             crash.setattr(
                 PublicationRecordStore,
-                "release_lease",
+                "finish_outcome",
                 lambda self, **_k: (_ for _ in ()).throw(RuntimeError("stopped")),
             )
             await mission_finish.finish_ready_missions(
@@ -1286,13 +1286,15 @@ def _a_teller(pool: SqliteLifecyclePersistence, thread: Any, *, failures: int = 
     ``failures`` deliveries fail first (the thread line could not be sent)."""
     left = {"n": failures}
 
-    async def tell(mission_id: str, line: str) -> bool:
+    async def tell(mission_id: str, line: str, delivery_id: str | None = None) -> bool:
+        tell.deliveries.append((mission_id, line, delivery_id))
         if left["n"]:
             left["n"] -= 1
             raise ConnectionError("the thread could not be reached")
         await thread(MissionStore(pool.connection).get(mission_id), line)
         return True
 
+    tell.deliveries = []  # type: ignore[attr-defined]
     return tell
 
 
@@ -1381,6 +1383,82 @@ class TestALandingsWarningAcrossAStop:
         lines = [line for _m, line in thread.lines if "teardown" in line]
         assert len(lines) == 1
         assert len(_stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)) == 1
+        assert _record(pool).lease_holder is None
+        assert MissionStore(pool.connection).get(MISSION_ID).status == "NOT_MERGED"
+        bookkeeping._everything_is_clear(pool)
+
+
+class TestALandingsWarningIsDeliveredAtLeastOnce:
+    """Codex round 2, R4: a stop right after the thread line was handed over
+    and before its mark, or a mark that could not be written, delivers it
+    again — at least once, on purpose — with the same stable delivery id,
+    so a consumer that drops repeats of one id shows it once."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", ["stopped", "mark-failed", "recovery-mark-failed"])
+    async def test_never_lost_and_always_the_same_delivery_id(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        how: str,
+    ) -> None:
+        from tests.forge.pipeline.test_mission_finish import _Thread
+        from tests.forge.pipeline.test_press_lease_recovery import (
+            _TheCoordinatorStopped as _Stopped,
+        )
+
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        _planned(pool)
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(config_on, pool, repo_root, deploy=_ATeardownThatLeavesItStanding())
+        thread = _Thread()
+        tell = _a_teller(pool, thread)
+        consumer = MergeApprovalConsumer(deps)
+        # "recovery-mark-failed": the press has no way to say it; the recovery
+        # says it, and its mark is the one that fails.
+        consumer.install_mission_teller(None if how == "recovery-mark-failed" else tell)
+        assert consumer._decide_landing(
+            B_BUILD, mission_id=MISSION_ID, decided_by="x", request_id=f"merge-{B_BUILD}"
+        )
+        _stop(pool)
+        real_mark = PublicationRecordStore.mark_outcome
+        broken = {"n": 0}
+
+        def the_delivery_mark(self: Any, **kwargs: Any) -> bool:
+            if "warning_delivered_at" in kwargs and not broken["n"]:
+                broken["n"] += 1
+                if how == "stopped":
+                    raise _Stopped()
+                return False
+            return real_mark(self, **kwargs)
+
+        with pytest.MonkeyPatch.context() as crash:
+            crash.setattr(PublicationRecordStore, "mark_outcome", the_delivery_mark)
+            if how == "stopped":
+                with pytest.raises(_Stopped):
+                    await consumer.land_mission_feature(B_BUILD)
+            elif how == "mark-failed":
+                await consumer.land_mission_feature(B_BUILD)
+        if how == "recovery-mark-failed":
+            await consumer.land_mission_feature(B_BUILD)
+            assert tell.deliveries == []
+            consumer.install_mission_teller(tell)
+        else:
+            assert len(tell.deliveries) == 1
+        bookkeeping = TestASettledLandingWhoseBookkeepingDidNotFinish()
+        with pytest.MonkeyPatch.context() as crash:
+            if how == "recovery-mark-failed":
+                crash.setattr(PublicationRecordStore, "mark_outcome", the_delivery_mark)
+            for _ in range(3):
+                bookkeeping._expire(pool)
+                await bookkeeping._passes(config_on, pool, MergeApprovalConsumer(deps))
+        ids = {delivery_id for _m, _line, delivery_id in tell.deliveries}
+        assert len(tell.deliveries) == 2  # handed over again: at least once
+        written = PublicationRecordStore(pool.connection).read_outcome(B_BUILD)
+        assert ids == {f"{B_BUILD}:{written.turn}:landing-warning"}
+        assert written.warning_delivered_at and written.finished_at
         assert _record(pool).lease_holder is None
         assert MissionStore(pool.connection).get(MISSION_ID).status == "NOT_MERGED"
         bookkeeping._everything_is_clear(pool)
