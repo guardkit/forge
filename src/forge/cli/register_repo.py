@@ -2300,20 +2300,22 @@ def activation_sequence(
         )
     if publisher is not None:
         lines += [
-            "(e) The publisher's routes changed: confirm the factory is still drained (as in (b),"
-            " exit 0 only), then restart the publisher and confirm it lists the new route:",
-            f"    {drained}",
-            f"    docker restart {container(PUBLISHER_SERVICE)}",
+            "(e) The publisher's routes changed: confirm the factory is still drained and restart"
+            " the publisher, as ONE command, so it restarts only if the check exits 0 (otherwise"
+            " reopen intake as in (b) and activate later); then confirm it lists the new route:",
+            f"    {drained} \\",
+            f"      && docker restart {container(PUBLISHER_SERVICE)}",
             f"    docker logs {container(PUBLISHER_SERVICE)} 2>&1 | grep 'publisher: settings'"
             f" | grep -F {q(key)}",
         ]
     else:
         lines.append("(e) The publisher's routes did not change; it is not restarted.")
     lines += [
-        "(f) Confirm once more that the factory is drained (as in (b), exit 0 only), then restart"
-        " the coordinator, which reads the new settings when it starts:",
-        f"    {drained}",
-        f"    docker restart {q(estate.coordinator)}",
+        "(f) Confirm once more that the factory is drained and restart the coordinator, which"
+        " reads the new settings when it starts, as ONE command, so it restarts only if the check"
+        " exits 0 (otherwise reopen intake as in (b) and activate later):",
+        f"    {drained} \\",
+        f"      && docker restart {q(estate.coordinator)}",
         "(g) Reopen intake, the Slack-facing services last:",
         f"    docker start {intake}",
         "(h) Check the services, and that the coordinator lists the new project's sandbox:",
@@ -2866,14 +2868,8 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     if create_sandbox_file:
         steps += sandbox_edit.steps
         assert sandbox_edit.staged is not None
-        beside = PurePosixPath(options.sandbox_settings).parent
-        runtime_folders = [str(beside / name) for name in SANDBOX_RUNTIME_FOLDERS]
         if options.dry_run:
             steps.append(Step("sandbox", "would create", sandbox.where(options.sandbox_settings)))
-            steps.append(Step(
-                "sandbox", "would create",
-                f"the runtime folders beside it, owner-only: {', '.join(runtime_folders)}",
-            ))
         else:
             sandbox.create(options.sandbox_settings, sandbox_edit.staged)
             steps.append(Step(
@@ -2881,12 +2877,26 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
                 f"{sandbox.where(options.sandbox_settings)}, the sandbox's own settings file "
                 "(nothing reads it until the sandbox's services start)",
             ))
+    if options.slot is not None:
+        # The runtime folders beside the settings file, made sure of on every
+        # registration of a sandbox of its own, the settings file new or not:
+        # a run that wrote the file and then failed here, or a file written
+        # before this step existed, is put right by running again (Codex
+        # review of the S1 window fixes, R3).
+        beside = PurePosixPath(options.sandbox_settings).parent
+        runtime_folders = [str(beside / name) for name in SANDBOX_RUNTIME_FOLDERS]
+        if options.dry_run:
+            steps.append(Step(
+                "sandbox", "would create",
+                f"any missing runtime folder beside its settings file, owner-only: {', '.join(runtime_folders)}",
+            ))
+        else:
             sandbox.make_folders(runtime_folders)
             steps.append(Step(
-                "sandbox", "created",
+                "sandbox", "ready",
                 f"the runtime folders its start-up uses, owner-only: {', '.join(runtime_folders)}",
             ))
-    else:
+    if not create_sandbox_file:
         edits.append(
             (sandbox_edit, sandbox, options.sandbox_settings, str(PurePosixPath(options.sandbox_settings).parent))
         )

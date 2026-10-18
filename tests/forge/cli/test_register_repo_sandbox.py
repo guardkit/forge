@@ -369,19 +369,48 @@ def test_making_the_runtime_folders_keeps_ones_already_there_and_owned(tmp_path)
     assert refused.returncode != 0
 
 
-def test_a_failure_making_the_runtime_folders_is_refused_by_name(own, monkeypatch):
+def test_a_failure_making_the_runtime_folders_is_refused_and_put_right_by_running_again(own, monkeypatch):
+    """Codex review of the S1 window fixes, R3: the settings file is written
+    before the folders, so a run that fails at the folders must have them
+    made by the next run, which finds the settings file already there."""
     own.sandbox_files = {}
     real = own._sbx_exec
+    failing = {"now": True}
 
-    def failing(rest, input):
-        if register_repo._MAKE_FOLDERS in rest:
+    def sometimes_failing(rest, input):
+        if register_repo._MAKE_FOLDERS in rest and failing["now"]:
             return subprocess.CompletedProcess(rest, 1, "", "mkdir: permission denied\n")
         return real(rest, input)
 
-    monkeypatch.setattr(own, "_sbx_exec", failing)
+    monkeypatch.setattr(own, "_sbx_exec", sometimes_failing)
     result = _run_own()
     assert result.exit_code == 1
     assert "could not make the runtime folders" in result.output
+    assert OWN_SETTINGS in own.sandbox_files and own.sandbox_folders == {}
+
+    failing["now"] = False
+    again = _run_own()
+    assert again.exit_code == 0, again.output
+    assert own.sandbox_folders == {folder: "700" for folder in RUNTIME_FOLDERS}
+
+
+def test_the_runtime_folders_are_made_sure_of_when_the_settings_file_is_already_there(own):
+    """A settings file written before this step existed (the S1 window) gets
+    its folders too; a dry run only says so."""
+    dry = _run_own("--dry-run")
+    assert dry.exit_code == 0, dry.output
+    assert own.sandbox_folders == {} and all(folder in dry.output for folder in RUNTIME_FOLDERS)
+    result = _run_own()
+    assert result.exit_code == 0, result.output
+    assert own.sandbox_folders == {folder: "700" for folder in RUNTIME_FOLDERS}
+
+
+def test_the_shared_sandbox_is_given_no_runtime_folders(estate):  # noqa: F811
+    from tests.forge.cli.test_register_repo import _run
+
+    assert _run().exit_code == 0
+    assert estate.sandbox_folders == {}
+    assert not [c for c in estate.calls if register_repo._MAKE_FOLDERS in c]
 
 
 def test_a_sandbox_of_its_own_is_named_after_its_project(own):

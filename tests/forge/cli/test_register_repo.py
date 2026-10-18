@@ -771,9 +771,9 @@ def test_the_sequence_closes_intake_before_the_drained_check_and_restarts_nothin
     checks = [i for i, line in enumerate(lines) if line.strip().startswith("forge register-repo --check-drained")]
     swap = next(i for i, line in enumerate(lines) if f"forge.yaml.{LEAF}-pending /s/forge.yaml" in line)
     supervisor = next(i for i, line in enumerate(lines) if line.strip() == "docker restart forge-estate-sandbox-runner-1")
-    publisher = next(i for i, line in enumerate(lines) if line.strip() == "docker restart forge-estate-forge-publisher-1")
+    publisher = next(i for i, line in enumerate(lines) if line.strip() == "&& docker restart forge-estate-forge-publisher-1")
     route = next(i for i, line in enumerate(lines) if "grep 'publisher: settings'" in line)
-    coordinator = next(i for i, line in enumerate(lines) if line.strip() == "docker restart forge-estate-coordinator-1")
+    coordinator = next(i for i, line in enumerate(lines) if line.strip() == "&& docker restart forge-estate-coordinator-1")
     reopen = max(i for i, line in enumerate(lines) if line.strip() == f"docker start {intake}")
     dispatch = next(i for i, line in enumerate(lines) if f"autobuild dispatch: {KEY} has a sandbox" in line)
     # A drained check before the swap, again before the publisher's restart
@@ -797,11 +797,55 @@ def test_each_restart_is_explicit_because_up_does_not_recreate_on_a_settings_cha
     assert "docker restart forge-estate-coordinator-1" in output
 
 
+def _restart_commands(lines: list[str]) -> list[str]:
+    """Each printed drained check joined with its continuation line(s)."""
+    commands = []
+    for index, line in enumerate(lines):
+        if not line.strip().startswith("forge register-repo --check-drained"):
+            continue
+        parts = [line.strip()]
+        while parts[-1].endswith("\\"):
+            parts[-1] = parts[-1][:-1].rstrip()
+            index += 1
+            parts.append(lines[index].strip())
+        if any("docker restart" in part for part in parts):
+            commands.append(" ".join(parts))
+    return commands
+
+
+@pytest.mark.parametrize("drained_exit, restarted", [(1, False), (2, False), (0, True)])
+def test_a_drained_check_that_does_not_pass_stops_its_restart(estate, publisher_file, tmp_path, drained_exit, restarted):
+    """Codex review of the S1 window fixes, R1: each drained check and its
+    restart are ONE command, so pasting it restarts nothing unless the check
+    exits 0. Each printed command is run with stand-ins for forge and docker."""
+    lines = _lines(_run("--publish", "--publisher-settings", str(publisher_file)))
+    commands = _restart_commands(lines)
+    assert len(commands) == 2
+    assert "forge-estate-forge-publisher-1" in commands[0] and "forge-estate-coordinator-1" in commands[1]
+    bin_dir = tmp_path / "stand-ins"
+    bin_dir.mkdir()
+    log = tmp_path / "docker.log"
+    (bin_dir / "forge").write_text(f"#!/bin/sh\nexit {drained_exit}\n")
+    (bin_dir / "docker").write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+    for stand_in in bin_dir.iterdir():
+        stand_in.chmod(0o755)
+    for command in commands:
+        done = subprocess.run(
+            ["sh", "-c", command], env={**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}"},
+        )
+        assert (done.returncode == 0) is restarted
+    said = log.read_text().splitlines() if log.exists() else []
+    if restarted:
+        assert said == ["restart forge-estate-forge-publisher-1", "restart forge-estate-coordinator-1"]
+    else:
+        assert said == []
+
+
 def test_without_a_publisher_change_only_the_coordinator_is_restarted(estate):
     lines = _lines(_run())
     assert "(e) The publisher's routes did not change; it is not restarted." in lines
     assert not [line for line in lines if "forge-publisher" in line]
-    assert [line for line in lines if line.strip() == "docker restart forge-estate-coordinator-1"]
+    assert [line for line in lines if line.strip() == "&& docker restart forge-estate-coordinator-1"]
 
 
 def test_the_swap_is_one_command_that_checks_all_three_files_before_copying_any(estate, publisher_file):
