@@ -59,6 +59,9 @@ ENTRY = {
     "sidecar_url": f"http://{SANDBOX_ADDRESS}:8935",
     "runner_url": f"http://{SANDBOX_ADDRESS}:8934",
     "git_door": DOOR,
+    #: The sandbox's own preview ports, slot 1's 8960 and 8961 (18 October
+    #: 2026), in both files.
+    "preview_ports": [8960, 8961],
 }
 #: The project's own receipts folder, as the coordinator sees it (design
 #: section 2.2a): in the coordinator's entry only.
@@ -662,3 +665,87 @@ def test_the_same_repository_running_again_with_its_grant_still_works(own):
     again = _run_own()
     assert again.exit_code == 0, again.output
     assert "nothing is staged" in again.output
+
+
+# ---------------------------------------------------------------------------
+# The sandbox's own preview ports (18 October 2026)
+
+
+def test_the_coordinator_entry_names_the_slot_s_own_preview_ports_and_loads(own):
+    from forge.config.models import SandboxEntry
+
+    result = _run_own()
+    assert result.exit_code == 0, result.output
+    staged = own.volume[f"forge.yaml.{LEAF}-pending"]
+    assert "preview_ports: [8960, 8961]" in staged, "written as numbers, not quoted text"
+    entry = yaml.safe_load(staged)["planning"]["sandboxes"][KEY]
+    assert SandboxEntry.model_validate(entry).preview_ports == [8960, 8961]
+    assert "preview_ports" not in yaml.safe_load(staged)["planning"]["sandboxes"]["guardkit/api_test"]
+    sandbox_staged = own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"]
+    assert "preview_ports: [8960, 8961]" in sandbox_staged, "the sandbox's link check reads them"
+    assert SandboxEntry.model_validate(
+        yaml.safe_load(sandbox_staged)["planning"]["sandboxes"][KEY]
+    ).preview_ports == [8960, 8961]
+
+
+def test_slot_two_names_its_own_preview_ports(own):
+    result = _run_own(slot="2")
+    assert result.exit_code == 0, result.output
+    entry = yaml.safe_load(own.volume[f"forge.yaml.{LEAF}-pending"])["planning"]["sandboxes"][KEY]
+    assert entry["preview_ports"] == [8970, 8971]
+
+
+def test_a_sandbox_registered_before_its_preview_ports_and_grant_is_given_both_and_nothing_else(own):
+    """The live case of 18 October 2026: an entry with neither line."""
+    assert _run_own().exit_code == 0
+    staged = own.volume[f"forge.yaml.{LEAF}-pending"]
+    before = "\n".join(
+        line for line in staged.split("\n")
+        if "memory_projects" not in line and "preview_ports" not in line
+    )
+    own.volume["forge.yaml"] = before
+    sandbox_before = "\n".join(
+        line for line in own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"].split("\n")
+        if "preview_ports" not in line
+    )
+    own.sandbox_files[OWN_SETTINGS] = sandbox_before
+    again = _run_own()
+    assert again.exit_code == 0, again.output
+    after = yaml.safe_load(own.volume[f"forge.yaml.{LEAF}-pending"])
+    assert after["planning"]["sandboxes"][KEY] == COORDINATOR_ENTRY
+    sandbox_after = yaml.safe_load(own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"])
+    assert sandbox_after["planning"]["sandboxes"][KEY] == ENTRY
+    assert again.output.count(f"sandboxes {KEY} preview_ports 8960, 8961") == 2, "one per file"
+    assert f"sandboxes {KEY} memory_projects bench_one" in again.output
+    removed = {k: v for k, v in after.items() if k != "planning"}
+    assert removed == {k: v for k, v in yaml.safe_load(before).items() if k != "planning"}
+
+
+def test_a_sandbox_with_other_preview_ports_is_refused(own):
+    assert _run_own().exit_code == 0
+    staged = own.volume[f"forge.yaml.{LEAF}-pending"]
+    own.volume["forge.yaml"] = staged.replace("preview_ports: [8960, 8961]", "preview_ports: [8950, 8951]")
+    own.sandbox_files[OWN_SETTINGS] = own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"]
+    own.writes.clear()
+    again = _run_own()
+    assert again.exit_code == 1
+    assert "already has an entry" in again.output
+    assert own.writes == []
+
+
+def test_a_preview_port_another_sandbox_has_is_refused(own):
+    _with_other_project(own, {**OTHER_ENTRY, "preview_ports": "[8961, 8999]"})
+    result = _run_own()
+    assert result.exit_code == 1
+    assert "port 8961 (preview_ports)" in result.output
+    assert "pick a slot no sandbox has" in result.output
+    assert own.writes == []
+
+
+def test_the_shared_sandbox_names_no_preview_ports(estate):  # noqa: F811
+    from tests.forge.cli.test_register_repo import _run
+
+    result = _run()
+    assert result.exit_code == 0, result.output
+    coordinator = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-pending"])
+    assert "preview_ports" not in coordinator["planning"]["sandboxes"][KEY]

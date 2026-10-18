@@ -130,3 +130,46 @@ def test_two_repositories_are_never_granted_the_same_memory_name() -> None:
     })
     assert planning.sandboxes["acme/shop-a"].memory_projects == ["shop_a"]
     assert planning.sandboxes["acme/shop-b"].memory_projects == ["shop_b"]
+
+
+# ---------------------------------------------------------------------------
+# A sandbox's own preview ports (18 October 2026)
+
+
+def test_a_sandbox_names_no_preview_ports_by_default() -> None:
+    assert SandboxEntry.model_validate(ENTRY).preview_ports == []
+
+
+def test_preview_ports_are_port_numbers_each_named_once() -> None:
+    entry = SandboxEntry.model_validate({**ENTRY, "preview_ports": [8960, 8961]})
+    assert entry.preview_ports == [8960, 8961]
+    for bad in ([0], [65536], [8960, 8960], ["not-a-port"]):
+        with pytest.raises(ValidationError):
+            SandboxEntry.model_validate({**ENTRY, "preview_ports": bad})
+
+
+def test_two_sandboxes_never_name_the_same_preview_port() -> None:
+    """Every sandbox publishes on one machine: one port is one sandbox's."""
+    paths = {"acme/shop-a": "/srv/repos/shop-a", "acme/shop-b": "/srv/repos/shop-b"}
+    other = {**ENTRY, "name": "shop-b", "sidecar_url": "http://127.0.0.1:8235",
+             "runner_url": "http://127.0.0.1:8234"}
+    with pytest.raises(ValidationError) as caught:
+        PlanningConfig.model_validate({
+            "target_repo_paths": paths,
+            "sandboxes": {
+                "acme/shop-a": {**ENTRY, "preview_ports": [8960, 8961]},
+                "acme/shop-b": {**other, "preview_ports": [8961, 8970]},
+            },
+        })
+    message = str(caught.value)
+    assert "8961" in message and "api-test" in message and "shop-b" in message
+    assert "preview ports of its own" in message
+
+    planning = PlanningConfig.model_validate({
+        "target_repo_paths": paths,
+        "sandboxes": {
+            "acme/shop-a": {**ENTRY, "preview_ports": [8960, 8961]},
+            "acme/shop-b": {**other, "preview_ports": [8970, 8971]},
+        },
+    })
+    assert planning.sandboxes["acme/shop-b"].preview_ports == [8970, 8971]
