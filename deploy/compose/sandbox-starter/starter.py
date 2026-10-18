@@ -88,7 +88,14 @@ LOG_KINDS = frozenset({
     "suspend", "unresolved", "clear",
 })
 
-#: Supervisor container states that mean it is not running.
+#: Supervisor states a stop starts from: the normal stop is sent.
+SUPERVISOR_STOPPABLE = ("running", "restarting", "paused")
+
+#: Supervisor states from which a stop may answer "already stopped", if and
+#: only if sbx ls also shows the VM stopped.
+SUPERVISOR_NOT_RUNNING = ("exited", "created", "missing")
+
+#: Supervisor states that, once a stop has been sent, mean it has ended.
 EXITED = ("exited", "dead", "created", "missing")
 
 #: The fewest seconds between two `sbx ls` calls during a stop.
@@ -723,31 +730,60 @@ class Starter:
             why = self._stop_refusal(sb, starting=False)
         if why:
             raise Refused(why)
+        # WHAT THE SUPERVISOR CONTAINER IS DOING DECIDES THE PATH, bluntly:
+        #   running, restarting, paused  the normal stop: docker stop -t 210,
+        #                                then the completion barrier;
+        #   exited, created, missing     "already stopped" only if sbx ls shows
+        #                                the VM stopped; a VM still running is
+        #                                seen to stopped through the barrier;
+        #   anything else (dead, removing, no answer ...) refuses the stop.
         state = self._container_state(sb)
-        if state == "running":
-            busy = self._helper_busy(sb)
-            if busy is None:
-                raise Refused(
-                    f"the deploy helper in {sb.name} did not answer GET /busy, so it cannot be "
-                    "shown to be idle and the sandbox was not stopped"
-                )
-            if busy:
-                shown = "; ".join(json.dumps(item, sort_keys=True)[:120] for item in busy[:5])
-                raise Refused(
-                    f"the deploy helper in {sb.name} is still executing {len(busy)} request(s) "
-                    f"({shown}), so it was not stopped"
-                )
-            self._container_check(sb)
-        else:
+        if state in SUPERVISOR_STOPPABLE:
+            vm = "running"
+            if state != "running":
+                # A paused or restarting supervisor may or may not still hold
+                # the VM. Only a running VM is asked anything: a listing of a
+                # stopped one through sbx exec would wake it.
+                worked, vm = self._sbx_ls(sb)
+                if not worked:
+                    raise Failed(
+                        f"the sandbox client did not answer (it said: {vm}), so {sb.name}'s VM "
+                        f"state is not known and the {state} supervisor was not stopped"
+                    )
+            if vm == "running":
+                busy = self._helper_busy(sb)
+                if busy is None:
+                    raise Refused(
+                        f"the deploy helper in {sb.name} did not answer GET /busy, so it cannot be "
+                        "shown to be idle and the sandbox was not stopped"
+                    )
+                if busy:
+                    shown = "; ".join(json.dumps(item, sort_keys=True)[:120] for item in busy[:5])
+                    raise Refused(
+                        f"the deploy helper in {sb.name} is still executing {len(busy)} request(s) "
+                        f"({shown}), so it was not stopped"
+                    )
+                self._container_check(sb)
+        elif state in SUPERVISOR_NOT_RUNNING:
             worked, vm = self._sbx_ls(sb)
             if not worked:
                 raise Failed(f"the sandbox client did not answer (it said: {vm}), so {sb.name}'s VM state is not known")
-            if vm != "running":
+            if vm in ("stopped", "not listed"):
                 self._set_readiness(sb, STOPPED)
                 return {"message": f"{sb.name} is already stopped (supervisor {state}, VM {vm})"}
+            if vm != "running":
+                raise Refused(
+                    f"{sb.name}'s supervisor is {state} but its VM shows {vm}, which is neither "
+                    "running nor stopped, so it was not stopped"
+                )
             # The VM is up without its supervisor: listing its engine does not
             # wake anything, and what runs there decides the stop as usual.
             self._container_check(sb)
+        else:
+            raise Refused(
+                f"{sb.name}'s supervisor container {sb.settings.supervisor} is {state}, a state "
+                "the starter does not stop from, so it was not stopped"
+            )
 
         with self.lock:
             why = self._stop_refusal(sb, starting=False)
@@ -762,7 +798,7 @@ class Starter:
         # Past the bounds the sandbox is unresolved until a session clears it.
         exit_deadline = self.clock() + self.settings.stop_grace + self.settings.margin
         said = ""
-        if state == "running":
+        if state in SUPERVISOR_STOPPABLE:
             grace = self.settings.stop_grace
             rc, out = self._run(
                 [self.settings.docker, "stop", "-t", str(int(grace)), sb.settings.supervisor],

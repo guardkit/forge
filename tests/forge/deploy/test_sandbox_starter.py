@@ -81,7 +81,7 @@ case "$1" in
     [ -f "$S/signed_out" ] && { echo "no valid user session: run sbx login" >&2; exit 1; }
     c=$(cat "$S/container" 2>/dev/null || echo missing)
     if [ -f "$S/vm_override" ]; then state=$(cat "$S/vm_override")
-    elif [ "$c" = running ]; then state=running
+    elif [ "$c" = running ] || [ "$c" = paused ]; then state=running
     else
       n=$(cat "$S/vm_stops_after" 2>/dev/null || echo 0)
       if [ "$n" -gt 0 ]; then echo $((n-1)) > "$S/vm_stops_after"; state=running; else state=stopped; fi
@@ -1037,3 +1037,69 @@ class TestOneDeadlineForADeployedHold:
         assert s.status(NAME)["holds"] == []
         assert any(e["kind"] == "hold-close" and e["hold_id"] == hold_id for e in log_entries(world))
         stopping["thread"].join(10)
+
+
+
+class TestTheAlreadyStoppedShortcut:
+    """Codex round 3, R6: "already stopped" only from exited, created or no
+    container, and only with sbx ls showing the VM stopped."""
+
+    def _stops_sent(self, world):
+        return [line for line in world.lines("docker.log") if line.startswith("stop")]
+
+    @pytest.mark.parametrize("state", ["exited", "created", None])
+    def test_a_supervisor_that_is_not_running_and_a_stopped_vm_is_already_stopped(self, world, state):
+        if state is None:
+            (world.state / "container").unlink()
+        else:
+            (world.state / "container").write_text(state + "\n")
+        s = world.make()
+        assert "is already stopped" in s.stop(NAME)["message"]
+        assert self._stops_sent(world) == []
+        assert world.lines("sbx.log") == ["ls"]
+
+    def test_a_restarting_supervisor_with_its_vm_stopped_takes_the_stop_path(self, world):
+        (world.state / "container").write_text("restarting\n")
+        s = world.make()
+        result = s.stop(NAME)
+        assert "is stopped" in result["message"] and "already" not in result["message"]
+        assert self._stops_sent(world) == [f"stop -t 210 {SUPERVISOR}"]
+        assert f"wait {SUPERVISOR}" in world.lines("docker.log")
+        # The VM was stopped, so nothing was asked of it through sbx exec.
+        assert not any(line.startswith("exec") for line in world.lines("sbx.log"))
+        assert s.status(NAME)["readiness"] == "stopped"
+
+    def test_a_paused_supervisor_takes_the_stop_path_with_its_checks(self, world):
+        (world.state / "container").write_text("paused\n")
+        s = world.make()
+        result = s.stop(NAME)
+        assert "is stopped" in result["message"] and "already" not in result["message"]
+        assert self._stops_sent(world) == [f"stop -t 210 {SUPERVISOR}"]
+        # Its VM was still running, so the engine was listed before the stop.
+        assert any(line.startswith(f"exec {NAME} docker ps") for line in world.lines("sbx.log"))
+
+    def test_a_paused_supervisor_with_a_busy_helper_is_refused(self, world):
+        (world.state / "container").write_text("paused\n")
+        world.services.answers["/busy"] = (200, '{"executing": [{"route": "/merge"}]}')
+        s = world.make()
+        with pytest.raises(starter_mod.Refused, match="still executing 1 request"):
+            s.stop(NAME)
+        assert self._stops_sent(world) == []
+
+    @pytest.mark.parametrize("state", ["dead", "removing", "something-new"])
+    def test_any_other_state_refuses_the_stop_and_never_reports_success(self, world, state):
+        (world.state / "container").write_text(state + "\n")
+        s = world.make()
+        with pytest.raises(starter_mod.Refused, match=f"is {state}, a state the starter does not stop from"):
+            s.stop(NAME)
+        assert self._stops_sent(world) == []
+        assert world.lines("sbx.log") == []
+        assert s.status(NAME)["readiness"] != "stopped"
+        assert s.status(NAME)["operations"]["last"]["outcome"] == "refused"
+
+    def test_a_supervisor_whose_state_cannot_be_read_refuses_the_stop(self, world):
+        (world.state / "container").write_text("")  # docker inspect answers nothing
+        s = world.make()
+        with pytest.raises(starter_mod.Refused, match="is unknown, a state the starter does not stop from"):
+            s.stop(NAME)
+        assert self._stops_sent(world) == []
