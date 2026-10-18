@@ -90,11 +90,38 @@ def test_the_single_door_is_for_an_estate_with_one_sandbox():
         _planning({}, git_door=DOOR_A)
     one = PlanningConfig(
         git_door=DOOR_A,
+        target_repo_paths={A: "/w/a"},
+        sandboxes={A: _entry("only-sbx", 1, None)},
+        fetch_addresses={A: f"{DOOR_A}{A}.git"},
+    )
+    assert one.git_door_for(A) == DOOR_A
+
+
+def test_the_shared_sandbox_never_reads_through_the_single_door():
+    """Codex implementation review 1, R1: a repository mapped to the shared
+    sandbox is refused a door address, through the single door too."""
+    with pytest.raises(ValueError, match="never reads through a door"):
+        PlanningConfig(
+            git_door=DOOR_A,
+            target_repo_paths={SHARED: "/w/s"},
+            sandboxes={SHARED: _entry("api-test-deploy", 0, None)},
+            fetch_addresses={SHARED: f"{DOOR_A}{SHARED}.git"},
+        )
+    # Over https it is as before.
+    assert PlanningConfig(
+        git_door=DOOR_A,
         target_repo_paths={SHARED: "/w/s"},
         sandboxes={SHARED: _entry("api-test-deploy", 0, None)},
-        fetch_addresses={SHARED: f"{DOOR_A}{SHARED}.git"},
-    )
-    assert one.git_door_for(SHARED) == DOOR_A
+        fetch_addresses={SHARED: f"https://github.com/{SHARED}.git"},
+    ).git_door_for(SHARED) == DOOR_A
+
+
+def test_the_shared_sandbox_never_has_a_door_of_its_own():
+    with pytest.raises(ValueError, match="never has one"):
+        PlanningConfig(
+            target_repo_paths={SHARED: "/w/s"},
+            sandboxes={SHARED: _entry("api-test-deploy", 0, DOOR_A)},
+        )
 
 
 def test_the_shared_question_answers_the_same_for_any_configuration_shape():

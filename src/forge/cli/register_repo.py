@@ -75,6 +75,13 @@ goes through it. The repository must already be on the door's allow-list,
 keyed by that port; the command says so, and changes nothing about the door
 itself.
 
+``--sandbox-ssh <host>`` (Codex implementation review 1, R3) is for the
+estate's two machines: the coordinator, its settings volume and the
+publisher's file are on this machine, and the sandboxes on another (the
+Spark). Run the command here, as before; every ``sbx`` command is then sent to
+``<host>`` over ssh, each argument shell-quoted so it arrives as written, and
+the printed activation lines say the same. Nothing else changes machine.
+
 When the publisher's settings say ``private_only`` (17 October 2026), a
 route is written only for a repository confirmed private
 (:mod:`forge.publisher.private_remote`): its own route key reads it (the
@@ -665,10 +672,27 @@ class SandboxStore:
     Every call is ``sbx exec -u 1000 <sandbox> ...``; a write hands the text in
     on standard input (``-i``) to ``sh -c 'cat > "$1"'`` and gives the file
     the mode of the live file it stands beside.
+
+    ``ssh_host`` (one sandbox per project, 17 October 2026; Codex
+    implementation review 1, R3): the sandbox lives on another machine than
+    the coordinator, as the estate's sandboxes live on the Spark. Every sbx
+    command is then sent there as ``ssh -o BatchMode=yes <host> -- <the
+    command, shell-quoted>``, so each argument arrives exactly as written (the
+    remote shell reads the one quoted line back into the same words) and
+    standard input still carries a write. Everything else this command does —
+    the coordinator's settings volume, the publisher's file, the check clone —
+    stays on this machine.
     """
 
     sandbox: str
     run: Runner
+    ssh_host: str | None = None
+
+    def _routed(self, command: Sequence[str]) -> list[str]:
+        """``command``, sent to the sandbox's machine when it is another."""
+        if not self.ssh_host:
+            return list(command)
+        return [*sandbox_ssh_prefix(self.ssh_host), shlex.join(list(command))]
 
     def exec(
         self,
@@ -684,7 +708,7 @@ class SandboxStore:
         for item in env:
             command += ["-e", item]
         command += [self.sandbox, *argv]
-        return _call(self.run, command, input=input, timeout=timeout)
+        return _call(self.run, self._routed(command), input=input, timeout=timeout)
 
     @property
     def exec_prefix(self) -> list[str]:
@@ -695,7 +719,7 @@ class SandboxStore:
         self, command: Sequence[str], *, timeout: float = COMMAND_TIMEOUT
     ) -> "subprocess.CompletedProcess[str]":
         """Run a command line built whole (by :mod:`forge.network_git`)."""
-        return _call(self.run, list(command), timeout=timeout)
+        return _call(self.run, self._routed(command), timeout=timeout)
 
     def git_read(self, *args: str) -> "subprocess.CompletedProcess[str]":
         """A local git read inside the sandbox, isolated (14 October 2026):
@@ -765,6 +789,16 @@ class HostStore:
         with os.fdopen(descriptor, "wb") as handle:
             handle.write(text.encode("utf-8", "surrogateescape"))
         os.chmod(name, mode)
+
+
+def sandbox_ssh_prefix(host: str) -> list[str]:
+    """How a command reaches the sandbox's machine: plain ssh, no prompt."""
+    return ["ssh", "-o", "BatchMode=yes", host, "--"]
+
+
+#: What an ssh host for the sandbox's machine may be: a host name, an alias
+#: from the ssh settings, or user@host. Never an option (no leading "-").
+_SSH_HOST = re.compile(r"^(?:[A-Za-z0-9._-]+@)?[A-Za-z0-9][A-Za-z0-9._:-]*$")
 
 
 # ---------------------------------------------------------------------------
@@ -2098,6 +2132,9 @@ class Estate:
     settle_seconds: int = DEFAULT_SETTLE_SECONDS
     #: A sandbox of its own (17 October 2026): its slot's ports, said in (e).
     slot: SlotPorts | None = None
+    #: The sandbox's machine, when it is another (--sandbox-ssh): the printed
+    #: sbx commands are sent there the same way.
+    sandbox_ssh: str | None = None
 
 
 def activation_sequence(
@@ -2120,6 +2157,13 @@ def activation_sequence(
     def q(value: str) -> str:
         # A name still to be filled in ("$ESTATE_ENV") stays expandable.
         return f'"{value}"' if value.startswith("$") else shlex.quote(value)
+
+    # The sandbox's own machine, when it is another (--sandbox-ssh).
+    sbx = (
+        f"{' '.join(sandbox_ssh_prefix(shlex.quote(estate.sandbox_ssh)))} sbx"
+        if estate.sandbox_ssh
+        else "sbx"
+    )
 
     dc = (
         f'dc() {{ ( set -a; . {q(estate.loaded_env_file)}; set +a; docker compose -p '
@@ -2157,7 +2201,7 @@ def activation_sequence(
         "    dc stop",
         f"    Check: docker ps --filter label=com.docker.compose.project={COMPOSE_PROJECT} -q"
         " prints nothing, and",
-        f"    sbx exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}}' lists neither"
+        f"    {sbx} exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}}' lists neither"
         f" {estate.sandbox}-helper nor {estate.sandbox}-runner.",
         "(d) Put the staged settings in place, as ONE command: it first checks that every live file"
         " is still the one its staged copy was made from, and only then copies any. If a check"
@@ -2180,7 +2224,7 @@ def activation_sequence(
         )
     if sandbox_file is not None:
         backup = sandbox_file.backup or "<its backup>"
-        exec_ = f"sbx exec -u {SANDBOX_USER} {q(estate.sandbox)}"
+        exec_ = f"{sbx} exec -u {SANDBOX_USER} {q(estate.sandbox)}"
         checks.append(f"{exec_} cmp {q(sandbox_file.live)} {q(backup)}")
         copies.append(f"{exec_} cp {q(sandbox_file.pending)} {q(sandbox_file.live)}")
     if publisher is not None:
@@ -2207,7 +2251,7 @@ def activation_sequence(
             f" {ports.memory_door}:",
         ]
     lines += [
-        f"    sbx exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'"
+        f"    {sbx} exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'"
         f"  (both {estate.sandbox}-helper and {estate.sandbox}-runner Up)",
     ]
     if helper_urls is not None:
@@ -2284,6 +2328,8 @@ class Options:
     #: The coordinator's copy of that entry also names the project's own
     #: receipts folder as the coordinator sees it (design section 2.2a).
     coordinator_entry: dict[str, str] | None = None
+    #: The sandbox's machine, when it is not this one (--sandbox-ssh).
+    sandbox_ssh: str | None = None
 
 
 def _parse_name(name: str) -> tuple[str, str]:
@@ -2343,9 +2389,16 @@ def resolve_options(
     slot: int | None = None,
     sandbox_address: str | None = None,
     receipts_root: str | None = None,
+    sandbox_ssh: str | None = None,
 ) -> Options:
     """The command's options with every default worked out, or a refusal."""
     org, leaf = _parse_name(name)
+    if sandbox_ssh is not None and not _SSH_HOST.match(sandbox_ssh):
+        raise Refused(
+            "sandbox",
+            "--sandbox-ssh is not an ssh host: a host name or alias, or user@host "
+            "(the value is not repeated here)",
+        )
     if sandbox is None:
         # A sandbox of its own is named after its project (the recipe's
         # convention); without --slot, the shared sandbox as before.
@@ -2543,6 +2596,7 @@ def resolve_options(
         via_git_door=via_git_door,
         slot=ports,
         sandbox_entry=sandbox_entry,
+        sandbox_ssh=sandbox_ssh,
         coordinator_entry=(
             {**sandbox_entry, "receipts_root": str(receipts_root).rstrip("/")}
             if sandbox_entry is not None
@@ -2564,6 +2618,7 @@ def resolve_options(
             coordinator=coordinator,
             settle_seconds=settle_seconds,
             slot=ports,
+            sandbox_ssh=sandbox_ssh,
         ),
     )
 
@@ -2684,7 +2739,7 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
         )
 
     volume = VolumeStore(options.volume, run)
-    sandbox = SandboxStore(options.sandbox, run)
+    sandbox = SandboxStore(options.sandbox, run, ssh_host=options.sandbox_ssh)
     host = HostStore()
 
     coordinator_text = volume.read(SETTINGS_FILE_NAME)
@@ -2880,6 +2935,10 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
 @click.option("--slot", "slot", type=int, default=None,
               help=f"With --sandbox <its own>: the sandbox's slot, 1 to {MAX_SLOT}; its ports and "
                    "its Git door port come from it (one sandbox per project).")
+@click.option("--sandbox-ssh", "sandbox_ssh", default=None, envvar="FORGE_SANDBOX_SSH",
+              help="The sandbox's machine, when it is not this one: every sbx command is "
+                   "sent there over ssh (the coordinator's and the publisher's files stay "
+                   "on this machine).")
 @click.option("--receipts-root", "receipts_root", default=None,
               help="With --slot: the project's own receipts folder, as the coordinator sees it "
                    f"(default {COORDINATOR_PROJECT_RECEIPTS}/<sandbox name>; design section 2.2a).")
@@ -2909,6 +2968,7 @@ def register_repo_cmd(
     git_export_port: int | None,
     sandbox: str | None,
     slot: int | None,
+    sandbox_ssh: str | None,
     receipts_root: str | None,
     sandbox_address: str | None,
     volume: str,
@@ -2971,6 +3031,7 @@ def register_repo_cmd(
             slot=slot,
             sandbox_address=sandbox_address,
             receipts_root=receipts_root,
+            sandbox_ssh=sandbox_ssh,
         )
         tail = register(options, run, steps)
     except Refused as refusal:

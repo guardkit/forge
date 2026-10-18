@@ -379,3 +379,76 @@ def test_the_shared_sandbox_still_takes_a_public_project_into_its_projects_folde
     staged = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-pending"])
     assert "git_door" not in staged["planning"]["sandboxes"][KEY]
     assert estate.clones == {CLONE_PATH: URL}
+
+
+# ---------------------------------------------------------------------------
+# Two machines (Codex implementation review 1, R3): the sandbox on the Spark,
+# the coordinator's volume and the publisher's file on this machine
+
+
+SSH = ["ssh", "-o", "BatchMode=yes", "spark-example", "--"]
+
+
+class _OverSsh:
+    """The fake estate behind an ssh hop: a routed command is unwrapped the
+    way the remote shell reads it (shlex.split), so the estate sees exactly the
+    words that would run on the sandbox's machine."""
+
+    def __init__(self, estate):  # noqa: ANN001
+        self.estate = estate
+        self.routed: list[list[str]] = []
+        self.local: list[list[str]] = []
+
+    def __call__(self, argv, *, input=None, timeout=None):  # noqa: A002
+        import shlex
+
+        argv = list(argv)
+        if argv[: len(SSH)] == SSH:
+            assert len(argv) == len(SSH) + 1, "one quoted command line after the hop"
+            words = shlex.split(argv[-1])
+            self.routed.append(words)
+            return self.estate(words, input=input, timeout=timeout)
+        self.local.append(argv)
+        return self.estate(argv, input=input, timeout=timeout)
+
+
+def test_on_two_machines_every_sbx_command_goes_to_the_sandbox_s_machine(own, publisher_file, monkeypatch):
+    from forge.cli import register_repo
+
+    hop = _OverSsh(own)
+    monkeypatch.setattr(register_repo, "run_command", hop)
+    result = _run_own("--via-git-door", "--sandbox-ssh", "spark-example",
+                      "--publish", "--publisher-settings", str(publisher_file))
+    assert result.exit_code == 0, result.output
+
+    assert hop.routed and all(words[0] == "sbx" for words in hop.routed)
+    assert not [c for c in hop.local if "sbx" in c], "no sbx command runs on this machine"
+    assert [c for c in hop.local if c[:2] == ["docker", "run"]], "the volume is read here"
+    # A write through the hop: the settings file was created on the sandbox side.
+    assert OWN_SETTINGS in own.sandbox_files
+    # Arguments with spaces and quotes arrive as written.
+    assert any("umask 077" in " ".join(words) for words in hop.routed)
+    # The publisher's file and the coordinator's volume are staged here.
+    assert (publisher_file.parent / f"settings.json.{LEAF}-pending").is_file()
+    assert f"forge.yaml.{LEAF}-pending" in own.volume
+    assert "ssh -o BatchMode=yes spark-example -- sbx exec" in result.output
+
+
+def test_the_shared_sandbox_on_the_other_machine_is_reached_the_same_way(estate, monkeypatch):
+    from forge.cli import register_repo
+    from tests.forge.cli.test_register_repo import _run
+
+    hop = _OverSsh(estate)
+    monkeypatch.setattr(register_repo, "run_command", hop)
+    result = _run("--sandbox-ssh", "spark-example")
+    assert result.exit_code == 0, result.output
+    assert hop.routed and not [c for c in hop.local if "sbx" in c]
+    assert any(words[:2] == ["sbx", "exec"] and "clone" in words for words in hop.routed)
+    assert "ssh -o BatchMode=yes spark-example -- sbx exec -u 1000 api-test-deploy cmp" in result.output
+
+
+@pytest.mark.parametrize("host", ["-oProxyCommand=x", "a b", "spark;rm", ""])
+def test_the_sandbox_s_machine_must_be_an_ssh_host(own, host):
+    result = _run_own("--sandbox-ssh", host)
+    assert result.exit_code == 1 and "--sandbox-ssh is not an ssh host" in result.output
+    assert own.calls == []

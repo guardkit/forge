@@ -1236,10 +1236,20 @@ class PlanningConfig(BaseModel):
         project's port. The refusal names the project, never the address: what
         was written may hold a credential.
         """
+        from forge.config.sandbox_slots import LEGACY_SANDBOX
         from forge.network_git import check_fetch_address, git_door_address, transport_of
 
         owners: dict[str, str] = {}
         for key, entry in self.sandboxes.items():
+            if entry.git_door is not None and entry.name == LEGACY_SANDBOX:
+                # The shared sandbox never gets a Git door (design 2.6, Codex
+                # implementation review 1, R1): private repositories are never
+                # readable where other projects build.
+                raise ValueError(
+                    f"planning.sandboxes gives {key} in {LEGACY_SANDBOX} a git_door, and "
+                    f"the shared sandbox {LEGACY_SANDBOX} never has one; register the "
+                    "repository into a sandbox of its own"
+                )
             if entry.git_door is None:
                 continue
             other = owners.setdefault(entry.git_door, entry.name)
@@ -1272,6 +1282,15 @@ class PlanningConfig(BaseModel):
             if problem:
                 raise ValueError(f"planning.fetch_addresses for {key}: {problem}")
             if door is not None and transport_of(address) == "http":
+                entry = self.sandboxes.get(key)
+                if entry is not None and entry.name == LEGACY_SANDBOX:
+                    # Not even through the single door (R1).
+                    raise ValueError(
+                        f"planning.fetch_addresses for {key}: it is read through the Git "
+                        f"door, and {key} builds in the shared sandbox {LEGACY_SANDBOX}, "
+                        "which never reads through a door; register it into a sandbox "
+                        "of its own (the value is not repeated here)"
+                    )
                 if address.lower() != git_door_address(door, key).lower():
                     raise ValueError(
                         f"planning.fetch_addresses for {key}: an address through the "
