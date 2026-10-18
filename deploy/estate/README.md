@@ -664,8 +664,13 @@ It only makes outgoing calls to Linear; nothing is exposed.
   Linear request is filed for; empty means the Slack planning originator. With no team or key the door logs one
   line and exits,
   and `restart: on-failure` leaves it stopped.
-- **What it reads:** Forge's record, read-only (the same mount as the answer service), and its own small state
-  volume `linear-door-state`. It is not given the Slack tokens.
+- **What it reads:** Forge's record, read-only (the same mount as the answer service), Forge's settings read-only
+  (only the registered repositories, so each gets a Linear project), and its own small state volume
+  `linear-door-state`. It is not given the Slack tokens.
+- **The dashboard's figures (optional, 18 October 2026):** for the project update it posts to Linear after each
+  merge, the door reads the dashboard's `project-summaries.json`. Add `compose.linear-dashboard.yaml` to
+  `COMPOSE_FILE` and set `FACTORY_DASHBOARD_DATA_DIR` to the dashboard's data folder; the folder is mounted
+  read-only. Without it, the updates say cost, open issues and health are not available from the dashboard.
 
 ## Walk (b): a cloud machine
 

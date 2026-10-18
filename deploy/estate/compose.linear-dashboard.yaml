@@ -1,0 +1,18 @@
+# THE LINEAR DOOR READS THE DASHBOARD'S PROJECT FIGURES (18 October 2026, Linear
+# front door design section 11.5). Optional: add this file to COMPOSE_FILE on a
+# machine where the factory dashboard runs, e.g.
+#   COMPOSE_FILE=compose.yaml:compose.external-bus.yaml:compose.linear-dashboard.yaml
+# and set FACTORY_DASHBOARD_DATA_DIR to the dashboard's data folder (the folder
+# its projector writes project-summaries.json into). The FOLDER is mounted, not
+# the file, because the dashboard replaces the file atomically. Read-only.
+# Without this file the door's project updates say "not available from the
+# dashboard" for cost, open issues and health.
+services:
+  linear-door:
+    volumes:
+      - type: bind
+        source: ${FACTORY_DASHBOARD_DATA_DIR:?name the factory dashboard's data folder in the env file}
+        target: /dashboard
+        read_only: true
+        bind:
+          create_host_path: false
