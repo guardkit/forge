@@ -652,12 +652,12 @@ It only makes outgoing calls to Linear; nothing is exposed.
   retained bus's network in external mode.
 - **Its key** comes from the child process's environment as `LINEAR_API_KEY`, the same way the Slack tokens do,
   and is handed to the service as a file. On this estate it is kept in fleet-secrets
-  `slack-jarvis/linear.enc.env`, so that file joins the others the start reads. **With the profile on, the start
-  must define `LINEAR_API_KEY`.** If it is not defined at all, Compose refuses to create this one container
-  ("environment variable LINEAR_API_KEY required by secret … is not set") while the rest of the estate starts,
-  and `up` reports the failure. If it is defined but empty, the door starts with no key file, logs one line
-  and exits cleanly, and `restart: on-failure` leaves it stopped. (Both checked with Compose v5.2.0 on a
-  throwaway project, 18 October 2026.)
+  `slack-jarvis/linear.enc.env`, so that file joins the others the start reads. The env file defines `LINEAR_API_KEY=` **empty**
+  (see `.env.example`), and the start's own environment, which carries the real key, takes precedence over it. So
+  with the profile on: key present, the door gets it as a file; key absent, the door starts with no key file,
+  logs one line and exits cleanly, and `restart: on-failure` leaves it stopped. (Without that empty line, an
+  absent key would stop Compose creating this one container.) Checked with Compose v5.2.0 on a throwaway project,
+  18 October 2026: undefined, empty-in-env-file, and set-in-process-over-empty-env-file.
 - **Its settings**, in the env file: `JARVIS_LINEAR_TEAM` (the team's key, for example `FAC`, or its exact name),
   `JARVIS_LINEAR_DEFAULT_REPO`, and `JARVIS_LINEAR_APPROVERS` (`<linear user id>=<identity>,...`: who may answer a
   card from Linear, and the identity the answer carries). Optionally `JARVIS_LINEAR_OWNER_IDENTITY`, the identity a

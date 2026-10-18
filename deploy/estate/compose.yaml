@@ -1860,8 +1860,8 @@ secrets:
     environment: JARVIS_SLACK_APP_TOKEN
   # The Linear door's key (18 October 2026), read from the same child process
   # environment as the others; only the 'linear' profile's service uses it.
-  # With that profile on, the start must define LINEAR_API_KEY: undefined, Compose
-  # will not create the door's container (the rest still starts); defined but
-  # empty, the door finds no key file and exits cleanly. README.md says more.
+  # The env file defines LINEAR_API_KEY empty (.env.example) and the start's own
+  # environment, which carries the real key, overrides it. Key absent: the door
+  # finds no key file and exits cleanly. README.md says more.
   linear-api-key:
     environment: LINEAR_API_KEY
