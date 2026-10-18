@@ -230,6 +230,32 @@ class TestTheLegTripwires:
 
         assert [call["timeout_seconds"] for call in runner.calls] == [1860, 1800]
 
+    def test_a_profile_that_gives_a_leg_3600s_raises_that_legs_wall(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """18 October 2026: the repair's review was killed at 1860s.
+
+        Its profile gave the review leg ``--sdk-timeout 3600``; the outer
+        wall was fixed at 1860s, so the leg was cut off inside its own
+        budget. Driven through the composed path from forge.yaml.
+        """
+        runner = _runner()
+        supervisor = _supervisor_factory(
+            pool,
+            subprocess_runner=runner,
+            config=_config(
+                conductor_on=True,
+                leg_budgets={"leg_max_turns": 3, "leg_sdk_timeout_seconds": 3600},
+            ),
+        )(BUILD_ID)
+
+        _drive(supervisor, StageClass.TASK_REVIEW)
+        _drive(supervisor, StageClass.TASK_WORK)
+
+        review, work = (call["timeout_seconds"] for call in runner.calls)
+        assert review == 3660 and review > 3600
+        assert work == 3780 and work > 3600
+
 
 class TestTheLegSeatIsConfigAsCode:
     """Conductor-activation design pass §2 — the seat, and the env DELETED.

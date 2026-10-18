@@ -783,6 +783,62 @@ class TestTheLegRoute:
         assert warning["code"] == "leg_timeout_clamped"
         assert "99999" in warning["message"] and "7200" in warning["message"]
 
+    @pytest.mark.parametrize(
+        ("subcommand", "stage_name", "expected"),
+        [("task-review", "TASK_REVIEW", 3660.0), ("task-work", "TASK_WORK", 3780.0)],
+    )
+    def test_a_3600s_leg_budget_runs_with_its_own_outer_limit_not_clamped(
+        self,
+        cfg: ForgeConfig,
+        repo: Path,
+        leg_guardkit: Path,
+        subcommand: str,
+        stage_name: str,
+        expected: float,
+    ) -> None:
+        """18 October 2026: the live repair profile gives each leg 3600s of
+        model time. The outer limit the dispatcher works out from it reaches
+        this route and the leg runs with exactly that wall, uncut."""
+        from forge.cli._serve_conductor import CONDUCTOR_STAGE_TIMEOUT_SECONDS
+        from forge.config.models import BudgetGuards
+        from forge.deploy_sidecar.service import process_guardkit_leg_request
+        from forge.pipeline.dispatchers.conductor_subprocess import leg_stage_timeout
+        from forge.pipeline.stage_taxonomy import StageClass
+
+        stage = StageClass[stage_name]
+        outer = leg_stage_timeout(
+            stage=stage,
+            floor=CONDUCTOR_STAGE_TIMEOUT_SECONDS[stage],
+            leg_budgets=BudgetGuards(leg_max_turns=3, leg_sdk_timeout_seconds=3600),
+        )
+        tree = _worktree_with_receipts(cfg, repo)
+        seen: dict[str, Any] = {}
+
+        def _record(
+            *, argv: list[str], cwd: str, timeout: float, **_launch: Any
+        ) -> tuple[int, str, str]:
+            seen["timeout"] = timeout
+            return 0, "leg ran", ""
+
+        status, body = process_guardkit_leg_request(
+            {
+                "repo": REPO_KEY,
+                "cwd": str(tree),
+                "subcommand": subcommand,
+                "timeout_seconds": float(outer),
+            },
+            config=cfg,
+            leg_runner=_record,
+        )
+
+        assert outer == expected
+        assert status == 200 and seen["timeout"] == expected
+        assert not [
+            warning
+            for warning in body["context_warnings"]
+            if warning.get("code") == "leg_timeout_clamped"
+        ]
+
     def test_a_wall_within_the_ceiling_is_passed_through_with_no_warning(
         self, cfg: ForgeConfig, repo: Path, leg_guardkit: Path
     ) -> None:

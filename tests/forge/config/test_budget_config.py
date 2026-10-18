@@ -245,3 +245,81 @@ class TestLegBudgets:
         )
         with pytest.raises(ValidationError):
             load_config(_minimal_forge_yaml(tmp_path, budget_block=budget))
+
+
+class TestLegBudgetsFitTheSandboxHelpersCeiling:
+    """A leg budget whose outer limit the sandbox helper would cut is refused.
+
+    Each repair leg's outer limit is its budget plus a margin (60 seconds for
+    review, 180 for work), and the sandbox helper cuts any leg's wall back to
+    its ceiling. So the largest budget either field can have is the ceiling
+    minus the work leg's margin: the model budget is given to both legs, and
+    the work leg's margin is the larger.
+    """
+
+    def test_the_config_reads_the_helpers_own_ceiling(self) -> None:
+        from forge import leg_time_limits
+        from forge.deploy_sidecar import service
+
+        assert service.LEG_TIMEOUT_MAX is leg_time_limits.LEG_TIMEOUT_MAX
+
+    def test_a_budget_exactly_at_the_ceiling_loads(self, tmp_path: Path) -> None:
+        from forge.leg_time_limits import (
+            LEG_TIMEOUT_MAX,
+            WORK_LEG_OUTER_MARGIN_SECONDS,
+        )
+
+        largest = int(LEG_TIMEOUT_MAX) - WORK_LEG_OUTER_MARGIN_SECONDS
+        budget = (
+            "budget:\n"
+            "  profiles:\n"
+            "    attended: {}\n"
+            "    fix-journey:\n"
+            "      max_review_cycles: 3\n"
+            f"      leg_sdk_timeout_seconds: {largest}\n"
+            f"      leg_budget_seconds: {largest}\n"
+        )
+        guards = load_config(
+            _minimal_forge_yaml(tmp_path, budget_block=budget)
+        ).budget.resolve("fix-journey")
+
+        assert largest == 7020
+        assert guards.leg_sdk_timeout_seconds == largest
+        assert guards.leg_budget_seconds == largest
+
+    @pytest.mark.parametrize("field", ["leg_sdk_timeout_seconds", "leg_budget_seconds"])
+    def test_one_second_above_the_ceiling_is_refused_in_a_plain_sentence(
+        self, field: str, tmp_path: Path
+    ) -> None:
+        budget = (
+            "budget:\n"
+            "  profiles:\n"
+            "    attended: {}\n"
+            "    fix-journey:\n"
+            "      max_review_cycles: 3\n"
+            f"      {field}: 7021\n"
+        )
+        with pytest.raises(ValidationError) as refused:
+            load_config(_minimal_forge_yaml(tmp_path, budget_block=budget))
+
+        message = str(refused.value)
+        assert f"{field} is 7021 seconds" in message
+        assert "7201 seconds" in message
+        assert "at most 7200 seconds" in message
+        assert f"The largest value {field} can have is 7020" in message
+
+    def test_the_review_legs_own_rule_holds_too(self) -> None:
+        """The review margin is smaller, so its limit is never the one hit
+        first, but a model budget past it is refused all the same."""
+        with pytest.raises(ValidationError, match="leg_sdk_timeout_seconds"):
+            BudgetGuards(leg_sdk_timeout_seconds=7141)
+
+    def test_the_live_profiles_budget_still_loads(self) -> None:
+        guards = BudgetGuards(
+            max_review_cycles=3,
+            max_build_wallclock_seconds=7200,
+            leg_max_turns=3,
+            leg_sdk_timeout_seconds=3600,
+        )
+
+        assert guards.leg_sdk_timeout_seconds == 3600
