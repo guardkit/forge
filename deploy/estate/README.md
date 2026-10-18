@@ -389,19 +389,23 @@ the same pinned image as the model door's, held to `estate-pins.conf`.
    writes it). The single `planning.git_door` is for an
    estate with one sandbox, and is left unset once any sandbox has its own.
 
-**Adding a repository.** Register it into its own sandbox with
-`forge register-repo <owner>/<name> --github https://github.com/<owner>/<name>
---slot <k> --sandbox-clone <its workspace clone> --via-git-door --publish
---publish-credential-name <its deploy key>` (the sandbox is named after the
-project, and its receipts folder is
-`/var/lib/forge-project-receipts/<sandbox name>` in the coordinator unless
-`--receipts-root` says otherwise): the project's fetch address is
-recorded as `<its sandbox's git_door><owner>/<name>.git` and the sandbox's read
-goes through the door. Then add the line `<31830 + k>/<owner>/<name>` to the
-allow-list file (and the port to `GIT_DOOR_PORTS` if it is not there) and
-restart the door (`docker compose ... up -d git-door`). The check clone on this
-machine reads it with the route's own deploy key, so a private repository needs
-that key.
+**Adding a repository.** In this order, because register-repo reads the
+repository through the door and stops if the door refuses it:
+
+1. Add the line `<31830 + k>/<owner>/<name>` to the allow-list file, add the
+   port to `GIT_DOOR_PORTS` if it is not there, and restart the door
+   (`docker compose ... up -d git-door`).
+2. Register it into its own sandbox with
+   `forge register-repo <owner>/<name> --github https://github.com/<owner>/<name>
+   --slot <k> --sandbox-clone <its workspace clone> --via-git-door --publish
+   --publish-credential-name <its deploy key>` (add `--sandbox-ssh <host>` when
+   the sandboxes are on another machine). The sandbox is named after the
+   project, and its receipts folder is
+   `/var/lib/forge-project-receipts/<sandbox name>` in the coordinator unless
+   `--receipts-root` says otherwise. The project's fetch address is recorded as
+   `<its sandbox's git_door><owner>/<name>.git`, and the sandbox's read goes
+   through the door. The check clone on this machine reads the repository with
+   the route's own deploy key, so a private repository needs that key.
 
 **What it does not do.** Product code in the sandbox can read any repository on
 the allow-list through the door, as it can use the model door. That is why the
