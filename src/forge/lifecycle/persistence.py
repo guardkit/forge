@@ -897,6 +897,21 @@ class SqliteLifecyclePersistence:
         if admitted is not None and records_start_point:
             start_commit = getattr(admitted, "start_commit", None) or None
             target_branch = getattr(admitted, "target_branch", None) or None
+        # A REPAIR (design "One sandbox per project", section 2.4a, 18 October
+        # 2026). A repair's correlation id is ``fix-<the build it repairs>``
+        # and no planning run is filed under it, so it used to be recorded
+        # with no memory name and no start commit, and ran with no memory. It
+        # now takes the memory name, start commit and launch settings of the
+        # build it repairs, but only when that build is in this ledger and is
+        # of the same repository. Otherwise it takes nothing, from anywhere.
+        repair_source = (
+            self._repair_source_facts(correlation_id, repo=payload.repo)
+            if admitted is None
+            else None
+        )
+        is_a_repair = admitted is None and self._names_a_repair(correlation_id)
+        if is_a_repair and records_start_point:
+            start_commit = (repair_source or {}).get("start_commit")
         columns = (
             "build_id, feature_id, repo, branch, feature_yaml_path, "
             "status, triggered_by, originating_adapter, "
@@ -937,11 +952,13 @@ class SqliteLifecyclePersistence:
         if records_memory_project:
             columns += ", memory_project"
             placeholders += ", ?"
-            values.append(
-                (getattr(admitted, "memory_project", None) or None)
-                if admitted is not None
-                else self._planning_memory_project(correlation_id)
-            )
+            if admitted is not None:
+                memory_name = getattr(admitted, "memory_project", None) or None
+            elif is_a_repair:
+                memory_name = (repair_source or {}).get("memory_project")
+            else:
+                memory_name = self._planning_memory_project(correlation_id)
+            values.append(memory_name)
         # And the NAMES the project said its own builds need
         # (``schema_v14.sql``), by the same rule, out of the same file at the
         # same commit, from the same planning run. Names only; the launch takes
@@ -952,13 +969,15 @@ class SqliteLifecyclePersistence:
         if self._builds_record_the_launch_settings():
             columns += ", launch_settings"
             placeholders += ", ?"
-            values.append(
-                json.dumps(
+            if admitted is not None:
+                settings = json.dumps(
                     [str(name).strip() for name in getattr(admitted, "launch_settings", ())]
                 )
-                if admitted is not None
-                else self._planning_launch_settings(correlation_id)
-            )
+            elif is_a_repair:
+                settings = (repair_source or {}).get("launch_settings")
+            else:
+                settings = self._planning_launch_settings(correlation_id)
+            values.append(settings)
         # The exact commit a prepared feature was admitted at
         # (``schema_v17.sql``). Only an admission writes it; it is what tells
         # the runner to build that commit rather than a branch that may move.
@@ -1604,6 +1623,52 @@ class SqliteLifecyclePersistence:
         answer = "memory_project" in names
         self._memory_project_column = answer
         return answer
+
+    @staticmethod
+    def _names_a_repair(correlation_id: str | None) -> bool:
+        """Is this a repair's correlation id (``fix-<build id>``)?"""
+        from forge.pipeline.fix_row_producer import source_build_id_from_correlation_id
+
+        return source_build_id_from_correlation_id(correlation_id) is not None
+
+    def _repair_source_facts(
+        self, correlation_id: str | None, *, repo: Any
+    ) -> dict[str, Any] | None:
+        """What a repair copies from the build it repairs, or ``None``.
+
+        ``None`` unless the correlation id names a build (``fix-<build id>``),
+        that build is in this ledger, and it is of the same repository as the
+        repair (design section 2.4a, Codex R1). Each fact is read only from a
+        column this ledger has, and an unrecorded one stays unrecorded. Read
+        only and forgiving, like its planning-run siblings: a ledger it cannot
+        read answers ``None``, and the repair is recorded with nothing copied.
+        """
+        from forge.pipeline.fix_row_producer import source_build_id_from_correlation_id
+
+        source = source_build_id_from_correlation_id(correlation_id)
+        wanted = str(repo or "").strip()
+        if not source or not wanted:
+            return None
+        try:
+            columns = {
+                row[1] for row in self._cx.execute("PRAGMA table_info(builds);")
+            }
+            chosen = [
+                name
+                for name in ("memory_project", "start_commit", "launch_settings")
+                if name in columns
+            ]
+            row = self._cx.execute(
+                f"SELECT {', '.join(['repo', *chosen])} FROM builds WHERE build_id = ?",
+                (source,),
+            ).fetchone()
+        except sqlite3.Error:
+            return None
+        if row is None:
+            return None
+        if str(row[0] or "").strip() != wanted:
+            return None
+        return {name: (row[index + 1] or None) for index, name in enumerate(chosen)}
 
     def _planning_memory_project(self, correlation_id: str) -> str | None:
         """The planning run's recorded memory name, or ``None``.

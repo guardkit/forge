@@ -947,6 +947,38 @@ class SandboxEntry(BaseModel):
             "Unset: the single receipts root, as before."
         ),
     )
+    memory_projects: list[str] = Field(
+        default_factory=list,
+        description=(
+            "The fleet-memory project names this repository's builds may read "
+            "outside the sandbox (design section 2.4a, 18 October 2026): the "
+            "priors on a build's approval card are read only when the build's "
+            "recorded memory name is one of these. register-repo writes the "
+            "project's declared name here when it gives the project a sandbox "
+            "of its own, the same name it puts on that sandbox's memory door "
+            "line. A project's own declaration does not grant a name; this "
+            "list does. Empty (the default): no priors are read for its builds."
+        ),
+    )
+
+    @field_validator("memory_projects")
+    @classmethod
+    def _memory_projects_are_memory_names(cls, value: list[str]) -> list[str]:
+        """Each entry is a name the memory service accepts: ^[a-z0-9_]+$."""
+        import re
+
+        names: list[str] = []
+        for raw in value:
+            name = str(raw)
+            if not re.fullmatch(r"[a-z0-9_]+", name) or len(name) > 128:
+                raise ValueError(
+                    "each of a sandbox's memory_projects must be a memory project "
+                    "name of lower-case letters, digits and underscores (at most "
+                    f"128 characters); {name[:40]!r} is not"
+                )
+            if name not in names:
+                names.append(name)
+        return names
 
     @field_validator("sidecar_url", "runner_url")
     @classmethod
@@ -1187,6 +1219,24 @@ class PlanningConfig(BaseModel):
                 f"planning.target_repo_paths: {', '.join(unknown)} — add each "
                 "one to target_repo_paths first"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _a_memory_name_is_granted_to_one_repository(self) -> "PlanningConfig":
+        """Two repositories are never granted the same memory name (design
+        section 2.4a, 18 October 2026): a hand edit could otherwise give two
+        projects one shelf, and each project's card would read the other's
+        records. The refusal names both repositories and the name."""
+        holders: dict[str, str] = {}
+        for key, entry in self.sandboxes.items():
+            for name in entry.memory_projects:
+                other = holders.setdefault(name, key)
+                if other != key:
+                    raise ValueError(
+                        f"planning.sandboxes grants the memory name {name} to both "
+                        f"{other} and {key}; a memory name belongs to one repository, "
+                        "so take it out of one of the two entries"
+                    )
         return self
 
     @field_validator("git_door")

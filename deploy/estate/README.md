@@ -1135,10 +1135,14 @@ A failed post-resume check follows this current-state recovery path too.
   correct and silent until a build is handed that credential. A build in a
   project's sandbox is not handed it either, since 14 October 2026: no key
   enters the sandbox, and a build there writes memory through the memory
-  service at the gateway address instead (`FLEET_MEMORY_MCP_URL`). Related: the project name the
-  coordinator reads memory under comes from a code default (`guardkit`) because
-  `FORGE_MEMORY_PROJECT` is in no env file; right today, and its own docstring
-  says when it stops being.
+  service at the gateway address instead (`FLEET_MEMORY_MCP_URL`). Related: the
+  coordinator reads the priors on a build's approval card from that build's own
+  memory name only, and only when the build's repository was granted that name
+  at registration (`memory_projects` in its `planning.sandboxes` entry, which
+  `register-repo --slot` writes). There is no default name: a build without a
+  recorded name, or of a repository with no grant, reads no priors (design "One
+  sandbox per project", section 2.4a, 18 October 2026; the old `guardkit`
+  default and `FORGE_MEMORY_PROJECT` are gone).
 - **Nothing in the estate calls the memory *service*.** The coordinator reads
   the store directly and no Forge code reads `FLEET_MEMORY_URL` at all, so the
   service's only caller is a Claude session over MCP, from outside. The service

@@ -47,6 +47,13 @@ pytestmark = [
 ]
 
 
+#: The one project a live read searches (design section 2.4a: a build's own
+#: recorded name, granted to its repository). Override with
+#: FORGE_LIVE_PRIORS_PROJECT to read another project's shelf.
+_LIVE_PROJECT = os.environ.get("FORGE_LIVE_PRIORS_PROJECT", "api_test").strip() or "api_test"
+_GRANTED = {"memory_project": _LIVE_PROJECT, "granted_memory_projects": (_LIVE_PROJECT,)}
+
+
 @pytest.fixture()
 def live_reader() -> FleetMemoryPriorsReader:
     pytest.importorskip(
@@ -69,12 +76,14 @@ class TestLivePriorsRead:
         self, live_reader: FleetMemoryPriorsReader
     ) -> None:
         config = load_priors_config_from_env()
+        assert config.enabled
         try:
             priors = await live_reader.read_priors(
                 target_kind="subagent",
                 target_identifier="autobuild_runner",
                 stage_label="autobuild",
                 build_id="build-live-priors-1",
+                **_GRANTED,
             )
 
             # Empty is legal (a young corpus); malformed is not.
@@ -94,8 +103,18 @@ class TestLivePriorsRead:
                 target_identifier="autobuild_runner",
                 stage_label="autobuild",
                 build_id="build-live-priors-2",
+                **_GRANTED,
             )
             assert isinstance(again, list)
-            assert config.project  # scoped read, never a blank namespace
+            # A name the repository was not granted reads nothing (design 2.4a).
+            ungranted = await live_reader.read_priors(
+                target_kind="subagent",
+                target_identifier="autobuild_runner",
+                stage_label="autobuild",
+                build_id="build-live-priors-3",
+                memory_project=_GRANTED["memory_project"],
+                granted_memory_projects=(),
+            )
+            assert ungranted == []
         finally:
             await live_reader.aclose()

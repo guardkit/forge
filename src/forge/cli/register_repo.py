@@ -63,7 +63,12 @@ sandbox's own git daemon, at its slot's port on the sandbox publish address. The
 ``planning.sandboxes`` entry it writes is not copied from api_test's: it names
 this sandbox, the helper and runner at slot *k*'s ports
 (:mod:`forge.config.sandbox_slots`) on the sandbox publish address, and the
-sandbox's own Git door port. A sandbox takes one project: a sandbox, or a
+sandbox's own Git door port. The coordinator's copy of the entry is also
+granted the project's declared memory name (``memory_projects: [<name>]``,
+design section 2.4a, 18 October 2026): a build's approval card reads priors
+only from a name its repository was granted, and the printed memory door line
+names the same one. A project whose declared name the memory service would
+refuse is refused here. A sandbox takes one project: a sandbox, or a
 slot, that another project already has is refused. The shared sandbox
 ``api-test-deploy`` keeps the projects already in it and the old form, but it
 has no slot and never a Git door.
@@ -526,6 +531,13 @@ def _scalar(value: str) -> str:
         except yaml.YAMLError:  # pragma: no cover — a plain match always parses
             pass
     return json.dumps(text)
+
+
+def _entry_value(value: Any) -> str:
+    """One sandbox entry value as YAML: a scalar, or a flow list of scalars."""
+    if isinstance(value, (list, tuple)):
+        return "[" + ", ".join(_scalar(str(item)) for item in value) + "]"
+    return _scalar(value)
 
 
 def _without_empty_flow(line: str) -> str:
@@ -1032,7 +1044,30 @@ def check_project(
     known_hosts: str | None = None,
     publisher_uid: int | None = None,
 ) -> list[Step]:
+    """Step 1's report lines (see :func:`check_project_and_memory`)."""
+    steps, _memory = check_project_and_memory(
+        run, key=key, url=url, folder=folder, credential_name=credential_name,
+        route_keys_dir=route_keys_dir, known_hosts=known_hosts, publisher_uid=publisher_uid,
+    )
+    return steps
+
+
+def check_project_and_memory(
+    run: Runner,
+    *,
+    key: str,
+    url: str,
+    folder: Path,
+    credential_name: str | None = None,
+    route_keys_dir: str | None = None,
+    known_hosts: str | None = None,
+    publisher_uid: int | None = None,
+) -> tuple[list[Step], str]:
     """Step 1: a shallow clone of the default branch, read, never written.
+
+    Returns the report lines and the memory name the project declares
+    (``memory: project:`` in its ``.guardkit/config.yaml``), which a sandbox
+    of its own is granted (design section 2.4a).
 
     THE CLONE IS ISOLATED (Forge git hardening, 14 October 2026; there is no
     exception for register-repo). It runs through ``env -i`` with a fresh
@@ -1143,9 +1178,10 @@ def check_project(
     problems += _document_problems(checkout, content)
     if problems:
         raise Refused("project", "\n".join(problems))
+    assert memory.project is not None  # memory.ok says so
     return [
         Step("project", "ok", f"{url} at {commit}: memory {memory.project}, tests `{test_command}`"),
-    ]
+    ], memory.project
 
 
 # ---------------------------------------------------------------------------
@@ -1232,7 +1268,12 @@ def plan_settings_edit(
     planning = _mapping(data.get("planning"))
     sandboxes = _mapping(planning.get("sandboxes"))
     if entry is not None:
-        entry = {k: str(v) for k, v in entry.items()}
+        # Every value is text, except a list of memory names (memory_projects,
+        # design section 2.4a), which stays a list of text.
+        entry = {
+            k: [str(item) for item in v] if isinstance(v, (list, tuple)) else str(v)
+            for k, v in entry.items()
+        }
         wanted_keys = tuple(entry)
         _one_project_per_sandbox(which, sandboxes, key=key, entry=entry)
     else:
@@ -1298,8 +1339,28 @@ def plan_settings_edit(
             changed = True
 
         current_entry = sandboxes.get(key)
+        granted_only = (
+            isinstance(current_entry, dict)
+            and "memory_projects" in entry
+            and "memory_projects" not in current_entry
+            and current_entry == {k: v for k, v in entry.items() if k != "memory_projects"}
+        )
         if current_entry == entry:
             steps.append(Step(which, "unchanged", f"sandboxes has {key} in {entry['name']}"))
+        elif granted_only:
+            # A project given its sandbox before the memory grant existed (18
+            # October 2026): its entry is as this run would write it, without
+            # the grant, so the grant is added to it and nothing else changes.
+            set_mapping_entry(
+                lines, ("planning", "sandboxes", _scalar(key)), "memory_projects",
+                _entry_value(entry["memory_projects"]),
+            )
+            expected["planning"]["sandboxes"][key] = dict(entry)
+            steps.append(Step(
+                which, "add",
+                f"sandboxes {key} memory_projects {', '.join(entry['memory_projects'])}",
+            ))
+            changed = True
         elif current_entry is not None:
             raise Refused(
                 which,
@@ -1310,7 +1371,7 @@ def plan_settings_edit(
             _ensure_block(lines, ("planning", "sandboxes", _scalar(key)))
             for name in wanted_keys:
                 set_mapping_entry(
-                    lines, ("planning", "sandboxes", _scalar(key)), name, _scalar(entry[name])
+                    lines, ("planning", "sandboxes", _scalar(key)), name, _entry_value(entry[name])
                 )
             expected.setdefault("planning", {})
             expected["planning"]["sandboxes"] = {
@@ -1373,7 +1434,9 @@ def _one_project_per_sandbox(
 ) -> None:
     """A sandbox of its own takes one project (17 October 2026): refuse when
     another project's entry names this sandbox, or another sandbox has this
-    entry's helper, runner or Git door."""
+    entry's helper, runner or Git door, or (18 October 2026) another
+    repository is already granted the memory name this entry is to be
+    granted."""
     for other, current in sandboxes.items():
         if other == key or not isinstance(current, dict):
             continue
@@ -1401,6 +1464,20 @@ def _one_project_per_sandbox(
                 f"the receipts_root of {entry['name']} is already the sandbox "
                 f"{current.get('name')}'s (for {other}); pick a slot no sandbox has",
             )
+        # A memory name belongs to one repository (design section 2.4a): the
+        # card of each would otherwise read the other's records.
+        theirs_memory = current.get("memory_projects") or []
+        if not isinstance(theirs_memory, list):
+            theirs_memory = [theirs_memory]
+        for name in entry.get("memory_projects") or []:
+            if name in [str(item) for item in theirs_memory]:
+                raise Refused(
+                    which,
+                    f"{key} declares the memory name {name}, and {other} is already "
+                    f"granted that name; a memory name belongs to one repository, so "
+                    f"give {key} a memory name of its own in its .guardkit/config.yaml, "
+                    "commit it to the default branch, and register again. Nothing was written",
+                )
 
 
 def _port_of(address: Any) -> int | None:
@@ -2177,8 +2254,12 @@ def activation_sequence(
     publisher: Staged | None,
     helper_urls: tuple[str, str] | None,
     dry_run: bool,
+    memory_project: str | None = None,
 ) -> list[str]:
     """The one-page procedure's own order, for this registration (step 7 a–h).
+
+    ``memory_project`` is the memory name a sandbox of its own is granted
+    (design section 2.4a); its memory door line names the same one.
 
     Every printed step stops, starts or restarts a running container by name
     (S1 window, 18 October 2026): that needs no secrets, so nothing printed
@@ -2289,6 +2370,14 @@ def activation_sequence(
             f" {ports.previews[1]}; its Git door port is {ports.git_door} and its memory door port"
             f" {ports.memory_door}:",
         ]
+        if memory_project:
+            lines.append(
+                f"    Its memory door answers for the memory {memory_project} only: the estate env"
+                f" file's FLEET_MEMORY_SANDBOX_DOORS has the entry {ports.memory_door}:{memory_project}"
+                f" (and FLEET_MEMORY_SANDBOX_DOOR_PORTS includes {ports.memory_door}). It is the same"
+                f" name the coordinator's entry for {key} is granted (memory_projects: [{memory_project}]),"
+                " so the build's approval card reads that memory and no other."
+            )
     lines += [
         f"    {sbx} exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'"
         f"  (both {estate.sandbox}-helper and {estate.sandbox}-runner Up)",
@@ -2761,7 +2850,7 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     The project's own repository is never written.
     """
     with tempfile.TemporaryDirectory(prefix="forge-register-") as folder:
-        steps += check_project(
+        project_steps, memory_name = check_project_and_memory(
             run,
             key=options.key,
             url=options.url,
@@ -2771,6 +2860,17 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
             known_hosts=options.known_hosts_file,
             publisher_uid=options.publisher_uid,
         )
+        steps += project_steps
+
+    # A sandbox of its own is granted the project's declared memory name (design
+    # section 2.4a): the coordinator's entry gets memory_projects, the same
+    # name printed for the sandbox's memory door line below, so the card's
+    # priors and the door answer for one name. The shared sandbox grants none.
+    coordinator_entry = options.coordinator_entry
+    granted_memory: str | None = None
+    if options.slot is not None:
+        granted_memory = _memory_name_to_grant(options.key, memory_name)
+        coordinator_entry = {**(coordinator_entry or {}), "memory_projects": [granted_memory]}
 
     volume = VolumeStore(options.volume, run)
     sandbox = SandboxStore(options.sandbox, run, ssh_host=options.sandbox_ssh)
@@ -2815,7 +2915,7 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     # sandbox's settings never carry it: that file sits inside a project clone.
     coordinator_edit = plan_settings_edit(
         coordinator_text, which="coordinator", key=options.key, path=coordinator_path,
-        fetch_address=read_from, entry=options.coordinator_entry,
+        fetch_address=read_from, entry=coordinator_entry,
     )
     sandbox_edit = plan_settings_edit(
         sandbox_text, which="sandbox", key=options.key, path=clone_path, entry=options.sandbox_entry,
@@ -2943,8 +3043,37 @@ def register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
         publisher=staged["publisher"],
         helper_urls=helper_urls,
         dry_run=options.dry_run,
+        memory_project=granted_memory,
     )
     return tail
+
+
+#: The memory service's own rule for a project name (fleet-memory refuses any
+#: other), which SandboxEntry.memory_projects holds to as well.
+_MEMORY_PROJECT_NAME = re.compile(r"^[a-z0-9_]+$")
+
+
+def _memory_name_to_grant(key: str, memory_name: str | None) -> str:
+    """The declared memory name a sandbox of its own is granted, or refuse."""
+    from forge.planning.declared_memory import THE_TWO_LINES
+
+    name = str(memory_name or "").strip()
+    if not name:
+        raise Refused(
+            "project",
+            f"{key} declares no memory name in .guardkit/config.yaml, and a sandbox of "
+            "its own is granted the name its project declares. Add these two lines, "
+            f"commit them to the default branch, and register again:\n{THE_TWO_LINES}",
+        )
+    if not _MEMORY_PROJECT_NAME.match(name):
+        raise Refused(
+            "project",
+            f"{key} declares the memory name {name!r}, and the memory service takes only "
+            "lower-case letters, digits and underscores, so a sandbox of its own cannot "
+            "be granted it. Correct the name in .guardkit/config.yaml, commit it to the "
+            "default branch, and register again. Nothing was written",
+        )
+    return name
 
 
 @click.command(name="register-repo")
