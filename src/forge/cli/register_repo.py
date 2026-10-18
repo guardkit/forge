@@ -1434,7 +1434,9 @@ def _one_project_per_sandbox(
 ) -> None:
     """A sandbox of its own takes one project (17 October 2026): refuse when
     another project's entry names this sandbox, or another sandbox has this
-    entry's helper, runner or Git door."""
+    entry's helper, runner or Git door, or (18 October 2026) another
+    repository is already granted the memory name this entry is to be
+    granted."""
     for other, current in sandboxes.items():
         if other == key or not isinstance(current, dict):
             continue
@@ -1462,6 +1464,20 @@ def _one_project_per_sandbox(
                 f"the receipts_root of {entry['name']} is already the sandbox "
                 f"{current.get('name')}'s (for {other}); pick a slot no sandbox has",
             )
+        # A memory name belongs to one repository (design section 2.4a): the
+        # card of each would otherwise read the other's records.
+        theirs_memory = current.get("memory_projects") or []
+        if not isinstance(theirs_memory, list):
+            theirs_memory = [theirs_memory]
+        for name in entry.get("memory_projects") or []:
+            if name in [str(item) for item in theirs_memory]:
+                raise Refused(
+                    which,
+                    f"{key} declares the memory name {name}, and {other} is already "
+                    f"granted that name; a memory name belongs to one repository, so "
+                    f"give {key} a memory name of its own in its .guardkit/config.yaml, "
+                    "commit it to the default branch, and register again. Nothing was written",
+                )
 
 
 def _port_of(address: Any) -> int | None:

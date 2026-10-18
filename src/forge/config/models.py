@@ -1221,6 +1221,24 @@ class PlanningConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _a_memory_name_is_granted_to_one_repository(self) -> "PlanningConfig":
+        """Two repositories are never granted the same memory name (design
+        section 2.4a, 18 October 2026): a hand edit could otherwise give two
+        projects one shelf, and each project's card would read the other's
+        records. The refusal names both repositories and the name."""
+        holders: dict[str, str] = {}
+        for key, entry in self.sandboxes.items():
+            for name in entry.memory_projects:
+                other = holders.setdefault(name, key)
+                if other != key:
+                    raise ValueError(
+                        f"planning.sandboxes grants the memory name {name} to both "
+                        f"{other} and {key}; a memory name belongs to one repository, "
+                        "so take it out of one of the two entries"
+                    )
+        return self
+
     @field_validator("git_door")
     @classmethod
     def _git_door_is_one_http_base(cls, value: str | None) -> str | None:

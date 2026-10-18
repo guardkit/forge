@@ -102,3 +102,31 @@ def test_memory_projects_are_names_the_memory_service_accepts() -> None:
         with pytest.raises(ValidationError) as caught:
             SandboxEntry.model_validate({**ENTRY, "memory_projects": [bad]})
         assert "lower-case letters, digits and underscores" in str(caught.value)
+
+
+def test_two_repositories_are_never_granted_the_same_memory_name() -> None:
+    """A hand edit could otherwise give two projects one shelf (design 2.4a)."""
+    paths = {"acme/shop-a": "/srv/repos/shop-a", "acme/shop-b": "/srv/repos/shop-b"}
+    other = {**ENTRY, "name": "shop-b", "sidecar_url": "http://127.0.0.1:8235",
+             "runner_url": "http://127.0.0.1:8234"}
+    with pytest.raises(ValidationError) as caught:
+        PlanningConfig.model_validate({
+            "target_repo_paths": paths,
+            "sandboxes": {
+                "acme/shop-a": {**ENTRY, "memory_projects": ["shop_a"]},
+                "acme/shop-b": {**other, "memory_projects": ["shop_b", "shop_a"]},
+            },
+        })
+    message = str(caught.value)
+    assert "shop_a" in message and "acme/shop-a" in message and "acme/shop-b" in message
+    assert "belongs to one repository" in message
+
+    planning = PlanningConfig.model_validate({
+        "target_repo_paths": paths,
+        "sandboxes": {
+            "acme/shop-a": {**ENTRY, "memory_projects": ["shop_a", "shop_a"]},
+            "acme/shop-b": {**other, "memory_projects": ["shop_b"]},
+        },
+    })
+    assert planning.sandboxes["acme/shop-a"].memory_projects == ["shop_a"]
+    assert planning.sandboxes["acme/shop-b"].memory_projects == ["shop_b"]

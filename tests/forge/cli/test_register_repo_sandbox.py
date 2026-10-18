@@ -624,3 +624,41 @@ def test_the_shared_sandbox_grants_no_memory(estate):  # noqa: F811
     coordinator = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-pending"])
     assert "memory_projects" not in coordinator["planning"]["sandboxes"][KEY]
     assert "FLEET_MEMORY_SANDBOX_DOORS" not in result.output
+
+
+OTHER_ENTRY = {
+    "name": "other-sbx",
+    "sidecar_url": "http://192.0.2.10:8945",
+    "runner_url": "http://192.0.2.10:8944",
+    "git_door": "http://192.0.2.1:31832/",
+}
+
+
+def test_a_memory_name_another_repository_is_granted_is_refused_naming_it(own):
+    _with_other_project(own, {**OTHER_ENTRY, "memory_projects": "[bench_one]"})
+    result = _run_own()
+    assert result.exit_code == 1
+    assert "guardkit/other-project is already granted that name" in result.output
+    assert "bench_one" in result.output
+    assert own.writes == []
+
+
+def test_another_repository_with_its_own_memory_name_does_not_stop_a_registration(own):
+    _with_other_project(own, {**OTHER_ENTRY, "memory_projects": "[other_one]"})
+    result = _run_own()
+    assert result.exit_code == 0, result.output
+    coordinator = yaml.safe_load(own.volume[f"forge.yaml.{LEAF}-pending"])
+    assert coordinator["planning"]["sandboxes"][KEY]["memory_projects"] == ["bench_one"]
+    assert coordinator["planning"]["sandboxes"]["guardkit/other-project"]["memory_projects"] == ["other_one"]
+
+
+def test_the_same_repository_running_again_with_its_grant_still_works(own):
+    """Its own entry already holds the name: that is not 'another repository'."""
+    _with_other_project(own, {**OTHER_ENTRY, "memory_projects": "[other_one]"})
+    assert _run_own().exit_code == 0
+    own.volume["forge.yaml"] = own.volume[f"forge.yaml.{LEAF}-pending"]
+    own.sandbox_files[OWN_SETTINGS] = own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"]
+    assert "memory_projects: [bench_one]" in own.volume["forge.yaml"]
+    again = _run_own()
+    assert again.exit_code == 0, again.output
+    assert "nothing is staged" in again.output
