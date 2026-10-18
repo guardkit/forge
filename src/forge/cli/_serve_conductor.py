@@ -83,32 +83,47 @@ logger = logging.getLogger(__name__)
 # BuildMonitor-class semantic liveness applied to this one-shot dispatch
 # seam, which replaces the blind clock with the leg's own diagnostics (and
 # brings with it the in-flight stage row and a TIMEOUT dispatch status
-# distinct from FAILED). Until that lands these two numbers are the only
-# ceiling a fix journey has, and a leg with NO ceiling is how the crossing
-# ran ~200 legs.
+# distinct from FAILED). Until that lands, an outer limit is the only
+# ceiling a repair leg has, and a leg with no ceiling at all is how the
+# crossing ran about 200 legs.
 #
-# Why 1800 for the work leg, specifically: the approval wait window anchors
-# on ``builds.started_at`` with ``approval.max_wait_seconds`` defaulting to
-# 3600, and the JetStream ``ack_wait`` is 3600. 1800 keeps a small journey
-# inside both. Anything larger MUST raise those two in the same change.
+# What is true now (18 October 2026):
 #
-# Why the review leg keeps 600: its inner budget is 480s, and the
-# inner-under-outer discipline is load-bearing — on an outer timeout the
-# parser discards even a perfect marker block, so the leg dies silently.
+# The two numbers are FLOORS, not the limits themselves. Each repair leg's
+# outer limit follows the budget the build's profile gives that leg, and is
+# worked out each time a leg starts by ``leg_stage_timeout`` in
+# ``forge.pipeline.dispatchers.conductor_subprocess``, from the same profile
+# that is put on the leg's command line. A review leg gets the larger of
+# 1860 seconds and its model budget (``leg_sdk_timeout_seconds``) plus 60
+# seconds. A work leg gets the larger of 1800 seconds and the larger of its
+# loop budget (``leg_budget_seconds``) and its model budget, plus 180
+# seconds. A profile with no leg budgets keeps exactly 1860 and 1800.
+#
+# The outer limit has to stay above the leg's own budget. When the outer
+# limit fires first, the coordinator kills the leg while it is still inside
+# its budget, the leg writes no receipt, and even a complete review result
+# is thrown away. That is what happened on 18 October 2026, when a repair's
+# review was given 3600 seconds and killed at 1860.
+#
+# With the live fix-journey profile (``leg_sdk_timeout_seconds: 3600``, no
+# loop budget) the review leg's limit is 3660 seconds and the work leg's is
+# 3780 seconds.
+#
+# These limits are separate from the build's own time cap,
+# ``max_build_wallclock_seconds`` (7200 seconds on the live fix-journey
+# profile). The budget guard checks that cap between steps, not during one,
+# so it never cuts a running leg short. But one full work leg and one full
+# review together come to about 7440 seconds, so a single repair round at
+# full budgets can use the whole build's time, and the next step is then
+# refused.
 
-#: These two numbers are FLOORS (18 October 2026). When a build's budget
-#: profile gives a leg a larger budget than its floor can clear, the
-#: dispatcher raises that leg's outer wall to the leg's budget plus a fixed
-#: margin, per dispatch, from the same profile it puts on the leg's argv
-#: (``leg_stage_timeout`` in ``forge.pipeline.dispatchers.conductor_subprocess``).
-#: A profile with no ``leg_*`` budgets keeps exactly these numbers.
-#:
-#: Outer tripwire for a ``task-review`` leg. Its inner budget is 480s.
+#: The floor for a ``task-review`` leg's outer limit. The review leg's own
+#: default model budget is 480 seconds; a profile may give it more.
 CONDUCTOR_REVIEW_STAGE_TIMEOUT_SECONDS: int = 1860  # 2026-09-09: the review leg's model budget is profile-driven (leg_sdk_timeout_seconds, now up to 1800s on the workhorse) and the outer wall must exceed it. Today's eight real reviews on this task ran 191, 221, 312, 326, 358, 675, 723 and 903 seconds on an idle box with the model warm — the tail is long, and a review that runs past its budget costs the owner a whole tap
 
-#: Outer tripwire for a ``task-work`` leg. The leg's own inner budget is
-#: 1620s (the builder venue's ``--leg-budget`` default) — the same
-#: inner-under-outer discipline the review leg already ships.
+#: The floor for a ``task-work`` leg's outer limit. The work leg's own
+#: default loop budget is 1620 seconds (``--leg-budget``) and its default
+#: model budget 420 seconds; a profile may give it more.
 CONDUCTOR_WORK_STAGE_TIMEOUT_SECONDS: int = 1800
 
 #: The per-stage mapping the dispatcher adapter selects from. Derived from
