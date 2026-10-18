@@ -774,3 +774,84 @@ class TestASettlementThatWasTakenOver:
         assert await finish_ready_mission(deps, MISSION_ID) == "stopping"
         assert offers == []
         assert store.get(MISSION_ID).final_commit is not None
+
+
+# ---------------------------------------------------------------------------
+# Codex implementation round 1, R1: a settlement is never left held
+# ---------------------------------------------------------------------------
+
+
+class TestASettlementIsNeverLeftHeld:
+    @pytest.mark.asyncio
+    async def test_a_crash_straight_after_the_settlement_cannot_leave_the_lease_held(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The result and the release are one write: a coordinator that stops
+        the instant after the settlement has nothing left to put down, so the
+        stopped mission drains and maintenance is free again."""
+        from forge.lifecycle.feature_routing import router_restart_blockers
+        from tests.forge.deploy.test_rollout_quiesce_back import q, r
+
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        _planned(pool)
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(config_on, pool, repo_root)
+        consumer = MergeApprovalConsumer(deps)
+        _a_send_whose_answer_was_lost(pool, repo_root, on_the_remote=True)
+        _decided_with_every_attempt_used(consumer, pool, used=3)
+        _stop(pool)
+
+        def the_coordinator_stops(self: Any, **_kwargs: Any) -> bool:
+            raise RuntimeError("the coordinator stopped before it put the lease down")
+
+        monkeypatch.setattr(PublicationRecordStore, "release_lease", the_coordinator_stops)
+        assert await consumer.land_mission_feature(B_BUILD) is None
+
+        record = _record(pool)
+        assert record.result == RESULT_PUBLISHED_TO_MISSION_BRANCH
+        assert record.lease_holder is None and record.lease_expires_at is None
+        assert _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER)[0].status == "PASSED"
+        await _step(pool).run_once()
+        mission = MissionStore(pool.connection).get(MISSION_ID)
+        assert mission.status == "NOT_MERGED"
+        assert mission.closed_reason.endswith("; 1 landed on the branch, 0 did not")
+        assert not any(
+            b.startswith(("mission:", "publication-")) for b in router_restart_blockers(pool.connection)
+        )
+        ledger = Path(pool.connection.execute("PRAGMA database_list").fetchone()[2])
+        problems = q.work_problems(r.ledger_state(ledger))
+        assert [x for x in problems if x["table"] in ("publication_records", "missions")] == []
+
+    @pytest.mark.asyncio
+    async def test_a_live_unexpired_lease_is_still_left_alone(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(config_on, pool, repo_root)
+        consumer = MergeApprovalConsumer(deps)
+        _a_send_whose_answer_was_lost(pool, repo_root, on_the_remote=True)
+        _decided_with_every_attempt_used(consumer, pool, used=3)
+        live_until = (datetime.now(UTC) + timedelta(minutes=10)).isoformat()
+        pool.connection.execute(
+            "UPDATE publication_records SET lease_holder = 'merge-press:live', "
+            "lease_expires_at = ? WHERE build_id = ?",
+            (live_until, B_BUILD),
+        )
+
+        assert await consumer.land_mission_feature(B_BUILD) is None
+
+        record = _record(pool)
+        assert record.result is None
+        assert record.lease_holder == "merge-press:live"
+        assert record.lease_expires_at == live_until
+        assert _stages(pool, MERGE_REPORT_TARGET_IDENTIFIER) == []

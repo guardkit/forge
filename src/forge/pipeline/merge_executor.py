@@ -7385,20 +7385,28 @@ class MergeApprovalConsumer:
         if grant is None:
             return "unknown"
         turn = grant.turn
+        settled = False
+
+        def settle(result: str) -> bool:
+            # The result and the release are ONE write (Codex implementation
+            # round 1, R1): a crash can never leave a settled record held.
+            nonlocal settled
+            settled = store.settle(
+                build_id=row.build_id,
+                turn=turn,
+                holder=holder,
+                now=self._deps.clock(),
+                result=result,
+            )
+            return settled
+
         try:
             record = store.read(row.build_id)
             send_lines = [line for line in record.lines if line.step == STEP_SEND]
             # Every write is on this worker's turn; one that is refused means
             # another worker took the record over, so nothing is claimed here.
             if not send_lines or not record.j_commit:
-                if not store.record(
-                    build_id=row.build_id,
-                    turn=turn,
-                    now=self._deps.clock(),
-                    result=RESULT_PUBLICATION_PENDING,
-                ):
-                    return "unknown"
-                return "not landed"
+                return "not landed" if settle(RESULT_PUBLICATION_PENDING) else "unknown"
             git = git_surface_for(self._deps, row.repo, repo_root)
             where = await target_branch_now(
                 git,
@@ -7434,26 +7442,15 @@ class MergeApprovalConsumer:
                     },
                 ):
                     return "unknown"
-                if not store.record(
-                    build_id=row.build_id,
-                    turn=turn,
-                    now=self._deps.clock(),
-                    result=RESULT_PUBLISHED_TO_MISSION_BRANCH,
-                ):
-                    return "unknown"
-                return "landed"
-            if not store.record(
-                build_id=row.build_id,
-                turn=turn,
-                now=self._deps.clock(),
-                result=RESULT_PUBLICATION_PENDING,
-            ):
-                return "unknown"
-            return "not landed"
+                return "landed" if settle(RESULT_PUBLISHED_TO_MISSION_BRANCH) else "unknown"
+            return "not landed" if settle(RESULT_PUBLICATION_PENDING) else "unknown"
         finally:
-            store.release_lease(
-                build_id=row.build_id, turn=turn, holder=holder, now=self._deps.clock()
-            )
+            if not settled:
+                # Nothing was settled: the lease this worker took is put down,
+                # so the next pass may look again.
+                store.release_lease(
+                    build_id=row.build_id, turn=turn, holder=holder, now=self._deps.clock()
+                )
 
     def _landing_reconciled(self, row: Any, attempt_id: str | None, mission: Any) -> None:
         """A PASSED landing report for a landing found on the remote by looking."""

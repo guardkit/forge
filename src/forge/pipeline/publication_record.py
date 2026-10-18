@@ -619,6 +619,27 @@ class PublicationRecordStore:
             holder=holder,
         )
 
+    def settle(
+        self, *, build_id: str, turn: int, holder: str, now: datetime, result: str
+    ) -> bool:
+        """Write the result AND put the lease down, in one statement.
+
+        Missions design section 11 (Codex implementation round 1, R1): a
+        settlement written in one transaction and a release in another can be
+        split by a crash, leaving a record with a result that is still held —
+        which nothing revisits, and which keeps a stopped mission from ever
+        draining. So the two go together, under the same turn and holder
+        condition every write carries. ``False`` (never an exception) when
+        this worker has been replaced and nothing was changed.
+        """
+        return self._write(
+            build_id=build_id,
+            turn=turn,
+            now=now,
+            assignments={"result": result, "lease_holder": None, "lease_expires_at": None},
+            holder=holder,
+        )
+
     # -- writing (always against the writer's own turn) ---------------------
 
     def _write(
