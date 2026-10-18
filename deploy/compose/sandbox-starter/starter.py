@@ -79,6 +79,15 @@ STOPPED = "stopped"
 STOPPING = "stopping"
 UNKNOWN = "unknown"
 
+#: Every kind of record the operation log holds. op-begin is informational:
+#: replay reads nothing from it, but it is a kind this service writes.
+LOG_KINDS = frozenset({
+    "op-queued", "op-begin", "stop-delivered", "op-end",
+    "hold-open", "hold-close",
+    "readiness", "vm", "deployment",
+    "suspend", "unresolved", "clear",
+})
+
 #: Supervisor container states that mean it is not running.
 EXITED = ("exited", "dead", "created", "missing")
 
@@ -344,12 +353,23 @@ class Starter:
                 f"acknowledged; it has been removed ({len(data) - keep} bytes)"
             )
             data = data[:keep]
+        expected = 1
         for number, raw in enumerate(data.split(b"\n")[:-1] if data else [], 1):
             try:
                 entry = json.loads(raw.decode("utf-8"))
                 if not isinstance(entry, dict) or not isinstance(entry.get("seq"), int) \
-                        or not isinstance(entry.get("kind"), str):
+                        or isinstance(entry.get("seq"), bool) or not isinstance(entry.get("kind"), str):
                     raise ValueError("not a record")
+                # The records are numbered 1, 2, 3 ... with nothing missing and
+                # nothing repeated, and each is of a kind this service writes.
+                if entry["seq"] != expected:
+                    raise ValueError(
+                        f"its number is {entry['seq']} where {expected} was due, so a record "
+                        "is missing or repeated"
+                    )
+                if entry["kind"] not in LOG_KINDS:
+                    raise ValueError(f"'{entry['kind']}' is not a kind of record this service writes")
+                expected += 1
                 self._apply(sb, entry, unended)
             except (ValueError, KeyError, TypeError) as exc:
                 raise ValueError(

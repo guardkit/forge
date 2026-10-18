@@ -15,6 +15,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import os
+import re
 import sys
 import threading
 import time
@@ -923,6 +924,64 @@ class TestTheLogIsWholeOrRefused:
         before = path.read_bytes()
         with pytest.raises(ValueError, match="damaged at line 2"):
             world.make()
+        assert path.read_bytes() == before
+
+    @pytest.mark.parametrize(
+        "records,why",
+        [
+            (  # an unknown hold event kind
+                [{"seq": 1, "kind": "hold-open", "hold_id": "hold-a", "owner": "x", "until": "services", "opened": 1},
+                 {"seq": 2, "kind": "hold-released", "hold_id": "hold-a"},
+                 {"seq": 3, "kind": "clear"}],
+                "line 2 ('hold-released' is not a kind of record",
+            ),
+            (  # a missing numbered hold record: number 2, the hold's close, is gone
+                [{"seq": 1, "kind": "hold-open", "hold_id": "hold-a", "owner": "x", "until": "services", "opened": 1},
+                 {"seq": 3, "kind": "suspend", "reason": "r"}],
+                "line 2 (its number is 3 where 2 was due",
+            ),
+            (  # a repeated sequence number
+                [{"seq": 1, "kind": "clear"},
+                 {"seq": 2, "kind": "hold-open", "hold_id": "hold-a", "owner": "x", "until": "services", "opened": 1},
+                 {"seq": 2, "kind": "hold-close", "hold_id": "hold-a"}],
+                "line 3 (its number is 2 where 3 was due",
+            ),
+            (  # a log that does not start at 1
+                [{"seq": 2, "kind": "clear"}],
+                "line 1 (its number is 2 where 1 was due",
+            ),
+        ],
+    )
+    def test_gaps_repeats_and_unknown_kinds_refuse_to_start(self, world, records, why):
+        path = _write_log(world, records)
+        before = path.read_bytes()
+        with pytest.raises(ValueError, match=re.escape(why)):
+            world.make()
+        assert path.read_bytes() == before
+        assert world.starters == [] and world.lines("docker.log") == []
+
+    def test_every_kind_the_service_writes_is_known(self):
+        written = set(re.findall(r'_record\(\s*sb,\s*"([a-z-]+)"', STARTER_PY.read_text()))
+        assert written == set(starter_mod.LOG_KINDS)
+
+    def test_the_program_refuses_a_gap_in_one_sentence(self, world):
+        import subprocess
+
+        world.settings()
+        path = _write_log(world, [{"seq": 1, "kind": "clear"}, {"seq": 3, "kind": "clear"}])
+        before = path.read_bytes()
+        env = dict(os.environ)
+        env.update({
+            "STARTER_LISTEN_ADDRESS": "127.0.0.1", "STARTER_LISTEN_PORT": "0",
+            "STARTER_SANDBOXES": NAME, "STARTER_SETTINGS_FILE": str(world.tmp / "sandboxes.json"),
+            "STARTER_STATE_DIR": str(path.parent),
+            "STARTER_DOCKER": str(world.bin / "docker"), "STARTER_SBX": str(world.bin / "sbx"),
+        })
+        done = subprocess.run([sys.executable, "-I", str(STARTER_PY)], env=env,
+                              capture_output=True, text=True, timeout=30)
+        assert done.returncode == 2
+        assert "damaged at line 2" in done.stderr and "Nothing was started" in done.stderr
+        assert len(done.stderr.strip().splitlines()) == 1
         assert path.read_bytes() == before
 
     def test_the_program_refuses_to_start_in_one_sentence(self, world):
