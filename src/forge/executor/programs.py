@@ -46,17 +46,17 @@ __all__ = [
     "RaisedWhileRunning",
     "RefusedBeforeStart",
     "TimedOut",
-    "observe_started",
+    "StoppableRun",
     "run_program",
     "start_program",
     "start_program_async",
-    "stop_program_group",
+    "stoppable",
 ]
 
 logger = logging.getLogger(__name__)
 
-#: Who, on this thread, wants to be handed the next program
-#: :func:`run_program` starts (see :func:`observe_started`).
+#: The run, on this thread, the next program :func:`run_program` starts
+#: belongs to (see :func:`stoppable`).
 _started_observer = threading.local()
 
 
@@ -183,46 +183,297 @@ def _stop(process: "subprocess.Popen[bytes]", *, group: bool, grace: float) -> N
         return
 
 
-def stop_program_group(process: "subprocess.Popen[bytes]", *, grace: float) -> None:
-    """Stop a program started in a session of its own, and everything it
-    started: TERM to its group, then KILL once ``grace`` seconds have passed
-    with it still running. Never raises.
+# ---------------------------------------------------------------------------
+# A program that another thread may stop (19 October 2026)
+# ---------------------------------------------------------------------------
+#
+# The helper's ``/guardkit-leg/cancel`` stops a fix journey's leg from another
+# request's thread. Three rules make that safe and complete:
+#
+# * NEVER SIGNAL A REAPED PROCESS. Once a process is reaped its id, and the
+#   id of the group it led, can be given to a new process. So the thread that
+#   runs the program observes its end WITHOUT reaping it
+#   (``waitid(..., WNOWAIT)``), marks the run finished under the run's lock,
+#   and only then reaps it. A stop takes the same lock, refuses once the run
+#   is finished, and holds the lock from the first signal to the last, so the
+#   leader stays unreaped (a zombie keeps its id and its group's id reserved)
+#   for the whole of the stop.
+# * EVERYTHING IT STARTED, NOT ONLY ITS GROUP. GuardKit starts the project's
+#   own test commands in sessions of their own, so a signal to the leg's group
+#   never reaches them. Before the first signal, while the leader is alive or
+#   unreaped, every descendant of the leader is found in ``/proc`` and each
+#   distinct process group among them is stopped (never this process's own).
+# * A STOP ASKED FOR BEFORE THE START means the program is never started; one
+#   that lands between the check and the start stops it at once.
 
-    For a caller on ANOTHER thread than the one waiting for the program (19
-    October 2026: the helper stopping a fix journey's leg whose build was
-    cancelled). The waiting thread then reads the program's end as usual.
-    """
-    _stop(process, group=True, grace=grace)
+
+def _process_table() -> dict[int, tuple[int, int, str]] | None:
+    """``{pid: (parent pid, process group, state)}`` from ``/proc``, or None."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    table: dict[int, tuple[int, int, str]] = {}
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as handle:
+                raw = handle.read().decode("utf-8", errors="replace")
+            fields = raw.rsplit(")", 1)[1].split()
+            table[int(entry)] = (int(fields[1]), int(fields[2]), fields[0])
+        except (OSError, IndexError, ValueError):
+            continue  # it ended while the table was read
+    return table
+
+
+def _groups_to_stop(leader: int) -> set[int]:
+    """The leader's group and the group of every one of its descendants."""
+    groups: set[int] = set()
+    try:
+        groups.add(os.getpgid(leader))
+    except OSError:
+        pass
+    table = _process_table()
+    if table is not None:
+        children: dict[int, list[int]] = {}
+        for pid, (ppid, _pgid, _state) in table.items():
+            children.setdefault(ppid, []).append(pid)
+        seen: set[int] = set()
+        todo = [leader]
+        while todo:
+            pid = todo.pop()
+            if pid in seen:
+                continue
+            seen.add(pid)
+            if pid in table:
+                groups.add(table[pid][1])
+            todo.extend(children.get(pid, ()))
+    groups.discard(0)
+    groups.discard(os.getpgrp())
+    return groups
+
+
+def _groups_still_running(groups: set[int]) -> set[int]:
+    """Which of ``groups`` still have a member that is not a zombie."""
+    table = _process_table()
+    if table is None:
+        remaining = set()
+        for group in groups:
+            try:
+                os.killpg(group, 0)
+            except OSError:
+                continue
+            remaining.add(group)
+        return remaining
+    live = {pgid for _ppid, pgid, state in table.values() if state != "Z"}
+    return groups & live
+
+
+class StoppableRun:
+    """One program :func:`run_program` starts inside :func:`stoppable`, which
+    another thread may stop with :meth:`request_stop`. See the block above."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._process: "subprocess.Popen[bytes] | None" = None
+        self._finished = False
+        self._stop_requested = False
+        self._stopped = False
+        self._grace = 2.0
+        #: Test hooks: called on the running thread just before and just
+        #: after the run is marked finished (the leader exited, unreaped).
+        self._before_finish_mark: "Callable[[], None] | None" = None
+        self._after_finish_mark: "Callable[[], None] | None" = None
+
+    # The three readings take no lock: each is one attribute read, and a stop
+    # holds the lock for its whole grace, which a reader (``GET /busy``) must
+    # never wait behind.
+
+    @property
+    def started(self) -> bool:
+        return self._process is not None
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    def request_stop(self, *, grace: float) -> bool:
+        """Ask for the program and everything it started to be stopped.
+
+        Before the start: it will not be started. Running: TERM to every
+        group, KILL to those still running after ``grace``; this returns
+        once that is done. Finished: nothing is signalled. ``True`` when
+        this call signalled something, or will stop the program at its start.
+        """
+        with self._lock:
+            first = not self._stop_requested
+            self._stop_requested = True
+            self._grace = grace
+            if self._process is None:
+                return first and not self._finished
+        return self._stop_now()
+
+    def may_start(self) -> bool:
+        with self._lock:
+            return not self._stop_requested
+
+    def _attach(self, process: "subprocess.Popen[bytes]") -> None:
+        with self._lock:
+            self._process = process
+            stop = self._stop_requested
+        if stop:
+            self._stop_now()
+
+    def _stop_now(self) -> bool:
+        """The stop itself, under the lock from the first signal to the last."""
+        with self._lock:
+            process = self._process
+            if process is None or self._finished or self._stopped:
+                return False
+            self._stopped = True
+            groups = _groups_to_stop(process.pid)
+            logger.warning(
+                "stopping pid %s and everything it started: process groups %s",
+                process.pid,
+                sorted(groups),
+            )
+            for group in groups:
+                try:
+                    os.killpg(group, signal.SIGTERM)
+                except OSError:
+                    continue
+            deadline = time.monotonic() + max(0.0, self._grace)
+            remaining = _groups_still_running(groups)
+            while remaining and time.monotonic() < deadline:
+                time.sleep(0.05)
+                remaining = _groups_still_running(groups)
+            # The KILL is sent under the same lock, so the run cannot have
+            # been marked finished, and its leader cannot have been reaped.
+            for group in remaining:
+                try:
+                    os.killpg(group, signal.SIGKILL)
+                except OSError:
+                    continue
+            return bool(groups)
+
+    def _mark_finished(self) -> None:
+        if self._before_finish_mark is not None:
+            self._before_finish_mark()
+        with self._lock:
+            self._finished = True
+        if self._after_finish_mark is not None:
+            self._after_finish_mark()
 
 
 @contextlib.contextmanager
-def observe_started(
-    callback: "Callable[[subprocess.Popen[bytes]], None]",
-) -> Iterator[None]:
-    """Hand ``callback`` each program :func:`run_program` starts on this
-    thread while the block runs, the moment it has started.
+def stoppable(run: StoppableRun) -> Iterator[None]:
+    """Run the next program :func:`run_program` starts on this thread as
+    ``run``, so another thread can stop it with ``run.request_stop``.
 
-    It is how something that did not start a program can still stop it (19
-    October 2026: the helper's ``/guardkit-leg/cancel``). The runners that
-    start a leg keep their signatures; the leg's handler thread says who is
-    watching. A callback that raises is logged and the program runs on.
+    The runners that start a leg keep their signatures; the leg's handler
+    thread says which run it is.
     """
-    previous = getattr(_started_observer, "callback", None)
-    _started_observer.callback = callback
+    previous = getattr(_started_observer, "run", None)
+    _started_observer.run = run
     try:
         yield
     finally:
-        _started_observer.callback = previous
+        _started_observer.run = previous
 
 
-def _tell_started_observer(process: "subprocess.Popen[bytes]") -> None:
-    callback = getattr(_started_observer, "callback", None)
-    if callback is None:
-        return
+def _exited_unreaped(pid: int) -> bool:
+    """Has the child ``pid`` exited? It is left unreaped either way."""
+    result = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    return result is not None and result.si_pid == pid
+
+
+def _reader(stream: Any, into: list[bytes]) -> threading.Thread:
+    def read() -> None:
+        try:
+            while True:
+                chunk = stream.read1(65536)
+                if not chunk:
+                    return
+                into.append(chunk)
+        except (OSError, ValueError):
+            return
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    return thread
+
+
+def _run_stoppable(
+    process: "subprocess.Popen[bytes]",
+    run: StoppableRun,
+    *,
+    timeout: float,
+    kill_grace_seconds: float,
+    post_kill_read_seconds: float,
+) -> ProgramOutcome:
+    """Wait for a program started under :func:`stoppable`; never reap early.
+
+    The same three endings as :func:`run_program`'s own wait: the program
+    exited (and its output reached its end), it was stopped at ``timeout``,
+    or something raised after the start. Its end is observed without reaping
+    it, the run is marked finished, and only then is it reaped.
+    """
+    out: list[bytes] = []
+    err: list[bytes] = []
+    readers = [_reader(process.stdout, out), _reader(process.stderr, err)]
+    timed_out = False
     try:
-        callback(process)
-    except Exception:  # noqa: BLE001 — the program runs on either way
-        logger.exception("a started-program observer raised; the program runs on")
+        run._attach(process)
+        deadline = time.monotonic() + timeout
+        while True:
+            if _exited_unreaped(process.pid) and not any(r.is_alive() for r in readers):
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.05)
+        if timed_out:
+            with run._lock:
+                run._grace = kill_grace_seconds
+            run._stop_now()
+            until = time.monotonic() + post_kill_read_seconds
+            while time.monotonic() < until:
+                if _exited_unreaped(process.pid) and not any(r.is_alive() for r in readers):
+                    break
+                time.sleep(0.05)
+        run._mark_finished()
+        try:
+            process.wait(timeout=post_kill_read_seconds if timed_out else None)
+        except subprocess.TimeoutExpired:
+            pass
+        return ProgramOutcome(
+            exit_code=process.returncode,
+            stdout=b"".join(out),
+            stderr=b"".join(err),
+            timed_out=timed_out,
+        )
+    except BaseException as exc:  # noqa: BLE001 — after the start: nobody knows
+        if not isinstance(exc, ChildProcessError):
+            # (A ChildProcessError means something else reaped it: its ids
+            # may already be reused, so nothing is signalled.)
+            with run._lock:
+                run._grace = kill_grace_seconds
+            run._stop_now()
+        run._mark_finished()
+        if not isinstance(exc, Exception):
+            raise
+        return ProgramOutcome(
+            exit_code=process.returncode,
+            stdout=b"",
+            stderr=b"",
+            raised_while_running=True,
+            error=exc,
+        )
 
 
 def run_program(
@@ -243,6 +494,20 @@ def run_program(
     group stopped too when ``new_session``); anything raised once it had
     started is ``raised_while_running``, after the program is stopped.
     """
+    run: StoppableRun | None = getattr(_started_observer, "run", None)
+    if run is not None:
+        # Taken once: the next program on this thread is the stoppable one.
+        _started_observer.run = None
+        if not run.may_start():
+            return ProgramOutcome(
+                exit_code=None,
+                stdout=b"",
+                stderr=b"",
+                refused_before_start=True,
+                error=ProgramRefused(
+                    "it was asked to stop before it started, so it was not started"
+                ),
+            )
     try:
         process = start_program(
             argv,
@@ -251,7 +516,7 @@ def run_program(
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=new_session,
+            start_new_session=True if run is not None else new_session,
         )
     except ProgramRefused as exc:
         return ProgramOutcome(
@@ -261,7 +526,14 @@ def run_program(
             refused_before_start=True,
             error=exc.__cause__ or exc,
         )
-    _tell_started_observer(process)
+    if run is not None:
+        return _run_stoppable(
+            process,
+            run,
+            timeout=timeout,
+            kill_grace_seconds=kill_grace_seconds,
+            post_kill_read_seconds=post_kill_read_seconds,
+        )
     try:
         out, err = process.communicate(timeout=timeout)
         return ProgramOutcome(exit_code=process.returncode, stdout=out or b"", stderr=err or b"")

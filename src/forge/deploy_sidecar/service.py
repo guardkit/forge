@@ -242,10 +242,10 @@ from forge.deploy_sidecar.deploy_executor import (
 from forge.executor.programs import (
     RaisedWhileRunning,
     RefusedBeforeStart,
+    StoppableRun,
     TimedOut,
-    observe_started,
     run_program,
-    stop_program_group,
+    stoppable,
 )
 from forge.executor.shell_steps import _run_script_step
 from forge.launch_environment import (
@@ -5759,9 +5759,14 @@ GUARDKIT_LEG_ROUTE: str = "/guardkit-leg"
 #: here. ``POST /guardkit-leg/cancel`` with ``{"build": "<build id>"}`` (what
 #: the coordinator sends: every leg request carries its build) or ``{"leg":
 #: <n>}`` (the number ``GET /busy`` lists for a leg) stops that leg's process
-#: group: TERM, then KILL after :data:`LEG_CANCEL_GRACE_SECONDS`. The leg's own
-#: request then answers as it always does, with ``"cancelled": true`` added.
-#: A build or number with no leg running here is refused in one sentence.
+#: group, and the group of every process it started (GuardKit starts a
+#: project's test commands in sessions of their own): TERM, then KILL after
+#: :data:`LEG_CANCEL_GRACE_SECONDS`. A leg is listed from the moment its
+#: request is admitted, so a cancel that lands before its process starts
+#: means it never starts. A finished leg is never signalled (see
+#: :class:`forge.executor.programs.StoppableRun`). The leg's own request then
+#: answers as it always does, with ``"cancelled": true`` added. A build or
+#: number with no leg running here is refused in one sentence.
 GUARDKIT_LEG_CANCEL_ROUTE: str = "/guardkit-leg/cancel"
 
 #: How long a cancelled leg is given to stop on TERM before it is killed.
@@ -8501,51 +8506,34 @@ class _SidecarServer(ThreadingHTTPServer):
 
 
 class _RunningLeg:
-    """One ``/guardkit-leg`` request in progress, and the process it started.
+    """One ``/guardkit-leg`` request in progress, from its admission.
 
-    The process arrives through :func:`forge.executor.programs.observe_started`
-    on the leg's own thread; a cancel arrives on another. Whichever comes
-    second stops the process group, so a cancel that lands before the leg has
-    started its process still stops it the moment it does.
+    Its program runs as a :class:`forge.executor.programs.StoppableRun`: a
+    cancel before the start means it is never started, and a cancel while it
+    runs stops it and everything it started, never once it has finished.
     """
 
     def __init__(self, *, number: int, build: str | None) -> None:
         self.number = number
         self.build = build
-        self.cancelled = False
-        self._process: "subprocess.Popen[bytes] | None" = None
-        self._lock = threading.Lock()
+        self.run = StoppableRun()
 
     @property
     def started(self) -> bool:
-        with self._lock:
-            return self._process is not None
+        return self.run.started
 
-    def process_started(self, process: "subprocess.Popen[bytes]") -> None:
-        with self._lock:
-            self._process = process
-            stop = self.cancelled
-        if stop:
-            self._stop(process)
+    @property
+    def cancelled(self) -> bool:
+        return self.run.stop_requested
 
     def cancel(self) -> None:
-        with self._lock:
-            already = self.cancelled
-            self.cancelled = True
-            process = self._process
-        if process is not None and not already:
-            self._stop(process)
-
-    def _stop(self, process: "subprocess.Popen[bytes]") -> None:
         logger.warning(
             "forge-deploy-sidecar: stopping the fix-journey leg number %d "
-            "(build %s, pid %s) and everything it started, because it was "
-            "cancelled",
+            "(build %s) and everything it started, because it was cancelled",
             self.number,
             self.build or "not named",
-            getattr(process, "pid", "?"),
         )
-        stop_program_group(process, grace=LEG_CANCEL_GRACE_SECONDS)
+        self.run.request_stop(grace=LEG_CANCEL_GRACE_SECONDS)
 
 
 class DeploySidecarHandler(BaseHTTPRequestHandler):
@@ -8631,8 +8619,15 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 self._write_json(400, {"error": f"invalid JSON body: {exc}"})
                 return
             number = self.server.begin_request(route, payload)  # type: ignore[attr-defined]
+            # A leg is cancellable from its admission, before anything else
+            # (configuration included) is done for it.
+            leg = (
+                self.server.begin_leg(number, payload)  # type: ignore[attr-defined]
+                if route == GUARDKIT_LEG_ROUTE
+                else None
+            )
             try:
-                self._answer_post(route, payload, number=number)
+                self._answer_post(route, payload, leg=leg)
             finally:
                 self.server.end_request(number)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001 — never crash the server
@@ -8640,7 +8635,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
             self._safe_500(exc)
 
     def _answer_post(
-        self, route: str, payload: Any, *, number: int | None = None
+        self, route: str, payload: Any, *, leg: "_RunningLeg | None" = None
     ) -> None:
         """Route one POST and write its answer (counted on ``/busy`` meanwhile)."""
         if route == GUARDKIT_LEG_CANCEL_ROUTE:
@@ -8755,29 +8750,38 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
         elif route in PREVIEW_ROUTES:
             status, body = process_preview_request(route, payload, config=config)
         elif route == GUARDKIT_LEG_ROUTE:
-            leg = (
-                self.server.begin_leg(number, payload)  # type: ignore[attr-defined]
-                if number is not None
-                else None
-            )
-            with (
-                observe_started(leg.process_started)
-                if leg is not None
-                else contextlib.nullcontext()
-            ):
-                status, body = process_guardkit_leg_request(
-                    payload,
-                    config=config,
-                    leg_runner=self.server.merge_runner,  # type: ignore[attr-defined]
-                )
+            if leg is not None and leg.cancelled:
+                # Cancelled before it started: it never starts.
+                status, body = 200, {
+                    "exit_code": MERGE_NOT_STARTED_EXIT_CODE,
+                    "stdout": "",
+                    "stderr_tail": "",
+                    "timed_out": False,
+                    "context_warnings": [],
+                }
+            else:
+                with (
+                    stoppable(leg.run) if leg is not None else contextlib.nullcontext()
+                ):
+                    status, body = process_guardkit_leg_request(
+                        payload,
+                        config=config,
+                        leg_runner=self.server.merge_runner,  # type: ignore[attr-defined]
+                    )
             if leg is not None and leg.cancelled and status == 200:
                 # Answered as cancelled: the coordinator asked for this leg to
                 # stop because its build was cancelled, so its end is not a
                 # failure of the work.
                 body["cancelled"] = True
+                said = (
+                    "this leg was stopped, with everything it had started, "
+                    "because it was cancelled"
+                    if leg.started
+                    else "this leg was not started, because it was cancelled "
+                    "before it could start"
+                )
                 body["stderr_tail"] = (
-                    f"{body.get('stderr_tail') or ''}\nthis leg was stopped, "
-                    "with everything it had started, because it was cancelled"
+                    f"{body.get('stderr_tail') or ''}\n{said}"
                 ).strip()
         else:
             status, body = process_run_request(

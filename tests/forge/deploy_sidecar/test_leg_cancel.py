@@ -16,8 +16,15 @@ group (a stand-in ``guardkit`` that starts a child of its own and waits):
 * a cancel by the number ``/busy`` lists works too;
 * an unknown build or number, or a request naming neither or both, is
   refused in one sentence and nothing is stopped;
-* a cancel that lands before the leg's process has started stops it the
-  moment it starts;
+* everything the leg started is stopped, a grandchild in a session of its
+  own included (GuardKit starts a project's test commands that way), and a
+  second build's leg is left running;
+* a cancel that lands before the leg starts (even while the helper is still
+  loading its configuration) means it never starts, and one that lands
+  between the check and the start stops it at once;
+* a finished leg is never signalled: a cancel after the finish mark sends
+  nothing, and one that races the leg's own end signals only the unreaped
+  (zombie) leader's group;
 * the coordinator's side end to end: the leg door reads the cancelled answer
   as a failed leg that says so, and the coordinator's canceller, pointed at
   the sandbox by the build's repository, stops it.
@@ -344,25 +351,213 @@ class TestWhatIsRefused:
         assert caught.value.code == 400
 
 
-class TestACancelBeforeTheProcessStarts:
-    def test_the_process_is_stopped_the_moment_it_starts(
+class TestEverythingTheLegStartedIsStopped:
+    """The coach's probes, 19 October 2026, adopted."""
+
+    def test_a_grandchild_in_a_session_of_its_own_is_stopped(
+        self, server: str, tree: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """GuardKit starts a project's test commands with start_new_session."""
+        pids = tmp_path / "setsid.pids"
+        binary = tmp_path / "setsid-bin" / "guardkit"
+        binary.parent.mkdir()
+        binary.write_text(
+            "#!/bin/sh\n"
+            "setsid sleep 300 >/dev/null 2>&1 </dev/null &\n"
+            f'echo "$$ $!" > {pids}.tmp && mv {pids}.tmp {pids}\n'
+            "wait\n"
+            "sleep 300\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        monkeypatch.setenv("FORGE_GUARDKIT_PATH", str(binary))
+        leg = _LegInFlight(server, _leg_body(tree))
+        leader, grandchild = _started_pids(pids)
+        _wait_for(
+            lambda: _alive(grandchild) and os.getpgid(grandchild) != os.getpgid(leader),
+            "the grandchild to be in a group of its own",
+        )
+
+        status, _body = _post(server + GUARDKIT_LEG_CANCEL_ROUTE, {"build": BUILD_ID})
+
+        assert status == 200
+        assert leg.join()[1]["cancelled"] is True
+        try:
+            assert _gone(leader)
+            assert _gone(grandchild), "the grandchild in its own session survived"
+        finally:
+            if _alive(grandchild):
+                os.kill(grandchild, 9)
+
+    def test_cancelling_one_build_leaves_the_other_builds_leg_running(
+        self, server: str, repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        binary = tmp_path / "two-bin" / "guardkit"
+        binary.parent.mkdir()
+        binary.write_text(
+            "#!/bin/sh\nsleep 300 &\nn=$(basename \"$PWD\")\n"
+            f'echo "$$ $!" > {tmp_path}/$n.tmp && mv {tmp_path}/$n.tmp {tmp_path}/$n.pids\n'
+            "wait\nwait\n",
+            encoding="utf-8",
+        )
+        binary.chmod(0o755)
+        monkeypatch.setenv("FORGE_GUARDKIT_PATH", str(binary))
+        trees = {}
+        for build in (BUILD_ID, OTHER_BUILD_ID):
+            trees[build] = repo / ".forge" / "worktrees" / build
+            trees[build].mkdir(parents=True)
+        first = _LegInFlight(server, _leg_body(trees[BUILD_ID], BUILD_ID))
+        second = _LegInFlight(server, _leg_body(trees[OTHER_BUILD_ID], OTHER_BUILD_ID))
+        a1, c1 = _started_pids(tmp_path / f"{BUILD_ID}.pids")
+        a2, c2 = _started_pids(tmp_path / f"{OTHER_BUILD_ID}.pids")
+
+        status, body = _post(server + GUARDKIT_LEG_CANCEL_ROUTE, {"build": BUILD_ID})
+
+        assert status == 200 and [e["build"] for e in body["cancelled"]] == [BUILD_ID]
+        assert first.join()[1]["cancelled"] is True
+        assert _gone(a1) and _gone(c1)
+        time.sleep(0.3)
+        assert _alive(a2) and _alive(c2)
+        busy = _legs_on_busy(server)
+        assert len(busy) == 1 and "cancelled" not in busy[0]
+        _post(server + GUARDKIT_LEG_CANCEL_ROUTE, {"build": OTHER_BUILD_ID})
+        assert second.join()[1]["cancelled"] is True
+
+
+class TestACancelBeforeTheLegStarts:
+    def test_a_cancel_while_its_configuration_loads_means_it_never_starts(
+        self, cfg: ForgeConfig, tree: Path, pids: Path
+    ) -> None:
+        """Codex R2: the leg is cancellable from its admission."""
+        loading = threading.Event()
+        resume = threading.Event()
+
+        def paused_loader() -> ForgeConfig:
+            loading.set()
+            assert resume.wait(PROMPT_SECONDS)
+            return cfg
+
+        srv = build_server(port=0, config_loader=paused_loader)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        host, port = srv.server_address[:2]
+        url = f"http://{host}:{port}"
+        try:
+            leg = _LegInFlight(url, _leg_body(tree))
+            assert loading.wait(PROMPT_SECONDS)
+            assert len(_legs_on_busy(url)) == 1
+
+            status, body = _post(url + GUARDKIT_LEG_CANCEL_ROUTE, {"build": BUILD_ID})
+            assert status == 200, body
+            assert body["cancelled"][0]["started"] is False
+            resume.set()
+
+            status, answer = leg.join()
+            assert status == 200 and answer["cancelled"] is True
+            assert "was not started" in answer["stderr_tail"]
+            time.sleep(0.3)
+            assert not pids.exists(), "the leg ran although it was cancelled first"
+        finally:
+            resume.set()
+            srv.shutdown()
+            srv.server_close()
+
+    def test_a_cancel_between_the_check_and_the_start_stops_it_at_once(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from forge.executor import programs
+
+        run = programs.StoppableRun()
+        real_start = programs.start_program
+
+        def start_then_cancel(argv: Any, **kwargs: Any) -> Any:
+            process = real_start(argv, **kwargs)
+            # The cancel lands after the check, before the run holds the process.
+            assert run.request_stop(grace=1.0) is True
+            return process
+
+        monkeypatch.setattr(programs, "start_program", start_then_cancel)
+        with programs.stoppable(run):
+            outcome = programs.run_program(
+                ["sleep", "300"], cwd=None, env=None, timeout=PROMPT_SECONDS * 3
+            )
+        assert outcome.exit_code is not None and outcome.exit_code < 0
+        assert not outcome.timed_out
+
+    def test_a_run_asked_to_stop_first_is_never_started(self, tmp_path: Path) -> None:
+        from forge.executor import programs
+
+        marker = tmp_path / "ran"
+        run = programs.StoppableRun()
+        assert run.request_stop(grace=1.0) is True
+        with programs.stoppable(run):
+            outcome = programs.run_program(
+                ["touch", str(marker)], cwd=None, env=None, timeout=10
+            )
+        assert outcome.refused_before_start
+        assert not marker.exists()
+
+
+class TestAFinishedLegIsNeverSignalled:
+    """Codex R1: never signal a reaped process (deterministic hooks)."""
+
+    def _signals(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+        from forge.executor import programs
+
+        sent: list[tuple[int, int]] = []
+        real_killpg = programs.os.killpg
+
+        def recording_killpg(group: int, sig: int) -> None:
+            sent.append((group, sig))
+            real_killpg(group, sig)
+
+        monkeypatch.setattr(programs.os, "killpg", recording_killpg)
+        return sent
+
+    def test_a_cancel_after_the_finish_mark_signals_nothing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(service, "LEG_CANCEL_GRACE_SECONDS", 1.0)
-        leg = service._RunningLeg(number=7, build=BUILD_ID)
-        leg.cancel()
-        assert leg.cancelled and not leg.started
+        from forge.executor import programs
 
-        process = subprocess.Popen(  # noqa: S603 — a fixed test argv
-            ["sleep", "300"], start_new_session=True
-        )
-        try:
-            leg.process_started(process)
-            assert process.wait(timeout=PROMPT_SECONDS) != 0
-        finally:
-            if process.poll() is None:
-                process.kill()
-                process.wait()
+        sent = self._signals(monkeypatch)
+        run = programs.StoppableRun()
+        answers: list[bool] = []
+        run._after_finish_mark = lambda: answers.append(run.request_stop(grace=0.2))
+
+        with programs.stoppable(run):
+            outcome = programs.run_program(["true"], cwd=None, env=None, timeout=10)
+
+        assert outcome.exit_code == 0
+        assert answers == [False]
+        assert sent == []
+
+    def test_completion_racing_the_cancel_signals_only_the_unreaped_leader(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The cancel lands after the leader exited, before the finish mark:
+        the leader is a zombie, so its id and its group's id are still its own."""
+        from forge.executor import programs
+
+        sent = self._signals(monkeypatch)
+        run = programs.StoppableRun()
+        seen: dict[str, Any] = {}
+
+        def cancel_while_a_zombie() -> None:
+            pid = run._process.pid
+            stat = Path(f"/proc/{pid}/stat").read_text()
+            seen["state"] = stat.rsplit(")", 1)[1].split()[0]
+            seen["pid"] = pid
+            seen["answer"] = run.request_stop(grace=0.2)
+
+        run._before_finish_mark = cancel_while_a_zombie
+        with programs.stoppable(run):
+            outcome = programs.run_program(["true"], cwd=None, env=None, timeout=10)
+
+        assert seen["state"] == "Z"
+        assert seen["answer"] is True
+        # TERM to the zombie's own group only; nothing left running, so no KILL.
+        assert sent == [(seen["pid"], 15)]
+        assert outcome.exit_code == 0
+        assert run.finished
 
 
 # ---------------------------------------------------------------------------
