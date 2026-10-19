@@ -129,6 +129,8 @@ class StarterStatus:
     #: The sandbox is stopped, as the starter sees it.
     stopped: bool = False
     holds: tuple[dict[str, Any], ...] = ()
+    #: The deployment the starter checks containers against now, if any.
+    deployment: dict[str, Any] | None = None
     #: Why the status could not be read, when it could not.
     why: str | None = None
     raw: dict[str, Any] = field(default_factory=dict)
@@ -225,6 +227,7 @@ def read_status(name: str, status: int, body: Any) -> StarterStatus:
         services_up=state == "running",
         stopped=state in _CONTAINER_DOWN or (readiness == "stopped" and state != "running"),
         holds=holds,
+        deployment=body.get("deployment") if isinstance(body.get("deployment"), dict) else None,
         raw=body,
     )
 
@@ -316,8 +319,16 @@ class StarterClient:
             timeout=STOP_TIMEOUT_SECONDS,
         )
 
-    def ready_sync(self, name: str) -> StarterAnswer:
-        return self._post_sync(f"/ready/{self._quoted(name)}")
+    def ready_sync(self, name: str, *, deployment: dict[str, str] | None = UNSAID) -> StarterAnswer:
+        """The redeploy is confirmed for this deployment (the starter refuses a
+        ready that names another than its current one)."""
+        return self._post_sync(
+            self._with(f"/ready/{self._quoted(name)}", deployment_query(deployment))
+        )
+
+    def clear_sync(self, name: str) -> StarterAnswer:
+        """A session clears a suspension (tests and tools; the coordinator never)."""
+        return self._post_sync(f"/clear/{self._quoted(name)}")
 
     def suspend_sync(self, name: str, reason: str) -> StarterAnswer:
         return self._post_sync(
@@ -368,8 +379,8 @@ class StarterClient:
     async def stop(self, name: str, *, deployment: dict[str, str] | None = UNSAID) -> StarterAnswer:
         return await asyncio.to_thread(lambda: self.stop_sync(name, deployment=deployment))
 
-    async def ready(self, name: str) -> StarterAnswer:
-        return await asyncio.to_thread(self.ready_sync, name)
+    async def ready(self, name: str, *, deployment: dict[str, str] | None = UNSAID) -> StarterAnswer:
+        return await asyncio.to_thread(lambda: self.ready_sync(name, deployment=deployment))
 
     async def suspend(self, name: str, reason: str) -> StarterAnswer:
         return await asyncio.to_thread(self.suspend_sync, name, reason)

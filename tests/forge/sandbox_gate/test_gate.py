@@ -34,8 +34,10 @@ from forge.sandbox_gate.gate import (
     READY,
     STOPPED,
     STOPPING,
+    SUSPENDED,
     UNKNOWN,
     RedeployOutcome,
+    SandboxNotReady,
     build_sandbox_gate,
 )
 from forge.sandbox_gate.starter_client import read_status
@@ -53,7 +55,12 @@ from tests.forge.sandbox_gate._fakes import (
     a_ledger,
     a_preview_lease,
     settle,
+    stopped,
+    LABEL_KEY,
+    COMPOSE_PROJECT,
 )
+
+NAMED = {"compose_project": COMPOSE_PROJECT, "identity_label": f"{LABEL_KEY}=notes-app@abc1234"}
 
 
 @pytest.fixture
@@ -287,16 +294,56 @@ class TestUse:
         )
 
     @pytest.mark.asyncio
-    async def test_a_step_whose_sandbox_never_comes_goes_ahead_and_says_why(
-        self, ledger: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    async def test_a_step_whose_sandbox_never_comes_never_runs_and_says_why(
+        self, ledger: sqlite3.Connection
     ) -> None:
         starter = FakeStarter(running=False)
         starter.start_refusal = "the sandbox client is not signed in"
         gate = a_gate(ledger, starter, clock=Clock(), ready_timeout_seconds=60)
-        with caplog.at_level(logging.WARNING):
+        ran: list[str] = []
+        with pytest.raises(SandboxNotReady, match="not signed in") as refused:
             async with gate.use(REPO, purpose="the merge press"):
-                assert gate.users_of(SANDBOX) == 1
-        assert "not signed in" in caplog.text
+                ran.append("body")
+        assert ran == [] and gate.users_of(SANDBOX) == 0
+        assert str(refused.value).startswith("the merge press did not run:")
+
+    @pytest.mark.asyncio
+    async def test_a_stop_still_pending_times_out_without_running_the_step(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        clock = Clock()
+        starter = FakeStarter(running=True)
+        gate = a_gate(ledger, starter, clock=clock, ready_timeout_seconds=60)
+        assert await gate.ensure_ready(SANDBOX)
+        await gate.poll_once()
+        clock.advance(31 * 60)
+        starter.stop_gate = asyncio.Event()  # the stop never answers in time
+        await gate.poll_once()
+        assert gate.state_of(SANDBOX) == STOPPING
+        ran: list[str] = []
+        with pytest.raises(SandboxNotReady, match="a stop of notes-app-sbx was still being answered"):
+            async with gate.use(REPO, purpose="a preview"):
+                ran.append("body")
+        assert ran == []
+        starter.stop_gate.set()
+        await stopped(gate)
+
+    @pytest.mark.asyncio
+    async def test_a_redeploy_still_pending_times_out_without_running_the_step(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        _record_deployment(ledger)
+        starter = FakeStarter(running=False)
+
+        async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+            return RedeployOutcome(ok=False, retry=True, sentence="another build holds the lock")
+
+        gate = a_gate(ledger, starter, clock=Clock(), redeploy=redeploy, ready_timeout_seconds=60)
+        ran: list[str] = []
+        with pytest.raises(SandboxNotReady, match="its redeploy is still pending: another build holds"):
+            async with gate.use(REPO, purpose="the merge press", needs_deployment=True):
+                ran.append("body")
+        assert ran == [] and not starter.suspended
 
 
 # ---------------------------------------------------------------------------
@@ -323,7 +370,9 @@ class TestRedeploy:
         assert await gate.ensure_ready(SANDBOX)
         assert asked == [(SANDBOX, (REPO,))]
         assert starter.calls.index("ready notes-app-sbx") > starter.calls.index("start notes-app-sbx")
-        assert starter.told[0] == ("start", None)  # unsaid: the starter's settings decide
+        # Always said: the recorded identity under the entry's names (R1).
+        assert starter.told[0] == ("start", NAMED)
+        assert ("ready", NAMED) in starter.told
 
     @pytest.mark.asyncio
     async def test_a_failed_redeploy_suspends_and_the_sandbox_stays_up(
@@ -366,7 +415,9 @@ class TestRedeploy:
         gate = a_gate(ledger, starter, clock=Clock(), redeploy=redeploy)
         gate._slots[SANDBOX].state = STOPPED
         # An outside command's hold wakes it: services ready, redeploy pending.
-        assert starter.hold_sync(SANDBOX, owner="merge-deploy", until="deployed").ok
+        assert starter.hold_sync(
+            SANDBOX, owner="merge-deploy", until="deployed", deployment=NAMED
+        ).ok
         await gate.poll_once()
         await settle(gate)
         assert ran == [SANDBOX]
@@ -399,6 +450,7 @@ class TestIdleStop:
         assert "stop notes-app-sbx" not in starter.calls
         clock.advance(2 * 60)
         await gate.poll_once()
+        await stopped(gate)
         assert "stop notes-app-sbx" in starter.calls
         assert starter.told[-1] == ("stop", {})  # no recorded deployment: says none
         assert gate.state_of(SANDBOX) == STOPPED
@@ -462,6 +514,7 @@ class TestIdleStop:
         await gate.poll_once()
         clock.advance(31 * 60)
         await gate.poll_once()
+        await stopped(gate)
         assert gate.state_of(SANDBOX) == UNKNOWN
         assert starter.running[SANDBOX] is True
         assert await gate.ensure_ready(SANDBOX)
@@ -478,6 +531,7 @@ class TestIdleStop:
         await gate.poll_once()
         clock.advance(31 * 60)
         await gate.poll_once()
+        await stopped(gate)
         assert gate.state_of(SANDBOX) == UNKNOWN
         # The stop had in fact finished: a step now waits for a fresh start
         # rather than going ahead on a sandbox that is not there.
@@ -523,6 +577,7 @@ class TestIdleStop:
         await gate.poll_once()
         clock.advance(31 * 60)
         await gate.poll_once()
+        await stopped(gate)
         assert "stop notes-app-sbx" in starter.calls
 
 
@@ -539,7 +594,7 @@ class TestBoot:
         a_build(ledger, "INTERRUPTED")
         starter = FakeStarter(running=False)
         gate = a_gate(ledger, starter, clock=Clock())
-        assert await gate.boot() == [SANDBOX]
+        assert await gate.boot() == []  # nothing left not ready
         assert starter.running[SANDBOX] is True
         assert gate.state_of(SANDBOX) == READY
 
@@ -549,3 +604,124 @@ class TestBoot:
         gate = a_gate(ledger, starter, clock=Clock())
         assert await gate.boot() == []
         assert "start notes-app-sbx" not in starter.calls
+
+
+# ---------------------------------------------------------------------------
+# Suspended is its own state (Codex S2 implementation review 1, R2)
+# ---------------------------------------------------------------------------
+
+
+class TestSuspended:
+    async def _suspended(self, ledger: sqlite3.Connection, starter: FakeStarter, ran: list[str], clock: Clock):
+        _record_deployment(ledger)
+
+        async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+            ran.append(name)
+            return RedeployOutcome(ok=False, sentence="the proxy did not answer its health check")
+
+        gate = a_gate(ledger, starter, clock=clock, redeploy=redeploy)
+        assert await gate.ensure_ready(SANDBOX)
+        assert gate.state_of(SANDBOX) == SUSPENDED
+        return gate
+
+    @pytest.mark.asyncio
+    async def test_a_suspension_is_not_readiness_and_no_poll_redeploys_again(
+        self, ledger: sqlite3.Connection, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        clock, ran = Clock(), []
+        starter = FakeStarter(running=False)
+        gate = await self._suspended(ledger, starter, ran, clock)
+        assert starter.redeploy_pending[SANDBOX] is True  # the real starter keeps it
+        for _ in range(5):
+            clock.advance(31 * 60)
+            await gate.poll_once()
+            await settle(gate)
+        assert ran == [SANDBOX]  # once, never again until a clear
+        assert "stop notes-app-sbx" not in starter.calls
+        assert "ready notes-app-sbx" not in starter.calls
+        assert gate.state_of(SANDBOX) == SUSPENDED
+        # Work that needs the deployment is held, with the reason; other work goes.
+        assert gate.admits(REPO, needs_deployment=True) is False
+        assert "is suspended (the proxy did not answer" in (gate.why_held(REPO) or "")
+        with pytest.raises(SandboxNotReady, match="suspended"):
+            async with gate.use(REPO, purpose="the merge press", needs_deployment=True):
+                raise AssertionError("the body must not run")
+        assert gate.admits(REPO) is True
+        async with gate.use(REPO, purpose="a planning step"):
+            pass
+
+    @pytest.mark.asyncio
+    async def test_a_restarted_coordinator_finds_it_suspended_and_does_not_redeploy(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        clock, ran = Clock(), []
+        starter = FakeStarter(running=False)
+        await self._suspended(ledger, starter, ran, clock)
+
+        async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+            ran.append(f"after restart {name}")
+            return RedeployOutcome(ok=True)
+
+        again = a_gate(ledger, starter, clock=clock, redeploy=redeploy)
+        assert again.state_of(SANDBOX) == UNKNOWN
+        await again.poll_once()
+        await settle(again)
+        assert again.state_of(SANDBOX) == SUSPENDED
+        assert await again.ensure_ready(SANDBOX)  # services answer: not ready for a deploy
+        assert again.admits(REPO, needs_deployment=True) is False
+        assert ran == [SANDBOX]
+
+    @pytest.mark.asyncio
+    async def test_after_a_clear_the_next_look_redeploys(self, ledger: sqlite3.Connection) -> None:
+        clock, ran = Clock(), []
+        starter = FakeStarter(running=False)
+        gate = await self._suspended(ledger, starter, ran, clock)
+
+        async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+            ran.append("after clear")
+            return RedeployOutcome(ok=True)
+
+        gate.set_redeploy(redeploy)
+        starter.clear_sync(SANDBOX)
+        await gate.poll_once()
+        await settle(gate)
+        assert ran == [SANDBOX, "after clear"]
+        assert gate.state_of(SANDBOX) == READY
+
+
+# ---------------------------------------------------------------------------
+# A stop never holds up the poll (R6)
+# ---------------------------------------------------------------------------
+
+
+class TestStopsRunOnTheirOwn:
+    @pytest.mark.asyncio
+    async def test_a_pending_redeploy_is_serviced_while_another_sandboxs_stop_is_outstanding(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        from tests.forge.sandbox_gate._fakes import SECOND_REPO, SECOND_SANDBOX
+
+        _record_deployment(ledger)
+        clock = Clock()
+        starter = FakeStarter(running=True)
+        starter.running[SECOND_SANDBOX] = True
+        ran: list[str] = []
+
+        async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+            ran.append(name)
+            return RedeployOutcome(ok=True)
+
+        gate = a_gate(ledger, starter, clock=clock, redeploy=redeploy, config=a_config(two_managed=True))
+        assert await gate.ensure_ready(SECOND_SANDBOX)
+        await gate.poll_once()  # the second is idle from now
+        clock.advance(31 * 60)
+        starter.stop_gate = asyncio.Event()  # its stop will hang
+        # Meanwhile the first sandbox is waiting for its redeploy.
+        starter.redeploy_pending[SANDBOX] = True
+        await asyncio.wait_for(gate.poll_once(), timeout=5)  # never waits for the stop
+        assert gate.state_of(SECOND_SANDBOX) == STOPPING
+        await settle(gate, REPO)
+        assert ran == [SANDBOX] and gate.state_of(SANDBOX) == READY
+        starter.stop_gate.set()
+        await stopped(gate, SECOND_SANDBOX)
+        assert gate.state_of(SECOND_SANDBOX) == STOPPED

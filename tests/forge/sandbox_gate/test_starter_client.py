@@ -95,3 +95,25 @@ def test_an_unreachable_starter_is_said_never_raised() -> None:
     assert client.stop_sync("notes-app-sbx").ok is False
     assert client.hold_sync("notes-app-sbx", owner="x", until="services").hold_id is None
     assert client.release_sync("hold-x") is False
+
+
+def test_ready_names_the_deployment_it_confirms() -> None:
+    t = Transport()
+    StarterClient(BASE, transport=t).ready_sync(
+        "notes-app-sbx", deployment={"compose_project": "notes", "identity_label": "k=v"}
+    )
+    StarterClient(BASE, transport=t).ready_sync("notes-app-sbx", deployment=NO_DEPLOYMENT)
+    assert t.asked[0][1] == f"{BASE}/ready/notes-app-sbx?compose_project=notes&identity_label=k%3Dv"
+    assert t.asked[1][1] == f"{BASE}/ready/notes-app-sbx?deployment=none"
+
+
+def test_the_starters_own_deployment_is_read_from_its_status() -> None:
+    from forge.sandbox_gate.starter_client import read_status
+
+    status = read_status(
+        "notes-app-sbx",
+        200,
+        {"ok": True, "container": {"state": "running"}, "operations": {},
+         "deployment": {"compose_project": "notes", "identity_label": "k=v"}},
+    )
+    assert status.deployment == {"compose_project": "notes", "identity_label": "k=v"}

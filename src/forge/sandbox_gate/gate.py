@@ -1,5 +1,6 @@
 """One gate per managed sandbox, in the coordinator (one sandbox per project,
-stage S2, design sections 2.3 and 2.3a, 18 October 2026).
+stage S2, design sections 2.3 and 2.3a, 18 October 2026; Codex S2
+implementation review 1, 19 October 2026).
 
 A sandbox is *managed* when every repository mapped to it says
 ``idle_stop: true`` in ``planning.sandboxes``, ``planning.sandbox_starter.url``
@@ -8,39 +9,49 @@ with no gate installed, or for an unmanaged sandbox, every entry point is
 exactly what it was.
 
 Each managed sandbox has one state (``unknown``, ``starting``, ``ready``,
-``stopping`` or ``stopped``), one :class:`asyncio.Lock`, a count of the steps
-using it now, and the moment it was last used. Every decision is made inside
-this one process, so starting and stopping never race:
+``stopping``, ``stopped`` or ``suspended``), one :class:`asyncio.Lock`, a
+count of the steps using it now, and the moment it was last used. Every
+decision is made inside this one process, so starting and stopping never race.
+The blunt rules:
 
-- **Use** (``async with gate.use(repo)``): a step that reaches the sandbox
-  takes the gate. ``ready``: it goes on at once. Otherwise the gate brings the
-  sandbox up — waits out a stop, asks the starter to start it, waits for both
-  services to answer and for any redeploy the starter is waiting for — and
-  then lets the step go on. A sandbox that is not ready within the limit is
-  said in one plain line naming what did not answer, and the step goes on to
-  meet its own failure, which it already reports.
-- **Admission** (:meth:`SandboxGate.admits`): the work queue and the mission
-  step admit work for a sandbox only when it is ``ready``. Otherwise the gate
-  starts bringing it up in the background, and the work stays queued.
+- **A gated step never runs on a sandbox that is not ready.**
+  ``async with gate.use(repo)`` waits out a stop, starts the sandbox, waits for
+  both services and any redeploy, and only then enters the body. If that does
+  not happen within the limit — the starter unreachable, a stop or a redeploy
+  still pending, a service not answering — it raises :class:`SandboxNotReady`
+  with a plain reason, and the caller defers or reports; the body never runs.
+- **Admission** (:meth:`SandboxGate.admits`) admits work only for a ``ready``
+  sandbox; otherwise the sandbox is brought up in the background and the work
+  stays queued, to be tried again on a later pass.
+- **Suspended is not ready.** A failed redeploy makes the starter suspend
+  automatic management, durably. The gate then holds the sandbox ``suspended``:
+  work that needs the restored deployment (a merge that deploys) is refused
+  with one plain line; work that does not (planning, building, previews,
+  landings on a mission branch) goes on while the services answer; no redeploy
+  runs and no stop is asked for until a session clears it at the starter
+  (``POST /clear/<name>``), after which the next look starts over.
 - **Stop**: once a minute (:meth:`SandboxGate.poll_once`) the gate reads the
-  starter's status for each managed sandbox. A sandbox that is ``ready``,
-  that no step is using, and for which the ledger has shown nothing
-  unfinished (:func:`forge.sandbox_gate.idle.what_keeps_it_up`) for the idle
-  time, is set ``stopping`` under the lock; then the starter is asked to stop
-  it. The starter decides: it refuses while a hold is open, an operation is
-  queued or running, the sandbox is suspended, the helper is still executing
-  something, or a container other than the recorded deployment is running.
-  Success sets ``stopped``; any other answer sets ``unknown``.
+  starter's status for each managed sandbox. A ``ready`` sandbox that no step
+  is using, for which the ledger has shown nothing unfinished for the idle
+  time, is set ``stopping`` under the lock, and its stop runs as a task of its
+  own: the poll never waits for it. The starter decides; success sets
+  ``stopped`` and any other answer ``unknown``.
 - **Leaving ``unknown``** needs the starter's status to show no operation
   queued, running or recovering; only then do the two readiness checks count
   (the helper's ``/healthz`` says ``"healthy"``; the runner's ``/ok`` says
   ``"ok":true``).
-- **Redeploy**: after the starter has started a sandbox it reports "redeploy
-  pending". The gate brings the recorded deployment back through the
-  factory's own route (the ``redeploy`` it is given), then tells the starter
-  ``ready``, or ``suspend`` with the reason when the redeploy failed. A
-  sandbox whose repositories have no recorded deployment is told ``ready`` at
-  once.
+- **The deployment is always said.** Every start, stop and ready names the
+  recorded deployment (:mod:`forge.sandbox_gate.deployment`), or says there is
+  none: the starter keeps what it was told durably.
+- **Redeploy**: when the starter reports "services ready, redeploy pending"
+  (or the gate itself started a sandbox whose ledger records a deployment),
+  the gate brings the recorded deployment back through the factory's own route
+  and tells the starter ``ready`` for that deployment, or ``suspend`` with the
+  reason.
+- **Boot**: before recovery, every managed sandbox with unfinished work is
+  brought up. Recovery that reaches a sandbox which did not come up is
+  deferred for that sandbox's repositories (:meth:`SandboxGate.defer`) and run
+  when it is ready; recovery for every other repository goes on.
 
 The state lives in memory only. After a coordinator restart every sandbox is
 ``unknown`` and the idle clocks start again from zero.
@@ -59,13 +70,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from forge.sandbox_gate.deployment import deployment_to_tell
 from forge.sandbox_gate.idle import what_keeps_it_up
-from forge.sandbox_gate.starter_client import (
-    NO_DEPLOYMENT,
-    UNSAID,
-    StarterClient,
-    StarterStatus,
-)
+from forge.sandbox_gate.starter_client import StarterClient, StarterStatus
 
 logger = logging.getLogger(__name__)
 
@@ -84,6 +91,7 @@ STARTING = "starting"
 READY = "ready"
 STOPPING = "stopping"
 STOPPED = "stopped"
+SUSPENDED = "suspended"
 
 #: How often a sandbox being brought up is looked at again.
 BRING_UP_POLL_SECONDS: float = 3.0
@@ -92,8 +100,8 @@ BRING_UP_POLL_SECONDS: float = 3.0
 START_ASK_AGAIN_SECONDS: float = 30.0
 
 
-class SandboxNotReady(Exception):
-    """A sandbox did not become ready within the limit; the message says why."""
+class SandboxNotReady(RuntimeError):
+    """A sandbox is not ready for a step; the message says why, plainly."""
 
 
 @dataclass(frozen=True)
@@ -101,8 +109,8 @@ class RedeployOutcome:
     """What the redeploy route said: back and verified, or why not.
 
     ``retry`` marks a redeploy that did not run for a reason that passes by
-    itself (another holder of the deployment lock): it is asked for again,
-    and management is not suspended for it.
+    itself (another holder of the deployment lock, an earlier promote still
+    running): it is asked for again, and management is not suspended for it.
     """
 
     ok: bool
@@ -129,6 +137,7 @@ def _urllib_get(url: str, timeout: float) -> tuple[int, str]:
 class _Slot:
     name: str
     repos: tuple[str, ...]
+    entry: Any
     sidecar_url: str
     runner_url: str
     state: str = UNKNOWN
@@ -139,18 +148,29 @@ class _Slot:
     #: When a step last finished using the sandbox.
     last_used: datetime | None = None
     bring_up: asyncio.Task[None] | None = None
+    #: The stop in flight, run as a task of its own (R6).
+    stop_task: asyncio.Task[None] | None = None
     #: Set whenever no stop is in flight; a bring-up waits on it.
     stop_settled: asyncio.Event = field(default_factory=asyncio.Event)
-    #: The last bring-up's failure, for the work queue to close held rows with.
+    #: The last bring-up's failure, said once by whoever reads it.
     failure: str | None = None
     #: The starter does not manage this name: the gate passes straight through.
     unmanaged: str | None = None
     #: Lines already said, so a held queue says each once.
     said: set[str] = field(default_factory=set)
     #: The gate itself started the sandbox in this bring-up: a recorded
-    #: deployment is brought back even if the starter's own settings name
-    #: none and it does not report "redeploy pending".
+    #: deployment is brought back even if the starter does not report
+    #: "redeploy pending".
     woke_it: bool = False
+    #: Why management is suspended, while it is.
+    suspended_reason: str | None = None
+    #: What the starter last reported as the sandbox's deployment.
+    starter_deployment: dict[str, Any] | None = None
+    #: The deployment this bring-up already redeployed, so a lost ready is
+    #: asked again without a second redeploy.
+    redeployed_for: dict[str, str] | None = None
+    #: Recovery deferred until the sandbox is ready (boot).
+    deferred: list[Callable[[], Awaitable[Any]]] = field(default_factory=list)
 
     def __post_init__(self) -> None:
         self.stop_settled.set()
@@ -188,13 +208,7 @@ class SandboxGate:
         sleep: Callable[[float], Awaitable[Any]] | None = None,
         poll_interval_seconds: float = BRING_UP_POLL_SECONDS,
         status_poll_seconds: float = 60.0,
-        deployment_of: Callable[[str, tuple[str, ...]], dict[str, str] | None] | None = None,
     ) -> None:
-        #: The recorded deployment's compose project and identity label, as
-        #: the starter checks the engine's containers against them, for a
-        #: sandbox whose repositories have one. ``None`` from it, or no reader,
-        #: leaves the starter's own settings file to say.
-        self._deployment_of = deployment_of
         self._starter = starter
         #: How often :meth:`run_forever` looks at the starter.
         self.poll_seconds = float(status_poll_seconds)
@@ -209,10 +223,14 @@ class SandboxGate:
         self._poll = float(poll_interval_seconds)
         self._slots: dict[str, _Slot] = {}
         self._by_repo: dict[str, _Slot] = {}
+        #: Background work this gate started (deferred recovery), held so none
+        #: is collected while it runs.
+        self._tasks: set[asyncio.Future[Any]] = set()
         for name, (entry, repos) in sandboxes.items():
             slot = _Slot(
                 name=name,
                 repos=tuple(repos),
+                entry=entry,
                 sidecar_url=str(entry.sidecar_url).rstrip("/"),
                 runner_url=str(entry.runner_url).rstrip("/"),
             )
@@ -255,21 +273,46 @@ class SandboxGate:
             return None
         return slot
 
+    @staticmethod
+    def _passes(slot: _Slot, needs_deployment: bool) -> bool:
+        return slot.state == READY or (slot.state == SUSPENDED and not needs_deployment)
+
+    def _suspended_sentence(self, slot: _Slot) -> str:
+        return (
+            f"automatic management of the sandbox {slot.name} is suspended "
+            f"({slot.suspended_reason or 'no reason given'}), so work that needs its "
+            "restored deployment waits until a session clears it at the starter "
+            f"(POST /clear/{slot.name})"
+        )
+
     # -- admission ------------------------------------------------------------
 
-    def admits(self, repo: str | None) -> bool:
+    def admits(self, repo: str | None, *, needs_deployment: bool = False) -> bool:
         """May work for ``repo`` be admitted now? Synchronous on purpose.
 
-        True for a repository whose sandbox is not managed, or is ``ready``.
-        Otherwise the sandbox starts being brought up in the background and the
-        answer is False: the work stays queued. The caller admits in the same
-        step, with no wait in between, so no stop can be decided in the gap.
+        True for a repository whose sandbox is not managed, or is ``ready``
+        (or ``suspended``, for work that does not need its deployment).
+        Otherwise the sandbox starts being brought up in the background and
+        the answer is False: the work stays queued. The caller admits in the
+        same step, with no wait in between, so no stop can be decided in the gap.
         """
         slot = self._slot_for(repo)
-        if slot is None or slot.state == READY:
+        if slot is None or self._passes(slot, needs_deployment):
             return True
-        self._kick(slot)
+        if slot.state != SUSPENDED:
+            self._kick(slot)
         return False
+
+    def why_held(self, repo: str | None) -> str | None:
+        """Why work for ``repo`` is held now, in words, or None."""
+        slot = self._slot_for(repo)
+        if slot is None:
+            return None
+        if slot.state == SUSPENDED:
+            return self._suspended_sentence(slot)
+        if slot.failure:
+            return slot.failure
+        return f"waiting for the sandbox {slot.name} to start"
 
     def take_failure(self, repo: str | None) -> str | None:
         """The last bring-up failure for ``repo``'s sandbox, once, or None."""
@@ -286,6 +329,21 @@ class SandboxGate:
         if slot is None or line in slot.said:
             return False
         slot.said.add(line)
+        return True
+
+    def defer(self, repo: str | None, action: Callable[[], Awaitable[Any]]) -> bool:
+        """Run ``action`` once ``repo``'s sandbox is ready, if it is not ready
+        now. True when deferred; False means run it now (unmanaged or ready)."""
+        slot = self._slot_for(repo)
+        if slot is None or self._passes(slot, needs_deployment=False):
+            return False
+        slot.deferred.append(action)
+        logger.info(
+            "sandbox gate: recovery for %s waits until the sandbox %s is ready",
+            repo,
+            slot.name,
+        )
+        self._kick(slot)
         return True
 
     def _kick(self, slot: _Slot) -> asyncio.Task[None]:
@@ -305,53 +363,51 @@ class SandboxGate:
     # -- use ------------------------------------------------------------------
 
     @contextlib.asynccontextmanager
-    async def use(self, repo: str | None, *, purpose: str = "a step") -> AsyncIterator[None]:
-        """Hold ``repo``'s sandbox up while the body runs; start it first if needed."""
+    async def use(
+        self, repo: str | None, *, purpose: str = "a step", needs_deployment: bool = False
+    ) -> AsyncIterator[None]:
+        """Hold ``repo``'s sandbox up while the body runs; bring it up first.
+
+        Raises :class:`SandboxNotReady` — and never runs the body — when the
+        sandbox does not become ready within the limit, or is suspended and
+        the step needs its deployment.
+        """
         slot = self._slot_for(repo)
         if slot is None:
             yield
             return
-        await self._enter(slot, purpose)
+        await self._enter(slot, purpose, needs_deployment)
         try:
             yield
         finally:
             slot.users = max(0, slot.users - 1)
             slot.last_used = self._clock()
 
-    async def _enter(self, slot: _Slot, purpose: str) -> None:
+    async def _enter(self, slot: _Slot, purpose: str, needs_deployment: bool) -> None:
+        tried = False
         while True:
             async with slot.lock:
-                if slot.state == READY:
+                if self._passes(slot, needs_deployment):
                     slot.users += 1
                     return
-            task = self._kick(slot)
-            try:
-                await asyncio.shield(task)
-            except asyncio.CancelledError:
-                raise
-            if slot.state == READY:
-                continue
-            failure = slot.failure or f"the sandbox {slot.name} is not ready"
-            logger.warning(
-                "sandbox gate: %s for %s goes ahead without a ready sandbox — %s",
-                purpose,
-                slot.name,
-                failure,
-            )
-            # Counted all the same: the step may still reach the sandbox, and a
-            # step in progress must never meet a stop.
-            slot.users += 1
-            return
+                if slot.state == SUSPENDED:
+                    raise SandboxNotReady(f"{purpose} did not run: {self._suspended_sentence(slot)}")
+            if tried:
+                failure = slot.failure or f"the sandbox {slot.name} is not ready"
+                raise SandboxNotReady(f"{purpose} did not run: {failure}")
+            tried = True
+            await asyncio.shield(self._kick(slot))
 
     async def ensure_ready(self, name: str) -> bool:
-        """Bring one sandbox up (boot uses it). True when it is ready."""
+        """Bring one sandbox up (boot uses it). True when it is ready (or
+        suspended with its services answering)."""
         slot = self._slots.get(name)
         if slot is None or slot.unmanaged is not None:
             return True
-        if slot.state == READY:
+        if self._passes(slot, needs_deployment=False):
             return True
         await asyncio.shield(self._kick(slot))
-        return slot.state == READY or slot.unmanaged is not None
+        return self._passes(slot, needs_deployment=False) or slot.unmanaged is not None
 
     # -- bringing a sandbox up ------------------------------------------------
 
@@ -376,55 +432,51 @@ class SandboxGate:
         return " and ".join(missing)
 
     def _has_recorded_deployment(self, slot: _Slot) -> bool:
-        connection = self._connection()
-        if connection is None:
-            return False
-        clauses = " OR ".join(
-            "(target = ? OR substr(target, 1, ?) = ?)" for _ in slot.repos
+        from forge.sandbox_gate.deployment import recorded_identity
+
+        return recorded_identity(self._connection(), slot.repos) is not None
+
+    def _deployment_for(self, slot: _Slot) -> dict[str, str]:
+        """What the starter is told about the recorded deployment: always said."""
+        deployment, warning = deployment_to_tell(
+            self._connection(), slot.repos, slot.entry, starter_says=slot.starter_deployment
         )
-        params: list[object] = []
-        for repo in slot.repos:
-            params.extend([repo, len(repo) + 2, f"{repo}::"])
-        try:
-            row = connection.execute(
-                f"SELECT 1 FROM deployment_targets WHERE ({clauses}) "
-                "AND running_commit IS NOT NULL AND trim(running_commit) <> '' LIMIT 1",
-                tuple(params),
-            ).fetchone()
-        except sqlite3.OperationalError as exc:
-            if "no such table" in str(exc).lower():
-                return False
-            raise
-        return row is not None
+        if warning and warning not in slot.said:
+            slot.said.add(warning)
+            logger.warning("sandbox gate: %s", warning)
+        return deployment
 
-    def _deployment_for(self, slot: _Slot) -> dict[str, str] | None:
-        """What to tell the starter about the recorded deployment: none when
-        the ledger has none; its compose project and identity label when they
-        can be read; otherwise nothing, and the starter's settings decide."""
+    async def _settle_redeploy(self, slot: _Slot) -> str:
+        """Answer the starter's "redeploy pending". ``"ready"`` once it is told
+        ready, ``"suspended"`` once it is told to suspend; otherwise why not."""
         if not self._has_recorded_deployment(slot):
-            return NO_DEPLOYMENT
-        if self._deployment_of is None:
-            return UNSAID
-        try:
-            return self._deployment_of(slot.name, slot.repos)
-        except Exception:  # noqa: BLE001 — unsaid is the starter's own settings
-            logger.exception("sandbox gate: reading %s's deployment raised", slot.name)
-            return UNSAID
-
-    async def _settle_redeploy(self, slot: _Slot) -> str | None:
-        """Answer the starter's "redeploy pending". ``None`` once it has been
-        told ready or suspended; otherwise why not (tried again)."""
-        if not self._has_recorded_deployment(slot):
-            answer = await self._starter.ready(slot.name)
-            return None if answer.ok else (
+            answer = await self._starter.ready(slot.name, deployment=self._deployment_for(slot))
+            return "ready" if answer.ok else (
+                f"the starter was not told {slot.name} is ready ({answer.sentence})"
+            )
+        told = self._deployment_for(slot)
+        if (slot.starter_deployment or None) != (told or None):
+            # The starter's deployment is not the recorded one (it was told
+            # another, or none): say it first, so its /ready can accept ours.
+            # A start of a running supervisor changes nothing else.
+            answer = await self._starter.start(slot.name, deployment=told)
+            if not answer.ok:
+                return f"the starter was not told {slot.name}'s deployment ({answer.sentence})"
+            slot.starter_deployment = told or None
+        if slot.redeployed_for is not None and slot.redeployed_for == told:
+            # Redeployed already in this bring-up; only its ready was lost.
+            answer = await self._starter.ready(slot.name, deployment=told)
+            return "ready" if answer.ok else (
                 f"the starter was not told {slot.name} is ready ({answer.sentence})"
             )
         if self._redeploy is None:
-            reason = (
-                "this coordinator has no route to bring the recorded deployment "
-                "back, so automatic management is suspended and the sandbox stays up"
+            outcome = RedeployOutcome(
+                ok=False,
+                sentence=(
+                    "this coordinator has no route to bring the recorded deployment "
+                    "back, so automatic management is suspended and the sandbox stays up"
+                ),
             )
-            outcome = RedeployOutcome(ok=False, sentence=reason)
         else:
             logger.info(
                 "sandbox gate: bringing %s's recorded deployment back after a start",
@@ -440,11 +492,12 @@ class SandboxGate:
         if outcome.retry and not outcome.ok:
             return outcome.sentence or "the redeploy is asked for again"
         if outcome.ok:
-            answer = await self._starter.ready(slot.name)
+            slot.redeployed_for = told
+            answer = await self._starter.ready(slot.name, deployment=self._deployment_for(slot))
             if not answer.ok:
                 return f"the starter was not told {slot.name} is ready ({answer.sentence})"
             logger.info("sandbox gate: %s's deployment is back and verified", slot.name)
-            return None
+            return "ready"
         answer = await self._starter.suspend(slot.name, outcome.sentence)
         logger.error(
             "sandbox gate: the redeploy for %s failed, so its automatic management "
@@ -454,24 +507,31 @@ class SandboxGate:
         )
         if not answer.ok:
             return f"the starter was not told to suspend {slot.name} ({answer.sentence})"
-        return None
+        self._now_suspended(slot, outcome.sentence)
+        return "suspended"
 
     async def _bring_up_once(self, slot: _Slot) -> None:
-        """Bring ``slot`` to ``ready``, or raise :class:`SandboxNotReady`."""
+        """Bring ``slot`` to ``ready`` (or ``suspended``), or raise
+        :class:`SandboxNotReady`."""
         started = self._clock()
         deadline = started + timedelta(seconds=self._ready_timeout)
         last_start_ask: datetime | None = None
         why = "the starter did not answer"
         while True:
             if slot.state == STOPPING:
-                remaining = max(0.0, (deadline - self._clock()).total_seconds())
-                with contextlib.suppress(asyncio.TimeoutError):
-                    await asyncio.wait_for(slot.stop_settled.wait(), timeout=remaining or 0.001)
+                # Waits out the stop in flight, a look at a time, within the
+                # same limit: a step never meets a stopping sandbox.
                 why = f"a stop of {slot.name} was still being answered"
                 if self._clock() >= deadline:
                     break
+                with contextlib.suppress(asyncio.TimeoutError):
+                    await asyncio.wait_for(slot.stop_settled.wait(), timeout=0.05)
+                if slot.state == STOPPING:
+                    await self._sleep(self._poll)
                 continue
             status = await self._starter.status(slot.name)
+            if status.reached and status.listed:
+                slot.starter_deployment = status.deployment
             if not status.reached:
                 why = status.why or "the starter did not answer"
             elif not status.listed:
@@ -518,25 +578,32 @@ class SandboxGate:
                 missing = await self._services_answer(slot)
                 if missing is not None:
                     why = missing
+                elif status.suspended:
+                    # No redeploy and no stop while suspended (R2): the
+                    # services answer, and work that needs no deployment goes on.
+                    self._now_suspended(slot, status.suspended)
+                    return
                 elif status.redeploy_pending or (
                     slot.woke_it and self._has_recorded_deployment(slot)
                 ):
-                    not_settled = await self._settle_redeploy(slot)
-                    if not_settled is None:
+                    settled = await self._settle_redeploy(slot)
+                    if settled == "ready":
                         self._now_ready(slot)
                         return
-                    why = not_settled
+                    if settled == "suspended":
+                        return
+                    why = f"its redeploy is still pending: {settled}"
                 else:
                     self._now_ready(slot)
                     return
             if self._clock() >= deadline:
                 break
             await self._sleep(self._poll)
-        if slot.state != STOPPING:
+        if slot.state not in (STOPPING, SUSPENDED):
             slot.state = UNKNOWN
         minutes = max(1, int(round(self._ready_timeout / 60)))
         raise SandboxNotReady(
-            f"the sandbox {slot.name} was not ready within {minutes} minute"
+            f"the sandbox {slot.name} did not start within {minutes} minute"
             f"{'' if minutes == 1 else 's'}: {why}"
         )
 
@@ -545,9 +612,42 @@ class SandboxGate:
             logger.info("sandbox gate: %s is ready", slot.name)
         slot.state = READY
         slot.failure = None
+        slot.redeployed_for = None
         slot.woke_it = False
+        slot.suspended_reason = None
         slot.said.clear()
         slot.idle_since = None
+        self._run_deferred(slot)
+
+    def _now_suspended(self, slot: _Slot, reason: str) -> None:
+        if slot.state != SUSPENDED:
+            logger.warning(
+                "sandbox gate: %s is suspended (%s); no redeploy and no stop until a "
+                "session clears it at the starter",
+                slot.name,
+                reason,
+            )
+        slot.state = SUSPENDED
+        slot.suspended_reason = reason
+        slot.redeployed_for = None
+        slot.failure = None
+        slot.woke_it = False
+        slot.idle_since = None
+        # Deferred recovery needs services, not the deployment.
+        self._run_deferred(slot)
+
+    def _run_deferred(self, slot: _Slot) -> None:
+        actions, slot.deferred = slot.deferred, []
+        for action in actions:
+            task = asyncio.ensure_future(self._run_one_deferred(slot, action))
+            self._tasks.add(task)
+            task.add_done_callback(self._tasks.discard)
+
+    async def _run_one_deferred(self, slot: _Slot, action: Callable[[], Awaitable[Any]]) -> None:
+        try:
+            await action()
+        except Exception:  # noqa: BLE001 — logged; one never stops another
+            logger.exception("sandbox gate: deferred recovery for %s raised", slot.name)
 
     # -- the once-a-minute look: redeploys and idle stops ---------------------
 
@@ -560,7 +660,9 @@ class SandboxGate:
         return what_keeps_it_up(connection, slot.repos)
 
     async def poll_once(self) -> None:
-        """Read each managed sandbox's status; redeploy, settle or stop it."""
+        """Read each managed sandbox's status; redeploy, settle or start a stop.
+
+        Never waits for a stop: each runs as a task of its own (R6)."""
         for slot in list(self._slots.values()):
             if slot.unmanaged is not None:
                 continue
@@ -570,13 +672,27 @@ class SandboxGate:
                 logger.exception("sandbox gate: looking at %s raised", slot.name)
 
     async def _poll_slot(self, slot: _Slot) -> None:
+        if slot.state == STOPPING or (slot.stop_task is not None and not slot.stop_task.done()):
+            return
         status = await self._starter.status(slot.name)
         if not status.reached:
             return
         if not status.listed:
             self._kick(slot)  # marks it unmanaged, in one line
             return
-        if slot.state == STOPPING:
+        slot.starter_deployment = status.deployment
+        if status.suspended:
+            if status.settled and status.services_up:
+                self._now_suspended(slot, status.suspended)
+            elif slot.state in (READY, SUSPENDED):
+                slot.state = UNKNOWN
+            return
+        if slot.state == SUSPENDED:
+            # Cleared at the starter: start over from unknown.
+            logger.info("sandbox gate: %s's suspension was cleared; looking again", slot.name)
+            slot.state = UNKNOWN
+            slot.suspended_reason = None
+            self._kick(slot)
             return
         if status.settled and status.stopped and slot.state == READY and slot.users == 0:
             # Stopped behind the coordinator's back (a session, or the machine):
@@ -592,63 +708,67 @@ class SandboxGate:
                 slot.state = UNKNOWN
             self._kick(slot)
             return
-        await self._consider_stop(slot, status)
+        if slot.deferred and slot.state != READY:
+            self._kick(slot)  # recovery waits for it: keep trying
+            return
+        self._consider_stop(slot, status)
 
-    async def _consider_stop(self, slot: _Slot, status: StarterStatus) -> None:
+    def _consider_stop(self, slot: _Slot, status: StarterStatus) -> None:
+        """Decide, synchronously, whether to stop; the stop runs on its own."""
         now = self._clock()
-        async with slot.lock:
-            if slot.state != READY:
-                slot.idle_since = None
-                return
-            busy = self._what_keeps_it_up(slot)
-            if busy is not None:
-                slot.idle_since = None
-                return
-            if status.suspended or status.busy or status.holds:
-                # The starter would refuse; asking is noise. Still idle here.
-                slot.idle_since = slot.idle_since or now
-                return
-            if slot.idle_since is None:
-                slot.idle_since = now
-                return
-            since = slot.idle_since
-            if slot.last_used is not None and slot.last_used > since:
-                since = slot.idle_since = slot.last_used
-            if now - since < self._idle:
-                return
-            slot.state = STOPPING
-            slot.stop_settled.clear()
+        if slot.lock.locked() or slot.state != READY:
+            slot.idle_since = None
+            return
+        busy = self._what_keeps_it_up(slot)
+        if busy is not None:
+            slot.idle_since = None
+            return
+        if status.suspended or status.busy or status.holds:
+            # The starter would refuse; asking is noise. Still idle here.
+            slot.idle_since = slot.idle_since or now
+            return
+        if slot.idle_since is None:
+            slot.idle_since = now
+            return
+        since = slot.idle_since
+        if slot.last_used is not None and slot.last_used > since:
+            since = slot.idle_since = slot.last_used
+        if now - since < self._idle:
+            return
+        slot.state = STOPPING
+        slot.stop_settled.clear()
+        slot.idle_since = None
+        slot.stop_task = asyncio.ensure_future(self._run_stop(slot))
+
+    async def _run_stop(self, slot: _Slot) -> None:
+        answer = None
         try:
             logger.info(
                 "sandbox gate: asking the starter to stop %s — nothing open for %d minutes",
                 slot.name,
                 int(self._idle.total_seconds() // 60),
             )
-            answer = await self._starter.stop(
-                slot.name, deployment=self._deployment_for(slot)
-            )
+            answer = await self._starter.stop(slot.name, deployment=self._deployment_for(slot))
         except Exception as exc:  # noqa: BLE001 — an unclear answer is unknown
-            answer = None
             logger.warning("sandbox gate: stopping %s raised (%s)", slot.name, exc)
         finally:
-            slot.idle_since = None
-        if answer is not None and answer.ok:
-            slot.state = STOPPED
-            logger.info("sandbox gate: %s is stopped", slot.name)
-        else:
-            slot.state = UNKNOWN
-            if answer is not None and answer.refused:
-                logger.info(
-                    "sandbox gate: the starter kept %s up — %s", slot.name, answer.sentence
-                )
+            if answer is not None and answer.ok:
+                slot.state = STOPPED
+                logger.info("sandbox gate: %s is stopped", slot.name)
             else:
-                logger.warning(
-                    "sandbox gate: the stop of %s got no clear answer (%s); it is "
-                    "unknown until the starter says nothing is pending",
-                    slot.name,
-                    answer.sentence if answer is not None else "it raised",
-                )
-        slot.stop_settled.set()
+                slot.state = UNKNOWN
+                if answer is not None and answer.refused:
+                    logger.info(
+                        "sandbox gate: the starter kept %s up — %s", slot.name, answer.sentence
+                    )
+                else:
+                    logger.warning(
+                        "sandbox gate: the stop of %s got no clear answer (%s); it is "
+                        "unknown until the starter says nothing is pending",
+                        slot.name,
+                        answer.sentence if answer is not None else "it raised",
+                    )
+            slot.stop_settled.set()
 
     async def run_forever(self, interval_seconds: float = 60.0) -> None:
         """Poll every ``interval_seconds``; a fault never stops the next poll."""
@@ -665,8 +785,8 @@ class SandboxGate:
 
     async def boot(self) -> list[str]:
         """Before recovery runs: bring up every managed sandbox the ledger shows
-        unfinished work for, all at once. Returns the names that are ready;
-        never raises."""
+        unfinished work for, all at once. Returns the names NOT ready: recovery
+        for their repositories is deferred (:meth:`defer`). Never raises."""
         connection = self._connection()
         wanted: list[_Slot] = []
         for slot in list(self._slots.values()):
@@ -686,18 +806,19 @@ class SandboxGate:
         answers = await asyncio.gather(
             *(self.ensure_ready(slot.name) for slot in wanted), return_exceptions=True
         )
-        brought: list[str] = []
+        not_ready: list[str] = []
         for slot, answer in zip(wanted, answers):
             if answer is True:
-                brought.append(slot.name)
                 continue
+            not_ready.append(slot.name)
             logger.warning(
-                "sandbox gate: %s was not ready at start-up — %s; recovery goes on",
+                "sandbox gate: %s was not ready at start-up — %s; recovery for %s waits "
+                "for it, and every other repository's recovery goes on",
                 slot.name,
                 slot.failure or answer,
+                ", ".join(slot.repos),
             )
-            slot.failure = None
-        return brought
+        return not_ready
 
 
 # ---------------------------------------------------------------------------
@@ -723,13 +844,21 @@ def admits(repo: str | None) -> bool:
     return True if gate is None else gate.admits(repo)
 
 
-def using(repo: str | None, *, purpose: str = "a step") -> contextlib.AbstractAsyncContextManager[None]:
+def using(
+    repo: str | None, *, purpose: str = "a step", needs_deployment: bool = False
+) -> contextlib.AbstractAsyncContextManager[None]:
     """``async with using(repo):`` — the installed gate's :meth:`SandboxGate.use`,
     or nothing at all when no gate is installed."""
     gate = _installed
     if gate is None:
         return contextlib.nullcontext()
-    return gate.use(repo, purpose=purpose)
+    return gate.use(repo, purpose=purpose, needs_deployment=needs_deployment)
+
+
+def defer(repo: str | None, action: Callable[[], Awaitable[Any]]) -> bool:
+    """:meth:`SandboxGate.defer` of the installed gate; False with none."""
+    gate = _installed
+    return False if gate is None else gate.defer(repo, action)
 
 
 def build_sandbox_gate(
@@ -759,4 +888,3 @@ def build_sandbox_gate(
         redeploy=redeploy,
         status_poll_seconds=float(getattr(settings, "poll_seconds", 60)),
     )
-

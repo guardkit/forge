@@ -43,6 +43,7 @@ from tests.forge.sandbox_gate._fakes import (
     a_gate,
     a_ledger,
     settle,
+    stopped,
 )
 
 
@@ -73,22 +74,30 @@ class TestHoldForConfig:
         assert starter.holds == {}
         assert any(c.startswith("hold notes-app-sbx forge merge-deploy") for c in starter.calls)
 
-    def test_no_recorded_deployment_is_said_to_the_starter(self, ledger: sqlite3.Connection) -> None:
-        told: list[Any] = []
+    def test_the_deployment_is_always_said_to_the_starter(self, ledger: sqlite3.Connection) -> None:
+        """R1: "none" while the ledger records none; the recorded identity,
+        under the entry's names, once it records one — never left unsaid."""
+        from tests.forge.sandbox_gate._fakes import COMPOSE_PROJECT, LABEL_KEY
+
         starter = FakeStarter()
-        real = starter.hold_sync
-
-        def hold_sync(name: str, **kw: Any) -> Any:
-            told.append(kw.get("deployment"))
-            return real(name, **kw)
-
-        starter.hold_sync = hold_sync  # type: ignore[method-assign]
         with hold_for_config(a_config(), REPO, command="x", until="deployed", connection=ledger, client=starter):
             pass
-        a_deployment_target(ledger, REPO, running_commit="abc1234")
+        ledger.execute(
+            "INSERT INTO deployment_targets (target, counter, running_commit, running_identity, "
+            "running_at) VALUES (?, 1, 'abc1234', 'notes-app@abc1234', '2026-10-19T09:00:00+00:00')",
+            (f"{REPO}::production",),
+        )
+        ledger.commit()
         with hold_for_config(a_config(), REPO, command="x", until="deployed", connection=ledger, client=starter):
             pass
-        assert told == [{}, None]  # none; then unsaid, for the starter's settings
+        held = [d for kind, d in starter.told if kind == "hold"]
+        assert held == [
+            {},
+            {"compose_project": COMPOSE_PROJECT, "identity_label": f"{LABEL_KEY}=notes-app@abc1234"},
+        ]
+        # The starter kept "none" from the first hold and was told the
+        # deployment on the second: a wake now waits for its redeploy.
+        assert starter.current(SANDBOX) == held[1]
 
     def test_a_hold_that_cannot_be_taken_refuses_in_one_sentence(self) -> None:
         starter = FakeStarter()
@@ -147,7 +156,8 @@ class TestRaces:
         with starter_hold("http://x", SANDBOX, command="forge register-repo", until="services", client=starter):
             # The gate decided on a status read before the hold; the starter,
             # which decides every stop, refuses it because the hold is open.
-            await gate._consider_stop(gate._slots[SANDBOX], before_the_hold)
+            gate._consider_stop(gate._slots[SANDBOX], before_the_hold)
+            await stopped(gate)
         assert starter.running[SANDBOX] is True
         assert gate.state_of(SANDBOX) == UNKNOWN
         assert any(c == "stop notes-app-sbx" for c in starter.calls)
@@ -163,6 +173,7 @@ class TestRaces:
         await gate.poll_once()
         clock.advance(31 * 60)
         await gate.poll_once()
+        await stopped(gate)
         assert gate.state_of(SANDBOX) == STOPPED and starter.running[SANDBOX] is False
         with starter_hold("http://x", SANDBOX, command="forge register-repo", until="services", client=starter):
             assert starter.running[SANDBOX] is True

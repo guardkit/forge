@@ -32,10 +32,24 @@ SANDBOX = "notes-app-sbx"
 HELPER = "http://127.0.0.1:18935"
 RUNNER = "http://127.0.0.1:18934"
 START = datetime(2026, 10, 19, 9, 0, 0, tzinfo=timezone.utc)
+#: A second managed project, for the tests that need two sandboxes.
+SECOND_REPO = "example-org/recipes-app"
+SECOND_SANDBOX = "recipes-app-sbx"
+SECOND_HELPER = "http://127.0.0.1:18955"
+SECOND_RUNNER = "http://127.0.0.1:18954"
+
+
+#: How the example project's deployment is named to the starter.
+COMPOSE_PROJECT = "notes-live"
+LABEL_KEY = "org.example.identity"
 
 
 def a_config(
-    *, idle_stop: bool = True, starter_url: str | None = "http://169.254.0.2:8930"
+    *,
+    idle_stop: bool = True,
+    starter_url: str | None = "http://169.254.0.2:8930",
+    names_its_deployment: bool = True,
+    two_managed: bool = False,
 ) -> ForgeConfig:
     planning: dict[str, Any] = {
         "target_repo_paths": {REPO: "/tmp/notes-app", OTHER_REPO: "/tmp/plain-app"},
@@ -45,6 +59,14 @@ def a_config(
                 "sidecar_url": HELPER,
                 "runner_url": RUNNER,
                 "idle_stop": idle_stop,
+                **(
+                    {
+                        "deployment_compose_project": COMPOSE_PROJECT,
+                        "deployment_identity_label": LABEL_KEY,
+                    }
+                    if names_its_deployment
+                    else {}
+                ),
             },
             OTHER_REPO: {
                 "name": "plain-app-sbx",
@@ -53,6 +75,14 @@ def a_config(
             },
         },
     }
+    if two_managed:
+        planning["target_repo_paths"][SECOND_REPO] = "/tmp/recipes-app"
+        planning["sandboxes"][SECOND_REPO] = {
+            "name": SECOND_SANDBOX,
+            "sidecar_url": SECOND_HELPER,
+            "runner_url": SECOND_RUNNER,
+            "idle_stop": True,
+        }
     if starter_url is not None:
         planning["sandbox_starter"] = {"url": starter_url}
     return ForgeConfig.model_validate(
@@ -85,7 +115,19 @@ class Clock:
 
 
 class FakeStarter:
-    """The starter's four jobs and its holds, for one or more sandboxes."""
+    """The starter's jobs and its holds, with the real starter's semantics for
+    what it is told (deploy/compose/sandbox-starter/starter.py, 69692e62):
+
+    - the deployment it is told is kept, durably; one not said leaves it;
+    - a start reports "services ready, redeploy pending" when it has a
+      deployment, else "ready"; ready is ready FOR one deployment, and a new or
+      changed deployment invalidates it;
+    - ``/ready`` is refused when the supervisor is not running, or when it
+      names another deployment than the current one;
+    - a suspension is durable and changes nothing else: stops are refused,
+      ``until=deployed`` holds refused, ``until=services`` holds accepted,
+      readiness kept as it was, until ``/clear``.
+    """
 
     def __init__(self, *, running: bool = False, listed: bool = True) -> None:
         self.running: dict[str, bool] = {SANDBOX: running}
@@ -107,16 +149,33 @@ class FakeStarter:
         self.start_delay_reads = 0
         self._reads_until_up: dict[str, int] = {}
         self._next_hold = 0
-        #: What each start and stop was told about the recorded deployment.
-        self.told: list[tuple[str, Any]] = []
         self.stop_gate: asyncio.Event | None = None
+        #: What each start, stop, hold and ready was told about the deployment.
+        self.told: list[tuple[str, Any]] = []
+        #: The deployment as told (``{}`` = none); absent = never told.
+        self.deployment: dict[str, dict[str, Any]] = {}
+
+    def current(self, name: str) -> dict[str, Any] | None:
+        return self.deployment.get(name) or None
+
+    def _note(self, name: str, told: Any) -> None:
+        if told is None:
+            return
+        before = self.current(name)
+        self.deployment[name] = dict(told)
+        if self.current(name) != before and self.running.get(name):
+            # A new or changed identity invalidates readiness (the real rule).
+            self.redeploy_pending[name] = self.current(name) is not None
+
+    def _woke(self, name: str) -> None:
+        self.running[name] = True
+        self.redeploy_pending[name] = self.current(name) is not None
 
     # -- the JSON the real starter answers with --------------------------------
 
     def body(self, name: str) -> dict[str, Any]:
         """The starter's own ``GET /status/<name>`` answer."""
         running = self.running.get(name, False)
-        queued: list[dict[str, Any]] = []
         busy_op = None
         if self.pending_operation:
             busy_op = {"id": 7, "op": self.pending_operation, "queued_at": "x"}
@@ -138,7 +197,7 @@ class FakeStarter:
             },
             "vm": {"state": "running" if running else "stopped"},
             "operations": {
-                "queued": queued,
+                "queued": [],
                 "running": busy_op,
                 "recovering": [],
                 "unresolved": self.unresolved.get(name),
@@ -156,7 +215,7 @@ class FakeStarter:
             "services_ready": running,
             "readiness": readiness,
             "redeploy_pending": readiness == "services ready, redeploy pending",
-            "deployment": None,
+            "deployment": self.current(name),
         }
 
     def _tick_start(self, name: str) -> None:
@@ -164,8 +223,7 @@ class FakeStarter:
             self._reads_until_up[name] -= 1
             if self._reads_until_up[name] <= 0:
                 del self._reads_until_up[name]
-                self.running[name] = True
-                self.redeploy_pending[name] = self.told[-1][1] != {} if self.told else True
+                self._woke(name)
 
     # -- the client's interface ----------------------------------------------------
 
@@ -174,7 +232,7 @@ class FakeStarter:
         if not self.reachable:
             return StarterStatus(name=name, reached=False, why="the starter could not be reached")
         if not self.listed:
-            return read_status(name, 404, {"refusal": f"{name} is not in my list"})
+            return read_status(name, 404, {"ok": False, "message": f"{name} is not in my list"})
         self._tick_start(name)
         return read_status(name, 200, self.body(name))
 
@@ -183,11 +241,11 @@ class FakeStarter:
         self.told.append(("start", deployment))
         if self.start_refusal:
             return StarterAnswer(ok=False, refused=True, sentence=self.start_refusal)
+        self._note(name, deployment)
         if self.start_delay_reads:
             self._reads_until_up[name] = self.start_delay_reads
-        else:
-            self.running[name] = True
-            self.redeploy_pending[name] = deployment != {}
+        elif not self.running.get(name):
+            self._woke(name)
         return StarterAnswer(ok=True)
 
     def stop_sync(self, name: str, *, deployment: Any = None) -> StarterAnswer:
@@ -202,21 +260,34 @@ class FakeStarter:
             )
         if name in self.suspended:
             return StarterAnswer(ok=False, refused=True, sentence="management is suspended")
+        self._note(name, deployment)
         self.running[name] = False
         self.redeploy_pending.pop(name, None)
         if self.lose_stop_answer:
             return StarterAnswer(ok=False, sentence="the answer was lost")
         return StarterAnswer(ok=True)
 
-    def ready_sync(self, name: str) -> StarterAnswer:
+    def ready_sync(self, name: str, *, deployment: Any = None) -> StarterAnswer:
         self.calls.append(f"ready {name}")
+        self.told.append(("ready", deployment))
+        if not self.running.get(name):
+            return StarterAnswer(ok=False, refused=True, sentence="the supervisor is not running")
+        if deployment is not None and (deployment or None) != self.current(name):
+            return StarterAnswer(
+                ok=False, refused=True, sentence="the ready names another deployment"
+            )
         self.redeploy_pending.pop(name, None)
         return StarterAnswer(ok=True)
 
     def suspend_sync(self, name: str, reason: str) -> StarterAnswer:
         self.calls.append(f"suspend {name}: {reason}")
-        self.redeploy_pending.pop(name, None)
         self.suspended[name] = reason
+        return StarterAnswer(ok=True)
+
+    def clear_sync(self, name: str) -> StarterAnswer:
+        self.calls.append(f"clear {name}")
+        self.suspended.pop(name, None)
+        self.unresolved.pop(name, None)
         return StarterAnswer(ok=True)
 
     def hold_sync(
@@ -229,17 +300,17 @@ class FakeStarter:
         timeout_s: float | None = None,
     ) -> HoldAnswer:
         self.calls.append(f"hold {name} {owner} {until}")
+        self.told.append(("hold", deployment))
         if not self.reachable:
             return HoldAnswer(None, "the starter could not be reached")
+        if until == "deployed" and name in self.suspended:
+            return HoldAnswer(None, f"{name} is managed: suspended")
+        self._note(name, deployment)
         self._next_hold += 1
         hold_id = f"h{self._next_hold}"
         self.holds[hold_id] = (name, owner, until)
-        if until == "deployed" and name in self.suspended:
-            del self.holds[hold_id]
-            return HoldAnswer(None, f"{name} is managed: suspended")
         if not self.running.get(name):
-            self.running[name] = True
-            self.redeploy_pending[name] = deployment != {}
+            self._woke(name)
         return HoldAnswer(hold_id)
 
     def release_sync(self, hold_id: str) -> bool:
@@ -258,8 +329,8 @@ class FakeStarter:
             await self.stop_gate.wait()
         return self.stop_sync(name, deployment=deployment)
 
-    async def ready(self, name: str) -> StarterAnswer:
-        return self.ready_sync(name)
+    async def ready(self, name: str, *, deployment: Any = None) -> StarterAnswer:
+        return self.ready_sync(name, deployment=deployment)
 
     async def suspend(self, name: str, reason: str) -> StarterAnswer:
         return self.suspend_sync(name, reason)
@@ -277,7 +348,8 @@ class Services:
 
     def __call__(self, url: str, timeout: float) -> tuple[int, str]:
         self.asked.append(url)
-        if not self.starter.running.get(SANDBOX):
+        name = SECOND_SANDBOX if (SECOND_HELPER in url or SECOND_RUNNER in url) else SANDBOX
+        if not self.starter.running.get(name):
             raise ConnectionRefusedError("nothing listening")
         if url.endswith("/healthz"):
             if self.helper_down:
@@ -312,6 +384,13 @@ def a_gate(
         clock=clock.now,
         sleep=clock.sleep,
     )
+
+
+async def stopped(gate: SandboxGate, name: str = SANDBOX) -> None:
+    """Wait for the stop the poll started for ``name`` (it runs on its own)."""
+    task = gate._slots[name].stop_task
+    if task is not None:
+        await asyncio.wait_for(asyncio.shield(task), timeout=10)
 
 
 async def settle(gate: SandboxGate, repo: str = REPO) -> None:

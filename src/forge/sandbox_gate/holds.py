@@ -28,7 +28,7 @@ import sqlite3
 from collections.abc import Iterator, Mapping
 from typing import Any
 
-from forge.sandbox_gate.starter_client import NO_DEPLOYMENT, UNSAID, StarterClient
+from forge.sandbox_gate.starter_client import UNSAID, StarterClient
 
 __all__ = [
     "HoldRefused",
@@ -99,26 +99,6 @@ def starter_hold(
         starter.release_sync(hold_id)
 
 
-def _recorded_deployment(connection: sqlite3.Connection | None, repos: list[str]) -> dict[str, str] | None:
-    """``deployment=none`` when the ledger records no deployment for the
-    repositories; otherwise unsaid, and the starter's settings decide."""
-    if connection is None or not repos:
-        return UNSAID
-    clauses = " OR ".join("(target = ? OR substr(target, 1, ?) = ?)" for _ in repos)
-    params: list[object] = []
-    for repo in repos:
-        params.extend([repo, len(repo) + 2, f"{repo}::"])
-    try:
-        row = connection.execute(
-            f"SELECT 1 FROM deployment_targets WHERE ({clauses}) "
-            "AND running_commit IS NOT NULL AND trim(running_commit) <> '' LIMIT 1",
-            tuple(params),
-        ).fetchone()
-    except sqlite3.Error:
-        return UNSAID
-    return UNSAID if row is not None else NO_DEPLOYMENT
-
-
 def hold_for_config(
     config: Any,
     repo: str | None,
@@ -135,14 +115,26 @@ def hold_for_config(
     url = getattr(getattr(planning, "sandbox_starter", None), "url", None)
     if not url or not repo:
         return contextlib.nullcontext()
-    for name, (_entry, repos) in managed_sandboxes(config).items():
+    for name, (entry, repos) in managed_sandboxes(config).items():
         if repo in repos:
+            starter = client or StarterClient(url)
+            deployment: dict[str, str] | None = UNSAID
+            if connection is not None:
+                # ALWAYS SAID (Codex S2 implementation review 1, R1): the
+                # starter keeps what it was told, so an omitted deployment
+                # would leave an earlier "none" in force.
+                from forge.sandbox_gate.deployment import deployment_to_tell
+
+                said = starter.status_sync(name)
+                deployment, _warning = deployment_to_tell(
+                    connection, repos, entry, starter_says=said.deployment
+                )
             return starter_hold(
                 url,
                 name,
                 command=command,
                 until=until,
-                deployment=_recorded_deployment(connection, list(repos)),
-                client=client,
+                deployment=deployment,
+                client=starter,
             )
     return contextlib.nullcontext()

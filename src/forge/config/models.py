@@ -1062,6 +1062,44 @@ class SandboxEntry(BaseModel):
         ),
     )
 
+    deployment_compose_project: str | None = Field(
+        default=None,
+        description=(
+            "The compose project of this sandbox's recorded deployment, as the "
+            "sandbox starter checks the engine's containers against it (stage "
+            "S2, Codex S2 implementation review 1, R1). With "
+            "deployment_identity_label, the coordinator names the recorded "
+            "deployment to the starter on every start, stop, hold and ready. "
+            "Unset: the starter's own reading of it is used, and failing that "
+            "the starter is told there is none (it then refuses stops while the "
+            "deployment's containers run)."
+        ),
+    )
+    deployment_identity_label: str | None = Field(
+        default=None,
+        description=(
+            "The KEY of the container label that carries the deployment's "
+            "identity (for example org.example.identity). The starter is told "
+            "<key>=<the identity recorded as running>."
+        ),
+    )
+
+    @field_validator("deployment_compose_project", "deployment_identity_label")
+    @classmethod
+    def _a_plain_name(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        import re
+
+        text = str(value).strip()
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,127}", text):
+            raise ValueError(
+                "a sandbox's deployment_compose_project and deployment_identity_label "
+                "must be plain names of letters, digits, '.', '_', '/' and '-' (no "
+                "'=': the label is given as its key only)"
+            )
+        return text
+
     @field_validator("memory_projects")
     @classmethod
     def _memory_projects_are_memory_names(cls, value: list[str]) -> list[str]:
