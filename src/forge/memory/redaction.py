@@ -114,9 +114,14 @@ _PASSWORD_KV_RE = re.compile(r"(?i)password=[^\s;&|)]+")
 _PGPASSWORD_RE = re.compile(r"PGPASSWORD=[^\s;&|)]+")
 
 #: A password in a URL's user part, any scheme (``https://user:pass@host``,
-#: ``nats://user:pass@host``). The scheme and user are kept; ``/`` cannot
-#: appear unencoded in the user part, so a ``host:port/path`` never matches.
-_URL_PASSWORD_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
+#: ``nats://user:pass@host``, and an empty user as in
+#: ``redis://:pass@host``). The scheme and user are kept. The user and the
+#: password both stop at ``/``, ``?`` and ``#`` (which cannot appear
+#: unencoded in the user part), so ``host:port/path@x``,
+#: ``host:port?q=a@b`` and ``host#a@b`` never match.
+_URL_PASSWORD_RE = re.compile(
+    r"\b([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/?#@]*):[^\s/?#@]+@"
+)
 
 #: Anthropic API keys.
 _ANTHROPIC_KEY_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")

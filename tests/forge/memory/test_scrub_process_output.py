@@ -298,6 +298,16 @@ class TestMoreSecretShapes:
                 "connect nats://operator:***REDACTED-PASSWORD***@host:4222 refused",
             ),
             (
+                "cache redis://:exampleSecret@localhost:6379/0 down",
+                "exampleSecret",
+                "cache redis://:***REDACTED-PASSWORD***@localhost:6379/0 down",
+            ),
+            (
+                "GET https://:emptyUserPw@example.org/x",
+                "emptyUserPw",
+                "GET https://:***REDACTED-PASSWORD***@example.org/x",
+            ),
+            (
                 "key sk-ant-api03-AbCdEf_0123456789-xyz rejected",
                 "sk-ant-api03",
                 "key ***REDACTED-ANTHROPIC-KEY*** rejected",
@@ -334,6 +344,11 @@ class TestMoreSecretShapes:
             "nats://127.0.0.1:4222",
             "see https://host/path@ref for details",
             "the api key was rotated",
+            "https://example.org:8443?contact=alice@example.net",
+            "https://example.org#alice@example.net",
+            "https://example.org:8443#mail=alice@example.net",
+            "https://example.org:8443/users/@alice",
+            "https://example.org:8443/a@b",
         ],
     )
     def test_no_false_positive(self, text: str) -> None:

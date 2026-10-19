@@ -443,3 +443,26 @@ class TestTheRunnerErrorTextScrubsEveryShape:
         )
         assert path is not None
         assert secret not in path.read_text(encoding="utf-8")
+
+
+class TestAnEmptyUserPasswordNeverReachesThePack:
+    def test_redis_password_is_gone_from_reason_and_runner_error(
+        self, tmp_path: Path
+    ) -> None:
+        path = write_crash_pack(
+            build_id="build-1",
+            feature_id="FEAT-X",
+            correlation_id="corr-1",
+            receipts_root=tmp_path,
+            run_status="error",
+            runner_error=(
+                "running_wave: ConnectionError('cannot reach "
+                "redis://:exampleSecret@localhost:6379/0')"
+            ),
+        )
+        assert path is not None
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        for field in ("reason", "runner_error"):
+            assert "exampleSecret" not in manifest[field]
+            assert "redis://:***REDACTED-PASSWORD***@localhost:6379/0" in manifest[field]
+        assert "exampleSecret" not in path.read_text(encoding="utf-8")
