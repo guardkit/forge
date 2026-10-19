@@ -117,6 +117,9 @@
 #     come from SANDBOX_ALLOW_NETWORK as before, and a rule there that names
 #     the gateway address, or the bus's or the router's port, is refused: the
 #     doors come from the slot and from nothing else;
+#   - is always allowed api.osv.dev:443 and api.deps.dev:443, the two
+#     read-only services the factory's own per-change security check looks
+#     dependencies up on (FACTORY_CHECK_RULES below; never a project's rule);
 #   - starts at 4 GiB and 2 processors unless SANDBOX_MEMORY / SANDBOX_CPUS say
 #     otherwise (measured in stage S1 before the size is fixed);
 #   - is created with disks big enough for real builds (S1 window, 18 October
@@ -255,6 +258,14 @@ SLOT_MAX=19
 # The shared sandbox, which is never made, given doors or given a project's
 # receipts by this shape (one sandbox per project, Codex R1).
 SHARED_SANDBOX_NAMES=(api-test-deploy)
+# The factory's per-change security check queries these; GuardKit
+# `security_check.py` (OSV-Scanner reads api.osv.dev, the fix lookup reads
+# api.deps.dev). They serve the factory's check, not the project, so a slot
+# sandbox always gets them beside its doors and no project profile carries
+# them (19 October 2026). Two read-only advisory services, host:port only.
+# Kept in step with FACTORY_CHECK_RULES in forge's deploy/estate/rollout-sandbox,
+# which gives the shared sandbox the same two; a test holds them equal.
+FACTORY_CHECK_RULES=(api.osv.dev:443 api.deps.dev:443)
 
 is_a_slot_sandbox() { [[ -n "${SANDBOX_SLOT}" ]]; }
 
@@ -377,9 +388,15 @@ if is_a_slot_sandbox; then
         exit 2
       fi
     done
+    # The factory adds its own security-check rules below; one copy each.
+    for factory_rule in "${FACTORY_CHECK_RULES[@]}"; do
+      [[ "${rule}" == "${factory_rule}" ]] && continue 2
+    done
     kept_rules+=("${rule}")
   done
-  SANDBOX_ALLOW_NETWORK="$(IFS=','; printf '%s' "${kept_rules[*]:+${kept_rules[*]},}${SLOT_DOOR_RULES[*]}")"
+  # The project's kept rules, its doors, then the factory's own security-check
+  # services, always (never part of SLOT_DOOR_RULES: those are the gateway's).
+  SANDBOX_ALLOW_NETWORK="$(IFS=','; printf '%s' "${kept_rules[*]:+${kept_rules[*]},}${SLOT_DOOR_RULES[*]},${FACTORY_CHECK_RULES[*]}")"
   # THE WHOLE POLICY, CHECKED BEFORE ANYTHING IS CALLED (Codex R2): the
   # generated rules as well as the project's, so a shared-service port set to
   # the bus's, the router's or another project's door is refused too. No rule

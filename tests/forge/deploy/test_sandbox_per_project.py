@@ -193,13 +193,42 @@ class TestAProjectsOwnSandbox:
         assert allowed == [
             "policy allow network --sandbox a-private-project "
             "deb.debian.org,pypi.org,github.com:443,"
-            f"{GATEWAY}:31831,{GATEWAY}:31851,{GATEWAY}:31823,{GATEWAY}:31821,{GATEWAY}:9000"
+            f"{GATEWAY}:31831,{GATEWAY}:31851,{GATEWAY}:31823,{GATEWAY}:31821,{GATEWAY}:9000,"
+            "api.osv.dev:443,api.deps.dev:443"
         ]
         rules = allowed[0].rsplit(" ", 1)[1].split(",")
         gateway_rules = [r for r in rules if r.startswith(GATEWAY + ":")]
         assert sorted(gateway_rules) == sorted(
             [f"{GATEWAY}:{p}" for p in (31831, 31851, 31823, 31821, 9000)])
         assert not any(r.endswith((":4222", ":4000")) for r in rules)
+
+    @pytest.mark.parametrize("project_rules", [
+        "deb.debian.org,pypi.org,github.com:443",
+        # A profile that already names one still gets each exactly once.
+        "deb.debian.org,api.osv.dev:443,pypi.org,api.deps.dev:443",
+    ])
+    def test_the_security_check_rules_are_added_once_after_the_doors(self, slot_repo, tmp_path, project_rules):
+        """19 October 2026: the factory's per-change security check (GuardKit
+        security_check.py) reaches api.osv.dev and api.deps.dev, so a slot
+        sandbox always gets both, once each, after its five unchanged door
+        rules, host:port only and no wildcard."""
+        result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_ALLOW_NETWORK=project_rules)
+        assert result.returncode == 0, result.stdout + result.stderr
+        allowed = [line for line in sbx if line.startswith("policy allow ")]
+        assert len(allowed) == 1
+        rules = allowed[0].rsplit(" ", 1)[1].split(",")
+        check = ["api.osv.dev:443", "api.deps.dev:443"]
+        assert rules[-2:] == check
+        assert all(rules.count(r) == 1 for r in check)
+        assert rules[-7:-2] == [f"{GATEWAY}:{p}" for p in (31831, 31851, 31823, 31821, 9000)]
+        assert rules[:-7] == [r for r in project_rules.split(",") if r not in check]
+        assert not any("*" in r or "/" in r for r in rules)
+
+    def test_the_template_names_the_security_check_rules_once(self):
+        code = [line for line in (TEMPLATES / "sandbox-deploy.sh").read_text().splitlines()
+                if not line.lstrip().startswith("#")]
+        named = [line for line in code if "api.osv.dev" in line or "api.deps.dev" in line]
+        assert named == ["FACTORY_CHECK_RULES=(api.osv.dev:443 api.deps.dev:443)"]
 
     @pytest.mark.parametrize("rule", [
         f"{GATEWAY}:4222", f"{GATEWAY}:31852", f"{GATEWAY}:31824", "*",
