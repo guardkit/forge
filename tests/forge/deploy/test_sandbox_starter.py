@@ -112,7 +112,7 @@ class FakeServices:
 
     def __init__(self):
         self.answers = {
-            "/healthz": (200, '{"status": "healthy"}'),
+            "/healthz": (200, '{"status": "healthy", "instance": "helper-run-1"}'),
             "/ok": (200, '{"ok":true,"name":"runner"}'),
             "/busy": (200, '{"executing": []}'),
         }
@@ -1311,3 +1311,134 @@ class TestReadyHoldsOnlyForTheSameSupervisorRun:
         assert report["readiness"] == "ready" and report["ready_confirmed_on_start"]
         assert second.hold(NAME, "merge-deploy", "deployed")["readiness"] == "ready"
         assert sum(1 for e in log_entries(world) if e["kind"] == "readiness") == records
+
+
+
+HEALTHY_AS = '{{"status": "healthy", "instance": "{}"}}'
+
+
+class TestReadyIsBoundToTheHelperInstanceToo:
+    """Codex round 7, R9 continued: (supervisor StartedAt, helper instance)."""
+
+    def _confirmed(self, world, **kw):
+        s = world.make(deployment=DEPLOYMENT, **kw)
+        s.start(NAME)
+        assert s.ready(NAME)["instance"] == "helper-run-1"
+        assert s.status(NAME)["readiness"] == "ready"
+        return s
+
+    def test_a_start_right_after_an_external_supervisor_restart_needs_a_redeploy(self, world):
+        base = world.http(self._confirmed(world))
+        (world.state / "started_at").write_text("2026-10-19T09:30:00.000000002Z\n")
+        world.services.answers["/healthz"] = (200, HEALTHY_AS.format("helper-run-2"))
+        status, body = call(base, "POST", f"/start/{NAME}")  # the first thing to look
+        assert status == 200
+        assert body["readiness"] == "services ready, redeploy pending"
+        assert sum(1 for line in world.lines("docker.log") if line.startswith("start")) == 2
+
+    def test_a_start_with_only_a_new_helper_instance_needs_a_redeploy(self, world):
+        s = self._confirmed(world)
+        world.services.answers["/healthz"] = (200, HEALTHY_AS.format("helper-run-2"))
+        assert s.start(NAME)["readiness"] == "services ready, redeploy pending"
+
+    def test_a_vm_recovered_between_probes_needs_a_redeploy(self, world):
+        s = self._confirmed(world)
+        # Same supervisor run; the VM restarted and its start-up script made a
+        # new helper, all between two probes, so no probe ever failed.
+        world.services.answers["/healthz"] = (200, HEALTHY_AS.format("helper-run-2"))
+        report = s.status(NAME)
+        assert report["readiness"] == "services ready, redeploy pending"
+        why = [e.get("why", "") for e in log_entries(world) if e["kind"] == "readiness"][-1]
+        assert "new instance (helper-run-2" in why
+
+    def test_a_helper_with_no_instance_field_cannot_be_confirmed(self, world):
+        world.services.answers["/healthz"] = (200, '{"status": "healthy"}')
+        s = world.make(deployment=DEPLOYMENT)
+        s.start(NAME)
+        with pytest.raises(starter_mod.Refused, match="did not report its instance id"):
+            s.ready(NAME)
+        assert s.status(NAME)["redeploy_pending"] is True
+
+    def test_a_confirmed_helper_that_stops_reporting_its_instance_ends_it(self, world):
+        s = self._confirmed(world)
+        world.services.answers["/healthz"] = (200, '{"status": "healthy"}')
+        assert s.status(NAME)["readiness"] == "services ready, redeploy pending"
+
+    def test_control_the_starter_restarts_with_the_same_run_and_instance(self, world):
+        first = self._confirmed(world)
+        first.close()
+        second = world.make(deployment=DEPLOYMENT)
+        assert second.start(NAME)["readiness"] == "ready"
+        report = second.status(NAME)
+        assert report["readiness"] == "ready"
+        assert report["ready_confirmed_on_instance"] == "helper-run-1"
+
+
+class TestTheLastCheckOfADeployedHold:
+    """Codex round 7, R10."""
+
+    def test_a_suspension_during_the_final_probe_ends_the_hold(self, world):
+        s = world.make(deployment=DEPLOYMENT)
+        s.start(NAME)
+        s.ready(NAME)
+        original = s._verify
+
+        def a_suspension_arrives_during_the_final_probe(sb, limit=None):
+            result = original(sb, limit)
+            if limit is not None:
+                s.suspend(NAME, "keycloak went down")
+            return result
+
+        s._verify = a_suspension_arrives_during_the_final_probe
+        with pytest.raises(starter_mod.Failed, match="suspended") as caught:
+            s.hold(NAME, "merge-deploy", "deployed")
+        assert caught.value.extra["hold_ended"] is True
+        assert s.status(NAME)["holds"] == []
+        assert any(e["kind"] == "hold-close" for e in log_entries(world))
+
+    def test_a_final_probe_crossing_the_deadline_ends_the_hold(self, world):
+        clock = FakeClock()
+        s = world.make(deployment=DEPLOYMENT, clock=clock)
+        s.start(NAME)
+        s.ready(NAME)
+        original = s._verify
+        limits = []
+
+        def the_final_probe_takes_past_the_deadline(sb, limit=None):
+            if limit is not None:
+                limits.append(limit)
+                clock.now += 901  # the probe was slow
+            return original(sb, limit)
+
+        s._verify = the_final_probe_takes_past_the_deadline
+        with pytest.raises(starter_mod.Failed, match="within 15 minutes of the hold being taken"):
+            s.hold(NAME, "merge-deploy", "deployed")
+        assert limits and limits[0] <= 900
+        assert s.status(NAME)["holds"] == []
+        # Running out of time is not evidence against the confirmation.
+        assert s.status(NAME)["readiness"] == "ready"
+
+    def test_the_final_reads_are_bounded_by_what_is_left(self, world):
+        clock = FakeClock()
+        s = world.make(deployment=DEPLOYMENT, clock=clock)
+        s.start(NAME)
+        s.ready(NAME)
+        seen = []
+        original_services = s._services
+
+        def services(sb, timeout=3.0):
+            seen.append(timeout)
+            return original_services(sb, timeout)
+
+        s._services = services
+        clock.now += 0  # the hold is taken now: 900 s left
+        original = s._verify
+
+        def most_of_the_time_has_gone(sb, limit=None):
+            if limit is not None:
+                return original(sb, 1.5)
+            return original(sb, limit)
+
+        s._verify = most_of_the_time_has_gone
+        assert s.hold(NAME, "merge-deploy", "deployed")["readiness"] == "ready"
+        assert seen[-1] <= 1.5

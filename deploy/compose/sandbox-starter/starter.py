@@ -283,6 +283,7 @@ class Sandbox:
         self.readiness = UNKNOWN
         self.ready_for: dict | None = None  # the identity "ready" was confirmed for
         self.ready_started_at: str | None = None  # the supervisor run it was confirmed on
+        self.ready_instance: str | None = None  # the helper instance it was confirmed on
         self.vm_state: str | None = None
         self.vm_seen_at: float | None = None
         self.vm_how: str | None = None
@@ -412,6 +413,7 @@ class Starter:
             sb.readiness = entry.get("state", UNKNOWN)
             sb.ready_for = entry.get("confirmed_for") or None
             sb.ready_started_at = entry.get("started_at") or None
+            sb.ready_instance = entry.get("instance") or None
         elif kind == "vm":
             sb.vm_state = entry.get("state")
             sb.vm_seen_at = float(entry.get("seen", 0)) or None
@@ -528,12 +530,12 @@ class Starter:
     def _container_state(self, sb: Sandbox) -> str:
         return self._inspect(sb)[0]
 
-    def _inspect(self, sb: Sandbox) -> tuple[str, str | None]:
+    def _inspect(self, sb: Sandbox, timeout: float | None = None) -> tuple[str, str | None]:
         """The supervisor container's state, and when it was last started (or None)."""
         rc, out = self._run(
             [self.settings.docker, "inspect", "--format", "{{.State.Status}}|{{.State.StartedAt}}",
              sb.settings.supervisor],
-            self.settings.client_timeout,
+            max(0.1, self.settings.client_timeout if timeout is None else timeout),
         )
         if rc == 0 and out:
             status, _, started = out.splitlines()[0].strip().partition("|")
@@ -564,21 +566,37 @@ class Starter:
             sb.vm_state, sb.vm_seen_at, sb.vm_how = state, self.wall(), how
             self._record(sb, "vm", state=state, seen=sb.vm_seen_at, how=how)
 
-    def _probe(self, url: str, expected: str, timeout: float = 3.0) -> bool:
+    def _probe(self, url: str, timeout: float = 3.0) -> str | None:
+        """The body a service answers with, or None if it did not answer."""
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as answer:  # noqa: S310 - fixed http address
-                body = answer.read(4096).decode("utf-8", "replace")
+            with urllib.request.urlopen(url, timeout=max(0.1, timeout)) as answer:  # noqa: S310 - fixed http address
+                return answer.read(4096).decode("utf-8", "replace")
         except urllib.error.HTTPError as exc:
-            body = exc.read(4096).decode("utf-8", "replace")
+            return exc.read(4096).decode("utf-8", "replace")
         except (urllib.error.URLError, OSError, ValueError):
-            return False
-        return expected in body
+            return None
 
-    def _services(self, sb: Sandbox) -> tuple[bool, bool]:
-        return (
-            self._probe(sb.settings.helper_url + "/healthz", HELPER_HEALTHY),
-            self._probe(sb.settings.runner_url + "/ok", RUNNER_OK),
-        )
+    def _services(self, sb: Sandbox, timeout: float = 3.0) -> tuple[bool, bool, str | None]:
+        """Both readiness checks, and the helper's instance id from its /healthz.
+
+        The helper makes a random instance id when its process starts and
+        reports it as "instance"; the sandbox's start-up script recreates the
+        helper whenever the VM restarts, so a new id means a new VM run. A
+        helper that reports none (an older one) gives None.
+        """
+        body = self._probe(sb.settings.helper_url + "/healthz", timeout)
+        helper = body is not None and HELPER_HEALTHY in body
+        instance = None
+        if helper:
+            try:
+                data = json.loads(body)
+            except ValueError:
+                data = None
+            if isinstance(data, dict) and isinstance(data.get("instance"), str) and data["instance"]:
+                instance = data["instance"]
+        body = self._probe(sb.settings.runner_url + "/ok", timeout)
+        runner = body is not None and RUNNER_OK in body
+        return helper, runner, instance
 
     def _helper_busy(self, sb: Sandbox) -> list | None:
         """What the helper says it is executing; None if it gave no usable answer."""
@@ -602,50 +620,73 @@ class Starter:
     # deployment. A new or changed identity invalidates it durably.
 
     def _set_readiness(self, sb: Sandbox, state: str, why: str | None = None,
-                       started_at: str | None = None) -> None:
+                       started_at: str | None = None, instance: str | None = None) -> None:
         with self.lock:
             confirmed_for = sb.deployment() if state == READY else None
             started_at = started_at if state == READY else None
-            if sb.readiness != state or sb.ready_for != confirmed_for or sb.ready_started_at != started_at:
-                sb.readiness, sb.ready_for, sb.ready_started_at = state, confirmed_for, started_at
+            instance = instance if state == READY else None
+            if (sb.readiness != state or sb.ready_for != confirmed_for
+                    or sb.ready_started_at != started_at or sb.ready_instance != instance):
+                sb.readiness, sb.ready_for = state, confirmed_for
+                sb.ready_started_at, sb.ready_instance = started_at, instance
                 extra = {"why": why} if why else {}
                 if started_at:
                     extra["started_at"] = started_at
+                if instance:
+                    extra["instance"] = instance
                 self._record(sb, "readiness", state=state, confirmed_for=confirmed_for, **extra)
 
-    def _verify(self, sb: Sandbox) -> tuple[str, bool, bool]:
+    def _judge(self, sb: Sandbox, state: str, started: str | None,
+               helper: bool, runner: bool, instance: str | None) -> None:
+        """End a deployment's confirmation that no longer holds. Called under the lock.
+
+        A confirmation is bound to the supervisor run (.State.StartedAt) and
+        the helper instance (its /healthz "instance") it was made on. Any
+        difference, anything unreadable, or a service not answering ends it.
+        """
+        if not (sb.readiness == READY and sb.ready_for is not None):
+            return
+        why = None
+        if state != "running":
+            why = f"the supervisor container is {state}"
+        elif not started or not sb.ready_started_at:
+            why = "the supervisor's start time could not be read, so its continuity is not shown"
+        elif started != sb.ready_started_at:
+            why = (f"the supervisor was started again at {started}; ready was confirmed on "
+                   f"the run started at {sb.ready_started_at}")
+        elif not (helper and runner):
+            why = "the " + " and the ".join(
+                w for w, ok in (("helper", helper), ("runner", runner)) if not ok) + " did not answer"
+        elif not instance or not sb.ready_instance:
+            why = "the helper did not report its instance id, so the VM's continuity is not shown"
+        elif instance != sb.ready_instance:
+            why = (f"the helper is a new instance ({instance}; ready was confirmed on "
+                   f"{sb.ready_instance}), so the VM was restarted")
+        if why:
+            self._set_readiness(sb, REDEPLOY_PENDING if (helper and runner) else UNKNOWN,
+                                why=f"the confirmation no longer holds: {why}")
+
+    def _verify(self, sb: Sandbox, limit: float | None = None) -> tuple[str, bool, bool]:
         """Read the supervisor and its services, and judge a confirmation against them.
 
-        A deployment's "ready" holds only while the supervisor it was
-        confirmed on is still the same run of it (the same .State.StartedAt)
-        and both services still answer. A supervisor restarted outside this
-        service, or a VM restart that drops the services, means the deployment
-        was not brought back, so the confirmation is ended in the log and the
-        sandbox reports "services ready, redeploy pending" once the services
-        answer. While an operation owns the sandbox, it owns its readiness.
+        See _judge. While an operation owns the sandbox, it owns its readiness
+        and nothing is judged here. With a limit, every read is bounded by it,
+        and if the limit runs out nothing is judged: an unfinished read is not
+        evidence either way.
         """
-        state, started = self._inspect(sb)
+        end = None if limit is None else self.clock() + limit
+        left = lambda cap: cap if end is None else min(cap, end - self.clock())  # noqa: E731
+        state, started = self._inspect(sb, timeout=left(self.settings.client_timeout))
         helper = runner = False
-        if state == "running":
-            helper, runner = self._services(sb)
+        instance = None
+        if state == "running" and (end is None or self.clock() < end):
+            helper, runner, instance = self._services(sb, timeout=left(3.0))
+        if end is not None and self.clock() >= end:
+            return state, helper, runner
         with self.lock:
             if sb.busy() or sb.unresolved:
                 return state, helper, runner
-            if sb.readiness == READY and sb.ready_for is not None:
-                why = None
-                if state != "running":
-                    why = f"the supervisor container is {state}"
-                elif not started or not sb.ready_started_at:
-                    why = "the supervisor's start time could not be read, so its continuity is not shown"
-                elif started != sb.ready_started_at:
-                    why = (f"the supervisor was started again at {started}; ready was confirmed on "
-                           f"the run started at {sb.ready_started_at}")
-                elif not (helper and runner):
-                    why = "the " + " and the ".join(
-                        w for w, ok in (("helper", helper), ("runner", runner)) if not ok) + " did not answer"
-                if why:
-                    self._set_readiness(sb, REDEPLOY_PENDING if (helper and runner) else UNKNOWN,
-                                        why=f"the confirmation no longer holds: {why}")
+            self._judge(sb, state, started, helper, runner, instance)
             if sb.readiness in (UNKNOWN, STOPPED) and state == "running" and helper and runner:
                 self._services_answered(sb, woke=False)
         return state, helper, runner
@@ -704,7 +745,7 @@ class Starter:
             raise Failed(f"docker start {sb.settings.supervisor} did not work ({out[:200] or 'no output'})")
         deadline = self.clock() + self.settings.ready_limit
         while True:
-            helper, runner = self._services(sb)
+            helper, runner, instance = self._services(sb)
             if helper and runner:
                 break
             state = self._container_state(sb)
@@ -728,6 +769,12 @@ class Starter:
         # Its services answering inside it shows the VM is up, without asking
         # the sandbox client again.
         self._note_vm(sb, "running", "its helper and runner answer")
+        # A start of a supervisor that was already running keeps a
+        # confirmation only if it is still the same supervisor run and the
+        # same helper instance it was made on.
+        _, started = self._inspect(sb)
+        with self.lock:
+            self._judge(sb, "running", started, True, True, instance)
         readiness = self._services_answered(sb, woke=(was != "running"))
         return {
             "readiness": readiness,
@@ -1031,6 +1078,7 @@ class Starter:
                 "readiness": sb.readiness,
                 "ready_confirmed_for": sb.ready_for if sb.readiness == READY else None,
                 "ready_confirmed_on_start": sb.ready_started_at if sb.readiness == READY else None,
+                "ready_confirmed_on_instance": sb.ready_instance if sb.readiness == READY else None,
                 "redeploy_pending": sb.readiness == REDEPLOY_PENDING,
                 "deployment": sb.deployment(),
             }
@@ -1125,12 +1173,16 @@ class Starter:
                                 "message": f"{sb.name} is held for {owner}: services ready"}
                     confirmed = self._confirmed(sb)
                 if confirmed:
-                    # Confirmed; and still the same supervisor run with both
-                    # services answering, read just before returning.
-                    self._verify(sb)
-                    if self._confirmed(sb):
-                        return {"hold_id": hold_id, "readiness": READY,
-                                "message": f"{sb.name} is held for {owner}: its recorded deployment is back"}
+                    # Confirmed; check it is still the same supervisor run and
+                    # helper instance, with reads bounded by what is left of
+                    # the deadline. Then, under the lock and immediately before
+                    # success, the hold, the suspension and the deadline again.
+                    self._verify(sb, limit=max(0.0, deadline - self.clock()))
+                    with self.lock:
+                        checkpoint()
+                        if self._confirmed(sb):
+                            return {"hold_id": hold_id, "readiness": READY,
+                                    "message": f"{sb.name} is held for {owner}: its recorded deployment is back"}
                 self.sleep(1.0)
         except Refused as exc:
             with self.lock:
@@ -1162,6 +1214,14 @@ class Starter:
                 f"{sb.name}'s supervisor start time could not be read, so the run the redeploy was "
                 "confirmed on cannot be known and nothing was recorded"
             )
+        helper, runner, instance = self._services(sb)
+        if not (helper and runner):
+            raise Refused(f"{sb.name}'s helper or runner did not answer, so nothing was recorded")
+        if not instance:
+            raise Refused(
+                f"{sb.name}'s helper did not report its instance id (an older helper), so the VM "
+                "run the redeploy was confirmed on cannot be known and nothing was recorded"
+            )
         with self.lock:
             current = sb.deployment()
             if told is not None and (told or None) != current:
@@ -1169,8 +1229,8 @@ class Starter:
                     f"the ready names {told or 'no deployment'} but {sb.name}'s recorded deployment is "
                     f"{current or 'none'}, so nothing was recorded"
                 )
-            self._set_readiness(sb, READY, started_at=started)
-        return {"readiness": READY, "confirmed_for": current, "started_at": started,
+            self._set_readiness(sb, READY, started_at=started, instance=instance)
+        return {"readiness": READY, "confirmed_for": current, "started_at": started, "instance": instance,
                 "message": f"{sb.name} is recorded as ready"}
 
     def suspend(self, name: str, reason: str) -> dict:
