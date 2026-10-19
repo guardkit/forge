@@ -420,3 +420,52 @@ class TestRestorationFoldersAfterAnUncertainAnswer:
         deps.http_get = helper_get
         outcome = await redeploy_recorded(deps, SANDBOX, (REPO,))
         assert outcome.retry and "may still be running" in outcome.sentence
+
+
+class TestACancelledPromoteKeepsItsFolder:
+    @pytest.mark.asyncio
+    async def test_a_cancellation_mid_promote_keeps_the_folder_until_busy_is_empty(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        """R5 (Codex review 2): the redeploy's task is cancelled (the
+        coordinator stops) while its promote is outstanding. The restoration
+        is recorded outstanding with its folder kept, and the cancellation
+        goes on up. Recovery while /busy still reports the execution removes
+        nothing; once /busy is empty the folder goes."""
+        from forge.sandbox_gate.redeploy import outstanding_restorations
+
+        started = asyncio.Event()
+
+        class Hangs(Helper):
+            async def __call__(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                started.set()
+                await asyncio.Event().wait()  # never answers
+
+        venue = Venue()
+        task = asyncio.ensure_future(
+            redeploy_recorded(_deps(ledger, Hangs(), venue), SANDBOX, (REPO,))
+        )
+        await asyncio.wait_for(started.wait(), 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        [kept] = outstanding_restorations(ledger, (REPO,))
+        assert venue.removed == []
+        assert _lock(ledger)[1] is None
+
+        answers = [{"executing": [{"route": "/run", "repo": REPO, "seconds": 300}]}]
+
+        def helper_get(url: str, timeout: float) -> tuple[int, str]:
+            return 200, json.dumps(answers[0])
+
+        helper, venue_after = Helper(), Venue()
+        deps = _deps(ledger, helper, venue_after)
+        deps.http_get = helper_get
+        waiting = await redeploy_recorded(deps, SANDBOX, (REPO,))
+        assert waiting.retry and venue_after.removed == [] and helper.calls == []
+        assert outstanding_restorations(ledger, (REPO,)) == [kept]
+
+        answers[0] = {"executing": []}
+        assert (await redeploy_recorded(deps, SANDBOX, (REPO,))).ok
+        assert venue_after.removed[0] == kept["restoration"]

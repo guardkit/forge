@@ -379,6 +379,12 @@ async def _redeploy_one(
             "artifact": artifact,
             "artifact_setting": declaration.artifact_setting,
         }
+        # R5 (Codex S2 implementation review 2): FROM HERE THE FOLDER IS KEPT
+        # unless a definite answer comes back. A cancellation (a coordinator
+        # stopping) or any exception leaves the row and the folder as
+        # outstanding, and is raised on; only a confirmed finish — this
+        # answer, or a later empty /busy — removes them.
+        keep_the_folder = True
         try:
             deployed = await deps.deploy_dispatcher(
                 repo=repo,
@@ -395,7 +401,6 @@ async def _redeploy_one(
                 candidate_cwd=tree,
             )
         except Exception as exc:  # noqa: BLE001 — no answer: the promote may still run
-            keep_the_folder = True
             return RedeployOutcome(
                 ok=False,
                 retry=True,
@@ -406,7 +411,6 @@ async def _redeploy_one(
             )
         detail = (getattr(deployed, "detail", None) or {}) if deployed is not None else {}
         if deployed is None or detail.get("answer_lost") or getattr(deployed, "confirmed", False) is not True:
-            keep_the_folder = True
             return RedeployOutcome(
                 ok=False,
                 retry=True,
@@ -415,6 +419,7 @@ async def _redeploy_one(
                     "restoration folder is kept until the helper shows it finished"
                 ),
             )
+        keep_the_folder = False  # a definite answer: the promote has finished
         word = getattr(deployed, "outcome", None)
         said = str(detail.get("deploy_output") or "")
         stopped = next((w for w in NOTHING_WAS_STARTED if w in said), None)
