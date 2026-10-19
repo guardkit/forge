@@ -374,6 +374,59 @@ def _is_scaffolding(path: str) -> bool:
     return first in _DOC_FOLDERS or first in _FACTORY_PAPERWORK_FOLDERS
 
 
+#: Dependency manifests: the files that list which packages a project uses.
+#: Read for capability words (a build that adds a rate-limiting package to
+#: one has said something), but never for web addresses: a manifest names
+#: packages, versions and local package folders, and none of those is an
+#: address the software answers at.
+_DEPENDENCY_MANIFEST_NAMES: frozenset[str] = frozenset(
+    {
+        "package.json",
+        "go.mod",
+        "go.work",
+        "cargo.toml",
+        "pyproject.toml",
+        "pipfile",
+        "gemfile",
+        "composer.json",
+        "pubspec.yaml",
+    }
+)
+
+
+def _file_name(path: str) -> str:
+    """The last part of a repository path, lower case."""
+    return _repo_path(path).rsplit("/", 1)[-1].lower()
+
+
+def _is_a_lockfile(path: str) -> bool:
+    """True for a dependency lockfile, by its name, wherever it sits.
+
+    WHY (19 October 2026). FEAT-3351 upgraded one test package in
+    ``apps/web/package.json`` and the lockfile beside it, and its merge card
+    said "It also answers at a web address the request did not name:" a dozen
+    times over: ``/minimatch-5``, ``/balanced-match-1``, ``/config-0`` and
+    more. Every one was read out of a lockfile line such as
+    ``"resolved": "https://registry.npmjs.org/minimatch/-/minimatch-5.1.6.tgz"``.
+    A lockfile is written by the package manager, not by the build, and it
+    lists every package the project pulls in, so nothing in it is a web
+    address or a capability this build added. The list of names is the one
+    the security sweep already keeps.
+    """
+    from forge.security_sweep.findings import LOCKFILE_NAMES
+
+    return _file_name(path) in LOCKFILE_NAMES
+
+
+def _is_a_dependency_manifest(path: str) -> bool:
+    """True for a file that lists a project's dependencies: one of the
+    manifests above, or a ``requirements*.txt`` file."""
+    name = _file_name(path)
+    if name in _DEPENDENCY_MANIFEST_NAMES:
+        return True
+    return name.startswith("requirements") and name.endswith(".txt")
+
+
 def _what_one_file_declares(text: str) -> list[str]:
     """The lines one file added that say something about what the software
     now does.
@@ -417,12 +470,19 @@ def what_the_branch_wrote(added_by_file: Mapping[str, str]) -> str:
     three are false sentences on the card Rich taps to say merge. A web
     address the build really answers at is declared in the code it was asked
     for, so nothing true is lost by leaving the tests, the documentation, the
-    factory's own paperwork and the commentary out. Never raises.
+    factory's own paperwork and the commentary out. Dependency lockfiles and
+    manifests are left out for the same reason: they name packages, and a
+    package's download link is not a web address. Never raises.
     """
     kept: list[str] = []
     for path, text in dict(added_by_file or {}).items():
         name = str(path or "").strip()
         if not name or _is_scaffolding(name):
+            continue
+        # A lockfile or a dependency manifest declares packages, never a web
+        # address: read as code, a lockfile's download links put a dozen
+        # package names on FEAT-3351's card as addresses (19 October 2026).
+        if _is_a_lockfile(name) or _is_a_dependency_manifest(name):
             continue
         kept.extend(_what_one_file_declares(text))
     return "\n".join(kept)
@@ -460,6 +520,11 @@ def what_the_branch_declares(added_by_file: Mapping[str, str]) -> str:
     for path, text in dict(added_by_file or {}).items():
         name = str(path or "").strip()
         if not name or _is_scaffolding(name):
+            continue
+        # A lockfile lists every package the project pulls in, written by
+        # the package manager: a capability word in a package's name there
+        # is not something this build added (19 October 2026).
+        if _is_a_lockfile(name):
             continue
         declared.append(name)
         declared.extend(_what_one_file_declares(text))

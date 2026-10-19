@@ -1241,3 +1241,178 @@ class TestTheReasonsReadAsSentences:
         for sentence in sentences:
             assert sentence[0].isupper(), sentence
         assert report.why_not.endswith(".")
+
+
+#: A dependency upgrade the way FEAT-3351 had it on 19 October 2026: one test
+#: package moved in a web app's manifest, and the lockfile beside it
+#: rewritten by the package manager. The package names and links below are
+#: written for this test.
+UPGRADE_REQUEST = "Upgrade the test runner in apps/web to the latest minor version."
+
+UPGRADE_MANIFEST_BEFORE = (
+    "{\n"
+    '  "name": "web",\n'
+    '  "devDependencies": {\n'
+    '    "testrunner": "4.0.15"\n'
+    "  }\n"
+    "}\n"
+)
+UPGRADE_MANIFEST_AFTER = UPGRADE_MANIFEST_BEFORE.replace("4.0.15", "4.1.11").replace(
+    '"testrunner": "4.1.11"\n',
+    '"testrunner": "4.1.11",\n    "local-helpers": "file:../local-helpers"\n',
+)
+UPGRADE_LOCKFILE_AFTER = (
+    "{\n"
+    '  "name": "web",\n'
+    '  "lockfileVersion": 3,\n'
+    '  "packages": {\n'
+    '    "node_modules/minimatch": {\n'
+    '      "version": "5.1.6",\n'
+    '      "resolved": "https://registry.example.invalid/minimatch/-/minimatch-5.1.6.tgz",\n'
+    '      "integrity": "sha512-AbC+/Defg/hIjk=="\n'
+    "    },\n"
+    '    "node_modules/balanced-match": {\n'
+    '      "version": "1.0.2",\n'
+    '      "resolved": "https://registry.example.invalid/balanced-match/-/balanced-match-1.0.2.tgz"\n'
+    "    },\n"
+    '    "node_modules/@scope/binding-android-arm-eabi": {\n'
+    '      "version": "1.2.3",\n'
+    '      "resolved": "https://registry.example.invalid/@scope/binding-android-arm-eabi/-/binding-android-arm-eabi-1.2.3.tgz"\n'
+    "    },\n"
+    '    "node_modules/passport-auth-helper": {\n'
+    '      "version": "0.1.0",\n'
+    '      "resolved": "https://registry.example.invalid/passport-auth-helper/-/passport-auth-helper-0.1.0.tgz"\n'
+    "    }\n"
+    "  }\n"
+    "}\n"
+)
+
+
+class TestADependencyUpgradeIsNotANewWebAddress:
+    """FEAT-3351, 19 October 2026: the merge card for a dependency upgrade
+    named a dozen package names as web addresses the request did not name,
+    every one read out of a lockfile's download links."""
+
+    @staticmethod
+    def _upgrade_repo(tmp_path: Path) -> Path:
+        root = tmp_path / "notes"
+        root.mkdir()
+        _git(root, "init", "-q", "-b", "main")
+        _write(root, "apps/web/package.json", UPGRADE_MANIFEST_BEFORE)
+        _write(root, "apps/web/package-lock.json", '{\n  "name": "web"\n}\n')
+        _write(root, "apps/web/src/routes.ts", "export const routes = [];\n")
+        _git(root, "add", "-A")
+        _git(root, "commit", "-q", "-m", "the repository as it stood")
+        return root
+
+    def test_an_upgrade_names_no_web_address(self, tmp_path: Path) -> None:
+        root = self._upgrade_repo(tmp_path)
+        _build_on(
+            root,
+            {
+                "apps/web/package.json": UPGRADE_MANIFEST_AFTER,
+                "apps/web/package-lock.json": UPGRADE_LOCKFILE_AFTER,
+            },
+        )
+        reading = read_branch_scope(
+            repo_root=root, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+
+        report = scope_of_the_build(reading=reading, request=UPGRADE_REQUEST)
+
+        assert report.read is True
+        assert report.routes_read is True
+        assert report.routes_the_branch_declares == []
+        assert report.routes_the_request_did_not_name == []
+        assert report.capabilities_the_request_did_not_name == []
+
+        from forge.cli._serve_gate_activation import card_line_about_scope
+
+        line = card_line_about_scope(report)
+        assert "web address" not in line
+        assert "It also added" not in line
+
+    def test_a_real_route_beside_the_upgrade_is_still_named(
+        self, tmp_path: Path
+    ) -> None:
+        root = self._upgrade_repo(tmp_path)
+        _build_on(
+            root,
+            {
+                "apps/web/package.json": UPGRADE_MANIFEST_AFTER,
+                "apps/web/package-lock.json": UPGRADE_LOCKFILE_AFTER,
+                "apps/web/src/routes.ts": (
+                    "export const routes = [\n"
+                    "  { path: '/notes/archive', component: Archive },\n"
+                    "];\n"
+                ),
+            },
+        )
+        reading = read_branch_scope(
+            repo_root=root, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+
+        report = scope_of_the_build(reading=reading, request=UPGRADE_REQUEST)
+
+        assert report.routes_the_request_did_not_name == ["/notes/archive"]
+        from forge.cli._serve_gate_activation import card_line_about_scope
+
+        assert (
+            "It also answers at a web address the request did not name: "
+            "/notes/archive." in card_line_about_scope(report)
+        )
+
+    def test_every_kind_of_lockfile_is_left_out_wherever_it_sits(self) -> None:
+        """The same rule for every stack: a lockfile is written by the
+        package manager, and its links are never web addresses."""
+        link = "https://registry.example.invalid/pkg/-/pkg-1.0.0.tgz\n"
+        for lockfile in (
+            "package-lock.json",
+            "web/yarn.lock",
+            "pnpm-lock.yaml",
+            "go.sum",
+            "crates/Cargo.lock",
+            "poetry.lock",
+            "uv.lock",
+            "Gemfile.lock",
+            "composer.lock",
+        ):
+
+            class OneLockfile:
+                error = None
+                name_status = f"M\x00{lockfile}\x00"
+                added_by_file = {lockfile: link}
+                added_lines_read_whole = True
+
+            report = scope_of_the_build(reading=OneLockfile(), request=UPGRADE_REQUEST)
+            assert report.routes_the_branch_declares == [], lockfile
+            assert report.capabilities_the_request_did_not_name == [], lockfile
+
+    def test_a_manifest_s_local_package_is_not_a_web_address(self) -> None:
+        """``file:../local-helpers`` in a manifest is a folder on disk."""
+
+        class OneManifest:
+            error = None
+            name_status = "M\x00apps/web/package.json\x00"
+            added_by_file = {
+                "apps/web/package.json": '    "local-helpers": "file:../local-helpers"\n',
+                "requirements-dev.txt": "-e ./tools/local-helper\n",
+            }
+            added_lines_read_whole = True
+
+        report = scope_of_the_build(reading=OneManifest(), request=UPGRADE_REQUEST)
+        assert report.routes_the_branch_declares == []
+
+    def test_a_package_the_build_chose_in_a_manifest_is_still_read(self) -> None:
+        """A lockfile is left out of the capability reading; a manifest is
+        not, because a package the build put there is its own choice."""
+        from forge.pipeline.scope_report import what_the_branch_declares
+
+        declared = what_the_branch_declares(
+            {
+                "apps/web/package.json": '    "rate-limiter": "1.0.0"\n',
+                "apps/web/package-lock.json": '    "node_modules/rate-limiter": {}\n',
+            }
+        )
+        assert "apps/web/package.json" in declared
+        assert "package-lock.json" not in declared
