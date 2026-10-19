@@ -103,7 +103,13 @@ def _bus_password_wiring_problems(compose_text: str) -> list[str]:
     data = yaml.safe_load(compose_text)
     bus = data["services"]["nats"]
     secrets = data.get("secrets", {})
-    mounts = {m["target"]: m["source"] for m in bus.get("secrets", []) if isinstance(m, dict)}
+    entries = [m for m in bus.get("secrets", []) if isinstance(m, dict)]
+    targets = [m.get("target") for m in entries]
+    for target in sorted({t for t in targets if targets.count(t) > 1}):
+        # A dictionary keeps only the last of a repeated target, so a second
+        # mount at the same place would otherwise pass unseen.
+        problems.append(f"the bus mounts /run/secrets/{target} more than once")
+    mounts = {m["target"]: m["source"] for m in entries}
     wrapper = "\n".join(str(part) for part in bus.get("entrypoint", []))
     loop = re.search(r"for account in ([A-Z_ ]+); do", wrapper)
     if loop is None:
@@ -364,6 +370,15 @@ class TestTheEstateRenders:
                 "    environment: DASHBOARD_APPROVE_NATS_PASSWORD\n",
                 "  bus-dashboard-approve-password:\n"
                 "    environment: JARVIS_NATS_PASSWORD\n",
+            ),
+            (
+                "a repeated mount target (a dictionary keeps only the last)",
+                "      - source: bus-dashboard-approve-password\n"
+                "        target: dashboard_approve_nats_password\n",
+                "      - source: bus-jarvis-password\n"
+                "        target: dashboard_approve_nats_password\n"
+                "      - source: bus-dashboard-approve-password\n"
+                "        target: dashboard_approve_nats_password\n",
             ),
             (
                 "the wrapper forgetting the dashboard account",
