@@ -54,6 +54,8 @@ from tests.forge.sandbox_gate._fakes import (
     a_gate,
     a_ledger,
     a_preview_lease,
+    HELPER,
+    RUNNER,
     settle,
     stopped,
     LABEL_KEY,
@@ -142,6 +144,8 @@ class TestOffByDefault:
                                 "sidecar_url": "http://127.0.0.1:18935",
                                 "runner_url": "http://127.0.0.1:18934",
                                 "idle_stop": True,
+                                "deployment_compose_project": COMPOSE_PROJECT,
+                                "deployment_identity_label": LABEL_KEY,
                             },
                             OTHER_REPO: {
                                 "name": SANDBOX,
@@ -778,3 +782,85 @@ class TestReadyOnlyForTheRecordedDeployment:
         gate = a_gate(ledger, starter, clock=Clock(), redeploy=redeploy)
         assert await gate.boot() == []
         assert ran == [SANDBOX] and starter.current(SANDBOX) == NAMED
+
+
+# ---------------------------------------------------------------------------
+# A deployment that cannot be identified (Codex review 3, R1)
+# ---------------------------------------------------------------------------
+
+
+class TestAnUnidentifiableDeployment:
+    def test_idle_stop_without_naming_the_deployment_is_refused_at_load(self) -> None:
+        for missing in ("deployment_compose_project", "deployment_identity_label"):
+            entry = {
+                "name": SANDBOX,
+                "sidecar_url": "http://127.0.0.1:18935",
+                "runner_url": "http://127.0.0.1:18934",
+                "idle_stop": True,
+                "deployment_compose_project": COMPOSE_PROJECT,
+                "deployment_identity_label": LABEL_KEY,
+            }
+            del entry[missing]
+            with pytest.raises(ValidationError, match="idle_stop without naming its deployment"):
+                ForgeConfig.model_validate(
+                    {
+                        "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                        "planning": {
+                            "target_repo_paths": {REPO: "/tmp/x"},
+                            "sandboxes": {REPO: entry},
+                        },
+                    }
+                )
+
+    @pytest.mark.asyncio
+    async def test_at_run_time_readiness_and_stops_are_refused_and_it_stays_up(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        """Settings that slipped past validation (no names) with a recorded
+        deployment: no start, no ready, no stop; a plain configuration reason."""
+        from types import SimpleNamespace
+
+        from forge.sandbox_gate.gate import SandboxGate
+
+        _record_deployment(ledger)
+        entry = SimpleNamespace(name=SANDBOX, sidecar_url=HELPER, runner_url=RUNNER)
+        clock = Clock()
+        for running in (False, True):
+            starter = FakeStarter(running=running)
+            gate = SandboxGate(
+                sandboxes={SANDBOX: (entry, (REPO,))},
+                starter=starter,  # type: ignore[arg-type]
+                connection=lambda: ledger,
+                http_get=Services(starter),
+                clock=clock.now,
+                sleep=clock.sleep,
+                ready_timeout_seconds=60,
+            )
+            assert await gate.ensure_ready(SANDBOX) is False
+            assert "does not name deployment_compose_project" in (gate._slots[SANDBOX].failure or "")
+            assert not any(c.startswith(("start", "ready", "stop")) for c in starter.calls)
+            with pytest.raises(SandboxNotReady, match="cannot be identified"):
+                async with gate.use(REPO, purpose="the merge press"):
+                    raise AssertionError("never")
+            gate._slots[SANDBOX].state = READY  # even if it were thought ready:
+            await gate.poll_once()
+            clock.advance(2 * 60 * 60)
+            await gate.poll_once()
+            assert not any(c.startswith("stop") for c in starter.calls)
+
+    def test_a_hold_is_refused_for_a_deployment_that_cannot_be_identified(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        from forge.sandbox_gate.deployment import deployment_to_tell
+        from types import SimpleNamespace
+
+        ledger.execute(
+            "INSERT INTO deployment_targets (target, counter, running_commit) VALUES (?, 1, 'abc')",
+            (REPO,),
+        )
+        ledger.commit()
+        deployment, problem = deployment_to_tell(
+            ledger, (REPO,), SimpleNamespace(name=SANDBOX, deployment_compose_project="p",
+                                             deployment_identity_label="k")
+        )
+        assert deployment is None and "has no identity in the ledger" in (problem or "")

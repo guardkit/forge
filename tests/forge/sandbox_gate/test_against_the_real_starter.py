@@ -219,3 +219,135 @@ async def test_a_first_deployment_then_a_services_only_hold_with_no_stop_between
     assert said["deployment"] == named
     assert said["readiness"] == READY and said["ready_confirmed_for"] == named
     assert gate.state_of(NAME) == READY
+
+
+def _a_gate(config: ForgeConfig, url: str, ledger: sqlite3.Connection, redeploy: Any, clock: Clock,
+            starter: StarterClient | None = None) -> SandboxGate:
+    return SandboxGate(
+        sandboxes=managed_sandboxes(config),
+        starter=starter or StarterClient(url),
+        connection=lambda: ledger,
+        redeploy=redeploy,
+        clock=clock.now,
+        sleep=clock.sleep,
+        poll_interval_seconds=0.05,
+    )
+
+
+def _record_the_first_deployment(ledger: sqlite3.Connection) -> dict[str, str]:
+    ledger.execute(
+        "INSERT INTO deployment_targets (target, counter, running_commit, running_identity, "
+        "running_build, running_at) VALUES (?, 1, 'abc1234', 'private-notes@abc1234', 'B-1', "
+        "'2026-10-19T09:00:00+00:00')",
+        (f"{REPO}::production",),
+    )
+    ledger.commit()
+    return {"compose_project": PROJECT, "identity_label": f"{KEY}=private-notes@abc1234"}
+
+
+async def _settled(gate: SandboxGate) -> None:
+    slot = gate._slots[NAME]
+    if slot.bring_up is not None:
+        await asyncio.wait_for(asyncio.shield(slot.bring_up), timeout=30)
+    if slot.stop_task is not None:
+        await asyncio.wait_for(asyncio.shield(slot.stop_task), timeout=30)
+
+
+@pytest.mark.asyncio
+async def test_a_declaration_overridden_by_none_then_a_first_deployment_then_an_outside_wake(
+    world: Any, tmp_path: Path  # noqa: F811
+) -> None:
+    """Codex review 3, R1: the starter's own settings declare a deployment; the
+    coordinator, with an empty ledger, tells it "none" (which overrides that
+    durably) and stops it while idle; a first deployment is then recorded; an
+    outside command wakes it, saying nothing about the deployment. The starter
+    is "ready" for none; the coordinator restores the recorded deployment
+    before it takes ready."""
+    from tests.forge.deploy.test_sandbox_starter import DEPLOYMENT
+
+    starter = world.make(deployment=DEPLOYMENT)
+    url = world.http(starter)
+    config = _config(world.services.url, url)
+    ledger = a_ledger(tmp_path)
+    clock, redeployed = Clock(), []
+
+    async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+        redeployed.append(_status(url)["readiness"])
+        return RedeployOutcome(ok=True)
+
+    gate = _a_gate(config, url, ledger, redeploy, clock)
+    assert await gate.ensure_ready(NAME)
+    assert _status(url)["deployment"] is None  # the settings' declaration, overridden
+    await gate.poll_once()
+    clock.advance(31 * 60)
+    await gate.poll_once()
+    await _settled(gate)
+    assert _status(url)["container"]["state"] != "running"
+
+    named = _record_the_first_deployment(ledger)
+    hold = await asyncio.to_thread(
+        StarterClient(url).hold_sync, NAME, owner="forge register-repo", until="services"
+    )
+    assert hold.ok, hold.sentence
+    try:
+        assert _status(url)["deployment"] is None  # still "none": ready for none
+        await gate.poll_once()
+        await _settled(gate)
+    finally:
+        await asyncio.to_thread(StarterClient(url).release_sync, hold.hold_id or "")
+    said = _status(url)
+    assert redeployed == ["services ready, redeploy pending"]  # restored before ready
+    assert said["deployment"] == named
+    assert said["readiness"] == READY and said["ready_confirmed_for"] == named
+    assert gate.state_of(NAME) == READY
+
+
+class _ReadyAnswerLost(StarterClient):
+    """The first /ready reaches the starter, then the sandbox restarts (a new
+    supervisor run and a new helper instance) and the answer never comes back."""
+
+    def __init__(self, url: str, world: Any) -> None:
+        super().__init__(url)
+        self.world = world
+        self.lost = False
+
+    def ready_sync(self, name: str, *, deployment: Any = None) -> Any:
+        answer = super().ready_sync(name, deployment=deployment)
+        if not self.lost:
+            self.lost = True
+            (self.world.state / "started_at").write_text("2026-10-19T11:00:00.000000009Z\n")
+            self.world.services.answers["/healthz"] = (
+                200, '{"status": "healthy", "instance": "helper-run-2"}'
+            )
+            from forge.sandbox_gate.starter_client import StarterAnswer
+
+            return StarterAnswer(ok=False, sentence="the answer was lost")
+        return answer
+
+
+@pytest.mark.asyncio
+async def test_a_lost_ready_then_a_restart_redeploys_again_before_ready(
+    world: Any, tmp_path: Path  # noqa: F811
+) -> None:
+    """Codex review 3, R7: a redeploy succeeds, its /ready answer is lost, the
+    sandbox restarts; the retry redeploys again (no cached success) before the
+    starter takes ready, for the new run."""
+    starter = world.make()
+    url = world.http(starter)
+    config = _config(world.services.url, url)
+    ledger = a_ledger(tmp_path)
+    named = _record_the_first_deployment(ledger)
+    clock, redeployed = Clock(), []
+
+    async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+        redeployed.append(name)
+        return RedeployOutcome(ok=True)
+
+    client = _ReadyAnswerLost(url, world)
+    gate = _a_gate(config, url, ledger, redeploy, clock, starter=client)
+    assert await gate.ensure_ready(NAME)
+    assert client.lost
+    assert redeployed == [NAME, NAME]  # once before the lost ready, again after the restart
+    said = _status(url)
+    assert said["readiness"] == READY and said["ready_confirmed_for"] == named
+    assert said.get("ready_confirmed_on_instance") in (None, "helper-run-2")

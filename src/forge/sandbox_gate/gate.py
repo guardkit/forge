@@ -166,9 +166,6 @@ class _Slot:
     suspended_reason: str | None = None
     #: What the starter last reported as the sandbox's deployment.
     starter_deployment: dict[str, Any] | None = None
-    #: The deployment this bring-up already redeployed, so a lost ready is
-    #: asked again without a second redeploy.
-    redeployed_for: dict[str, str] | None = None
     #: Recovery deferred until the sandbox is ready (boot).
     deferred: list[Callable[[], Awaitable[Any]]] = field(default_factory=list)
 
@@ -444,24 +441,37 @@ class SandboxGate:
         implementation review 2, R1). A starter that says none while the
         ledger records one disagrees. The answer is then to tell it the
         recorded deployment, which makes it report "pending" again, and
-        redeploy.
+        redeploy. A deployment that cannot be identified always disagrees.
         """
-        told = self._deployment_for(slot)
-        return (status.deployment or None) != (told or None)
+        told, problem = self._deployment_or_problem(slot)
+        return problem is not None or (status.deployment or None) != (told or None)
+
+    def _deployment_or_problem(self, slot: _Slot) -> tuple[dict[str, str] | None, str | None]:
+        """What the starter is told about the recorded deployment, or the
+        configuration problem that stops it being identified (said once)."""
+        deployment, problem = deployment_to_tell(self._connection(), slot.repos, slot.entry)
+        if problem and problem not in slot.said:
+            slot.said.add(problem)
+            logger.error("sandbox gate: %s", problem)
+        return deployment, problem
 
     def _deployment_for(self, slot: _Slot) -> dict[str, str]:
-        """What the starter is told about the recorded deployment: always said."""
-        deployment, warning = deployment_to_tell(
-            self._connection(), slot.repos, slot.entry, starter_says=slot.starter_deployment
-        )
-        if warning and warning not in slot.said:
-            slot.said.add(warning)
-            logger.warning("sandbox gate: %s", warning)
+        """What the starter is told: always said. Raises
+        :class:`SandboxNotReady` with the configuration reason when the
+        recorded deployment cannot be identified (Codex review 3, R1)."""
+        deployment, problem = self._deployment_or_problem(slot)
+        if problem is not None or deployment is None:
+            raise SandboxNotReady(problem or f"{slot.name}'s deployment cannot be identified")
         return deployment
 
     async def _settle_redeploy(self, slot: _Slot) -> str:
         """Answer the starter's "redeploy pending". ``"ready"`` once it is told
-        ready, ``"suspended"`` once it is told to suspend; otherwise why not."""
+        ready, ``"suspended"`` once it is told to suspend; otherwise why not.
+
+        No cache (Codex review 3, R7): every confirmation that follows a
+        "pending" runs the redeploy again — it promotes the same recorded
+        images, so it is safe to repeat — and then posts /ready with the
+        identity."""
         told = self._deployment_for(slot)
         if (slot.starter_deployment or None) != (told or None):
             # The starter's deployment is not the recorded one (it was told
@@ -473,12 +483,6 @@ class SandboxGate:
                 return f"the starter was not told {slot.name}'s deployment ({answer.sentence})"
             slot.starter_deployment = told or None
         if not self._has_recorded_deployment(slot):
-            answer = await self._starter.ready(slot.name, deployment=told)
-            return "ready" if answer.ok else (
-                f"the starter was not told {slot.name} is ready ({answer.sentence})"
-            )
-        if slot.redeployed_for is not None and slot.redeployed_for == told:
-            # Redeployed already in this bring-up; only its ready was lost.
             answer = await self._starter.ready(slot.name, deployment=told)
             return "ready" if answer.ok else (
                 f"the starter was not told {slot.name} is ready ({answer.sentence})"
@@ -506,8 +510,7 @@ class SandboxGate:
         if outcome.retry and not outcome.ok:
             return outcome.sentence or "the redeploy is asked for again"
         if outcome.ok:
-            slot.redeployed_for = told
-            answer = await self._starter.ready(slot.name, deployment=self._deployment_for(slot))
+            answer = await self._starter.ready(slot.name, deployment=told)
             if not answer.ok:
                 return f"the starter was not told {slot.name} is ready ({answer.sentence})"
             logger.info("sandbox gate: %s's deployment is back and verified", slot.name)
@@ -572,11 +575,12 @@ class SandboxGate:
                     or (now - last_start_ask).total_seconds() >= START_ASK_AGAIN_SECONDS
                 ):
                     last_start_ask = now
+                    # Raises, before anything is asked, when the recorded
+                    # deployment cannot be identified (Codex review 3, R1).
+                    told = self._deployment_for(slot)
                     slot.state = STARTING
                     logger.info("sandbox gate: asking the starter to start %s", slot.name)
-                    answer = await self._starter.start(
-                        slot.name, deployment=self._deployment_for(slot)
-                    )
+                    answer = await self._starter.start(slot.name, deployment=told)
                     if answer.ok:
                         slot.woke_it = True
                     why = (
@@ -628,7 +632,6 @@ class SandboxGate:
             logger.info("sandbox gate: %s is ready", slot.name)
         slot.state = READY
         slot.failure = None
-        slot.redeployed_for = None
         slot.woke_it = False
         slot.suspended_reason = None
         slot.said.clear()
@@ -645,7 +648,6 @@ class SandboxGate:
             )
         slot.state = SUSPENDED
         slot.suspended_reason = reason
-        slot.redeployed_for = None
         slot.failure = None
         slot.woke_it = False
         slot.idle_since = None
@@ -739,6 +741,10 @@ class SandboxGate:
             return
         busy = self._what_keeps_it_up(slot)
         if busy is not None:
+            slot.idle_since = None
+            return
+        if self._deployment_or_problem(slot)[1] is not None:
+            # A deployment that cannot be identified: left up (R1).
             slot.idle_since = None
             return
         if status.suspended or status.busy or status.holds:

@@ -82,6 +82,8 @@ def a_config(
             "sidecar_url": SECOND_HELPER,
             "runner_url": SECOND_RUNNER,
             "idle_stop": True,
+            "deployment_compose_project": "recipes-live",
+            "deployment_identity_label": LABEL_KEY,
         }
     if starter_url is not None:
         planning["sandbox_starter"] = {"url": starter_url}

@@ -122,13 +122,14 @@ def hold_for_config(
             if connection is not None:
                 # ALWAYS SAID (Codex S2 implementation review 1, R1): the
                 # starter keeps what it was told, so an omitted deployment
-                # would leave an earlier "none" in force.
+                # would leave an earlier "none" in force. A recorded
+                # deployment that cannot be identified refuses the hold
+                # (review 3, R1); there is no fallback.
                 from forge.sandbox_gate.deployment import deployment_to_tell
 
-                said = starter.status_sync(name)
-                deployment, _warning = deployment_to_tell(
-                    connection, repos, entry, starter_says=said.deployment
-                )
+                deployment, problem = deployment_to_tell(connection, repos, entry)
+                if problem is not None:
+                    raise HoldRefused(f"{command} did not run: {problem}. Nothing was changed.")
             return starter_hold(
                 url,
                 name,

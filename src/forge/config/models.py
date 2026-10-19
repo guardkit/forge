@@ -1070,9 +1070,8 @@ class SandboxEntry(BaseModel):
             "S2, Codex S2 implementation review 1, R1). With "
             "deployment_identity_label, the coordinator names the recorded "
             "deployment to the starter on every start, stop, hold and ready. "
-            "Unset: the starter's own reading of it is used, and failing that "
-            "the starter is told there is none (it then refuses stops while the "
-            "deployment's containers run)."
+            "Required, with deployment_identity_label, for idle_stop (Codex S2 "
+            "implementation review 3, R1)."
         ),
     )
     deployment_identity_label: str | None = Field(
@@ -1430,6 +1429,15 @@ class PlanningConfig(BaseModel):
                     f"planning.sandboxes gives {key} idle_stop in the shared "
                     f"sandbox {LEGACY_SANDBOX}, which is never stopped (it hosts "
                     "an app with an in-memory database); take idle_stop off"
+                )
+            if entry.idle_stop and not (
+                entry.deployment_compose_project and entry.deployment_identity_label
+            ):
+                raise ValueError(
+                    f"planning.sandboxes gives {key} idle_stop without naming its "
+                    "deployment: a sandbox the factory may stop and start again needs "
+                    "deployment_compose_project and deployment_identity_label, so the "
+                    "deployment it brings back can always be identified to the starter"
                 )
             seen = answers.setdefault(entry.name, (entry.idle_stop, key))
             if seen[0] != entry.idle_stop:
