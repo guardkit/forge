@@ -33,7 +33,8 @@ What the command does, in order, saying one plain line per step:
 
    Each YAML file gains exactly three entries — the allowlist path, the
    ``planning.target_repo_paths`` key and the ``planning.sandboxes`` entry
-   (copying api_test's sandbox name and addresses from the same file) — by
+   (copying the sandbox name and addresses of the first repository already
+   registered on the shared sandbox in the same file) — by
    surgical line insertion that keeps every comment, and must re-parse with
    :func:`forge.config.loader.load_config` or nothing is written.
 3. **The factory's clone**, in the sandbox, as the sandbox user: refused when
@@ -60,7 +61,7 @@ cloned: the command checks that the workspace clone is this project's and
 keeps the runtime folder out of git, and the project's path in the sandbox's
 settings is the workspace clone itself. The publisher's route fetches from the
 sandbox's own git daemon, at its slot's port on the sandbox publish address. The
-``planning.sandboxes`` entry it writes is not copied from api_test's: it names
+``planning.sandboxes`` entry it writes is not copied from another project's: it names
 this sandbox, the helper and runner at slot *k*'s ports
 (:mod:`forge.config.sandbox_slots`) on the sandbox publish address, and the
 sandbox's own Git door port. The coordinator's copy of the entry is also
@@ -207,9 +208,26 @@ PROJECTS_FOLDER: str = f"{RUNTIME_FOLDER}/projects"
 #: entry names ``<this>/<sandbox name>``; the shared sandbox's never does.
 COORDINATOR_PROJECT_RECEIPTS: str = "/var/lib/forge-project-receipts"
 
-#: The project whose sandbox entry a new project copies: the sandbox name and
-#: its two addresses are the same for every project in the shared sandbox.
-REFERENCE_PROJECT: str = "guardkit/api_test"
+#: A new project in the shared sandbox copies the sandbox entry of a project
+#: already registered there: the sandbox name and its two addresses are the
+#: same for every project in it. Any such project serves (Codex design review
+#: R9, 18 October 2026: it was api_test's alone, so unregistering api_test
+#: would have stopped every later registration), so the reference is the first
+#: entry, in file order, that names the shared sandbox: see
+#: :func:`shared_sandbox_reference`.
+
+
+def shared_sandbox_reference(sandboxes: Mapping[str, Any], key: str) -> tuple[str, Any] | None:
+    """``(repository, entry)`` of the first registration on the shared sandbox,
+    another repository's when there is one, else ``key``'s own; ``None`` when
+    no registration is on the shared sandbox."""
+    shared = [
+        (name, entry) for name, entry in sandboxes.items()
+        if isinstance(entry, dict) and entry.get("name") == LEGACY_SANDBOX
+    ]
+    others = [item for item in shared if item[0] != key]
+    chosen = others or shared
+    return chosen[0] if chosen else None
 
 #: The lines of a sandbox of its own's entries that a later release
 #: added, in the order they are written: the memory grant (18 October 2026,
@@ -1264,8 +1282,8 @@ def plan_settings_edit(
     2026) a fourth, ``planning.fetch_addresses``.
 
     ``path`` is the project's folder as that file's own world knows it. The
-    sandbox entry copies the reference project's name and addresses from the
-    same file, as written (an address may be a ``${NAME}``); with ``entry``
+    sandbox entry copies the name and addresses of a project already on the
+    shared sandbox (:func:`shared_sandbox_reference`) from the same file, as written (an address may be a ``${NAME}``); with ``entry``
     (a sandbox of its own, 17 October 2026) that entry is written instead, and
     a sandbox another project's entry already names, or another sandbox's
     addresses or door, is refused. Refuses — writing
@@ -1294,20 +1312,21 @@ def plan_settings_edit(
         wanted_keys = tuple(entry)
         _one_project_per_sandbox(which, sandboxes, key=key, entry=entry)
     else:
-        reference = sandboxes.get(REFERENCE_PROJECT)
+        found = shared_sandbox_reference(sandboxes, key)
+        reference_key, reference = found if found is not None else (LEGACY_SANDBOX, None)
         wanted_keys = ("name", "sidecar_url", "runner_url")
         if not isinstance(reference, dict) or not all(
             isinstance(reference.get(k), str) and reference.get(k) for k in wanted_keys
         ):
             raise Refused(
                 which,
-                f"its forge.yaml has no complete planning.sandboxes entry for "
-                f"{REFERENCE_PROJECT} to copy the sandbox name and addresses from",
+                f"its forge.yaml has no complete planning.sandboxes entry on the shared "
+                f"sandbox {LEGACY_SANDBOX} to copy the sandbox name and addresses from",
             )
         if reference.get("git_door"):
             raise Refused(
                 which,
-                f"its planning.sandboxes entry for {REFERENCE_PROJECT} names a Git door, "
+                f"its planning.sandboxes entry for {reference_key} names a Git door, "
                 f"and the shared sandbox {reference.get('name')} never has one (one "
                 "sandbox per project); take that line out by hand first",
             )
@@ -1387,7 +1406,7 @@ def plan_settings_edit(
             raise Refused(
                 which,
                 f"planning.sandboxes already has an entry for {key} that differs from "
-                f"{REFERENCE_PROJECT}'s; fix it by hand",
+                "the one this run would write; fix it by hand",
             )
         else:
             _ensure_block(lines, ("planning", "sandboxes", _scalar(key)))
@@ -1586,19 +1605,24 @@ def plan_publisher_edit(
     return JsonEdit(text, staged, [Step("publisher", "add", said)])
 
 
-def _backup_name(live: str, leaf: str, *, today: date | None = None) -> str:
+def _backup_name(live: str, leaf: str, *, today: date | None = None, action: str = "register") -> str:
     stamp = (today or date.today()).strftime("%Y%m%d")
-    return f"{live}.bak-{stamp}-pre-register-{leaf}"
+    return f"{live}.bak-{stamp}-pre-{action}-{leaf}"
 
 
-def _pending_name(live: str, leaf: str) -> str:
-    return f"{live}.{leaf}-pending"
+def _pending_name(live: str, leaf: str, action: str = "register") -> str:
+    """The staged copy: ``<live>.<leaf>-pending`` for register-repo, and
+    ``<live>.<leaf>-unregister-pending`` for unregister-repo, so neither
+    command's staged copy is ever taken for the other's."""
+    return f"{live}.{leaf}-pending" if action == "register" else f"{live}.{leaf}-{action}-pending"
 
 
-def _existing_backup(store: Any, live: str, leaf: str, original: str, folder: str | None) -> str | None:
+def _existing_backup(
+    store: Any, live: str, leaf: str, original: str, folder: str | None, action: str = "register"
+) -> str | None:
     """The newest backup of ``live`` for this project that holds ``original``."""
     base = PurePosixPath(live).name
-    pattern = re.compile(rf"^{re.escape(base)}\.bak-(\d{{8}})-pre-register-{re.escape(leaf)}$")
+    pattern = re.compile(rf"^{re.escape(base)}\.bak-(\d{{8}})-pre-{re.escape(action)}-{re.escape(leaf)}$")
     listed = store.names() if folder is None else store.names(folder)
     for name in sorted((n for n in listed if pattern.match(n)), reverse=True):
         full = name if folder is None else f"{folder.rstrip('/')}/{name}"
@@ -1627,22 +1651,23 @@ def stage(
     staged: str,
     dry_run: bool,
     like: str | None = None,
+    action: str = "register",
 ) -> tuple[Step, Staged | None]:
     """Write ``staged`` beside ``live`` as the pending copy, with a dated backup.
 
     Writes nothing when the same pending copy is already there (the backup it
     was made with is found and named), and nothing at all in a dry run.
     """
-    pending = _pending_name(live, leaf)
+    pending = _pending_name(live, leaf, action)
     if store.read(pending) == staged:
-        backup = _existing_backup(store, live, leaf, original, folder)
+        backup = _existing_backup(store, live, leaf, original, folder, action)
         detail = f"already staged as {store.where(pending)}"
         if backup is not None:
             detail += f" (backup {PurePosixPath(backup).name})"
         return Step(which, "unchanged", detail), Staged(live, pending, backup)
     if dry_run:
         return Step(which, "would stage", store.where(pending)), None
-    backup = _backup_name(live, leaf)
+    backup = _backup_name(live, leaf, action=action)
     # Both copies take the live file's mode: the publisher's is 600, and a
     # sandbox or volume copy must not be readable more widely than its live file.
     store.write(backup, original, like=like or live)
@@ -2292,8 +2317,14 @@ def activation_sequence(
     helper_urls: tuple[str, str] | None,
     dry_run: bool,
     memory_project: str | None = None,
+    removing: bool = False,
 ) -> list[str]:
     """The one-page procedure's own order, for this registration (step 7 a–h).
+
+    ``removing`` (forge unregister-repo, 18 October 2026): the same order for
+    taking a registration out; its last check is that the coordinator no
+    longer lists the project's sandbox, and a sandbox whose settings did not
+    change is not restarted.
 
     ``memory_project`` is the memory name a sandbox of its own is granted
     (design section 2.4a); its memory door line names the same one.
@@ -2308,7 +2339,10 @@ def activation_sequence(
     if coordinator is None and sandbox_file is None and publisher is None:
         if dry_run:
             return ["Activation: nothing would be staged, so there would be nothing to activate."]
+        if removing:
+            return [f"Activation: nothing is staged — {key} is already out of the live settings."]
         return [f"Activation: nothing is staged — {key} is already in the live settings."]
+    command = "unregister-repo" if removing else "register-repo"
 
     def q(value: str) -> str:
         # A name still to be filled in ("$ESTATE_ENV") stays expandable.
@@ -2362,7 +2396,7 @@ def activation_sequence(
         f"    docker start {intake}",
         "(c) Put the staged settings in place, as ONE command: it first checks that every live file"
         " is still the one its staged copy was made from, and only then copies any. If a check"
-        " fails nothing is copied: reopen intake as in (b) and run register-repo again. If a copy"
+        f" fails nothing is copied: reopen intake as in (b) and run {command} again. If a copy"
         " fails part-way, put the files already copied back from their backups, then restart as"
         " below:",
     ]
@@ -2392,7 +2426,18 @@ def activation_sequence(
     lines.append(f"    {chain[0]}" + (" \\" if len(chain) > 1 else ""))
     for index, command in enumerate(chain[1:], start=1):
         lines.append(f"      && {command}" + (" \\" if index < len(chain) - 1 else ""))
-    if estate.slot is None:
+    # Taking a project out of a sandbox of its own leaves that sandbox serving
+    # nothing, its settings as they were before the project was registered.
+    quiet_sandbox = removing and (sandbox_file is None or estate.slot is not None)
+    if removing and sandbox_file is None:
+        lines.append("(d) The sandbox's settings did not change; its supervisor is not restarted.")
+    elif quiet_sandbox:
+        lines.append(
+            f"(d) {estate.sandbox} now serves no project, and its settings are back as they were before"
+            " the project was registered, so its supervisor is not restarted. Stopping or removing the"
+            " sandbox is a separate decision."
+        )
+    elif estate.slot is None:
         lines += [
             "(d) Restart the sandbox supervisor and confirm the helper and runner are ready:",
             f"    docker restart {container(SANDBOX_SUPERVISOR_SERVICE)}",
@@ -2415,16 +2460,36 @@ def activation_sequence(
                 f" name the coordinator's entry for {key} is granted (memory_projects: [{memory_project}]),"
                 " so the build's approval card reads that memory and no other."
             )
-    lines += [
-        f"    {sbx} exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'"
-        f"  (both {estate.sandbox}-helper and {estate.sandbox}-runner Up)",
-    ]
-    if helper_urls is not None:
+    if not quiet_sandbox:
+        lines.append(
+            f"    {sbx} exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'"
+            f"  (both {estate.sandbox}-helper and {estate.sandbox}-runner Up)"
+        )
+    if helper_urls is not None and not quiet_sandbox:
         sidecar, runner = helper_urls
         lines.append(
             f"    curl -sf {q(sidecar.rstrip('/') + '/healthz')} && curl -sf {q(runner.rstrip('/') + '/ok')}"
         )
-    if publisher is not None:
+    publisher_container = container(PUBLISHER_SERVICE)
+    if publisher is not None and removing:
+        # The route must be ABSENT from the settings the publisher loaded on
+        # THIS start (Codex review of unregister-repo, R3): only log lines
+        # since the restart are read, the last settings line must be there
+        # (it started), and it must not hold the route's key.
+        route = q(json.dumps(key) + ": {")
+        lines += [
+            "(e) The publisher's routes changed: confirm the factory is still drained and restart"
+            " the publisher, as ONE command, so it restarts only if the check exits 0 (otherwise"
+            " reopen intake as in (b) and activate later):",
+            f"    {drained} \\",
+            "      && publisher_since=$(date -u +%Y-%m-%dT%H:%M:%SZ) \\",
+            f"      && docker restart {publisher_container}",
+            f"    Then, in the same shell, confirm it started again and that the settings it loaded have"
+            f" no route for {key}; this prints those settings and exits 0 only then:",
+            f"    docker logs --since \"$publisher_since\" {publisher_container} 2>&1 | grep 'publisher: settings'"
+            f" | tail -n 1 | grep -vF -- {route}",
+        ]
+    elif publisher is not None:
         lines += [
             "(e) The publisher's routes changed: confirm the factory is still drained and restart"
             " the publisher, as ONE command, so it restarts only if the check exits 0 (otherwise"
@@ -2441,15 +2506,24 @@ def activation_sequence(
         " reads the new settings when it starts, as ONE command, so it restarts only if the check"
         " exits 0 (otherwise reopen intake as in (b) and activate later):",
         f"    {drained} \\",
+        *(["      && coordinator_since=$(date -u +%Y-%m-%dT%H:%M:%SZ) \\"] if removing else []),
         f"      && docker restart {q(estate.coordinator)}",
         "(g) Reopen intake, the Slack-facing services last:",
         f"    docker start {intake}",
-        "(h) Check the services, and that the coordinator lists the new project's sandbox:",
+        "(h) Check the services, and that the coordinator "
+        + ("no longer lists the project's sandbox:" if removing else "lists the new project's sandbox:"),
         f"    DOCKER_HOST=unix:///var/run/docker.sock {q(estate.estate_check)} --env-file"
         f" {q(estate.env_file)} --project {COMPOSE_PROJECT} services",
-        f"    docker logs {q(estate.coordinator)} 2>&1 | grep -F"
-        f" {q(f'autobuild dispatch: {key} has a sandbox')}",
     ]
+    listed = q(f"autobuild dispatch: {key} has a sandbox")
+    if removing:
+        lines.append(
+            f"    docker logs --since \"$coordinator_since\" {q(estate.coordinator)} 2>&1 | grep -F {listed}"
+            "  (in the same shell as (f); it should print nothing: the coordinator no longer has the"
+            " project's sandbox)"
+        )
+    else:
+        lines.append(f"    docker logs {q(estate.coordinator)} 2>&1 | grep -F {listed}")
     return lines
 
 
@@ -2736,12 +2810,7 @@ def resolve_options(
             "preview_ports": list(ports.previews),
         }
 
-    env_text = str(estate_env_file) if estate_env_file is not None else "$ESTATE_ENV"
-    estate_check = "$FORGE/deploy/estate/estate-check"
-    compose = estate_values.get(ESTATE_ENV_COMPOSE_FILE, "")
-    first = next((part for part in re.split(r"[:,]", compose) if part.strip()), "")
-    if first and estate_env_file is not None:
-        estate_check = str(_resolve_beside(first.strip(), estate_env_file).parent / "estate-check")
+    env_text, estate_check = estate_names(estate_values, estate_env_file)
 
     return Options(
         key=f"{org}/{leaf}",
@@ -2785,6 +2854,18 @@ def resolve_options(
             sandbox_ssh=sandbox_ssh,
         ),
     )
+
+
+def estate_names(estate_values: Mapping[str, str], estate_env_file: Path | None) -> tuple[str, str]:
+    """The estate env file and the estate check script, as the printed
+    sequence names them (stand-ins to fill in when no env file was given)."""
+    env_text = str(estate_env_file) if estate_env_file is not None else "$ESTATE_ENV"
+    estate_check = "$FORGE/deploy/estate/estate-check"
+    compose = estate_values.get(ESTATE_ENV_COMPOSE_FILE, "")
+    first = next((part for part in re.split(r"[:,]", compose) if part.strip()), "")
+    if first and estate_env_file is not None:
+        estate_check = str(_resolve_beside(first.strip(), estate_env_file).parent / "estate-check")
+    return env_text, estate_check
 
 
 def _a_plain_address(value: str) -> bool:

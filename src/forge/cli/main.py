@@ -11,6 +11,9 @@ every subcommand currently shipped:
 * ``forge register-repo`` (register-projects design 2026-10-05 — registers
   a project on GitHub with the running, containerised factory: stages the
   settings, makes the shared sandbox's clone, prints the stop/start sequence)
+* ``forge unregister-repo`` (Linear front door design 2026-10-18, section
+  11.6 — the inverse of register-repo: stages the settings without one
+  repository's entries and prints the same stop/start sequence)
 * ``forge repo-paths`` (register-repo spec 2026-09-05 rule 9 — prints the
   repository map's distinct checkout paths so the forge-prod recreate script
   derives its binds instead of carrying them by hand)
@@ -58,6 +61,7 @@ from forge.cli import mission as _mission
 from forge.cli import serve as _serve
 from forge.cli import skip as _skip
 from forge.cli import status as _status
+from forge.cli import unregister_repo as _unregister_repo
 from forge.cli.runtime import CliRuntime, build_cli_runtime
 from forge.config.loader import load_config
 
@@ -137,6 +141,7 @@ main.add_command(_merge_deploy.merge_deploy_cmd)
 main.add_command(_runbook.runbook_cmd)
 main.add_command(_review_gate.review_gate_cmd)
 main.add_command(_register_repo.register_repo_cmd)
+main.add_command(_unregister_repo.unregister_repo_cmd)
 main.add_command(_repo_paths.repo_paths_cmd)
 main.add_command(_security_sweep.security_sweep_cmd)
 main.add_command(_mission.mission_cmd)

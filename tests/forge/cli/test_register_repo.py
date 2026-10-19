@@ -611,7 +611,7 @@ def test_a_file_without_api_test_s_sandbox_entry_is_refused(estate):
     estate.sandbox_files[SANDBOX_SETTINGS] = SANDBOX_YAML.split("  sandboxes:")[0]
     result = _run()
     assert result.exit_code == 1
-    assert "no complete planning.sandboxes entry for guardkit/api_test" in result.output
+    assert "no complete planning.sandboxes entry on the shared sandbox api-test-deploy" in result.output
     assert estate.writes == []
 
 
