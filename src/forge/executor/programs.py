@@ -201,10 +201,11 @@ def _stop(process: "subprocess.Popen[bytes]", *, group: bool, grace: float) -> N
 #   for the whole of the stop.
 # * EVERYTHING IT STARTED, NOT ONLY ITS GROUP. GuardKit starts the project's
 #   own test commands in sessions of their own, so a signal to the leg's group
-#   never reaches them. Before the first signal, while the leader is alive or
-#   unreaped, every descendant of the leader is found in ``/proc`` and held by
-#   a pidfd, and is signalled through it (see "the descendants are held by
-#   pidfd" below).
+#   never reaches them. The program runs under a subreaper wrapper, so all it
+#   starts stays under the wrapper even when a parent in between exits; every
+#   process under the wrapper is found in ``/proc``, held by a pidfd, and
+#   signalled through it (see "the descendants are held by pidfd" and "the
+#   subreaper wrapper" below).
 # * A STOP ASKED FOR BEFORE THE START means the program is never started; one
 #   that lands between the check and the start stops it at once.
 
@@ -377,12 +378,15 @@ class _Descendants:
     def running(self) -> list[int]:
         return [fd for fd in self.fds.values() if not _pidfd_exited(fd)]
 
-    def signal(self, sig: int) -> None:
+    def signal(self, sig: int) -> bool:
+        sent = False
         for fd in self.running():
             try:
                 _pidfd_send_signal(fd, sig)
             except OSError:
                 continue
+            sent = True
+        return sent
 
     def close(self) -> None:
         for fd in self.fds.values():
@@ -391,22 +395,6 @@ class _Descendants:
             except OSError:
                 pass
         self.fds.clear()
-
-
-def _groups_still_running(groups: set[int]) -> set[int]:
-    """Which of ``groups`` still have a member that is not a zombie."""
-    table = _process_table()
-    if table is None:
-        remaining = set()
-        for group in groups:
-            try:
-                os.killpg(group, 0)
-            except OSError:
-                continue
-            remaining.add(group)
-        return remaining
-    live = {pgid for _ppid, pgid, state in table.values() if state != "Z"}
-    return groups & live
 
 
 class StoppableRun:
@@ -471,60 +459,60 @@ class StoppableRun:
     def _stop_now(self) -> bool:
         """The stop itself, under the lock from the first signal to the last.
 
-        The leader's own group by number (the leader is unreaped throughout);
-        every descendant by pidfd: TERM, then after the grace a second walk
-        from those still running, and KILL to every one still running.
+        The process held is the subreaper wrapper (see :data:`_SUBREAPER`),
+        unreaped throughout. Everything under it — the program and every
+        process in its tree, re-parented orphans included — is held by pidfd
+        and sent TERM; during the grace and once more before the KILL the walk
+        is repeated from the wrapper, so a process started or orphaned during
+        the grace is found too; KILL goes to every one still running, and
+        last to the wrapper itself. The wrapper is never sent TERM: it is
+        first sent the hold signal, so it stays until that KILL. ``True``
+        when anything was signalled.
         """
         with self._lock:
             process = self._process
             if process is None or self._finished or self._stopped:
                 return False
             self._stopped = True
-            try:
-                leader_group: int | None = os.getpgid(process.pid)
-            except OSError:
-                leader_group = None
-            if leader_group in (0, os.getpgrp()):
-                leader_group = None
             descendants = _Descendants(process.pid)
+            signalled = False
             try:
+                if not _exited_unreaped(process.pid):
+                    # Hold the wrapper first (it is unreaped: the id is its own).
+                    try:
+                        os.kill(process.pid, _SUBREAPER_HOLD_SIGNAL)
+                    except OSError:
+                        pass
                 descendants.collect()
                 logger.warning(
-                    "stopping pid %s, its process group %s and %d processes "
-                    "it started",
+                    "stopping pid %s and the %d processes under it",
                     process.pid,
-                    leader_group,
                     len(descendants.fds),
                 )
-                if leader_group is not None:
-                    try:
-                        os.killpg(leader_group, signal.SIGTERM)
-                    except OSError:
-                        pass
-                descendants.signal(signal.SIGTERM)
+                signalled = descendants.signal(signal.SIGTERM)
                 deadline = time.monotonic() + max(0.0, self._grace)
-
-                def still_running() -> bool:
-                    return bool(
-                        (leader_group is not None and _groups_still_running({leader_group}))
-                        or descendants.running()
-                    )
-
-                while still_running() and time.monotonic() < deadline:
+                ticks = 0
+                while time.monotonic() < deadline:
+                    ticks += 1
+                    if ticks % 5 == 0:
+                        descendants.collect()
+                    if not descendants.running():
+                        break
                     time.sleep(0.05)
-                # The KILL is sent under the same lock: the leader cannot have
-                # been reaped, and every descendant is reached by its pidfd,
-                # including any started during the grace.
+                # The KILL is sent under the same lock: the wrapper cannot
+                # have been reaped, so everything re-parented to it is still
+                # under it, and every process is reached by its pidfd.
                 descendants.collect()
-                if leader_group is not None and _groups_still_running({leader_group}):
+                signalled = descendants.signal(signal.SIGKILL) or signalled
+                if not _exited_unreaped(process.pid):
                     try:
-                        os.killpg(leader_group, signal.SIGKILL)
+                        os.kill(process.pid, signal.SIGKILL)
+                        signalled = True
                     except OSError:
                         pass
-                descendants.signal(signal.SIGKILL)
             finally:
                 descendants.close()
-            return True
+            return signalled
 
     def _mark_finished(self) -> None:
         if self._before_finish_mark is not None:
@@ -571,6 +559,140 @@ def _reader(stream: Any, into: list[bytes]) -> threading.Thread:
     thread = threading.Thread(target=read, daemon=True)
     thread.start()
     return thread
+
+
+#: THE SUBREAPER WRAPPER (Codex round 3, 19 October 2026). A stoppable
+#: program is started under this small Python program, which marks itself a
+#: Linux child subreaper (prctl PR_SET_CHILD_SUBREAPER, 36 on every
+#: architecture the factory runs on) and then starts the program as its
+#: child. A process anywhere in the program's tree whose parent exits is then
+#: re-parented to the wrapper, never to init, so everything the program
+#: started always stays under the wrapper, where a stop can find it. The
+#: wrapper reaps those orphans as they end, and exits with the program's own
+#: exit code (dying of the same signal when the program did), so exit codes,
+#: output and time limits are what they were.
+#:
+#: A stop first sends it :data:`_SUBREAPER_HOLD_SIGNAL`; a held wrapper does
+#: not exit when the program does, but stays (reaping) until the stop's final
+#: KILL, so a process orphaned during the stop is still re-parented to it. Its
+#: handler is installed before it says it has started, so the signal never
+#: kills it. A program that is never stopped never sees any of this.
+#:
+#: It writes one line on a status pipe of its own: ``started <pid> <subreaper
+#: or no-subreaper>``, or ``refused <errno> <reason>`` when the program could
+#: not be started, which is then reported as refused before it started,
+#: exactly as before. It runs with ``-I``, so nothing in the program's
+#: environment or working directory changes what it imports.
+_SUBREAPER = r"""
+import ctypes, os, signal, sys, time
+status = int(sys.argv[1])
+hold_signal = int(sys.argv[2])
+argv = sys.argv[4:]
+held = []
+signal.signal(hold_signal, lambda *_: held.append(True))
+reaper = "no-subreaper"
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(ctypes.c_int(36), ctypes.c_ulong(1), ctypes.c_ulong(0),
+                  ctypes.c_ulong(0), ctypes.c_ulong(0)) == 0:
+        reaper = "subreaper"
+except Exception:
+    pass
+os.set_inheritable(status, False)
+defaults = [getattr(signal, n) for n in ("SIGPIPE", "SIGXFZ", "SIGXFSZ") if hasattr(signal, n)]
+try:
+    child = os.posix_spawnp(argv[0], argv, os.environ, setsigdef=defaults)
+except OSError as exc:
+    os.write(status, ("refused %d %s" % (exc.errno or 0, exc.strerror or exc)).encode())
+    os._exit(127)
+os.write(status, ("started %d %s" % (child, reaper)).encode())
+os.close(status)
+while True:
+    pid, how = os.wait()
+    if pid == child:
+        break
+while True:
+    try:
+        pid, _ = os.waitpid(-1, os.WNOHANG)
+    except ChildProcessError:
+        break
+    if pid == 0:
+        break
+while held:
+    # A stop is under way: stay, so everything orphaned during it is still
+    # re-parented here, until the stop's final KILL.
+    try:
+        os.waitpid(-1, os.WNOHANG)
+    except ChildProcessError:
+        pass
+    time.sleep(0.05)
+code = os.waitstatus_to_exitcode(how)
+if code < 0:
+    try:
+        signal.signal(-code, signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass
+    os.kill(os.getpid(), -code)
+    os._exit(128 - code)
+os._exit(code)
+"""
+
+#: What a stop sends the wrapper first, to keep it until the final KILL.
+_SUBREAPER_HOLD_SIGNAL: int = int(signal.SIGRTMIN) + 3
+
+#: How long the parent waits for the wrapper's status line.
+_SUBREAPER_STATUS_SECONDS = 30.0
+
+
+def _subreaper_argv(argv: Sequence[str], status_write: int) -> list[str]:
+    """``argv`` run under the wrapper, which reports on ``status_write``."""
+    import sys
+
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        _SUBREAPER,
+        str(status_write),
+        str(_SUBREAPER_HOLD_SIGNAL),
+        "--",
+        *argv,
+    ]
+
+
+def _await_subreaper(process: "subprocess.Popen[bytes]", status_read: int) -> None:
+    """Read the wrapper's status line; raise :class:`ProgramRefused` (nothing
+    is running) when it says the program could not be started."""
+    said = b""
+    try:
+        poller = select.poll()
+        poller.register(status_read, select.POLLIN | select.POLLHUP)
+        until = time.monotonic() + _SUBREAPER_STATUS_SECONDS
+        while time.monotonic() < until:
+            if not poller.poll(100):
+                continue
+            chunk = os.read(status_read, 4096)
+            if not chunk:
+                break
+            said += chunk
+    except OSError as exc:  # unread: it is running, and is waited for as such
+        said = f"unread status: {exc}".encode()
+    words = said.decode("utf-8", errors="replace").split(" ", 2)
+    if words[0] == "refused":
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        number = int(words[1]) if len(words) > 1 and words[1].isdigit() else 0
+        reason = words[2] if len(words) > 2 else "the program could not be started"
+        raise ProgramRefused(number, reason) from OSError(number, reason)
+    if words[0] != "started" or "no-subreaper" in words[-1]:
+        logger.warning(
+            "the stoppable program's wrapper said %r: what it starts may not all "
+            "stay under it",
+            said[:200],
+        )
 
 
 def _run_stoppable(
@@ -673,16 +795,24 @@ def run_program(
                     "it was asked to stop before it started, so it was not started"
                 ),
             )
+    # A stoppable program runs under the subreaper wrapper (see _SUBREAPER),
+    # which reports whether it started on a pipe of its own.
+    status_pipe = os.pipe() if run is not None else None
     try:
         process = start_program(
-            argv,
+            _subreaper_argv(argv, status_pipe[1]) if status_pipe else argv,
             cwd=cwd,
             env=env,
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=True if run is not None else new_session,
+            start_new_session=True if status_pipe else new_session,
+            pass_fds=(status_pipe[1],) if status_pipe else (),
         )
+        if status_pipe:
+            os.close(status_pipe[1])
+            status_pipe = (status_pipe[0], -1)
+            _await_subreaper(process, status_pipe[0])
     except ProgramRefused as exc:
         return ProgramOutcome(
             exit_code=None,
@@ -691,6 +821,10 @@ def run_program(
             refused_before_start=True,
             error=exc.__cause__ or exc,
         )
+    finally:
+        for end in status_pipe or ():
+            if end >= 0:
+                os.close(end)
     if run is not None:
         return _run_stoppable(
             process,

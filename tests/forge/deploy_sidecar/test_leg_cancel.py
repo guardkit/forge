@@ -500,17 +500,29 @@ class TestACancelBeforeTheLegStarts:
 class TestAFinishedLegIsNeverSignalled:
     """Codex R1: never signal a reaped process (deterministic hooks)."""
 
-    def _signals(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[int, int]]:
+    def _signals(self, monkeypatch: pytest.MonkeyPatch) -> list[tuple[str, int, int]]:
+        """Every signal the stop sends, by any of its three ways."""
         from forge.executor import programs
 
-        sent: list[tuple[int, int]] = []
-        real_killpg = programs.os.killpg
+        sent: list[tuple[str, int, int]] = []
+        real_killpg, real_kill = programs.os.killpg, programs.os.kill
+        real_pidfd = programs._pidfd_send_signal
 
         def recording_killpg(group: int, sig: int) -> None:
-            sent.append((group, sig))
+            sent.append(("group", group, sig))
             real_killpg(group, sig)
 
+        def recording_kill(pid: int, sig: int) -> None:
+            sent.append(("pid", pid, sig))
+            real_kill(pid, sig)
+
+        def recording_pidfd(fd: int, sig: int) -> None:
+            sent.append(("pidfd", fd, sig))
+            real_pidfd(fd, sig)
+
         monkeypatch.setattr(programs.os, "killpg", recording_killpg)
+        monkeypatch.setattr(programs.os, "kill", recording_kill)
+        monkeypatch.setattr(programs, "_pidfd_send_signal", recording_pidfd)
         return sent
 
     def test_a_cancel_after_the_finish_mark_signals_nothing(
@@ -530,11 +542,12 @@ class TestAFinishedLegIsNeverSignalled:
         assert answers == [False]
         assert sent == []
 
-    def test_completion_racing_the_cancel_signals_only_the_unreaped_leader(
+    def test_completion_racing_the_cancel_signals_nothing(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """The cancel lands after the leader exited, before the finish mark:
-        the leader is a zombie, so its id and its group's id are still its own."""
+        """The cancel lands after the wrapper exited, before the finish mark:
+        it is a zombie (its ids still reserved), nothing is under it, so the
+        stop sends nothing and the program keeps its own exit code."""
         from forge.executor import programs
 
         sent = self._signals(monkeypatch)
@@ -553,9 +566,8 @@ class TestAFinishedLegIsNeverSignalled:
             outcome = programs.run_program(["true"], cwd=None, env=None, timeout=10)
 
         assert seen["state"] == "Z"
-        assert seen["answer"] is True
-        # TERM to the zombie's own group only; nothing left running, so no KILL.
-        assert sent == [(seen["pid"], 15)]
+        assert seen["answer"] is False
+        assert sent == []
         assert outcome.exit_code == 0
         assert run.finished
 
@@ -824,3 +836,102 @@ class TestAdmissionIsOneStep:
             resume.set()
             srv.shutdown()
             srv.server_close()
+
+
+# ---------------------------------------------------------------------------
+# Codex round 3: everything stays under a subreaper wrapper
+# ---------------------------------------------------------------------------
+
+
+class TestEverythingStaysUnderTheWrapper:
+    def test_a_child_of_a_detached_parent_that_exits_during_the_grace_is_stopped(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex R3: a detached parent answers TERM by starting a child and
+        exiting at once, before the KILL. The orphan is re-parented to the
+        wrapper (not to init), so the walk before the KILL finds it."""
+        from forge.executor import programs
+
+        d_pid, n_pid = tmp_path / "d.pid", tmp_path / "n.pid"
+        detached = tmp_path / "detached.sh"
+        detached.write_text(
+            "#!/bin/sh\n"
+            f"trap 'sleep 300 >/dev/null 2>&1 </dev/null & echo $! > {n_pid}.tmp; "
+            f"mv {n_pid}.tmp {n_pid}; exit 0' TERM\n"
+            "while :; do sleep 0.05; done\n",
+            encoding="utf-8",
+        )
+        detached.chmod(0o755)
+        run = programs.StoppableRun()
+        thread, result = _run_in_thread(
+            run,
+            [
+                "sh",
+                "-c",
+                f"setsid {detached} >/dev/null 2>&1 </dev/null & "
+                f"echo $! > {d_pid}; wait",
+            ],
+        )
+        d = _read_pid(d_pid)
+        _wait_for(lambda: _alive(d) and os.getpgid(d) == d, "the detached parent")
+        try:
+            assert run.request_stop(grace=1.5) is True
+            thread.join(PROMPT_SECONDS)
+            n = _read_pid(n_pid)
+            assert _gone(d)
+            assert _gone(n), "the orphan of a detached parent survived the stop"
+        finally:
+            for path in (d_pid, n_pid):
+                if path.exists():
+                    pid = int(path.read_text().split()[0])
+                    if _alive(pid):
+                        os.kill(pid, 9)
+
+    @pytest.mark.parametrize(
+        "argv",
+        [
+            ["sh", "-c", "echo out; echo err >&2; exit 3"],
+            ["sh", "-c", "echo before; kill -TERM $$"],
+            ["sh", "-c", "exit 0"],
+        ],
+    )
+    def test_a_normal_programs_exit_code_and_output_are_unchanged(
+        self, argv: list[str]
+    ) -> None:
+        from forge.executor import programs
+
+        plain = programs.run_program(argv, cwd=None, env=None, timeout=20)
+        with programs.stoppable(programs.StoppableRun()):
+            wrapped = programs.run_program(argv, cwd=None, env=None, timeout=20)
+        assert (wrapped.exit_code, wrapped.stdout, wrapped.stderr) == (
+            plain.exit_code,
+            plain.stdout,
+            plain.stderr,
+        )
+        assert not wrapped.timed_out and not wrapped.refused_before_start
+
+    def test_a_program_that_cannot_be_started_is_still_refused_before_start(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.executor import programs
+
+        missing = str(tmp_path / "no-such-program")
+        plain = programs.run_program([missing], cwd=None, env=None, timeout=20)
+        with programs.stoppable(programs.StoppableRun()):
+            wrapped = programs.run_program([missing], cwd=None, env=None, timeout=20)
+        assert plain.refused_before_start and wrapped.refused_before_start
+        assert isinstance(wrapped.error, FileNotFoundError)
+
+    def test_a_time_limit_still_stops_it_and_says_so(self) -> None:
+        from forge.executor import programs
+
+        with programs.stoppable(programs.StoppableRun()):
+            outcome = programs.run_program(
+                ["sh", "-c", "echo started; sleep 300"],
+                cwd=None,
+                env=None,
+                timeout=1,
+                kill_grace_seconds=1,
+            )
+        assert outcome.timed_out
+        assert outcome.stdout == b"started\n"
