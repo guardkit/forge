@@ -289,6 +289,7 @@ class Sandbox:
         self.vm_how: str | None = None
         self.deployment_told: dict | None = None  # {} means told "none"
         self.next_op = 1
+        self.op_generation = 0  # moves whenever an operation is queued
         self.next_seq = 1
         self.last_operation: dict | None = None
         self.log_path = ""
@@ -444,6 +445,7 @@ class Starter:
                 ids = ", ".join(str(o["id"]) for o in sb.recovering)
                 self.say(f"{sb.name}: operation(s) {ids} have no recorded end; recovering")
                 sb.queue.appendleft(Op(None, "recover", self.clock()))
+                sb.op_generation += 1
             thread = threading.Thread(target=self._work, args=(sb,), name=f"starter-{sb.name}", daemon=True)
             thread.start()
             self.threads.append(thread)
@@ -494,6 +496,7 @@ class Starter:
         with self.lock:
             op = Op(sb.next_op, kind, self.clock())
             sb.next_op += 1
+            sb.op_generation += 1
             self._record(sb, "op-queued", op_id=op.id, op=kind)
             sb.queue.append(op)
             sb.cond.notify_all()
@@ -666,13 +669,11 @@ class Starter:
             self._set_readiness(sb, REDEPLOY_PENDING if (helper and runner) else UNKNOWN,
                                 why=f"the confirmation no longer holds: {why}")
 
-    def _verify(self, sb: Sandbox, limit: float | None = None) -> tuple[str, bool, bool]:
-        """Read the supervisor and its services, and judge a confirmation against them.
+    def _read(self, sb: Sandbox, limit: float | None = None) -> dict | None:
+        """One read of the supervisor (state, StartedAt) and both services.
 
-        See _judge. While an operation owns the sandbox, it owns its readiness
-        and nothing is judged here. With a limit, every read is bounded by it,
-        and if the limit runs out nothing is judged: an unfinished read is not
-        evidence either way.
+        With a limit every read is bounded by it, and a read the limit cut
+        short gives None: an unfinished read is not evidence either way.
         """
         end = None if limit is None else self.clock() + limit
         left = lambda cap: cap if end is None else min(cap, end - self.clock())  # noqa: E731
@@ -682,14 +683,27 @@ class Starter:
         if state == "running" and (end is None or self.clock() < end):
             helper, runner, instance = self._services(sb, timeout=left(3.0))
         if end is not None and self.clock() >= end:
-            return state, helper, runner
+            return None
+        return {"state": state, "started": started, "helper": helper, "runner": runner, "instance": instance}
+
+    def _verify(self, sb: Sandbox) -> tuple[str, bool, bool]:
+        """Read the supervisor and its services, and judge a confirmation against them.
+
+        See _judge. Judgement counts only for a read made entirely while no
+        operation owned the sandbox: one queued or running at the start of the
+        read, at its end, or in between (the operation count moved) owns its
+        readiness, and nothing is judged here.
+        """
         with self.lock:
-            if sb.busy() or sb.unresolved:
-                return state, helper, runner
-            self._judge(sb, state, started, helper, runner, instance)
-            if sb.readiness in (UNKNOWN, STOPPED) and state == "running" and helper and runner:
+            generation = sb.op_generation
+        seen = self._read(sb)
+        with self.lock:
+            if sb.busy() or sb.unresolved or sb.op_generation != generation:
+                return seen["state"], seen["helper"], seen["runner"]
+            self._judge(sb, seen["state"], seen["started"], seen["helper"], seen["runner"], seen["instance"])
+            if sb.readiness in (UNKNOWN, STOPPED) and seen["state"] == "running" and seen["helper"] and seen["runner"]:
                 self._services_answered(sb, woke=False)
-        return state, helper, runner
+        return seen["state"], seen["helper"], seen["runner"]
 
     def _confirmed(self, sb: Sandbox) -> bool:
         with self.lock:
@@ -746,24 +760,33 @@ class Starter:
         deadline = self.clock() + self.settings.ready_limit
         while True:
             helper, runner, instance = self._services(sb)
-            if helper and runner:
+            # THE REAL FINAL STATE, read after the probes: the start counts only
+            # if the supervisor is still running and its start time is known.
+            # Otherwise any confirmation ends, and the bounded wait goes on or
+            # fails with the reason.
+            state, started = self._inspect(sb)
+            if helper and runner and state == "running" and started:
                 break
-            state = self._container_state(sb)
+            with self.lock:
+                self._judge(sb, state, started, helper, runner, instance)
             if state not in ("running", "restarting", UNKNOWN):
                 self._set_readiness(sb, UNKNOWN)
                 raise Failed(
                     f"the supervisor container {sb.settings.supervisor} is {state} again before "
-                    f"{sb.name}'s services answered; its log says why"
+                    f"{sb.name} was shown ready; its log says why"
                 )
             if self.clock() >= deadline:
                 self._set_readiness(sb, UNKNOWN)
-                missing = " and ".join(
-                    what for what, ok in (("the deploy helper (/healthz)", helper),
-                                          ("the build runner (/ok)", runner)) if not ok
-                )
+                missing = [what for what, ok in (("the deploy helper (/healthz)", helper),
+                                                 ("the build runner (/ok)", runner)) if not ok]
+                if missing:
+                    raise Failed(
+                        f"{' and '.join(missing)} in {sb.name} did not answer within "
+                        f"{int(self.settings.ready_limit)}s of the start"
+                    )
                 raise Failed(
-                    f"{missing} in {sb.name} did not answer within "
-                    f"{int(self.settings.ready_limit)}s of the start"
+                    f"the supervisor container {sb.settings.supervisor}'s state or start time could "
+                    f"not be read (it showed {state}) within {int(self.settings.ready_limit)}s of the start"
                 )
             self.sleep(self.settings.ready_poll)
         # Its services answering inside it shows the VM is up, without asking
@@ -772,9 +795,8 @@ class Starter:
         # A start of a supervisor that was already running keeps a
         # confirmation only if it is still the same supervisor run and the
         # same helper instance it was made on.
-        _, started = self._inspect(sb)
         with self.lock:
-            self._judge(sb, "running", started, True, True, instance)
+            self._judge(sb, state, started, True, True, instance)
         readiness = self._services_answered(sb, woke=(was != "running"))
         return {
             "readiness": readiness,
@@ -1172,17 +1194,26 @@ class Starter:
                         return {"hold_id": hold_id, "readiness": sb.readiness,
                                 "message": f"{sb.name} is held for {owner}: services ready"}
                     confirmed = self._confirmed(sb)
-                if confirmed:
-                    # Confirmed; check it is still the same supervisor run and
-                    # helper instance, with reads bounded by what is left of
-                    # the deadline. Then, under the lock and immediately before
+                    quiet_now = not sb.busy() and not sb.unresolved
+                    generation = sb.op_generation
+                if confirmed and quiet_now:
+                    # THE FINAL CHECK. Success only from a check completed while
+                    # NO operation owned the sandbox: none queued or running at
+                    # the start of the reads, at the end, or in between. Reads
+                    # are bounded by what is left of the deadline. Then, under
+                    # the same lock as the judgement and immediately before
                     # success, the hold, the suspension and the deadline again.
-                    self._verify(sb, limit=max(0.0, deadline - self.clock()))
+                    # If an operation intervened, wait for it and start over.
+                    seen = self._read(sb, limit=max(0.0, deadline - self.clock()))
                     with self.lock:
                         checkpoint()
-                        if self._confirmed(sb):
-                            return {"hold_id": hold_id, "readiness": READY,
-                                    "message": f"{sb.name} is held for {owner}: its recorded deployment is back"}
+                        if seen is not None and not sb.busy() and not sb.unresolved \
+                                and sb.op_generation == generation:
+                            self._judge(sb, seen["state"], seen["started"], seen["helper"],
+                                        seen["runner"], seen["instance"])
+                            if self._confirmed(sb):
+                                return {"hold_id": hold_id, "readiness": READY,
+                                        "message": f"{sb.name} is held for {owner}: its recorded deployment is back"}
                 self.sleep(1.0)
         except Refused as exc:
             with self.lock:

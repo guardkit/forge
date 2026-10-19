@@ -1381,7 +1381,7 @@ class TestTheLastCheckOfADeployedHold:
         s = world.make(deployment=DEPLOYMENT)
         s.start(NAME)
         s.ready(NAME)
-        original = s._verify
+        original = s._read
 
         def a_suspension_arrives_during_the_final_probe(sb, limit=None):
             result = original(sb, limit)
@@ -1389,7 +1389,7 @@ class TestTheLastCheckOfADeployedHold:
                 s.suspend(NAME, "keycloak went down")
             return result
 
-        s._verify = a_suspension_arrives_during_the_final_probe
+        s._read = a_suspension_arrives_during_the_final_probe
         with pytest.raises(starter_mod.Failed, match="suspended") as caught:
             s.hold(NAME, "merge-deploy", "deployed")
         assert caught.value.extra["hold_ended"] is True
@@ -1401,7 +1401,7 @@ class TestTheLastCheckOfADeployedHold:
         s = world.make(deployment=DEPLOYMENT, clock=clock)
         s.start(NAME)
         s.ready(NAME)
-        original = s._verify
+        original = s._read
         limits = []
 
         def the_final_probe_takes_past_the_deadline(sb, limit=None):
@@ -1410,7 +1410,7 @@ class TestTheLastCheckOfADeployedHold:
                 clock.now += 901  # the probe was slow
             return original(sb, limit)
 
-        s._verify = the_final_probe_takes_past_the_deadline
+        s._read = the_final_probe_takes_past_the_deadline
         with pytest.raises(starter_mod.Failed, match="within 15 minutes of the hold being taken"):
             s.hold(NAME, "merge-deploy", "deployed")
         assert limits and limits[0] <= 900
@@ -1432,13 +1432,111 @@ class TestTheLastCheckOfADeployedHold:
 
         s._services = services
         clock.now += 0  # the hold is taken now: 900 s left
-        original = s._verify
+        original = s._read
 
         def most_of_the_time_has_gone(sb, limit=None):
             if limit is not None:
                 return original(sb, 1.5)
             return original(sb, limit)
 
-        s._verify = most_of_the_time_has_gone
+        s._read = most_of_the_time_has_gone
         assert s.hold(NAME, "merge-deploy", "deployed")["readiness"] == "ready"
         assert seen[-1] <= 1.5
+
+
+
+class TestAnOperationDuringTheFinalCheck:
+    """Codex round 8, R9: success only from a check no operation overlapped."""
+
+    def test_a_concurrent_start_mid_check_never_returns_the_old_confirmation(self, world):
+        s = world.make(deployment=DEPLOYMENT)
+        s.start(NAME)
+        s.ready(NAME)  # confirmed on helper-run-1
+        start_is_running = threading.Event()
+        release_the_start = threading.Event()
+        original_start = s._run_start
+
+        def a_start_held_mid_way(sb, op):
+            start_is_running.set()
+            assert release_the_start.wait(10)
+            return original_start(sb, op)
+
+        s._run_start = a_start_held_mid_way
+        original_read = s._read
+        fired = []
+
+        def a_start_arrives_during_the_final_read(sb, limit=None):
+            seen = original_read(sb, limit)  # still shows helper-run-1
+            if limit is not None and not fired:
+                fired.append(in_background(s.start, NAME))
+                assert start_is_running.wait(10)
+                # The VM restarts while the start owns the sandbox.
+                world.services.answers["/healthz"] = (200, HEALTHY_AS.format("helper-run-2"))
+            return seen
+
+        s._read = a_start_arrives_during_the_final_read
+        box = in_background(s.hold, NAME, "merge-deploy", "deployed")
+        assert wait_for(lambda: bool(fired))
+        time.sleep(0.5)
+        assert "result" not in box and "error" not in box  # the old confirmation was not returned
+        release_the_start.set()
+        fired[0]["thread"].join(10)
+        assert fired[0]["result"]["readiness"] == "services ready, redeploy pending"
+        time.sleep(1.5)
+        assert "result" not in box and "error" not in box  # waiting for a ready on the new run
+        s.ready(NAME)
+        box["thread"].join(10)
+        assert box["result"]["readiness"] == "ready"
+        assert s.status(NAME)["ready_confirmed_on_instance"] == "helper-run-2"
+
+    def test_control_an_unchanged_instance_with_no_operation_returns_ready(self, world):
+        s = world.make(deployment=DEPLOYMENT)
+        s.start(NAME)
+        s.ready(NAME)
+        assert s.hold(NAME, "merge-deploy", "deployed")["readiness"] == "ready"
+
+
+class TestTheStartUsesTheRealFinalState:
+    """Codex round 8, R11."""
+
+    def _confirmed(self, world, **kw):
+        s = world.make(deployment=DEPLOYMENT, **kw)
+        s.start(NAME)
+        s.ready(NAME)
+        return s
+
+    def test_a_supervisor_that_exits_between_the_probes_and_the_inspection(self, world):
+        s = self._confirmed(world)
+        original = s._services
+
+        def it_exits_just_after_the_probes(sb, timeout=3.0):
+            result = original(sb, timeout)
+            (world.state / "container").write_text("exited\n")
+            return result
+
+        s._services = it_exits_just_after_the_probes
+        with pytest.raises(starter_mod.Failed, match="is exited again before"):
+            s.start(NAME)
+        s._services = original
+        report = s.status(NAME)
+        assert report["readiness"] == "unknown"
+        assert any("the supervisor container is exited" in e.get("why", "") for e in log_entries(world))
+
+    def test_a_state_that_cannot_be_read_fails_the_bounded_start_with_the_reason(self, world):
+        s = self._confirmed(world)
+        original = s._services
+
+        def it_cannot_be_read_after_the_probes(sb, timeout=3.0):
+            result = original(sb, timeout)
+            (world.state / "container").write_text("")
+            return result
+
+        s._services = it_cannot_be_read_after_the_probes
+        with pytest.raises(starter_mod.Failed, match="state or start time could not be read"):
+            s.start(NAME)
+        assert s.sandboxes[NAME].readiness == "unknown"
+
+    def test_control_it_stays_running_and_ready(self, world):
+        s = self._confirmed(world)
+        assert s.start(NAME)["readiness"] == "ready"
+        assert s.status(NAME)["readiness"] == "ready"
