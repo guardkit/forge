@@ -45,12 +45,14 @@ printf '%s\n' "$*" >> "$S/docker.log"
 case "$1" in
   inspect)
     c="${@: -1}"
+    started=$(cat "$S/started_at" 2>/dev/null || echo 2026-10-19T08:00:00.000000001Z)
     if [ -f "$S/inspect_running_for" ]; then
       n=$(cat "$S/inspect_running_for")
-      if [ "$n" -gt 0 ]; then echo $((n-1)) > "$S/inspect_running_for"; echo running; exit 0; fi
+      if [ "$n" -gt 0 ]; then echo $((n-1)) > "$S/inspect_running_for"; echo "running|$started"; exit 0; fi
     fi
     [ -f "$S/container" ] || { echo "Error: No such object: $c" >&2; exit 1; }
-    cat "$S/container" ;;
+    state=$(cat "$S/container")
+    [ -n "$state" ] && echo "$state|$started" ;;
   start)
     # Started while a stop is still under way: the thing that must never happen.
     if [ "$(cat "$S/inspect_running_for" 2>/dev/null || echo 0)" -gt 0 ] ||
@@ -59,6 +61,10 @@ case "$1" in
     fi
     [ -f "$S/start_sleep" ] && sleep "$(cat "$S/start_sleep")"
     [ -f "$S/start_fails" ] && { echo "Error response from daemon: it would not start" >&2; exit 1; }
+    # A start of a stopped container is a new run of it; of a running one, nothing.
+    if [ "$(cat "$S/container" 2>/dev/null)" != running ]; then
+      date -u +%Y-%m-%dT%H:%M:%S.%NZ > "$S/started_at"
+    fi
     echo running > "$S/container" ;;
   stop)
     [ -f "$S/stop_sleep" ] && sleep "$(cat "$S/stop_sleep")"
@@ -1230,3 +1236,78 @@ class TestADeploymentRecordedWhileAHoldWaits:
         result = s.hold(NAME, "merge-deploy", "deployed")
         assert result["readiness"] == "ready"
         assert "services ready" in result["message"]
+
+
+
+class TestReadyHoldsOnlyForTheSameSupervisorRun:
+    """Codex round 6, R9."""
+
+    def _confirmed(self, world):
+        s = world.make(deployment=DEPLOYMENT)
+        s.start(NAME)
+        result = s.ready(NAME)
+        assert result["started_at"]
+        assert s.status(NAME)["readiness"] == "ready"
+        return s
+
+    def test_a_supervisor_restarted_outside_the_starter_needs_a_redeploy(self, world):
+        s = self._confirmed(world)
+        # Restarted by someone else (same identity; the app's containers,
+        # restart policy "no", are not restored): a new run, services answer.
+        (world.state / "started_at").write_text("2026-10-19T09:30:00.000000002Z\n")
+        report = s.status(NAME)
+        assert report["readiness"] == "services ready, redeploy pending"
+        assert report["deployment"] == DEPLOYMENT and report["services_ready"] is True
+        why = [e.get("why", "") for e in log_entries(world) if e["kind"] == "readiness"][-1]
+        assert "started again" in why
+
+    def test_services_that_drop_briefly_and_come_back_need_a_redeploy(self, world):
+        s = self._confirmed(world)
+        world.services.answers["/ok"] = (503, "restarting")
+        report = s.status(NAME)
+        assert report["readiness"] == "unknown" and report["redeploy_pending"] is False
+        world.services.answers["/ok"] = (200, '{"ok":true}')
+        report = s.status(NAME)
+        assert report["readiness"] == "services ready, redeploy pending"
+        assert any("the runner did not answer" in e.get("why", "") for e in log_entries(world))
+
+    def test_a_supervisor_that_is_no_longer_running_ends_the_confirmation(self, world):
+        s = self._confirmed(world)
+        (world.state / "container").write_text("exited\n")
+        assert s.status(NAME)["readiness"] == "unknown"
+
+    def test_an_unreadable_start_time_ends_the_confirmation_and_refuses_ready(self, world):
+        s = self._confirmed(world)
+        (world.state / "started_at").write_text("\n")
+        assert s.status(NAME)["readiness"] == "services ready, redeploy pending"
+        with pytest.raises(starter_mod.Refused, match="start time could not be read"):
+            s.ready(NAME)
+        assert s.status(NAME)["redeploy_pending"] is True
+
+    def test_a_deployed_hold_on_a_restarted_supervisor_waits_for_a_new_ready(self, world):
+        s = self._confirmed(world)
+        (world.state / "started_at").write_text("2026-10-19T09:30:00.000000002Z\n")
+        box = in_background(s.hold, NAME, "merge-deploy", "deployed")
+        time.sleep(0.5)
+        assert "result" not in box and "error" not in box
+        s.ready(NAME)
+        box["thread"].join(10)
+        assert box["result"]["readiness"] == "ready"
+
+    def test_a_stop_decision_reads_the_run_too(self, world):
+        s = self._confirmed(world)
+        (world.state / "started_at").write_text("2026-10-19T09:30:00.000000002Z\n")
+        s.suspend(NAME, "held for a look")
+        with pytest.raises(starter_mod.Refused, match="suspended"):
+            s.stop(NAME)
+        assert any("started again" in e.get("why", "") for e in log_entries(world))
+
+    def test_control_only_the_starter_restarts_and_ready_stays(self, world):
+        first = self._confirmed(world)
+        first.close()
+        records = sum(1 for e in log_entries(world) if e["kind"] == "readiness")
+        second = world.make(deployment=DEPLOYMENT)
+        report = second.status(NAME)
+        assert report["readiness"] == "ready" and report["ready_confirmed_on_start"]
+        assert second.hold(NAME, "merge-deploy", "deployed")["readiness"] == "ready"
+        assert sum(1 for e in log_entries(world) if e["kind"] == "readiness") == records
