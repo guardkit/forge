@@ -28,10 +28,15 @@ own, never in its words.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import os
+import select
 import signal
 import subprocess
+import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -42,10 +47,18 @@ __all__ = [
     "RaisedWhileRunning",
     "RefusedBeforeStart",
     "TimedOut",
+    "StoppableRun",
     "run_program",
     "start_program",
     "start_program_async",
+    "stoppable",
 ]
+
+logger = logging.getLogger(__name__)
+
+#: The run, on this thread, the next program :func:`run_program` starts
+#: belongs to (see :func:`stoppable`).
+_started_observer = threading.local()
 
 
 class ProgramRefused(OSError):
@@ -171,6 +184,715 @@ def _stop(process: "subprocess.Popen[bytes]", *, group: bool, grace: float) -> N
         return
 
 
+# ---------------------------------------------------------------------------
+# A program that another thread may stop (19 October 2026)
+# ---------------------------------------------------------------------------
+#
+# The helper's ``/guardkit-leg/cancel`` stops a fix journey's leg from another
+# request's thread. Three rules make that safe and complete:
+#
+# * NEVER SIGNAL A REAPED PROCESS. Once a process is reaped its id, and the
+#   id of the group it led, can be given to a new process. So the thread that
+#   runs the program observes its end WITHOUT reaping it
+#   (``waitid(..., WNOWAIT)``), marks the run finished under the run's lock,
+#   and only then reaps it. A stop takes the same lock, refuses once the run
+#   is finished, and holds the lock from the first signal to the last, so the
+#   leader stays unreaped (a zombie keeps its id and its group's id reserved)
+#   for the whole of the stop.
+# * EVERYTHING IT STARTED, NOT ONLY ITS GROUP. GuardKit starts the project's
+#   own test commands in sessions of their own, so a signal to the leg's group
+#   never reaches them. The program runs under a subreaper wrapper, so all it
+#   starts stays under the wrapper even when a parent in between exits; every
+#   process under the wrapper is found in ``/proc``, held by a pidfd, and
+#   signalled through it (see "the descendants are held by pidfd" and "the
+#   subreaper wrapper" below).
+# * A STOP ASKED FOR BEFORE THE START means the program is never started; one
+#   that lands between the check and the start stops it at once.
+
+
+def _process_table() -> dict[int, tuple[int, int, str]] | None:
+    """``{pid: (parent pid, process group, state)}`` from ``/proc``, or None."""
+    try:
+        entries = os.listdir("/proc")
+    except OSError:
+        return None
+    table: dict[int, tuple[int, int, str]] = {}
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as handle:
+                raw = handle.read().decode("utf-8", errors="replace")
+            fields = raw.rsplit(")", 1)[1].split()
+            table[int(entry)] = (int(fields[1]), int(fields[2]), fields[0])
+        except (OSError, IndexError, ValueError):
+            continue  # it ended while the table was read
+    return table
+
+
+# THE DESCENDANTS ARE HELD BY PIDFD, NEVER BY NUMBER (Codex round 2, 19
+# October 2026). A saved process or group id can be reused by an unrelated
+# process; a pidfd always refers to the one process it was opened for. The
+# leader is the exception: it is unreaped for the whole stop, so its id and
+# its group's id are still its own, and its group is signalled by number.
+#
+# A child is taken as ours only if, after its pidfd is open, its parent is
+# still the parent it was found under, and that parent is itself still
+# pinned (the unreaped leader, or a process whose pidfd shows it has not
+# exited). A pid read from /proc that has meanwhile become someone else's
+# fails that check and is never signalled.
+
+#: The two Linux system calls, by their numbers, which are the same on every
+#: architecture the factory runs on. Used only when this Python lacks
+#: ``os.pidfd_open`` / ``signal.pidfd_send_signal`` (uv's standalone 3.14
+#: build for aarch64 has neither).
+_SYS_PIDFD_SEND_SIGNAL = 424
+_SYS_PIDFD_OPEN = 434
+_libc: Any = None
+
+
+def _syscall(*args: int | None) -> int:
+    global _libc
+    import ctypes
+
+    if _libc is None:
+        _libc = ctypes.CDLL(None, use_errno=True)
+        _libc.syscall.restype = ctypes.c_long
+    result = _libc.syscall(
+        *(ctypes.c_long(a) if a is not None else None for a in args)
+    )
+    if result < 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+    return int(result)
+
+
+def _pidfd_open(pid: int) -> int:
+    # (Attribute access, never the module object handed on: the launch check
+    # in the test suite reads every reference to ``os``.)
+    try:
+        opener = os.pidfd_open
+    except AttributeError:
+        return _syscall(_SYS_PIDFD_OPEN, pid, 0)
+    return opener(pid)
+
+
+def _pidfd_send_signal(fd: int, sig: int) -> None:
+    try:
+        sender = signal.pidfd_send_signal
+    except AttributeError:
+        _syscall(_SYS_PIDFD_SEND_SIGNAL, fd, int(sig), None, 0)
+        return
+    sender(fd, sig)
+
+
+def _pidfd_exited(fd: int) -> bool:
+    """Has the process this pidfd refers to ended? (Readable once it has.)"""
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return bool(poller.poll(0))
+
+
+def _parent_of(pid: int) -> int | None:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read().decode("utf-8", errors="replace")
+        return int(raw.rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _children_of(pid: int) -> list[int]:
+    """The ids /proc gives as ``pid``'s children (each still to be checked).
+
+    ``/proc/<pid>/task/*/children`` where the kernel has it; otherwise every
+    process whose parent id is ``pid``.
+    """
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
+    except OSError:
+        return []
+    found: list[int] = []
+    try:
+        for task in tasks:
+            with open(f"/proc/{pid}/task/{task}/children", "rb") as handle:
+                found.extend(int(part) for part in handle.read().split())
+        return found
+    except FileNotFoundError:
+        pass  # this kernel has no children files
+    except (OSError, ValueError):
+        return found
+    table = _process_table() or {}
+    return [child for child, (ppid, _pgid, _state) in table.items() if ppid == pid]
+
+
+class _Descendants:
+    """Pidfds for the leader's descendants, each checked to be ours."""
+
+    def __init__(self, leader: int) -> None:
+        self.leader = leader
+        self.fds: dict[int, int] = {}
+
+    def collect(self) -> None:
+        """Walk from the leader and from every held process still running,
+        and hold a pidfd for each new descendant that checks out."""
+        todo: list[tuple[int, int | None]] = [(self.leader, None)]
+        todo += [(pid, fd) for pid, fd in self.fds.items() if not _pidfd_exited(fd)]
+        seen: set[int] = set()
+        while todo:
+            parent, parent_fd = todo.pop()
+            if parent in seen:
+                continue
+            seen.add(parent)
+            for child in _children_of(parent):
+                if child == self.leader or child == os.getpid():
+                    continue
+                held = self.fds.get(child)
+                if held is not None and not _pidfd_exited(held):
+                    todo.append((child, held))
+                    continue
+                fd = self._open_if_ours(child, parent, parent_fd)
+                if fd is None:
+                    continue
+                if held is not None:
+                    os.close(held)
+                self.fds[child] = fd
+                todo.append((child, fd))
+
+    @staticmethod
+    def _open_if_ours(child: int, parent: int, parent_fd: int | None) -> int | None:
+        try:
+            fd = _pidfd_open(child)
+        except OSError:
+            return None  # it ended already
+        ours = (
+            _parent_of(child) == parent
+            and (parent_fd is None or not _pidfd_exited(parent_fd))
+            and not _pidfd_exited(fd)
+        )
+        if not ours:
+            os.close(fd)
+            return None
+        return fd
+
+    def running(self) -> list[int]:
+        return [fd for fd in self.fds.values() if not _pidfd_exited(fd)]
+
+    def signal(self, sig: int) -> bool:
+        sent = False
+        for fd in self.running():
+            try:
+                _pidfd_send_signal(fd, sig)
+            except OSError:
+                continue
+            sent = True
+        return sent
+
+    def close(self) -> None:
+        for fd in self.fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds.clear()
+
+
+#: How long the stop waits for the wrapper's drain to end.
+_DRAIN_SECONDS: float = 10.0
+
+
+def _wait_for_exit(pid: int, seconds: float) -> bool:
+    """Wait on ``pid``'s pidfd until it exits (``True``) or ``seconds`` pass.
+
+    ``pid`` is this process's own unreaped child (the wrapper), so the pidfd
+    is opened for exactly it.
+    """
+    try:
+        fd = _pidfd_open(pid)
+    except OSError:
+        return True  # it is gone already
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        return bool(poller.poll(max(0, int(seconds * 1000))))
+    finally:
+        os.close(fd)
+
+
+class StoppableRun:
+    """One program :func:`run_program` starts inside :func:`stoppable`, which
+    another thread may stop with :meth:`request_stop`. See the block above."""
+
+    def __init__(self, label: str = "") -> None:
+        #: Names this run in the stop's log lines (the helper: which leg).
+        self.label = label
+        self._lock = threading.Lock()
+        self._process: "subprocess.Popen[bytes] | None" = None
+        self._finished = False
+        self._stop_requested = False
+        self._stopped = False
+        self._grace = 2.0
+        #: Test hooks: called on the running thread just before and just
+        #: after the run is marked finished (the leader exited, unreaped).
+        self._before_finish_mark: "Callable[[], None] | None" = None
+        self._after_finish_mark: "Callable[[], None] | None" = None
+
+    # The three readings take no lock: each is one attribute read, and a stop
+    # holds the lock for its whole grace, which a reader (``GET /busy``) must
+    # never wait behind.
+
+    @property
+    def started(self) -> bool:
+        return self._process is not None
+
+    @property
+    def stop_requested(self) -> bool:
+        return self._stop_requested
+
+    @property
+    def finished(self) -> bool:
+        return self._finished
+
+    def request_stop(self, *, grace: float) -> bool:
+        """Ask for the program and everything it started to be stopped.
+
+        Before the start: it will not be started. Running: TERM to every
+        group, KILL to those still running after ``grace``; this returns
+        once that is done. Finished: nothing is signalled. ``True`` when
+        this call signalled something, or will stop the program at its start.
+        """
+        with self._lock:
+            first = not self._stop_requested
+            self._stop_requested = True
+            self._grace = grace
+            if self._process is None:
+                return first and not self._finished
+        return self._stop_now()
+
+    def may_start(self) -> bool:
+        with self._lock:
+            return not self._stop_requested
+
+    def _attach(self, process: "subprocess.Popen[bytes]") -> None:
+        with self._lock:
+            self._process = process
+            stop = self._stop_requested
+        if stop:
+            self._stop_now()
+
+    def _stop_now(self) -> bool:
+        """The stop itself, under the lock from the first signal to the last.
+
+        The process held is the subreaper wrapper (see :data:`_SUBREAPER`),
+        unreaped throughout. Everything under it — the program and every
+        process in its tree, re-parented orphans included — is held by pidfd
+        and sent TERM; during the grace the walk is repeated from the wrapper,
+        so a process started or orphaned during the grace is found too. Then
+        the wrapper is sent the drain signal: it kills and reaps everything
+        under it until it has no child left, and exits; it is KILLed only if
+        that has not happened within :data:`_DRAIN_SECONDS`. The wrapper is
+        never sent TERM: it is first sent the hold signal, so it stays,
+        reaping, until the drain. ``True`` when anything was signalled.
+        """
+        with self._lock:
+            process = self._process
+            if process is None or self._finished or self._stopped:
+                return False
+            self._stopped = True
+            descendants = _Descendants(process.pid)
+            signalled = False
+            try:
+                if not _exited_unreaped(process.pid):
+                    # Hold the wrapper first (it is unreaped: the id is its own).
+                    try:
+                        os.kill(process.pid, _SUBREAPER_HOLD_SIGNAL)
+                    except OSError:
+                        pass
+                descendants.collect()
+                logger.warning(
+                    "stopping pid %s and the %d processes under it",
+                    process.pid,
+                    len(descendants.fds),
+                )
+                signalled = descendants.signal(signal.SIGTERM)
+                deadline = time.monotonic() + max(0.0, self._grace)
+                ticks = 0
+                while time.monotonic() < deadline:
+                    ticks += 1
+                    if ticks % 5 == 0:
+                        descendants.collect()
+                    if not descendants.running():
+                        break
+                    time.sleep(0.05)
+                # THE DRAIN IS THE WRAPPER'S OWN (Codex round 6). Under the
+                # same lock, the wrapper unreaped (its id is its own): it is
+                # told to drain, and it kills and reaps everything under it
+                # until it has no child at all, then exits. It is waited for,
+                # up to the drain's limit, and only killed if it is still
+                # there then.
+                if not _exited_unreaped(process.pid):
+                    try:
+                        os.kill(process.pid, _SUBREAPER_DRAIN_SIGNAL)
+                        signalled = True
+                    except OSError:
+                        pass
+                    if not _wait_for_exit(process.pid, _DRAIN_SECONDS):
+                        descendants.collect()
+                        logger.warning(
+                            "stopping %s: %d processes under it are still there "
+                            "after %g seconds of draining; killing its wrapper "
+                            "and going on",
+                            self.label or "a stoppable program",
+                            len(descendants.running()),
+                            _DRAIN_SECONDS,
+                        )
+                        try:
+                            os.kill(process.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
+            finally:
+                descendants.close()
+            return signalled
+
+    def _mark_finished(self) -> None:
+        if self._before_finish_mark is not None:
+            self._before_finish_mark()
+        with self._lock:
+            self._finished = True
+        if self._after_finish_mark is not None:
+            self._after_finish_mark()
+
+
+@contextlib.contextmanager
+def stoppable(run: StoppableRun) -> Iterator[None]:
+    """Run the next program :func:`run_program` starts on this thread as
+    ``run``, so another thread can stop it with ``run.request_stop``.
+
+    The runners that start a leg keep their signatures; the leg's handler
+    thread says which run it is.
+    """
+    previous = getattr(_started_observer, "run", None)
+    _started_observer.run = run
+    try:
+        yield
+    finally:
+        _started_observer.run = previous
+
+
+def _exited_unreaped(pid: int) -> bool:
+    """Has the child ``pid`` exited? It is left unreaped either way."""
+    result = os.waitid(os.P_PID, pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+    return result is not None and result.si_pid == pid
+
+
+def _reader(stream: Any, into: list[bytes]) -> threading.Thread:
+    def read() -> None:
+        try:
+            while True:
+                chunk = stream.read1(65536)
+                if not chunk:
+                    return
+                into.append(chunk)
+        except (OSError, ValueError):
+            return
+
+    thread = threading.Thread(target=read, daemon=True)
+    thread.start()
+    return thread
+
+
+#: THE SUBREAPER WRAPPER (Codex round 3, 19 October 2026). A stoppable
+#: program is started under this small Python program, which marks itself a
+#: Linux child subreaper (prctl PR_SET_CHILD_SUBREAPER, 36 on every
+#: architecture the factory runs on) and then starts the program as its
+#: child. A process anywhere in the program's tree whose parent exits is then
+#: re-parented to the wrapper, never to init, so everything the program
+#: started always stays under the wrapper, where a stop can find it. When the
+#: program exits, the wrapper records its status and stays, reaping, until it
+#: has no child left (Codex round 4): a child the program left running keeps
+#: the leg running, under the wrapper, until it ends or a stop or the time
+#: limit stops it. Then the wrapper exits with the program's own exit code
+#: (dying of the same signal when the program did), so exit codes and output
+#: are what they were.
+#:
+#: A stop first sends it :data:`_SUBREAPER_HOLD_SIGNAL`; a held wrapper does
+#: not exit when nothing is left under it, but stays (reaping) until the
+#: stop's drain. When the stop's TERM grace ends it sends
+#: :data:`_SUBREAPER_DRAIN_SIGNAL`, and the wrapper itself kills and reaps its
+#: direct children, pass after pass, until it has no child at all (Codex
+#: round 6: only the subreaper can know that for certain), then exits with
+#: the program's own status if the program had already exited, or with
+#: :data:`_SUBREAPER_DRAINED_EXIT_CODE`. Both handlers are installed before it
+#: says it has started, so neither signal kills it. A program that is never
+#: stopped never sees any of this.
+#:
+#: It writes one line on a status pipe of its own: ``started <pid> <subreaper
+#: or no-subreaper>``, or ``refused <errno> <reason>`` when the program could
+#: not be started, which is then reported as refused before it started,
+#: exactly as before. It runs with ``-I``, so nothing in the program's
+#: environment or working directory changes what it imports.
+#: The wrapper's exit code after a drain when the program was still running
+#: (it was killed by the drain): 128 + SIGKILL, as a shell would say it.
+_SUBREAPER_DRAINED_EXIT_CODE: int = 137
+
+_SUBREAPER = r"""
+import ctypes, os, signal, sys, time
+status = int(sys.argv[1])
+hold_signal = int(sys.argv[2])
+drain_signal = int(sys.argv[3])
+argv = sys.argv[5:]
+held = []
+drain = []
+signal.signal(hold_signal, lambda *_: held.append(True))
+signal.signal(drain_signal, lambda *_: drain.append(True))
+reaper = "no-subreaper"
+try:
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(ctypes.c_int(36), ctypes.c_ulong(1), ctypes.c_ulong(0),
+                  ctypes.c_ulong(0), ctypes.c_ulong(0)) == 0:
+        reaper = "subreaper"
+except Exception:
+    pass
+os.set_inheritable(status, False)
+defaults = [getattr(signal, n) for n in ("SIGPIPE", "SIGXFZ", "SIGXFSZ") if hasattr(signal, n)]
+try:
+    child = os.posix_spawnp(argv[0], argv, os.environ, setsigdef=defaults)
+except OSError as exc:
+    os.write(status, ("refused %d %s" % (exc.errno or 0, exc.strerror or exc)).encode())
+    os._exit(127)
+os.write(status, ("started %d %s" % (child, reaper)).encode())
+os.close(status)
+me = os.getpid()
+
+
+def my_children():
+    found = []
+    try:
+        tasks = os.listdir("/proc/self/task")
+        for task in tasks:
+            with open("/proc/self/task/%s/children" % task, "rb") as handle:
+                found.extend(int(part) for part in handle.read().split())
+        return found
+    except FileNotFoundError:
+        found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry, "rb") as handle:
+                fields = handle.read().decode("utf-8", "replace").rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if int(fields[1]) == me:
+            found.append(int(entry))
+    return found
+
+
+def pause_for_test(name):
+    # Off unless a test names a folder; the factory's launch list never does.
+    folder = os.environ.get("FORGE_TEST_WRAPPER_PAUSE_DIR")
+    if not folder:
+        return
+    with open(os.path.join(folder, name + ".tmp"), "w") as handle:
+        handle.write(" ".join(str(pid) for pid in snapshot))
+    os.rename(os.path.join(folder, name + ".tmp"), os.path.join(folder, name))
+    while not os.path.exists(os.path.join(folder, "resume")):
+        time.sleep(0.01)
+
+
+program_status = None
+while not drain:
+    try:
+        pid, how = os.waitpid(-1, os.WNOHANG)
+    except ChildProcessError:
+        # Nothing is left under this wrapper. A held wrapper waits for the
+        # stop's drain signal; otherwise the leg is over.
+        if not held:
+            break
+        time.sleep(0.05)
+        continue
+    if pid == 0:
+        time.sleep(0.05)
+        continue
+    if pid == child:
+        program_status = how
+
+if drain:
+    # THE DRAIN (Codex round 6). Kill every direct child, then reap, until
+    # there is no child at all. Each one killed is this wrapper's own
+    # unreaped child, so its id cannot have been reused: the kill comes
+    # before any reap in the pass, and only single positive ids are
+    # signalled. As subreaper this wrapper receives every orphan of the leg,
+    # and every live descendant descends from one of its direct children, so
+    # "no child" (ECHILD) means nothing of the leg is left.
+    exited_before_drain = program_status is not None
+    while True:
+        snapshot = [pid for pid in my_children() if pid > 0 and pid != me]
+        pause_for_test("snapshot")
+        for pid in snapshot:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        reaped = False
+        try:
+            while True:
+                pid, how = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                reaped = True
+                if pid == child and program_status is None:
+                    program_status = how
+        except ChildProcessError:
+            break
+        if not reaped:
+            time.sleep(0.01)
+    if not exited_before_drain:
+        os._exit(DRAINED_EXIT_CODE)
+
+code = os.waitstatus_to_exitcode(program_status)
+if code < 0:
+    try:
+        signal.signal(-code, signal.SIG_DFL)
+    except (OSError, ValueError):
+        pass
+    os.kill(me, -code)
+    os._exit(128 - code)
+os._exit(code)
+""".replace("DRAINED_EXIT_CODE", str(_SUBREAPER_DRAINED_EXIT_CODE))
+
+#: What a stop sends the wrapper first, to keep it until the drain.
+_SUBREAPER_HOLD_SIGNAL: int = int(signal.SIGRTMIN) + 3
+
+#: What a stop sends the wrapper when the TERM grace ends: kill and reap
+#: everything under it until nothing is left, then exit.
+_SUBREAPER_DRAIN_SIGNAL: int = int(signal.SIGRTMIN) + 4
+
+
+#: How long the parent waits for the wrapper's status line.
+_SUBREAPER_STATUS_SECONDS = 30.0
+
+
+def _subreaper_argv(argv: Sequence[str], status_write: int) -> list[str]:
+    """``argv`` run under the wrapper, which reports on ``status_write``."""
+    import sys
+
+    return [
+        sys.executable,
+        "-I",
+        "-c",
+        _SUBREAPER,
+        str(status_write),
+        str(_SUBREAPER_HOLD_SIGNAL),
+        str(_SUBREAPER_DRAIN_SIGNAL),
+        "--",
+        *argv,
+    ]
+
+
+def _await_subreaper(process: "subprocess.Popen[bytes]", status_read: int) -> None:
+    """Read the wrapper's status line; raise :class:`ProgramRefused` (nothing
+    is running) when it says the program could not be started."""
+    said = b""
+    try:
+        poller = select.poll()
+        poller.register(status_read, select.POLLIN | select.POLLHUP)
+        until = time.monotonic() + _SUBREAPER_STATUS_SECONDS
+        while time.monotonic() < until:
+            if not poller.poll(100):
+                continue
+            chunk = os.read(status_read, 4096)
+            if not chunk:
+                break
+            said += chunk
+    except OSError as exc:  # unread: it is running, and is waited for as such
+        said = f"unread status: {exc}".encode()
+    words = said.decode("utf-8", errors="replace").split(" ", 2)
+    if words[0] == "refused":
+        try:
+            process.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        number = int(words[1]) if len(words) > 1 and words[1].isdigit() else 0
+        reason = words[2] if len(words) > 2 else "the program could not be started"
+        raise ProgramRefused(number, reason) from OSError(number, reason)
+    if words[0] != "started" or "no-subreaper" in words[-1]:
+        logger.warning(
+            "the stoppable program's wrapper said %r: what it starts may not all "
+            "stay under it",
+            said[:200],
+        )
+
+
+def _run_stoppable(
+    process: "subprocess.Popen[bytes]",
+    run: StoppableRun,
+    *,
+    timeout: float,
+    kill_grace_seconds: float,
+    post_kill_read_seconds: float,
+) -> ProgramOutcome:
+    """Wait for a program started under :func:`stoppable`; never reap early.
+
+    The same three endings as :func:`run_program`'s own wait: the program
+    exited (and its output reached its end), it was stopped at ``timeout``,
+    or something raised after the start. Its end is observed without reaping
+    it, the run is marked finished, and only then is it reaped.
+    """
+    out: list[bytes] = []
+    err: list[bytes] = []
+    readers = [_reader(process.stdout, out), _reader(process.stderr, err)]
+    timed_out = False
+    try:
+        run._attach(process)
+        deadline = time.monotonic() + timeout
+        while True:
+            if _exited_unreaped(process.pid) and not any(r.is_alive() for r in readers):
+                break
+            if time.monotonic() >= deadline:
+                timed_out = True
+                break
+            time.sleep(0.05)
+        if timed_out:
+            with run._lock:
+                run._grace = kill_grace_seconds
+            run._stop_now()
+            until = time.monotonic() + post_kill_read_seconds
+            while time.monotonic() < until:
+                if _exited_unreaped(process.pid) and not any(r.is_alive() for r in readers):
+                    break
+                time.sleep(0.05)
+        run._mark_finished()
+        try:
+            process.wait(timeout=post_kill_read_seconds if timed_out else None)
+        except subprocess.TimeoutExpired:
+            pass
+        return ProgramOutcome(
+            exit_code=process.returncode,
+            stdout=b"".join(out),
+            stderr=b"".join(err),
+            timed_out=timed_out,
+        )
+    except BaseException as exc:  # noqa: BLE001 — after the start: nobody knows
+        if not isinstance(exc, ChildProcessError):
+            # (A ChildProcessError means something else reaped it: its ids
+            # may already be reused, so nothing is signalled.)
+            with run._lock:
+                run._grace = kill_grace_seconds
+            run._stop_now()
+        run._mark_finished()
+        if not isinstance(exc, Exception):
+            raise
+        return ProgramOutcome(
+            exit_code=process.returncode,
+            stdout=b"",
+            stderr=b"",
+            raised_while_running=True,
+            error=exc,
+        )
+
+
 def run_program(
     argv: Sequence[str],
     *,
@@ -189,16 +911,38 @@ def run_program(
     group stopped too when ``new_session``); anything raised once it had
     started is ``raised_while_running``, after the program is stopped.
     """
+    run: StoppableRun | None = getattr(_started_observer, "run", None)
+    if run is not None:
+        # Taken once: the next program on this thread is the stoppable one.
+        _started_observer.run = None
+        if not run.may_start():
+            return ProgramOutcome(
+                exit_code=None,
+                stdout=b"",
+                stderr=b"",
+                refused_before_start=True,
+                error=ProgramRefused(
+                    "it was asked to stop before it started, so it was not started"
+                ),
+            )
+    # A stoppable program runs under the subreaper wrapper (see _SUBREAPER),
+    # which reports whether it started on a pipe of its own.
+    status_pipe = os.pipe() if run is not None else None
     try:
         process = start_program(
-            argv,
+            _subreaper_argv(argv, status_pipe[1]) if status_pipe else argv,
             cwd=cwd,
             env=env,
             stdin=stdin,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            start_new_session=new_session,
+            start_new_session=True if status_pipe else new_session,
+            pass_fds=(status_pipe[1],) if status_pipe else (),
         )
+        if status_pipe:
+            os.close(status_pipe[1])
+            status_pipe = (status_pipe[0], -1)
+            _await_subreaper(process, status_pipe[0])
     except ProgramRefused as exc:
         return ProgramOutcome(
             exit_code=None,
@@ -206,6 +950,18 @@ def run_program(
             stderr=b"",
             refused_before_start=True,
             error=exc.__cause__ or exc,
+        )
+    finally:
+        for end in status_pipe or ():
+            if end >= 0:
+                os.close(end)
+    if run is not None:
+        return _run_stoppable(
+            process,
+            run,
+            timeout=timeout,
+            kill_grace_seconds=kill_grace_seconds,
+            post_kill_read_seconds=post_kill_read_seconds,
         )
     try:
         out, err = process.communicate(timeout=timeout)

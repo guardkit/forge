@@ -169,6 +169,7 @@ __all__ = [
     "failure_lines_in_output",
     "summarise_declared_test_output",
     "build_conductor_driver_deps_factory",
+    "make_conductor_leg_canceller",
     "build_conductor_supervisor_factory",
     "load_declared_toolchain",
     "make_conductor_close_out",
@@ -4246,6 +4247,7 @@ def build_conductor_driver_deps_factory(
     source_build_id_reader: Callable[[str], str | None] | None = None,
     take_ack_handle: Callable[[str], Any] | None = None,
     clock: Callable[[], datetime] | None = None,
+    cancel_leg: Callable[..., tuple[bool, str]] | None = None,
 ) -> Callable[[str, Any], ConductorDriverDeps]:
     """Return the ``(build_id, supervisor) -> ConductorDriverDeps`` factory.
 
@@ -4274,6 +4276,10 @@ def build_conductor_driver_deps_factory(
       while a turn or a wait is in flight. It is how the daemon notices a
       ``forge cancel`` run in another process and releases the queued
       message at once rather than after the stage in flight ends.
+    * ``cancel_running_leg`` — :func:`make_conductor_leg_canceller`: once
+      that release is done, asks the build's sandbox helper to stop the leg
+      it is still running. ``cancel_leg`` is injected by tests; production
+      uses :func:`forge.adapters.guardkit.run_via_sidecar.cancel_leg_via_sidecar`.
 
     The bus seam is the ONLY one that touches NATS, and it arrives
     injected, so every test here runs network-free.
@@ -4317,6 +4323,10 @@ def build_conductor_driver_deps_factory(
         row = pool.get_build_row(build_id)
         return row is not None and row.status in TERMINAL_STATES
 
+    cancel_running_leg = make_conductor_leg_canceller(
+        pool=pool, config=config, cancel_leg=cancel_leg
+    )
+
     def deps_factory(build_id: str, supervisor: Any) -> ConductorDriverDeps:
         return ConductorDriverDeps(
             supervisor=supervisor,
@@ -4329,6 +4339,65 @@ def build_conductor_driver_deps_factory(
             close_out=close_out,
             release_queue_message=release_queue_message,
             build_has_ended=build_has_ended,
+            cancel_running_leg=cancel_running_leg,
         )
 
     return deps_factory
+
+
+def make_conductor_leg_canceller(
+    *,
+    pool: Any,
+    config: Any,
+    cancel_leg: Callable[..., tuple[bool, str]] | None = None,
+) -> Callable[[str], Awaitable[None]]:
+    """Return ``async (build_id) -> None``: stop the build's leg in its sandbox.
+
+    19 October 2026. When ``forge cancel`` ends a running fix journey, the
+    conductor releases its place within seconds, but a leg sent to the
+    repository's sandbox ran on to its end, because the sandbox helper does
+    nothing when a client stops waiting. This asks that helper — the one
+    :func:`make_conductor_guardkit_run_chooser` sent the leg to, found the
+    same way, off the build row's repository — to stop the leg of this build
+    (``POST /guardkit-leg/cancel``, by the build id every leg request
+    carries). A repository with no sandbox runs its legs here, where the
+    existing kill path stops them, so nothing is asked.
+
+    Its answer is logged once. Raises only what reading the row raises; the
+    driver logs that once and carries on, its release already done.
+    """
+
+    async def cancel_running_leg(build_id: str) -> None:
+        sandboxes = dict(
+            getattr(getattr(config, "planning", None), "sandboxes", None) or {}
+        )
+        if not sandboxes:
+            return
+        row = pool.get_build_row(build_id)
+        repo = str(getattr(row, "repo", "") or "") if row is not None else ""
+        entry = sandboxes.get(repo)
+        if entry is None:
+            return
+        stopper = cancel_leg
+        if stopper is None:
+            from forge.adapters.guardkit.run_via_sidecar import cancel_leg_via_sidecar
+
+            stopper = cancel_leg_via_sidecar
+        status = getattr(getattr(row, "status", None), "value", None) or str(
+            getattr(row, "status", "") or "unknown"
+        )
+        stopped, sentence = await asyncio.to_thread(
+            stopper, base_url=str(entry.sidecar_url), build=build_id
+        )
+        # The watch fires for any ended status, not only a cancel.
+        logger.warning(
+            "conductor: build_id=%s has ended (%s) while a stage ran in %s's "
+            "sandbox — %s%s",
+            build_id,
+            status,
+            repo,
+            sentence,
+            "" if stopped else "; it runs on to its own end",
+        )
+
+    return cancel_running_leg

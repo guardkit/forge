@@ -91,7 +91,7 @@ services:
   # one, from the environment the command was run in.
   #
   # BUT THEY DO NOT GO INTO THE CONTAINER'S ENVIRONMENT. The bus repository's
-  # own compose file puts all eight in 'environment:', where 'docker inspect'
+  # own compose file puts all nine in 'environment:', where 'docker inspect'
   # shows them to anybody who can reach the Docker daemon, and where they are
   # copied into the container's declared configuration on disk. Here each one
   # arrives as a FILE (the 'secrets:' at the foot of this file, each read from
@@ -123,11 +123,11 @@ services:
       - -c
       - |
         set -eu
-        for account in ADMIN RICH JAMES MARK FORGE FLEET_MEMORY GUARDKIT JARVIS; do
+        for account in ADMIN RICH JAMES MARK FORGE FLEET_MEMORY GUARDKIT JARVIS DASHBOARD_APPROVE; do
             variable="$${account}_NATS_PASSWORD"
             file="/run/secrets/$$(printf '%s' "$${variable}" | tr 'A-Z' 'a-z')"
             if [ ! -s "$${file}" ]; then
-                echo "the bus was given no $${variable}: the estate passes each of the bus's eight account passwords in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with the values passed in from a child process." >&2
+                echo "the bus was given no $${variable}: the estate passes each of the bus's nine account passwords in as a file, and this one arrived missing or empty. Start the estate the way deploy/estate/README.md says, with the values passed in from a child process." >&2
                 exit 1
             fi
             value="$$(cat "$${file}")"
@@ -160,6 +160,8 @@ services:
         target: guardkit_nats_password
       - source: bus-jarvis-password
         target: jarvis_nats_password
+      - source: bus-dashboard-approve-password
+        target: dashboard_approve_nats_password
     volumes:
       # THE BUS'S OWN CONFIG, READ-ONLY — exactly the two mounts the bus
       # repository's own compose file makes, at the same two places, but out of
@@ -423,7 +425,7 @@ services:
   # same in longer words.
   #
   # THE DATABASE ADDRESS IS A SECRET, because it carries the password in it. It
-  # arrives the same way the bus's eight account passwords do — as a FILE under
+  # arrives the same way the bus's nine account passwords do — as a FILE under
   # /run/secrets, read from the environment the command was run in — and a
   # small wrapper puts it into the environment of the service's own PROCESS and
   # nothing else. It is never in a container's declared environment, where
@@ -1781,7 +1783,7 @@ volumes:
     name: ${BUS_SOURCE_VOLUME:?name the volume holding the bus repository's config and provisioning scripts - ./build-estate-images.sh makes it and prints its name}
 
 # ---------------------------------------------------------------------------
-# THE BUS'S EIGHT ACCOUNT PASSWORDS, AS FILES.
+# THE BUS'S NINE ACCOUNT PASSWORDS, AS FILES.
 #
 # Each one is read from the environment the 'docker compose' command was run
 # in — which is a child process of 'sops exec-env', and the only place a value
@@ -1817,13 +1819,20 @@ secrets:
     environment: GUARDKIT_NATS_PASSWORD
   bus-jarvis-password:
     environment: JARVIS_NATS_PASSWORD
+  # The factory dashboard's answer account (19 October 2026): it may publish
+  # only answers to Forge's cards and may subscribe to nothing. The bus is given it here like the other
+  # eight. The dashboard is not in this estate and never reads this secret: it
+  # keeps its own copy as a file in its own config folder (README.md, "The
+  # dashboard's answer password").
+  bus-dashboard-approve-password:
+    environment: DASHBOARD_APPROVE_NATS_PASSWORD
 
   # The account the one-shot provisions the bus's storage as. The env file says
-  # WHICH of the eight names above that account's password is under, so the
+  # WHICH of the nine names above that account's password is under, so the
   # account can be changed in the env file without changing this file — and so
-  # that it is always one of the eight the bus itself is given.
+  # that it is always one of the nine the bus itself is given.
   bus-provision-password:
-    environment: ${NATS_PROVISION_PASSWORD_NAME:?name which of the bus's eight password names the provisioning account's password is under, e.g. RICH_NATS_PASSWORD}
+    environment: ${NATS_PROVISION_PASSWORD_NAME:?name which of the bus's nine password names the provisioning account's password is under, e.g. RICH_NATS_PASSWORD}
 
   # THE MEMORY STORE'S ADDRESS, WHICH CARRIES ITS PASSWORD. One value, so one
   # secret: it is read from the environment the command was run in — the same

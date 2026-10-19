@@ -471,6 +471,15 @@ class ConductorDriverDeps:
             hour-long redelivery). A wait is cut short so the next turn
             reads the terminal and closes the journey out. ``None`` keeps
             the loop exactly as before.
+        cancel_running_leg: ``(build_id) -> Any`` — ask for the stage still
+            running for a build ended from outside to be stopped. Called
+            once, after the queued message is released, when
+            ``build_has_ended`` reads terminal while a turn is running (19
+            October 2026: the released place was free within seconds, but
+            the sandbox's leg ran on to its end for up to half an hour of
+            model time). The composition asks the build's sandbox helper; a
+            build with no sandbox has nothing to ask. A failure is logged
+            once and changes nothing else. ``None`` asks nobody.
         ended_watch_seconds: See :data:`ENDED_WATCH_SECONDS`.
         clock: Monotonic source, injected for deterministic tests.
         sleep: ``(seconds) -> Awaitable[None]`` — injected so tests do
@@ -490,6 +499,7 @@ class ConductorDriverDeps:
     close_out: Callable[..., Any] | None = None
     release_queue_message: Callable[[str], Any] | None = None
     build_has_ended: Callable[[str], Any] | None = None
+    cancel_running_leg: Callable[[str], Any] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     max_turns: int = DEFAULT_MAX_TURNS
@@ -519,6 +529,9 @@ class ConductorTurnLoop:
         #: later close-out never asks for a handle again: after a cancel
         #: frees the place, a new build of the same feature may hold one.
         self._released = False
+        #: Set once the running stage of a build ended from outside has been
+        #: asked to stop, so it is asked at most once per journey.
+        self._leg_cancel_asked = False
 
     async def drive(self, build_id: str) -> ConductorRunReport:
         """Walk ``build_id`` through the conductor until it stops.
@@ -1366,14 +1379,38 @@ class ConductorTurnLoop:
                     "conductor: build_id=%s was ended from outside (its row "
                     "is terminal) while a stage was running; releasing its "
                     "queued message now so the next build can start — the "
-                    "running stage is left to finish and the journey then "
+                    "running stage is asked to stop and the journey then "
                     "closes out",
                     build_id,
                 )
                 await self._release(build_id)
+                await self._cancel_running_leg(build_id)
             return await turn
         finally:
             await _cancel_and_settle(turn)
+
+    async def _cancel_running_leg(self, build_id: str) -> None:
+        """Ask once for the running stage to be stopped; never raises.
+
+        Comes after the release, so a failure here can never hold the
+        build's place. The turn itself is left running: it ends when the
+        stage it is waiting on does.
+        """
+        deps = self._deps
+        if deps.cancel_running_leg is None or self._leg_cancel_asked:
+            return
+        self._leg_cancel_asked = True
+        try:
+            await _maybe_await(deps.cancel_running_leg(build_id))
+        except Exception as exc:  # noqa: BLE001 — a stop that fails changes nothing
+            logger.warning(
+                "conductor: asking for the running stage of build_id=%s to "
+                "stop raised %s: %s — it runs on to its own end; the build's "
+                "place is already released",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
 
     async def _ended_while(self, build_id: str, task: "asyncio.Future[Any]") -> bool:
         """Wait for ``task``; ``True`` as soon as the build reads ended first.

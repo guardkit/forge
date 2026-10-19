@@ -11,7 +11,12 @@ Design of record: docs/factory-deploy-execution-surface-design-2026-07-16.md §1
 The narrow contract:
 
     GET  /healthz -> {"status": "healthy", "rev": "git-<sha>", "instance": "<id>"}
-    GET  /busy    -> {"busy": bool, "executing": [{route, repo, seconds}]}
+    GET  /busy    -> {"busy": bool, "executing": [{route, repo, seconds,
+                                                   leg?, cancelled?}]}
+    POST /guardkit-leg/cancel {build} | {leg}
+              -> {cancelled: [{leg, build, started}]}
+              (stops a running fix-journey leg and everything it started;
+              see the block above :func:`process_guardkit_leg_request`)
     POST /run  {repo, script, env, timeout_seconds, cwd?}
               -> {exit_code, output_tail, cwd}
     POST /run  {repo, driver, args, env, timeout_seconds, cwd?}
@@ -200,6 +205,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -236,8 +242,10 @@ from forge.deploy_sidecar.deploy_executor import (
 from forge.executor.programs import (
     RaisedWhileRunning,
     RefusedBeforeStart,
+    StoppableRun,
     TimedOut,
     run_program,
+    stoppable,
 )
 from forge.executor.shell_steps import _run_script_step
 from forge.launch_environment import (
@@ -595,7 +603,7 @@ SIDECAR_CODE_VERSION: str = resolve_code_version()
 #: id made once when the helper process starts, so it changes whenever the
 #: helper is recreated (a VM restart recreates it). ``/healthz`` reports it as
 #: ``instance``, and the sandbox starter binds a deployment's readiness to it.
-HELPER_INSTANCE: str = __import__("uuid").uuid4().hex
+HELPER_INSTANCE: str = uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------------------
@@ -5744,6 +5752,26 @@ def _validate_extra_files(raw: Any) -> tuple[dict[str, str], str | None]:
 #: The route.
 GUARDKIT_LEG_ROUTE: str = "/guardkit-leg"
 
+#: STOPPING A RUNNING LEG (19 October 2026). ``forge cancel`` ends a fix
+#: journey from outside; the coordinator then frees the build's place, but the
+#: leg it had sent here kept running to its end, up to half an hour of model
+#: time, because a client that hangs up does nothing to a request in progress
+#: here. ``POST /guardkit-leg/cancel`` with ``{"build": "<build id>"}`` (what
+#: the coordinator sends: every leg request carries its build) or ``{"leg":
+#: <n>}`` (the number ``GET /busy`` lists for a leg) stops that leg's process
+#: group, and the group of every process it started (GuardKit starts a
+#: project's test commands in sessions of their own): TERM, then KILL after
+#: :data:`LEG_CANCEL_GRACE_SECONDS`. A leg is listed from the moment its
+#: request is admitted, so a cancel that lands before its process starts
+#: means it never starts. A finished leg is never signalled (see
+#: :class:`forge.executor.programs.StoppableRun`). The leg's own request then
+#: answers as it always does, with ``"cancelled": true`` added. A build or
+#: number with no leg running here is refused in one sentence.
+GUARDKIT_LEG_CANCEL_ROUTE: str = "/guardkit-leg/cancel"
+
+#: How long a cancelled leg is given to stop on TERM before it is killed.
+LEG_CANCEL_GRACE_SECONDS: float = 5.0
+
 #: The only two subcommands this route will carry.
 LEG_SUBCOMMANDS: tuple[str, ...] = ("task-review", "task-work")
 
@@ -8343,6 +8371,12 @@ class _SidecarServer(ThreadingHTTPServer):
         self.executing: dict[int, dict[str, Any]] = {}
         self.executing_lock = threading.Lock()
         self._next_request = 0
+        # The fix-journey legs among them, by the same number, so one can be
+        # stopped from another request (``/guardkit-leg/cancel``).
+        self.running_legs: dict[int, _RunningLeg] = {}
+        #: Test hook: ``(number, route)``, called on the request's thread
+        #: straight after its admission.
+        self.after_admission: Callable[[int, str], None] | None = None
         self.config_loader = config_loader
         self.script_runner = script_runner
         # TWO RUNNERS, NOT ONE (13 October 2026). ``merge_runner`` starts the
@@ -8364,9 +8398,12 @@ class _SidecarServer(ThreadingHTTPServer):
         # rather than run ungated.
         self.deploy_executor = deploy_executor
 
-    def begin_request(self, route: str, payload: Any) -> int:
-        """Note a request as executing; the number to end it with."""
+    def admit(self, route: str, payload: Any) -> tuple[int, "_RunningLeg | None"]:
+        """Note a request as executing and, for a leg, as cancellable — both
+        under ONE hold of the lock, so a cancel sees both or neither (Codex
+        round 2). The number to end it with, and the leg when it is one."""
         repo = payload.get("repo") if isinstance(payload, dict) else None
+        leg: _RunningLeg | None = None
         with self.executing_lock:
             self._next_request += 1
             number = self._next_request
@@ -8375,11 +8412,74 @@ class _SidecarServer(ThreadingHTTPServer):
                 "repo": str(repo)[:200] if isinstance(repo, str) else None,
                 "started": time.monotonic(),
             }
-        return number
+            if route == GUARDKIT_LEG_ROUTE:
+                raw = payload.get("build") if isinstance(payload, dict) else None
+                build = raw.strip() if isinstance(raw, str) and raw.strip() else None
+                leg = _RunningLeg(number=number, build=build)
+                self.running_legs[number] = leg
+        return number, leg
 
     def end_request(self, number: int) -> None:
         with self.executing_lock:
             self.executing.pop(number, None)
+            self.running_legs.pop(number, None)
+
+    def cancel_legs(self, payload: Any) -> tuple[int, dict[str, Any]]:
+        """``POST /guardkit-leg/cancel``: stop the leg(s) named; never raises.
+
+        ``{"build": id}`` stops every leg of that build running here (a
+        journey runs one at a time); ``{"leg": n}`` the one ``GET /busy``
+        numbers ``n``. Exactly one of the two. Answers once each process
+        group has been stopped (TERM, then KILL after the grace).
+        """
+        if not isinstance(payload, dict):
+            return 400, {"error": "request body must be a JSON object"}
+        build = payload.get("build")
+        number = payload.get("leg")
+        if (build is None) == (number is None):
+            return 400, {
+                "error": (
+                    "name the leg to stop by exactly one of 'build' (the build "
+                    "it belongs to) or 'leg' (its number on GET /busy)"
+                )
+            }
+        if build is not None and (
+            not isinstance(build, str) or not BUILD_ID_PATTERN.match(build.strip())
+        ):
+            return 400, {
+                "error": (
+                    "'build' is a build id as the coordinator writes it down: "
+                    "letters, digits, dots, dashes, colons and underscores, at "
+                    f"most 128 of them; got {build!r}"
+                )
+            }
+        if number is not None and (
+            isinstance(number, bool) or not isinstance(number, int)
+        ):
+            return 400, {"error": f"'leg' is a whole number; got {number!r}"}
+        with self.executing_lock:
+            if build is not None:
+                wanted = build.strip()
+                legs = [leg for leg in self.running_legs.values() if leg.build == wanted]
+            else:
+                found = self.running_legs.get(number)
+                legs = [found] if found is not None else []
+        if not legs:
+            named = f"build {build.strip()}" if build is not None else f"number {number}"
+            return 404, {
+                "error": (
+                    f"no fix-journey leg of {named} is running on this helper "
+                    "(it may have finished already), so nothing was stopped"
+                )
+            }
+        for leg in legs:
+            leg.cancel()
+        return 200, {
+            "cancelled": [
+                {"leg": leg.number, "build": leg.build, "started": leg.started}
+                for leg in legs
+            ]
+        }
 
     def busy_answer(self) -> dict[str, Any]:
         """``GET /busy``: the requests executing now, oldest first. Read-only:
@@ -8388,15 +8488,56 @@ class _SidecarServer(ThreadingHTTPServer):
         now = time.monotonic()
         with self.executing_lock:
             entries = sorted(self.executing.items())
-        listed = [
-            {
+            legs = dict(self.running_legs)
+        listed = []
+        for number, entry in entries:
+            item: dict[str, Any] = {
                 "route": entry["route"],
                 "repo": entry["repo"],
                 "seconds": round(max(0.0, now - entry["started"]), 1),
             }
-            for _number, entry in entries
-        ]
+            leg = legs.get(number)
+            if leg is not None:
+                # The leg's number, so it can be stopped by hand, and whether
+                # it has been asked to stop. Nothing the request carried.
+                item["leg"] = number
+                if leg.cancelled:
+                    item["cancelled"] = True
+            listed.append(item)
         return {"busy": bool(listed), "executing": listed}
+
+
+class _RunningLeg:
+    """One ``/guardkit-leg`` request in progress, from its admission.
+
+    Its program runs as a :class:`forge.executor.programs.StoppableRun`: a
+    cancel before the start means it is never started, and a cancel while it
+    runs stops it and everything it started, never once it has finished.
+    """
+
+    def __init__(self, *, number: int, build: str | None) -> None:
+        self.number = number
+        self.build = build
+        self.run = StoppableRun(
+            label=f"the fix-journey leg number {number} (build {build or 'not named'})"
+        )
+
+    @property
+    def started(self) -> bool:
+        return self.run.started
+
+    @property
+    def cancelled(self) -> bool:
+        return self.run.stop_requested
+
+    def cancel(self) -> None:
+        logger.warning(
+            "forge-deploy-sidecar: stopping the fix-journey leg number %d "
+            "(build %s) and everything it started, because it was cancelled",
+            self.number,
+            self.build or "not named",
+        )
+        self.run.request_stop(grace=LEG_CANCEL_GRACE_SECONDS)
 
 
 class DeploySidecarHandler(BaseHTTPRequestHandler):
@@ -8464,6 +8605,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 RECEIPTS_EXPORT_ROUTE,
                 STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
+                GUARDKIT_LEG_CANCEL_ROUTE,
                 CODE_LIST_FILES_ROUTE,
                 CODE_READ_FILE_ROUTE,
                 CODE_IMPORTS_ROUTE,
@@ -8480,17 +8622,29 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._write_json(400, {"error": f"invalid JSON body: {exc}"})
                 return
-            number = self.server.begin_request(route, payload)  # type: ignore[attr-defined]
+            # A leg is cancellable from its admission, before anything else
+            # (configuration included) is done for it.
+            number, leg = self.server.admit(route, payload)  # type: ignore[attr-defined]
             try:
-                self._answer_post(route, payload)
+                hook = self.server.after_admission  # type: ignore[attr-defined]
+                if hook is not None:
+                    hook(number, route)
+                self._answer_post(route, payload, leg=leg)
             finally:
                 self.server.end_request(number)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001 — never crash the server
             logger.exception("sidecar POST handler error")
             self._safe_500(exc)
 
-    def _answer_post(self, route: str, payload: Any) -> None:
+    def _answer_post(
+        self, route: str, payload: Any, *, leg: "_RunningLeg | None" = None
+    ) -> None:
         """Route one POST and write its answer (counted on ``/busy`` meanwhile)."""
+        if route == GUARDKIT_LEG_CANCEL_ROUTE:
+            # Needs no configuration: it only stops what this process started.
+            status, body = self.server.cancel_legs(payload)  # type: ignore[attr-defined]
+            self._write_json(status, body)
+            return
         try:
             config = self.server.config_loader()  # type: ignore[attr-defined]
         except SidecarConfigError as exc:
@@ -8598,11 +8752,39 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
         elif route in PREVIEW_ROUTES:
             status, body = process_preview_request(route, payload, config=config)
         elif route == GUARDKIT_LEG_ROUTE:
-            status, body = process_guardkit_leg_request(
-                payload,
-                config=config,
-                leg_runner=self.server.merge_runner,  # type: ignore[attr-defined]
-            )
+            if leg is not None and leg.cancelled:
+                # Cancelled before it started: it never starts.
+                status, body = 200, {
+                    "exit_code": MERGE_NOT_STARTED_EXIT_CODE,
+                    "stdout": "",
+                    "stderr_tail": "",
+                    "timed_out": False,
+                    "context_warnings": [],
+                }
+            else:
+                with (
+                    stoppable(leg.run) if leg is not None else contextlib.nullcontext()
+                ):
+                    status, body = process_guardkit_leg_request(
+                        payload,
+                        config=config,
+                        leg_runner=self.server.merge_runner,  # type: ignore[attr-defined]
+                    )
+            if leg is not None and leg.cancelled and status == 200:
+                # Answered as cancelled: the coordinator asked for this leg to
+                # stop because its build was cancelled, so its end is not a
+                # failure of the work.
+                body["cancelled"] = True
+                said = (
+                    "this leg was stopped, with everything it had started, "
+                    "because it was cancelled"
+                    if leg.started
+                    else "this leg was not started, because it was cancelled "
+                    "before it could start"
+                )
+                body["stderr_tail"] = (
+                    f"{body.get('stderr_tail') or ''}\n{said}"
+                ).strip()
         else:
             status, body = process_run_request(
                 payload,
@@ -8815,6 +8997,8 @@ __all__ = [
     "GIT_BRANCH_DIFF_LIMIT_BYTES",
     "process_receipts_export_request",
     "GUARDKIT_LEG_ROUTE",
+    "GUARDKIT_LEG_CANCEL_ROUTE",
+    "LEG_CANCEL_GRACE_SECONDS",
     "LEG_SUBCOMMANDS",
     "LEG_TIMEOUT_DEFAULT",
     "LEG_TIMEOUT_MAX",

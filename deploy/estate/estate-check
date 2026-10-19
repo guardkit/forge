@@ -729,7 +729,7 @@ check_the_bus_mode_and_the_files_agree() {
 # Every ${NAME:?...} in the files the estate composes: the names that have no
 # default and that compose refuses to render without. Also every ${NAME} the
 # env file's own values are built out of, and every name a SECRET is read from
-# — which is where the bus's eight account passwords come in. A secret names an
+# — which is where the bus's nine account passwords come in. A secret names an
 # environment variable rather than interpolating one, so it is deliberately
 # invisible to the first rule: compose renders the bundle without it and
 # refuses to START without it, which is why this check is the place the

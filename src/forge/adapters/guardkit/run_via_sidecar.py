@@ -114,6 +114,13 @@ def _target_is_carried(target: str) -> bool:
 #: The sidecar operation the fix journey's legs talk to (rule 75).
 LEG_ENDPOINT: str = "/guardkit-leg"
 
+#: The sidecar operation that stops a running leg (19 October 2026).
+LEG_CANCEL_ENDPOINT: str = "/guardkit-leg/cancel"
+
+#: How long the coordinator waits for the sidecar to say it stopped a leg.
+#: Longer than the sidecar's own TERM-to-KILL grace, so its answer arrives.
+LEG_CANCEL_HTTP_TIMEOUT_SECONDS: float = 20.0
+
 #: The only subcommands the leg door will carry.
 LEG_SUBCOMMANDS: tuple[str, ...] = ("task-review", "task-work")
 
@@ -815,6 +822,11 @@ def build_sidecar_leg_run(
         exit_code = int(parsed["exit_code"])
         stdout = parsed.get("stdout")
         stderr = parsed.get("stderr_tail")
+        # A LEG STOPPED BECAUSE ITS BUILD WAS CANCELLED (19 October 2026) is
+        # never read as work that passed, whatever it exited with.
+        cancelled = parsed.get("cancelled") is True
+        if cancelled and exit_code == 0:
+            exit_code = TRANSPORT_EXIT_CODE
         # THE LEG'S ANSWER IS READ, NOT THROWN AWAY. A leg says what it found
         # in its own output — the artefacts it wrote, its findings block, the
         # coach's score — and the conductor's dispatcher records a review leg
@@ -831,6 +843,16 @@ def build_sidecar_leg_run(
             timed_out=parsed.get("timed_out") is True,
         )
         warnings = _context_warnings(parsed.get("context_warnings"))
+        if cancelled:
+            warnings.append(
+                GuardKitWarning(
+                    code="leg_cancelled",
+                    message=(
+                        f"the sandbox stopped the {subcommand} leg because its "
+                        "build was cancelled"
+                    ),
+                )
+            )
         if warnings:
             return result.model_copy(
                 update={"warnings": warnings + list(result.warnings)}
@@ -838,6 +860,35 @@ def build_sidecar_leg_run(
         return result
 
     return run_leg_via_sidecar
+
+
+def cancel_leg_via_sidecar(
+    *,
+    base_url: str,
+    build: str,
+    timeout: float = LEG_CANCEL_HTTP_TIMEOUT_SECONDS,
+) -> tuple[bool, str]:
+    """Ask a sandbox's sidecar to stop the running leg of ``build``.
+
+    Blocking; returns ``(stopped, sentence)`` and never raises. ``stopped``
+    is True only when the sidecar says it stopped a leg; a 404 (no leg of
+    that build running there) or no answer is False, said in the sentence.
+    """
+    endpoint = f"{base_url.rstrip('/')}{LEG_CANCEL_ENDPOINT}"
+    try:
+        status, parsed = _post(endpoint, {"build": str(build)}, timeout=timeout)
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return False, (
+            f"the sandbox sidecar at {base_url} could not be asked to stop the "
+            f"leg of build {build}: {type(exc).__name__}: {exc}"
+        )
+    if status == 200:
+        return True, f"the sandbox sidecar at {base_url} stopped the leg of build {build}"
+    said = parsed.get("error") if isinstance(parsed, dict) else None
+    return False, (
+        f"the sandbox sidecar at {base_url} did not stop a leg of build {build} "
+        f"(HTTP {status}): {said or parsed!r}"
+    )
 
 
 __all__ = [
@@ -849,6 +900,8 @@ __all__ = [
     "TRANSPORT_EXIT_CODE",
     "MergeCallRefused",
     "LEG_ENDPOINT",
+    "LEG_CANCEL_ENDPOINT",
+    "cancel_leg_via_sidecar",
     "LEG_SUBCOMMANDS",
     "LegCallRefused",
     "build_sidecar_guardkit_run",
