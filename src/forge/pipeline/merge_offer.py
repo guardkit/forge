@@ -2481,21 +2481,32 @@ class MergeOfferService:
         ledger shows nothing else open. With no sandbox gate installed this is
         exactly :meth:`_offer`.
         """
-        from forge.sandbox_gate.gate import current_gate, using
+        from forge.sandbox_gate.gate import SandboxNotReady, current_gate, using
 
         repo = None
         if current_gate() is not None:
             row = self._pool.get_build_row(build_id)
             repo = getattr(row, "repo", None) if row is not None else None
-        async with using(repo, purpose=f"the merge offer for {build_id}"):
-            return await self._offer(
-                build_id=build_id,
-                feature_id=feature_id,
-                card_words=card_words,
-                extra_details=extra_details,
-                changed_files=changed_files,
-                on_refusal=on_refusal,
-            )
+        try:
+            async with using(repo, purpose=f"the merge offer for {build_id}"):
+                return await self._offer(
+                    build_id=build_id,
+                    feature_id=feature_id,
+                    card_words=card_words,
+                    extra_details=extra_details,
+                    changed_files=changed_files,
+                    on_refusal=on_refusal,
+                )
+        except SandboxNotReady as exc:
+            # Refused before anything was written or asked of the sandbox
+            # (Codex S2 implementation review 1, R3); it may pass by itself.
+            logger.warning("merge-offer: no card for %s yet — %s", build_id, exc)
+            if on_refusal is not None:
+                try:
+                    on_refusal(str(exc), True)
+                except Exception:  # noqa: BLE001 — a listener never changes the answer
+                    logger.warning("merge-offer: the refusal listener raised")
+            return False
 
     async def _offer(
         self,

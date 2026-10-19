@@ -1099,9 +1099,6 @@ class WorkQueueLoop:
         self._waiting_said_for: frozenset[int] | None = None
         self._merge_hold_said_for: frozenset[str] | None = None
         self._cards_waited_on: set[str] = set()
-        #: Lines said in the background (a row closed because its sandbox
-        #: could not be started), held so none is collected while it runs.
-        self._said_later: set[asyncio.Future[Any]] = set()
 
     # -- one pass --------------------------------------------------------
 
@@ -1493,8 +1490,8 @@ class WorkQueueLoop:
 
         # A PROJECT'S OWN SANDBOX MAY BE STOPPED (one sandbox per project,
         # stage S2, design 2.3a). A row whose sandbox is not ready stays
-        # QUEUED while the sandbox is started; a row whose sandbox could not
-        # be started within the limit stops with the reason. With no gate
+        # QUEUED while the sandbox is started, and is tried again on a later
+        # pass, whatever the reason it is not ready. With no gate
         # installed (the default) every row passes, exactly as before. The
         # check and the admission below have no wait between them, so no
         # stop can be decided in the gap.
@@ -1900,10 +1897,11 @@ class WorkQueueLoop:
     ) -> list[sqlite3.Row]:
         """The rows whose project's sandbox is ready (design 2.3a).
 
-        Every row passes when no sandbox gate is installed. A row held for its
-        sandbox is said once, in the log; a row whose sandbox did not start
-        within the limit is closed BLOCKED with the reason, which names the
-        service that did not answer.
+        Every row passes when no sandbox gate is installed. A row whose
+        sandbox is not ready stays QUEUED, is said once in the log with the
+        reason (starting, did not start in time, or suspended), and is tried
+        again on a later pass; it is never closed for it (Codex S2
+        implementation review 1, R3).
         """
         from forge.sandbox_gate.gate import current_gate
 
@@ -1911,37 +1909,13 @@ class WorkQueueLoop:
         if gate is None:
             return list(rows)
         ready: list[sqlite3.Row] = []
-        failures: dict[str, str] = {}
         for row in rows:
             repo = row["target_repo"]
-            name = gate.sandbox_for(repo)
-            if name is None:
+            if gate.sandbox_for(repo) is None or gate.admits(repo):
                 ready.append(row)
                 continue
-            if name not in failures:
-                failures[name] = gate.take_failure(repo) or ""
-            if failures[name]:
-                refusal = FixAdmissionRefused(
-                    f"its project's sandbox could not be started: {failures[name]}",
-                    reason="sandbox-not-ready",
-                    permanent=True,
-                )
-                if self._close_refused(row, refusal):
-                    # Said in the background: nothing here may wait between
-                    # the readiness check and the admission that follows it.
-                    self._said_later.add(
-                        asyncio.ensure_future(
-                            self._say(row, refusal_line(int(row["id"]), refusal.message))
-                        )
-                    )
-                    for task in list(self._said_later):
-                        if task.done():
-                            self._said_later.discard(task)
-                continue
-            if gate.admits(repo):
-                ready.append(row)
-                continue
-            line = f"holding #{int(row['id'])} — waiting for sandbox {name} to start"
+            why = gate.why_held(repo) or "its sandbox is not ready"
+            line = f"holding #{int(row['id'])} — {why}; it stays queued and is tried again"
             if gate.say_once(repo, line):
                 logger.info("work queue: %s", line)
         return ready

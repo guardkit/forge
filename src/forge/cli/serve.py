@@ -3083,6 +3083,9 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
             try:
                 if sandbox_redeploy_factory is not None:
                     sandbox_gate.set_redeploy(sandbox_redeploy_factory(client))
+                # Any sandbox not ready here has the recovery that reaches it
+                # deferred, per repository, until it is (the gate's defer);
+                # every other repository's recovery goes on now.
                 await sandbox_gate.boot()
             except Exception as exc:  # noqa: BLE001 — never blocks boot
                 logger.error(

@@ -2014,7 +2014,7 @@ class ReviewPreviewService:
 
     async def prepare(self, req: PreviewRequest) -> "ReviewEvidence":
         """Prepare the preview and its evidence. Never raises for expected failures."""
-        from forge.sandbox_gate.gate import using
+        from forge.sandbox_gate.gate import SandboxNotReady, using
 
         now = self._clock()
         run_id = self._run_id_factory()
@@ -2025,6 +2025,17 @@ class ReviewPreviewService:
             # exists it keeps the sandbox up by itself.
             async with using(req.project, purpose=f"the preview for {req.build_id}"):
                 return await self._prepare(req, now=now, run_id=run_id)
+        except SandboxNotReady as exc:
+            # Refused, and nothing was asked of the sandbox (Codex S2
+            # implementation review 1, R3).
+            return self._record(
+                req,
+                state="failed",
+                run_id=run_id,
+                now=now,
+                preview_tree=None,
+                failure_reason=f"the preview was not prepared: {exc}",
+            )
         except Exception as exc:  # noqa: BLE001 — the offer must always get a record
             logger.exception("review preview: preparing %s raised", req.build_id)
             return self._record(

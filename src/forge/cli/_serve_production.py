@@ -1121,7 +1121,22 @@ class _RepoRoutedAsyncTaskStarter:
         self, subagent_name: str, context: "Mapping[str, Any]"
     ) -> str:
         starter = self._starter_for(context)
-        return await starter.astart_async_task(subagent_name, context)
+        # A PROJECT'S OWN SANDBOX MAY BE STOPPED (stage S2, design 2.3a): the
+        # launch takes its gate, so a build relaunched after a restart waits
+        # for start-up, and is refused with the plain reason (a RuntimeError,
+        # like an admission refusal) rather than sent to a sandbox that is not
+        # ready. With no sandbox gate installed this is today's launch.
+        from forge.sandbox_gate.gate import using
+
+        from forge.config.build_admission import build_admission
+
+        try:
+            raw = str(context.get("repo") or "").strip()
+        except AttributeError:  # pragma: no cover — a mapping is what is sent
+            raw = ""
+        repo = build_admission(self._config, target_repo=raw).repo_key or raw or None
+        async with using(repo, purpose="the build's launch"):
+            return await starter.astart_async_task(subagent_name, context)
 
 
 def build_repo_routed_async_task_starter(

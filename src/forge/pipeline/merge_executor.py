@@ -171,6 +171,7 @@ from forge.pipeline.merge_join import (
     target_branch_now,
     working_folder_path,
 )
+from forge.sandbox_gate.gate import SandboxNotReady
 from forge.pipeline.deployment_identity import (
     declared_identity,
     fixed_identity,
@@ -2292,8 +2293,15 @@ async def execute_merge_deploy(
     expected_preview_tree: str | None = None,
     deploy: bool = True,
     join_name: str | None = None,
+    sandbox_not_ready: str | None = None,
 ) -> MergeDeployOutcome:
     """Run join -> checks -> report for one press, and stop before publishing.
+
+    ``sandbox_not_ready`` (one sandbox per project, stage S2, Codex S2
+    implementation review 1, R3): the project's own sandbox did not become
+    ready, with this reason. The press then makes no git, sandbox or deploy
+    call at all: it writes its report — refused, nothing merged, the branch
+    kept — and ends.
 
     The order inside the merge word (the one-true-copy design, 2026-09-21):
 
@@ -6716,31 +6724,43 @@ async def execute_merge_deploy(
             a_leg_did_not_complete = True
         return retired
 
-    try:
-        outcome = await _press()
-        # THE ENDING IS WRITTEN DOWN FIRST (press lease recovery, 18 October
-        # 2026), before the clean-up, in its report's words, on this press's
-        # own turn: a coordinator that stops from here on is reported for
-        # from it, word for word (:meth:`MergeApprovalConsumer.finish_a_settled_press`).
-        # A copy, so the ending itself is put into words exactly once.
+    if sandbox_not_ready:
+        outcome = MergeDeployOutcome(
+            result="merge-refused",
+            status="FAILED",
+            failed_step="sandbox",
+            detail=(
+                f"{named} was not merged: its project's sandbox did not start "
+                f"({sandbox_not_ready}). Nothing was joined, checked, published or "
+                "deployed, and the branch is kept."
+            ),
+        )
+    else:
         try:
-            _write_the_ending_down(
-                _the_reports_words(_with_main_copies_said(copy.copy(outcome))),
-                cleanup_done=False,
-            )
-        except Exception as exc:  # noqa: BLE001 — never costs a result
-            logger.warning(
-                "merge-executor: %s's ending could not be put into words "
-                "before the clean-up (%s: %s)",
-                build_id,
-                type(exc).__name__,
-                exc,
-            )
-    finally:
-        # Every ending, the normal ones and a crash alike: the candidate down
-        # if it is still standing, and its laid-out tree removed — BEFORE the
-        # report goes out, so the report never says "torn down" ahead of time.
-        await _cleanup()
+            outcome = await _press()
+            # THE ENDING IS WRITTEN DOWN FIRST (press lease recovery, 18 October
+            # 2026), before the clean-up, in its report's words, on this press's
+            # own turn: a coordinator that stops from here on is reported for
+            # from it, word for word (:meth:`MergeApprovalConsumer.finish_a_settled_press`).
+            # A copy, so the ending itself is put into words exactly once.
+            try:
+                _write_the_ending_down(
+                    _the_reports_words(_with_main_copies_said(copy.copy(outcome))),
+                    cleanup_done=False,
+                )
+            except Exception as exc:  # noqa: BLE001 — never costs a result
+                logger.warning(
+                    "merge-executor: %s's ending could not be put into words "
+                    "before the clean-up (%s: %s)",
+                    build_id,
+                    type(exc).__name__,
+                    exc,
+                )
+        finally:
+            # Every ending, the normal ones and a crash alike: the candidate down
+            # if it is still standing, and its laid-out tree removed — BEFORE the
+            # report goes out, so the report never says "torn down" ahead of time.
+            await _cleanup()
     if turned_away_by and not outcome.turned_away:
         outcome.turned_away = True
         outcome.detail = (
@@ -7296,17 +7316,22 @@ class MergeApprovalConsumer:
         self._deps.tell_mission = tell
 
     @contextlib.asynccontextmanager
-    async def _pressing(self, repo: str, purpose: str) -> AsyncIterator[None]:
+    async def _pressing(
+        self, repo: str, purpose: str, *, needs_deployment: bool = False
+    ) -> AsyncIterator[None]:
         """The repository's press lock, with its sandbox started first.
 
         One sandbox per project, stage S2 (design 2.3a): a press reaches the
         project's own sandbox, which may have been stopped while idle, so it
         takes the sandbox's gate before the lock and waits for start-up rather
-        than failing. With no sandbox gate installed this is exactly the lock.
+        than failing. A sandbox that does not become ready raises
+        :class:`~forge.sandbox_gate.gate.SandboxNotReady` before the body runs
+        (Codex S2 implementation review 1, R3). With no sandbox gate installed
+        this is exactly the lock.
         """
         from forge.sandbox_gate.gate import using
 
-        async with using(repo, purpose=purpose):
+        async with using(repo, purpose=purpose, needs_deployment=needs_deployment):
             async with self._lock_for(repo):
                 yield
 
@@ -7789,57 +7814,118 @@ class MergeApprovalConsumer:
         expected_preview_tree: str | None,
         join_name: str | None,
     ) -> None:
-        async with self._pressing(repo, f"the merge press for {build_id}"):
-            ended = "approval failed: the merge press raised"
-            try:
-                outcome = await execute_merge_deploy(
-                    deps=self._deps,
-                    build_id=build_id,
-                    feature_id=feature_id,
-                    repo=repo,
-                    repo_root=repo_root,
-                    expect_main_sha=expect_main_sha,
-                    correlation_id=correlation_id,
-                    decided_by=decided_by,
-                    baseline_failing=baseline_failing,
-                    merge_branch=merge_branch,
-                    expected_candidate_sha=expected_candidate_sha,
-                    expected_candidate_tree=expected_candidate_tree,
-                    expected_candidate_branch=expected_candidate_branch,
-                    worktree_retention=worktree_retention,
-                    merge_execution_attempt_id=merge_execution_attempt_id,
-                    **(
-                        {"expected_preview_tree": expected_preview_tree}
-                        if expected_preview_tree
-                        else {}
-                    ),
-                    **({"join_name": join_name} if join_name else {}),
-                )
-                ended = f"approval ended: {getattr(outcome, 'result', None)}"
-                if getattr(outcome, "turned_away", False):
-                    # Another press holds the record: its ending, and the
-                    # preview's release, are that press's (18 October 2026).
-                    logger.warning(
-                        "merge-executor: the approved press of %s was turned "
-                        "away by a live hold; nothing was done and the preview "
-                        "is left to the press that holds the record",
-                        build_id,
-                    )
-                    return
-            except Exception as exc:  # noqa: BLE001 — the task must not die silent
-                logger.error(
-                    "merge-executor: executor raised (%s) for build %s — see "
-                    "the receipts under merge-%s",
-                    exc,
+        press = dict(
+            build_id=build_id,
+            feature_id=feature_id,
+            repo=repo,
+            repo_root=repo_root,
+            expect_main_sha=expect_main_sha,
+            correlation_id=correlation_id,
+            decided_by=decided_by,
+            baseline_failing=baseline_failing,
+            merge_branch=merge_branch,
+            expected_candidate_sha=expected_candidate_sha,
+            expected_candidate_tree=expected_candidate_tree,
+            expected_candidate_branch=expected_candidate_branch,
+            worktree_retention=worktree_retention,
+            merge_execution_attempt_id=merge_execution_attempt_id,
+            previewed_offer=previewed_offer,
+            expected_preview_tree=expected_preview_tree,
+            join_name=join_name,
+        )
+        try:
+            async with self._pressing(
+                repo, f"the merge press for {build_id}", needs_deployment=True
+            ):
+                await self._press_approved(**press)
+            return
+        except SandboxNotReady as exc:
+            not_ready = str(exc)
+        # THE SANDBOX DID NOT START (stage S2, Codex S2 implementation review
+        # 1, R3): the press reports it, under the repository's lock, and
+        # touches nothing in the sandbox.
+        async with self._lock_for(repo):
+            await self._press_approved(**press, sandbox_not_ready=not_ready)
+
+    async def _press_approved(
+        self,
+        *,
+        build_id: str,
+        feature_id: str,
+        repo: str,
+        repo_root: Path,
+        expect_main_sha: str,
+        correlation_id: str,
+        decided_by: str,
+        baseline_failing: list[str] | None,
+        merge_branch: str | None,
+        expected_candidate_sha: str | None,
+        expected_candidate_tree: str | None,
+        expected_candidate_branch: str | None,
+        worktree_retention: dict[str, Any] | None,
+        merge_execution_attempt_id: str,
+        previewed_offer: dict[str, Any] | None,
+        expected_preview_tree: str | None,
+        join_name: str | None,
+        sandbox_not_ready: str | None = None,
+    ) -> None:
+        ended = "approval failed: the merge press raised"
+        try:
+            outcome = await execute_merge_deploy(
+                deps=self._deps,
+                build_id=build_id,
+                feature_id=feature_id,
+                repo=repo,
+                repo_root=repo_root,
+                expect_main_sha=expect_main_sha,
+                correlation_id=correlation_id,
+                decided_by=decided_by,
+                baseline_failing=baseline_failing,
+                merge_branch=merge_branch,
+                expected_candidate_sha=expected_candidate_sha,
+                expected_candidate_tree=expected_candidate_tree,
+                expected_candidate_branch=expected_candidate_branch,
+                worktree_retention=worktree_retention,
+                merge_execution_attempt_id=merge_execution_attempt_id,
+                **(
+                    {"expected_preview_tree": expected_preview_tree}
+                    if expected_preview_tree
+                    else {}
+                ),
+                **({"join_name": join_name} if join_name else {}),
+                **(
+                    {"sandbox_not_ready": sandbox_not_ready}
+                    if sandbox_not_ready
+                    else {}
+                ),
+            )
+            ended = f"approval ended: {getattr(outcome, 'result', None)}"
+            if getattr(outcome, "turned_away", False):
+                # Another press holds the record: its ending, and the
+                # preview's release, are that press's (18 October 2026).
+                logger.warning(
+                    "merge-executor: the approved press of %s was turned "
+                    "away by a live hold; nothing was done and the preview "
+                    "is left to the press that holds the record",
                     build_id,
-                    build_id,
                 )
-            # A cancelled press (a restart) does not get here: its preview is
-            # left to its own expiry and the start-up reconcile.
-            if previewed_offer is not None:
-                await self._release_the_preview(
-                    previewed_offer, build_id=build_id, reason=ended
-                )
+                return
+        except Exception as exc:  # noqa: BLE001 — the task must not die silent
+            logger.error(
+                "merge-executor: executor raised (%s) for build %s — see "
+                "the receipts under merge-%s",
+                exc,
+                build_id,
+                build_id,
+            )
+        # A cancelled press (a restart) does not get here: its preview is
+        # left to its own expiry and the start-up reconcile. A press whose
+        # sandbox did not start leaves it to the sweep too: releasing it
+        # would reach into the sandbox.
+        if previewed_offer is not None and not sandbox_not_ready:
+            await self._release_the_preview(
+                previewed_offer, build_id=build_id, reason=ended
+            )
 
     async def resume_mission_merge(self, build_id: str) -> bool:
         """Carry on an approved mission merge into main that never reported.
@@ -8200,6 +8286,13 @@ class MergeApprovalConsumer:
                         )
                     return None
                 return outcome
+        except SandboxNotReady as exc:
+            # Nothing was decided or pressed: the landing request stays on
+            # record and the finishing step carries it on (stage S2, R3).
+            logger.warning(
+                "merge-executor: %s's landing waits for its sandbox — %s", build_id, exc
+            )
+            return None
         finally:
             self._landing_now.discard(build_id)
 
@@ -8301,8 +8394,12 @@ class MergeApprovalConsumer:
         repo_root_raw = self._deps.config.planning.target_repo_paths.get(row.repo)
         if mission is None or not repo_root_raw:
             return "nothing to do"
-        async with self._pressing(row.repo, f"settling the landing of {build_id}"):
-            return await self._settle_by_looking(row, mission, Path(repo_root_raw))
+        try:
+            async with self._pressing(row.repo, f"settling the landing of {build_id}"):
+                return await self._settle_by_looking(row, mission, Path(repo_root_raw))
+        except SandboxNotReady as exc:
+            logger.warning("merge-executor: settling %s waits — %s", build_id, exc)
+            return "unknown"
 
     async def finish_a_settled_landing(self, build_id: str) -> str:
         """Finish the bookkeeping of a mission feature's landing whose outcome is settled.
@@ -8342,6 +8439,17 @@ class MergeApprovalConsumer:
         if not repo_root_raw:
             return "nothing to do"
         store = PublicationRecordStore(self._deps.pool.connection)
+        try:
+            return await self._finish_a_settled_landing_gated(
+                row, store, build_id, repo_root_raw
+            )
+        except SandboxNotReady as exc:
+            logger.warning("merge-executor: finishing %s waits — %s", build_id, exc)
+            return "held"
+
+    async def _finish_a_settled_landing_gated(
+        self, row: Any, store: Any, build_id: str, repo_root_raw: str
+    ) -> str:
         async with self._pressing(row.repo, f"finishing the landing of {build_id}"):
             record = store.read(build_id)
             if not record.recorded or not record.result:

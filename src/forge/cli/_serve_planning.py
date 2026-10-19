@@ -2064,8 +2064,28 @@ async def sweep_interrupted_planning_runs(
                 logger.debug("No interrupted planning runs to recover")
             return []
 
+        from forge.sandbox_gate.gate import defer as _defer_for_its_sandbox
+
         for state_name, run in interrupted:
             correlation_id = run["correlation_id"]
+            # A PROJECT'S OWN SANDBOX THAT DID NOT COME UP AT BOOT (stage S2,
+            # Codex S2 implementation review 1, R3): this run is re-driven when
+            # its sandbox is ready, and every other run now. With no sandbox
+            # gate installed nothing is ever deferred.
+            try:
+                target_repo = run["target_repo"]
+            except (KeyError, IndexError, TypeError):
+                target_repo = None
+            if _defer_for_its_sandbox(
+                target_repo,
+                lambda cid=correlation_id: dispatch_callable(cid),
+            ):
+                logger.info(
+                    "Re-driving %s planning run %s waits for its sandbox",
+                    state_name,
+                    correlation_id,
+                )
+                continue
             try:
                 # RT-08: RUNNING runs are re-driven instead of terminally
                 # failed — the re-entrant driver + idempotent handoff

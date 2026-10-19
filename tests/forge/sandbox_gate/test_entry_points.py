@@ -92,7 +92,10 @@ class TestQueueAdmission:
         with caplog.at_level(logging.INFO):
             assert await loop.take_next() is None
         assert store.get(queue_id)["status"] == "QUEUED"
-        assert f"holding #{queue_id} — waiting for sandbox {SANDBOX} to start" in caplog.text
+        assert (
+            f"holding #{queue_id} — waiting for the sandbox {SANDBOX} to start; it stays "
+            "queued and is tried again"
+        ) in caplog.text
         assert maker.admissions == []
         await settle(gate)
         assert "start notes-app-sbx" in starter.calls
@@ -112,8 +115,8 @@ class TestQueueAdmission:
         assert await loop.take_next() == other
 
     @pytest.mark.asyncio
-    async def test_a_sandbox_that_will_not_start_stops_the_row_with_the_reason(
-        self, ledger: sqlite3.Connection, installed: Any
+    async def test_a_sandbox_that_will_not_start_keeps_the_row_queued_with_the_reason(
+        self, ledger: sqlite3.Connection, installed: Any, caplog: pytest.LogCaptureFixture
     ) -> None:
         starter = FakeStarter(running=False)
         services = Services(starter)
@@ -123,21 +126,19 @@ class TestQueueAdmission:
         )
         clock = FakeClock()
         store = WorkQueueStore(ledger, clock=clock.now)
-        notifier = Notifier()
-        loop, maker = build_loop(store, clock=clock, notifier=notifier, runs={})
+        loop, maker = build_loop(store, clock=clock, notifier=Notifier(), runs={})
         queue_id = file_row(store, "c-1", repo=REPO)
         assert await loop.take_next() is None
         await settle(gate)
-        assert await loop.take_next() is None
-        row = store.get(queue_id)
-        assert row["status"] == "BLOCKED"
-        for _ in range(5):
-            await asyncio.sleep(0)
-        assert any(
-            "the deploy helper did not answer /healthz" in message
-            for message in notifier.messages
-        )
+        with caplog.at_level(logging.INFO):
+            assert await loop.take_next() is None
+        assert store.get(queue_id)["status"] == "QUEUED"  # never closed for it (R3)
+        assert "the deploy helper did not answer /healthz" in caplog.text
         assert maker.admissions == []
+        services.helper_down = False  # a later pass, once it answers
+        assert await loop.take_next() is None
+        await settle(gate)
+        assert await loop.take_next() == queue_id
 
 
 # ---------------------------------------------------------------------------

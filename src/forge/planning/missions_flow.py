@@ -641,10 +641,16 @@ class MissionFlow:
             # stopped (one sandbox per project, stage S2, design 2.3a): before
             # any helper call, on approval and on every tend. With no sandbox
             # gate installed this is nothing at all.
-            from forge.sandbox_gate.gate import using
+            from forge.sandbox_gate.gate import SandboxNotReady, using
 
-            async with using(mission.target_repo, purpose=f"mission {mission.id}'s branch start"):
-                await self._start_branch(mission)
+            try:
+                async with using(
+                    mission.target_repo, purpose=f"mission {mission.id}'s branch start"
+                ):
+                    await self._start_branch(mission)
+            except SandboxNotReady as exc:
+                # Nothing was asked for: tend() asks again within a minute.
+                logger.warning("missions: %s waits — %s", mission.id, exc)
         finally:
             self._starting.discard(mission.id)
 

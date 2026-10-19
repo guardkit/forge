@@ -391,7 +391,8 @@ class MissionStep:
             if self._count_in_flight() >= self._max_in_flight:
                 return False
             if gate is not None and not gate.admits(mission.target_repo):
-                line = f"mission {mission.id} is waiting for its sandbox to start"
+                why = gate.why_held(mission.target_repo) or "its sandbox is not ready"
+                line = f"mission {mission.id} is waiting: {why}"
                 if gate.say_once(mission.target_repo, line):
                     logger.info("missions: %s", line)
                 return True
