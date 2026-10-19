@@ -481,7 +481,6 @@ def test_the_shared_sandbox_still_takes_a_public_project_into_its_projects_folde
 # the coordinator's volume and the publisher's file on this machine
 
 
-SSH = ["ssh", "-o", "BatchMode=yes", "spark-example", "--"]
 
 
 class _OverSsh:
@@ -489,8 +488,9 @@ class _OverSsh:
     way the remote shell reads it (shlex.split), so the estate sees exactly the
     words that would run on the sandbox's machine."""
 
-    def __init__(self, estate):  # noqa: ANN001
+    def __init__(self, estate, host: str = "spark-example"):  # noqa: ANN001
         self.estate = estate
+        self.hop = ["ssh", "-o", "BatchMode=yes", host, "--"]
         self.routed: list[list[str]] = []
         self.local: list[list[str]] = []
 
@@ -498,8 +498,8 @@ class _OverSsh:
         import shlex
 
         argv = list(argv)
-        if argv[: len(SSH)] == SSH:
-            assert len(argv) == len(SSH) + 1, "one quoted command line after the hop"
+        if argv[: len(self.hop)] == self.hop:
+            assert len(argv) == len(self.hop) + 1, "one quoted command line after the hop"
             words = shlex.split(argv[-1])
             self.routed.append(words)
             return self.estate(words, input=input, timeout=timeout)
@@ -540,6 +540,46 @@ def test_the_shared_sandbox_on_the_other_machine_is_reached_the_same_way(estate,
     assert hop.routed and not [c for c in hop.local if "sbx" in c]
     assert any(words[:2] == ["sbx", "exec"] and "clone" in words for words in hop.routed)
     assert "ssh -o BatchMode=yes spark-example -- sbx exec -u 1000 api-test-deploy cmp" in result.output
+
+
+SUPERVISOR_RESTART = "docker restart forge-estate-sandbox-runner-1"
+
+
+def test_on_two_machines_the_printed_supervisor_restart_goes_to_the_sandbox_s_machine(tmp_path, monkeypatch):
+    """The shared sandbox's supervisor runs on the sandbox's machine; run as
+    printed on this one, a bare restart would start a stopped container of the
+    same name here (release 2026.10.19-1 preparation)."""
+    import copy
+
+    from forge.cli import register_repo
+    from tests.forge.cli.test_register_repo import FakeEstate, _run
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("FORGE_ESTATE_ENV_FILE", raising=False)
+    monkeypatch.delenv("FORGE_SANDBOX_SSH", raising=False)
+    here = FakeEstate(tmp_path)
+    there = copy.deepcopy(here)
+    for fake in (here, there):
+        monkeypatch.setattr(register_repo, "sleep", lambda seconds, fake=fake: fake.calls.append(["sleep", str(seconds)]))
+
+    monkeypatch.setattr(register_repo, "run_command", here)
+    plain = _run()
+    assert plain.exit_code == 0, plain.output
+    monkeypatch.setattr(register_repo, "run_command", _OverSsh(there, "sandbox-host.example"))
+    routed = _run("--sandbox-ssh", "sandbox-host.example")
+    assert routed.exit_code == 0, routed.output
+
+    hop = "ssh -o BatchMode=yes sandbox-host.example -- "
+    # Without --sandbox-ssh the line is the bare restart, as before.
+    assert f"    {SUPERVISOR_RESTART}" in plain.output.splitlines()
+    assert hop not in plain.output
+    # With it, the restart is sent to the sandbox's machine, and never bare.
+    lines = routed.output.splitlines()
+    assert f"    {hop}{SUPERVISOR_RESTART}" in lines
+    assert not [line for line in lines if line.strip() == SUPERVISOR_RESTART]
+    # Every sandbox-side step is routed and nothing else differs.
+    assert f"{hop}sbx exec" in routed.output
+    assert routed.output.replace(hop, "") == plain.output
 
 
 @pytest.mark.parametrize("host", ["-oProxyCommand=x", "a b", "spark;rm", ""])

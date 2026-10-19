@@ -581,7 +581,10 @@ def unregister(
 @click.option("--publisher-settings", type=click.Path(dir_okay=False, path_type=Path), default=None,
               help=f"The publisher's settings file (default: the estate env's {ESTATE_ENV_PUBLISHER_SETTINGS}).")
 @click.option("--sandbox-ssh", "sandbox_ssh", default=None, envvar="FORGE_SANDBOX_SSH",
-              help="The sandbox's machine, when it is not this one: sbx commands go there over ssh.")
+              help="The sandbox's machine, when it is not this one: sbx commands go there over ssh. "
+                   "The Forge image carries no ssh client, so run register-repo / unregister-repo "
+                   "with --sandbox-ssh from a checkout of the same commit on the coordinator "
+                   "machine, not inside the image.")
 @click.option("--settle-seconds", type=click.IntRange(min=0), default=DEFAULT_SETTLE_SECONDS,
               show_default=True, help="How far apart the printed drained check's two looks are.")
 @click.option("--settings-volume", "volume", default=DEFAULT_SETTINGS_VOLUME, show_default=True,

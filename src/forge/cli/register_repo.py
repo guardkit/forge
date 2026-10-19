@@ -88,7 +88,10 @@ estate's two machines: the coordinator, its settings volume and the
 publisher's file are on this machine, and the sandboxes on another (the
 Spark). Run the command here, as before; every ``sbx`` command is then sent to
 ``<host>`` over ssh, each argument shell-quoted so it arrives as written, and
-the printed activation lines say the same. Nothing else changes machine.
+the printed activation lines say the same, the restart of the sandbox
+supervisor included. Nothing else changes machine. The Forge image carries no
+ssh client, so run register-repo / unregister-repo with ``--sandbox-ssh`` from a
+checkout of the same commit on the coordinator machine, not inside the image.
 
 When the publisher's settings say ``private_only`` (17 October 2026), a
 route is written only for a repository confirmed private
@@ -2303,7 +2306,7 @@ class Estate:
     #: A sandbox of its own (17 October 2026): its slot's ports, said in (e).
     slot: SlotPorts | None = None
     #: The sandbox's machine, when it is another (--sandbox-ssh): the printed
-    #: sbx commands are sent there the same way.
+    #: sbx commands and the supervisor's restart are sent there the same way.
     sandbox_ssh: str | None = None
 
 
@@ -2357,12 +2360,16 @@ def activation_sequence(
         f" --coordinator-container {q(estate.coordinator)}"
     )
 
-    # The sandbox's own machine, when it is another (--sandbox-ssh).
-    sbx = (
-        f"{' '.join(sandbox_ssh_prefix(shlex.quote(estate.sandbox_ssh)))} sbx"
+    # The sandbox's own machine, when it is another (--sandbox-ssh): every
+    # printed step that acts there (its sbx commands and the restart of its
+    # supervisor) is sent there the same way, so none of them is run on this
+    # machine by mistake.
+    there = (
+        f"{' '.join(sandbox_ssh_prefix(shlex.quote(estate.sandbox_ssh)))} "
         if estate.sandbox_ssh
-        else "sbx"
+        else ""
     )
+    sbx = f"{there}sbx"
 
     lines = [
         ("What would make it live" if dry_run else "What makes it live")
@@ -2440,7 +2447,7 @@ def activation_sequence(
     elif estate.slot is None:
         lines += [
             "(d) Restart the sandbox supervisor and confirm the helper and runner are ready:",
-            f"    docker restart {container(SANDBOX_SUPERVISOR_SERVICE)}",
+            f"    {there}docker restart {container(SANDBOX_SUPERVISOR_SERVICE)}",
         ]
     else:
         ports = estate.slot
@@ -3274,7 +3281,9 @@ def _memory_name_to_grant(key: str, memory_name: str | None) -> str:
 @click.option("--sandbox-ssh", "sandbox_ssh", default=None, envvar="FORGE_SANDBOX_SSH",
               help="The sandbox's machine, when it is not this one: every sbx command is "
                    "sent there over ssh (the coordinator's and the publisher's files stay "
-                   "on this machine).")
+                   "on this machine). The Forge image carries no ssh client, so run "
+                   "register-repo / unregister-repo with --sandbox-ssh from a checkout of the "
+                   "same commit on the coordinator machine, not inside the image.")
 @click.option("--receipts-root", "receipts_root", default=None,
               help="With --slot: the project's own receipts folder, as the coordinator sees it "
                    f"(default {COORDINATOR_PROJECT_RECEIPTS}/<sandbox name>; design section 2.2a).")

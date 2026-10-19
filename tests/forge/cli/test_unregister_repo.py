@@ -543,3 +543,35 @@ def test_c3_the_default_repository_is_said_for_each_file_that_names_it(estate): 
     assert result.exit_code == 0, result.output
     notes = [line for line in result.output.splitlines() if "default_target_repo still names" in line]
     assert [line.split()[0] for line in notes] == ["coordinator", "sandbox"]
+
+
+def test_on_two_machines_the_printed_supervisor_restart_goes_to_the_sandbox_s_machine(estate, monkeypatch):  # noqa: F811
+    """Taking a project out of the shared sandbox restarts its supervisor,
+    which runs on the sandbox's machine: with --sandbox-ssh the printed
+    restart goes there, as the sbx steps do (release 2026.10.19-1
+    preparation); without it the sequence is as it was."""
+    import copy
+
+    from forge.cli import register_repo
+    from tests.forge.cli.test_register_repo_sandbox import SUPERVISOR_RESTART, _OverSsh
+
+    monkeypatch.delenv("FORGE_SANDBOX_SSH", raising=False)
+    _registered(estate)
+    there = copy.deepcopy(estate)
+
+    plain = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS)
+    assert plain.exit_code == 0, plain.output
+    hop = _OverSsh(there, "sandbox-host.example")
+    monkeypatch.setattr(register_repo, "run_command", hop)
+    routed = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS, "--sandbox-ssh", "sandbox-host.example")
+    assert routed.exit_code == 0, routed.output
+    assert hop.routed and not [c for c in hop.local if "sbx" in c]
+
+    prefix = "ssh -o BatchMode=yes sandbox-host.example -- "
+    assert f"    {SUPERVISOR_RESTART}" in plain.output.splitlines()
+    assert prefix not in plain.output
+    lines = routed.output.splitlines()
+    assert f"    {prefix}{SUPERVISOR_RESTART}" in lines
+    assert not [line for line in lines if line.strip() == SUPERVISOR_RESTART]
+    assert f"{prefix}sbx exec -u 1000 api-test-deploy cmp" in routed.output
+    assert routed.output.replace(prefix, "") == plain.output
