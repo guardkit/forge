@@ -19,6 +19,9 @@ slot's ports (GIT_DOOR_PORT 31830+slot, FLEET_MEMORY_SANDBOX_PORT 31850+slot,
 helper 8925+10*slot, runner 8924+10*slot) and whose rules may name on the
 gateway only its own two doors, the model door, the answer service and the
 embedder (never the bus or the model router).
+Every sandbox, shared or slot, is also given FACTORY_CHECK_RULES
+(api.osv.dev:443 and api.deps.dev:443, the factory's own security check's
+services, 19 October 2026) after its door rules.
 An inventory may instead be {"sandboxes": [<inventory>, ...]}: one entry per
 sandbox, each with its own project, env file and profile. --sandbox NAME picks
 one; --plan without it plans every entry with its own files. The entries may
@@ -212,6 +215,11 @@ assert answer in rules and memory in rules and door in rules and len({answer,mem
 git_door=p.get('git_door')
 if git_door:
  rules=list(dict.fromkeys(rules+[git_door])); assert git_door not in (answer,memory,door)
+# The factory's own security-check services (FACTORY_CHECK_RULES), always,
+# beside the doors; never the gateway, a wildcard or a path.
+check=p['check_rules']
+assert check and all(x not in (answer,memory,door,git_door) and not x.startswith(gateway+':') for x in check)
+rules=[x for x in rules if x not in check]+check  # once each, after the doors, even if the profile named one
 assert all(x!='*' and '/' not in x for x in rules)
 s['allow_network']=rules; s['receipts_path']=c['receipts_path']; doc['cwd']=c['clone_path']
 parse_deploy_profile(doc)
@@ -268,6 +276,14 @@ SLOT_EMBEDDER_PORT = 9000
 NEVER_ON_THE_GATEWAY_FROM_A_SLOT = (31822, 31824)
 # The shared sandbox is never a slot entry (Codex R1).
 SHARED_SANDBOX_NAMES = ('api-test-deploy',)
+# The factory's per-change security check queries these; GuardKit
+# `security_check.py` (OSV-Scanner reads api.osv.dev, the fix lookup reads
+# api.deps.dev). They serve the factory's check, not the project, so every
+# sandbox gets them as factory rules beside the doors and no project profile
+# carries them (19 October 2026). Two read-only advisory services, host:port
+# only. Kept in step with FACTORY_CHECK_RULES in
+# src/forge/cli/deploy_templates/sandbox-deploy.sh; a test holds them equal.
+FACTORY_CHECK_RULES = ('api.osv.dev:443', 'api.deps.dev:443')
 
 
 def slot_of(sandbox):
@@ -580,7 +596,7 @@ class Rollout:
             raise Refusal(f'stopped status is unknown or not proved for {self.s["name"]}; work may still be running inside, so keep units masked and inspect before retrying') from None
 
     def profile(self):
-        payload = {'source':self.source,'sandbox':self.s,'env':{**{k:v for k,v in self.values.items() if k in {'FACTORY_GATEWAY_ADDRESS','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'} or k in self.s.get('allow_replacements',{}).values()},'SANDBOX_PUBLISH_ADDRESS':self.sandbox_address},'answer':self.answer,'memory_mcp':self.memory_mcp,'model_door':self.model_door,'git_door':self.git_door}
+        payload = {'source':self.source,'sandbox':self.s,'env':{**{k:v for k,v in self.values.items() if k in {'FACTORY_GATEWAY_ADDRESS','FORGE_SANDBOX_SIDECAR_URL','FORGE_SANDBOX_RUNNER_URL'} or k in self.s.get('allow_replacements',{}).values()},'SANDBOX_PUBLISH_ADDRESS':self.sandbox_address},'answer':self.answer,'memory_mcp':self.memory_mcp,'model_door':self.model_door,'git_door':self.git_door,'check_rules':list(FACTORY_CHECK_RULES)}
         out = self.run(['docker','--context',self.config['docker_context'],'run','--rm','--pull=never','--network=none','--read-only','-i','--entrypoint','python',self.config['runtime_image'],'-c',PROFILE], input=json.dumps(payload)).stdout
         return json.loads(out)
 
@@ -692,13 +708,15 @@ class Rollout:
         replacements = self.s.get('allow_replacements', {})
         rules = [self.values[replacements[x]] if x in replacements else x for x in doc['sandbox'].get('allow_network', [])]
         rules = list(dict.fromkeys(rules + [self.answer, self.memory_mcp, self.model_door] + ([self.git_door] if self.git_door else [])))
+        # The security check's rules once each, after the doors, even if the profile named one.
+        rules = [x for x in rules if x not in FACTORY_CHECK_RULES] + list(FACTORY_CHECK_RULES)
         return {'rules': rules}
 
     def plan_text(self):
         rules = self.plan_rules() if self.slot is not None else None
         if rules is not None:
             self.check_slot_rules(rules)
-        return 'Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+self.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes (answer service '+self.answer+', memory MCP '+self.memory_mcp+', model door '+self.model_door+(', Git door '+self.git_door if self.git_door else '')+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; unmask both stopped units; record evidence.'
+        return 'Plan only: remote, systemd, sandbox, image and disk facts are NOT VERIFIED. Would validate profile in the pinned image; record clone, known-file hashes, receipt listing and process diagnostics; empty and prove both runner stop hooks; stop and mask keeper then runner; refuse held sessions; stop only '+self.s['name']+'; require positive stopped status; wake with our exec; refuse any running container or legacy process; compare every disk witness; hand in the release with the normal identity helper; add sandbox-scoped routes (answer service '+self.answer+', memory MCP '+self.memory_mcp+', model door '+self.model_door+(', Git door '+self.git_door if self.git_door else '')+'; the security check\'s '+', '.join(FACTORY_CHECK_RULES)+'); install the current template byte-for-byte and rewrite producer profile paths/publish rules; remove legacy drop-ins; unmask both stopped units; record evidence.'
 
     def execute(self):
         print('While the sandbox is stopped, nobody may run sbx prune, sbx rm or sbx reset.',flush=True)
@@ -816,7 +834,7 @@ class Rollout:
             self.systemctl('daemon-reload',check=False)
             raise
         self.save('commands.json',self.events)
-        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'model_door_rule':self.model_door,'git_door_rule':self.git_door,'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted({name for name in self.forwarded_names if name in self.values} | image_settings.keys()),'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
+        self.save('sandbox-installed.json',{'format_version':1,'project':self.args.project,'sandbox':self.s['name'],'image':self.config['runtime_image'],'template_sha256':digest(self.template),'profile_sha256':digest(profile['text'].encode()),'answer_rule':self.answer,'memory_mcp_rule':self.memory_mcp,'model_door_rule':self.model_door,'git_door_rule':self.git_door,'factory_check_rules':list(FACTORY_CHECK_RULES),'disk_before':before,'disk_after':after,'bootstrap_image_settings':image_settings,'bootstrap_env_file':str(self.bootstrap_env),'bootstrap_env_names':sorted({name for name in self.forwarded_names if name in self.values} | image_settings.keys()),'remote_fetch_through_normal_entry':'NOT-TESTED','memory_forwarded_names':list(MEMORY_NAMES),'actual_memory_read_write':'NOT-TESTED'})
         self.complete = True
         print('Current template and producer profile installed and read back; units are unmasked but stopped; actual memory read/write and normal lifecycle checks remain required.')
 

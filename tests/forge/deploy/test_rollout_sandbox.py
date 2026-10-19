@@ -315,7 +315,7 @@ def test_profile_preserves_choices_and_all_routes(inventory,monkeypatch):
     import yaml
     doc=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())
     assert doc['custom_choice']=={'keep':True}
-    assert doc['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30824','192.0.2.10:30823']
+    assert doc['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30824','192.0.2.10:30823','api.osv.dev:443','api.deps.dev:443']
     assert doc['sandbox']['receipts_path']=='/private/receipts'
     assert doc['cwd']=='/private/clone'
     publishes=[x[-1] for x in b.argv() if x[:3]==['sbx','ports','owned-sandbox'] and '--publish' in x]
@@ -334,7 +334,7 @@ def test_split_sandbox_publications_keep_factory_return_rules(inventory, monkeyp
                        '169.254.88.7:8925:8125','169.254.88.7:8924:8124']
     import yaml
     profile=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())
-    assert profile['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30824','192.0.2.10:30823']
+    assert profile['sandbox']['allow_network']==['example.test:443','192.0.2.10:8900','192.0.2.10:30824','192.0.2.10:30823','api.osv.dev:443','api.deps.dev:443']
 
 
 def test_explicit_shared_host_alias_and_ambient_absence(inventory, monkeypatch):
@@ -518,6 +518,82 @@ def test_bad_git_door_route_refuses_before_anything_is_written(inventory,monkeyp
     assert m.main(args)==2
     assert message in capsys.readouterr().err
     assert {p:p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}==before
+
+
+CHECK_RULES=['api.osv.dev:443','api.deps.dev:443']
+
+
+def _template_check_rules():
+    """FACTORY_CHECK_RULES as the project-sandbox template names them."""
+    import re
+    text=(ROOT/'src/forge/cli/deploy_templates/sandbox-deploy.sh').read_text()
+    found=re.findall(r'^FACTORY_CHECK_RULES=\(([^)]*)\)$',text,re.MULTILINE)
+    assert len(found)==1
+    return found[0].split()
+
+
+def test_the_security_check_rules_are_named_once_and_in_step_with_the_template():
+    """19 October 2026: the factory's per-change security check reaches
+    api.osv.dev and api.deps.dev. One constant here, the same two in the
+    project-sandbox template, host:port only, no wildcard or path."""
+    assert list(m.FACTORY_CHECK_RULES)==CHECK_RULES
+    assert _template_check_rules()==CHECK_RULES
+    assert all(x!='*' and '*' not in x and '/' not in x and x.count(':')==1 for x in CHECK_RULES)
+
+
+@pytest.mark.parametrize('slot',[False,True])
+def test_every_sandbox_gets_the_security_check_rules_once_after_its_doors(inventory,monkeypatch,slot):
+    """Shared and slot sandboxes alike: both rules exactly once, after the
+    door rules, which are unchanged; nothing wildcard; the receipt says so."""
+    config,path,args=inventory
+    if slot:
+        make_slot(config,path)
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    import yaml
+    rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
+    allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
+    assert allowed==rules
+    assert all(allowed.count(x)==1 for x in CHECK_RULES)
+    assert allowed[-2:]==CHECK_RULES
+    doors=[x for x in allowed if x.startswith('192.0.2.10')]
+    if slot:
+        assert doors==['192.0.2.10:31821','192.0.2.10:31851','192.0.2.10:31823','192.0.2.10:31831']
+    else:
+        assert doors==['192.0.2.10:8900','192.0.2.10:30824','192.0.2.10:30823']
+    assert [x for x in allowed if x not in CHECK_RULES and not x.startswith('192.0.2.10')]==['example.test:443']
+    assert not any('*' in x or '/' in x for x in allowed)
+    receipt=json.loads((Path(config['sandbox']['evidence_dir'])/'sandbox-installed.json').read_text())
+    assert receipt['factory_check_rules']==CHECK_RULES
+
+
+@pytest.mark.parametrize('slot',[False,True])
+def test_a_profile_that_already_names_a_check_rule_still_gets_it_once_after_the_doors(inventory,monkeypatch,slot):
+    """Codex R1: a check rule the profile already names moves to the end;
+    both rules come once each, after the doors, in the rollout and the plan."""
+    config,path,args=inventory
+    profile=Path(config['sandbox']['profile_source'])
+    profile.write_text(profile.read_text().replace('["example.test:443"]','["api.deps.dev:443", "example.test:443", "api.osv.dev:443"]'))
+    if slot:
+        make_slot(config,path)
+    rollout=m.Rollout(argparse.Namespace(config=str(path),env_file=config['env_file'],project=config['project'],secret_env_file=[]))
+    planned=rollout.plan_rules()['rules']
+    b=Boundary(config,monkeypatch)
+    assert m.main(args)==0
+    import yaml
+    rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
+    allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
+    assert allowed==rules==planned
+    assert allowed[-2:]==list(m.FACTORY_CHECK_RULES)
+    assert all(allowed.count(x)==1 for x in CHECK_RULES)
+    assert allowed[0]=='example.test:443'
+
+
+def test_plan_names_the_security_check_rules(inventory):
+    config,path,args=inventory
+    result=subprocess.run([sys.executable,str(SCRIPT),*args,'--plan'],capture_output=True,text=True,env={'PATH':'/does-not-exist'})
+    assert result.returncode==0,result.stderr
+    assert "the security check's api.osv.dev:443, api.deps.dev:443" in result.stdout
 
 
 def test_plan_shows_answer_and_memory_mcp_rules(inventory):
