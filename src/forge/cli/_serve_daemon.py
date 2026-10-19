@@ -29,11 +29,12 @@ criteria):
 * :class:`SubscriptionState.live` flips to ``True`` only after the
   pull subscription is bound; it flips to ``False`` on broker loss
   and again at clean shutdown.
-* Broker-outage recovery is JetStream-defaults only (ASSUM-007): we
-  reconnect with bounded backoff and re-attach the same durable. The
-  reconnect path opens a fresh client via the :data:`nats_connect`
-  seam (only the **first** attach uses the injected ``client`` from
-  ``_run_serve`` — see TASK-FW10-001 AC-006).
+* Broker-outage recovery (bus reconnect, 19 October 2026): the shared
+  client reconnects FOR EVER by itself (:mod:`forge.cli._serve_bus`), and
+  on a broker error the daemon re-attaches the same durable, with bounded
+  backoff, ON THE SAME CLIENT. It never closes the shared client and never
+  opens another; a client closed for good ends the daemon with
+  :class:`~forge.cli._serve_bus.BusConnectionLost`.
 * SIGTERM / SIGINT are wired via :func:`asyncio.AbstractEventLoop.add_signal_handler`
   when available; the daemon also exits cleanly on
   :class:`asyncio.CancelledError`.
@@ -180,7 +181,14 @@ async def _default_nats_connect(servers: str) -> Any:
         import nats  # type: ignore[import-not-found]
     except ImportError as exc:  # pragma: no cover - covered via the seam
         raise RuntimeError("nats client not installed — `pip install nats-py`") from exc
-    return await nats.connect(servers=servers)
+    from forge.cli._serve_bus import nats_connect_kwargs
+
+    # RECONNECT FOR EVER (bus reconnect, 19 October 2026): the shared client
+    # is held by reference by the publisher, the dispatcher and the planning
+    # loop, so an outage of any length must heal on this same client.
+    return await nats.connect(
+        servers=servers, **nats_connect_kwargs("forge-serve", shared=True)
+    )
 
 
 async def _default_dispatch(msg: _MsgLike) -> None:
@@ -556,20 +564,21 @@ async def run_daemon(
     (:func:`forge.cli.serve._run_serve`) opens exactly one NATS client
     and shares it with the dispatcher, the deps factory, the publisher,
     and this daemon, so all components share the connection (ASSUM-011).
-    The reconnect path still calls :data:`nats_connect` for subsequent
-    attaches; the AC restricts the **startup** path to a single connect.
+    Every later attach re-uses that same client (bus reconnect, 19 October
+    2026): it reconnects for ever by itself, and its other holders keep it.
 
     Control flow:
 
     1. Install signal handlers (best-effort — see
        :func:`_install_signal_handlers`).
-    2. Outer loop: use ``client`` for the first iteration, then attach
-       consumer, run the inner pull loop until either the stop event
-       fires or a broker error escapes.
+    2. Outer loop: attach the consumer on the one client, run the inner
+       pull loop until either the stop event fires or a broker error
+       escapes.
     3. On broker error: mark state not-live, sleep with bounded backoff,
-       open a fresh client via :data:`nats_connect`, retry. Repeats
-       until ``stop_event`` is set.
-    4. On clean exit: mark state not-live, unsubscribe, close client.
+       re-attach on the same client. Repeats until ``stop_event`` is set;
+       a client closed for good raises ``BusConnectionLost``.
+    4. On clean exit: mark state not-live and unsubscribe; a client the
+       daemon opened itself is closed, a shared one never is.
 
     Args:
         config: Daemon configuration (NATS URL, durable name, …).
@@ -580,26 +589,31 @@ async def run_daemon(
             :data:`nats_connect` (legacy behaviour, retained so
             existing direct callers and tests do not break).
     """
+    from forge.cli._serve_bus import BusConnectionLost
+
     stop_event = asyncio.Event()
     _install_signal_handlers(stop_event)
 
-    # Track whether the next iteration should reuse the injected client.
-    # Once consumed (or once the broker drops it), subsequent iterations
-    # open a fresh one via the seam.
-    pending_client: Any | None = client
+    # ONE CLIENT FOR THE DAEMON'S WHOLE LIFE (bus reconnect, 19 October
+    # 2026). The shared client reconnects for ever by itself; on a broker
+    # error the daemon re-attaches its consumer ON THE SAME CLIENT. It never
+    # closes the shared client and never opens another, because the
+    # publisher, the dispatcher and the planning loop hold that client by
+    # reference. A client that is closed for good ends the daemon with
+    # :class:`BusConnectionLost`, and the coordinator exits so it is
+    # restarted.
+    owns_the_client = client is None
+    if client is None:
+        client = await nats_connect(config.nats_url)
     backoff = RECONNECT_INITIAL_BACKOFF
     try:
         while not stop_event.is_set():
-            iteration_client: Any = None
             sub: Any = None
             try:
-                if pending_client is not None:
-                    iteration_client = pending_client
-                    pending_client = None
-                else:
-                    iteration_client = await nats_connect(config.nats_url)
+                if getattr(client, "is_closed", False) is True:
+                    raise BusConnectionLost("the shared bus connection is closed for good")
                 sub = await _attach_consumer(
-                    iteration_client,
+                    client,
                     config.durable_name,
                     max_ack_pending=config.max_concurrent_builds,
                 )
@@ -616,9 +630,13 @@ async def run_daemon(
                 stop_event.set()
                 await state.set_live(False)
                 raise
-            except Exception as exc:  # noqa: BLE001 — D3 reconnect path
+            except BusConnectionLost:
+                await state.set_live(False)
+                raise
+            except Exception as exc:  # noqa: BLE001 — D3 re-attach path
                 logger.warning(
-                    "forge-serve: broker error (%s); reconnecting in %.1fs",
+                    "forge-serve: broker error (%s); re-attaching on the same "
+                    "client in %.1fs",
                     exc,
                     backoff,
                 )
@@ -630,22 +648,20 @@ async def run_daemon(
                     pass
                 backoff = min(backoff * 2, RECONNECT_MAX_BACKOFF)
             finally:
-                # Best-effort tear-down — broker may already be gone.
+                # Best-effort tear-down of this attach only — the client
+                # stays open for every other holder.
                 if sub is not None:
                     try:
                         await sub.unsubscribe()
                     except Exception as exc:  # noqa: BLE001
                         logger.debug("forge-serve: unsubscribe error (%s)", exc)
-                if iteration_client is not None:
-                    try:
-                        await asyncio.wait_for(
-                            iteration_client.close(),
-                            timeout=SHUTDOWN_TIMEOUT_SECONDS,
-                        )
-                    except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
-                        logger.debug("forge-serve: client.close error (%s)", exc)
     finally:
         await state.set_live(False)
+        if owns_the_client:
+            try:
+                await asyncio.wait_for(client.close(), timeout=SHUTDOWN_TIMEOUT_SECONDS)
+            except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
+                logger.debug("forge-serve: client.close error (%s)", exc)
 
 
 __all__ = [

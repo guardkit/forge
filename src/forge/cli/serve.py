@@ -292,12 +292,10 @@ async def _default_open_fleet_client(nats_url: str) -> Any:
         A connected :class:`nats_core.client.NATSClient` exposing
         ``register_agent`` and ``deregister_agent``.
     """
-    from nats_core.client import NATSClient
-    from nats_core.config import NATSConfig
+    from forge.cli._serve_bus import open_fleet_core_client
 
-    fleet_client = NATSClient(
-        NATSConfig(url=nats_url, name="forge-serve-fleet"),
-    )
+    # Reconnects for ever, and a close for good is reported (bus reconnect).
+    fleet_client = open_fleet_core_client(nats_url, "forge-serve-fleet")
     await fleet_client.connect()
     return fleet_client
 
@@ -3041,10 +3039,10 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
 
     The daemon receives the shared client so its **first** attach does
     not call ``nats.connect(...)`` (the AC restricts the startup path
-    to one connect). Reconnects after a broker drop still open a fresh
-    client through the daemon's :data:`_serve_daemon.nats_connect` seam
-    — the AC scopes "no second connect" to startup, not to
-    runtime-reconnect.
+    to one connect). A broker drop never opens another (bus reconnect, 19
+    October 2026): the shared client reconnects for ever, the daemon
+    re-attaches on it, and a connection closed for good ends the run with
+    ``BusConnectionLost`` so the coordinator exits non-zero.
 
     Args:
         config: Validated :class:`ServeConfig`. Source of NATS URL,
@@ -3053,6 +3051,12 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
             flipped here; ``live`` is flipped by the daemon. Both are
             read by the healthz handler.
     """
+    # A FRESH BUS WATCH for this run (bus reconnect, 19 October 2026): every
+    # long-lived connection below reports its state to it, the shared one
+    # onto ``state`` for /healthz, and a close for good ends the run.
+    from forge.cli import _serve_bus
+
+    bus_watch = _serve_bus.reset(state)
     client: Any = await _serve_daemon.nats_connect(config.nats_url)
     # Open a dedicated NATSClient wrapper for fleet lifecycle ops. The
     # daemon's ``client`` above is the raw ``nats.aio.client.Client`` and
@@ -3160,7 +3164,14 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
             run_healthz_server(config, state),
             name="forge-serve-healthz",
         )
-        tasks: set[asyncio.Task[None]] = {daemon_task, healthz_task}
+        # A LOST BUS ENDS THE RUN (bus reconnect): any connection closed for
+        # good raises BusConnectionLost here, and the coordinator exits
+        # non-zero so its restart policy brings it back.
+        bus_task: asyncio.Task[None] = asyncio.create_task(
+            _serve_bus.watch_for_a_lost_bus(client, bus_watch),
+            name="forge-serve-bus-watch",
+        )
+        tasks: set[asyncio.Task[None]] = {daemon_task, healthz_task, bus_task}
 
         # Step 5.5 — FEAT-PAC runtime ack-slot watchdog (alarm-only). Only
         # created when enabled (interval > 0) so a disabled watchdog never
@@ -3263,11 +3274,9 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
         # ON) alongside the other transports.
         await _close_priors_reader_quietly()
 
-        # ``run_daemon`` already closes the client on its own
-        # iteration's ``finally`` block. This second close is
-        # defensive: if the daemon never reached the iteration finally
-        # (e.g. cancelled mid-recovery_reconcile), we still release
-        # the connection rather than relying on garbage collection.
+        # The shared client is closed HERE, once, at shutdown — the daemon
+        # never closes it (bus reconnect, 19 October 2026), because every
+        # holder shares it for the whole run.
         await _close_client_quietly(client)
 
 
@@ -3356,7 +3365,15 @@ def serve_cmd(ctx: click.Context) -> None:
     # the production closure rather than the no-op default.
     bind_production_serve(config, forge_config)
     state = SubscriptionState()
-    asyncio.run(_run_serve(config, state))
+    from forge.cli._serve_bus import BusConnectionLost
+
+    try:
+        asyncio.run(_run_serve(config, state))
+    except BusConnectionLost as exc:
+        # EXIT NON-ZERO, so the container's restart policy (unless-stopped)
+        # brings the coordinator back on a fresh connection (bus reconnect).
+        logger.error("forge-serve: %s; exiting", exc)
+        raise SystemExit(1) from exc
 
 
 __all__ = [

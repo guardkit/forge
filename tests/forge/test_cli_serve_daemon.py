@@ -352,41 +352,87 @@ class TestBrokerOutageRecovery:
     """AC-004: state.live flips False on broker loss, True on reconnect."""
 
     @pytest.mark.asyncio
-    async def test_state_clears_on_fetch_error_then_recovers(
+    @pytest.mark.parametrize(
+        "error",
+        [
+            pytest.param(ConnectionError("broker gone"), id="connection-lost"),
+            pytest.param(RuntimeError("nats: no responders available for request"), id="no-responders-503"),
+        ],
+    )
+    async def test_state_clears_on_fetch_error_then_recovers_on_the_same_client(
         self,
         monkeypatch: pytest.MonkeyPatch,
+        error: BaseException,
     ) -> None:
-        # First call: a sub that raises on fetch (broker loss).
-        # Second call: a healthy sub that yields nothing (broker back).
+        """Bus reconnect (19 October 2026): a broker error re-attaches the
+        consumer ON THE SAME CLIENT, which is never closed and never swapped
+        — the publisher, the dispatcher and the planning loop hold it by
+        reference. A short outage's 503-style error takes the same path."""
         sub_bad = _FakeSubscription()
-        sub_bad.raise_on_fetch = ConnectionError("broker gone")
-        client_bad = _FakeNatsClient(sub_bad)
-
+        sub_bad.raise_on_fetch = error
         sub_good = _FakeSubscription()
-        client_good = _FakeNatsClient(sub_good)
+        client = _FakeNatsClient(sub_bad)
+        subs = iter([sub_bad, sub_good])
+        attaches: list[Any] = []
 
-        seq = iter([client_bad, client_good])
+        async def _pull_subscribe(**kwargs: Any) -> _FakeSubscription:
+            client._js.pull_subscribe_kwargs = kwargs
+            sub = next(subs)
+            attaches.append(sub)
+            return sub
+
+        client._js.pull_subscribe = _pull_subscribe  # type: ignore[method-assign]
+        connects: list[str] = []
 
         async def _connect(url: str) -> Any:
-            return next(seq)
+            connects.append(url)
+            raise AssertionError("no second client is ever opened")
 
         monkeypatch.setattr(_serve_daemon, "nats_connect", _connect)
-        monkeypatch.setattr(
-            _serve_daemon, "RECONNECT_INITIAL_BACKOFF", 0.05
-        )
+        monkeypatch.setattr(_serve_daemon, "RECONNECT_INITIAL_BACKOFF", 0.05)
         monkeypatch.setattr(_serve_daemon, "RECONNECT_MAX_BACKOFF", 0.05)
 
         config = ServeConfig()
         state = SubscriptionState()
+        task = asyncio.create_task(run_daemon(config, state, client=client))
+        try:
+            await asyncio.wait_for(_until(lambda: len(attaches) == 2 and state.is_live()), 2.0)
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        assert connects == []
+        assert client.closed is False  # the shared client is never closed
+        assert sub_bad.unsubscribed is True
 
-        # Wait for second attach (state goes False then True again).
-        await _drive_daemon(
-            config,
-            state,
-            until=lambda: client_good.jetstream().pull_subscribe_kwargs is not None,
-            timeout=2.0,
-        )
-        assert client_bad.closed is True
+    @pytest.mark.asyncio
+    async def test_a_client_closed_for_good_ends_the_daemon_loudly(self) -> None:
+        from forge.cli._serve_bus import BusConnectionLost
+
+        client = _FakeNatsClient(_FakeSubscription())
+        client.is_closed = True  # type: ignore[attr-defined]
+        state = SubscriptionState()
+        with pytest.raises(BusConnectionLost):
+            await asyncio.wait_for(run_daemon(ServeConfig(), state, client=client), 2.0)
+        assert client.closed is False and state.is_live() is False
+
+    @pytest.mark.asyncio
+    async def test_a_daemon_given_no_client_opens_one_and_closes_only_that(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        client = _FakeNatsClient(_FakeSubscription())
+
+        async def _connect(url: str) -> Any:
+            return client
+
+        monkeypatch.setattr(_serve_daemon, "nats_connect", _connect)
+        state = SubscriptionState()
+        await _drive_daemon(ServeConfig(), state, until=lambda: state.is_live())
+        assert client.closed is True
+
+
+async def _until(predicate: Any) -> None:
+    while not predicate():
+        await asyncio.sleep(0.01)
 
 
 # ---------------------------------------------------------------------------
