@@ -4263,6 +4263,10 @@ def build_conductor_driver_deps_factory(
       lets the next build start when a fix journey ends; ``take_ack_handle``
       ``None`` (no bridge this boot, and every test here) leaves it saying
       so in one line and doing nothing.
+    * ``build_has_ended`` — whether the build's row is terminal, re-read
+      while a turn or a wait is in flight. It is how the daemon notices a
+      ``forge cancel`` run in another process and releases the queued
+      message at once rather than after the stage in flight ends.
 
     The bus seam is the ONLY one that touches NATS, and it arrives
     injected, so every test here runs network-free.
@@ -4300,6 +4304,12 @@ def build_conductor_driver_deps_factory(
             return False
         return not getattr(row, "pending_approval_request_id", None)
 
+    def build_has_ended(build_id: str) -> bool:
+        from forge.lifecycle.state_machine import TERMINAL_STATES
+
+        row = pool.get_build_row(build_id)
+        return row is not None and row.status in TERMINAL_STATES
+
     def deps_factory(build_id: str, supervisor: Any) -> ConductorDriverDeps:
         return ConductorDriverDeps(
             supervisor=supervisor,
@@ -4311,6 +4321,7 @@ def build_conductor_driver_deps_factory(
             write_failure_pack=write_pack,
             close_out=close_out,
             release_queue_message=release_queue_message,
+            build_has_ended=build_has_ended,
         )
 
     return deps_factory

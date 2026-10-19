@@ -162,6 +162,11 @@ ARM_TIMEOUT_SECONDS: float = 10.0
 #: time remained. Anti-spin: a broken wire must never hot-loop the daemon.
 ANTI_SPIN_SLEEP_SECONDS: float = 1.0
 
+#: How often (seconds) the loop re-reads the build's row while a turn or a
+#: wait is in flight, to notice a build that was ended from outside — a
+#: ``forge cancel`` run in its own process. One indexed read per tick.
+ENDED_WATCH_SECONDS: float = 10.0
+
 #: Consecutive identical, no-progress turns before the loop stops loudly.
 #: The cure-then-retry ladder's "nothing changed" rung: two retries of an
 #: unchanged state are diagnosis, a third is a wedge.
@@ -455,6 +460,18 @@ class ConductorDriverDeps:
             did exactly that, and the cure was pulling the message off
             the stream by hand). ``None`` — every test, and any boot with
             no lifecycle bridge — does nothing at all.
+        build_has_ended: ``(build_id) -> bool`` — whether the build's row
+            is already terminal. Read every ``ended_watch_seconds`` while a
+            turn or a wait is in flight. A build ended from outside — a
+            ``forge cancel`` in its own process, which cannot reach this
+            process's message — has its queued message released through
+            ``release_queue_message`` at once, instead of after the stage
+            in flight finishes (19 October 2026: a cancel during a
+            half-hour ``/task-work`` stage held a build place until the
+            hour-long redelivery). A wait is cut short so the next turn
+            reads the terminal and closes the journey out. ``None`` keeps
+            the loop exactly as before.
+        ended_watch_seconds: See :data:`ENDED_WATCH_SECONDS`.
         clock: Monotonic source, injected for deterministic tests.
         sleep: ``(seconds) -> Awaitable[None]`` — injected so tests do
             not spend real wall-clock on the anti-spin back-off.
@@ -472,12 +489,14 @@ class ConductorDriverDeps:
     write_failure_pack: Callable[..., Any] | None = None
     close_out: Callable[..., Any] | None = None
     release_queue_message: Callable[[str], Any] | None = None
+    build_has_ended: Callable[[str], Any] | None = None
     clock: Callable[[], float] = time.monotonic
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep
     max_turns: int = DEFAULT_MAX_TURNS
     arm_timeout_seconds: float = ARM_TIMEOUT_SECONDS
     nothing_changed_limit: int = NOTHING_CHANGED_LIMIT
     anti_spin_seconds: float = ANTI_SPIN_SLEEP_SECONDS
+    ended_watch_seconds: float = ENDED_WATCH_SECONDS
 
 
 #: Build ids currently being driven. Module scope so the sentinel is
@@ -532,7 +551,7 @@ class ConductorTurnLoop:
 
         while turns < deps.max_turns:
             try:
-                report = await deps.supervisor.next_turn(build_id)
+                report = await self._next_turn(build_id)
             except Exception as exc:  # noqa: BLE001 — never crash the daemon
                 logger.exception(
                     "conductor: next_turn raised for build_id=%s; stopping the "
@@ -1095,8 +1114,20 @@ class ConductorTurnLoop:
                     )
 
             try:
+                if await self._ended_while(build_id, wait_task):
+                    # Ended from outside while we waited (a ``forge cancel``
+                    # in its own process). Nothing will answer this wait;
+                    # the next turn reads the terminal and closes out.
+                    await _cancel_and_settle(wait_task)
+                    logger.info(
+                        "conductor: build_id=%s was ended from outside while "
+                        "waiting; re-planning so the journey closes out",
+                        build_id,
+                    )
+                    return True
                 signal = await wait_task
             except asyncio.CancelledError:  # pragma: no cover - shutdown path
+                await _cancel_and_settle(wait_task)
                 raise
             except Exception:  # noqa: BLE001 — a waiter defect must not kill it
                 logger.exception(
@@ -1272,6 +1303,15 @@ class ConductorTurnLoop:
                     build_id,
                 )
 
+        await self._release(build_id)
+
+    async def _release(self, build_id: str) -> None:
+        """Release the build's queued message; never raises.
+
+        The release seam takes the handle, so a second call for the same
+        build (the watch, then the close-out) acknowledges nothing twice.
+        """
+        deps = self._deps
         if deps.release_queue_message is None:
             return
         try:
@@ -1286,6 +1326,68 @@ class ConductorTurnLoop:
                 exc,
                 build_id,
             )
+
+    # -- noticing a build ended from outside ---------------------------
+
+    async def _next_turn(self, build_id: str) -> Any:
+        """One supervisor turn, watching for the build to be ended outside.
+
+        A turn can run a stage for half an hour. ``forge cancel`` runs in
+        its own process: it marks the row CANCELLED but cannot acknowledge
+        the queued message this process holds. So while the turn runs, the
+        row is re-read every ``ended_watch_seconds``; once it reads
+        terminal, the message is released through the same seam the
+        close-out uses, and the turn is left to finish. The next turn then
+        reads TERMINAL and closes the journey out as before (its release
+        finds nothing left to release).
+        """
+        deps = self._deps
+        if deps.build_has_ended is None:
+            return await deps.supervisor.next_turn(build_id)
+        turn = asyncio.ensure_future(deps.supervisor.next_turn(build_id))
+        try:
+            if await self._ended_while(build_id, turn):
+                logger.warning(
+                    "conductor: build_id=%s was ended from outside (its row "
+                    "is terminal) while a stage was running; releasing its "
+                    "queued message now so the next build can start — the "
+                    "running stage is left to finish and the journey then "
+                    "closes out",
+                    build_id,
+                )
+                await self._release(build_id)
+            return await turn
+        finally:
+            await _cancel_and_settle(turn)
+
+    async def _ended_while(self, build_id: str, task: "asyncio.Future[Any]") -> bool:
+        """Wait for ``task``; ``True`` as soon as the build reads ended first.
+
+        ``False`` once ``task`` is done (its result is left on it) or when
+        no ``build_has_ended`` seam is wired.
+        """
+        deps = self._deps
+        if deps.build_has_ended is None:
+            return False
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=deps.ended_watch_seconds)
+            if done:
+                return False
+            if await self._build_has_ended(build_id):
+                return True
+
+    async def _build_has_ended(self, build_id: str) -> bool:
+        try:
+            return bool(await _maybe_await(self._deps.build_has_ended(build_id)))
+        except Exception as exc:  # noqa: BLE001 — an unknown answer is "no"
+            logger.warning(
+                "conductor: reading whether build_id=%s has ended raised "
+                "%s: %s — reading it as 'not ended'",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return False
 
     async def _escalation_resolved(self, build_id: str) -> bool | None:
         deps = self._deps
@@ -1718,6 +1820,14 @@ def _card_was_published(report: Any) -> bool:
     backwards-compat rail again.
     """
     return getattr(getattr(report, "dispatch_result", None), "card_published", False) is True
+
+
+async def _cancel_and_settle(task: "asyncio.Future[Any]") -> None:
+    """Cancel ``task`` if it is still running and wait for it to settle."""
+    if task.done():
+        return
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
 
 
 async def _maybe_await(value: Any) -> Any:
