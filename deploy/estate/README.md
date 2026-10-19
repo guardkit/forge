@@ -412,7 +412,10 @@ repository through the door and stops if the door refuses it:
    `forge register-repo <owner>/<name> --github https://github.com/<owner>/<name>
    --slot <k> --sandbox-clone <its workspace clone> --via-git-door --publish
    --publish-credential-name <its deploy key>` (add `--sandbox-ssh <host>` when
-   the sandboxes are on another machine). The sandbox is named after the
+   the sandboxes are on another machine). The Forge image carries no ssh
+   client, so run register-repo / unregister-repo with `--sandbox-ssh` from a
+   checkout of the same commit on the coordinator machine, not inside the
+   image. The sandbox is named after the
    project, and its receipts folder is
    `/var/lib/forge-project-receipts/<sandbox name>` in the coordinator unless
    `--receipts-root` says otherwise. The project's fetch address is recorded as
