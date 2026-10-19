@@ -3306,13 +3306,12 @@ def _plain_error_text(text: str, *, limit: int = ERROR_TEXT_LIMIT) -> str:
     """
     from forge.memory.redaction import redact_credentials, scrub_process_output
 
-    text = str(text)
-    # Bound the scrubbers' work on a huge text first; the final cut below
-    # keeps far less than this, so nothing past it can show.
-    cleaned = scrub_process_output(redact_credentials(text[: limit * 4]))
-    if len(text) > limit * 4 or len(cleaned) > limit:
-        dropped = len(text) - limit if len(text) > limit * 4 else len(cleaned) - limit
-        cleaned = f"{cleaned[:limit]}… [cut: {dropped} characters]"
+    # Redact the WHOLE text first, then cut: cutting first could split a
+    # credential so the patterns no longer recognise the half that is kept.
+    cleaned = scrub_process_output(redact_credentials(str(text)))
+    if len(cleaned) > limit:
+        # The count is what this cut dropped from the redacted text.
+        cleaned = f"{cleaned[:limit]}… [cut: {len(cleaned) - limit} characters]"
     return cleaned
 
 #: Evidence forge cannot see from here, named in every pack's

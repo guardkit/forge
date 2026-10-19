@@ -2254,6 +2254,15 @@ class LifecycleBridgeWireup:
         """
         snapshot = self._last_run_state.pop(context.feature_id, None)
         if self._crash_pack_writer is None:
+            # Never silent: a production wireup without the writer means a
+            # crashed build is back to "no readable manifest" for its repair.
+            logger.warning(
+                "wireup: no crash failure-pack writer is wired, so build_id=%s "
+                "(feature_id=%s), which ended with no terminal, leaves no "
+                "failure pack and its repair will find no readable manifest",
+                build_id,
+                context.feature_id,
+            )
             return
         try:
             self._crash_pack_writer(

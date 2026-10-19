@@ -32,7 +32,7 @@ from nats_core.events import BuildQueuedPayload
 
 from forge import receipts as forge_receipts
 from forge.adapters.sqlite import connect as sqlite_connect
-from forge.cli._serve_production import _build_crash_pack_writer
+from forge.cli._serve_production import _build_lifecycle_bridge_wireup_parts
 from forge.lifecycle import migrations as lifecycle_migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle_bridge.bridge import LifecycleBridge
@@ -156,10 +156,20 @@ def _errored_run_fetcher(build_id: str) -> Any:
 
 
 async def _run_no_terminal_path(
-    persistence: SqliteLifecyclePersistence, build_id: str
+    persistence: SqliteLifecyclePersistence,
+    build_id: str,
+    *,
+    with_writer: bool = True,
 ) -> MagicMock:
     async def _resolver(_feature_id: str, _correlation_id: str) -> str:
         return build_id
+
+    # The writer the production composition builds, taken from the very
+    # parts object serve.py hands to the wireup.
+    parts = _build_lifecycle_bridge_wireup_parts(
+        sqlite_pool=persistence, autobuild_runner_url="http://127.0.0.1:9"
+    )
+    assert callable(parts.crash_pack_writer)
 
     publisher = _publisher()
     wireup = LifecycleBridgeWireup(
@@ -173,7 +183,7 @@ async def _run_no_terminal_path(
         build_id_resolver=_resolver,
         identity_resolution_attempts=1,
         identity_poll_interval_seconds=0.0,
-        crash_pack_writer=_build_crash_pack_writer(sqlite_pool=persistence),
+        crash_pack_writer=parts.crash_pack_writer if with_writer else None,
     )
     handle = AsyncMock(spec=BuildAckHandle)
     await wireup.register_ack_handle(_FEATURE_ID, _CORRELATION_ID, handle)
@@ -273,6 +283,28 @@ class TestTheNoTerminalPathLeavesAPack:
         assert "no readable manifest" in caught.value.message
 
 
+class TestAMissingWriterIsNeverSilent:
+    @pytest.mark.asyncio
+    async def test_no_writer_logs_a_warning_and_the_terminal_still_publishes(
+        self,
+        persistence: SqliteLifecyclePersistence,
+        receipts: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        build_id = _queued_build(persistence)
+        with caplog.at_level("WARNING", logger="forge.lifecycle_bridge.wireup"):
+            publisher = await _run_no_terminal_path(
+                persistence, build_id, with_writer=False
+            )
+        publisher.publish_build_failed.assert_awaited_once()
+        assert not (receipts / build_id / ar.FAILURE_MANIFEST_NAME).exists()
+        assert any(
+            "no crash failure-pack writer is wired" in record.getMessage()
+            and build_id in record.getMessage()
+            for record in caplog.records
+        )
+
+
 class TestTheWriter:
     def test_task_counts_come_from_the_last_heartbeat_first(self, tmp_path: Path) -> None:
         pack_dir = tmp_path / "build-1"
@@ -337,6 +369,23 @@ class TestTheWriter:
         assert json.loads(path.read_text())["correlation_id"] == "corr-NEW"
         assert len(list(pack_dir.glob("failure-manifest.*.json"))) == 1
 
+    def test_a_credential_straddling_the_cut_is_still_redacted(self) -> None:
+        token = "ghp_" + "A1b2C3d4E5" * 3 + "F6g7H8"  # 36 characters after ghp_
+        assert len(token) == 40
+        limit = ar.ERROR_TEXT_LIMIT
+        for start in (limit - 20, limit - 1, limit * 4 - 15, limit * 4 - 1):
+            text = "x" * start + token + " tail"
+            out = ar._plain_error_text(text)
+            assert "ghp_" not in out
+            assert "A1b2C3d4E5" not in out
+            # The count is what was dropped from the redacted text.
+            redacted_len = start + len("***REDACTED-GITHUB-TOKEN***") + len(" tail")
+            assert out.endswith(f"… [cut: {redacted_len - limit} characters]")
+            assert out.startswith("x" * min(start, limit))
+
+    def test_a_short_text_is_not_cut(self) -> None:
+        assert ar._plain_error_text("boom") == "boom"
+
     def test_a_long_error_is_cut(self, tmp_path: Path) -> None:
         path = write_crash_pack(
             build_id="build-1",
@@ -366,3 +415,31 @@ class TestTheRunErrorIsRead:
         assert _task_error({"values": {}}) is None
         assert _task_error({"tasks": "nonsense"}) is None
         assert _task_error(object()) is None
+
+
+class TestTheRunnerErrorTextScrubsEveryShape:
+    @pytest.mark.parametrize(
+        "secret_text, secret",
+        [
+            ("https://rich:s3cretpw@github.com/x.git", "s3cretpw"),
+            ("nats://operator:natspass@host:4222", "natspass"),
+            ("sk-ant-api03-AbCdEf_0123456789-xyz", "sk-ant-api03"),
+            ("api_key=abcd1234efgh", "abcd1234efgh"),
+            ("Authorization: token gho_ABCdef123456", "gho_ABCdef123456"),
+            ("ghp_" + "A1b2C3d4E5" * 3 + "F6g7H8", "A1b2C3d4E5"),
+            ("password=hunter2", "hunter2"),
+        ],
+    )
+    def test_the_secret_never_reaches_the_pack(
+        self, tmp_path: Path, secret_text: str, secret: str
+    ) -> None:
+        path = write_crash_pack(
+            build_id="build-1",
+            feature_id="FEAT-X",
+            correlation_id="corr-1",
+            receipts_root=tmp_path,
+            run_status="error",
+            runner_error=f"running_wave: RuntimeError('failed at {secret_text}')",
+        )
+        assert path is not None
+        assert secret not in path.read_text(encoding="utf-8")

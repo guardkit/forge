@@ -1069,6 +1069,8 @@ class TestLifecycleBridgeWireupComposition:
                 # Timeout truth (schema_v9) — the durable class sink is
                 # passed through like every other SQLite-bound part.
                 terminal_class_recorder=object(),
+                # 19 October 2026 — the crash failure-pack writer.
+                crash_pack_writer=object(),
             )
 
             previous_dispatch = _serve_daemon.dispatch_payload
@@ -1106,6 +1108,9 @@ class TestLifecycleBridgeWireupComposition:
             # build that outlives the per-build deadline (drive-5,
             # 2026-08-04: a live work leg killed 90s into an 1800s budget).
             assert captured["build_mode_reader"] is parts.build_mode_reader
+            # 19 October 2026 — dropped here, a build whose runner crashed
+            # would leave no failure pack and its repair would be refused.
+            assert captured["crash_pack_writer"] is parts.crash_pack_writer
         finally:
             cx.close()
 

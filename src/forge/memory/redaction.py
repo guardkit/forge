@@ -113,6 +113,26 @@ _PASSWORD_KV_RE = re.compile(r"(?i)password=[^\s;&|)]+")
 #: Stops at common shell delimiters: whitespace, ;, &, |, ), etc.
 _PGPASSWORD_RE = re.compile(r"PGPASSWORD=[^\s;&|)]+")
 
+#: A password in a URL's user part, any scheme (``https://user:pass@host``,
+#: ``nats://user:pass@host``). The scheme and user are kept; ``/`` cannot
+#: appear unencoded in the user part, so a ``host:port/path`` never matches.
+_URL_PASSWORD_RE = re.compile(r"\b([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/@]+):[^\s/@]+@")
+
+#: Anthropic API keys.
+_ANTHROPIC_KEY_RE = re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}")
+
+#: ``api_key=…`` / ``api-key: …`` / ``apikey=…`` (any case), with an
+#: optional quote kept around the value.
+_API_KEY_KV_RE = re.compile(
+    r"(?i)\b(api[_-]?key)(\s*[=:]\s*)([\"']?)[^\s;&|)\"',]+"
+)
+
+#: ``Authorization: token …`` / ``Authorization: Basic …`` (any case). The
+#: ``Bearer`` form is already covered by :func:`redact_credentials`.
+_AUTH_HEADER_RE = re.compile(
+    r"(?i)(authorization:\s*(?:token|basic)\s+)[^\s\"',;]+"
+)
+
 
 # ---------------------------------------------------------------------------
 # Replacement markers
@@ -123,6 +143,8 @@ _BEARER_REDACTION = "Bearer ***REDACTED***"
 _HEX_REDACTION = "***REDACTED-HEX***"
 _DSN_REDACTION = "***REDACTED-DSN***"
 _PASSWORD_REDACTION = "***REDACTED-PASSWORD***"
+_ANTHROPIC_KEY_REDACTION = "***REDACTED-ANTHROPIC-KEY***"
+_SECRET_REDACTION = "***REDACTED***"
 
 
 def redact_credentials(text: str) -> str:
@@ -183,6 +205,17 @@ def scrub_process_output(text: str) -> str:
     3. ``PGPASSWORD=<value>`` (case-sensitive env var) →
        ``PGPASSWORD=***REDACTED-PASSWORD***``
 
+    4. A password in a URL's user part, any scheme
+       (``nats://user:pass@host``) → ``nats://user:***REDACTED-PASSWORD***@host``
+
+    5. ``sk-ant-…`` Anthropic keys → ``***REDACTED-ANTHROPIC-KEY***``
+
+    6. ``api_key=<value>`` / ``api-key: <value>`` / ``apikey=<value>`` (any
+       case) → the key, then ``***REDACTED***``
+
+    7. ``Authorization: token <value>`` / ``Authorization: Basic <value>``
+       (any case) → the header, then ``***REDACTED***``
+
     The function is pure: no logging, no I/O, no original-value retention.
     It is idempotent: ``scrub_process_output(scrub_process_output(s)) ==
     scrub_process_output(s)`` for every ``s``.
@@ -223,6 +256,15 @@ def scrub_process_output(text: str) -> str:
         return "PGPASSWORD=" + _PASSWORD_REDACTION
 
     text = _PGPASSWORD_RE.sub(_replace_pgpassword, text)
+
+    # 19 October 2026: the shapes a crashed runner's error text was found to
+    # let through. Each keeps its key and replaces only the value.
+    text = _URL_PASSWORD_RE.sub(lambda m: f"{m.group(1)}:{_PASSWORD_REDACTION}@", text)
+    text = _ANTHROPIC_KEY_RE.sub(_ANTHROPIC_KEY_REDACTION, text)
+    text = _API_KEY_KV_RE.sub(
+        lambda m: f"{m.group(1)}{m.group(2)}{m.group(3)}{_SECRET_REDACTION}", text
+    )
+    text = _AUTH_HEADER_RE.sub(lambda m: f"{m.group(1)}{_SECRET_REDACTION}", text)
 
     return text
 

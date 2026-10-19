@@ -932,9 +932,7 @@ def bind_production_dispatch_chain(
                 merge_offer_hook=merge_offer_hook,
                 # A run that ended with no terminal still leaves a failure
                 # pack its repair can read (19 October 2026, FEAT-B874).
-                crash_pack_writer=getattr(
-                    bridge_wireup_parts, "crash_pack_writer", None
-                ),
+                crash_pack_writer=bridge_wireup_parts.crash_pack_writer,
             )
             register_ack_handle = wireup.register_ack_handle
             take_ack_handle = wireup.take_ack_handle
