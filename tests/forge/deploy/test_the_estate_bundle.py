@@ -69,7 +69,7 @@ _ONLY_THESE_ARE_INHERITED = (
     "XDG_RUNTIME_DIR",
 )
 
-#: The bus's eight account passwords. They never appear in a file in the
+#: The bus's nine account passwords. They never appear in a file in the
 #: bundle: they are passed into the command from a child process, which is the
 #: bus repository's own arrangement. **Nothing below sets one**, and that is
 #: the point — the estate hands each to the bus as a secret read from the
@@ -87,7 +87,58 @@ _THE_BUSS_ACCOUNT_PASSWORDS = (
     "FLEET_MEMORY_NATS_PASSWORD",
     "GUARDKIT_NATS_PASSWORD",
     "JARVIS_NATS_PASSWORD",
+    "DASHBOARD_APPROVE_NATS_PASSWORD",
 )
+
+
+def _bus_password_wiring_problems(compose_text: str) -> list[str]:
+    """What is wrong with how the bus is handed its account passwords, read
+    from the PARSED compose file: for each account name, the bus mounts a
+    secret at the lower-cased name, that secret reads exactly that variable
+    from the environment, and the wrapper's list, the mounts and the
+    environment-read secrets are the same set as the bus's passwords."""
+    import yaml
+
+    problems: list[str] = []
+    data = yaml.safe_load(compose_text)
+    bus = data["services"]["nats"]
+    secrets = data.get("secrets", {})
+    entries = [m for m in bus.get("secrets", []) if isinstance(m, dict)]
+    targets = [m.get("target") for m in entries]
+    for target in sorted({t for t in targets if targets.count(t) > 1}):
+        # A dictionary keeps only the last of a repeated target, so a second
+        # mount at the same place would otherwise pass unseen.
+        problems.append(f"the bus mounts /run/secrets/{target} more than once")
+    mounts = {m["target"]: m["source"] for m in entries}
+    wrapper = "\n".join(str(part) for part in bus.get("entrypoint", []))
+    loop = re.search(r"for account in ([A-Z_ ]+); do", wrapper)
+    if loop is None:
+        return ["the bus's password wrapper has no account list"]
+    wanted = set(_THE_BUSS_ACCOUNT_PASSWORDS)
+    listed = {f"{a}_NATS_PASSWORD" for a in loop.group(1).split()}
+    if listed != wanted:
+        problems.append(f"the wrapper reads {sorted(listed)}, not {sorted(wanted)}")
+    mounted = {t.upper() for t in mounts if t.endswith("_nats_password")}
+    if mounted != wanted:
+        problems.append(f"the bus mounts {sorted(mounted)}, not {sorted(wanted)}")
+    read = {
+        v.get("environment") for v in secrets.values()
+        if isinstance(v, dict) and str(v.get("environment", "")).endswith("_NATS_PASSWORD")
+    }
+    if not wanted <= read:
+        problems.append(f"no secret reads {sorted(wanted - read)} from the environment")
+    for name in sorted(wanted):
+        source = mounts.get(name.lower())
+        if source is None:
+            problems.append(f"the bus is not given {name} as /run/secrets/{name.lower()}")
+            continue
+        reads = (secrets.get(source) or {}).get("environment")
+        if reads != name:
+            problems.append(
+                f"/run/secrets/{name.lower()} comes from secret {source}, "
+                f"which reads {reads}, not {name}"
+            )
+    return problems
 
 
 def _render(
@@ -276,7 +327,7 @@ class TestTheEstateRenders:
     def test_no_password_reaches_a_container_environment(
         self, rendered: str
     ) -> None:
-        """The bus's eight passwords reach it as FILES. The bus repository's
+        """The bus's nine passwords reach it as FILES. The bus repository's
         own compose file puts them in ``environment:``, where ``docker
         inspect`` shows them to anybody who can reach the Docker daemon; the
         estate hands each one in as a secret instead and a wrapper puts them
@@ -288,6 +339,65 @@ class TestTheEstateRenders:
                 "'docker inspect' would show its value"
             )
         assert "/run/secrets" in rendered or "secrets:" in rendered
+
+    def test_the_bus_is_handed_every_account_password(self) -> None:
+        """EVERY PASSWORD THE BUS'S ENTRYPOINT SUBSTITUTES ARRIVES, AS A FILE,
+        AND IT IS THE RIGHT ONE. The bus's accounts file names nine passwords
+        since 19 October 2026 (the dashboard's answer account joined the eight),
+        and its entrypoint refuses to start with any of them empty. So the
+        wrapper's account list, the bus's secret mounts and the secrets read
+        from the environment must name the same nine, and each mount must be
+        wired to the secret that reads ITS OWN variable — a mount sourced from
+        another account's secret starts the bus with the wrong password."""
+        problems = _bus_password_wiring_problems(
+            (ESTATE / "compose.yaml").read_text(encoding="utf-8")
+        )
+        assert problems == [], "\n".join(problems)
+
+    @pytest.mark.parametrize(
+        ("label", "old", "new"),
+        [
+            (
+                "the dashboard mount sourced from the jarvis secret",
+                "      - source: bus-dashboard-approve-password\n"
+                "        target: dashboard_approve_nats_password\n",
+                "      - source: bus-jarvis-password\n"
+                "        target: dashboard_approve_nats_password\n",
+            ),
+            (
+                "the dashboard secret reading the jarvis variable",
+                "  bus-dashboard-approve-password:\n"
+                "    environment: DASHBOARD_APPROVE_NATS_PASSWORD\n",
+                "  bus-dashboard-approve-password:\n"
+                "    environment: JARVIS_NATS_PASSWORD\n",
+            ),
+            (
+                "a repeated mount target (a dictionary keeps only the last)",
+                "      - source: bus-dashboard-approve-password\n"
+                "        target: dashboard_approve_nats_password\n",
+                "      - source: bus-jarvis-password\n"
+                "        target: dashboard_approve_nats_password\n"
+                "      - source: bus-dashboard-approve-password\n"
+                "        target: dashboard_approve_nats_password\n",
+            ),
+            (
+                "the wrapper forgetting the dashboard account",
+                "GUARDKIT JARVIS DASHBOARD_APPROVE; do",
+                "GUARDKIT JARVIS; do",
+            ),
+        ],
+    )
+    def test_a_miswired_bus_password_is_caught(
+        self, label: str, old: str, new: str
+    ) -> None:
+        """The check above is held to the two miswirings the 19 October review
+        found it let through when it compared names only, and to a list that
+        drops an account."""
+        text = (ESTATE / "compose.yaml").read_text(encoding="utf-8")
+        assert text.count(old) == 1, f"the mutation for {label} no longer applies"
+        assert _bus_password_wiring_problems(text.replace(old, new)) != [], (
+            f"{label} was not caught"
+        )
 
     def test_the_bus_still_reads_its_own_config(self, rendered: str) -> None:
         """NAMING AN ENTRYPOINT EMPTIES THE IMAGE'S OWN COMMAND. Compose drops
@@ -736,7 +846,7 @@ class TestWhatTheEstatePromises:
         self, rendered: str
     ) -> None:
         """It carries the store's password, so it is a secret and travels as a
-        file — the same way the bus's eight account passwords do, and
+        file — the same way the bus's nine account passwords do, and
         deliberately NOT the way the coordinator's bus address still does."""
         for service in ("memory", "memory-relay"):
             block = _service_block(rendered, service)
