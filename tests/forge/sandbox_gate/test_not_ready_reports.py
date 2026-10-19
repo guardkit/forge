@@ -213,3 +213,28 @@ class TestBootRecoveryIsDeferredPerRepository:
             gate_module.install_gate(None)
             ledger.close()
         assert launched == []
+
+
+class TestASettledPressWaits:
+    @pytest.mark.asyncio
+    async def test_finishing_a_settled_press_waits_for_its_sandbox(self, tmp_path: Path) -> None:
+        """The press-lease recovery's finishing reaches the sandbox (its
+        clean-up); with the sandbox not ready it answers "held" and touches
+        nothing, for the work queue's tick to try again."""
+        ledger = a_ledger(tmp_path)
+        starter = FakeStarter(running=False)
+        starter.start_refusal = "the sandbox client is not signed in"
+        gate_module.install_gate(a_gate(ledger, starter, clock=Clock(), ready_timeout_seconds=60))
+        try:
+            deps = SimpleNamespace(
+                pool=SimpleNamespace(
+                    connection=ledger, get_build_row=lambda build_id: SimpleNamespace(repo=REPO)
+                ),
+                clock=Clock().now,
+            )
+            consumer = MergeApprovalConsumer(deps)  # type: ignore[arg-type]
+            assert await consumer.finish_a_settled_press("B-1") == "held"
+            assert not consumer._lock_for(REPO).locked()
+        finally:
+            gate_module.install_gate(None)
+            ledger.close()

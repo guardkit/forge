@@ -8513,6 +8513,17 @@ class MergeApprovalConsumer:
         )
 
     async def finish_a_settled_press(self, build_id: str) -> str:
+        """:meth:`_finish_a_settled_press`, with the project's sandbox started
+        first: its clean-up reaches the sandbox (one sandbox per project,
+        stage S2). A sandbox that is not ready answers "held", and the work
+        queue's tick tries again; nothing is touched meanwhile."""
+        try:
+            return await self._finish_a_settled_press(build_id)
+        except SandboxNotReady as exc:
+            logger.warning("merge-executor: finishing %s's press waits — %s", build_id, exc)
+            return "held"
+
+    async def _finish_a_settled_press(self, build_id: str) -> str:
         """Finish a press that stopped after its result: the recovery's half
         of the one finishing routine (Codex round 1, 18 October 2026).
 
@@ -8542,7 +8553,7 @@ class MergeApprovalConsumer:
         store = PublicationRecordStore(self._deps.pool.connection)
         record = store.read(build_id)
         repo = str(record.repo or row.repo or "")
-        async with self._lock_for(repo):
+        async with self._pressing(repo, f"finishing the press of {build_id}"):
             record = store.read(build_id)
             written = store.read_outcome(build_id)
             if not _a_press_is_owed_its_finishing(record, written):
