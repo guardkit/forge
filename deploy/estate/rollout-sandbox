@@ -219,7 +219,7 @@ if git_door:
 # beside the doors; never the gateway, a wildcard or a path.
 check=p['check_rules']
 assert check and all(x not in (answer,memory,door,git_door) and not x.startswith(gateway+':') for x in check)
-rules=list(dict.fromkeys(rules+check))
+rules=[x for x in rules if x not in check]+check  # once each, after the doors, even if the profile named one
 assert all(x!='*' and '/' not in x for x in rules)
 s['allow_network']=rules; s['receipts_path']=c['receipts_path']; doc['cwd']=c['clone_path']
 parse_deploy_profile(doc)
@@ -707,7 +707,9 @@ class Rollout:
         require(isinstance(doc, dict) and isinstance(doc.get('sandbox'), dict), 'the producer profile has no sandbox block; fix the profile')
         replacements = self.s.get('allow_replacements', {})
         rules = [self.values[replacements[x]] if x in replacements else x for x in doc['sandbox'].get('allow_network', [])]
-        rules = list(dict.fromkeys(rules + [self.answer, self.memory_mcp, self.model_door] + ([self.git_door] if self.git_door else []) + list(FACTORY_CHECK_RULES)))
+        rules = list(dict.fromkeys(rules + [self.answer, self.memory_mcp, self.model_door] + ([self.git_door] if self.git_door else [])))
+        # The security check's rules once each, after the doors, even if the profile named one.
+        rules = [x for x in rules if x not in FACTORY_CHECK_RULES] + list(FACTORY_CHECK_RULES)
         return {'rules': rules}
 
     def plan_text(self):

@@ -567,14 +567,26 @@ def test_every_sandbox_gets_the_security_check_rules_once_after_its_doors(invent
     assert receipt['factory_check_rules']==CHECK_RULES
 
 
-def test_a_profile_that_already_names_a_check_rule_still_gets_it_once(inventory,monkeypatch):
+@pytest.mark.parametrize('slot',[False,True])
+def test_a_profile_that_already_names_a_check_rule_still_gets_it_once_after_the_doors(inventory,monkeypatch,slot):
+    """Codex R1: a check rule the profile already names moves to the end;
+    both rules come once each, after the doors, in the rollout and the plan."""
     config,path,args=inventory
     profile=Path(config['sandbox']['profile_source'])
-    profile.write_text(profile.read_text().replace('["example.test:443"]','["example.test:443", "api.osv.dev:443"]'))
+    profile.write_text(profile.read_text().replace('["example.test:443"]','["api.deps.dev:443", "example.test:443", "api.osv.dev:443"]'))
+    if slot:
+        make_slot(config,path)
+    rollout=m.Rollout(argparse.Namespace(config=str(path),env_file=config['env_file'],project=config['project'],secret_env_file=[]))
+    planned=rollout.plan_rules()['rules']
     b=Boundary(config,monkeypatch)
     assert m.main(args)==0
+    import yaml
+    rules=yaml.safe_load(Path(config['sandbox']['profile_source']).read_text())['sandbox']['allow_network']
     allowed=next(x for x in b.argv() if x[:4]==['sbx','policy','allow','network'])[-1].split(',')
+    assert allowed==rules==planned
+    assert allowed[-2:]==list(m.FACTORY_CHECK_RULES)
     assert all(allowed.count(x)==1 for x in CHECK_RULES)
+    assert allowed[0]=='example.test:443'
 
 
 def test_plan_names_the_security_check_rules(inventory):
