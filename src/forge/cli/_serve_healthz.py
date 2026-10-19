@@ -82,6 +82,8 @@ async def _healthz_handler(request: web.Request) -> web.Response:
     * ``chain_not_ready`` — chain composition / reconcile_on_boot has
       not finished (kubelet should keep the pod out of the Service
       until reconcile completes).
+    * ``bus_disconnected`` — the shared bus connection is down (it is
+      reconnecting) or closed for good (bus reconnect, 19 October 2026).
     * ``subscription_not_live`` — chain is ready but the broker is
       gone (Group E scenario row 3 — the daemon is composed but the
       pull subscription has dropped).
@@ -107,6 +109,17 @@ async def _healthz_handler(request: web.Request) -> web.Response:
             {
                 "status": "unhealthy",
                 "reason": "chain_not_ready",
+                "ack_slot": ack_slot,
+            },
+            status=503,
+        )
+    if not getattr(state, "bus_connected", True):
+        # The shared bus connection is disconnected (it is reconnecting) or
+        # closed for good (bus reconnect, 19 October 2026).
+        return web.json_response(
+            {
+                "status": "unhealthy",
+                "reason": "bus_disconnected",
                 "ack_slot": ack_slot,
             },
             status=503,

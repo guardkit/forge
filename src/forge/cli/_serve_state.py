@@ -59,6 +59,10 @@ class SubscriptionState:
     live: bool = False
     chain_ready: bool = False
     ack_slot: str = "unknown"
+    #: The shared bus connection is up (bus reconnect, 19 October 2026):
+    #: written by its ``disconnected_cb`` / ``reconnected_cb`` / ``closed_cb``
+    #: (:mod:`forge.cli._serve_bus`). ``/healthz`` answers 503 while False.
+    bus_connected: bool = True
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
 
     async def set_live(self, value: bool) -> None:

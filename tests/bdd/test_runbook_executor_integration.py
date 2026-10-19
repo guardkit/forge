@@ -54,12 +54,9 @@ TEST_LABEL = "forge.test=runbook-executor"
 async def _connect(url: str):
     import nats
 
-    return await nats.connect(
-        servers=[url],
-        connect_timeout=2,
-        allow_reconnect=False,
-        max_reconnect_attempts=0,
-    )
+    from forge.adapters.nats.connect_once import connect_once
+
+    return await connect_once([url], timeout=2)
 
 
 @pytest.fixture(scope="module")

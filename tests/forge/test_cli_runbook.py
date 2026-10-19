@@ -711,7 +711,8 @@ class TestBestEffortAuthAndFailFast:
         assert kwargs["token"] == "tok-123"
         # AC-2 guard: reconnect is disabled so an auth-reject can't spin.
         assert kwargs["allow_reconnect"] is False
-        assert kwargs["max_reconnect_attempts"] == 0
+        # 0 is "for ever" in nats-py: a positive limit makes it give up.
+        assert kwargs["max_reconnect_attempts"] == 1
 
     def test_auth_reject_fails_fast_to_noop_single_attempt(
         self, monkeypatch: pytest.MonkeyPatch
