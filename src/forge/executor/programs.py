@@ -388,6 +388,13 @@ class _Descendants:
             sent = True
         return sent
 
+    def forget_exited(self) -> None:
+        """Close the pidfds of processes that have ended."""
+        for pid, fd in list(self.fds.items()):
+            if _pidfd_exited(fd):
+                os.close(fd)
+                del self.fds[pid]
+
     def close(self) -> None:
         for fd in self.fds.values():
             try:
@@ -397,11 +404,20 @@ class _Descendants:
         self.fds.clear()
 
 
+#: How long the stop's drain may go on killing what is under the wrapper.
+_DRAIN_SECONDS: float = 10.0
+
+#: How long one drain pass waits for what it killed to end.
+_DRAIN_PASS_WAIT_SECONDS: float = 2.0
+
+
 class StoppableRun:
     """One program :func:`run_program` starts inside :func:`stoppable`, which
     another thread may stop with :meth:`request_stop`. See the block above."""
 
-    def __init__(self) -> None:
+    def __init__(self, label: str = "") -> None:
+        #: Names this run in the stop's log lines (the helper: which leg).
+        self.label = label
         self._lock = threading.Lock()
         self._process: "subprocess.Popen[bytes] | None" = None
         self._finished = False
@@ -462,12 +478,13 @@ class StoppableRun:
         The process held is the subreaper wrapper (see :data:`_SUBREAPER`),
         unreaped throughout. Everything under it — the program and every
         process in its tree, re-parented orphans included — is held by pidfd
-        and sent TERM; during the grace and once more before the KILL the walk
-        is repeated from the wrapper, so a process started or orphaned during
-        the grace is found too; KILL goes to every one still running, and
-        last to the wrapper itself. The wrapper is never sent TERM: it is
-        first sent the hold signal, so it stays until that KILL. ``True``
-        when anything was signalled.
+        and sent TERM; during the grace the walk is repeated from the wrapper,
+        so a process started or orphaned during the grace is found too. Then
+        the drain (:meth:`_drain`) KILLs everything under the wrapper, pass
+        after pass, until a scan finds nothing; only then is the wrapper
+        itself KILLed. The wrapper is never sent TERM: it is first sent the
+        hold signal, so it stays, reaping, until that KILL. ``True`` when
+        anything was signalled.
         """
         with self._lock:
             process = self._process
@@ -499,11 +516,13 @@ class StoppableRun:
                     if not descendants.running():
                         break
                     time.sleep(0.05)
-                # The KILL is sent under the same lock: the wrapper cannot
-                # have been reaped, so everything re-parented to it is still
-                # under it, and every process is reached by its pidfd.
-                descendants.collect()
-                signalled = descendants.signal(signal.SIGKILL) or signalled
+                # THE DRAIN (Codex round 5). Under the same lock, the wrapper
+                # held and unreaped: scan everything under it, KILL each one
+                # through its pidfd, wait until each has exited, scan again.
+                # A killed process cannot fork once the signal lands, so each
+                # pass sees only what was forked just before its parent died;
+                # the loop ends when a scan finds nothing (bounded).
+                signalled = self._drain(descendants) or signalled
                 if not _exited_unreaped(process.pid):
                     try:
                         os.kill(process.pid, signal.SIGKILL)
@@ -513,6 +532,32 @@ class StoppableRun:
             finally:
                 descendants.close()
             return signalled
+
+    def _drain(self, descendants: "_Descendants") -> bool:
+        """KILL everything under the wrapper until a scan finds nothing."""
+        signalled = False
+        until = time.monotonic() + _DRAIN_SECONDS
+        while True:
+            descendants.collect()
+            found = descendants.running()
+            if not found:
+                return signalled
+            if time.monotonic() >= until:
+                logger.warning(
+                    "stopping %s: %d processes under it are still there after "
+                    "%g seconds of killing; going on",
+                    self.label or "a stoppable program",
+                    len(found),
+                    _DRAIN_SECONDS,
+                )
+                return signalled
+            signalled = descendants.signal(signal.SIGKILL) or signalled
+            wait_until = min(until, time.monotonic() + _DRAIN_PASS_WAIT_SECONDS)
+            while time.monotonic() < wait_until and not all(
+                _pidfd_exited(fd) for fd in found
+            ):
+                time.sleep(0.01)
+            descendants.forget_exited()
 
     def _mark_finished(self) -> None:
         if self._before_finish_mark is not None:

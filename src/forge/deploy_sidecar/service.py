@@ -8518,7 +8518,9 @@ class _RunningLeg:
     def __init__(self, *, number: int, build: str | None) -> None:
         self.number = number
         self.build = build
-        self.run = StoppableRun()
+        self.run = StoppableRun(
+            label=f"the fix-journey leg number {number} (build {build or 'not named'})"
+        )
 
     @property
     def started(self) -> bool:

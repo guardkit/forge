@@ -35,6 +35,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import signal
 import subprocess
 import threading
 import time
@@ -1038,3 +1039,84 @@ class TestTheWrapperStaysForWhatTheProgramLeft:
             plain.stderr,
         )
         assert not wrapped.timed_out
+
+
+# ---------------------------------------------------------------------------
+# Codex round 5: the KILL drains until nothing is left under the wrapper
+# ---------------------------------------------------------------------------
+
+
+def _forker(directory: Path) -> list[str]:
+    """A program that ignores TERM and, each time it is asked (a file named
+    ``fork-now``), forks a fresh child that forks once more and exits."""
+    d = directory
+    return [
+        "sh",
+        "-c",
+        "trap '' TERM\n"
+        f"echo $$ > {d}/program.tmp && mv {d}/program.tmp {d}/program.pid\n"
+        "sleep 300 &\n"
+        f"echo $! > {d}/first.tmp && mv {d}/first.tmp {d}/first.pid\n"
+        "while :; do\n"
+        f"  if [ -e {d}/fork-now ]; then rm -f {d}/fork-now\n"
+        f"    ( sleep 300 & echo $! > {d}/forked.tmp && mv {d}/forked.tmp {d}/forked.pid )\n"
+        "  fi\n"
+        "  sleep 0.02\n"
+        "done\n",
+    ]
+
+
+class TestTheKillDrainsEverythingUnderTheWrapper:
+    def test_a_fork_after_a_kill_pass_began_is_still_stopped(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Codex R5. At the first SIGKILL of the drain, before it is sent, the
+        program is made to fork a fresh child (which forks a grandchild and
+        exits). That grandchild was not in the pass's scan; the next pass
+        finds it under the wrapper and kills it."""
+        from forge.executor import programs
+
+        mine, other = tmp_path / "mine", tmp_path / "other"
+        mine.mkdir()
+        other.mkdir()
+        handshakes: list[int] = []
+        real_send = programs._pidfd_send_signal
+
+        def fork_before_the_first_kill(fd: int, sig: int) -> None:
+            if sig == signal.SIGKILL and not handshakes:
+                (mine / "fork-now").write_text("", encoding="utf-8")
+                handshakes.append(_read_pid(mine / "forked.pid"))
+            real_send(fd, sig)
+
+        other_run = programs.StoppableRun()
+        other_thread, _other = _run_in_thread(other_run, _forker(other))
+        other_pids = [_read_pid(other / "program.pid"), _read_pid(other / "first.pid")]
+
+        run = programs.StoppableRun()
+        thread, result = _run_in_thread(run, _forker(mine))
+        program, first = _read_pid(mine / "program.pid"), _read_pid(mine / "first.pid")
+        started: list[int] = [program, first]
+        try:
+            monkeypatch.setattr(programs, "_pidfd_send_signal", fork_before_the_first_kill)
+            assert run.request_stop(grace=0.3) is True
+            monkeypatch.setattr(programs, "_pidfd_send_signal", real_send)
+            thread.join(PROMPT_SECONDS)
+
+            assert handshakes, "the handshake fork never happened"
+            started.append(handshakes[0])
+            assert not thread.is_alive()
+            assert result["outcome"].exit_code is not None
+            for pid in started:
+                assert _gone(pid), f"pid {pid} survived the stop"
+            assert all(_alive(pid) for pid in other_pids)
+            assert other_thread.is_alive()
+        finally:
+            monkeypatch.setattr(programs, "_pidfd_send_signal", real_send)
+            other_run.request_stop(grace=0.3)
+            other_thread.join(PROMPT_SECONDS)
+            for path in (other / "forked.pid",):
+                if path.exists():
+                    other_pids.append(int(path.read_text().split()[0]))
+            for pid in [*started, *other_pids]:
+                if _alive(pid):
+                    os.kill(pid, 9)
