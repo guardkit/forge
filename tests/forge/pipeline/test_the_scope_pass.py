@@ -1416,3 +1416,31 @@ class TestADependencyUpgradeIsNotANewWebAddress:
         )
         assert "apps/web/package.json" in declared
         assert "package-lock.json" not in declared
+
+    def test_a_manifest_adding_a_package_reports_its_capability(self) -> None:
+        """Through the whole pass, not just the text it reads: a rate-limiting
+        package the build put in a manifest is reported, and the same line in
+        a lockfile is not."""
+        line = '    "rate-limiter": "1.0.0"\n'
+
+        def _reading(path: str) -> object:
+            class OneFile:
+                error = None
+                name_status = f"M\x00{path}\x00"
+                added_by_file = {path: line}
+                added_lines_read_whole = True
+
+            return OneFile()
+
+        in_the_manifest = scope_of_the_build(
+            reading=_reading("apps/web/package.json"), request=UPGRADE_REQUEST
+        )
+        assert in_the_manifest.capabilities_the_request_did_not_name == [
+            "rate limiting"
+        ]
+
+        in_the_lockfile = scope_of_the_build(
+            reading=_reading("apps/web/package-lock.json"), request=UPGRADE_REQUEST
+        )
+        assert in_the_lockfile.routes_read is True
+        assert in_the_lockfile.capabilities_the_request_did_not_name == []
