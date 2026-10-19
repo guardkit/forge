@@ -10,7 +10,7 @@ Design of record: docs/factory-deploy-execution-surface-design-2026-07-16.md §1
 
 The narrow contract:
 
-    GET  /healthz -> {"status": "healthy", "rev": "git-<sha>"}
+    GET  /healthz -> {"status": "healthy", "rev": "git-<sha>", "instance": "<id>"}
     GET  /busy    -> {"busy": bool, "executing": [{route, repo, seconds}]}
     POST /run  {repo, script, env, timeout_seconds, cwd?}
               -> {exit_code, output_tail, cwd}
@@ -590,6 +590,12 @@ def resolve_code_version() -> str:
 
 #: Import-time code-version stamp (see :func:`resolve_code_version`).
 SIDECAR_CODE_VERSION: str = resolve_code_version()
+
+#: THIS HELPER PROCESS'S OWN ID (one sandbox per project, stage S2): a random
+#: id made once when the helper process starts, so it changes whenever the
+#: helper is recreated (a VM restart recreates it). ``/healthz`` reports it as
+#: ``instance``, and the sandbox starter binds a deployment's readiness to it.
+HELPER_INSTANCE: str = __import__("uuid").uuid4().hex
 
 
 # ---------------------------------------------------------------------------
@@ -8415,7 +8421,12 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
         try:
             if self.path.split("?", 1)[0] == "/healthz":
                 self._write_json(
-                    200, {"status": "healthy", "rev": SIDECAR_CODE_VERSION}
+                    200,
+                    {
+                        "status": "healthy",
+                        "rev": SIDECAR_CODE_VERSION,
+                        "instance": HELPER_INSTANCE,
+                    },
                 )
                 return
             if self.path.split("?", 1)[0] == BUSY_ROUTE:
@@ -8726,6 +8737,7 @@ __all__ = [
     "ENV_ALLOWLIST_BASE",
     "OUTPUT_TAIL_CHARS",
     "SIDECAR_CODE_VERSION",
+    "HELPER_INSTANCE",
     "BUSY_ROUTE",
     "MERGE_TIMEOUT_DEFAULT",
     "MERGE_TIMEOUT_MAX",
