@@ -112,6 +112,10 @@ class RunStateSnapshot:
 
     status: str
     values: Mapping[str, Any]
+    #: The error a task of the thread's last step raised, as LangGraph
+    #: recorded it (``"<task name>: <error>"``), or ``None``. Read so a run
+    #: that crashed can say why in its failure pack (19 October 2026).
+    error: str | None = None
 
 
 #: ``async (*, feature_id, thread_id, run_id) -> RunStateSnapshot | None``.
@@ -232,7 +236,9 @@ def langgraph_run_state_fetcher(*, runner_url: str) -> RunStateFetcher:
             )
             return None
 
-        return RunStateSnapshot(status=status, values=values)
+        return RunStateSnapshot(
+            status=status, values=values, error=_task_error(thread_state)
+        )
 
     return _fetcher
 
@@ -266,3 +272,26 @@ def _extract_values(thread_state: Any) -> Mapping[str, Any] | None:
     if not isinstance(values, Mapping):
         return None
     return values
+
+
+def _task_error(thread_state: Any) -> str | None:
+    """The first task error on a ``ThreadState``, as ``"<name>: <error>"``.
+
+    LangGraph lists the thread's pending tasks with the error each raised.
+    Never raises; ``None`` when there is none or the shape is unexpected.
+    """
+    try:
+        if isinstance(thread_state, Mapping):
+            tasks = thread_state.get("tasks")
+        else:
+            tasks = getattr(thread_state, "tasks", None)
+        for task in tasks or ():
+            if isinstance(task, Mapping):
+                error, name = task.get("error"), task.get("name")
+            else:
+                error, name = getattr(task, "error", None), getattr(task, "name", None)
+            if error:
+                return f"{name}: {error}" if name else str(error)
+    except Exception:  # noqa: BLE001 — SDK shape drift: no error text
+        return None
+    return None

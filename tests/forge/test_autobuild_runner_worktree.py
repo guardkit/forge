@@ -116,7 +116,7 @@ class _FakeStdout:
     def __init__(self, lines: list[bytes]) -> None:
         self._lines = [*lines, b""]
 
-    async def readline(self) -> bytes:
+    async def read(self, n: int = -1) -> bytes:
         return self._lines.pop(0) if self._lines else b""
 
 
@@ -1448,7 +1448,7 @@ class _HangingProc:
         def __init__(self, dead: asyncio.Event) -> None:
             self._dead = dead
 
-        async def readline(self) -> bytes:
+        async def read(self, n: int = -1) -> bytes:
             await self._dead.wait()
             return b""
 

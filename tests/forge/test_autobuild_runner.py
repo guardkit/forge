@@ -652,7 +652,7 @@ class TestRunnerGraphConstruction:
                         b"",  # EOF
                     ]
 
-                async def readline(self) -> bytes:
+                async def read(self, n: int = -1) -> bytes:
                     return self._lines.pop(0) if self._lines else b""
 
             class _FakeProc:
@@ -726,7 +726,7 @@ class TestRunnerGraphConstruction:
                         b"",
                     ]
 
-                async def readline(self) -> bytes:
+                async def read(self, n: int = -1) -> bytes:
                     return self._lines.pop(0) if self._lines else b""
 
             class _FakeProc:
@@ -932,7 +932,7 @@ class TestResolveBudgetWallclockSeconds:
 
 
 class _BudgetFakeStdout:
-    async def readline(self) -> bytes:
+    async def read(self, n: int = -1) -> bytes:
         return b""  # immediate EOF
 
 

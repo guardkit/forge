@@ -274,3 +274,82 @@ class TestModuleLevelInvariants:
             assert f"import {needle}" not in source, (
                 f"redaction module must not import {needle!r}"
             )
+
+
+# ---------------------------------------------------------------------------
+# Shapes a crashed runner's error text let through (19 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class TestMoreSecretShapes:
+    """Each shape keeps its key and loses only its value."""
+
+    @pytest.mark.parametrize(
+        ("text", "secret", "expected"),
+        [
+            (
+                "fetch https://rich:s3cretpw@github.com/x.git failed",
+                "s3cretpw",
+                "fetch https://rich:***REDACTED-PASSWORD***@github.com/x.git failed",
+            ),
+            (
+                "connect nats://operator:natspass@host:4222 refused",
+                "natspass",
+                "connect nats://operator:***REDACTED-PASSWORD***@host:4222 refused",
+            ),
+            (
+                "cache redis://:exampleSecret@localhost:6379/0 down",
+                "exampleSecret",
+                "cache redis://:***REDACTED-PASSWORD***@localhost:6379/0 down",
+            ),
+            (
+                "GET https://:emptyUserPw@example.org/x",
+                "emptyUserPw",
+                "GET https://:***REDACTED-PASSWORD***@example.org/x",
+            ),
+            (
+                "key sk-ant-api03-AbCdEf_0123456789-xyz rejected",
+                "sk-ant-api03",
+                "key ***REDACTED-ANTHROPIC-KEY*** rejected",
+            ),
+            (
+                "api_key=abcd1234efgh and more",
+                "abcd1234efgh",
+                "api_key=***REDACTED*** and more",
+            ),
+            (
+                'API-KEY: "zz9plural" sent',
+                "zz9plural",
+                'API-KEY: "***REDACTED***" sent',
+            ),
+            (
+                "Authorization: token gho_ABCdef123456 header",
+                "gho_ABCdef123456",
+                "Authorization: token ***REDACTED*** header",
+            ),
+        ],
+    )
+    def test_each_shape_is_redacted(
+        self, text: str, secret: str, expected: str
+    ) -> None:
+        out = scrub_process_output(text)
+        assert secret not in out
+        assert out == expected
+        assert scrub_process_output(out) == out  # idempotent
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "https://example.com:8080/api/v1/users",
+            "nats://127.0.0.1:4222",
+            "see https://host/path@ref for details",
+            "the api key was rotated",
+            "https://example.org:8443?contact=alice@example.net",
+            "https://example.org#alice@example.net",
+            "https://example.org:8443#mail=alice@example.net",
+            "https://example.org:8443/users/@alice",
+            "https://example.org:8443/a@b",
+        ],
+    )
+    def test_no_false_positive(self, text: str) -> None:
+        assert scrub_process_output(text) == text

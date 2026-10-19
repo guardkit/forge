@@ -1768,6 +1768,7 @@ async def _retained_candidate_base(
     closing the race between this inspection and the branch cut.
     """
     from forge.pipeline.fix_journey_receipts import read_failure_pack
+    from forge.subagents.autobuild_runner import TERMINAL_RUNNER_CRASHED
 
     pack = read_failure_pack(source_build_id, receipts_root=receipts_root)
     if pack is None or not pack.has_manifest:
@@ -1803,6 +1804,21 @@ async def _retained_candidate_base(
     subprocess_ran = (
         evidence.get("subprocess_ran") if isinstance(evidence, Mapping) else None
     )
+    if pack.terminal == TERMINAL_RUNNER_CRASHED and subprocess_ran is None:
+        # 19 October 2026 (FEAT-B874): the coordinator's pack for a run whose
+        # runner stopped without reporting an end. It says honestly that
+        # nobody checked for a candidate, so the refusal names that rather
+        # than a missing manifest.
+        raise FixAdmissionRefused(
+            f"Nothing was queued: {source_build_id} ended without a terminal "
+            f"({pack.reason or 'the build runner stopped without reporting an end'})"
+            ". Nothing checked whether coding began or which candidate it "
+            "left, so there is no verified candidate to repair. Refusing to "
+            "fall back to main because that could discard the failed build's "
+            "work.",
+            reason=REPAIR_BASE_REASON,
+            permanent=True,
+        )
     if subprocess_ran is False:
         return RepairBase(branch=fallback_branch)
     if subprocess_ran is not True:

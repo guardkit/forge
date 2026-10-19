@@ -207,6 +207,63 @@ class LifecycleBridgeWireupParts:
     # constructions publish no classified terminal, and a missing recorder is
     # a quiet no-op, never a hole in an enforcement path.
     terminal_class_recorder: "TerminalClassRecorder | None" = None
+    # 19 October 2026 (FEAT-B874) — leaves a failure pack for a run that
+    # ended with no terminal, so its repair can start or refuse for a stated
+    # reason. Optional: ``None`` writes nothing.
+    crash_pack_writer: "Callable[..., object] | None" = None
+
+
+def _build_crash_pack_writer(
+    *, sqlite_pool: SqliteLifecyclePersistence
+) -> "Callable[..., object]":
+    """Bind :func:`forge.lifecycle_bridge.crash_pack.write_crash_pack` to the
+    build row: its project's own receipts folder and its branch.
+
+    A build whose row cannot be read gets no pack (the row's branch is what
+    the repair's identity check compares, so guessing it would fail that
+    check later anyway). Never raises.
+    """
+    from forge.lifecycle_bridge.crash_pack import write_crash_pack
+    from forge.receipts import receipts_root_for
+
+    def _write(
+        *,
+        build_id: str,
+        feature_id: str,
+        correlation_id: str,
+        run_status: str | None = None,
+        runner_error: str | None = None,
+        last_values: Any = None,
+    ) -> object:
+        try:
+            row = sqlite_pool.get_build_row(build_id) if build_id else None
+        except Exception as exc:  # noqa: BLE001 — degrade to no pack
+            logger.warning(
+                "crash pack: build row read failed for %s (%s: %s); no pack",
+                build_id,
+                type(exc).__name__,
+                exc,
+            )
+            return None
+        if row is None:
+            logger.warning(
+                "crash pack: no build row for %s (feature %s); no pack",
+                build_id,
+                feature_id,
+            )
+            return None
+        return write_crash_pack(
+            build_id=build_id,
+            feature_id=feature_id,
+            correlation_id=str(getattr(row, "correlation_id", "") or correlation_id),
+            receipts_root=receipts_root_for(getattr(row, "repo", None)),
+            branch=getattr(row, "branch", None),
+            run_status=run_status,
+            runner_error=runner_error,
+            last_values=last_values,
+        )
+
+    return _write
 
 
 def build_feature_runner_url_resolver(
@@ -611,6 +668,8 @@ def _build_lifecycle_bridge_wireup_parts(
     # re-recording the same verdict changes nothing.
     terminal_class_recorder = sqlite_pool.record_terminal_class
 
+    crash_pack_writer = _build_crash_pack_writer(sqlite_pool=sqlite_pool)
+
     return LifecycleBridgeWireupParts(
         bridge=bridge,
         translator=translator,
@@ -623,6 +682,7 @@ def _build_lifecycle_bridge_wireup_parts(
         build_id_resolver=build_id_resolver,
         build_mode_reader=build_mode_reader,
         terminal_class_recorder=terminal_class_recorder,
+        crash_pack_writer=crash_pack_writer,
     )
 
 

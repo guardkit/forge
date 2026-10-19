@@ -69,7 +69,7 @@ class _BlockingStdout:
         self._tail = list(tail_lines or [])
         self.reads_after_eof = 0
 
-    async def readline(self) -> bytes:
+    async def read(self, n: int = -1) -> bytes:
         if self._lines:
             await asyncio.sleep(0)
             return self._lines.pop(0)
@@ -1137,7 +1137,7 @@ class TestTailReadCannotAlterTheTerminal:
         """A kill that did not take must not hold the terminal for ever."""
 
         class _NeverEnds:
-            async def readline(self) -> bytes:
+            async def read(self, n: int = -1) -> bytes:
                 await asyncio.sleep(3600)
                 return b""
 
@@ -1161,7 +1161,7 @@ class TestTailReadCannotAlterTheTerminal:
             def __init__(self) -> None:
                 self._lines = [b"a line\n"]
 
-            async def readline(self) -> bytes:
+            async def read(self, n: int = -1) -> bytes:
                 return self._lines.pop(0) if self._lines else b""
 
         class _Proc:
