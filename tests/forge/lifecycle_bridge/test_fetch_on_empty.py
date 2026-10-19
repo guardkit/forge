@@ -523,6 +523,46 @@ class TestFetchOnEmptyInterruptedRun:
         fake_publisher.publish_build_complete.assert_not_awaited()
         handle.ack.assert_awaited_once()
 
+    @pytest.mark.asyncio
+    async def test_a_cancelled_routine_build_leaves_nothing_held(
+        self,
+        bridge: LifecycleBridge,
+        translator: StreamEventTranslator,
+        fake_publisher: MagicMock,
+    ) -> None:
+        """A direct ``forge cancel`` of a routine (mode-b) build, 19 Oct 2026.
+
+        The cancel interrupts the run; the observer acknowledges the queued
+        message when the run ends, without waiting for the redelivery, and
+        afterwards the bridge holds no handle and no observer for the
+        feature — what ``register-repo --check-drained`` needs to see.
+        """
+        feature_id = "FEAT-FETCH-CANCELLED-B"
+        fetcher = AsyncMock(
+            return_value=RunStateSnapshot(
+                status="interrupted",
+                values=_terminal_state_values(
+                    feature_id, lifecycle="running_wave", tasks_completed=0
+                ),
+            )
+        )
+        wireup = _build_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            stream_source=_empty_stream_source(),
+            run_state_fetcher=fetcher,
+        )
+        handle = _make_handle()
+
+        await wireup.register_ack_handle(feature_id, "corr-cancelled-b", handle)
+        await _drain(wireup, feature_id)
+
+        handle.ack.assert_awaited_once()
+        handle.nak.assert_not_awaited()
+        assert wireup.take_ack_handle(feature_id) is None
+        assert wireup.active_observer_count() == 0
+
 
 class TestInterruptedStateProjectionBoundaries:
     @pytest.mark.parametrize(

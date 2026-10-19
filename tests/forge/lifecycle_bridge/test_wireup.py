@@ -1445,6 +1445,37 @@ class TestTheConductorCanTakeTheAckHandle:
         await wireup.shutdown()
 
     @pytest.mark.asyncio
+    async def test_a_take_for_another_build_of_the_feature_leaves_it_held(
+        self, bridge, translator, fake_publisher
+    ) -> None:
+        # 19 October 2026: a cancelled fix journey A released its place and
+        # a new build B of the same feature (fix journeys reuse the parent's
+        # feature id) registered here. A's close-out asks by A's correlation
+        # id and must get nothing; B's handle stays for B.
+        wireup = _build_mode_aware_wireup(
+            bridge,
+            translator,
+            fake_publisher,
+            mode_reader=_StubModeReader({"build-take-next": BuildMode.MODE_C}),
+            resolved_build_id="build-take-next",
+        )
+        handle_a = _make_handle()
+        handle_b = _make_handle()
+
+        await wireup.register_ack_handle("FEAT-TKN", "corr-tkn-a", handle_a)
+        await _drain_observer(wireup, "FEAT-TKN", timeout=2.0)
+        assert wireup.take_ack_handle("FEAT-TKN", correlation_id="corr-tkn-a") is handle_a
+
+        await wireup.register_ack_handle("FEAT-TKN", "corr-tkn-b", handle_b)
+        await _drain_observer(wireup, "FEAT-TKN", timeout=2.0)
+
+        assert wireup.take_ack_handle("FEAT-TKN", correlation_id="corr-tkn-a") is None
+        handle_b.ack.assert_not_awaited()
+        assert wireup.take_ack_handle("FEAT-TKN", correlation_id="corr-tkn-b") is handle_b
+
+        await wireup.shutdown()
+
+    @pytest.mark.asyncio
     async def test_a_routine_build_leaves_nothing_behind(
         self, bridge, translator, fake_publisher
     ) -> None:

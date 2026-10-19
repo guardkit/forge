@@ -4071,7 +4071,9 @@ def make_conductor_queue_release(
     1. reads the build's feature id off its row (that is the name the
        bridge files the handle under);
     2. takes the handle — taking it, not borrowing it, so a second
-       close-out for the same build cannot acknowledge twice;
+       close-out for the same build cannot acknowledge twice — and takes it
+       only if it belongs to this build's correlation id, so a later build
+       of the same feature keeps its own;
     3. acknowledges the message once.
 
     Anything missing — no bridge this boot, no row, a journey that began
@@ -4090,9 +4092,11 @@ def make_conductor_queue_release(
             return
 
         feature_id: str | None = None
+        correlation_id: str | None = None
         try:
             row = pool.get_build_row(build_id)
             feature_id = getattr(row, "feature_id", None) if row else None
+            correlation_id = getattr(row, "correlation_id", None) if row else None
         except Exception as exc:  # noqa: BLE001 — a read must not end a terminal
             logger.warning(
                 "conductor close-out: could not read the build row for "
@@ -4112,7 +4116,10 @@ def make_conductor_queue_release(
             )
             return
 
-        handle = take_ack_handle(feature_id)
+        # Asked by THIS build's correlation id: a fix journey shares its
+        # feature id with its parent and any later build of the feature,
+        # and the bridge hands out only the handle that belongs to us.
+        handle = take_ack_handle(feature_id, correlation_id=correlation_id or None)
         if handle is None:
             logger.info(
                 "conductor close-out: build_id=%s (%s) — no queued message is "
@@ -4263,6 +4270,10 @@ def build_conductor_driver_deps_factory(
       lets the next build start when a fix journey ends; ``take_ack_handle``
       ``None`` (no bridge this boot, and every test here) leaves it saying
       so in one line and doing nothing.
+    * ``build_has_ended`` — whether the build's row is terminal, re-read
+      while a turn or a wait is in flight. It is how the daemon notices a
+      ``forge cancel`` run in another process and releases the queued
+      message at once rather than after the stage in flight ends.
 
     The bus seam is the ONLY one that touches NATS, and it arrives
     injected, so every test here runs network-free.
@@ -4300,6 +4311,12 @@ def build_conductor_driver_deps_factory(
             return False
         return not getattr(row, "pending_approval_request_id", None)
 
+    def build_has_ended(build_id: str) -> bool:
+        from forge.lifecycle.state_machine import TERMINAL_STATES
+
+        row = pool.get_build_row(build_id)
+        return row is not None and row.status in TERMINAL_STATES
+
     def deps_factory(build_id: str, supervisor: Any) -> ConductorDriverDeps:
         return ConductorDriverDeps(
             supervisor=supervisor,
@@ -4311,6 +4328,7 @@ def build_conductor_driver_deps_factory(
             write_failure_pack=write_pack,
             close_out=close_out,
             release_queue_message=release_queue_message,
+            build_has_ended=build_has_ended,
         )
 
     return deps_factory
