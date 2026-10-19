@@ -1204,6 +1204,16 @@ def landing_left_standing_sentence(
     )
 
 
+def the_identity_handed_to_the_check(written: Any) -> str | None:
+    """The identity the press handed to its check, as its row keeps it: with
+    the result (``standing_json``), else in the ending it wrote down."""
+    for said in (getattr(written, "standing", None), getattr(written, "outcome", None)):
+        handed = (said or {}).get("identity_handed_to_the_check")
+        if handed:
+            return str(handed)
+    return None
+
+
 def press_kept_on_purpose(record: Any, written: Any) -> str | None:
     """Why a stopped press's hold is kept on purpose, or ``None``.
 
@@ -3458,6 +3468,11 @@ async def execute_merge_deploy(
         return {
             "candidate_may_stand": bool(candidate_standing or something_is_left_standing),
             "leg_unanswered": bool(a_leg_did_not_complete),
+            # THE IDENTITY HANDED TO THE CHECK, written with the result (Codex
+            # round 4, R10): a check that failed saves no ``checked`` block,
+            # so this is the one place a recovery can read it to name the
+            # candidate that may still be standing.
+            "identity_handed_to_the_check": gate.get("identity_handed_to_the_check"),
         }
 
     def _cannot_join(sentence: str) -> MergeDeployOutcome:
@@ -8435,7 +8450,12 @@ class MergeApprovalConsumer:
             ending = the_stopped_presss_ending(self._deps, row, record, again, kept=kept)
             if landing and kept:
                 ending.warning = (again.warning or {}).get("sentence") or (
-                    landing_left_standing_sentence(row.feature_id, record, kept)
+                    landing_left_standing_sentence(
+                        row.feature_id,
+                        record,
+                        kept,
+                        handed=the_identity_handed_to_the_check(again),
+                    )
                 )
                 ending.mission_id = belongs.mission_id
             repo_root_raw = self._deps.config.planning.target_repo_paths.get(repo)

@@ -1530,6 +1530,72 @@ class TestTheWarningsSentence:
         assert "no identity was recorded" in sentence("F", pending, kept)
 
 
+class TestAFailedChecksIdentityIsKeptWithTheResult:
+    """Codex round 4, R10: a failed candidate check saves no ``checked``
+    block; the identity handed to it is written with the result, so a
+    recovery after any stop names the same candidate in the thread and on
+    the card, and only then puts the hold down."""
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("stop", ["after-the-result", "after-ending-1", "after-ending-2"])
+    async def test_the_recovery_names_the_same_identity(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        stop: str,
+    ) -> None:
+        from tests.forge.pipeline.test_mission_finish import _Thread
+        from tests.forge.pipeline.test_press_lease_recovery import (
+            _stop_after_the_ending_is_written_down,
+            _stop_after_the_result,
+            _TheCoordinatorStopped as _Stopped,
+        )
+
+        a_running_mission(pool, keys=("B",))
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        _planned(pool)
+        the_mission_branch_on_the_remote(repo_root)
+        deps, *_ = press_deps(
+            config_on, pool, repo_root, deploy=_ACheckThatFailsAndLeavesItStanding()
+        )
+        consumer = MergeApprovalConsumer(deps)
+        assert consumer._decide_landing(
+            B_BUILD, mission_id=MISSION_ID, decided_by="x", request_id=f"merge-{B_BUILD}"
+        )
+        with pytest.MonkeyPatch.context() as crash:
+            if stop == "after-the-result":
+                _stop_after_the_result(crash, RESULT_PUBLICATION_PENDING)
+            else:
+                _stop_after_the_ending_is_written_down(crash, int(stop[-1]))
+            with pytest.raises(_Stopped):
+                await consumer.land_mission_feature(B_BUILD)
+        record = _record(pool)
+        assert record.result == RESULT_PUBLICATION_PENDING and not record.checked
+        written = PublicationRecordStore(pool.connection).read_outcome(B_BUILD)
+        handed = written.standing.get("identity_handed_to_the_check")
+        assert handed and written.warning == {}  # the warning was never kept
+
+        bookkeeping = TestASettledLandingWhoseBookkeepingDidNotFinish()
+        bookkeeping._expire(pool)
+        await MergeApprovalConsumer(deps).finish_a_settled_press(B_BUILD)
+        # No way to say it yet: kept on the row for the card, not finished,
+        # and the hold not put down.
+        assert _record(pool).lease_holder
+        assert PublicationRecordStore(pool.connection).read_outcome(B_BUILD).finished_at is None
+        thread = _Thread()
+        consumer.install_mission_teller(_a_teller(pool, thread))
+        bookkeeping._expire(pool)
+        assert await MergeApprovalConsumer(deps).finish_a_settled_press(B_BUILD) == "finished"
+
+        lines = [line for _m, line in thread.lines]
+        cards = mission_finish._left_standing_sentences(pool, mission_id=MISSION_ID)
+        assert len(lines) == 1 and cards == lines
+        assert f"(identity {handed})" in lines[0]
+        assert lines[0].startswith("FEAT-MX1's check left its candidate standing")
+        assert _record(pool).lease_holder is None
+
+
 class TestTheWarningsSentenceIsKeptForTheCard:
     @pytest.mark.asyncio
     async def test_a_failed_write_of_the_sentence_is_retried_without_saying_it_again(
