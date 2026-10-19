@@ -27,6 +27,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
+import time
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger("forge.cli.serve")
@@ -45,6 +47,18 @@ class BusConnectionLost(RuntimeError):
     """A bus connection reached *closed*: the coordinator exits non-zero."""
 
 
+#: While a connection has never connected, its "can't be reached yet" warning
+#: is said on the first failed attempt and then about once a minute.
+UNREACHABLE_WARNING_SECONDS: float = 60.0
+
+_CREDENTIALS_IN_A_URL = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)[^/@\s]+@", re.IGNORECASE)
+
+
+def without_credentials(text: Any) -> str:
+    """``text`` with any ``user:password@`` in a URL taken out."""
+    return _CREDENTIALS_IN_A_URL.sub(r"\g<scheme>***@", str(text))
+
+
 class BusWatch:
     """What every long-lived bus connection says about itself.
 
@@ -52,41 +66,76 @@ class BusWatch:
     lifecycle callbacks for one connection; the shared connection's are
     also written onto the readiness state, so ``/healthz`` answers 503 while
     it is disconnected or closed.
+
+    Two quiet cases (coach review, 19 October 2026): a connection that has
+    NEVER connected (the bus is down when the coordinator starts) gets a
+    WARNING on its first failed attempt and then about once a minute, never
+    with the URL's credentials; and once :meth:`begin_shutdown` is called,
+    the deliberate closes at shutdown are said at INFO and lose nothing.
     """
 
     def __init__(self) -> None:
         self.state: Any = None
         self.lost = asyncio.Event()
         self.lost_names: list[str] = []
+        self.shutting_down = False
+        self._connected: set[str] = set()
+        self._last_unreachable: dict[str, float] = {}
+
+    def begin_shutdown(self) -> None:
+        """The closes from here on are deliberate."""
+        self.shutting_down = True
+
+    def mark_connected(self, name: str) -> None:
+        """The connection ``name`` has connected at least once."""
+        self._connected.add(name)
 
     def callbacks(self, name: str, *, shared: bool = False) -> dict[str, Callable[..., Awaitable[None]]]:
         async def disconnected() -> None:
-            logger.warning("forge-serve: the %s bus connection is down; reconnecting", name)
             if shared:
                 self._set_connected(False)
+            if self.shutting_down:
+                logger.info("forge-serve: the %s bus connection is closing for shutdown", name)
+                return
+            logger.warning("forge-serve: the %s bus connection is down; reconnecting", name)
 
         async def reconnected() -> None:
+            self.mark_connected(name)
             logger.info("forge-serve: the %s bus connection is back", name)
             if shared:
                 self._set_connected(True)
 
         async def closed() -> None:
+            if shared:
+                self._set_connected(False)
+            if self.shutting_down:
+                logger.info("forge-serve: the %s bus connection is closed for shutdown", name)
+                return
             logger.error(
                 "forge-serve: the %s bus connection is closed for good; the "
                 "coordinator exits so it is restarted",
                 name,
             )
-            if shared:
-                self._set_connected(False)
             self.lost_names.append(name)
             self.lost.set()
 
         async def error(exc: Exception) -> None:
-            # One line per failed attempt, not nats-py's default traceback:
-            # an outage of an hour is 1800 attempts.
-            logger.debug(
-                "forge-serve: the %s bus connection: %s: %s", name, type(exc).__name__, exc
-            )
+            said = f"{type(exc).__name__}: {without_credentials(exc)}"
+            if name not in self._connected and not self.shutting_down:
+                now = time.monotonic()
+                last = self._last_unreachable.get(name)
+                if last is None or now - last >= UNREACHABLE_WARNING_SECONDS:
+                    self._last_unreachable[name] = now
+                    logger.warning(
+                        "forge-serve: the bus can't be reached yet for the %s "
+                        "connection (%s); still trying",
+                        name,
+                        said,
+                    )
+                    return
+            # One debug line per failed attempt, not nats-py's default
+            # traceback: an outage of an hour is 1800 attempts.
+            logger.debug("forge-serve: the %s bus connection: %s", name, said)
 
         return {
             "disconnected_cb": disconnected,
@@ -139,6 +188,14 @@ def open_fleet_core_client(nats_url: str, name: str) -> Any:
     return NATSClient(config, **WATCH.callbacks(name))
 
 
+async def connect_fleet_core_client(nats_url: str, name: str) -> Any:
+    """:func:`open_fleet_core_client`, connected, and marked as connected."""
+    client = open_fleet_core_client(nats_url, name)
+    await client.connect()
+    WATCH.mark_connected(name)
+    return client
+
+
 async def watch_for_a_lost_bus(client: Any, watch: BusWatch | None = None) -> None:
     """Return never; raise :class:`BusConnectionLost` once any watched
     connection is closed, or the shared client says it is closed."""
@@ -165,7 +222,9 @@ __all__ = [
     "RECONNECT_TIME_WAIT_SECONDS",
     "WATCH",
     "nats_connect_kwargs",
+    "connect_fleet_core_client",
     "open_fleet_core_client",
+    "without_credentials",
     "reset",
     "watch_for_a_lost_bus",
 ]

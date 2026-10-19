@@ -1095,13 +1095,14 @@ async def compose_planning_consumer_and_dispatch(
         if nats_url:
             try:
                 from forge.adapters.nats.fleet_watcher import watch as fleet_watch
-                from forge.cli._serve_bus import open_fleet_core_client
+                from forge.cli._serve_bus import connect_fleet_core_client
 
                 # Reconnects for ever, and a close for good is reported, so
                 # the coordinator exits rather than lose discovery silently
                 # (bus reconnect, 19 October 2026).
-                fleet_client = open_fleet_core_client(nats_url, "forge-serve-planning-fleet")
-                await fleet_client.connect()
+                fleet_client = await connect_fleet_core_client(
+                    nats_url, "forge-serve-planning-fleet"
+                )
 
                 watcher_task = asyncio.create_task(
                     fleet_watch(fleet_client, cache, status_reader=cache)

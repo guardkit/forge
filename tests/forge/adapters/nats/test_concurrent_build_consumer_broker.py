@@ -100,12 +100,9 @@ class _Broker:
 
 
 async def _connect(url: str) -> Any:
-    return await nats.connect(
-        servers=[url],
-        connect_timeout=2,
-        allow_reconnect=False,
-        max_reconnect_attempts=0,
-    )
+    from forge.adapters.nats.connect_once import connect_once
+
+    return await connect_once([url], timeout=2)
 
 
 def _start_broker(image: str) -> Iterator[_Broker]:

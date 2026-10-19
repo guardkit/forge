@@ -292,12 +292,10 @@ async def _default_open_fleet_client(nats_url: str) -> Any:
         A connected :class:`nats_core.client.NATSClient` exposing
         ``register_agent`` and ``deregister_agent``.
     """
-    from forge.cli._serve_bus import open_fleet_core_client
+    from forge.cli._serve_bus import connect_fleet_core_client
 
     # Reconnects for ever, and a close for good is reported (bus reconnect).
-    fleet_client = open_fleet_core_client(nats_url, "forge-serve-fleet")
-    await fleet_client.connect()
-    return fleet_client
+    return await connect_fleet_core_client(nats_url, "forge-serve-fleet")
 
 
 #: Module-level rebindable seam: fleet lifecycle client opener.
@@ -2698,9 +2696,16 @@ async def _close_client_quietly(client: Any) -> None:
     """
     if client is None:
         return
+    # A raw nats-py client closes with close(); a nats_core NATSClient (the
+    # fleet client) has only disconnect(), which drains and closes it.
+    closer = getattr(client, "close", None)
+    if closer is None:
+        closer = getattr(client, "disconnect", None)
+    if closer is None:
+        return
     try:
         await asyncio.wait_for(
-            client.close(),
+            closer(),
             timeout=_serve_daemon.SHUTDOWN_TIMEOUT_SECONDS,
         )
     except (asyncio.TimeoutError, Exception) as exc:  # noqa: BLE001
@@ -3260,6 +3265,9 @@ async def _run_serve(config: ServeConfig, state: SubscriptionState) -> None:
             if exc is not None:
                 raise exc
     finally:
+        # THE CLOSES FROM HERE ON ARE DELIBERATE (coach review, 19 October
+        # 2026): they are said at INFO and never read as a lost bus.
+        bus_watch.begin_shutdown()
         # Best-effort fleet deregistration so the agent-registry KV
         # reflects shutdown promptly rather than waiting for jarvis to
         # mark forge stale. ``deregister`` is idempotent and swallows

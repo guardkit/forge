@@ -44,9 +44,11 @@ def _config(ctx: click.Context) -> Any:
 
 
 async def _connect(url: str) -> Any:
-    import nats  # type: ignore[import-not-found]
+    """A one-shot connect that gives up within ten seconds: nats-py reads
+    ``max_reconnect_attempts=0`` as "for ever" (19 October 2026)."""
+    from forge.adapters.nats.connect_once import connect_once
 
-    return await nats.connect(servers=url, connect_timeout=10, max_reconnect_attempts=0)
+    return await connect_once(url, timeout=10)
 
 
 async def _run_once(config: Any, db_path: Path) -> int:

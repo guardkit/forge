@@ -522,10 +522,12 @@ async def _connect_nats_best_effort(
     - **AC-1** — auth kwargs (token / user+password / ``.creds`` file) are
       passed to ``nats.connect``; the server URL is sanitised + scrubbed
       before any log line, so the secret is never logged.
-    - **AC-2** — ``allow_reconnect=False`` makes an auth-rejecting broker
-      raise immediately instead of spinning in a reconnect loop; the single
-      raise is caught here and converted to the NoOp fallback. (The earlier
-      ``max_reconnect_attempts=0`` alone did *not* prevent the spin.)
+    - **AC-2** — :func:`~forge.adapters.nats.connect_once.connect_once`:
+      ``allow_reconnect=False`` makes an auth-rejecting broker raise
+      immediately, a positive attempt limit makes a broker that is down give
+      up too (nats-py reads ``max_reconnect_attempts=0`` as "for ever"), and
+      the whole connect is bounded by its timeout; the raise is caught here
+      and converted to the NoOp fallback.
 
     Args:
         environ: Optional mapping to read instead of :data:`os.environ`.
@@ -547,15 +549,14 @@ async def _connect_nats_best_effort(
     safe_display = _scrub_for_log(safe_servers, secrets)
 
     try:
-        client = await nats_connect(
-            servers,
-            connect_timeout=2,  # Fail fast if broker unavailable.
-            # AC-2: disable reconnect entirely so an Authorization Violation
-            # raises on the first attempt instead of spinning. Keeping
-            # max_reconnect_attempts=0 too is belt-and-suspenders.
-            allow_reconnect=False,
-            max_reconnect_attempts=0,
-            **auth_kwargs,
+        # AC-2, and a broker that is down (19 October 2026): reconnects off
+        # and a POSITIVE attempt limit, so nats-py's first connect gives up
+        # (it reads max_reconnect_attempts=0 as "for ever"), the whole
+        # connect bounded by its two-second timeout.
+        from forge.adapters.nats.connect_once import connect_once
+
+        client = await connect_once(
+            servers, timeout=2, connect=nats_connect, **auth_kwargs
         )
     except ImportError:
         logger.warning(

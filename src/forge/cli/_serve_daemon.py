@@ -186,9 +186,13 @@ async def _default_nats_connect(servers: str) -> Any:
     # RECONNECT FOR EVER (bus reconnect, 19 October 2026): the shared client
     # is held by reference by the publisher, the dispatcher and the planning
     # loop, so an outage of any length must heal on this same client.
-    return await nats.connect(
+    from forge.cli import _serve_bus
+
+    client = await nats.connect(
         servers=servers, **nats_connect_kwargs("forge-serve", shared=True)
     )
+    _serve_bus.WATCH.mark_connected("forge-serve")
+    return client
 
 
 async def _default_dispatch(msg: _MsgLike) -> None:

@@ -304,10 +304,10 @@ class TestEveryLongLivedConnectionReconnectsForEver:
 
         from forge.cli import _serve_planning, serve
 
-        assert "open_fleet_core_client(" in inspect.getsource(serve._default_open_fleet_client)
+        assert "connect_fleet_core_client(" in inspect.getsource(serve._default_open_fleet_client)
         planning = inspect.getsource(_serve_planning)
-        assert 'open_fleet_core_client(nats_url, "forge-serve-planning-fleet")' in planning
-        assert "NATSClient(" not in planning.split("open_fleet_core_client")[1][:600]
+        assert '"forge-serve-planning-fleet"' in planning.split("await connect_fleet_core_client(")[1][:120]
+        assert "NATSClient(" not in planning.split("connect_fleet_core_client")[1][:600]
         daemon = inspect.getsource(_serve_daemon._default_nats_connect)
         assert 'nats_connect_kwargs("forge-serve", shared=True)' in daemon
 
@@ -365,19 +365,6 @@ def test_the_subject_filter_is_the_build_queued_one() -> None:
     assert BUILD_QUEUED_SUBJECT_FILTER == "pipeline.build-queued.*"
 
 
-def test_the_serve_run_watches_for_a_lost_bus() -> None:
-    """The serve loop runs the watch beside the daemon, so a close for good
-    ends the run (and the CLI exits non-zero)."""
-    import inspect
-
-    from forge.cli import serve
-
-    source = inspect.getsource(serve._run_serve)
-    assert "bus_watch = _serve_bus.reset(state)" in source
-    assert "_serve_bus.watch_for_a_lost_bus(client, bus_watch)" in source
-    assert "{daemon_task, healthz_task, bus_task}" in source
-
-
 @pytest.mark.asyncio
 async def test_a_shared_client_closed_without_its_callback_is_still_seen(
     monkeypatch: pytest.MonkeyPatch,
@@ -397,3 +384,251 @@ async def test_a_shared_client_closed_without_its_callback_is_still_seen(
     client.is_closed = True
     with pytest.raises(_serve_bus.BusConnectionLost, match="shared"):
         await asyncio.wait_for(lost, 5)
+
+
+# ---------------------------------------------------------------------------
+# Coach review (19 October 2026): the logs say what is true
+# ---------------------------------------------------------------------------
+
+
+def _bus_records(caplog: pytest.LogCaptureFixture, level: int) -> list[Any]:
+    return [
+        r for r in caplog.records
+        if r.name == "forge.cli.serve" and r.levelno >= level
+    ]
+
+
+class TestABusThatCannotBeReachedAtStart:
+    @pytest.mark.asyncio
+    async def test_warned_on_the_first_try_then_about_once_a_minute_without_credentials(
+        self, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import logging
+
+        monkeypatch.setattr(_serve_bus, "RECONNECT_TIME_WAIT_SECONDS", FAST_WAIT)
+        monkeypatch.setattr(_serve_bus, "UNREACHABLE_WARNING_SECONDS", 0.5)
+        caplog.set_level(logging.DEBUG, logger="forge.cli.serve")
+        _serve_bus.reset(SubscriptionState())
+        url = f"nats://forge:s3cret-password@127.0.0.1:{_free_port()}"  # nothing listens
+        connecting = asyncio.create_task(_serve_daemon._default_nats_connect(url))
+        try:
+            await asyncio.sleep(0.2)
+            warned = _bus_records(caplog, logging.WARNING)
+            assert len(warned) == 1  # on the first failed attempt
+            assert "the bus can't be reached yet" in warned[0].getMessage()
+            assert "still trying" in warned[0].getMessage()
+            await asyncio.sleep(1.1)
+            warned = _bus_records(caplog, logging.WARNING)
+            tries = len([r for r in caplog.records if "forge-serve" in r.getMessage()])
+            assert 2 <= len(warned) <= 4 < tries  # about once a period, not per try
+            assert not connecting.done()  # still trying, for ever
+        finally:
+            connecting.cancel()
+            await asyncio.gather(connecting, return_exceptions=True)
+        assert all("s3cret-password" not in r.getMessage() for r in caplog.records)
+
+    def test_credentials_are_taken_out_of_any_url(self) -> None:
+        said = _serve_bus.without_credentials(
+            "nats: could not reach nats://forge:pw@bus:4222 or tls://a:b@c:1"
+        )
+        assert "pw" not in said and ":b@" not in said
+        assert "nats://***@bus:4222" in said and "tls://***@c:1" in said
+
+
+class TestAShutdownIsNotALostBus:
+    @pytest.mark.asyncio
+    async def test_the_deliberate_closes_say_nothing_alarming(
+        self, bus: _ABus, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from forge.cli import serve
+
+        caplog.set_level(logging.INFO, logger="forge.cli.serve")
+        watch = _serve_bus.reset(SubscriptionState())
+        shared = await _serve_daemon._default_nats_connect(bus.url)
+        fleet = await _serve_bus.connect_fleet_core_client(bus.url, "forge-serve-fleet")
+        raw_fleet = fleet._nc
+        watch.begin_shutdown()
+        await serve._close_client_quietly(fleet)
+        await serve._close_client_quietly(shared)
+        await asyncio.sleep(0.2)
+        assert _bus_records(caplog, logging.WARNING) == []
+        assert not watch.lost.is_set()
+        assert shared.is_closed is True
+        # THE FLEET CLIENT IS REALLY CLOSED: nats_core's client has only
+        # disconnect(), which the close now calls.
+        assert fleet._nc is None and raw_fleet.is_closed is True
+
+    @pytest.mark.asyncio
+    async def test_a_client_with_only_disconnect_is_disconnected(self) -> None:
+        from forge.cli import serve
+
+        calls: list[str] = []
+
+        class _CoreClient:
+            async def disconnect(self) -> None:
+                calls.append("disconnect")
+
+        await serve._close_client_quietly(_CoreClient())
+        assert calls == ["disconnect"]
+
+
+# ---------------------------------------------------------------------------
+# The whole serve run, against a real bus
+# ---------------------------------------------------------------------------
+
+
+async def _a_serve_run(bus: _ABus, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any, list[Any]]:
+    from forge.cli import serve
+
+    async def _nothing(*_a: Any, **_k: Any) -> None:
+        return None
+
+    async def _healthz(_config: Any, _state: Any) -> None:
+        await asyncio.Event().wait()
+
+    for seam in ("recovery_reconcile_on_boot", "consumer_reconcile_on_boot", "compose_dispatch_chain"):
+        monkeypatch.setattr(serve, seam, _nothing)
+    monkeypatch.setattr(serve, "register_on_boot", _nothing)
+    monkeypatch.setattr(serve, "deregister", _nothing)
+    monkeypatch.setattr(serve, "run_healthz_server", _healthz)
+    monkeypatch.setattr(serve, "_ack_slot_boot_check", _nothing)
+    monkeypatch.setenv("FORGE_ACK_WATCHDOG_SECONDS", "0")
+    shared: list[Any] = []
+    real_connect = _serve_daemon.nats_connect
+
+    async def _recorded(url: str) -> Any:
+        client = await real_connect(url)
+        shared.append(client)
+        return client
+
+    monkeypatch.setattr(_serve_daemon, "nats_connect", _recorded)
+    setup = await _serve_daemon._default_nats_connect(bus.url)
+    await setup.jetstream().add_stream(name=PIPELINE_STREAM_NAME, subjects=["pipeline.>"])
+    await setup.close()
+    state = SubscriptionState()
+    run = asyncio.create_task(serve._run_serve(ServeConfig(nats_url=bus.url), state))
+    await _until(lambda: state.is_live() or run.done(), 20, "the serve run to go live")
+    assert not run.done(), run
+    return run, state, shared
+
+
+class TestTheWholeServeRun:
+    @pytest.mark.asyncio
+    async def test_a_fleet_client_closed_for_good_ends_the_run(
+        self, bus: _ABus, fast_reconnects: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The build loop watches only the shared client; the run's own bus
+        watch is what ends the run when the FLEET client closes for good."""
+        from forge.cli import serve
+
+        fleets: list[Any] = []
+        real_open = serve.open_fleet_client
+
+        async def _recorded(url: str) -> Any:
+            fleet = await real_open(url)
+            fleets.append(fleet)
+            return fleet
+
+        monkeypatch.setattr(serve, "open_fleet_client", _recorded)
+        run, _state, shared = await _a_serve_run(bus, monkeypatch)
+        await fleets[0]._nc.close()  # the fleet connection closed for good
+        with pytest.raises(_serve_bus.BusConnectionLost, match="forge-serve-fleet"):
+            await asyncio.wait_for(run, 20)
+        assert shared[0].is_closed is True  # and the run closed the shared client
+
+
+    @pytest.mark.asyncio
+    async def test_a_real_close_for_good_ends_the_run_with_a_lost_bus(
+        self, bus: _ABus, fast_reconnects: None, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        run, _state, shared = await _a_serve_run(bus, monkeypatch)
+        await shared[0].close()  # closed for good, not by the run
+        with pytest.raises(_serve_bus.BusConnectionLost):
+            await asyncio.wait_for(run, 20)
+
+    @pytest.mark.asyncio
+    async def test_a_normal_shutdown_logs_no_failure(
+        self,
+        bus: _ABus,
+        fast_reconnects: None,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        import logging
+
+        caplog.set_level(logging.INFO, logger="forge.cli.serve")
+        run, _state, shared = await _a_serve_run(bus, monkeypatch)
+        caplog.clear()
+        run.cancel()  # the stop a SIGTERM gives
+        await asyncio.gather(run, return_exceptions=True)
+        assert shared[0].is_closed is True
+        assert _bus_records(caplog, logging.WARNING) == []
+
+
+# ---------------------------------------------------------------------------
+# One-shot command-line connects give up
+# ---------------------------------------------------------------------------
+
+
+class TestAOneShotConnectGivesUp:
+    @pytest.mark.asyncio
+    async def test_connect_once_fails_within_its_timeout(self) -> None:
+        from forge.adapters.nats.connect_once import connect_once
+
+        started = time.monotonic()
+        with pytest.raises(Exception):
+            await asyncio.wait_for(
+                connect_once(f"nats://127.0.0.1:{_free_port()}", timeout=1.0), 5
+            )
+        assert time.monotonic() - started < 1.5
+
+    @pytest.mark.asyncio
+    async def test_the_security_sweep_connect_gives_up(self) -> None:
+        from forge.cli import security_sweep
+
+        started = time.monotonic()
+        with pytest.raises(Exception) as raised:
+            await asyncio.wait_for(
+                security_sweep._connect(f"nats://127.0.0.1:{_free_port()}"), 15
+            )
+        assert not isinstance(raised.value, asyncio.CancelledError)
+        assert time.monotonic() - started < 10.5
+
+    @pytest.mark.asyncio
+    async def test_the_runbook_connect_falls_back_within_its_timeout(self) -> None:
+        from forge.cli import runbook
+
+        started = time.monotonic()
+        client = await asyncio.wait_for(
+            runbook._connect_nats_best_effort(
+                environ={"FORGE_NATS_URL": f"nats://127.0.0.1:{_free_port()}"}
+            ),
+            15,
+        )
+        assert isinstance(client, runbook._NoOpNATSClient)
+        assert time.monotonic() - started < 2.5
+
+
+@pytest.mark.asyncio
+async def test_after_connecting_a_failed_attempt_is_not_said_to_be_unreachable_at_start(
+    bus: _ABus, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Once a connection has connected, its failed reconnect attempts are
+    debug lines (the disconnect WARNING already said it), never the start-up
+    "can't be reached yet" warning."""
+    import logging
+
+    caplog.set_level(logging.DEBUG, logger="forge.cli.serve")
+    watch = _serve_bus.reset(SubscriptionState())
+    shared = await _serve_daemon._default_nats_connect(bus.url)
+    fleet = await _serve_bus.connect_fleet_core_client(bus.url, "forge-serve-fleet")
+    try:
+        for name in ("forge-serve", "forge-serve-fleet"):
+            await watch.callbacks(name)["error_cb"](ConnectionRefusedError("refused"))
+        assert _bus_records(caplog, logging.WARNING) == []
+    finally:
+        watch.begin_shutdown()
+        await shared.close()
+        await fleet.disconnect()
