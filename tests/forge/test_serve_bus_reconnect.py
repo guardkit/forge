@@ -427,6 +427,25 @@ class TestABusThatCannotBeReachedAtStart:
             await asyncio.gather(connecting, return_exceptions=True)
         assert all("s3cret-password" not in r.getMessage() for r in caplog.records)
 
+    @pytest.mark.parametrize(
+        ("said", "secret", "kept"),
+        [
+            ("nats://forge:p@ss@bus:4222 failed", "p@ss", "nats://***@bus:4222 failed"),
+            ("nats://forge:pa/ss@bus:4222", "pa/ss", "nats://***@bus:4222"),
+            ("could not reach ('nats://forge:x9@y8/z7@bus:1')", "x9@y8/z7", "could not reach ('nats://***@bus:1')"),
+            ("no address here at all", None, "no address here at all"),
+            ("nats://bus:4222/a/path stays", None, "nats://bus:4222/a/path stays"),
+        ],
+    )
+    def test_a_password_with_an_at_sign_or_a_slash_is_taken_out_whole(
+        self, said: str, secret: str | None, kept: str
+    ) -> None:
+        cleaned = _serve_bus.without_credentials(said)
+        assert cleaned == kept
+        if secret:
+            for piece in secret.replace("/", "@").split("@"):
+                assert piece not in cleaned.replace("***", "")
+
     def test_credentials_are_taken_out_of_any_url(self) -> None:
         said = _serve_bus.without_credentials(
             "nats: could not reach nats://forge:pw@bus:4222 or tls://a:b@c:1"
@@ -583,6 +602,47 @@ class TestAOneShotConnectGivesUp:
                 connect_once(f"nats://127.0.0.1:{_free_port()}", timeout=1.0), 5
             )
         assert time.monotonic() - started < 1.5
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("hello_after", [None, 0.9], ids=["never-says-hello", "says-hello-late"])
+    async def test_a_listener_that_never_answers_is_given_up_on_within_the_bound(
+        self, hello_after: float | None
+    ) -> None:
+        """A server that accepts the connection and never answers: no INFO at
+        all, or an INFO just before the timeout and then no answer to the
+        client's CONNECT and PING. nats-py alone waits out one timeout per
+        step (about 1.9 s for the late hello); the outer bound ends the
+        connect within its own timeout."""
+        from forge.adapters.nats.connect_once import connect_once
+
+        accepted: list[asyncio.StreamWriter] = []
+        info = (
+            b'INFO {"server_id":"silent","version":"2.11.0","proto":1,'
+            b'"host":"127.0.0.1","port":4222,"max_payload":1048576}\r\n'
+        )
+
+        async def _silent(_reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            accepted.append(writer)
+            if hello_after is not None:
+                await asyncio.sleep(hello_after)
+                writer.write(info)
+                await writer.drain()
+            await asyncio.Event().wait()
+
+        server = await asyncio.start_server(_silent, "127.0.0.1", 0)
+        port = server.sockets[0].getsockname()[1]
+        try:
+            started = time.monotonic()
+            with pytest.raises(Exception):
+                await asyncio.wait_for(
+                    connect_once(f"nats://127.0.0.1:{port}", timeout=1.0), 10
+                )
+            assert time.monotonic() - started < 1.5
+            assert accepted  # it really was accepted, and never answered
+        finally:
+            for writer in accepted:
+                writer.close()
+            server.close()
 
     @pytest.mark.asyncio
     async def test_the_security_sweep_connect_gives_up(self) -> None:

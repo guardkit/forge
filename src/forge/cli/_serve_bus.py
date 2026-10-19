@@ -26,9 +26,10 @@ Two blunt rules replace that:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import logging
-import re
 import time
+import urllib.parse
 from typing import Any, Awaitable, Callable
 
 logger = logging.getLogger("forge.cli.serve")
@@ -51,12 +52,36 @@ class BusConnectionLost(RuntimeError):
 #: is said on the first failed attempt and then about once a minute.
 UNREACHABLE_WARNING_SECONDS: float = 60.0
 
-_CREDENTIALS_IN_A_URL = re.compile(r"(?P<scheme>[a-z][a-z0-9+.-]*://)[^/@\s]+@", re.IGNORECASE)
+def _without_userinfo(word: str) -> str:
+    """One whitespace-free word with any URL's ``user:password@`` taken out.
+
+    Everything between ``://`` and the LAST ``@`` of the word is the URL's
+    userinfo, so a password holding a raw ``@`` or ``/`` is taken out whole
+    (a regex stopping at the first ``@`` or ``/`` left part of it). What is
+    left is checked with :func:`urllib.parse.urlsplit` as a host.
+    """
+    start = word.find("://")
+    if start < 0:
+        return word
+    head, rest = word[: start + 3], word[start + 3 :]
+    at = rest.rfind("@")
+    if at < 0:
+        return word
+    host = rest[at + 1 :]
+    try:
+        urllib.parse.urlsplit(f"nats://{host}")
+    except ValueError:
+        pass  # not a well-formed host: the userinfo is still taken out
+    return f"{head}***@{host}"
 
 
 def without_credentials(text: Any) -> str:
     """``text`` with any ``user:password@`` in a URL taken out."""
-    return _CREDENTIALS_IN_A_URL.sub(r"\g<scheme>***@", str(text))
+    return "".join(
+        part if is_space else _without_userinfo(part)
+        for is_space, chars in itertools.groupby(str(text), key=str.isspace)
+        for part in ["".join(chars)]
+    )
 
 
 class BusWatch:
