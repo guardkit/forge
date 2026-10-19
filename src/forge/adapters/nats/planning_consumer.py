@@ -42,6 +42,7 @@ from forge.planning.run_store import (
 )
 from forge.planning.states import PlanningState
 from forge.planning.target_repos import (
+    no_default_repo_message,
     refusal_message,
     resolve_named_or_default,
     resolve_target_repo,
@@ -470,6 +471,45 @@ async def _handle_with_queue(
 
 
 # ---------------------------------------------------------------------------
+# Nothing named and no default (Linear front-door design, section 12)
+# ---------------------------------------------------------------------------
+
+#: The queue commands that file NEW work, and so need a repository exactly as
+#: a sentence does. The others only inspect or manage rows already filed.
+_COMMANDS_THAT_FILE_WORK: frozenset[str] = frozenset({"add_front", "add_before"})
+
+
+def _no_repository_refusal(
+    deps: PlanningConsumerDeps,
+    payload: Any,
+    command: Mapping[str, Any] | None,
+) -> str | None:
+    """The sentence to refuse with when nothing is named and there is no default.
+
+    Only when the request names no repository AND ``planning.default_target_repo``
+    is unset; then it is refused at the door, before anything is filed, instead
+    of failing later in planning. Applies to sentences, questions and the queue
+    commands that file new work. A fix takes the repository of the build it
+    fixes, and the other commands touch only work already filed, so neither is
+    refused here. With a default configured, nothing changes: the row keeps an
+    unset repository and the driver resolves the default, as before. With no
+    planning configuration wired in, nothing is resolved here at all.
+    """
+    planning = deps.planning_config
+    if planning is None or payload.target_repo:
+        return None
+    if getattr(planning, "default_target_repo", None):
+        return None
+    if command is not None and command.get("verb") not in _COMMANDS_THAT_FILE_WORK:
+        return None
+    if _kind_from(payload) == "fix":
+        return None
+    return no_default_repo_message(
+        dict(getattr(planning, "target_repo_paths", None) or {})
+    )
+
+
+# ---------------------------------------------------------------------------
 # A feature planned elsewhere, handed over by its branch (register-projects
 # design, 5 October 2026, part 3)
 # ---------------------------------------------------------------------------
@@ -846,6 +886,10 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
        the repository is resolved (typed name or default); an unresolvable
        one is answered in the thread, a resolved one is published as one
        ``BuildQueuedPayload``; acked either way, no run and no queue row.
+    2a'. *No repository named and no default configured* (a sentence, a
+       question, or ``add_front`` / ``add_before``; not a fix and not a
+       command that manages work already filed) → one plain sentence naming
+       the known repositories, acked, nothing filed.
     2b. *A queue is wired in and the repository resolved* → the message goes
        to the queue: a sentence becomes one QUEUED ``work_queue`` row and no
        planning run; a forwarded ``queue_command`` is executed and answered
@@ -927,6 +971,20 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
     # the coordinator; answered in the thread like a mission.
     if command is not None and command.get("verb") == "stop-mission":
         await _stop_mission(msg, deps, payload, command)
+        return
+
+    # --- 3a'. Nothing named and no default: refused before anything is filed
+    refusal = _no_repository_refusal(deps, payload, command)
+    if refusal is not None:
+        logger.info(
+            "planning_consumer: correlation_id=%s named no repository and this "
+            "factory has no default; answered, nothing filed",
+            correlation_id,
+        )
+        await _notify_best_effort(
+            deps, correlation_id, refusal, parent_request_id=payload.parent_request_id
+        )
+        await msg.ack()
         return
 
     # --- 3b. Resolve the repository the sentence named (rule 3) ----------
