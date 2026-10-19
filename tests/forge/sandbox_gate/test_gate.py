@@ -725,3 +725,56 @@ class TestStopsRunOnTheirOwn:
         starter.stop_gate.set()
         await stopped(gate, SECOND_SANDBOX)
         assert gate.state_of(SECOND_SANDBOX) == STOPPED
+
+
+# ---------------------------------------------------------------------------
+# Ready is accepted only for the recorded deployment (Codex review 2, R1)
+# ---------------------------------------------------------------------------
+
+
+class TestReadyOnlyForTheRecordedDeployment:
+    @pytest.mark.asyncio
+    async def test_a_first_deployment_then_a_services_only_hold_is_restored(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        """No coordinator stop in between: the starter was last told "none" and
+        says ready. An outside services-only hold leaves it so. The next poll
+        sees the starter disagree with the ledger, tells it the recorded
+        deployment, and redeploys before taking "ready" again."""
+        clock = Clock()
+        starter = FakeStarter(running=False)
+        ran: list[str] = []
+
+        async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+            ran.append(name)
+            return RedeployOutcome(ok=True)
+
+        gate = a_gate(ledger, starter, clock=clock, redeploy=redeploy)
+        assert await gate.ensure_ready(SANDBOX)
+        assert starter.current(SANDBOX) is None and ran == []
+        _record_deployment(ledger)  # the first deployment
+        hold = starter.hold_sync(SANDBOX, owner="register-repo", until="services")
+        assert hold.ok and starter.redeploy_pending.get(SANDBOX) is not True  # still "ready"
+        await gate.poll_once()
+        await settle(gate)
+        assert ran == [SANDBOX]
+        assert starter.current(SANDBOX) == NAMED
+        assert ("ready", NAMED) in starter.told
+        assert gate.state_of(SANDBOX) == READY
+
+    @pytest.mark.asyncio
+    async def test_boot_does_not_take_ready_for_another_deployment(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        _record_deployment(ledger)
+        a_build(ledger, "RUNNING")  # unfinished work: boot brings it up
+        starter = FakeStarter(running=True)  # up, and "ready" for none
+        ran: list[str] = []
+
+        async def redeploy(name: str, repos: tuple[str, ...]) -> RedeployOutcome:
+            ran.append(name)
+            return RedeployOutcome(ok=True)
+
+        gate = a_gate(ledger, starter, clock=Clock(), redeploy=redeploy)
+        assert await gate.boot() == []
+        assert ran == [SANDBOX] and starter.current(SANDBOX) == NAMED

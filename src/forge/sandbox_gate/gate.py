@@ -436,6 +436,19 @@ class SandboxGate:
 
         return recorded_identity(self._connection(), slot.repos) is not None
 
+    def _starter_disagrees(self, slot: _Slot, status: StarterStatus) -> bool:
+        """Does the starter hold another deployment than the ledger records?
+
+        Checked before "ready" is ever accepted from the starter — at boot,
+        after an outside wake or a services-only hold, on a poll (Codex S2
+        implementation review 2, R1). A starter that says none while the
+        ledger records one disagrees. The answer is then to tell it the
+        recorded deployment, which makes it report "pending" again, and
+        redeploy.
+        """
+        told = self._deployment_for(slot)
+        return (status.deployment or None) != (told or None)
+
     def _deployment_for(self, slot: _Slot) -> dict[str, str]:
         """What the starter is told about the recorded deployment: always said."""
         deployment, warning = deployment_to_tell(
@@ -449,20 +462,21 @@ class SandboxGate:
     async def _settle_redeploy(self, slot: _Slot) -> str:
         """Answer the starter's "redeploy pending". ``"ready"`` once it is told
         ready, ``"suspended"`` once it is told to suspend; otherwise why not."""
-        if not self._has_recorded_deployment(slot):
-            answer = await self._starter.ready(slot.name, deployment=self._deployment_for(slot))
-            return "ready" if answer.ok else (
-                f"the starter was not told {slot.name} is ready ({answer.sentence})"
-            )
         told = self._deployment_for(slot)
         if (slot.starter_deployment or None) != (told or None):
             # The starter's deployment is not the recorded one (it was told
-            # another, or none): say it first, so its /ready can accept ours.
-            # A start of a running supervisor changes nothing else.
+            # another, or none, or woke without it): say it first, which makes
+            # it report "pending" again, so its /ready can accept ours. A start
+            # of a running supervisor changes nothing else.
             answer = await self._starter.start(slot.name, deployment=told)
             if not answer.ok:
                 return f"the starter was not told {slot.name}'s deployment ({answer.sentence})"
             slot.starter_deployment = told or None
+        if not self._has_recorded_deployment(slot):
+            answer = await self._starter.ready(slot.name, deployment=told)
+            return "ready" if answer.ok else (
+                f"the starter was not told {slot.name} is ready ({answer.sentence})"
+            )
         if slot.redeployed_for is not None and slot.redeployed_for == told:
             # Redeployed already in this bring-up; only its ready was lost.
             answer = await self._starter.ready(slot.name, deployment=told)
@@ -583,8 +597,10 @@ class SandboxGate:
                     # services answer, and work that needs no deployment goes on.
                     self._now_suspended(slot, status.suspended)
                     return
-                elif status.redeploy_pending or (
-                    slot.woke_it and self._has_recorded_deployment(slot)
+                elif (
+                    status.redeploy_pending
+                    or (slot.woke_it and self._has_recorded_deployment(slot))
+                    or self._starter_disagrees(slot, status)
                 ):
                     settled = await self._settle_redeploy(slot)
                     if settled == "ready":
@@ -700,11 +716,13 @@ class SandboxGate:
             slot.state = STOPPED
             return
         if status.settled and status.services_up and (
-            slot.state != READY or status.redeploy_pending
+            slot.state != READY
+            or status.redeploy_pending
+            or self._starter_disagrees(slot, status)
         ):
             # Woken by a hold, or waiting for its redeploy: bring it to ready
             # here, so it can also be stopped again once idle.
-            if status.redeploy_pending and slot.state == READY:
+            if slot.state == READY:
                 slot.state = UNKNOWN
             self._kick(slot)
             return
