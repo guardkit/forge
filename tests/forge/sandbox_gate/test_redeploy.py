@@ -118,6 +118,7 @@ def _deps(ledger: sqlite3.Connection, helper: Helper, venue: Venue) -> Any:
         pool=SimpleNamespace(connection=ledger),
         git_surface=lambda repo, root: venue,
         deploy_dispatcher=helper,
+        http_get=None,
     )
 
 
@@ -142,12 +143,16 @@ class TestTheRoute:
         assert outcome.ok, outcome.sentence
         [call] = helper.calls
         assert call["leg"] == "promote" and call["dry_run"] is False
-        assert call["candidate_cwd"] == "/work/candidates/FEAT-1"
+        # R5: a restoration folder of its own, never the feature's candidate folder.
+        assert call["candidate_cwd"].startswith("/work/candidates/FEAT-R")
+        assert call["candidate_cwd"] != "/work/candidates/FEAT-1"
         ownership = call["deploy_ownership"]
         assert ownership["artifact"] == ARTIFACT and ownership["identity"] == IDENTITY
         assert ownership["target"] == TARGET and ownership["build"] == "B-1"
         assert ownership["target_counter"] == 4  # a fresh grant, above the record's 3
-        assert venue.laid == [("FEAT-1", COMMIT)] and venue.removed == ["FEAT-1"]
+        [(restoration, sha)] = venue.laid
+        assert restoration.startswith("FEAT-R") and sha == COMMIT
+        assert venue.removed == [restoration]  # an answered promote: removed
         counter, holder, commit, identity = _lock(ledger)
         assert holder is None  # the lock is put down
         assert (commit, identity) == (COMMIT, IDENTITY)
@@ -215,9 +220,9 @@ class TestThroughTheGate:
         order: list[str] = []
         real_ready = starter.ready_sync
 
-        def ready_sync(name: str) -> Any:
+        def ready_sync(name: str, *, deployment: Any = None) -> Any:
             order.append(f"ready after {len(helper.calls)} promote(s)")
-            return real_ready(name)
+            return real_ready(name, deployment=deployment)
 
         starter.ready_sync = ready_sync  # type: ignore[method-assign]
         deps = _deps(ledger, helper, Venue())
@@ -301,3 +306,117 @@ class TestThroughTheGate:
         assert len(helper.calls) == 1 and "ready notes-app-sbx" in starter.calls
         await gate.poll_once()
         assert "stop notes-app-sbx" not in starter.calls  # the idle clock starts again
+
+
+class TestTheRecordIsReadAgainUnderTheLock:
+    @pytest.mark.asyncio
+    async def test_a_newer_deployment_recorded_meanwhile_is_followed(
+        self, ledger: sqlite3.Connection, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """R4: while this attempt reads the profile, another holder records and
+        releases a newer deployment; the attempt is abandoned under the lock and
+        the current record is the one redeployed."""
+        newer_commit = "beef" * 10
+        newer_identity = "notes-app@beef000"
+        a_build(ledger, "COMPLETE", build_id="B-2")
+        ledger.execute(
+            "INSERT INTO publication_records (build_id, feature_id, repo, j_commit, result, "
+            "checked_json) VALUES ('B-2', 'FEAT-1', ?, ?, 'merged and running', ?)",
+            (REPO, newer_commit, json.dumps({"artifact": "notes-app:checked-beef000"})),
+        )
+        ledger.commit()
+        reads: list[str] = []
+
+        async def profile(git: Any, repo_root: Any, commit: Any) -> tuple[Any, None]:
+            reads.append(commit)
+            if len(reads) == 1:
+                # Another holder deploys the newer result and puts its lock down.
+                ledger.execute(
+                    "UPDATE deployment_targets SET counter = counter + 1, running_commit = ?, "
+                    "running_identity = ?, running_build = 'B-2', holder_build = NULL "
+                    "WHERE target = ?",
+                    (newer_commit, newer_identity, TARGET),
+                )
+                ledger.commit()
+            return (
+                SimpleNamespace(
+                    env_id="production",
+                    identity={"setting": "APP_IDENTITY", "reported_as": "RUNNING_IDENTITY",
+                              "artifact_setting": "APP_ARTIFACT"},
+                ),
+                None,
+            )
+
+        monkeypatch.setattr(merge_executor, "_the_profile_where_it_lives", profile)
+        helper, venue = Helper(reports=newer_identity), Venue()
+        outcome = await redeploy_recorded(_deps(ledger, helper, venue), SANDBOX, (REPO,))
+        assert outcome.ok, outcome.sentence
+        assert reads == [COMMIT, newer_commit]
+        [call] = helper.calls  # only the current record was promoted
+        assert call["deploy_ownership"]["identity"] == newer_identity
+        assert call["deploy_ownership"]["build"] == "B-2"
+        assert [sha for _key, sha in venue.laid] == [newer_commit]  # nothing laid out for the old
+        assert _lock(ledger)[2:] == (newer_commit, newer_identity)
+
+
+class TestRestorationFoldersAfterAnUncertainAnswer:
+    @pytest.mark.asyncio
+    async def test_a_coordinator_restart_during_an_outstanding_promote_keeps_the_folder(
+        self, ledger: sqlite3.Connection
+    ) -> None:
+        """R5: the promote's answer is lost; the restoration folder is kept and
+        written down. After a restart, while the helper still shows a request
+        executing, nothing is laid out again; once it is idle the kept folder is
+        removed and the redeploy goes on in a new folder."""
+        from forge.sandbox_gate.redeploy import outstanding_restorations
+
+        class LostAnswer(Helper):
+            async def __call__(self, **kwargs: Any) -> Any:
+                self.calls.append(kwargs)
+                raise TimeoutError("the helper's answer did not come back")
+
+        venue = Venue()
+        first = await redeploy_recorded(_deps(ledger, LostAnswer(), venue), SANDBOX, (REPO,))
+        assert not first.ok and first.retry  # never a suspension for a lost answer
+        [kept] = outstanding_restorations(ledger, (REPO,))
+        assert venue.removed == []
+        assert _lock(ledger)[1] is None  # the lock is still put down
+
+        # The coordinator restarts: new parts, the same ledger.
+        busy = {"executing": [{"route": "/run", "repo": REPO, "seconds": 40}]}
+        answers = [busy]
+
+        def helper_get(url: str, timeout: float) -> tuple[int, str]:
+            assert url.endswith("/busy")
+            return 200, json.dumps(answers[0])
+
+        helper, venue_after = Helper(), Venue()
+        deps = _deps(ledger, helper, venue_after)
+        deps.http_get = helper_get
+        waiting = await redeploy_recorded(deps, SANDBOX, (REPO,))
+        assert not waiting.ok and waiting.retry and "may still be running" in waiting.sentence
+        assert helper.calls == [] and venue_after.laid == [] and venue_after.removed == []
+
+        answers[0] = {"executing": []}
+        done = await redeploy_recorded(deps, SANDBOX, (REPO,))
+        assert done.ok, done.sentence
+        assert venue_after.removed[0] == kept["restoration"]  # the old folder, first
+        [(new_key, _sha)] = venue_after.laid
+        assert new_key != kept["restoration"]
+        assert outstanding_restorations(ledger, (REPO,)) == []
+
+    @pytest.mark.asyncio
+    async def test_no_answer_from_busy_counts_as_busy(self, ledger: sqlite3.Connection) -> None:
+        class LostAnswer(Helper):
+            async def __call__(self, **kwargs: Any) -> Any:
+                raise TimeoutError("lost")
+
+        await redeploy_recorded(_deps(ledger, LostAnswer(), Venue()), SANDBOX, (REPO,))
+
+        def helper_get(url: str, timeout: float) -> tuple[int, str]:
+            raise ConnectionRefusedError("helper down")
+
+        deps = _deps(ledger, Helper(), Venue())
+        deps.http_get = helper_get
+        outcome = await redeploy_recorded(deps, SANDBOX, (REPO,))
+        assert outcome.retry and "may still be running" in outcome.sentence

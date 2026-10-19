@@ -1,5 +1,6 @@
 """Bring a sandbox's recorded deployment back after a start (one sandbox per
-project, stage S2, design section 2.3a, Codex S2 round 1, R1, R2 and R6).
+project, stage S2, design section 2.3a, Codex S2 round 1, R1, R2 and R6;
+implementation review 1, R4 and R5).
 
 A project's own sandbox is a factory workspace, and its deployment is the
 factory's check that the merged result runs. When a stopped sandbox is started
@@ -15,27 +16,40 @@ route, with the parts the merge press already uses and nothing else:
    (``checked_json``);
 3. the project's own deploy profile at that commit says how the identity and
    the artifact are handed over (the identity declaration);
-4. the commit's tree is laid out again where the repository lives, so the
-   project's own steps are the ones that shipped with the commit;
-5. under the deployment lock, the promote leg re-tags and starts those exact
-   images, with no rebuild, and runs the project's own health checks and live
-   gate;
-6. what is running must report the very identity on record, and only then is
+4. the deployment lock is taken, and the record is READ AGAIN under it: if
+   another holder recorded something newer meanwhile, this attempt is
+   abandoned and the current record is redeployed instead (R4);
+5. only then is the commit's tree laid out, in a restoration folder of its own
+   for this attempt — never the original feature's candidate folder — so the
+   project's own steps are the ones that shipped with the commit (R5);
+6. the promote leg re-tags and starts those exact images, with no rebuild, and
+   runs the project's own health checks and live gate;
+7. what is running must report the very identity on record, and only then is
    it written down again and the lock put down.
 
-No join, no check and no publish: it is the same deploy steps the merge press
-runs after its join. Any failure is a failed redeploy, in one plain sentence:
-the gate then tells the starter to suspend automatic management, and the
-sandbox stays up. A lock somebody else holds, or a command a takeover stopped,
-is not a failure: the redeploy is asked for again.
+A restoration folder is removed only after an answer: when the promote's
+answer was lost (it raised, or the stage did not confirm it), the folder is
+kept and written down (``sandbox_restorations``). Before any later attempt,
+the helper's ``GET /busy`` is asked: while it is executing anything, the
+redeploy waits; once it is not, the kept folders are removed and the attempt
+goes on (R5).
+
+No join, no check and no publish. Any failure is a failed redeploy, in one
+plain sentence: the gate then tells the starter to suspend automatic
+management, and the sandbox stays up. A lock somebody else holds, a command a
+takeover stopped, or a promote that may still be running is not a failure:
+the redeploy is asked for again.
 """
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
 import sqlite3
+import urllib.error
+import urllib.request
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -45,10 +59,55 @@ from forge.sandbox_gate.gate import RedeployOutcome
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["compose_redeploy", "recorded_targets", "redeploy_recorded"]
+__all__ = [
+    "compose_redeploy",
+    "outstanding_restorations",
+    "recorded_targets",
+    "redeploy_recorded",
+]
 
 #: Who the promote leg is told decided this deploy.
 DECIDED_BY = "the sandbox gate (bringing the recorded deployment back after a start)"
+
+#: How many times one redeploy follows a record that changed under it.
+MAX_RECORD_CHANGES = 3
+
+_RESTORATIONS_DDL = """
+CREATE TABLE IF NOT EXISTS sandbox_restorations (
+    restoration TEXT PRIMARY KEY,
+    repo        TEXT NOT NULL,
+    target      TEXT NOT NULL,
+    path        TEXT NOT NULL,
+    started_at  TEXT NOT NULL,
+    settled_at  TEXT
+)
+"""
+
+
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _ensure_restorations(connection: sqlite3.Connection) -> None:
+    connection.execute(_RESTORATIONS_DDL)
+    connection.commit()
+
+
+def outstanding_restorations(
+    connection: sqlite3.Connection, repos: tuple[str, ...]
+) -> list[dict[str, str]]:
+    """Restoration folders kept after an uncertain promote, not yet removed."""
+    _ensure_restorations(connection)
+    marks = ", ".join("?" for _ in repos)
+    rows = connection.execute(
+        f"SELECT restoration, repo, target, path FROM sandbox_restorations "
+        f"WHERE settled_at IS NULL AND repo IN ({marks}) ORDER BY started_at",
+        tuple(repos),
+    ).fetchall()
+    return [
+        {"restoration": str(r[0]), "repo": str(r[1]), "target": str(r[2]), "path": str(r[3])}
+        for r in rows
+    ]
 
 
 def recorded_targets(connection: sqlite3.Connection, repos: tuple[str, ...]) -> list[dict[str, Any]]:
@@ -57,8 +116,7 @@ def recorded_targets(connection: sqlite3.Connection, repos: tuple[str, ...]) -> 
     for repo in repos:
         try:
             rows = connection.execute(
-                "SELECT target, running_commit, running_identity, running_build "
-                "FROM deployment_targets WHERE (target = ? OR substr(target, 1, ?) = ?) "
+                "SELECT target FROM deployment_targets WHERE (target = ? OR substr(target, 1, ?) = ?) "
                 "AND running_commit IS NOT NULL AND trim(running_commit) <> '' "
                 "ORDER BY target",
                 (repo, len(repo) + 2, f"{repo}::"),
@@ -68,16 +126,27 @@ def recorded_targets(connection: sqlite3.Connection, repos: tuple[str, ...]) -> 
                 return []
             raise
         for row in rows:
-            found.append(
-                {
-                    "repo": repo,
-                    "target": str(row[0]),
-                    "commit": str(row[1]),
-                    "identity": str(row[2] or ""),
-                    "build": str(row[3] or ""),
-                }
-            )
+            record = _the_record(connection, repo, str(row[0]))
+            if record is not None:
+                found.append(record)
     return found
+
+
+def _the_record(connection: sqlite3.Connection, repo: str, target: str) -> dict[str, Any] | None:
+    row = connection.execute(
+        "SELECT running_commit, running_identity, running_build FROM deployment_targets "
+        "WHERE target = ?",
+        (target,),
+    ).fetchone()
+    if row is None or not row[0]:
+        return None
+    return {
+        "repo": repo,
+        "target": target,
+        "commit": str(row[0]),
+        "identity": str(row[1] or ""),
+        "build": str(row[2] or ""),
+    }
 
 
 def _the_checked_artifact(connection: sqlite3.Connection, build_id: str) -> tuple[str | None, str | None]:
@@ -96,6 +165,61 @@ def _the_checked_artifact(connection: sqlite3.Connection, build_id: str) -> tupl
     return (artifact or None), (str(row[1]) if row[1] else None)
 
 
+def _helper_get(url: str, timeout: float) -> tuple[int, str]:
+    request = urllib.request.Request(url, method="GET")
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
+            return int(response.status), response.read(65536).decode("utf-8", "replace")
+    except urllib.error.HTTPError as exc:
+        return int(exc.code), ""
+
+
+async def _the_helper_is_idle(deps: Any, repo: str) -> bool:
+    """True only when the repository's helper answers ``GET /busy`` with an
+    empty list; any request executing, or no usable answer, is False."""
+    from forge.config.sandboxes import sandbox_for
+
+    entry = sandbox_for(deps.config, repo)
+    if entry is None:
+        return False
+    get = getattr(deps, "http_get", None) or _helper_get
+    try:
+        status, body = await asyncio.to_thread(get, f"{str(entry.sidecar_url).rstrip('/')}/busy", 10.0)
+        data = json.loads(body) if status == 200 else None
+    except Exception:  # noqa: BLE001 — no usable answer
+        return False
+    executing = data.get("executing") if isinstance(data, dict) else data
+    return isinstance(executing, list) and not executing
+
+
+async def _settle_kept_folders(deps: Any, connection: sqlite3.Connection, repos: tuple[str, ...], clock: Any) -> str | None:
+    """Remove the restoration folders an earlier uncertain promote left, once
+    the helper shows nothing executing. ``None`` when none is left; else why
+    the redeploy must wait."""
+    kept = outstanding_restorations(connection, repos)
+    if not kept:
+        return None
+    for repo in sorted({k["repo"] for k in kept}):
+        if not await _the_helper_is_idle(deps, repo):
+            return (
+                f"an earlier redeploy's promote for {repo} may still be running (its "
+                "answer was lost and the helper does not show itself idle), so its "
+                "restoration folder is kept and the redeploy is asked for again"
+            )
+    for item in kept:
+        repo_root = Path(deps.config.planning.target_repo_paths.get(item["repo"]) or ".")
+        git = deps.git_surface(item["repo"], repo_root) if deps.git_surface is not None else None
+        removed = await git.remove_candidate_tree(item["restoration"], item["path"]) if git else None
+        if removed is not True:
+            return f"the kept restoration folder {item['restoration']} could not be removed yet"
+        connection.execute(
+            "UPDATE sandbox_restorations SET settled_at = ? WHERE restoration = ?",
+            (clock().isoformat(), item["restoration"]),
+        )
+        connection.commit()
+    return None
+
+
 async def redeploy_recorded(
     deps: Any, sandbox: str, repos: tuple[str, ...], *, clock: Any = None
 ) -> RedeployOutcome:
@@ -103,11 +227,26 @@ async def redeploy_recorded(
     connection = getattr(deps.pool, "connection", None)
     if connection is None:
         return RedeployOutcome(ok=False, sentence="the ledger could not be read")
+    clock = clock or _utcnow
+    waiting = await _settle_kept_folders(deps, connection, tuple(repos), clock)
+    if waiting is not None:
+        return RedeployOutcome(ok=False, retry=True, sentence=waiting)
     targets = recorded_targets(connection, repos)
     if not targets:
         return RedeployOutcome(ok=True, sentence="no deployment is recorded")
-    for recorded in targets:
-        outcome = await _redeploy_one(deps, connection, recorded, clock or _utcnow)
+    for first in targets:
+        recorded = first
+        for _ in range(MAX_RECORD_CHANGES):
+            outcome = await _redeploy_one(deps, connection, recorded, clock)
+            if not isinstance(outcome, dict):
+                break
+            recorded = outcome  # the record changed under the lock: follow it
+        else:
+            return RedeployOutcome(
+                ok=False,
+                retry=True,
+                sentence=f"{first['target']}'s record kept changing; the redeploy is asked for again",
+            )
         if not outcome.ok:
             return outcome
         logger.info(
@@ -119,13 +258,11 @@ async def redeploy_recorded(
     return RedeployOutcome(ok=True, sentence="every recorded deployment is back")
 
 
-def _utcnow() -> datetime:
-    return datetime.now(timezone.utc)
-
-
 async def _redeploy_one(
     deps: Any, connection: sqlite3.Connection, recorded: dict[str, Any], clock: Any
-) -> RedeployOutcome:
+) -> RedeployOutcome | dict[str, Any]:
+    """One attempt. A dict back means the record changed under the lock: that
+    is the current record, to redeploy instead."""
     from forge.pipeline.deployment_identity import (
         declared_identity,
         identity_reported_by,
@@ -175,12 +312,6 @@ async def _redeploy_one(
     declaration = declared_identity(profile)
     if not getattr(declaration, "declared", False):
         return failed("its deploy profile does not declare how the identity is handed over")
-    try:
-        await git.ensure_candidate_trees_excluded()
-        laid_out = await git.materialise_candidate_tree(feature_id, commit)
-    except Exception as exc:  # noqa: BLE001 — a lay-out that failed is a redeploy not made
-        return failed(f"the tree of {commit[:10]} could not be laid out ({exc})")
-    tree = str(laid_out.path)
 
     lock = DeploymentLockStore(connection)
     grant = lock.grant(
@@ -192,7 +323,6 @@ async def _redeploy_one(
     )
     if grant is None:
         current = lock.read(target)
-        await git.remove_candidate_tree(feature_id, tree)
         return RedeployOutcome(
             ok=False,
             retry=True,
@@ -201,7 +331,45 @@ async def _redeploy_one(
                 f"lock on {target}; the redeploy is asked for again"
             ),
         )
+    restoration: str | None = None
+    tree: str | None = None
+    keep_the_folder = False
     try:
+        # R4: THE RECORD IS READ AGAIN UNDER THE LOCK. Another holder may have
+        # deployed and recorded something newer while this attempt read the
+        # profile; then this attempt is abandoned for the current record.
+        now_recorded = _the_record(connection, repo, target)
+        if now_recorded is None:
+            return RedeployOutcome(ok=True, sentence=f"{target} no longer records a deployment")
+        if (now_recorded["commit"], now_recorded["identity"], now_recorded["build"]) != (
+            commit,
+            identity,
+            build_id,
+        ):
+            logger.info(
+                "sandbox redeploy: %s's record changed to %s while this attempt "
+                "prepared; following the current record",
+                target,
+                now_recorded["identity"],
+            )
+            return now_recorded
+
+        # R5: A RESTORATION FOLDER OF ITS OWN, laid out only under the lock.
+        restoration = f"FEAT-R{uuid.uuid4().hex[:8].upper()}"
+        try:
+            await git.ensure_candidate_trees_excluded()
+            laid_out = await git.materialise_candidate_tree(restoration, commit)
+        except Exception as exc:  # noqa: BLE001 — a lay-out that failed is a redeploy not made
+            return failed(f"the tree of {commit[:10]} could not be laid out ({exc})")
+        tree = str(laid_out.path)
+        _ensure_restorations(connection)
+        connection.execute(
+            "INSERT INTO sandbox_restorations (restoration, repo, target, path, started_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (restoration, repo, target, tree, clock().isoformat()),
+        )
+        connection.commit()
+
         ownership = {
             "target": target,
             "target_counter": grant.counter,
@@ -226,10 +394,28 @@ async def _redeploy_one(
                 deploy_ownership=ownership,
                 candidate_cwd=tree,
             )
-        except Exception as exc:  # noqa: BLE001 — a raise is a failed redeploy
-            return failed(f"its promote raised ({type(exc).__name__}: {exc})")
-        word = getattr(deployed, "outcome", None) if deployed is not None else None
+        except Exception as exc:  # noqa: BLE001 — no answer: the promote may still run
+            keep_the_folder = True
+            return RedeployOutcome(
+                ok=False,
+                retry=True,
+                sentence=(
+                    f"the promote of {target} got no answer ({type(exc).__name__}: {exc}); "
+                    "its restoration folder is kept until the helper shows it finished"
+                ),
+            )
         detail = (getattr(deployed, "detail", None) or {}) if deployed is not None else {}
+        if deployed is None or detail.get("answer_lost") or getattr(deployed, "confirmed", False) is not True:
+            keep_the_folder = True
+            return RedeployOutcome(
+                ok=False,
+                retry=True,
+                sentence=(
+                    f"the promote of {target} was not confirmed as finished; its "
+                    "restoration folder is kept until the helper shows it finished"
+                ),
+            )
+        word = getattr(deployed, "outcome", None)
         said = str(detail.get("deploy_output") or "")
         stopped = next((w for w in NOTHING_WAS_STARTED if w in said), None)
         if stopped is not None:
@@ -268,7 +454,13 @@ async def _redeploy_one(
             lock.release(target=target, counter=grant.counter, now=clock())
         except Exception:  # noqa: BLE001 — never costs a result
             logger.warning("sandbox redeploy: the lock on %s was not put down", target)
-        await git.remove_candidate_tree(feature_id, tree)
+        if restoration is not None and tree is not None and not keep_the_folder:
+            if await git.remove_candidate_tree(restoration, tree) is True:
+                connection.execute(
+                    "UPDATE sandbox_restorations SET settled_at = ? WHERE restoration = ?",
+                    (clock().isoformat(), restoration),
+                )
+                connection.commit()
 
 
 def compose_redeploy(
@@ -288,6 +480,7 @@ def compose_redeploy(
         deploy_dispatcher=build_in_daemon_deploy_dispatcher(
             config=forge_config, nats_client=nats_client, db_path=db_path
         ),
+        http_get=None,
     )
 
     async def redeploy(sandbox: str, repos: tuple[str, ...]) -> RedeployOutcome:
