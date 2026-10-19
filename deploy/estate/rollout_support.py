@@ -189,12 +189,16 @@ import forge.lifecycle.migrations as canonical
 module_path=pathlib.Path(canonical.__file__).parents[1]/'lifecycle_bridge'/'coexistence.py'
 spec=importlib.util.spec_from_file_location('rollout_boot_coexistence',module_path)
 coexistence=importlib.util.module_from_spec(spec);sys.modules[spec.name]=coexistence;spec.loader.exec_module(coexistence)
+record_path=pathlib.Path(canonical.__file__).parents[1]/'pipeline'/'publication_record.py'
+record_spec=importlib.util.spec_from_file_location('rollout_boot_publication_record',record_path)
+publication_record=importlib.util.module_from_spec(record_spec);sys.modules[record_spec.name]=publication_record;record_spec.loader.exec_module(publication_record)
 c=connect_writer(pathlib.Path('/copy/forge.db'))
 assert apply_at_boot(c)==__LEDGER_SCHEMA_VERSION__
 coexistence.apply_migration(c)
 lifecycle_bridge_registry.apply(c)
 card_revisions.ensure_table(c)
 missions.ensure_tables(c)
+publication_record.ensure_outcome_table(c)
 c.execute('PRAGMA wal_checkpoint(TRUNCATE)');c.close()
 assert not any(n=='nats' or n.startswith('nats.') or n=='nats_core.client' for n in sys.modules)
 '''

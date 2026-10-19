@@ -625,3 +625,35 @@ class TestAProjectThatPreparesPreviewsWithNoPreviewedCard:
 
         assert result.exit_code == 0, result.output
         assert "result=publication-pending" in result.output
+
+
+class TestATurnedAwayPress:
+    """A press a live hold turns away is a no-op for the build (18 October
+    2026): the person is told it was refused, and nothing else is written."""
+
+    def test_the_user_is_told_and_nothing_is_reported(self, config, pool, fakes) -> None:
+        from datetime import UTC, datetime
+
+        from forge.pipeline.publication_record import PublicationRecordStore
+
+        _insert_build(pool)
+        grant = PublicationRecordStore(pool.connection).take_lease(
+            build_id=BUILD_ID, holder="merge-press:elsewhere", now=datetime.now(UTC)
+        )
+        assert grant is not None
+        status_before = pool.connection.execute(
+            "SELECT status, error FROM builds WHERE build_id = ?", (BUILD_ID,)
+        ).fetchone()
+        result = CliRunner().invoke(merge_deploy_cmd, [FEATURE_ID], obj=config)
+        assert result.exit_code == 1, result.output
+        assert f"merge-deploy {FEATURE_ID} @ {REPO}: refused — another worker (merge-press:elsewhere)" in result.output
+        assert "result=" not in result.output  # no ending is claimed for the build
+        assert fakes["publisher"].reports == []  # nothing on the bus
+        assert [
+            r for r in pool.read_stages(BUILD_ID) if r.target_identifier == "merge_deploy_executor"
+        ] == []
+        assert pool.connection.execute(
+            "SELECT status, error FROM builds WHERE build_id = ?", (BUILD_ID,)
+        ).fetchone() == status_before
+        record = PublicationRecordStore(pool.connection).read(BUILD_ID)
+        assert (record.lease_holder, record.turn) == ("merge-press:elsewhere", grant.turn)

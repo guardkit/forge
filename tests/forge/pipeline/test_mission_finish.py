@@ -1847,3 +1847,146 @@ class TestAnApprovedMergeThatNeverReported:
 
         assert await consumer.resume_mission_merge(build_id) is False
         assert joins.calls == []
+
+
+class TestAnApprovedMergeWhoseFinishingIsOwed:
+    """Press lease recovery: a mission's merge into main whose press stopped
+    after writing its ending down (no ``finished_at``) is not carried on or
+    pressed again; the finishing routine finishes it, and the mission merges."""
+
+    @pytest.mark.asyncio
+    async def test_it_is_not_resumed_and_the_recovery_finishes_it(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        from forge.pipeline.merge_executor import MISSION_MERGE_RESUME_TARGET_IDENTIFIER
+        from forge.pipeline.publication_record import PublicationRecordStore
+        from tests.forge.pipeline.test_press_lease_recovery import (
+            _stop_after_the_ending_is_written_down,
+            _TheCoordinatorStopped,
+        )
+
+        approved = TestAnApprovedMergeThatNeverReported()
+        store, build_id = await approved._offered(config_on, pool, repo_root)
+        approved._approved(pool, build_id)
+        press, joins, _deploy, publisher, _bus = press_deps(
+            config_on, pool, repo_root, declares_a_target=False
+        )
+        consumer = MergeApprovalConsumer(press)
+        with pytest.MonkeyPatch.context() as crash:
+            _stop_after_the_ending_is_written_down(crash, 2)
+            with pytest.raises(_TheCoordinatorStopped):
+                await consumer.resume_mission_merge(build_id)
+        records = PublicationRecordStore(pool.connection)
+        written = records.read_outcome(build_id)
+        assert written.result_written and written.outcome.get("outcome")
+        assert written.finished_at is None
+        assert approved._reports(pool, build_id) == []
+        merges = len([c for c in joins.calls if c["args"][0] == "merge"])
+        sends = len(publisher.asked)
+        resumes = len(
+            [s for s in pool.read_stages(build_id) if s.target_identifier == MISSION_MERGE_RESUME_TARGET_IDENTIFIER]
+        )
+        pool.connection.execute(
+            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+            ((datetime.now(UTC) - timedelta(seconds=1)).isoformat(), build_id),
+        )
+        pool.connection.commit()
+
+        # NOT CARRIED ON: no resume row, no merge, nothing sent.
+        assert await MergeApprovalConsumer(press).resume_mission_merge(build_id) is False
+        assert len([c for c in joins.calls if c["args"][0] == "merge"]) == merges
+        assert len(publisher.asked) == sends
+        assert len(
+            [s for s in pool.read_stages(build_id) if s.target_identifier == MISSION_MERGE_RESUME_TARGET_IDENTIFIER]
+        ) == resumes
+
+        # FINISHED by the routine, from the ending the press wrote down.
+        kept = written.outcome.get("kept_because")
+        said = await MergeApprovalConsumer(press).finish_a_settled_press(build_id)
+        assert said == ("kept" if kept else "finished")
+        reports = approved._reports(pool, build_id)
+        assert len(reports) == 1
+        assert reports[0].details["result"] == written.outcome["outcome"]["result"]
+        assert reports[0].details["merge_decision"]["execution_attempt_id"] == "b" * 32
+        assert records.read_outcome(build_id).finished_at
+        # A hold the press kept on purpose stays a person's; otherwise it is down.
+        assert (records.read(build_id).lease_holder is not None) == bool(kept)
+        assert len([c for c in joins.calls if c["args"][0] == "merge"]) == merges
+        assert len(publisher.asked) == sends
+        # The mission reads the reported merge and ends.
+        deps, _thread = approved._finisher(config_on, pool, MergeApprovalConsumer(press))
+        assert await finish_ready_mission(deps, MISSION_ID) == "merged"
+        assert store.get(MISSION_ID).status == "MERGED"
+
+
+class TestTheCardSaysWhatALandingLeftStanding:
+    """Press lease recovery (18 October 2026): the sentence a landing wrote
+    when it left something standing is on the mission's merge card too."""
+
+    @pytest.mark.asyncio
+    async def test_the_sentence_is_in_the_card_summary(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        import json
+
+        main_tip = _git(repo_root, "rev-parse", "main")
+        a_running_mission(pool, keys=("B", "C"), base_commit=main_tip)
+        the_mission_branch_on_the_remote(repo_root)
+        store = await _land(config_on, pool, repo_root)
+        sentence = (
+            "FEAT-MX1 landed, but its check's candidate j-abc may still be "
+            "standing; remove it with the project's own teardown step."
+        )
+        # The warning B's press row carries (the finishing routine keeps it
+        # there before it says it in the thread).
+        pool.connection.execute(
+            "UPDATE publication_outcomes SET warning_json = ? WHERE build_id = ?",
+            (json.dumps({"sentence": sentence, "mission_id": MISSION_ID}), B_BUILD),
+        )
+        pool.connection.commit()
+        service, wire = _offer_service(config_on, pool)
+        deps, _thread = _finish_deps(config_on, pool, offer=service.offer)
+        assert await finish_ready_mission(deps, MISSION_ID) == "offered"
+        assert store.get(MISSION_ID).status == "READY"
+        words = wire.cards[0].rationale
+        assert f"Left standing: {sentence}" in words
+
+
+class TestTheMissionTellerCarriesTheDeliveryId:
+    @pytest.mark.asyncio
+    async def test_the_envelope_message_id_is_the_stable_delivery_id(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+    ) -> None:
+        """Codex round 2, R4: Jarvis's thread consumer drops a repeat of one
+        envelope ``message_id``; the finisher's line carries the warning's
+        stable delivery id there."""
+        import json
+        from types import SimpleNamespace
+
+        a_running_mission(pool, keys=("B",))
+        sent: list[tuple[str, bytes]] = []
+
+        class _Bus:
+            async def publish(self, subject: str, data: bytes) -> None:
+                sent.append((subject, data))
+
+        finisher = mission_finish.compose_mission_finisher(
+            forge_config=config_on,
+            pool=pool,
+            offer_service=SimpleNamespace(offer=None),
+            nats_client=_Bus(),
+        )
+        assert await finisher.tell(MISSION_ID, "a line", "build-x:3:landing-warning") is True
+        assert await finisher.tell(MISSION_ID, "a line", "build-x:3:landing-warning") is True
+        assert [subject for subject, _ in sent] == ["jarvis.notification.slack"] * 2
+        ids = [json.loads(data)["message_id"] for _, data in sent]
+        assert ids == ["build-x:3:landing-warning"] * 2
+        assert await finisher.tell("no-such-mission", "a line", "x") is False

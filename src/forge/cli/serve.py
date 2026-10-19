@@ -1211,8 +1211,7 @@ def bind_production_dispatch_chain(
                     merge_offer_service.set_mission_lander(
                         _merge_consumer.land_mission_feature
                     )
-                    install_finisher(
-                        compose_mission_finisher(
+                    _finisher = compose_mission_finisher(
                             forge_config=forge_config,
                             pool=sqlite_pool,
                             offer_service=merge_offer_service,
@@ -1221,12 +1220,19 @@ def bind_production_dispatch_chain(
                             resume_merge=_merge_consumer.resume_mission_merge,
                             reconcile=_merge_consumer.reconcile_mission_landing,
                             finish_settled=_merge_consumer.finish_a_settled_landing,
+                            # A press that stopped after its result is
+                            # finished by the one finishing routine (press
+                            # lease recovery, 18 October 2026).
+                            finish_settled_press=_merge_consumer.finish_a_settled_press,
                             git_surface=compose_merge_git_surface(forge_config),
                             tree_reader_for=compose_merge_check_reader(forge_config),
                             feature_routing_gate=feature_routing_gate,
                             feature_routing_required=feature_routing_required,
                         )
-                    )
+                    # The finishing routine says a mission landing's warning
+                    # in the mission's own thread through the finisher's line.
+                    _merge_consumer.install_mission_teller(_finisher.tell)
+                    install_finisher(_finisher)
         except Exception as exc:  # noqa: BLE001 — DDR-007 boot protection
             logger.error(
                 "forge-serve: merge-executor composition FAILED (%s) — merge "

@@ -160,6 +160,7 @@ def mission_card_words(
     latest: Mapping[str, MissionAttempt],
     risky: Sequence[str] | None,
     risky_unread: str | None = None,
+    left_standing: Sequence[str] = (),
 ) -> str:
     """The mission merge card's own sentences (design section 7).
 
@@ -203,6 +204,10 @@ def mission_card_words(
             "Look at these first: no changed file touches sign-in, security or "
             "the database."
         )
+    # WHAT A LANDING LEFT STANDING (press lease recovery, 18 October 2026):
+    # the same sentence the mission's thread was given.
+    for sentence in left_standing:
+        lines.append(f"Left standing: {sentence}")
     lines.append(
         "Approve = merge the mission into main and deploy. Reject = nothing "
         "reaches main; the branch is kept."
@@ -256,6 +261,11 @@ class MissionFinishDeps:
     #: press stopped after its result) is finished from the record (R2).
     #: ``None`` finishes nothing.
     finish_settled: Callable[[str], Awaitable[Any]] | None = None
+    #: ``MergeApprovalConsumer.finish_a_settled_press``: an ORDINARY build's
+    #: press (not a mission's) that stopped after its result, with its hold's
+    #: lease run out, is reported for and its hold put down (press lease
+    #: recovery, 18 October 2026). ``None`` finishes nothing.
+    finish_settled_press: Callable[[str], Awaitable[Any]] | None = None
     feature_routing_gate: Any | None = None
     feature_routing_required: bool = False
     clock: Callable[[], datetime] = field(default=lambda: datetime.now(timezone.utc))
@@ -313,12 +323,26 @@ async def finish_ready_missions(
     cx = getattr(deps.pool, "connection", None)
     if cx is None:
         return []
+    started: list[str] = []
+    # Ordinary builds first, and whatever the missions tables say: a press
+    # that stopped after its result blocks the router and the rollout's idle
+    # check, mission or no mission.
+    for build_id in _settled_presses_to_finish(deps, cx):
+        _resuming.add(build_id)
+        started.append(build_id)
+        task = asyncio.create_task(_finish_settled_press_guarded(deps, build_id))
+        _tasks.add(task)
+        task.add_done_callback(_tasks.discard)
     try:
         missions = MissionStore(cx, clock=deps.clock).list_by_status(_FINISHING_STATES)
     except Exception as exc:  # noqa: BLE001 — a read never stops the queue
         logger.warning("missions: could not list missions to finish (%s)", exc)
-        return []
-    started: list[str] = []
+        missions = None
+    if missions is None:
+        if wait:
+            while _tasks:
+                await asyncio.gather(*list(_tasks), return_exceptions=True)
+        return started
     for build_id, decided in _landings_to_resume(deps, cx):
         _resuming.add(build_id)
         started.append(build_id)
@@ -486,12 +510,23 @@ def _settled_landings_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
     from forge.pipeline.publication_record import PublicationRecordStore
 
     marks = ", ".join("?" for _ in ACTIVE_MISSION_STATUSES)
+    # A result a PRESS wrote is its finishing routine's (press lease
+    # recovery); this path keeps the results a reconciliation settled.
+    not_a_presss = (
+        "AND NOT EXISTS (SELECT 1 FROM publication_outcomes AS o "
+        "WHERE o.build_id = b.build_id AND o.result_written = 1) "
+        if cx.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'publication_outcomes'"
+        ).fetchone()
+        else ""
+    )
     try:
         rows = cx.execute(
             "SELECT b.build_id FROM builds AS b "
             "JOIN missions AS m ON m.id = b.mission_id "
             "JOIN publication_records AS p ON p.build_id = b.build_id "
             f"WHERE b.mission_role = ? AND m.status IN ({marks}) "
+            f"{not_a_presss}"
             "AND p.result IS NOT NULL "
             "AND (NOT EXISTS (SELECT 1 FROM stage_log AS r WHERE r.build_id = b.build_id "
             "AND r.target_identifier = ?) "
@@ -510,6 +545,81 @@ def _settled_landings_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
         if str(build_id) not in _resuming
         and not settled_records.read(str(build_id)).lease_is_live(now)
     ]
+
+
+def _settled_presses_to_finish(deps: MissionFinishDeps, cx: Any) -> list[str]:
+    """Every press whose result is written and whose finishing is not done.
+
+    Press lease recovery (Codex round 1, 18 October 2026): every press begins
+    its own ``publication_outcomes`` row with its lease and marks its result
+    there in the result's own transaction; its finishing routine sets the
+    row's ``finished_at`` only after every bookkeeping step. So the work is
+    exactly a row with a result written, no ``finished_at``, on a record that
+    still has its result and holds no live lease — any build, mission or not.
+    A record no press of today began has no row and is never offered.
+    """
+    if deps.finish_settled_press is None:
+        return []
+    from forge.pipeline.publication_record import PublicationRecordStore
+
+    try:
+        if cx.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'publication_outcomes'"
+        ).fetchone() is None:
+            return []
+        rows = cx.execute(
+            "SELECT p.build_id FROM publication_records AS p "
+            "JOIN builds AS b ON b.build_id = p.build_id "
+            "JOIN publication_outcomes AS o ON o.build_id = p.build_id "
+            "WHERE p.result IS NOT NULL AND o.result_written = 1 "
+            "AND o.finished_at IS NULL "
+            "ORDER BY b.queued_at ASC"
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — a read never stops the queue
+        logger.warning("merge: could not look for presses to finish (%s)", exc)
+        return []
+    records = PublicationRecordStore(cx)
+    now = deps.clock()
+    return [
+        str(build_id)
+        for (build_id,) in rows
+        if str(build_id) not in _resuming and not records.read(str(build_id)).lease_is_live(now)
+    ]
+
+
+async def _finish_settled_press_guarded(deps: MissionFinishDeps, build_id: str) -> None:
+    try:
+        assert deps.finish_settled_press is not None
+        said = await deps.finish_settled_press(build_id)
+        logger.info("merge: %s's press stopped after its result, finished: %s", build_id, said)
+    except Exception as exc:  # noqa: BLE001 — logged; tried again next pass
+        logger.error(
+            "merge: finishing %s's stopped press raised (%s: %s)",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+    finally:
+        _resuming.discard(build_id)
+
+
+def _left_standing_sentences(pool: Any, *, mission_id: str) -> list[str]:
+    """The warnings a mission's landings recorded when they left something
+    standing (their press rows' ``warning_json``), for its merge card."""
+    cx = getattr(pool, "connection", None)
+    if cx is None:
+        return []
+    try:
+        rows = cx.execute(
+            "SELECT json_extract(o.warning_json, '$.sentence') FROM publication_outcomes AS o "
+            "JOIN builds AS b ON b.build_id = o.build_id "
+            "WHERE b.mission_id = ? AND o.warning_json IS NOT NULL ORDER BY b.queued_at ASC",
+            (str(mission_id),),
+        ).fetchall()
+    except Exception as exc:  # noqa: BLE001 — a read never stops the queue
+        logger.debug("missions: no warnings to read for %s (%s)", mission_id, exc)
+        return []
+    return [str(r[0]) for r in rows if r[0]]
 
 
 async def _finish_settled_guarded(deps: MissionFinishDeps, build_id: str) -> None:
@@ -982,6 +1092,7 @@ async def _freeze_and_offer(
         latest=latest,
         risky=risky,
         risky_unread=unread,
+        left_standing=_left_standing_sentences(deps.pool, mission_id=mission.id),
     )
     row = deps.pool.get_build_row(build_id)
     landed = [f.key for f in features if _status(latest, f.key) == "LANDED"]
@@ -1271,6 +1382,7 @@ def compose_mission_finisher(
     resume_merge: Callable[[str], Awaitable[Any]] | None = None,
     reconcile: Callable[[str], Awaitable[Any]] | None = None,
     finish_settled: Callable[[str], Awaitable[Any]] | None = None,
+    finish_settled_press: Callable[[str], Awaitable[Any]] | None = None,
     git_surface: Callable[[str, Path], Any] | None = None,
     tree_reader_for: Callable[[str, Path], Any] | None = None,
     feature_routing_gate: Any | None = None,
@@ -1306,6 +1418,29 @@ def compose_mission_finisher(
             "jarvis.notification.slack", envelope.model_dump_json().encode("utf-8")
         )
 
+    async def tell(mission_id: str, message: str, delivery_id: str | None = None) -> bool:
+        """One line in a mission's thread; True once it was handed over.
+
+        ``delivery_id`` is the line's stable identity, sent as the envelope's
+        ``message_id``: Jarvis's thread consumer drops a repeat of one
+        ``message_id`` (in its own process, for five minutes), so a repeat of
+        this warning inside that window shows once."""
+        mission = MissionStore(pool.connection).get(mission_id)
+        if mission is None:
+            return False
+        envelope = build_planning_notification_envelope(
+            correlation_id=mission.correlation_id,
+            message=message,
+            level="info",
+            target_user=mission.originating_user,
+        )
+        if delivery_id:
+            envelope = envelope.model_copy(update={"message_id": delivery_id})
+        await nats_client.publish(
+            "jarvis.notification.slack", envelope.model_dump_json().encode("utf-8")
+        )
+        return True
+
     deps = MissionFinishDeps(
         pool=pool,
         config=forge_config,
@@ -1317,6 +1452,7 @@ def compose_mission_finisher(
         resume_merge=resume_merge,
         reconcile=reconcile,
         finish_settled=finish_settled,
+        finish_settled_press=finish_settled_press,
         feature_routing_gate=feature_routing_gate,
         feature_routing_required=feature_routing_required,
     )
@@ -1324,4 +1460,10 @@ def compose_mission_finisher(
     async def finisher() -> list[str]:
         return await finish_ready_missions(deps)
 
+    # What was composed, for the test that the production wiring binds each
+    # recovery to the merge consumer's own method.
+    finisher.deps = deps  # type: ignore[attr-defined]
+    #: Says one line in a mission's thread, for the merge press's finishing
+    #: routine (``MergeExecutorDeps.tell_mission``, installed at boot).
+    finisher.tell = tell  # type: ignore[attr-defined]
     return finisher
