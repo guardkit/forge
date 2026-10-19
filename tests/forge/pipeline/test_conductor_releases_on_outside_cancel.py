@@ -748,4 +748,7 @@ class TestTheRunningLegIsAskedToStop:
         assert len(stop.calls) == 1
         said = [r for r in caplog.records if logged in r.getMessage()]
         assert len(said) == 1
+        if raises is None:
+            # It names the status the row ended with, not "was cancelled".
+            assert "has ended (CANCELLED)" in said[0].getMessage()
         assert pool.get_build_row(BUILD_ID).status is BuildState.CANCELLED

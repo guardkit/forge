@@ -4383,13 +4383,18 @@ def make_conductor_leg_canceller(
             from forge.adapters.guardkit.run_via_sidecar import cancel_leg_via_sidecar
 
             stopper = cancel_leg_via_sidecar
+        status = getattr(getattr(row, "status", None), "value", None) or str(
+            getattr(row, "status", "") or "unknown"
+        )
         stopped, sentence = await asyncio.to_thread(
             stopper, base_url=str(entry.sidecar_url), build=build_id
         )
+        # The watch fires for any ended status, not only a cancel.
         logger.warning(
-            "conductor: build_id=%s was cancelled while a stage ran in %s's "
+            "conductor: build_id=%s has ended (%s) while a stage ran in %s's "
             "sandbox — %s%s",
             build_id,
+            status,
             repo,
             sentence,
             "" if stopped else "; it runs on to its own end",
