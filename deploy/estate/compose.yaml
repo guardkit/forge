@@ -1438,6 +1438,13 @@ services:
       JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID: ${JARVIS_SLACK_PLANNING_ORIGINATOR_USER_ID:?name the Slack member id whose sentences become planning requests, in the env file}
       JARVIS_LINEAR_STATE_DIR: /var/lib/jarvis
       JARVIS_LINEAR_FORGE_DB: /var/lib/forge/forge.db
+      # The registered repositories (planning.sandboxes), read-only, so every
+      # registered repository gets a Linear project (design section 11.1).
+      JARVIS_LINEAR_FORGE_SETTINGS: /etc/forge/forge.yaml
+      # The dashboard's project figures (cost, open issues, health) for the
+      # project update after each merge (design 11.4-11.5). Only present when
+      # compose.linear-dashboard.yaml is added; absent means "not available".
+      JARVIS_LINEAR_DASHBOARD_SUMMARY: /dashboard/project-summaries.json
       JARVIS_LOG_LEVEL: ${JARVIS_LOG_LEVEL:-INFO}
     # On the bus's network like the gateway; the external-bus file adds the
     # retained bus's network in that mode.
@@ -1446,6 +1453,8 @@ services:
     volumes:
       - linear-door-state:/var/lib/jarvis
       - forge-ledger:/var/lib/forge:ro
+      # Forge's settings, read-only: the door only reads planning.sandboxes.
+      - forge-settings:/etc/forge:ro
     secrets:
       - source: bus-jarvis-password
         target: jarvis_bus_password
