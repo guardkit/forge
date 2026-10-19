@@ -286,6 +286,14 @@ class TestYamlRoundTrip:
                 "fetch_addresses": {},
                 "nothing_to_build": {"enabled": False},
                 "ranked_source": {"enabled": False},
+                # Added 18 October 2026 (one sandbox per project, stage S2):
+                # the sandbox starter, off with no url; always in the dump.
+                "sandbox_starter": {
+                    "url": None,
+                    "idle_minutes": 30,
+                    "ready_timeout_seconds": 600,
+                    "poll_seconds": 60,
+                },
             },
             # ``deploy`` was added by WS2-B8 (output-side stages) — like
             # ``planning`` above, the unfiltered round-trip dump always includes

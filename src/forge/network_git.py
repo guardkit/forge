@@ -51,7 +51,7 @@ import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterator, List, Mapping, Optional, Sequence, Tuple
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from forge import project_git
 
@@ -80,6 +80,10 @@ __all__ = [
     "fetch_start_point",
     "git_door_address",
     "git_door_problem",
+    "git_export_problem",
+    "fetch_sandbox_copy_branch",
+    "SANDBOX_BRANCH_REFUSAL",
+    "SANDBOX_COPY_MISMATCH",
     "https_address_problem",
     "isolated_environment",
     "no_fetch_address_sentence",
@@ -270,8 +274,6 @@ def git_door_problem(door: Optional[str]) -> Optional[str]:
     ``/``. No user name, query or fragment. The answer never repeats the
     value.
     """
-    import ipaddress
-
     text = str(door or "")
     if not text.strip():
         return "it is empty"
@@ -285,16 +287,26 @@ def git_door_problem(door: Optional[str]) -> Optional[str]:
         return "it does not begin with http://"
     try:
         parts = urlsplit(text)
-        port = parts.port
+        parts.port
     except ValueError:
         return "its address or port cannot be read"
+    if parts.path != "/" and parts.hostname and parts.port is not None:
+        return "its path is not exactly /"
+    return _host_and_port_problem(parts)
+
+
+def _host_and_port_problem(parts: "SplitResult") -> Optional[str]:
+    """Why an address's host and port are not one plain address and an
+    explicit port, else ``None`` (shared by the Git door and the sandbox's
+    export, 19 October 2026). ``parts`` was split without error."""
+    import ipaddress
+
     host = parts.hostname or ""
+    port = parts.port
     if not host:
         return "it names no address"
     if port is None:
         return "it names no port"
-    if parts.path != "/":
-        return "its path is not exactly /"
     try:
         found = ipaddress.ip_address(host)
     except ValueError:
@@ -326,6 +338,45 @@ def git_door_address(door: str, repo: str) -> str:
     if not _DOOR_REPO.match(address[len(door):]):
         raise ValueError(f"{repo!r} is not a repository name of the form owner/name")
     return address
+
+
+#: One folder name in a sandbox export's path: a letter or digit first, so
+#: never ``.``, ``..`` or an option.
+_EXPORT_PART = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,99}$")
+
+
+def git_export_problem(address: Optional[str]) -> Optional[str]:
+    """Why ``address`` is not a sandbox's read-only git export, else ``None``.
+
+    A sandbox's export (19 October 2026, the nightly check's fetch of a
+    private project) is exactly ``git://<address>:<port>/<folder>[/...]``:
+    one specific address, an explicit port written plainly, and a path of
+    one or more plain folder names (a letter or digit first; never ``..``).
+    No user name, query or fragment. The answer never repeats the value.
+    """
+    text = str(address or "")
+    if not text.strip():
+        return "it is empty"
+    if text != text.strip() or any(ch.isspace() or ord(ch) < 32 for ch in text):
+        return "it contains a space or a control character"
+    for char, called in (("@", "an @ (a user name before the address)"),
+                         ("?", "a ? (a query)"), ("#", "a # (a fragment)")):
+        if char in text:
+            return f"it contains {called}"
+    if not text.startswith("git://"):
+        return "it does not begin with git://"
+    try:
+        parts = urlsplit(text)
+        parts.port
+    except ValueError:
+        return "its address or port cannot be read"
+    problem = _host_and_port_problem(parts)
+    if problem:
+        return problem
+    folders = parts.path.split("/")[1:]
+    if not folders or not all(_EXPORT_PART.match(part) for part in folders):
+        return "its path is not one or more plain folder names"
+    return None
 
 
 def _door_address_problem(text: str, git_door: str) -> Optional[str]:
@@ -876,6 +927,88 @@ def fetch_default_branch_copy(
         if not commit:
             return StartPoint(refusal="The factory's own copy could not say which commit it holds.")
     return StartPoint(branch=default, commit=commit)
+
+
+#: The refusal when a sandbox's copy of GitHub is not at the commit the
+#: sandbox reported (19 October 2026).
+SANDBOX_COPY_MISMATCH: str = (
+    "The sandbox's copy of the project's repository is not at the commit the "
+    "sandbox reported, so it was not used."
+)
+
+#: The refusal when the sandbox names a default branch the factory will not
+#: fetch (a name git would read as something else, or ``HEAD``).
+SANDBOX_BRANCH_REFUSAL: str = (
+    "The sandbox named a default branch the factory will not pass to git."
+)
+
+_A_COMMIT = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
+
+
+def fetch_sandbox_copy_branch(
+    export: Optional[str],
+    *,
+    branch: str,
+    expected_commit: str,
+    copies_root: Path,
+    timeout: float = _DEFAULT_TIMEOUT_S,
+) -> StartPoint:
+    """The sandbox's copy of GitHub's ``branch``, fetched from the sandbox's
+    read-only git export into the factory's own bare copy under
+    ``copies_root``. Never raises.
+
+    The nightly security check's fetch of a private project (design
+    "How the nightly security check fetches a private project", 19 October
+    2026). The coordinator cannot reach the Git door, which answers only the
+    project's own sandbox, so it reads the sandbox's export instead, and only
+    the sandbox clone's copy of GitHub: ``refs/remotes/origin/<branch>``
+    becomes the copy's ``refs/heads/<branch>``. The sandbox's own branches,
+    its local ``main`` among them, are never read.
+
+    The caller has just asked the sandbox to update that copy, and the
+    sandbox answered with ``branch`` and ``expected_commit``. Anything but
+    exactly that commit is refused (:data:`SANDBOX_COPY_MISMATCH`). The
+    export address is checked (:func:`git_export_problem`) and fetched with
+    the ``git`` transport alone, in the same isolated environment as every
+    other network git command.
+    """
+    problem = git_export_problem(export)
+    if problem:
+        return StartPoint(
+            refusal=f"The sandbox's export address will not do: {problem} (the value is not repeated here)."
+        )
+    # HEAD is git's pointer, never a branch (coach review, 19 October 2026):
+    # "+refs/remotes/origin/HEAD:refs/heads/HEAD" would make a branch named
+    # HEAD in the factory's copy.
+    if not _BRANCH.match(str(branch or "")) or str(branch) == "HEAD":
+        return StartPoint(refusal=SANDBOX_BRANCH_REFUSAL)
+    if not _A_COMMIT.match(str(expected_commit or "")):
+        return StartPoint(refusal="The sandbox named a commit that is not a full commit id.")
+    address = str(export).strip()
+    refused = _proxy_refusal("git")
+    if refused:
+        return StartPoint(refusal=refused)
+    copy = factory_copy_for(address, copies_root)
+    with _held(copy):
+        made = _ready(copy, timeout)
+        if not made.ok:
+            return StartPoint(refusal=f"The factory's own copy could not be made: {made.said}")
+        fetched = run_network_git(
+            ["fetch", "--no-tags", "--no-recurse-submodules", "--", address,
+             f"+refs/remotes/origin/{branch}:refs/heads/{branch}"],
+            transport="git", git_dir=copy, timeout=timeout,
+        )
+        if not fetched.ok:
+            return StartPoint(
+                refusal=f"The sandbox's copy of '{branch}' could not be fetched: {fetched.said}"
+            )
+        held = _copy_refs(copy, "refs/heads/", timeout)
+        commit = (held or {}).get(f"refs/heads/{branch}")
+        if not commit:
+            return StartPoint(refusal="The factory's own copy could not say which commit it holds.")
+    if commit != expected_commit:
+        return StartPoint(refusal=SANDBOX_COPY_MISMATCH)
+    return StartPoint(branch=branch, commit=commit)
 
 
 def fetch_start_point(
