@@ -1605,7 +1605,9 @@ async def rearm_paused_gates(
     snapshots = await gate_repository.list_paused_builds()
     tasks: list["asyncio.Task[Any]"] = []
 
-    for snap in snapshots:
+    async def _rearm_one(snap: Any) -> "asyncio.Task[Any] | None":
+        """Interrupt, re-arm and (on approve) relaunch one PAUSED build: the
+        sandbox-facing recovery of one build, as one unit."""
         # One persistently-bad row must never abort the whole sweep (and with
         # it daemon boot): wrap the per-snapshot body so any unexpected error
         # logs and continues to the next PAUSED build.
@@ -1632,7 +1634,7 @@ async def rearm_paused_gates(
                         "recorded run or showing a card",
                         snap.build_id,
                     )
-                    continue
+                    return None
             ctx = BuildContext(
                 feature_id=snap.feature_id,
                 build_id=snap.build_id,
@@ -1649,7 +1651,7 @@ async def rearm_paused_gates(
                     "skipping (corrupt state)",
                     snap.build_id,
                 )
-                continue
+                return None
             # A recovered build's card: its recorded run (which may still be
             # going after a factory-only restart) is interrupted before the
             # card is shown again. If that cannot be sent, the card is not
@@ -1666,7 +1668,7 @@ async def rearm_paused_gates(
                     "not be interrupted; its card is not re-armed this boot",
                     snap.build_id,
                 )
-                continue
+                return None
             try:
                 recovery_envelope = build_recovery_approval_envelope(build_row)
             except ValueError as exc:  # pragma: no cover - guarded by list scan
@@ -1676,7 +1678,7 @@ async def rearm_paused_gates(
                     snap.build_id,
                     exc,
                 )
-                continue
+                return None
 
             deps = make_gate_check_deps(
                 parts,
@@ -1793,7 +1795,7 @@ async def rearm_paused_gates(
                 # a hung await; if it already died, cancel is a harmless no-op
                 # and _log_rearm_task_exception has surfaced the cause.
                 task.cancel()
-                continue
+                return None
 
             try:
                 await deps.publisher.publish_request(recovery_envelope)
@@ -1815,7 +1817,7 @@ async def rearm_paused_gates(
                     snap.attempt_count,
                     snap.correlation_id,
                 )
-            tasks.append(task)
+            return task
         except Exception as exc:  # noqa: BLE001 — one bad row must not abort sweep
             logger.error(
                 "rearm_paused_gates: unexpected error re-arming build_id=%s "
@@ -1823,7 +1825,38 @@ async def rearm_paused_gates(
                 snap.build_id,
                 exc,
             )
+            return None
+
+    # A PROJECT'S OWN SANDBOX THAT DID NOT COME UP AT BOOT (one sandbox per
+    # project, stage S2, Codex S2 implementation review 2, R3): every
+    # sandbox-facing recovery step of a build of that repository — the
+    # interrupt of its recorded run, the card's re-arm and the relaunch on
+    # approve — waits, as one unit, until the sandbox is ready. Every other
+    # repository's builds are re-armed now. With no sandbox gate installed
+    # nothing is deferred.
+    from forge.sandbox_gate.gate import defer as _defer_for_its_sandbox
+
+    async def _rearm_later(snap: Any) -> None:
+        task = await _rearm_one(snap)
+        if task is not None:
+            logger.info(
+                "rearm_paused_gates: build_id=%s re-armed once its sandbox was ready",
+                snap.build_id,
+            )
+
+    for snap in snapshots:
+        row = sqlite_pool.get_build_row(snap.build_id)
+        repo = getattr(row, "repo", None) if row is not None else None
+        if _defer_for_its_sandbox(repo, lambda snap=snap: _rearm_later(snap)):
+            logger.info(
+                "rearm_paused_gates: build_id=%s waits for its sandbox before its "
+                "recorded run is interrupted and its card re-armed",
+                snap.build_id,
+            )
             continue
+        task = await _rearm_one(snap)
+        if task is not None:
+            tasks.append(task)
 
     logger.info("rearm_paused_gates: re-armed %d PAUSED build(s)", len(tasks))
     return tasks

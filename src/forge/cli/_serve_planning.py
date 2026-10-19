@@ -1938,8 +1938,26 @@ async def rearm_paused_planning_runs(
         store = composition.store or SqlitePlanningRunStore(connect_writer(db_path))
         rearmed: list[str] = []
 
+        from forge.sandbox_gate.gate import defer as _defer_for_its_sandbox
+
         for run in store.list_runs_by_state(PlanningState.PAUSED):
             correlation_id = run["correlation_id"]
+            # A PROJECT'S OWN SANDBOX THAT DID NOT COME UP AT BOOT (stage S2,
+            # Codex S2 implementation review 2, R3): the run is re-armed, and
+            # so driven on, once its sandbox is ready. Nothing deferred with
+            # no sandbox gate installed.
+            try:
+                target_repo = run["target_repo"]
+            except (KeyError, IndexError, TypeError):
+                target_repo = None
+            if composition.rearm_callable is not None and _defer_for_its_sandbox(
+                target_repo,
+                lambda cid=correlation_id: composition.rearm_callable(cid),
+            ):
+                logger.info(
+                    "Rearming paused planning run %s waits for its sandbox", correlation_id
+                )
+                continue
             try:
                 if composition.rearm_callable is not None:
                     # Production path: routes through the composition's
