@@ -526,7 +526,7 @@ def test_on_two_machines_every_sbx_command_goes_to_the_sandbox_s_machine(own, pu
     # The publisher's file and the coordinator's volume are staged here.
     assert (publisher_file.parent / f"settings.json.{LEAF}-pending").is_file()
     assert f"forge.yaml.{LEAF}-pending" in own.volume
-    assert "ssh -o BatchMode=yes spark-example -- sbx exec" in result.output
+    assert "ssh -o BatchMode=yes spark-example -- 'sbx exec" in result.output
 
 
 def test_the_shared_sandbox_on_the_other_machine_is_reached_the_same_way(estate, monkeypatch):
@@ -539,10 +539,55 @@ def test_the_shared_sandbox_on_the_other_machine_is_reached_the_same_way(estate,
     assert result.exit_code == 0, result.output
     assert hop.routed and not [c for c in hop.local if "sbx" in c]
     assert any(words[:2] == ["sbx", "exec"] and "clone" in words for words in hop.routed)
-    assert "ssh -o BatchMode=yes spark-example -- sbx exec -u 1000 api-test-deploy cmp" in result.output
+    assert "ssh -o BatchMode=yes spark-example -- 'sbx exec -u 1000 api-test-deploy cmp" in result.output
 
 
 SUPERVISOR_RESTART = "docker restart forge-estate-sandbox-runner-1"
+
+
+def _unhopped(output: str, host: str) -> str:
+    """The printed output with each ssh hop taken off and its one quoted
+    command put back as it would be typed on the sandbox's machine."""
+    import shlex
+
+    hop = f"ssh -o BatchMode=yes {host} -- "
+    lines = []
+    for line in output.split("\n"):
+        if hop in line:
+            before, rest = line.split(hop, 1)
+            lexer = shlex.shlex(rest, posix=True)
+            lexer.whitespace_split = True
+            command = lexer.get_token()
+            after = lexer.instream.read()
+            line = before + command + (f" {after}" if after else "")
+        lines.append(line)
+    return "\n".join(lines)
+
+
+def _remote_words(line: str, host: str) -> list[str]:
+    """What the sandbox's machine runs for one printed ssh line: this shell
+    splits the line, ssh joins the words after ``--`` with spaces, and the
+    remote shell splits that again."""
+    import shlex
+
+    command = line.strip().removeprefix("&& ").removesuffix(" \\").split("  (", 1)[0]
+    words = shlex.split(command)
+    hop = ["ssh", "-o", "BatchMode=yes", host, "--"]
+    assert words[: len(hop)] == hop, line
+    return shlex.split(" ".join(words[len(hop):]))
+
+
+def _assert_docker_ps_format_arrives_whole(output: str, host: str) -> None:
+    routed = [line for line in output.splitlines() if f"ssh -o BatchMode=yes {host} -- " in line]
+    assert routed
+    remote = [_remote_words(line, host) for line in routed]
+    ps = [words for words in remote if "ps" in words and "docker" in words]
+    assert ps, "the readiness check is printed"
+    for words in ps:
+        at = words.index("--format")
+        assert words[at + 1:] == ["{{.Names}} {{.Status}}"], words
+    # Every other routed step arrives as the words it was printed with.
+    assert all(words[0] in ("sbx", "docker") for words in remote)
 
 
 def test_on_two_machines_the_printed_supervisor_restart_goes_to_the_sandbox_s_machine(tmp_path, monkeypatch):
@@ -575,11 +620,12 @@ def test_on_two_machines_the_printed_supervisor_restart_goes_to_the_sandbox_s_ma
     assert hop not in plain.output
     # With it, the restart is sent to the sandbox's machine, and never bare.
     lines = routed.output.splitlines()
-    assert f"    {hop}{SUPERVISOR_RESTART}" in lines
+    assert f"    {hop}'{SUPERVISOR_RESTART}'" in lines
     assert not [line for line in lines if line.strip() == SUPERVISOR_RESTART]
     # Every sandbox-side step is routed and nothing else differs.
-    assert f"{hop}sbx exec" in routed.output
-    assert routed.output.replace(hop, "") == plain.output
+    assert f"{hop}'sbx exec" in routed.output
+    assert _unhopped(routed.output, "sandbox-host.example") == plain.output
+    _assert_docker_ps_format_arrives_whole(routed.output, "sandbox-host.example")
 
 
 @pytest.mark.parametrize("host", ["-oProxyCommand=x", "a b", "spark;rm", ""])

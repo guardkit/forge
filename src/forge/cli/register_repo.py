@@ -2360,16 +2360,16 @@ def activation_sequence(
         f" --coordinator-container {q(estate.coordinator)}"
     )
 
-    # The sandbox's own machine, when it is another (--sandbox-ssh): every
-    # printed step that acts there (its sbx commands and the restart of its
-    # supervisor) is sent there the same way, so none of them is run on this
-    # machine by mistake.
-    there = (
-        f"{' '.join(sandbox_ssh_prefix(shlex.quote(estate.sandbox_ssh)))} "
-        if estate.sandbox_ssh
-        else ""
-    )
-    sbx = f"{there}sbx"
+    def there(command: str) -> str:
+        """A printed step that acts on the sandbox's machine (its sbx commands
+        and the restart of its supervisor). When that is another machine
+        (--sandbox-ssh) it is sent there the way the tool sends its own: the
+        whole command line as ONE quoted argument after the ssh hop, so the
+        remote shell reads it with its quoting intact (ssh joins its
+        arguments with spaces). On this machine it is printed as it is."""
+        if not estate.sandbox_ssh:
+            return command
+        return " ".join([*sandbox_ssh_prefix(shlex.quote(estate.sandbox_ssh)), shlex.quote(command)])
 
     lines = [
         ("What would make it live" if dry_run else "What makes it live")
@@ -2422,9 +2422,9 @@ def activation_sequence(
         )
     if sandbox_file is not None:
         backup = sandbox_file.backup or "<its backup>"
-        exec_ = f"{sbx} exec -u {SANDBOX_USER} {q(estate.sandbox)}"
-        checks.append(f"{exec_} cmp {q(sandbox_file.live)} {q(backup)}")
-        copies.append(f"{exec_} cp {q(sandbox_file.pending)} {q(sandbox_file.live)}")
+        exec_ = f"sbx exec -u {SANDBOX_USER} {q(estate.sandbox)}"
+        checks.append(there(f"{exec_} cmp {q(sandbox_file.live)} {q(backup)}"))
+        copies.append(there(f"{exec_} cp {q(sandbox_file.pending)} {q(sandbox_file.live)}"))
     if publisher is not None:
         backup = publisher.backup or "<its backup>"
         checks.append(f"cmp {q(publisher.live)} {q(backup)}")
@@ -2447,7 +2447,7 @@ def activation_sequence(
     elif estate.slot is None:
         lines += [
             "(d) Restart the sandbox supervisor and confirm the helper and runner are ready:",
-            f"    {there}docker restart {container(SANDBOX_SUPERVISOR_SERVICE)}",
+            "    " + there(f"docker restart {container(SANDBOX_SUPERVISOR_SERVICE)}"),
         ]
     else:
         ports = estate.slot
@@ -2469,8 +2469,9 @@ def activation_sequence(
             )
     if not quiet_sandbox:
         lines.append(
-            f"    {sbx} exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'"
-            f"  (both {estate.sandbox}-helper and {estate.sandbox}-runner Up)"
+            "    "
+            + there(f"sbx exec {q(estate.sandbox)} docker ps --format '{{{{.Names}}}} {{{{.Status}}}}'")
+            + f"  (both {estate.sandbox}-helper and {estate.sandbox}-runner Up)"
         )
     if helper_urls is not None and not quiet_sandbox:
         sidecar, runner = helper_urls

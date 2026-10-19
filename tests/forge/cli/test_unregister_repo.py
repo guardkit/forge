@@ -553,7 +553,12 @@ def test_on_two_machines_the_printed_supervisor_restart_goes_to_the_sandbox_s_ma
     import copy
 
     from forge.cli import register_repo
-    from tests.forge.cli.test_register_repo_sandbox import SUPERVISOR_RESTART, _OverSsh
+    from tests.forge.cli.test_register_repo_sandbox import (
+        SUPERVISOR_RESTART,
+        _assert_docker_ps_format_arrives_whole,
+        _OverSsh,
+        _unhopped,
+    )
 
     monkeypatch.delenv("FORGE_SANDBOX_SSH", raising=False)
     _registered(estate)
@@ -571,7 +576,19 @@ def test_on_two_machines_the_printed_supervisor_restart_goes_to_the_sandbox_s_ma
     assert f"    {SUPERVISOR_RESTART}" in plain.output.splitlines()
     assert prefix not in plain.output
     lines = routed.output.splitlines()
-    assert f"    {prefix}{SUPERVISOR_RESTART}" in lines
+    assert f"    {prefix}'{SUPERVISOR_RESTART}'" in lines
     assert not [line for line in lines if line.strip() == SUPERVISOR_RESTART]
-    assert f"{prefix}sbx exec -u 1000 api-test-deploy cmp" in routed.output
-    assert routed.output.replace(prefix, "") == plain.output
+    assert f"{prefix}'sbx exec -u 1000 api-test-deploy cmp" in routed.output
+    assert _unhopped(routed.output, "sandbox-host.example") == plain.output
+    _assert_docker_ps_format_arrives_whole(routed.output, "sandbox-host.example")
+
+
+@pytest.mark.parametrize("host", ["-oProxyCommand=x", "a b", "spark;rm", ""])
+def test_the_sandbox_s_machine_must_be_an_ssh_host(estate, host):  # noqa: F811
+    _registered(estate)
+    estate.calls.clear()
+    before = (dict(estate.volume), dict(estate.sandbox_files))
+    result = _unregister(KEY, "--sandbox-settings", SANDBOX_SETTINGS, "--sandbox-ssh", host)
+    assert result.exit_code == 1 and "--sandbox-ssh is not an ssh host" in result.output
+    assert estate.calls == [] and estate.writes == []
+    assert (estate.volume, estate.sandbox_files) == before
