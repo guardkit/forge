@@ -205,6 +205,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Mapping
 from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -602,7 +603,7 @@ SIDECAR_CODE_VERSION: str = resolve_code_version()
 #: id made once when the helper process starts, so it changes whenever the
 #: helper is recreated (a VM restart recreates it). ``/healthz`` reports it as
 #: ``instance``, and the sandbox starter binds a deployment's readiness to it.
-HELPER_INSTANCE: str = __import__("uuid").uuid4().hex
+HELPER_INSTANCE: str = uuid.uuid4().hex
 
 
 # ---------------------------------------------------------------------------
