@@ -1452,6 +1452,62 @@ class TestAnAdditionCannotCarryTheFactorysOwnValues:
         _no_sentinel(answer.sentence, "the refusal")
         assert not (project / "env-deploy.json").exists(), "it ran"
 
+    def _deploy_with_artifact(
+        self, project: Path, tmp_path: Path, artifact: str
+    ) -> Any:
+        from forge.deploy_sidecar.deploy_executor import DeployExecutor, DeployRequest
+
+        return DeployExecutor(
+            notes_root=tmp_path / "notes",
+            ask_the_coordinator=lambda _t: {"counter": 1, "build": BUILD},
+        ).run(
+            DeployRequest(
+                target=f"shop-{tmp_path.name}::live",
+                target_counter=1,
+                build=BUILD,
+                cwd=str(project),
+                script="deploy/deploy.sh",
+                identity="shop:abc123",
+                identity_setting="DEPLOY_IDENTITY",
+                artifact=artifact,
+                artifact_setting="RELEASE_VERSION",
+                repository=str(project),
+            )
+        )
+
+    def test_an_artifact_valued_1_is_deployed_in_a_factory_container(
+        self, project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """20 October 2026 (Codex review of the factory-launch flag). The
+        helper's own environment holds ``GUARDKIT_FACTORY_LAUNCH=1`` (the
+        image sets it), ``FORGE_SIDECAR_IN_SANDBOX=1`` and on-switches such as
+        ``FLEET_MEMORY_ENABLED=1``. None of those is a secret, so a project's
+        artifact that happens to be ``1`` is deployed, not refused."""
+        monkeypatch.setenv("GUARDKIT_FACTORY_LAUNCH", "1")
+        monkeypatch.setenv("FLEET_MEMORY_ENABLED", "1")
+
+        answer = self._deploy_with_artifact(project, tmp_path, "1")
+
+        assert answer.accepted, answer
+        given = _given(project, "deploy")
+        assert given["RELEASE_VERSION"] == "1"
+        assert "GUARDKIT_FACTORY_LAUNCH" not in given
+        _no_sentinel(given, "the deploy step")
+
+    def test_an_artifact_carrying_a_factory_secret_is_still_refused(
+        self, project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("GUARDKIT_FACTORY_LAUNCH", "1")
+
+        answer = self._deploy_with_artifact(
+            project, tmp_path, SENTINELS["FLEET_MEMORY_PG_DSN"]
+        )
+
+        assert not answer.accepted, answer
+        assert "RELEASE_VERSION" in answer.sentence
+        _no_sentinel(answer.sentence, "the refusal")
+        assert not (project / "env-deploy.json").exists(), "it ran"
+
 
 # ---------------------------------------------------------------------------
 # A named repository's git directory is its own (14 October 2026)

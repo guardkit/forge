@@ -82,7 +82,7 @@ import sqlite3
 import subprocess
 import threading
 import uuid
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1396,6 +1396,153 @@ def _parse_stopped_because_line(
         return None
     if len(sentence) > _STOPPED_BECAUSE_MAX_CHARS:
         sentence = sentence[: _STOPPED_BECAUSE_MAX_CHARS - 1].rstrip() + "\u2026"
+    return sentence
+
+
+# ---------------------------------------------------------------------------
+# GuardKit's configuration-error stop (19 October 2026)
+# ---------------------------------------------------------------------------
+#
+# GuardKit stops a task before any model call, with the final decision
+# ``configuration_error``, when the project's own setup cannot support it: a
+# task that needs measured coverage in a project that declares no coverage
+# command, a task type GuardKit does not know, or binding documents that
+# cannot be given to the reviewer whole. A repair build cannot change a
+# project's setup, so the factory files no repair for such a build and tells a
+# person instead, in GuardKit's own words, which name the fix.
+#
+# How Forge knows, and why it trusts it: TWO records from this run must agree
+# (coach review, 19 October 2026). The task's line on the stdout of the
+# GuardKit process THIS run started (the R3 rule of 18 October),
+#
+#       ✗ TASK-X: configuration_error (0 turns)
+#
+# and the feature ledger GuardKit rewrites from its own state as each task
+# finishes, recording ``result.final_decision: configuration_error`` for that
+# same task. Neither alone is enough: the stream also carries a project's raw
+# output (a failed smoke gate or install prints it whole), so a project's test
+# can print that line; and the ledger in a kept worktree can hold an earlier
+# run's entry. When either is missing the build is repaired as before.
+
+#: The manifest field the stop is recorded under, read by the repair-row
+#: producer (:mod:`forge.pipeline.fix_row_producer`).
+CONFIGURATION_ERRORS_FIELD: str = "configuration_errors"
+
+#: GuardKit's final decision for the stop.
+GUARDKIT_CONFIGURATION_ERROR: str = "configuration_error"
+
+#: One task's result line as GuardKit prints it, for that decision only.
+_CONFIGURATION_ERROR_LINE_PATTERN: re.Pattern[str] = re.compile(
+    r"^\s*\u2717\s+(?P<task>[A-Za-z0-9][A-Za-z0-9_.\-]*):\s+"
+    + GUARDKIT_CONFIGURATION_ERROR
+    + r"\s+\((?P<turns>\d+)\s+turns?\)\s*$"
+)
+
+#: Terminal colour codes, in case GuardKit's console ever writes them here.
+_ANSI_ESCAPE_PATTERN: re.Pattern[str] = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
+
+#: A bound on GuardKit's sentence for one task, in a reason and a manifest.
+_CONFIGURATION_ERROR_MAX_CHARS: int = 1000
+
+#: A bound on the whole passage a person is shown (Slack prints it whole).
+_CONFIGURATION_NOTICE_MAX_CHARS: int = 2000
+
+
+def _parse_configuration_error_line(line: str) -> tuple[str, int] | None:
+    """``(task id, turns)`` from GuardKit's ``✗ TASK-X: configuration_error
+    (N turns)`` line, or ``None`` for any other line."""
+    if not isinstance(line, str):
+        return None
+    match = _CONFIGURATION_ERROR_LINE_PATTERN.match(
+        _ANSI_ESCAPE_PATTERN.sub("", line)
+    )
+    if match is None:
+        return None
+    return match.group("task"), int(match.group("turns"))
+
+
+def _configuration_errors(
+    root: Path, feature_id: str, printed: Sequence[tuple[str, int]]
+) -> list[dict[str, Any]]:
+    """``[{"task_id", "turns", "message"}]`` for each configuration stop.
+
+    A task counts only when this run's stdout printed its line (``printed``)
+    AND the ledger records ``final_decision: configuration_error`` for it.
+    ``message`` is the ledger's ``result.error``, flattened to one line,
+    credentials replaced and bounded; ``None`` when the ledger has no words.
+    Never raises: with no readable ledger nothing counts.
+    """
+    if not printed:
+        return []
+    try:
+        results = build_monitor.read_task_results(root, feature_id)
+    except Exception:  # noqa: BLE001 — no ledger, no stop: the repair is filed
+        results = {}
+    errors: list[dict[str, Any]] = []
+    for task_id, turns in printed:
+        decision, error = results.get(task_id, (None, None))
+        if decision != GUARDKIT_CONFIGURATION_ERROR:
+            continue
+        message: str | None = None
+        if error and error.strip():
+            message = _plain_error_text(
+                " ".join(error.split()), limit=_CONFIGURATION_ERROR_MAX_CHARS
+            )
+        errors.append({"task_id": task_id, "turns": turns, "message": message})
+    return errors
+
+
+def _configuration_error_sentence(
+    errors: Sequence[Mapping[str, Any]], *, no_repair_filed: bool = True
+) -> str:
+    """What a person reads when GuardKit stopped tasks for project setup.
+
+    "before any work" only when every stop came at 0 turns. Identical words
+    are given once, naming every task they are about, and the whole passage is
+    bounded. ``no_repair_filed`` is False when the failure manifest could not
+    be written: the repair-row producer cannot then see the stop, so the
+    passage makes no claim about a repair either way.
+    """
+    task_ids = [str(error.get("task_id")) for error in errors]
+    if len(task_ids) == 1:
+        stopped = f"GuardKit stopped {task_ids[0]}"
+    else:
+        stopped = f"GuardKit stopped {len(task_ids)} tasks ({', '.join(task_ids)})"
+    if all(error.get("turns") == 0 for error in errors):
+        stopped += " before any work"
+    sentence = f"{stopped} because the project's setup cannot support it."
+    if no_repair_filed:
+        sentence += (
+            " A repair build cannot change the project's setup, so none was "
+            "filed: the project needs the change GuardKit names, then the "
+            "feature can be built again."
+        )
+    else:
+        sentence += (
+            " The project needs the change GuardKit names, then the feature "
+            "can be built again."
+        )
+    said: dict[str, list[str]] = {}
+    unsaid: list[str] = []
+    for error in errors:
+        message = error.get("message")
+        if message:
+            said.setdefault(str(message), []).append(str(error.get("task_id")))
+        else:
+            unsaid.append(str(error.get("task_id")))
+    for message, about in said.items():
+        sentence += f" GuardKit says about {', '.join(about)}: {message}"
+    if unsaid:
+        sentence += (
+            f" GuardKit's own words for {', '.join(unsaid)} were not in its "
+            "record; the build log has them."
+        )
+    if len(sentence) > _CONFIGURATION_NOTICE_MAX_CHARS:
+        cut = len(sentence) - _CONFIGURATION_NOTICE_MAX_CHARS
+        sentence = (
+            f"{sentence[:_CONFIGURATION_NOTICE_MAX_CHARS]}\u2026 [cut: {cut} "
+            "characters; the build log has the rest]"
+        )
     return sentence
 
 
@@ -5180,6 +5327,10 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     # GuardKit's early-stop sentence, from THIS process's stdout only
     # (18 October 2026). The last parsable line wins; None when absent.
     stopped_because: str | None = None
+    # Tasks GuardKit printed as a configuration error on THIS process's stdout
+    # (19 October 2026), task id -> turns, in the order first printed. Counted
+    # as a stop only when the ledger agrees (see _configuration_errors).
+    configuration_error_tasks: dict[str, int] = {}
 
     # FEAT-DRF — durable per-build stdout. Constructed here (not opened: the
     # handle is created lazily on the first line) so a build that prints
@@ -5258,6 +5409,11 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
                 stop_sentence = _parse_stopped_because_line(decoded, feature_id)
                 if stop_sentence is not None:
                     stopped_because = stop_sentence
+                # GuardKit's configuration-error stop (19 October 2026): the
+                # task's result line on this run's own stdout.
+                stopped_task = _parse_configuration_error_line(decoded)
+                if stopped_task is not None:
+                    configuration_error_tasks[stopped_task[0]] = stopped_task[1]
                 # FEAT-DRF: tee BEFORE the debug log so the narrative survives
                 # whatever the journald level is. Never raises (see _StdoutTee).
                 stdout_tee.write(decoded)
@@ -5544,6 +5700,17 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             if stopped_because:
                 reason = f"{reason}: {stopped_because}"
 
+        # 19 October 2026: GuardKit stopped a task because the project's setup
+        # cannot support it. The reason so far stays byte for byte; the plain
+        # sentence follows it, and the manifest records the stop so the
+        # repair-row producer files no repair a repair build could not make.
+        configuration_errors = _configuration_errors(
+            run_cwd, feature_id, list(configuration_error_tasks.items())
+        )
+        reason_before_stop = reason
+        if configuration_errors:
+            reason = f"{reason}: {_configuration_error_sentence(configuration_errors)}"
+
         # TIMEOUT TRUTH (2026-08-07). The reason strings above are UNCHANGED,
         # byte for byte — prose is what an operator reads, and rewriting it
         # would break every consumer that greps it. What was missing is a
@@ -5645,7 +5812,20 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
                 if runner_error is not None
                 else None
             ),
+            extra=(
+                {CONFIGURATION_ERRORS_FIELD: configuration_errors}
+                if configuration_errors
+                else None
+            ),
         )
+        if configuration_errors and manifest_path is None:
+            # The manifest that tells the producer about the stop was not
+            # written, so the producer may file a repair after all: the notice
+            # makes no claim about one (coach review F4, 19 October 2026).
+            reason = (
+                f"{reason_before_stop}: "
+                f"{_configuration_error_sentence(configuration_errors, no_repair_filed=False)}"
+            )
         return _snapshot_update(
             _build_failed_snapshot(
                 payload,

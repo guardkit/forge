@@ -1620,6 +1620,16 @@ log "settings named but not set here: ${SKIPPED[*]:-none}"
 MODEL_KEY_PLACEHOLDER="no-key-the-model-door-adds-it"
 log "both containers are given the fixed model key placeholder ${MODEL_KEY_PLACEHOLDER}; the model door adds the real key outside this sandbox"
 
+# BOTH CONTAINERS ARE THE FACTORY (19 October 2026). GuardKit's frontier-model
+# fence and its handed-memory-name rule apply when GUARDKIT_FACTORY_LAUNCH is
+# set. Every launch the factory makes sets it, and the release image sets it
+# too; it is set here as well, after the named settings so that nothing handed
+# in can clear it, so a GuardKit started in either container is fenced even by
+# a path that forgot. A fixed text, not a secret. A project's own programs are
+# started with an environment built from nothing and never see it.
+FACTORY_LAUNCH_SETTING="GUARDKIT_FACTORY_LAUNCH=1"
+log "both containers are marked as the factory's (${FACTORY_LAUNCH_SETTING}), so GuardKit's fence applies to anything started in them"
+
 CONTAINER_USER="${SANDBOX_CONTAINER_USER:-$(id -u):$(id -g)}"
 if [[ -n "${SANDBOX_CONTAINER_USER:-}" ]]; then
   log "the two containers run as ${CONTAINER_USER}, which this sandbox was told to use; the shared folders above were made by this script's own user, so that user and this one have to be able to write the same folders"
@@ -1800,6 +1810,7 @@ start_helper() {
     --env "FORGE_DEPLOY_SIDECAR_HOST=${BIND}" \
     ${ENV_ARGUMENTS[@]+"${ENV_ARGUMENTS[@]}"} \
     --env "OPENAI_API_KEY=${MODEL_KEY_PLACEHOLDER}" \
+    --env "${FACTORY_LAUNCH_SETTING}" \
     "${MOUNTS[@]}" \
     ${ENGINE_SOCKET_ARGUMENTS[@]+"${ENGINE_SOCKET_ARGUMENTS[@]}"} \
     --workdir "${REPO_ROOT}" \
@@ -1850,6 +1861,7 @@ start_runner() {
     --network host \
     ${ENV_ARGUMENTS[@]+"${ENV_ARGUMENTS[@]}"} \
     --env "OPENAI_API_KEY=${MODEL_KEY_PLACEHOLDER}" \
+    --env "${FACTORY_LAUNCH_SETTING}" \
     "${MOUNTS[@]}" \
     ${ENGINE_SOCKET_ARGUMENTS[@]+"${ENGINE_SOCKET_ARGUMENTS[@]}"} \
     --volume "${RUNNER_CONFIG_FILE}:${RUNNER_CONFIG_IN_CONTAINER}:ro" \

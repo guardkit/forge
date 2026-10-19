@@ -62,6 +62,15 @@ journey three. So a source build whose mode is ``mode-c`` files nothing,
 and says so in one log line naming the build. A person reads the failed
 journey and decides what to do.
 
+**No repair of a project's setup** (19 October 2026). GuardKit stops a task
+before any model call, as a configuration error, when the project's setup
+cannot support it (no declared coverage command for a task that needs one, a
+task type it does not know, binding documents too large to give whole). A
+repair build changes code, not the project's setup, so a build whose failure
+pack records such a stop files nothing, and says so in one log line. The
+build's failure reason, which every failed-build notice shows, carries
+GuardKit's own sentence naming the change a person has to make.
+
 **It never raises.** Both callers are on a terminal write path: the build
 state recorder is the single writer of ``builds.status``, and the merge
 executor's report is the only durable record of what the merge did. A defect
@@ -266,13 +275,31 @@ def maybe_mint_fix_row(
             own = receipts_root_for(getattr(row, "repo", None))
             if own != receipts_root_for(None):
                 pack_root = own
-        pack_path = _pack_path(build_id, receipts_root=pack_root)
+        pack = _read_pack(build_id, receipts_root=pack_root)
+        pack_path = str(pack.pack_dir) if pack is not None else None
         if source == SOURCE_BUILD_FAILED and pack_path is None:
             logger.info(
                 "fix producer: build %s failed but left no failure pack — "
                 "filing no repair row (a review with no evidence reviews "
                 "blind)",
                 build_id,
+            )
+            return None
+
+        stopped = (
+            configuration_errors_in_pack(pack)
+            if source == SOURCE_BUILD_FAILED
+            else ()
+        )
+        if stopped:
+            logger.info(
+                "fix producer: build %s failed because GuardKit stopped %s "
+                "for the project's setup (a configuration error) — filing no "
+                "repair row: a repair build cannot change a project's setup, "
+                "so this one is for a person, and the build's failure notice "
+                "names the change",
+                build_id,
+                ", ".join(task_id for task_id, _message in stopped),
             )
             return None
 
@@ -389,12 +416,43 @@ def _connection(pool: Any) -> Any:
     return getattr(pool, "connection", None)
 
 
-def _pack_path(build_id: str, *, receipts_root: Any) -> str | None:
-    """The failure pack's directory for this build, or None when there is none."""
+def _read_pack(build_id: str, *, receipts_root: Any) -> Any:
+    """The failure pack this build left, or None when there is none."""
     from forge.pipeline.fix_journey_receipts import read_failure_pack
 
-    pack = read_failure_pack(build_id, receipts_root=receipts_root)
-    return str(pack.pack_dir) if pack is not None else None
+    return read_failure_pack(build_id, receipts_root=receipts_root)
+
+
+def configuration_errors_in_pack(pack: Any) -> tuple[tuple[str, str | None], ...]:
+    """``(task id, GuardKit's sentence or None)`` for each configuration stop.
+
+    The build runner records them in the failure manifest when GuardKit
+    stopped a task, in this run, because the project's setup cannot support
+    it (19 October 2026; see ``CONFIGURATION_ERRORS_FIELD`` in
+    :mod:`forge.subagents.autobuild_runner`). Anything else there — no pack,
+    no manifest, a field of the wrong shape, an entry without a task id —
+    reads as no stop at all, so an ordinary failure is repaired as before.
+    """
+    from forge.subagents.autobuild_runner import CONFIGURATION_ERRORS_FIELD
+
+    raw = getattr(pack, "raw", None)
+    if not isinstance(raw, dict):
+        return ()
+    recorded = raw.get(CONFIGURATION_ERRORS_FIELD)
+    if not isinstance(recorded, list):
+        return ()
+    stopped: list[tuple[str, str | None]] = []
+    for entry in recorded:
+        if not isinstance(entry, dict):
+            continue
+        task_id = entry.get("task_id")
+        if not isinstance(task_id, str) or not task_id.strip():
+            continue
+        message = entry.get("message")
+        stopped.append(
+            (task_id.strip(), message if isinstance(message, str) else None)
+        )
+    return tuple(stopped)
 
 
 def candidate_refused_sentence(
@@ -479,6 +537,7 @@ __all__ = [
     "SOURCE_CANDIDATE_REFUSED",
     "SOURCE_MERGE_REPORT",
     "candidate_refused_sentence",
+    "configuration_errors_in_pack",
     "fix_correlation_id",
     "make_failure_pack_source_reader",
     "maybe_mint_fix_row",

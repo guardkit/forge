@@ -883,6 +883,41 @@ def _addition_refusal(name: object) -> str | None:
     return declared_setting_refusal(name)
 
 
+#: Settings the factory keeps for itself whose values are fixed public
+#: markers, never a secret or an address (20 October 2026, Codex review of the
+#: factory-launch flag). Their NAMES stay reserved; only their values are left
+#: out of the value comparison below, because "1" is a value a project's own
+#: addition can legitimately have (a release version, for one).
+PUBLIC_MARKER_SETTINGS: frozenset[str] = frozenset(
+    {
+        # Set to 1 for every GuardKit the factory starts, and in every
+        # factory container's environment.
+        GUARDKIT_FACTORY_LAUNCH_ENV,
+        # Set to 1 by the sandbox start-up script for its deploy helper.
+        "FORGE_SIDECAR_IN_SANDBOX",
+    }
+)
+
+_DIGITS_ONLY = re.compile(r"[0-9]+")
+
+
+def _value_can_carry_a_secret(name: str, value: str) -> bool:
+    """Whether a reserved setting's value is worth guarding by value.
+
+    Not a public marker's, and not a plain number under a name that is not
+    credential-shaped (a timeout, a count, a port, an on-switch): a number of
+    that kind is neither an address nor a key, and a project's own value can
+    equal it by chance. A credential-shaped name's value is always guarded.
+    """
+    if name.upper() in PUBLIC_MARKER_SETTINGS:
+        return False
+    if _DIGITS_ONLY.fullmatch(value) and not any(
+        word in name.upper() for word in RESERVED_CREDENTIAL_WORDS
+    ):
+        return False
+    return True
+
+
 def _carries_a_factory_value(
     values: Mapping[str, str], source: Mapping[str, str]
 ) -> str | None:
@@ -891,12 +926,16 @@ def _carries_a_factory_value(
 
     A value the factory sets for a command under an ordinary name (say
     ``DATABASE_URL``) could otherwise carry the memory store's address or the
-    bus's out of the factory's own settings, past every check on names.
+    bus's out of the factory's own settings, past every check on names. Only
+    values that could be such a thing are compared
+    (:func:`_value_can_carry_a_secret`).
     """
     reserved = {
         str(value): name
         for name, value in source.items()
-        if str(value) and declared_setting_refusal(name) is not None
+        if str(value)
+        and declared_setting_refusal(name) is not None
+        and _value_can_carry_a_secret(name, str(value))
     }
     for name, value in values.items():
         held = reserved.get(str(value))

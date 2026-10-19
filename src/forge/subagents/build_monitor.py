@@ -873,6 +873,48 @@ def read_feature_ledger(root: Path, feature_id: str) -> FeatureLedger | None:
     )
 
 
+def read_task_results(
+    root: Path, feature_id: str
+) -> dict[str, tuple[str | None, str | None]]:
+    """Each task's ``(final_decision, error)`` as the feature ledger records it.
+
+    GuardKit writes ``result: {final_decision, error, ...}`` on a task when it
+    finishes (19 October 2026: read for a configuration-error stop, whose
+    ``error`` is GuardKit's own sentence naming the fix). A task with no
+    result, or a value that is not text, reads as ``None``. Returns an empty
+    mapping on ANY trouble (no file, a torn write, the wrong shape): no
+    evidence, never a guess.
+    """
+    path = Path(root) / FEATURES_DIR / f"{feature_id}.yaml"
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, yaml.YAMLError):
+        return {}
+    if not isinstance(data, Mapping):
+        return {}
+    tasks = data.get("tasks")
+    if not isinstance(tasks, list):
+        return {}
+    results: dict[str, tuple[str | None, str | None]] = {}
+    for entry in tasks:
+        if not isinstance(entry, Mapping):
+            continue
+        task_id = entry.get("id")
+        if not isinstance(task_id, str) or not task_id:
+            continue
+        result = entry.get("result")
+        if not isinstance(result, Mapping):
+            results[task_id] = (None, None)
+            continue
+        decision = result.get("final_decision")
+        error = result.get("error")
+        results[task_id] = (
+            decision if isinstance(decision, str) else None,
+            error if isinstance(error, str) else None,
+        )
+    return results
+
+
 def _as_int(value: Any) -> int:
     try:
         return int(value)

@@ -710,6 +710,20 @@ RUN check_home="$(mktemp -d)" \
 # (global by default only from node 19).
 ENV NODE_OPTIONS=--experimental-global-webcrypto
 
+# 19 October 2026 — EVERY GuardKit PROCESS IN THIS IMAGE IS A FACTORY LAUNCH.
+# GuardKit's frontier-model fence, and its rule that a factory build uses only
+# the memory name it is handed, both apply when GUARDKIT_FACTORY_LAUNCH is set
+# to anything non-empty. Forge's own launches set it every time
+# (forge.launch_environment.build_launch_env); this sets it for the whole
+# image as well, so a GuardKit started inside a factory container by a path
+# that forgot is still fenced. It is set after the self-check above, which runs
+# in the Player's minimal environment and does not need it. A project's own
+# programs never see it: their environment is built from nothing, and every
+# GUARDKIT_ name is the factory's own. A person running GuardKit by hand in a
+# factory container, as a person and not as the factory, clears it for that
+# one command: `env -u GUARDKIT_FACTORY_LAUNCH guardkit ...`.
+ENV GUARDKIT_FACTORY_LAUNCH=1
+
 # ---------------------------------------------------------------------------
 # PROVENANCE — which tree this image was built from, and the cache barrier.
 #
