@@ -1342,6 +1342,62 @@ def _parse_decision_line(line: str) -> tuple[int, str] | None:
     return int(match.group(1)), match.group(2).lower()
 
 
+# ---------------------------------------------------------------------------
+# GuardKit's early-stop sentence (18 October 2026)
+# ---------------------------------------------------------------------------
+#
+# When a whole-feature repair round stops early because the plan contradicts
+# the project's own check, GuardKit prints ONE line to its stdout:
+#
+#   GUARDKIT_STOPPED_BECAUSE {"feature_id": "...", "sentence": "..."}
+#
+# The rule (design review R3): Forge takes the sentence only from the stdout of
+# the GuardKit process THIS run started, in the drain loop that already reads
+# decision lines, and never reads a file for it. No file is read, so an old
+# record left on disk by an earlier run can never be used.
+
+#: The marker GuardKit's line starts with (guardkit feature_check.py).
+GUARDKIT_STOPPED_BECAUSE_MARKER: str = "GUARDKIT_STOPPED_BECAUSE"
+
+#: A bound on the sentence Forge carries into a failure reason.
+_STOPPED_BECAUSE_MAX_CHARS: int = 2000
+
+
+def _parse_stopped_because_line(
+    line: str, feature_id: str | None = None
+) -> str | None:
+    """The sentence from one ``GUARDKIT_STOPPED_BECAUSE`` stdout line, or None.
+
+    The line must start with the marker and a space, followed by one JSON
+    object whose ``sentence`` is a non-empty string. When the object names a
+    ``feature_id`` it must be this build's. Anything else (another line, bad
+    JSON, a missing or empty sentence, another feature) returns ``None`` and
+    is ignored. Whitespace in the sentence is collapsed to single spaces and
+    the sentence is bounded, so it stays one plain line in any reason.
+    """
+    prefix = GUARDKIT_STOPPED_BECAUSE_MARKER + " "
+    if not isinstance(line, str) or not line.startswith(prefix):
+        return None
+    try:
+        payload = json.loads(line[len(prefix):])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    sentence = payload.get("sentence")
+    if not isinstance(sentence, str):
+        return None
+    named = payload.get("feature_id")
+    if feature_id and isinstance(named, str) and named and named != feature_id:
+        return None
+    sentence = " ".join(sentence.split())
+    if not sentence:
+        return None
+    if len(sentence) > _STOPPED_BECAUSE_MAX_CHARS:
+        sentence = sentence[: _STOPPED_BECAUSE_MAX_CHARS - 1].rstrip() + "\u2026"
+    return sentence
+
+
 def _resolve_guardkit_path() -> Path | None:
     """Resolve the absolute path of the ``guardkit`` executable.
 
@@ -5059,6 +5115,9 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     # Coach-score state (TASK-UBS1C-001).
     last_coach_score: float | None = None
     decision_turns: list[str] = []  # "success" or "feedback" per turn
+    # GuardKit's early-stop sentence, from THIS process's stdout only
+    # (18 October 2026). The last parsable line wins; None when absent.
+    stopped_because: str | None = None
 
     # FEAT-DRF — durable per-build stdout. Constructed here (not opened: the
     # handle is created lazily on the first line) so a build that prints
@@ -5105,7 +5164,7 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     wedge_verdict: build_monitor.WedgeVerdict | None = None
 
     async def _drain_stdout() -> None:
-        nonlocal stage_complete_count, last_coach_score
+        nonlocal stage_complete_count, last_coach_score, stopped_because
         if proc.stdout is None:  # defensive — PIPE was requested above
             return
         try:
@@ -5126,6 +5185,11 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
                     turn_number, decision_type = decision
                     decision_turns.append(decision_type)
                     last_coach_score = 1.0 if decision_type == "success" else 0.0
+                # GuardKit's early-stop sentence (18 October 2026): read from
+                # this run's own stdout, never from a file.
+                stop_sentence = _parse_stopped_because_line(decoded, feature_id)
+                if stop_sentence is not None:
+                    stopped_because = stop_sentence
                 # FEAT-DRF: tee BEFORE the debug log so the narrative survives
                 # whatever the journald level is. Never raises (see _StdoutTee).
                 stdout_tee.write(decoded)
@@ -5362,6 +5426,11 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             )
         else:
             reason = f"guardkit autobuild exit={exit_code}"
+            # 18 October 2026: when GuardKit's repair round stopped early it
+            # said why on its own stdout. The start of the reason stays byte
+            # for byte; the sentence follows it. Absent line, same reason.
+            if stopped_because:
+                reason = f"{reason}: {stopped_because}"
 
         # TIMEOUT TRUTH (2026-08-07). The reason strings above are UNCHANGED,
         # byte for byte — prose is what an operator reads, and rewriting it
