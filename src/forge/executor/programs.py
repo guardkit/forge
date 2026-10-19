@@ -388,13 +388,6 @@ class _Descendants:
             sent = True
         return sent
 
-    def forget_exited(self) -> None:
-        """Close the pidfds of processes that have ended."""
-        for pid, fd in list(self.fds.items()):
-            if _pidfd_exited(fd):
-                os.close(fd)
-                del self.fds[pid]
-
     def close(self) -> None:
         for fd in self.fds.values():
             try:
@@ -404,11 +397,26 @@ class _Descendants:
         self.fds.clear()
 
 
-#: How long the stop's drain may go on killing what is under the wrapper.
+#: How long the stop waits for the wrapper's drain to end.
 _DRAIN_SECONDS: float = 10.0
 
-#: How long one drain pass waits for what it killed to end.
-_DRAIN_PASS_WAIT_SECONDS: float = 2.0
+
+def _wait_for_exit(pid: int, seconds: float) -> bool:
+    """Wait on ``pid``'s pidfd until it exits (``True``) or ``seconds`` pass.
+
+    ``pid`` is this process's own unreaped child (the wrapper), so the pidfd
+    is opened for exactly it.
+    """
+    try:
+        fd = _pidfd_open(pid)
+    except OSError:
+        return True  # it is gone already
+    try:
+        poller = select.poll()
+        poller.register(fd, select.POLLIN)
+        return bool(poller.poll(max(0, int(seconds * 1000))))
+    finally:
+        os.close(fd)
 
 
 class StoppableRun:
@@ -480,11 +488,11 @@ class StoppableRun:
         process in its tree, re-parented orphans included — is held by pidfd
         and sent TERM; during the grace the walk is repeated from the wrapper,
         so a process started or orphaned during the grace is found too. Then
-        the drain (:meth:`_drain`) KILLs everything under the wrapper, pass
-        after pass, until a scan finds nothing; only then is the wrapper
-        itself KILLed. The wrapper is never sent TERM: it is first sent the
-        hold signal, so it stays, reaping, until that KILL. ``True`` when
-        anything was signalled.
+        the wrapper is sent the drain signal: it kills and reaps everything
+        under it until it has no child left, and exits; it is KILLed only if
+        that has not happened within :data:`_DRAIN_SECONDS`. The wrapper is
+        never sent TERM: it is first sent the hold signal, so it stays,
+        reaping, until the drain. ``True`` when anything was signalled.
         """
         with self._lock:
             process = self._process
@@ -516,48 +524,35 @@ class StoppableRun:
                     if not descendants.running():
                         break
                     time.sleep(0.05)
-                # THE DRAIN (Codex round 5). Under the same lock, the wrapper
-                # held and unreaped: scan everything under it, KILL each one
-                # through its pidfd, wait until each has exited, scan again.
-                # A killed process cannot fork once the signal lands, so each
-                # pass sees only what was forked just before its parent died;
-                # the loop ends when a scan finds nothing (bounded).
-                signalled = self._drain(descendants) or signalled
+                # THE DRAIN IS THE WRAPPER'S OWN (Codex round 6). Under the
+                # same lock, the wrapper unreaped (its id is its own): it is
+                # told to drain, and it kills and reaps everything under it
+                # until it has no child at all, then exits. It is waited for,
+                # up to the drain's limit, and only killed if it is still
+                # there then.
                 if not _exited_unreaped(process.pid):
                     try:
-                        os.kill(process.pid, signal.SIGKILL)
+                        os.kill(process.pid, _SUBREAPER_DRAIN_SIGNAL)
                         signalled = True
                     except OSError:
                         pass
+                    if not _wait_for_exit(process.pid, _DRAIN_SECONDS):
+                        descendants.collect()
+                        logger.warning(
+                            "stopping %s: %d processes under it are still there "
+                            "after %g seconds of draining; killing its wrapper "
+                            "and going on",
+                            self.label or "a stoppable program",
+                            len(descendants.running()),
+                            _DRAIN_SECONDS,
+                        )
+                        try:
+                            os.kill(process.pid, signal.SIGKILL)
+                        except OSError:
+                            pass
             finally:
                 descendants.close()
             return signalled
-
-    def _drain(self, descendants: "_Descendants") -> bool:
-        """KILL everything under the wrapper until a scan finds nothing."""
-        signalled = False
-        until = time.monotonic() + _DRAIN_SECONDS
-        while True:
-            descendants.collect()
-            found = descendants.running()
-            if not found:
-                return signalled
-            if time.monotonic() >= until:
-                logger.warning(
-                    "stopping %s: %d processes under it are still there after "
-                    "%g seconds of killing; going on",
-                    self.label or "a stoppable program",
-                    len(found),
-                    _DRAIN_SECONDS,
-                )
-                return signalled
-            signalled = descendants.signal(signal.SIGKILL) or signalled
-            wait_until = min(until, time.monotonic() + _DRAIN_PASS_WAIT_SECONDS)
-            while time.monotonic() < wait_until and not all(
-                _pidfd_exited(fd) for fd in found
-            ):
-                time.sleep(0.01)
-            descendants.forget_exited()
 
     def _mark_finished(self) -> None:
         if self._before_finish_mark is not None:
@@ -621,23 +616,35 @@ def _reader(stream: Any, into: list[bytes]) -> threading.Thread:
 #: are what they were.
 #:
 #: A stop first sends it :data:`_SUBREAPER_HOLD_SIGNAL`; a held wrapper does
-#: not exit when the program does, but stays (reaping) until the stop's final
-#: KILL, so a process orphaned during the stop is still re-parented to it. Its
-#: handler is installed before it says it has started, so the signal never
-#: kills it. A program that is never stopped never sees any of this.
+#: not exit when nothing is left under it, but stays (reaping) until the
+#: stop's drain. When the stop's TERM grace ends it sends
+#: :data:`_SUBREAPER_DRAIN_SIGNAL`, and the wrapper itself kills and reaps its
+#: direct children, pass after pass, until it has no child at all (Codex
+#: round 6: only the subreaper can know that for certain), then exits with
+#: the program's own status if the program had already exited, or with
+#: :data:`_SUBREAPER_DRAINED_EXIT_CODE`. Both handlers are installed before it
+#: says it has started, so neither signal kills it. A program that is never
+#: stopped never sees any of this.
 #:
 #: It writes one line on a status pipe of its own: ``started <pid> <subreaper
 #: or no-subreaper>``, or ``refused <errno> <reason>`` when the program could
 #: not be started, which is then reported as refused before it started,
 #: exactly as before. It runs with ``-I``, so nothing in the program's
 #: environment or working directory changes what it imports.
+#: The wrapper's exit code after a drain when the program was still running
+#: (it was killed by the drain): 128 + SIGKILL, as a shell would say it.
+_SUBREAPER_DRAINED_EXIT_CODE: int = 137
+
 _SUBREAPER = r"""
 import ctypes, os, signal, sys, time
 status = int(sys.argv[1])
 hold_signal = int(sys.argv[2])
-argv = sys.argv[4:]
+drain_signal = int(sys.argv[3])
+argv = sys.argv[5:]
 held = []
+drain = []
 signal.signal(hold_signal, lambda *_: held.append(True))
+signal.signal(drain_signal, lambda *_: drain.append(True))
 reaper = "no-subreaper"
 try:
     libc = ctypes.CDLL(None, use_errno=True)
@@ -655,40 +662,112 @@ except OSError as exc:
     os._exit(127)
 os.write(status, ("started %d %s" % (child, reaper)).encode())
 os.close(status)
-while True:
-    pid, how = os.wait()
+me = os.getpid()
+
+
+def my_children():
+    found = []
+    try:
+        tasks = os.listdir("/proc/self/task")
+        for task in tasks:
+            with open("/proc/self/task/%s/children" % task, "rb") as handle:
+                found.extend(int(part) for part in handle.read().split())
+        return found
+    except FileNotFoundError:
+        found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/stat" % entry, "rb") as handle:
+                fields = handle.read().decode("utf-8", "replace").rsplit(")", 1)[1].split()
+        except (OSError, IndexError):
+            continue
+        if int(fields[1]) == me:
+            found.append(int(entry))
+    return found
+
+
+def pause_for_test(name):
+    # Off unless a test names a folder; the factory's launch list never does.
+    folder = os.environ.get("FORGE_TEST_WRAPPER_PAUSE_DIR")
+    if not folder:
+        return
+    with open(os.path.join(folder, name + ".tmp"), "w") as handle:
+        handle.write(" ".join(str(pid) for pid in snapshot))
+    os.rename(os.path.join(folder, name + ".tmp"), os.path.join(folder, name))
+    while not os.path.exists(os.path.join(folder, "resume")):
+        time.sleep(0.01)
+
+
+program_status = None
+while not drain:
+    try:
+        pid, how = os.waitpid(-1, os.WNOHANG)
+    except ChildProcessError:
+        # Nothing is left under this wrapper. A held wrapper waits for the
+        # stop's drain signal; otherwise the leg is over.
+        if not held:
+            break
+        time.sleep(0.05)
+        continue
+    if pid == 0:
+        time.sleep(0.05)
+        continue
     if pid == child:
-        break
-# The program's own status is recorded above. As a subreaper every orphan of
-# its tree is a child of this wrapper, so it stays, reaping, until none is
-# left: whatever the program left running is still under it, for a stop or
-# the time limit to reach.
-while True:
-    try:
-        os.wait()
-    except ChildProcessError:
-        break
-while held:
-    # A stop is under way: stay, so everything orphaned during it is still
-    # re-parented here, until the stop's final KILL.
-    try:
-        os.waitpid(-1, os.WNOHANG)
-    except ChildProcessError:
-        pass
-    time.sleep(0.05)
-code = os.waitstatus_to_exitcode(how)
+        program_status = how
+
+if drain:
+    # THE DRAIN (Codex round 6). Kill every direct child, then reap, until
+    # there is no child at all. Each one killed is this wrapper's own
+    # unreaped child, so its id cannot have been reused: the kill comes
+    # before any reap in the pass, and only single positive ids are
+    # signalled. As subreaper this wrapper receives every orphan of the leg,
+    # and every live descendant descends from one of its direct children, so
+    # "no child" (ECHILD) means nothing of the leg is left.
+    exited_before_drain = program_status is not None
+    while True:
+        snapshot = [pid for pid in my_children() if pid > 0 and pid != me]
+        pause_for_test("snapshot")
+        for pid in snapshot:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        reaped = False
+        try:
+            while True:
+                pid, how = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                reaped = True
+                if pid == child and program_status is None:
+                    program_status = how
+        except ChildProcessError:
+            break
+        if not reaped:
+            time.sleep(0.01)
+    if not exited_before_drain:
+        os._exit(DRAINED_EXIT_CODE)
+
+code = os.waitstatus_to_exitcode(program_status)
 if code < 0:
     try:
         signal.signal(-code, signal.SIG_DFL)
     except (OSError, ValueError):
         pass
-    os.kill(os.getpid(), -code)
+    os.kill(me, -code)
     os._exit(128 - code)
 os._exit(code)
-"""
+""".replace("DRAINED_EXIT_CODE", str(_SUBREAPER_DRAINED_EXIT_CODE))
 
-#: What a stop sends the wrapper first, to keep it until the final KILL.
+#: What a stop sends the wrapper first, to keep it until the drain.
 _SUBREAPER_HOLD_SIGNAL: int = int(signal.SIGRTMIN) + 3
+
+#: What a stop sends the wrapper when the TERM grace ends: kill and reap
+#: everything under it until nothing is left, then exit.
+_SUBREAPER_DRAIN_SIGNAL: int = int(signal.SIGRTMIN) + 4
+
 
 #: How long the parent waits for the wrapper's status line.
 _SUBREAPER_STATUS_SECONDS = 30.0
@@ -705,6 +784,7 @@ def _subreaper_argv(argv: Sequence[str], status_write: int) -> list[str]:
         _SUBREAPER,
         str(status_write),
         str(_SUBREAPER_HOLD_SIGNAL),
+        str(_SUBREAPER_DRAIN_SIGNAL),
         "--",
         *argv,
     ]

@@ -1066,57 +1066,149 @@ def _forker(directory: Path) -> list[str]:
     ]
 
 
-class TestTheKillDrainsEverythingUnderTheWrapper:
-    def test_a_fork_after_a_kill_pass_began_is_still_stopped(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """Codex R5. At the first SIGKILL of the drain, before it is sent, the
-        program is made to fork a fresh child (which forks a grandchild and
-        exits). That grandchild was not in the pass's scan; the next pass
-        finds it under the wrapper and kills it."""
+def _run_with_env(
+    run: Any, argv: list[str], env: dict[str, str]
+) -> tuple[threading.Thread, dict[str, Any]]:
+    from forge.executor import programs
+
+    result: dict[str, Any] = {}
+
+    def go() -> None:
+        with programs.stoppable(run):
+            result["outcome"] = programs.run_program(
+                argv, cwd=None, env=env, timeout=PROMPT_SECONDS * 6
+            )
+
+    thread = threading.Thread(target=go, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _paused_env(pause: Path) -> dict[str, str]:
+    """The test-only hook: the wrapper's drain waits after each snapshot."""
+    return {**os.environ, "FORGE_TEST_WRAPPER_PAUSE_DIR": str(pause)}
+
+
+def _parent_pid(pid: int) -> int | None:
+    try:
+        return int(Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+class TestTheWrappersOwnDrain:
+    """Codex rounds 5 and 6: the KILL is the wrapper's own drain, which ends
+    only when the wrapper has no child at all."""
+
+    def _stop_in_background(self, run: Any) -> threading.Thread:
+        stopper = threading.Thread(
+            target=lambda: run.request_stop(grace=0.3), daemon=True
+        )
+        stopper.start()
+        return stopper
+
+    def test_a_fork_during_a_drain_pass_is_still_stopped(self, tmp_path: Path) -> None:
+        """Round 5's shape, under the wrapper's drain: after the pass's
+        snapshot, before its kills, the program forks a child that forks a
+        grandchild and exits. The next pass kills the grandchild."""
         from forge.executor import programs
 
-        mine, other = tmp_path / "mine", tmp_path / "other"
-        mine.mkdir()
-        other.mkdir()
-        handshakes: list[int] = []
-        real_send = programs._pidfd_send_signal
-
-        def fork_before_the_first_kill(fd: int, sig: int) -> None:
-            if sig == signal.SIGKILL and not handshakes:
-                (mine / "fork-now").write_text("", encoding="utf-8")
-                handshakes.append(_read_pid(mine / "forked.pid"))
-            real_send(fd, sig)
-
+        mine, other, pause = tmp_path / "mine", tmp_path / "other", tmp_path / "pause"
+        for folder in (mine, other, pause):
+            folder.mkdir()
         other_run = programs.StoppableRun()
-        other_thread, _other = _run_in_thread(other_run, _forker(other))
+        other_thread, _ = _run_with_env(other_run, _forker(other), dict(os.environ))
         other_pids = [_read_pid(other / "program.pid"), _read_pid(other / "first.pid")]
-
         run = programs.StoppableRun()
-        thread, result = _run_in_thread(run, _forker(mine))
-        program, first = _read_pid(mine / "program.pid"), _read_pid(mine / "first.pid")
-        started: list[int] = [program, first]
+        thread, result = _run_with_env(run, _forker(mine), _paused_env(pause))
+        started = [_read_pid(mine / "program.pid"), _read_pid(mine / "first.pid")]
+        stopper = None
         try:
-            monkeypatch.setattr(programs, "_pidfd_send_signal", fork_before_the_first_kill)
-            assert run.request_stop(grace=0.3) is True
-            monkeypatch.setattr(programs, "_pidfd_send_signal", real_send)
+            stopper = self._stop_in_background(run)
+            _wait_for((pause / "snapshot").exists, "the drain's first snapshot")
+            (mine / "fork-now").write_text("", encoding="utf-8")
+            started.append(_read_pid(mine / "forked.pid"))
+            (pause / "resume").write_text("", encoding="utf-8")
+            stopper.join(PROMPT_SECONDS)
             thread.join(PROMPT_SECONDS)
 
-            assert handshakes, "the handshake fork never happened"
-            started.append(handshakes[0])
-            assert not thread.is_alive()
+            assert not stopper.is_alive() and not thread.is_alive()
             assert result["outcome"].exit_code is not None
             for pid in started:
-                assert _gone(pid), f"pid {pid} survived the stop"
-            assert all(_alive(pid) for pid in other_pids)
-            assert other_thread.is_alive()
+                assert _gone(pid), f"pid {pid} survived the drain"
+            assert all(_alive(pid) for pid in other_pids) and other_thread.is_alive()
         finally:
-            monkeypatch.setattr(programs, "_pidfd_send_signal", real_send)
+            (pause / "resume").write_text("", encoding="utf-8")
             other_run.request_stop(grace=0.3)
             other_thread.join(PROMPT_SECONDS)
-            for path in (other / "forked.pid",):
-                if path.exists():
-                    other_pids.append(int(path.read_text().split()[0]))
+            for pid in [*started, *other_pids]:
+                if _alive(pid):
+                    os.kill(pid, 9)
+
+    def test_a_child_adopted_after_the_snapshot_that_forks_and_exits_is_stopped(
+        self, tmp_path: Path
+    ) -> None:
+        """Codex R6. After the snapshot (which holds only the program), the
+        program exits, so its child C is adopted by the wrapper: a direct
+        child that is not in the snapshot. C forks a grandchild G and exits.
+        Only the wrapper's "no child left" check can know G is there."""
+        from forge.executor import programs
+
+        mine, other, pause = tmp_path / "mine", tmp_path / "other", tmp_path / "pause"
+        for folder in (mine, other, pause):
+            folder.mkdir()
+        c_script = mine / "c.sh"
+        c_script.write_text(
+            "#!/bin/sh\ntrap '' TERM\n"
+            f"while [ ! -e {mine}/c-go ]; do sleep 0.02; done\n"
+            "sleep 300 >/dev/null 2>&1 </dev/null &\n"
+            f"echo $! > {mine}/g.tmp && mv {mine}/g.tmp {mine}/g.pid\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        c_script.chmod(0o755)
+        program = [
+            "sh",
+            "-c",
+            "trap '' TERM\n"
+            f"echo $$ > {mine}/p.tmp && mv {mine}/p.tmp {mine}/p.pid\n"
+            f"{c_script} &\n"
+            f"echo $! > {mine}/c.tmp && mv {mine}/c.tmp {mine}/c.pid\n"
+            f"while [ ! -e {mine}/p-exit ]; do sleep 0.02; done\n"
+            "exit 0\n",
+        ]
+        other_run = programs.StoppableRun()
+        other_thread, _ = _run_with_env(other_run, _forker(other), dict(os.environ))
+        other_pids = [_read_pid(other / "program.pid"), _read_pid(other / "first.pid")]
+        run = programs.StoppableRun()
+        thread, result = _run_with_env(run, program, _paused_env(pause))
+        p_pid, c_pid = _read_pid(mine / "p.pid"), _read_pid(mine / "c.pid")
+        started = [p_pid, c_pid]
+        try:
+            wrapper = run._process.pid
+            self._stop_in_background(run)
+            _wait_for((pause / "snapshot").exists, "the drain's first snapshot")
+            snapshot = [int(x) for x in (pause / "snapshot").read_text().split()]
+            assert c_pid not in snapshot
+
+            (mine / "p-exit").write_text("", encoding="utf-8")
+            _wait_for(lambda: _parent_pid(c_pid) == wrapper, "C to be adopted by the wrapper")
+            (mine / "c-go").write_text("", encoding="utf-8")
+            g_pid = _read_pid(mine / "g.pid")
+            started.append(g_pid)
+            _wait_for(lambda: not _alive(c_pid), "C to exit")
+            assert _alive(g_pid)
+            (pause / "resume").write_text("", encoding="utf-8")
+            thread.join(PROMPT_SECONDS)
+
+            assert _gone(g_pid), "the grandchild of an adopted child escaped the drain"
+            assert not thread.is_alive()
+            assert result["outcome"].exit_code is not None
+            assert all(_alive(pid) for pid in other_pids) and other_thread.is_alive()
+        finally:
+            (pause / "resume").write_text("", encoding="utf-8")
+            other_run.request_stop(grace=0.3)
+            other_thread.join(PROMPT_SECONDS)
             for pid in [*started, *other_pids]:
                 if _alive(pid):
                     os.kill(pid, 9)
