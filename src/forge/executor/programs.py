@@ -267,16 +267,22 @@ def _syscall(*args: int | None) -> int:
 
 
 def _pidfd_open(pid: int) -> int:
-    if hasattr(os, "pidfd_open"):
-        return os.pidfd_open(pid)
-    return _syscall(_SYS_PIDFD_OPEN, pid, 0)
+    # (Attribute access, never the module object handed on: the launch check
+    # in the test suite reads every reference to ``os``.)
+    try:
+        opener = os.pidfd_open
+    except AttributeError:
+        return _syscall(_SYS_PIDFD_OPEN, pid, 0)
+    return opener(pid)
 
 
 def _pidfd_send_signal(fd: int, sig: int) -> None:
-    if hasattr(signal, "pidfd_send_signal"):
-        signal.pidfd_send_signal(fd, sig)
+    try:
+        sender = signal.pidfd_send_signal
+    except AttributeError:
+        _syscall(_SYS_PIDFD_SEND_SIGNAL, fd, int(sig), None, 0)
         return
-    _syscall(_SYS_PIDFD_SEND_SIGNAL, fd, int(sig), None, 0)
+    sender(fd, sig)
 
 
 def _pidfd_exited(fd: int) -> bool:
