@@ -68,7 +68,13 @@ ENTRY = {
 RECEIPTS = f"/var/lib/forge-project-receipts/{LEAF}"
 #: And the memory name the project declares (GOOD_CONFIG: bench_one), granted
 #: to it in the coordinator's entry only (design section 2.4a).
-COORDINATOR_ENTRY = {**ENTRY, "receipts_root": RECEIPTS, "memory_projects": ["bench_one"]}
+#: And (19 October 2026) the sandbox's read-only git export, where the nightly
+#: security check reads the project's copy of GitHub: the coordinator's entry
+#: only, the same address the publisher's route fetches from.
+EXPORT = f"git://{SANDBOX_ADDRESS}:8928/{LEAF}"
+COORDINATOR_ENTRY = {
+    **ENTRY, "receipts_root": RECEIPTS, "git_export": EXPORT, "memory_projects": ["bench_one"],
+}
 
 
 @pytest.fixture
@@ -835,3 +841,77 @@ def test_the_shared_sandbox_names_no_preview_ports(estate):  # noqa: F811
     assert result.exit_code == 0, result.output
     coordinator = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-pending"])
     assert "preview_ports" not in coordinator["planning"]["sandboxes"][KEY]
+
+
+# ---------------------------------------------------------------------------
+# The sandbox's read-only git export (19 October 2026)
+
+
+def test_the_coordinator_entry_records_the_sandbox_s_export_and_the_sandbox_s_entry_does_not(
+    own, publisher_file
+):
+    from forge.config.models import SandboxEntry
+
+    result = _run_own("--publish", "--publisher-settings", str(publisher_file))
+    assert result.exit_code == 0, result.output
+    coordinator = yaml.safe_load(own.volume[f"forge.yaml.{LEAF}-pending"])["planning"]["sandboxes"]
+    assert coordinator[KEY]["git_export"] == EXPORT
+    assert SandboxEntry.model_validate(coordinator[KEY]).git_export == EXPORT
+    staged = json.loads((publisher_file.parent / f"settings.json.{LEAF}-pending").read_text())
+    assert staged["projects"][KEY]["source"] == EXPORT, "the same address the publisher reads"
+    sandbox = yaml.safe_load(own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"])
+    assert "git_export" not in sandbox["planning"]["sandboxes"][KEY]
+
+
+def test_the_export_is_recorded_without_publish_too_at_the_slot_s_own_port(own):
+    result = _run_own(slot="2")
+    assert result.exit_code == 0, result.output
+    entry = yaml.safe_load(own.volume[f"forge.yaml.{LEAF}-pending"])["planning"]["sandboxes"][KEY]
+    assert entry["git_export"] == f"git://{SANDBOX_ADDRESS}:8938/{LEAF}"
+
+
+def test_a_sandbox_registered_before_its_export_is_given_it_and_nothing_else(own):
+    """notes-private-fixture's case: registered before 19 October."""
+    assert _run_own().exit_code == 0
+    staged = own.volume[f"forge.yaml.{LEAF}-pending"]
+    before = "\n".join(line for line in staged.split("\n") if "git_export" not in line)
+    own.volume["forge.yaml"] = before
+    own.sandbox_files[OWN_SETTINGS] = own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"]
+    sandbox_before = own.sandbox_files[OWN_SETTINGS]
+    again = _run_own()
+    assert again.exit_code == 0, again.output
+    after = yaml.safe_load(own.volume[f"forge.yaml.{LEAF}-pending"])
+    assert after["planning"]["sandboxes"][KEY] == COORDINATOR_ENTRY
+    assert again.output.count(f"sandboxes {KEY} git_export {EXPORT}") == 1, "the coordinator's file only"
+    assert f"{OWN_SETTINGS}.{LEAF}-pending" not in own.sandbox_files or (
+        own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"] == sandbox_before
+    )
+    # Nothing else in the coordinator's file changed.
+    assert after == {
+        **yaml.safe_load(before),
+        "planning": {
+            **yaml.safe_load(before)["planning"],
+            "sandboxes": {**yaml.safe_load(before)["planning"]["sandboxes"], KEY: COORDINATOR_ENTRY},
+        },
+    }
+
+
+def test_a_sandbox_with_another_export_is_refused(own):
+    assert _run_own().exit_code == 0
+    staged = own.volume[f"forge.yaml.{LEAF}-pending"]
+    own.volume["forge.yaml"] = staged.replace(EXPORT, f"git://{SANDBOX_ADDRESS}:8928/elsewhere")
+    own.sandbox_files[OWN_SETTINGS] = own.sandbox_files[f"{OWN_SETTINGS}.{LEAF}-pending"]
+    own.writes.clear()
+    again = _run_own()
+    assert again.exit_code == 1
+    assert "already has an entry" in again.output
+    assert own.writes == []
+
+
+def test_the_shared_sandbox_records_no_export(estate):  # noqa: F811
+    from tests.forge.cli.test_register_repo import _run
+
+    result = _run()
+    assert result.exit_code == 0, result.output
+    coordinator = yaml.safe_load(estate.volume[f"forge.yaml.{LEAF}-pending"])
+    assert "git_export" not in coordinator["planning"]["sandboxes"][KEY]

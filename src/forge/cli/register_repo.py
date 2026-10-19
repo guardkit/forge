@@ -138,6 +138,7 @@ from forge.config.sandbox_slots import LEGACY_SANDBOX, MAX_SLOT, SlotPorts, slot
 from forge.network_git import (
     NetworkRefused,
     git_door_address,
+    git_export_problem,
     proxy_environment,
     sandbox_git_command,
     sandbox_network_git,
@@ -234,10 +235,11 @@ def shared_sandbox_reference(sandboxes: Mapping[str, Any], key: str) -> tuple[st
 
 #: The lines of a sandbox of its own's entries that a later release
 #: added, in the order they are written: the memory grant (18 October 2026,
-#: design section 2.4a) and the sandbox's preview ports (18 October 2026). A
-#: project registered before them is given them by running again, and nothing
-#: else in its entry changes.
-ADDED_LATER_ENTRY_KEYS: tuple[str, ...] = ("preview_ports", "memory_projects")
+#: design section 2.4a), the sandbox's preview ports (18 October 2026) and
+#: the sandbox's read-only git export, in the coordinator's entry (19 October
+#: 2026, for the nightly security check). A project registered before them is
+#: given them by running again, and nothing else in its entry changes.
+ADDED_LATER_ENTRY_KEYS: tuple[str, ...] = ("preview_ports", "memory_projects", "git_export")
 
 #: The publisher fetches a project's clone from sbx's git daemon, which serves
 #: anything inside the api_test clone (its base path is the clone's parent
@@ -1399,10 +1401,11 @@ def plan_settings_edit(
                     lines, ("planning", "sandboxes", _scalar(key)), name,
                     _entry_value(entry[name]),
                 )
-                steps.append(Step(
-                    which, "add",
-                    f"sandboxes {key} {name} {', '.join(str(v) for v in entry[name])}",
-                ))
+                value = entry[name]
+                shown_value = (
+                    ", ".join(str(v) for v in value) if isinstance(value, (list, tuple)) else str(value)
+                )
+                steps.append(Step(which, "add", f"sandboxes {key} {name} {shown_value}"))
             expected["planning"]["sandboxes"][key] = dict(entry)
             changed = True
         elif current_entry is not None:
@@ -1493,9 +1496,10 @@ def _one_project_per_sandbox(
         # Compared by port, not by spelling: every sandbox is published on
         # the same machine, so one port is one sandbox's whatever the address
         # is written as (an address written as a ${NAME} has no port to read).
-        theirs = {_port_of(current.get(f)) for f in ("sidecar_url", "runner_url", "git_door")} - {None}
+        port_fields = ("sidecar_url", "runner_url", "git_door", "git_export")
+        theirs = {_port_of(current.get(f)) for f in port_fields} - {None}
         theirs |= set(_ports_of(current.get("preview_ports")))
-        for field_name in ("sidecar_url", "runner_url", "git_door"):
+        for field_name in port_fields:
             port = _port_of(entry.get(field_name))
             if port is not None and port in theirs:
                 raise Refused(
@@ -2795,6 +2799,7 @@ def resolve_options(
         publish_source = f"git://{gateway}:{port}/{clone_folder}/{PROJECTS_FOLDER}/{leaf}"
 
     sandbox_entry: dict[str, Any] | None = None
+    git_export: str | None = None
     if ports is not None:
         address = (sandbox_address or _env_value(estate_values, ESTATE_ENV_SANDBOX_ADDRESS) or gateway).strip()
         if not _a_plain_address(address):
@@ -2803,10 +2808,22 @@ def resolve_options(
                 f"the sandbox publish address {address!r} is not a plain host name or address: "
                 f"pass --sandbox-address, or --estate-env-file (its {ESTATE_ENV_SANDBOX_ADDRESS} names it)",
             )
+        # The sandbox's own git daemon serves its workspace clone's parent
+        # folder, published with the helper and runner at its slot's port. The
+        # publisher's route fetches from it, and (19 October 2026) the
+        # coordinator's entry records it as git_export, where the nightly
+        # security check reads the project's copy of GitHub.
+        git_export = f"git://{address}:{ports.git_daemon}/{clone_folder}"
+        export_problem = git_export_problem(git_export)
+        if export_problem:
+            raise Refused(
+                "sandbox",
+                f"the sandbox's git export address git://{address}:{ports.git_daemon}/<the "
+                f"workspace clone's folder> will not do: {export_problem}; name the workspace "
+                "clone's folder with letters, digits, '.', '_' or '-'",
+            )
         if publish:
-            # The sandbox's own git daemon serves its workspace clone's parent
-            # folder, published with the helper and runner at its slot's port.
-            publish_source = f"git://{address}:{ports.git_daemon}/{clone_folder}"
+            publish_source = git_export
         sandbox_entry = {
             "name": sandbox,
             "sidecar_url": f"http://{address}:{ports.helper}",
@@ -2840,7 +2857,12 @@ def resolve_options(
         sandbox_entry=sandbox_entry,
         sandbox_ssh=sandbox_ssh,
         coordinator_entry=(
-            {**sandbox_entry, "receipts_root": str(receipts_root).rstrip("/")}
+            {
+                **sandbox_entry,
+                "receipts_root": str(receipts_root).rstrip("/"),
+                # The coordinator's entry only: the sandbox never reads it.
+                "git_export": git_export,
+            }
             if sandbox_entry is not None
             else None
         ),
