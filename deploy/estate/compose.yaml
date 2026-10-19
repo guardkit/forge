@@ -1820,7 +1820,7 @@ secrets:
   bus-jarvis-password:
     environment: JARVIS_NATS_PASSWORD
   # The factory dashboard's answer account (19 October 2026): it may publish
-  # only answers to Forge's cards. The bus is given it here like the other
+  # only answers to Forge's cards and may subscribe to nothing. The bus is given it here like the other
   # eight. The dashboard is not in this estate and never reads this secret: it
   # keeps its own copy as a file in its own config folder (README.md, "The
   # dashboard's answer password").

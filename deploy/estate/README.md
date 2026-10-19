@@ -186,8 +186,9 @@ environment of the `docker compose` command as a child process. From there:
 Since 19 October 2026 the factory dashboard can answer Forge's cards (design:
 factory-dashboard `docs/architecture/approvals-from-the-dashboard-2026-10-19.md`).
 It posts each answer as its own bus account, `dashboard_approve`, which may
-publish only on `agents.approval.forge.*.response` and subscribe only to its own
-reply inboxes. Its password is the ninth of the bus's account passwords, under
+publish only on `agents.approval.forge.*.response` and may subscribe to nothing
+(a plain publish and flush needs no subscription, and `_INBOX.>` would be every
+client's replies). Its password is the ninth of the bus's account passwords, under
 the name `DASHBOARD_APPROVE_NATS_PASSWORD` in the same encrypted file, and the
 bus is handed it as a file exactly like the other eight.
 
@@ -200,12 +201,14 @@ factory-dashboard repository), so it never reads the bus's secret. It keeps
   `accounts.yaml` and `session_secret`. The board already mounts that folder
   read-only at `/config`, so inside the board the file is
   `/config/dashboard_approve_nats_password`, and the dashboard's own setting
-  names that path. Mode `0600`, owned by the account the dashboard runs as.
+  names that path. Mode `0600`, owned by the account the dashboard runs as:
+  the step below writes a fresh `mktemp` file (always `0600`) and renames it
+  over the old copy, so a stale `0644` file cannot keep its mode.
 - **How it is written:** from the encrypted file, by a shell builtin inside
   `sops exec-env`, so the value is never on a command line and never printed:
 
   ```bash
-  sops exec-env "$NATS_SECRETS_FILE" 'umask 077; d="${FACTORY_DASH_CONFIG_DIR:-$HOME/.config/factory-dashboard}"; printf %s "$DASHBOARD_APPROVE_NATS_PASSWORD" > "$d/dashboard_approve_nats_password.new" && mv "$d/dashboard_approve_nats_password.new" "$d/dashboard_approve_nats_password"'
+  sops exec-env "$NATS_SECRETS_FILE" 'umask 077; d="${FACTORY_DASH_CONFIG_DIR:-$HOME/.config/factory-dashboard}"; t=$(mktemp "$d/.dashboard_approve_nats_password.XXXXXX") && printf %s "$DASHBOARD_APPROVE_NATS_PASSWORD" > "$t" && mv -f "$t" "$d/dashboard_approve_nats_password"'
   ```
 
 - **When it changes:** the bus repository's `scripts/rotate-nats-password.sh
@@ -214,6 +217,21 @@ factory-dashboard repository), so it never reads the bus's secret. It keeps
   the dashboard reads the file at each send.
 - **Nothing in this estate needs the file.** Without it only the dashboard's
   answers stop; the bus and every other service carry on.
+
+**Release order when the bus gains a password** (as it did here):
+
+1. **Add the new key to the encrypted file first** (`DASHBOARD_APPROVE_NATS_PASSWORD`
+   in `$NATS_SECRETS_FILE`, and in the bus repository's own broker file if that
+   broker is the one running). An extra variable is harmless to the old image.
+2. **Then move the bus pin and rebuild, and recreate the bus, as one step**: in
+   local-bus mode, `BUS_REPOSITORY_COMMIT` in `estate-pins.conf`, then
+   `./build-estate-images.sh` (the image and the `bus-source` volume come from
+   the same pin), then the start command, in an idle window. For a bus run from
+   the bus repository's own checkout: pull, `up -d --build --force-recreate nats`.
+3. **Never `git pull` on its own** in a bus checkout. That compose file mounts
+   `./config/accounts` from the checkout while the entrypoint's password list is
+   built into the image, so an old image with the new template refuses to start
+   at its next restart or reboot.
 
 ## Memory — what the factory remembers
 
