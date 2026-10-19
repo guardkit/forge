@@ -31,6 +31,7 @@ import asyncio
 import contextlib
 import logging
 import os
+import select
 import signal
 import subprocess
 import threading
@@ -201,8 +202,9 @@ def _stop(process: "subprocess.Popen[bytes]", *, group: bool, grace: float) -> N
 # * EVERYTHING IT STARTED, NOT ONLY ITS GROUP. GuardKit starts the project's
 #   own test commands in sessions of their own, so a signal to the leg's group
 #   never reaches them. Before the first signal, while the leader is alive or
-#   unreaped, every descendant of the leader is found in ``/proc`` and each
-#   distinct process group among them is stopped (never this process's own).
+#   unreaped, every descendant of the leader is found in ``/proc`` and held by
+#   a pidfd, and is signalled through it (see "the descendants are held by
+#   pidfd" below).
 # * A STOP ASKED FOR BEFORE THE START means the program is never started; one
 #   that lands between the check and the start stops it at once.
 
@@ -227,31 +229,162 @@ def _process_table() -> dict[int, tuple[int, int, str]] | None:
     return table
 
 
-def _groups_to_stop(leader: int) -> set[int]:
-    """The leader's group and the group of every one of its descendants."""
-    groups: set[int] = set()
+# THE DESCENDANTS ARE HELD BY PIDFD, NEVER BY NUMBER (Codex round 2, 19
+# October 2026). A saved process or group id can be reused by an unrelated
+# process; a pidfd always refers to the one process it was opened for. The
+# leader is the exception: it is unreaped for the whole stop, so its id and
+# its group's id are still its own, and its group is signalled by number.
+#
+# A child is taken as ours only if, after its pidfd is open, its parent is
+# still the parent it was found under, and that parent is itself still
+# pinned (the unreaped leader, or a process whose pidfd shows it has not
+# exited). A pid read from /proc that has meanwhile become someone else's
+# fails that check and is never signalled.
+
+#: The two Linux system calls, by their numbers, which are the same on every
+#: architecture the factory runs on. Used only when this Python lacks
+#: ``os.pidfd_open`` / ``signal.pidfd_send_signal`` (uv's standalone 3.14
+#: build for aarch64 has neither).
+_SYS_PIDFD_SEND_SIGNAL = 424
+_SYS_PIDFD_OPEN = 434
+_libc: Any = None
+
+
+def _syscall(*args: int | None) -> int:
+    global _libc
+    import ctypes
+
+    if _libc is None:
+        _libc = ctypes.CDLL(None, use_errno=True)
+        _libc.syscall.restype = ctypes.c_long
+    result = _libc.syscall(
+        *(ctypes.c_long(a) if a is not None else None for a in args)
+    )
+    if result < 0:
+        number = ctypes.get_errno()
+        raise OSError(number, os.strerror(number))
+    return int(result)
+
+
+def _pidfd_open(pid: int) -> int:
+    if hasattr(os, "pidfd_open"):
+        return os.pidfd_open(pid)
+    return _syscall(_SYS_PIDFD_OPEN, pid, 0)
+
+
+def _pidfd_send_signal(fd: int, sig: int) -> None:
+    if hasattr(signal, "pidfd_send_signal"):
+        signal.pidfd_send_signal(fd, sig)
+        return
+    _syscall(_SYS_PIDFD_SEND_SIGNAL, fd, int(sig), None, 0)
+
+
+def _pidfd_exited(fd: int) -> bool:
+    """Has the process this pidfd refers to ended? (Readable once it has.)"""
+    poller = select.poll()
+    poller.register(fd, select.POLLIN)
+    return bool(poller.poll(0))
+
+
+def _parent_of(pid: int) -> int | None:
     try:
-        groups.add(os.getpgid(leader))
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            raw = handle.read().decode("utf-8", errors="replace")
+        return int(raw.rsplit(")", 1)[1].split()[1])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
+def _children_of(pid: int) -> list[int]:
+    """The ids /proc gives as ``pid``'s children (each still to be checked).
+
+    ``/proc/<pid>/task/*/children`` where the kernel has it; otherwise every
+    process whose parent id is ``pid``.
+    """
+    try:
+        tasks = os.listdir(f"/proc/{pid}/task")
     except OSError:
-        pass
-    table = _process_table()
-    if table is not None:
-        children: dict[int, list[int]] = {}
-        for pid, (ppid, _pgid, _state) in table.items():
-            children.setdefault(ppid, []).append(pid)
+        return []
+    found: list[int] = []
+    try:
+        for task in tasks:
+            with open(f"/proc/{pid}/task/{task}/children", "rb") as handle:
+                found.extend(int(part) for part in handle.read().split())
+        return found
+    except FileNotFoundError:
+        pass  # this kernel has no children files
+    except (OSError, ValueError):
+        return found
+    table = _process_table() or {}
+    return [child for child, (ppid, _pgid, _state) in table.items() if ppid == pid]
+
+
+class _Descendants:
+    """Pidfds for the leader's descendants, each checked to be ours."""
+
+    def __init__(self, leader: int) -> None:
+        self.leader = leader
+        self.fds: dict[int, int] = {}
+
+    def collect(self) -> None:
+        """Walk from the leader and from every held process still running,
+        and hold a pidfd for each new descendant that checks out."""
+        todo: list[tuple[int, int | None]] = [(self.leader, None)]
+        todo += [(pid, fd) for pid, fd in self.fds.items() if not _pidfd_exited(fd)]
         seen: set[int] = set()
-        todo = [leader]
         while todo:
-            pid = todo.pop()
-            if pid in seen:
+            parent, parent_fd = todo.pop()
+            if parent in seen:
                 continue
-            seen.add(pid)
-            if pid in table:
-                groups.add(table[pid][1])
-            todo.extend(children.get(pid, ()))
-    groups.discard(0)
-    groups.discard(os.getpgrp())
-    return groups
+            seen.add(parent)
+            for child in _children_of(parent):
+                if child == self.leader or child == os.getpid():
+                    continue
+                held = self.fds.get(child)
+                if held is not None and not _pidfd_exited(held):
+                    todo.append((child, held))
+                    continue
+                fd = self._open_if_ours(child, parent, parent_fd)
+                if fd is None:
+                    continue
+                if held is not None:
+                    os.close(held)
+                self.fds[child] = fd
+                todo.append((child, fd))
+
+    @staticmethod
+    def _open_if_ours(child: int, parent: int, parent_fd: int | None) -> int | None:
+        try:
+            fd = _pidfd_open(child)
+        except OSError:
+            return None  # it ended already
+        ours = (
+            _parent_of(child) == parent
+            and (parent_fd is None or not _pidfd_exited(parent_fd))
+            and not _pidfd_exited(fd)
+        )
+        if not ours:
+            os.close(fd)
+            return None
+        return fd
+
+    def running(self) -> list[int]:
+        return [fd for fd in self.fds.values() if not _pidfd_exited(fd)]
+
+    def signal(self, sig: int) -> None:
+        for fd in self.running():
+            try:
+                _pidfd_send_signal(fd, sig)
+            except OSError:
+                continue
+
+    def close(self) -> None:
+        for fd in self.fds.values():
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        self.fds.clear()
 
 
 def _groups_still_running(groups: set[int]) -> set[int]:
@@ -330,36 +463,62 @@ class StoppableRun:
             self._stop_now()
 
     def _stop_now(self) -> bool:
-        """The stop itself, under the lock from the first signal to the last."""
+        """The stop itself, under the lock from the first signal to the last.
+
+        The leader's own group by number (the leader is unreaped throughout);
+        every descendant by pidfd: TERM, then after the grace a second walk
+        from those still running, and KILL to every one still running.
+        """
         with self._lock:
             process = self._process
             if process is None or self._finished or self._stopped:
                 return False
             self._stopped = True
-            groups = _groups_to_stop(process.pid)
-            logger.warning(
-                "stopping pid %s and everything it started: process groups %s",
-                process.pid,
-                sorted(groups),
-            )
-            for group in groups:
-                try:
-                    os.killpg(group, signal.SIGTERM)
-                except OSError:
-                    continue
-            deadline = time.monotonic() + max(0.0, self._grace)
-            remaining = _groups_still_running(groups)
-            while remaining and time.monotonic() < deadline:
-                time.sleep(0.05)
-                remaining = _groups_still_running(groups)
-            # The KILL is sent under the same lock, so the run cannot have
-            # been marked finished, and its leader cannot have been reaped.
-            for group in remaining:
-                try:
-                    os.killpg(group, signal.SIGKILL)
-                except OSError:
-                    continue
-            return bool(groups)
+            try:
+                leader_group: int | None = os.getpgid(process.pid)
+            except OSError:
+                leader_group = None
+            if leader_group in (0, os.getpgrp()):
+                leader_group = None
+            descendants = _Descendants(process.pid)
+            try:
+                descendants.collect()
+                logger.warning(
+                    "stopping pid %s, its process group %s and %d processes "
+                    "it started",
+                    process.pid,
+                    leader_group,
+                    len(descendants.fds),
+                )
+                if leader_group is not None:
+                    try:
+                        os.killpg(leader_group, signal.SIGTERM)
+                    except OSError:
+                        pass
+                descendants.signal(signal.SIGTERM)
+                deadline = time.monotonic() + max(0.0, self._grace)
+
+                def still_running() -> bool:
+                    return bool(
+                        (leader_group is not None and _groups_still_running({leader_group}))
+                        or descendants.running()
+                    )
+
+                while still_running() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                # The KILL is sent under the same lock: the leader cannot have
+                # been reaped, and every descendant is reached by its pidfd,
+                # including any started during the grace.
+                descendants.collect()
+                if leader_group is not None and _groups_still_running({leader_group}):
+                    try:
+                        os.killpg(leader_group, signal.SIGKILL)
+                    except OSError:
+                        pass
+                descendants.signal(signal.SIGKILL)
+            finally:
+                descendants.close()
+            return True
 
     def _mark_finished(self) -> None:
         if self._before_finish_mark is not None:

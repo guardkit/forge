@@ -677,3 +677,112 @@ class TestTheCoordinatorsSideEndToEnd:
         )
         asyncio.run(cancel(BUILD_ID))
         assert asked == []
+
+
+# ---------------------------------------------------------------------------
+# Codex round 2: descendants are held by pidfd; admission is one step
+# ---------------------------------------------------------------------------
+
+
+def _run_in_thread(run: Any, argv: list[str]) -> tuple[threading.Thread, dict[str, Any]]:
+    from forge.executor import programs
+
+    result: dict[str, Any] = {}
+
+    def go() -> None:
+        with programs.stoppable(run):
+            result["outcome"] = programs.run_program(
+                argv, cwd=None, env=None, timeout=PROMPT_SECONDS * 6
+            )
+
+    thread = threading.Thread(target=go, daemon=True)
+    thread.start()
+    return thread, result
+
+
+def _read_pid(path: Path) -> int:
+    _wait_for(path.exists, f"{path.name} to be written")
+    return int(path.read_text().split()[0])
+
+
+class TestDescendantsAreHeldByPidfd:
+    def test_a_pid_the_walk_gives_that_is_not_ours_is_never_signalled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A descendant's id reused by an unrelated process: the walk is made
+        to report that process as the leader's child; it is never signalled."""
+        from forge.executor import programs
+
+        started = tmp_path / "leader.pid"
+        unrelated = subprocess.Popen(  # noqa: S603 — ours, not started under the leg
+            ["sleep", "300"], start_new_session=True
+        )
+        try:
+            run = programs.StoppableRun()
+            real_children = programs._children_of
+            leader_pid: dict[str, int] = {}
+
+            def children_with_a_stranger(pid: int) -> list[int]:
+                found = real_children(pid)
+                if pid == leader_pid.get("pid"):
+                    found = [*found, unrelated.pid]
+                return found
+
+            monkeypatch.setattr(programs, "_children_of", children_with_a_stranger)
+            thread, result = _run_in_thread(
+                run, ["sh", "-c", f"echo $$ > {started}; sleep 300 & wait"]
+            )
+            leader_pid["pid"] = _read_pid(started)
+
+            assert run.request_stop(grace=1.0) is True
+            thread.join(PROMPT_SECONDS)
+
+            assert result["outcome"].exit_code is not None
+            time.sleep(0.2)
+            assert unrelated.poll() is None, "an unrelated process was signalled"
+        finally:
+            unrelated.kill()
+            unrelated.wait()
+
+    def test_the_kill_reaches_a_descendant_started_during_the_grace(
+        self, tmp_path: Path
+    ) -> None:
+        """A descendant in a session of its own answers TERM by starting a new
+        child; the second walk after the grace finds that child and kills it."""
+        from forge.executor import programs
+
+        d_pid, n_pid = tmp_path / "d.pid", tmp_path / "n.pid"
+        descendant = tmp_path / "descendant.sh"
+        descendant.write_text(
+            "#!/bin/sh\n"
+            f"trap 'sleep 300 >/dev/null 2>&1 </dev/null & echo $! > {n_pid}.tmp; "
+            f"mv {n_pid}.tmp {n_pid}' TERM\n"
+            "while :; do sleep 0.05; done\n",
+            encoding="utf-8",
+        )
+        descendant.chmod(0o755)
+        run = programs.StoppableRun()
+        thread, result = _run_in_thread(
+            run,
+            [
+                "sh",
+                "-c",
+                f"setsid {descendant} >/dev/null 2>&1 </dev/null & "
+                f"echo $! > {d_pid}; wait",
+            ],
+        )
+        d = _read_pid(d_pid)
+        _wait_for(lambda: _alive(d) and os.getpgid(d) == d, "the descendant's own session")
+        try:
+            assert run.request_stop(grace=1.5) is True
+            thread.join(PROMPT_SECONDS)
+            n = _read_pid(n_pid)  # started on the TERM, during the grace
+            assert _gone(d), "the descendant survived the KILL"
+            assert _gone(n), "the child started during the grace survived"
+        finally:
+            for path in (d_pid, n_pid):
+                if path.exists():
+                    pid = int(path.read_text().split()[0])
+                    if _alive(pid):
+                        os.kill(pid, 9)
+
