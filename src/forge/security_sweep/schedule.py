@@ -186,8 +186,11 @@ def compose_sweep(
     db_path: Path,
     publish: Callable[[str], Awaitable[None]],
     connection: sqlite3.Connection | None = None,
+    sandbox_post: Any = None,
 ) -> tuple[SweepDeps, Callable[[], bool]]:
     """``(deps, is_idle)`` for the coordinator's own settings and database.
+
+    ``sandbox_post`` replaces the sandbox helper's HTTP call (tests only).
 
     The projects are ``planning.fetch_addresses``; the approver is
     ``approval.expected_approver``; the folder is ``security-sweep`` beside
@@ -198,7 +201,6 @@ def compose_sweep(
     from forge.adapters.sqlite import connect_writer
     from forge.planning.work_queue_store import WorkQueueStore
 
-    from .repository import fetch_mirror
     from .scanners import ScannerSetup
     from .sorting import default_asker
     from .state import sweep_folder
@@ -224,10 +226,10 @@ def compose_sweep(
         is_idle=is_idle,
         asker=asker,
         asker_missing=why_not or "the model is not configured",
-        # The coordinator's declared Git door, threaded to every fetch exactly
-        # as its other fetches take it (Codex implementation review 4, F6):
-        # each project's own sandbox's door (one sandbox per project).
-        fetch=_fetch_through_each_project_s_door(forge_config, fetch_mirror),
+        # A public project from GitHub; a private one through its own
+        # sandbox (19 October 2026). The coordinator never fetches through a
+        # Git door: the door answers only the project's own sandbox.
+        fetch=_fetch_for_each_project(forge_config, sandbox_post=sandbox_post),
         merge_executor_enabled=bool(
             getattr(getattr(forge_config, "merge_executor", None), "enabled", False)
         ),
@@ -235,19 +237,51 @@ def compose_sweep(
     return deps, is_idle
 
 
-def _fetch_through_each_project_s_door(forge_config: Any, fetch_mirror: Any) -> Any:
-    """``fetch(address, folder)`` given the Git door of the project whose
-    recorded address it is (one sandbox per project, 17 October 2026)."""
-    from forge.config.sandboxes import git_door_for
+def _fetch_for_each_project(
+    forge_config: Any,
+    *,
+    sandbox_post: Any = None,
+    fetch_public: Any = None,
+    fetch_private: Any = None,
+) -> Any:
+    """``fetch(address, folder)`` for the project whose recorded address it is.
 
-    doors = {
-        str(address): git_door_for(forge_config, repo)
+    A project whose recorded address goes through its sandbox's Git door is
+    private: it is fetched through that sandbox (the helper updates the
+    sandbox's copy of GitHub, then the sandbox's read-only export is read,
+    :func:`~.repository.fetch_through_sandbox`), with the export address the
+    coordinator's sandbox entry records (``git_export``). Every other
+    project is fetched from its https address exactly as before
+    (:func:`~.repository.fetch_mirror`). The door address itself is never
+    fetched from here.
+    """
+    from forge.config.sandboxes import git_door_for, sandbox_for
+    from forge.network_git import transport_of
+
+    from .repository import fetch_mirror, fetch_through_sandbox
+
+    public = fetch_public or fetch_mirror
+    private = fetch_private or fetch_through_sandbox
+    repos = {
+        str(address).strip(): repo
         for repo, address in dict(forge_config.planning.fetch_addresses).items()
     }
-    default = getattr(forge_config.planning, "git_door", None)
 
     def fetch(address: str, folder: Path) -> Any:
-        return fetch_mirror(address, folder, git_door=doors.get(str(address), default))
+        repo = repos.get(str(address).strip())
+        door = git_door_for(forge_config, repo) if repo else None
+        if repo and door is not None and transport_of(str(address)) == "http":
+            entry = sandbox_for(forge_config, repo)
+            return private(
+                repo,
+                str(address).strip(),
+                folder,
+                sidecar_url=getattr(entry, "sidecar_url", None),
+                git_door=door,
+                git_export=getattr(entry, "git_export", None),
+                post=sandbox_post,
+            )
+        return public(address, folder)
 
     return fetch
 

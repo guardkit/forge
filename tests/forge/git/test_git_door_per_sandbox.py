@@ -134,19 +134,36 @@ def test_the_shared_question_answers_the_same_for_any_configuration_shape():
     assert git_door_for(single, "example/anything") == DOOR_A
 
 
-def test_the_sweep_fetches_each_project_through_its_own_door():
-    from forge.security_sweep.schedule import _fetch_through_each_project_s_door
+def test_the_sweep_sends_each_private_project_to_its_own_sandbox_never_the_door():
+    """19 October 2026: the coordinator cannot reach a door, so a project read
+    through one is fetched through its own sandbox (its helper, its door named
+    to that helper, its git_export); a public project is fetched as before."""
+    from forge.security_sweep.schedule import _fetch_for_each_project
 
-    asked: list[tuple[str, str | None]] = []
+    public: list[str] = []
+    private: list[tuple] = []
     config = SimpleNamespace(planning=_planning(
-        {A: f"{DOOR_A}{A}.git", SHARED: f"https://github.com/{SHARED}.git"}
+        {A: f"{DOOR_A}{A}.git", B: f"{DOOR_B}{B}.git", SHARED: f"https://github.com/{SHARED}.git"}
     ))
-    fetch = _fetch_through_each_project_s_door(
-        config, lambda address, folder, *, git_door=None: asked.append((address, git_door))
+    config.planning.sandboxes[A] = SandboxEntry(
+        **_entry("sbx-a", 1, DOOR_A), git_export="git://192.0.2.10:8928/project-a"
+    )
+    fetch = _fetch_for_each_project(
+        config,
+        sandbox_post="the-post",
+        fetch_public=lambda address, folder: public.append(address),
+        fetch_private=lambda repo, address, folder, **kw: private.append(
+            (repo, address, kw["sidecar_url"], kw["git_door"], kw["git_export"], kw["post"])
+        ),
     )
     fetch(f"{DOOR_A}{A}.git", "/tmp/x")
+    fetch(f"{DOOR_B}{B}.git", "/tmp/x")
     fetch(f"https://github.com/{SHARED}.git", "/tmp/x")
-    assert asked == [(f"{DOOR_A}{A}.git", DOOR_A), (f"https://github.com/{SHARED}.git", None)]
+    assert public == [f"https://github.com/{SHARED}.git"]
+    assert private == [
+        (A, f"{DOOR_A}{A}.git", "http://192.0.2.10:8935", DOOR_A, "git://192.0.2.10:8928/project-a", "the-post"),
+        (B, f"{DOOR_B}{B}.git", "http://192.0.2.10:8945", DOOR_B, None, "the-post"),
+    ]
 
 
 def test_the_planning_git_of_each_sandboxed_repository_gets_its_own_door():

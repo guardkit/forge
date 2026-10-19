@@ -3,10 +3,18 @@
 Public surface
 ==============
 
-- :func:`fetch_mirror` — the project's default branch, with its history,
-  fetched from the recorded address into the sweep's own bare copy
-  (:func:`forge.network_git.fetch_default_branch_copy`). The coordinator's
-  project clones are never touched.
+- :func:`fetch_mirror` — a public project's default branch, with its
+  history, fetched from its recorded https address into the sweep's own bare
+  copy (:func:`forge.network_git.fetch_default_branch_copy`). The
+  coordinator's project clones are never touched.
+- :func:`fetch_through_sandbox` — a private project's (19 October 2026):
+  its sandbox is asked to update its copy of GitHub, then that copy is
+  fetched from the sandbox's read-only export
+  (:func:`forge.network_git.fetch_sandbox_copy_branch`). The coordinator
+  never fetches through a Git door: the door answers only the sandbox.
+- The fixed plain reasons a project could not be fetched
+  (:data:`FETCH_REASONS`): the Slack line names one, never git's words or an
+  address.
 - :func:`export_committed_files` — the committed files of one commit, written
   out straight from the mirror's object store (Codex R12).
 
@@ -32,16 +40,19 @@ conversion apply to either command.
 - **Very large files** (over :data:`LARGEST_FILE_BYTES`) are left out and
   counted; the scanners skip files that size anyway.
 
-Every git command runs through :func:`forge.network_git.run_network_git`
-with no transport allowed, in the factory's own copy, as the rest of Forge's
-git does.
+Every git command runs through :func:`forge.network_git.run_network_git`,
+in the factory's own copy, as the rest of Forge's git does: the export's
+reads with no transport allowed, each fetch with its one transport (``https``
+from GitHub, ``git`` from a sandbox's export).
 """
 
 from __future__ import annotations
 
+import asyncio
 import os
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
+from typing import Any
 
 from forge import network_git
 
@@ -63,37 +74,136 @@ _MODE_SYMLINK = b"120000"
 _MODE_SUBMODULE = b"160000"
 
 
+#: Where a fetched copy came from, as the sweep's history line says it.
+SOURCE_GITHUB = "github"
+SOURCE_SANDBOX_COPY = "sandbox copy"
+
+#: The fixed plain reasons a project could not be fetched (design, 19
+#: October 2026). The Slack line names one; nothing else is ever said there.
+REASON_GITHUB = "GitHub could not be reached"
+REASON_SANDBOX_SILENT = "its sandbox did not answer"
+REASON_COPY_UNREADABLE = "its sandbox's copy could not be read"
+REASON_COPY_MISMATCH = "its sandbox's copy did not match GitHub"
+REASON_NO_EXPORT = "its sandbox's copy address is not in the settings"
+FETCH_REASONS: frozenset[str] = frozenset(
+    {REASON_GITHUB, REASON_SANDBOX_SILENT, REASON_COPY_UNREADABLE, REASON_COPY_MISMATCH, REASON_NO_EXPORT}
+)
+
+
 @dataclass(frozen=True)
 class Mirror:
-    """A fetched project: its mirror, default branch and commit, or why not."""
+    """A fetched project: its mirror, default branch and commit, or why not.
+
+    ``refusal`` is a sentence for the log; ``reason`` is one of
+    :data:`FETCH_REASONS`, for the Slack line. ``source`` says where a
+    fetched copy came from (:data:`SOURCE_GITHUB` or
+    :data:`SOURCE_SANDBOX_COPY`).
+    """
 
     path: Path | None = None
     branch: str | None = None
     commit: str | None = None
     refusal: str | None = None
+    reason: str | None = None
+    source: str | None = None
 
 
-def fetch_mirror(
-    address: str,
-    mirrors_root: Path,
-    *,
-    timeout: float = 600.0,
-    git_door: str | None = None,
-) -> Mirror:
-    """Fetch the default branch of ``address`` into the sweep's own mirror.
+def fetch_mirror(address: str, mirrors_root: Path, *, timeout: float = 600.0) -> Mirror:
+    """Fetch the default branch of the https ``address`` into the sweep's own mirror.
 
-    ``git_door`` is the coordinator's declared Git door (``planning.git_door``),
-    when there is one; without it only plain https addresses are fetched.
+    Only plain https addresses are fetched: an address through a Git door is
+    refused, because the door answers only the project's own sandbox (a
+    private project goes through :func:`fetch_through_sandbox`).
     """
-    point = network_git.fetch_default_branch_copy(
-        address, copies_root=mirrors_root, timeout=timeout, git_door=git_door
-    )
+    point = network_git.fetch_default_branch_copy(address, copies_root=mirrors_root, timeout=timeout)
     if point.refusal or not point.commit:
-        return Mirror(refusal=point.refusal or "the project could not be fetched")
+        return Mirror(
+            refusal=point.refusal or "the project could not be fetched", reason=REASON_GITHUB
+        )
     return Mirror(
         path=network_git.factory_copy_for(address, mirrors_root),
         branch=point.branch,
         commit=point.commit,
+        source=SOURCE_GITHUB,
+    )
+
+
+def fetch_through_sandbox(
+    repo: str,
+    address: str,
+    mirrors_root: Path,
+    *,
+    sidecar_url: str | None,
+    git_door: str | None,
+    git_export: str | None,
+    post: Any = None,
+    timeout: float = 600.0,
+) -> Mirror:
+    """Fetch a private project's default branch through its own sandbox.
+
+    1. The sandbox helper's existing ``/git/remote-start-point`` (the call
+       planning makes before every feature) updates the sandbox clone's copy
+       of GitHub through that sandbox's own door, and answers with the
+       default branch and its commit.
+    2. ``refs/remotes/origin/<branch>`` is fetched from the sandbox's
+       read-only export (``git_export``) into the sweep's own mirror.
+    3. The mirror must hold exactly the commit the sandbox reported.
+
+    ``address`` is the project's recorded fetch address (through the door),
+    sent to the sandbox, never fetched here. ``post`` replaces the helper's
+    HTTP call in tests. Runs its own event loop for the helper's call, so it
+    is called from a worker thread (the sweep runs every fetch in one).
+    """
+    if not git_export:
+        return Mirror(
+            refusal="No sandbox export address (git_export) is recorded for this project.",
+            reason=REASON_NO_EXPORT,
+        )
+    if not sidecar_url:
+        return Mirror(refusal="No sandbox helper is recorded for this project.", reason=REASON_SANDBOX_SILENT)
+    from forge.deploy.sidecar_git import SidecarCandidateGit
+
+    extra: dict[str, Any] = {} if post is None else {"post": post}
+    helper = SidecarCandidateGit(
+        str(sidecar_url), repo=str(repo), fetch_address=address, git_door=git_door, **extra
+    )
+    try:
+        start = asyncio.run(helper.fetch_remote_start_point())
+    except Exception as exc:  # noqa: BLE001 — never raises; said as a reason
+        return Mirror(
+            refusal=f"The sandbox helper could not be asked ({type(exc).__name__}).",
+            reason=REASON_SANDBOX_SILENT,
+        )
+    if not start.ok or not start.branch or not start.commit:
+        return Mirror(
+            refusal=start.refusal or "The sandbox did not say where the default branch is.",
+            reason=REASON_SANDBOX_SILENT,
+        )
+    point = network_git.fetch_sandbox_copy_branch(
+        git_export,
+        branch=start.branch,
+        expected_commit=start.commit,
+        copies_root=mirrors_root,
+        timeout=timeout,
+    )
+    if point.refusal or not point.commit:
+        return Mirror(
+            refusal=point.refusal or "the sandbox's copy could not be fetched",
+            reason=(
+                REASON_COPY_MISMATCH
+                if point.refusal == network_git.SANDBOX_COPY_MISMATCH
+                # The sandbox's answer named no branch that can be fetched:
+                # no usable answer.
+                else REASON_SANDBOX_SILENT
+                if point.refusal == network_git.SANDBOX_BRANCH_REFUSAL
+                else REASON_COPY_UNREADABLE
+            ),
+        )
+    return Mirror(
+        path=network_git.factory_copy_for(git_export, mirrors_root),
+        branch=point.branch,
+        commit=point.commit,
+        source=SOURCE_SANDBOX_COPY,
     )
 
 
@@ -222,6 +332,14 @@ def _write_batch(mirror: Path, batch: list[tuple[bytes, PurePosixPath, int]], ro
 
 __all__ = [
     "BATCH_BYTES",
+    "FETCH_REASONS",
+    "REASON_COPY_MISMATCH",
+    "REASON_COPY_UNREADABLE",
+    "REASON_GITHUB",
+    "REASON_NO_EXPORT",
+    "REASON_SANDBOX_SILENT",
+    "SOURCE_GITHUB",
+    "SOURCE_SANDBOX_COPY",
     "ExportFailed",
     "ExportReport",
     "LARGEST_FILE_BYTES",
@@ -229,4 +347,5 @@ __all__ = [
     "SCANNER_SETTINGS_FILES",
     "export_committed_files",
     "fetch_mirror",
+    "fetch_through_sandbox",
 ]

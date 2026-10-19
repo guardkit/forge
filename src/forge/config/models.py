@@ -988,6 +988,19 @@ class SandboxEntry(BaseModel):
             "door of its own."
         ),
     )
+    git_export: str | None = Field(
+        default=None,
+        description=(
+            "This sandbox's read-only git export of its project clone, as the "
+            "coordinator reaches it (19 October 2026): exactly "
+            "git://<address>:<port>/<folder>, the address the publisher's route "
+            "fetches from. The nightly security check reads the project's copy "
+            "of GitHub from it, because the Git door answers only the sandbox. "
+            "register-repo writes it in the coordinator's entry for a sandbox of "
+            "its own. Unset: a private project is not fetched by the check, and "
+            "its line says so. The shared sandbox never has one."
+        ),
+    )
     receipts_root: str | None = Field(
         default=None,
         description=(
@@ -1161,6 +1174,22 @@ class SandboxEntry(BaseModel):
         if problem:
             raise ValueError(
                 "a sandbox's git_door must be exactly http://<address>:<port>/: "
+                f"{problem} (the value is not repeated here)"
+            )
+        return value
+
+    @field_validator("git_export")
+    @classmethod
+    def _git_export_is_one_git_address(cls, value: str | None) -> str | None:
+        """Exactly git://<address>:<port>/<folder>[/...], or unset."""
+        if value is None:
+            return None
+        from forge.network_git import git_export_problem
+
+        problem = git_export_problem(value)
+        if problem:
+            raise ValueError(
+                "a sandbox's git_export must be exactly git://<address>:<port>/<folder>: "
                 f"{problem} (the value is not repeated here)"
             )
         return value
@@ -1573,6 +1602,14 @@ class PlanningConfig(BaseModel):
                     f"planning.sandboxes gives {key} in {LEGACY_SANDBOX} a git_door, and "
                     f"the shared sandbox {LEGACY_SANDBOX} never has one; register the "
                     "repository into a sandbox of its own"
+                )
+            if entry.git_export is not None and entry.name == LEGACY_SANDBOX:
+                # Its projects are public and fetched from GitHub (19 October
+                # 2026): the nightly check never reads the shared export.
+                raise ValueError(
+                    f"planning.sandboxes gives {key} in {LEGACY_SANDBOX} a git_export, and "
+                    f"the shared sandbox {LEGACY_SANDBOX} never has one: its projects are "
+                    "public and checked from GitHub"
                 )
             if entry.git_door is None:
                 continue

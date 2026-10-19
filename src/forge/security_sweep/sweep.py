@@ -15,7 +15,9 @@ A run, in the order the design gives (piece 3, steps 1 to 9)
 
 For each distinct fetch address, one project at a time:
 
-1. fetch the default branch into the sweep's own mirror;
+1. fetch the default branch into the sweep's own mirror (a public project
+   from GitHub; a private one from its sandbox's read-only export, after the
+   sandbox has updated its copy of GitHub, 19 October 2026);
 2. write out its committed files from the object store (Codex R12) and scan
    them, one scanner at a time: OSV-Scanner, Gitleaks over the tree,
    Gitleaks over the history (counted only), Opengrep;
@@ -36,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -62,6 +65,7 @@ from .findings import (
     shown,
 )
 from .repository import (
+    FETCH_REASONS,
     ExportFailed,
     ExportReport,
     Mirror,
@@ -161,6 +165,14 @@ class ProjectResult:
     project: str
     fetched: bool = False
     fetch_problem: bool = False
+    #: Why it could not be fetched: one of the fixed plain reasons
+    #: (``repository.FETCH_REASONS``), or None when none was given.
+    fetch_reason: str | None = None
+    #: What was scanned: the default branch, its commit, and where the copy
+    #: came from ("github" or "sandbox copy"), for the history line.
+    branch: str | None = None
+    commit: str | None = None
+    source: str | None = None
     #: The mirror was fetched but its files could not be written out.
     unreadable: bool = False
     not_checked: dict[str, str] = field(default_factory=dict)
@@ -223,6 +235,12 @@ class ProjectResult:
             "serious_eligible": self.serious_eligible,
             "pending": self.pending,
         }
+        for name in ("branch", "commit", "source"):
+            value = getattr(self, name)
+            if value:
+                out[name] = value
+        if self.fetch_problem and self.fetch_reason:
+            out["not_fetched_reason"] = self.fetch_reason
         for name in ("drafted_row", "waiting_for_row", "history_secret_matches"):
             value = getattr(self, name)
             if value is not None:
@@ -281,9 +299,21 @@ def _plural(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
 
 
+#: An address of any scheme (``git://``, ``http://``, ``https://``...) up to
+#: the next space, quote or bracket.
+_AN_ADDRESS = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"()<>]+")
+
+
+def without_addresses(text: str) -> str:
+    """``text`` with every address in it replaced by ``<address>``."""
+    return _AN_ADDRESS.sub("<address>", str(text))
+
+
 def _project_phrase(result: ProjectResult, name: str) -> str:
     if result.fetch_problem:
-        return f"{name} — could not be fetched, so it was not checked"
+        # One of the fixed plain reasons only: never git's words or an address.
+        why = f" ({result.fetch_reason})" if result.fetch_reason in FETCH_REASONS else ""
+        return f"{name} — could not be fetched{why}, so it was not checked"
     if result.unreadable:
         return f"{name} — its files could not be read from the fetched copy, so it was not checked"
     parts: list[str] = []
@@ -545,9 +575,22 @@ async def _sweep_project(
     mirror = await asyncio.to_thread(deps.fetch, address, deps.folder / MIRRORS_FOLDER)
     if mirror.refusal or mirror.path is None or not mirror.commit:
         result.fetch_problem = True
-        logger.warning("security sweep: %s could not be fetched", project)
+        reason = getattr(mirror, "reason", None)
+        result.fetch_reason = reason if reason in FETCH_REASONS else None
+        # The detailed sentence goes to the local log only, so a live failure
+        # can be diagnosed; any address in it is replaced. The Slack line and
+        # the history carry the fixed reason alone (coach review, 19 October).
+        logger.warning(
+            "security sweep: %s could not be fetched (%s): %s",
+            project,
+            result.fetch_reason or "no reason given",
+            without_addresses(getattr(mirror, "refusal", None) or "no detail"),
+        )
         return result
     result.fetched = True
+    result.branch = mirror.branch
+    result.commit = mirror.commit
+    result.source = getattr(mirror, "source", None)
     work = Path(tempfile.mkdtemp(prefix="project-", dir=str(deps.folder / WORK_FOLDER)))
     try:
         tree = work / "tree"
