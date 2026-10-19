@@ -935,3 +935,106 @@ class TestEverythingStaysUnderTheWrapper:
             )
         assert outcome.timed_out
         assert outcome.stdout == b"started\n"
+
+
+# ---------------------------------------------------------------------------
+# Codex round 4: the wrapper stays while anything the program left runs
+# ---------------------------------------------------------------------------
+
+
+def _program_leaving_a_child(child_pid: Path) -> list[str]:
+    """A direct program that exits at once, leaving a child holding stdout."""
+    return [
+        "sh",
+        "-c",
+        f"sleep 300 & echo $! > {child_pid}.tmp && mv {child_pid}.tmp {child_pid}; exit 0",
+    ]
+
+
+class TestTheWrapperStaysForWhatTheProgramLeft:
+    def _start(
+        self, tmp_path: Path, name: str, **kwargs: Any
+    ) -> tuple[Any, threading.Thread, dict[str, Any], int]:
+        from forge.executor import programs
+
+        child_pid = tmp_path / f"{name}.child.pid"
+        run = programs.StoppableRun()
+        result: dict[str, Any] = {}
+
+        def go() -> None:
+            with programs.stoppable(run):
+                result["outcome"] = programs.run_program(
+                    _program_leaving_a_child(child_pid), cwd=None, env=None, **kwargs
+                )
+
+        thread = threading.Thread(target=go, daemon=True)
+        thread.start()
+        return run, thread, result, _read_pid(child_pid)
+
+    @staticmethod
+    def _kill_if_alive(*pids: int) -> None:
+        for pid in pids:
+            if _alive(pid):
+                os.kill(pid, 9)
+
+    def test_a_cancel_stops_the_child_the_program_left_and_not_another_builds(
+        self, tmp_path: Path
+    ) -> None:
+        mine, mine_thread, mine_result, mine_child = self._start(
+            tmp_path, "mine", timeout=PROMPT_SECONDS * 6
+        )
+        other, other_thread, _other_result, other_child = self._start(
+            tmp_path, "other", timeout=PROMPT_SECONDS * 6
+        )
+        try:
+            time.sleep(0.3)
+            # The program has exited; its child holds stdout, so the leg runs on.
+            assert mine_thread.is_alive() and _alive(mine_child)
+
+            assert mine.request_stop(grace=1.0) is True
+            mine_thread.join(PROMPT_SECONDS)
+
+            assert not mine_thread.is_alive()
+            assert mine_result["outcome"].exit_code is not None
+            assert _gone(mine_child), "the child the program left escaped the cancel"
+            time.sleep(0.3)
+            assert _alive(other_child) and other_thread.is_alive()
+        finally:
+            other.request_stop(grace=1.0)
+            other_thread.join(PROMPT_SECONDS)
+            self._kill_if_alive(mine_child, other_child)
+
+    def test_the_time_limit_stops_the_child_the_program_left_and_not_another_builds(
+        self, tmp_path: Path
+    ) -> None:
+        other, other_thread, _other_result, other_child = self._start(
+            tmp_path, "other", timeout=PROMPT_SECONDS * 6
+        )
+        mine, mine_thread, mine_result, mine_child = self._start(
+            tmp_path, "mine", timeout=1, kill_grace_seconds=1
+        )
+        try:
+            mine_thread.join(PROMPT_SECONDS)
+            assert not mine_thread.is_alive()
+            assert mine_result["outcome"].timed_out is True
+            assert _gone(mine_child), "the child the program left escaped the time limit"
+            assert _alive(other_child) and other_thread.is_alive()
+        finally:
+            other.request_stop(grace=1.0)
+            other_thread.join(PROMPT_SECONDS)
+            self._kill_if_alive(mine_child, other_child)
+
+    def test_a_program_whose_short_lived_child_ends_is_unchanged(self) -> None:
+        from forge.executor import programs
+
+        argv = ["sh", "-c", "(sleep 0.3; echo late) & echo now; exit 4"]
+        plain = programs.run_program(argv, cwd=None, env=None, timeout=20)
+        with programs.stoppable(programs.StoppableRun()):
+            wrapped = programs.run_program(argv, cwd=None, env=None, timeout=20)
+        assert plain.exit_code == 4 and plain.stdout == b"now\nlate\n"
+        assert (wrapped.exit_code, wrapped.stdout, wrapped.stderr) == (
+            plain.exit_code,
+            plain.stdout,
+            plain.stderr,
+        )
+        assert not wrapped.timed_out

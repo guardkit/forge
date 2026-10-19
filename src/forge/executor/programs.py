@@ -567,10 +567,13 @@ def _reader(stream: Any, into: list[bytes]) -> threading.Thread:
 #: architecture the factory runs on) and then starts the program as its
 #: child. A process anywhere in the program's tree whose parent exits is then
 #: re-parented to the wrapper, never to init, so everything the program
-#: started always stays under the wrapper, where a stop can find it. The
-#: wrapper reaps those orphans as they end, and exits with the program's own
-#: exit code (dying of the same signal when the program did), so exit codes,
-#: output and time limits are what they were.
+#: started always stays under the wrapper, where a stop can find it. When the
+#: program exits, the wrapper records its status and stays, reaping, until it
+#: has no child left (Codex round 4): a child the program left running keeps
+#: the leg running, under the wrapper, until it ends or a stop or the time
+#: limit stops it. Then the wrapper exits with the program's own exit code
+#: (dying of the same signal when the program did), so exit codes and output
+#: are what they were.
 #:
 #: A stop first sends it :data:`_SUBREAPER_HOLD_SIGNAL`; a held wrapper does
 #: not exit when the program does, but stays (reaping) until the stop's final
@@ -611,12 +614,14 @@ while True:
     pid, how = os.wait()
     if pid == child:
         break
+# The program's own status is recorded above. As a subreaper every orphan of
+# its tree is a child of this wrapper, so it stays, reaping, until none is
+# left: whatever the program left running is still under it, for a stop or
+# the time limit to reach.
 while True:
     try:
-        pid, _ = os.waitpid(-1, os.WNOHANG)
+        os.wait()
     except ChildProcessError:
-        break
-    if pid == 0:
         break
 while held:
     # A stop is under way: stay, so everything orphaned during it is still
