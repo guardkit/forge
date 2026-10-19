@@ -578,3 +578,174 @@ class TestTheEndedCheckIsWired:
             await asyncio.wait_for(journey, PROMPT_SECONDS)
 
         asyncio.run(scenario())
+
+
+# ---------------------------------------------------------------------------
+# The running leg in the sandbox is asked to stop (19 October 2026)
+# ---------------------------------------------------------------------------
+
+SANDBOX_URL = "http://127.0.0.1:8223"
+
+
+def _sandbox_config() -> ForgeConfig:
+    """The repository of the ledger's journey has a sandbox."""
+    raw = _config().model_dump(mode="json")
+    raw["planning"] = {
+        "target_repo_paths": {"example/notes": "/work/notes"},
+        "sandboxes": {
+            "example/notes": {
+                "name": "notes-sandbox",
+                "sidecar_url": SANDBOX_URL,
+                "runner_url": "http://127.0.0.1:8224",
+            }
+        },
+    }
+    return ForgeConfig.model_validate(raw)
+
+
+@dataclass
+class SpyLegStop:
+    """The helper's cancel, as the coordinator calls it; records each ask."""
+
+    msg: FakeMsg
+    calls: list[dict[str, Any]] = field(default_factory=list)
+    acks_when_asked: list[int] = field(default_factory=list)
+    raises: BaseException | None = None
+    answer: tuple[bool, str] = (True, "the sandbox sidecar stopped the leg")
+
+    def __call__(self, **kwargs: Any) -> tuple[bool, str]:
+        self.calls.append(kwargs)
+        self.acks_when_asked.append(self.msg.acks)
+        if self.raises is not None:
+            raise self.raises
+        return self.answer
+
+
+def _sandbox_deps(
+    pool: SqliteLifecyclePersistence,
+    bridge: FakeBridge,
+    supervisor: Any,
+    stop: SpyLegStop,
+    **overrides: Any,
+) -> ConductorDriverDeps:
+    deps = build_conductor_driver_deps_factory(
+        pool=pool,
+        config=_sandbox_config(),
+        take_ack_handle=bridge.take_ack_handle,
+        cancel_leg=stop,
+    )(BUILD_ID, supervisor)
+    return dataclasses.replace(
+        deps,
+        sleep=_no_sleep,
+        ended_watch_seconds=WATCH_SECONDS,
+        export_stage_receipts=None,
+        write_failure_pack=None,
+        **overrides,
+    )
+
+
+class TestTheRunningLegIsAskedToStop:
+    def test_a_cancelled_running_journey_asks_its_sandbox_once_after_the_release(
+        self, db_path: Path, pool: SqliteLifecyclePersistence
+    ) -> None:
+        msg = FakeMsg()
+        bridge = FakeBridge(handles={FEATURE_ID: make_msg_ack_handle(msg)})
+        stop = SpyLegStop(msg)
+        supervisor = StageInFlight(pool, TurnOutcome.DISPATCHED)
+
+        async def scenario() -> Any:
+            journey = asyncio.ensure_future(
+                drive_fix_journey(
+                    BUILD_ID, _sandbox_deps(pool, bridge, supervisor, stop)
+                )
+            )
+            await asyncio.wait_for(supervisor.started.wait(), PROMPT_SECONDS)
+            await asyncio.sleep(WATCH_SECONDS * 5)
+            assert stop.calls == []
+            _forge_cancel(db_path)
+            await _until(lambda: len(stop.calls) == 1)
+            # Several more watch ticks while the stage is still running.
+            await asyncio.sleep(WATCH_SECONDS * 10)
+            supervisor.finish.set()
+            return await asyncio.wait_for(journey, PROMPT_SECONDS)
+
+        report = asyncio.run(scenario())
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert stop.calls == [{"base_url": SANDBOX_URL, "build": BUILD_ID}]
+        # The place was released before the sandbox was asked.
+        assert stop.acks_when_asked == [1]
+        assert msg.acks == 1
+
+    def test_a_running_journey_that_is_not_cancelled_asks_nobody(
+        self, pool: SqliteLifecyclePersistence
+    ) -> None:
+        msg = FakeMsg()
+        bridge = FakeBridge(handles={FEATURE_ID: make_msg_ack_handle(msg)})
+        stop = SpyLegStop(msg)
+        supervisor = StageInFlight(pool, TurnOutcome.DISPATCHED)
+
+        async def scenario() -> None:
+            journey = asyncio.ensure_future(
+                drive_fix_journey(
+                    BUILD_ID,
+                    _sandbox_deps(pool, bridge, supervisor, stop, max_turns=1),
+                )
+            )
+            await asyncio.wait_for(supervisor.started.wait(), PROMPT_SECONDS)
+            await asyncio.sleep(WATCH_SECONDS * 10)
+            assert stop.calls == []
+            assert msg.acks == 0
+            supervisor.finish.set()
+            await asyncio.wait_for(journey, PROMPT_SECONDS)
+
+        asyncio.run(scenario())
+
+        # The turn ceiling's own close-out releases the message; nobody was
+        # asked to stop a leg at any point.
+        assert stop.calls == []
+
+    @pytest.mark.parametrize(
+        ("raises", "answer", "logged"),
+        [
+            (OSError("connection refused"), (True, ""), "raised OSError"),
+            (None, (False, "HTTP 404: no fix-journey leg"), "it runs on to its own end"),
+        ],
+    )
+    def test_a_stop_that_fails_never_holds_the_place(
+        self,
+        db_path: Path,
+        pool: SqliteLifecyclePersistence,
+        caplog: pytest.LogCaptureFixture,
+        raises: BaseException | None,
+        answer: tuple[bool, str],
+        logged: str,
+    ) -> None:
+        msg = FakeMsg()
+        bridge = FakeBridge(handles={FEATURE_ID: make_msg_ack_handle(msg)})
+        stop = SpyLegStop(msg, raises=raises, answer=answer)
+        supervisor = StageInFlight(pool, TurnOutcome.DISPATCHED)
+
+        async def scenario() -> Any:
+            journey = asyncio.ensure_future(
+                drive_fix_journey(
+                    BUILD_ID, _sandbox_deps(pool, bridge, supervisor, stop)
+                )
+            )
+            await asyncio.wait_for(supervisor.started.wait(), PROMPT_SECONDS)
+            _forge_cancel(db_path)
+            await _until(lambda: len(stop.calls) == 1)
+            await asyncio.sleep(WATCH_SECONDS * 5)
+            supervisor.finish.set()
+            return await asyncio.wait_for(journey, PROMPT_SECONDS)
+
+        with caplog.at_level(logging.INFO):
+            report = asyncio.run(scenario())
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert msg.acks == 1
+        assert bridge.handles == {}
+        assert len(stop.calls) == 1
+        said = [r for r in caplog.records if logged in r.getMessage()]
+        assert len(said) == 1
+        assert pool.get_build_row(BUILD_ID).status is BuildState.CANCELLED

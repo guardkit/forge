@@ -28,10 +28,14 @@ own, never in its words.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import logging
 import os
 import signal
 import subprocess
+import threading
 import time
+from collections.abc import Callable, Iterator
 from dataclasses import dataclass
 from typing import Any, Sequence
 
@@ -42,10 +46,18 @@ __all__ = [
     "RaisedWhileRunning",
     "RefusedBeforeStart",
     "TimedOut",
+    "observe_started",
     "run_program",
     "start_program",
     "start_program_async",
+    "stop_program_group",
 ]
+
+logger = logging.getLogger(__name__)
+
+#: Who, on this thread, wants to be handed the next program
+#: :func:`run_program` starts (see :func:`observe_started`).
+_started_observer = threading.local()
 
 
 class ProgramRefused(OSError):
@@ -171,6 +183,48 @@ def _stop(process: "subprocess.Popen[bytes]", *, group: bool, grace: float) -> N
         return
 
 
+def stop_program_group(process: "subprocess.Popen[bytes]", *, grace: float) -> None:
+    """Stop a program started in a session of its own, and everything it
+    started: TERM to its group, then KILL once ``grace`` seconds have passed
+    with it still running. Never raises.
+
+    For a caller on ANOTHER thread than the one waiting for the program (19
+    October 2026: the helper stopping a fix journey's leg whose build was
+    cancelled). The waiting thread then reads the program's end as usual.
+    """
+    _stop(process, group=True, grace=grace)
+
+
+@contextlib.contextmanager
+def observe_started(
+    callback: "Callable[[subprocess.Popen[bytes]], None]",
+) -> Iterator[None]:
+    """Hand ``callback`` each program :func:`run_program` starts on this
+    thread while the block runs, the moment it has started.
+
+    It is how something that did not start a program can still stop it (19
+    October 2026: the helper's ``/guardkit-leg/cancel``). The runners that
+    start a leg keep their signatures; the leg's handler thread says who is
+    watching. A callback that raises is logged and the program runs on.
+    """
+    previous = getattr(_started_observer, "callback", None)
+    _started_observer.callback = callback
+    try:
+        yield
+    finally:
+        _started_observer.callback = previous
+
+
+def _tell_started_observer(process: "subprocess.Popen[bytes]") -> None:
+    callback = getattr(_started_observer, "callback", None)
+    if callback is None:
+        return
+    try:
+        callback(process)
+    except Exception:  # noqa: BLE001 — the program runs on either way
+        logger.exception("a started-program observer raised; the program runs on")
+
+
 def run_program(
     argv: Sequence[str],
     *,
@@ -207,6 +261,7 @@ def run_program(
             refused_before_start=True,
             error=exc.__cause__ or exc,
         )
+    _tell_started_observer(process)
     try:
         out, err = process.communicate(timeout=timeout)
         return ProgramOutcome(exit_code=process.returncode, stdout=out or b"", stderr=err or b"")
