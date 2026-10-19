@@ -324,6 +324,14 @@ class TestSettings:
             in (ROOT / "Dockerfile").read_text()
         )
 
+    def test_the_release_image_leaves_the_program_readable(self):
+        """19 October 2026: the COPY left it root-owned 0600, unreadable by the
+        machine's user that compose runs it as. The chmod must follow the COPY."""
+        text = (ROOT / "Dockerfile").read_text()
+        copy = text.index("COPY deploy/compose/sandbox-starter/starter.py /opt/forge/sandbox-starter/starter.py")
+        chmod = text.index("RUN chmod 0644 /opt/forge/sandbox-starter/starter.py")
+        assert chmod > copy
+
 
 class TestNamesItActsFor:
     @pytest.mark.parametrize(

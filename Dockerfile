@@ -781,6 +781,9 @@ RUN chmod 0755 /opt/forge/sandbox-runner/run.sh
 # library program that starts and stops the project sandboxes' supervisor
 # containers. A leaf, like the supervisor script above.
 COPY deploy/compose/sandbox-starter/starter.py /opt/forge/sandbox-starter/starter.py
+# Read, never executed directly: compose runs it as the machine's user with
+# `python -I`, so it must be readable by that user (COPY leaves it root 0600).
+RUN chmod 0644 /opt/forge/sandbox-starter/starter.py
 
 # Create the unprivileged runtime user *before* WORKDIR/COPY-into-home
 # so any files copied later inherit the correct ownership when --chown
