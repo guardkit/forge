@@ -1029,11 +1029,18 @@ class Starter:
         # ONE DEADLINE for a hold until deployed, from the moment the hold is
         # taken, across waiting in the queue, the start and the redeploy's
         # confirmation, with the suspension checked throughout. With no
-        # recorded deployment, deployed is the same as services.
-        deployed = until == "deployed" and sb.deployment() is not None
+        # recorded deployment, deployed is the same as services. Whether there
+        # is one is read again at every check, under the lock, and last of all
+        # just before the hold returns: a deployment recorded while the hold
+        # waits still has to be confirmed ready.
         deadline = started + self.settings.deployed_limit
 
+        def needs_deployment() -> bool:
+            with self.lock:
+                return until == "deployed" and sb.deployment() is not None
+
         def checkpoint() -> None:
+            deployed = needs_deployment()
             with self.lock:
                 if hold_id not in sb.holds:
                     raise Failed(f"hold {hold_id} was ended while it waited for {sb.name}")
@@ -1053,18 +1060,18 @@ class Starter:
         try:
             checkpoint()
             if quiet and self._container_state(sb) == "running" and all(self._services(sb)):
-                readiness = self._services_answered(sb, woke=False)
+                self._services_answered(sb, woke=False)
             else:
                 op = self._start_or_join(sb)
                 while not self.wait(op.done, 1.0):
                     checkpoint()
-                readiness = self._finish(op)["readiness"]
-            if not deployed:
-                return {"hold_id": hold_id, "readiness": readiness,
-                        "message": f"{sb.name} is held for {owner}: services ready"}
+                self._finish(op)
             while True:
                 checkpoint()
                 with self.lock:
+                    if not needs_deployment():
+                        return {"hold_id": hold_id, "readiness": sb.readiness,
+                                "message": f"{sb.name} is held for {owner}: services ready"}
                     if self._confirmed(sb):
                         return {"hold_id": hold_id, "readiness": READY,
                                 "message": f"{sb.name} is held for {owner}: its recorded deployment is back"}

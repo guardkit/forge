@@ -1189,3 +1189,44 @@ class TestReadyBelongsToOneDeploymentIdentity:
         first.close()
         second = world.make(deployment=ANOTHER)
         assert second.status(NAME)["readiness"] == "services ready, redeploy pending"
+
+
+
+class TestADeploymentRecordedWhileAHoldWaits:
+    """Codex round 5, R8."""
+
+    def test_a_first_deployment_recorded_during_start_up_must_be_confirmed(self, world):
+        (world.state / "start_sleep").write_text("1")
+        s = world.make()  # no deployment when the hold is taken
+        box = in_background(s.hold, NAME, "merge-deploy", "deployed")
+        assert wait_for(lambda: s.sandboxes[NAME].running is not None)
+        other = in_background(s.hold, NAME, "register-repo", "services", DEPLOYMENT)
+        other["thread"].join(10)
+        assert other["result"]["readiness"] == "services ready, redeploy pending"
+        time.sleep(1.5)  # the start has finished; the deployed hold must still wait
+        assert "result" not in box and "error" not in box
+        assert s.status(NAME)["redeploy_pending"] is True
+        s.ready(NAME, DEPLOYMENT)
+        box["thread"].join(10)
+        assert box["result"]["readiness"] == "ready"
+        assert s.status(NAME)["ready_confirmed_for"] == DEPLOYMENT
+
+    def test_a_deployment_recorded_during_the_wait_keeps_the_original_deadline(self, world):
+        (world.state / "start_sleep").write_text("1")
+        s = world.make(STARTER_DEPLOYED_LIMIT_SECONDS="3")
+        began = time.monotonic()
+        box = in_background(s.hold, NAME, "merge-deploy", "deployed")
+        assert wait_for(lambda: s.sandboxes[NAME].running is not None)
+        s.hold(NAME, "register-repo", "services", DEPLOYMENT)
+        box["thread"].join(10)
+        assert isinstance(box["error"], starter_mod.Failed)
+        assert "within 3 seconds of the hold being taken" in box["error"].message
+        assert time.monotonic() - began < 4.5
+        assert [h["owner"] for h in s.status(NAME)["holds"]] == ["register-repo"]
+
+    def test_with_no_deployment_at_all_a_deployed_hold_returns_at_services(self, world):
+        (world.state / "start_sleep").write_text("1")
+        s = world.make()
+        result = s.hold(NAME, "merge-deploy", "deployed")
+        assert result["readiness"] == "ready"
+        assert "services ready" in result["message"]
