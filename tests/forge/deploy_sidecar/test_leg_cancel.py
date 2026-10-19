@@ -786,3 +786,41 @@ class TestDescendantsAreHeldByPidfd:
                     if _alive(pid):
                         os.kill(pid, 9)
 
+
+class TestAdmissionIsOneStep:
+    def test_a_cancel_straight_after_admission_finds_the_pending_leg(
+        self, cfg: ForgeConfig, tree: Path, pids: Path
+    ) -> None:
+        """Codex R2: counted as executing and cancellable in one hold of the
+        lock; a hook pauses the request straight after that."""
+        admitted = threading.Event()
+        resume = threading.Event()
+        srv = build_server(port=0, config_loader=lambda: cfg)
+
+        def pause_after_admission(number: int, route: str) -> None:
+            if route == GUARDKIT_LEG_ROUTE:
+                admitted.set()
+                assert resume.wait(PROMPT_SECONDS)
+
+        srv.after_admission = pause_after_admission
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        host, port = srv.server_address[:2]
+        url = f"http://{host}:{port}"
+        try:
+            leg = _LegInFlight(url, _leg_body(tree))
+            assert admitted.wait(PROMPT_SECONDS)
+
+            status, body = _post(url + GUARDKIT_LEG_CANCEL_ROUTE, {"build": BUILD_ID})
+
+            assert status == 200, body
+            assert body["cancelled"][0]["started"] is False
+            resume.set()
+            status, answer = leg.join()
+            assert status == 200 and answer["cancelled"] is True
+            assert "was not started" in answer["stderr_tail"]
+            time.sleep(0.3)
+            assert not pids.exists(), "the leg ran although it was cancelled first"
+        finally:
+            resume.set()
+            srv.shutdown()
+            srv.server_close()

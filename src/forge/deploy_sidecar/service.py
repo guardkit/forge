@@ -8374,6 +8374,9 @@ class _SidecarServer(ThreadingHTTPServer):
         # The fix-journey legs among them, by the same number, so one can be
         # stopped from another request (``/guardkit-leg/cancel``).
         self.running_legs: dict[int, _RunningLeg] = {}
+        #: Test hook: ``(number, route)``, called on the request's thread
+        #: straight after its admission.
+        self.after_admission: Callable[[int, str], None] | None = None
         self.config_loader = config_loader
         self.script_runner = script_runner
         # TWO RUNNERS, NOT ONE (13 October 2026). ``merge_runner`` starts the
@@ -8395,9 +8398,12 @@ class _SidecarServer(ThreadingHTTPServer):
         # rather than run ungated.
         self.deploy_executor = deploy_executor
 
-    def begin_request(self, route: str, payload: Any) -> int:
-        """Note a request as executing; the number to end it with."""
+    def admit(self, route: str, payload: Any) -> tuple[int, "_RunningLeg | None"]:
+        """Note a request as executing and, for a leg, as cancellable — both
+        under ONE hold of the lock, so a cancel sees both or neither (Codex
+        round 2). The number to end it with, and the leg when it is one."""
         repo = payload.get("repo") if isinstance(payload, dict) else None
+        leg: _RunningLeg | None = None
         with self.executing_lock:
             self._next_request += 1
             number = self._next_request
@@ -8406,21 +8412,17 @@ class _SidecarServer(ThreadingHTTPServer):
                 "repo": str(repo)[:200] if isinstance(repo, str) else None,
                 "started": time.monotonic(),
             }
-        return number
+            if route == GUARDKIT_LEG_ROUTE:
+                raw = payload.get("build") if isinstance(payload, dict) else None
+                build = raw.strip() if isinstance(raw, str) and raw.strip() else None
+                leg = _RunningLeg(number=number, build=build)
+                self.running_legs[number] = leg
+        return number, leg
 
     def end_request(self, number: int) -> None:
         with self.executing_lock:
             self.executing.pop(number, None)
             self.running_legs.pop(number, None)
-
-    def begin_leg(self, number: int, payload: Any) -> "_RunningLeg":
-        """Note that request ``number`` is a leg, so it can be cancelled."""
-        raw = payload.get("build") if isinstance(payload, dict) else None
-        build = raw.strip() if isinstance(raw, str) and raw.strip() else None
-        leg = _RunningLeg(number=number, build=build)
-        with self.executing_lock:
-            self.running_legs[number] = leg
-        return leg
 
     def cancel_legs(self, payload: Any) -> tuple[int, dict[str, Any]]:
         """``POST /guardkit-leg/cancel``: stop the leg(s) named; never raises.
@@ -8618,15 +8620,13 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
             except (json.JSONDecodeError, UnicodeDecodeError) as exc:
                 self._write_json(400, {"error": f"invalid JSON body: {exc}"})
                 return
-            number = self.server.begin_request(route, payload)  # type: ignore[attr-defined]
             # A leg is cancellable from its admission, before anything else
             # (configuration included) is done for it.
-            leg = (
-                self.server.begin_leg(number, payload)  # type: ignore[attr-defined]
-                if route == GUARDKIT_LEG_ROUTE
-                else None
-            )
+            number, leg = self.server.admit(route, payload)  # type: ignore[attr-defined]
             try:
+                hook = self.server.after_admission  # type: ignore[attr-defined]
+                if hook is not None:
+                    hook(number, route)
                 self._answer_post(route, payload, leg=leg)
             finally:
                 self.server.end_request(number)  # type: ignore[attr-defined]
