@@ -103,6 +103,8 @@ class SandboxLab:
             raise ConnectionRefusedError("helper down")
         if self.helper == "refuse":
             return 400, {"error": "the Git door did not answer"}
+        if self.helper == "head":
+            return 200, {"branch": "HEAD", "commit": self.clone_ref("refs/remotes/origin/main"), "refusal": None}
         if self.helper == "fetch":
             _git(self.clone, "fetch", "-q", str(self.github), "+refs/heads/main:refs/remotes/origin/main")
             return 200, {"branch": "main", "commit": self.clone_ref("refs/remotes/origin/main"), "refusal": None}
@@ -240,8 +242,27 @@ def test_a_branch_or_commit_that_will_not_do_is_refused_before_anything_runs(
     assert not (tmp_path / "m").exists()
 
 
+def test_a_head_branch_answer_is_refused_before_anything_runs(tmp_path: Path) -> None:
+    """HEAD is git's pointer, never a branch (coach review, 19 October 2026)."""
+    point = network_git.fetch_sandbox_copy_branch(
+        LIVE_SHAPE, branch="HEAD", expected_commit="a" * 40, copies_root=tmp_path / "m"
+    )
+    assert point.refusal == network_git.SANDBOX_BRANCH_REFUSAL
+    assert not (tmp_path / "m").exists()
+
+
 # ---------------------------------------------------------------------------
 # Through the sandbox: refresh, read, check
+
+
+def test_a_sandbox_that_names_head_as_its_branch_is_said_and_nothing_is_fetched(
+    sandbox_lab: SandboxLab, tmp_path: Path
+) -> None:
+    sandbox_lab.helper = "head"
+    got = _through(sandbox_lab, tmp_path / "m")
+    assert got.reason == REASON_SANDBOX_SILENT and got.path is None
+    assert got.refusal == network_git.SANDBOX_BRANCH_REFUSAL
+    assert not (tmp_path / "m").exists()
 
 
 def test_the_sandbox_is_asked_to_refresh_first_so_the_newest_merge_is_checked(
@@ -442,3 +463,33 @@ async def test_the_history_line_says_what_was_scanned_and_where_from(lab: Lab, s
     got = history["projects"]["org/app"]
     assert (got["branch"], got["commit"], got["source"]) == ("main", commit, source)
     assert "not_fetched_reason" not in got
+
+
+@pytest.mark.asyncio
+async def test_the_detail_goes_to_the_log_without_addresses_and_never_to_slack_or_history(
+    lab: Lab, caplog: pytest.LogCaptureFixture
+) -> None:
+    import logging
+
+    lab.add("org/app", {"a.txt": "a\n"})
+    detail = (
+        "The sandbox's copy of 'main' could not be fetched: the sandbox sidecar at "
+        "http://169.254.207.2:8935 answered 500 for git://169.254.207.2:8928/notes-private-fixture"
+    )
+    caplog.set_level(logging.WARNING, logger="forge.security_sweep.sweep")
+    await run_sweep(lab.deps(
+        fetch=lambda address, folder: Mirror(refusal=detail, reason=REASON_COPY_UNREADABLE)
+    ))
+    (line,) = lab.slack.lines
+    assert line == (
+        f"Nightly security check: app — could not be fetched ({REASON_COPY_UNREADABLE}), "
+        "so it was not checked."
+    )
+    history = (lab.folder / HISTORY_FILE).read_text()
+    assert "answered 500" not in history and "169.254" not in history
+    logged = [r.getMessage() for r in caplog.records if "could not be fetched" in r.getMessage()]
+    assert logged == [
+        f"security sweep: org/app could not be fetched ({REASON_COPY_UNREADABLE}): "
+        "The sandbox's copy of 'main' could not be fetched: the sandbox sidecar at "
+        "<address> answered 500 for <address>"
+    ]

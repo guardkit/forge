@@ -82,6 +82,7 @@ __all__ = [
     "git_door_problem",
     "git_export_problem",
     "fetch_sandbox_copy_branch",
+    "SANDBOX_BRANCH_REFUSAL",
     "SANDBOX_COPY_MISMATCH",
     "https_address_problem",
     "isolated_environment",
@@ -935,6 +936,12 @@ SANDBOX_COPY_MISMATCH: str = (
     "sandbox reported, so it was not used."
 )
 
+#: The refusal when the sandbox names a default branch the factory will not
+#: fetch (a name git would read as something else, or ``HEAD``).
+SANDBOX_BRANCH_REFUSAL: str = (
+    "The sandbox named a default branch the factory will not pass to git."
+)
+
 _A_COMMIT = re.compile(r"^(?:[0-9a-f]{40}|[0-9a-f]{64})$")
 
 
@@ -970,8 +977,11 @@ def fetch_sandbox_copy_branch(
         return StartPoint(
             refusal=f"The sandbox's export address will not do: {problem} (the value is not repeated here)."
         )
-    if not _BRANCH.match(str(branch or "")):
-        return StartPoint(refusal="The sandbox named a default branch the factory will not pass to git.")
+    # HEAD is git's pointer, never a branch (coach review, 19 October 2026):
+    # "+refs/remotes/origin/HEAD:refs/heads/HEAD" would make a branch named
+    # HEAD in the factory's copy.
+    if not _BRANCH.match(str(branch or "")) or str(branch) == "HEAD":
+        return StartPoint(refusal=SANDBOX_BRANCH_REFUSAL)
     if not _A_COMMIT.match(str(expected_commit or "")):
         return StartPoint(refusal="The sandbox named a commit that is not a full commit id.")
     address = str(export).strip()

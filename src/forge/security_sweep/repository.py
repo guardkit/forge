@@ -192,6 +192,10 @@ def fetch_through_sandbox(
             reason=(
                 REASON_COPY_MISMATCH
                 if point.refusal == network_git.SANDBOX_COPY_MISMATCH
+                # The sandbox's answer named no branch that can be fetched:
+                # no usable answer.
+                else REASON_SANDBOX_SILENT
+                if point.refusal == network_git.SANDBOX_BRANCH_REFUSAL
                 else REASON_COPY_UNREADABLE
             ),
         )

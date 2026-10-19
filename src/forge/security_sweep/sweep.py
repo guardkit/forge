@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import shutil
 import tempfile
 from dataclasses import dataclass, field
@@ -296,6 +297,16 @@ def display_names(projects: list[str]) -> dict[str, str]:
 
 def _plural(n: int, one: str, many: str) -> str:
     return f"{n} {one if n == 1 else many}"
+
+
+#: An address of any scheme (``git://``, ``http://``, ``https://``...) up to
+#: the next space, quote or bracket.
+_AN_ADDRESS = re.compile(r"\b[A-Za-z][A-Za-z0-9+.-]*://[^\s'\"()<>]+")
+
+
+def without_addresses(text: str) -> str:
+    """``text`` with every address in it replaced by ``<address>``."""
+    return _AN_ADDRESS.sub("<address>", str(text))
 
 
 def _project_phrase(result: ProjectResult, name: str) -> str:
@@ -566,10 +577,14 @@ async def _sweep_project(
         result.fetch_problem = True
         reason = getattr(mirror, "reason", None)
         result.fetch_reason = reason if reason in FETCH_REASONS else None
+        # The detailed sentence goes to the local log only, so a live failure
+        # can be diagnosed; any address in it is replaced. The Slack line and
+        # the history carry the fixed reason alone (coach review, 19 October).
         logger.warning(
-            "security sweep: %s could not be fetched (%s)",
+            "security sweep: %s could not be fetched (%s): %s",
             project,
             result.fetch_reason or "no reason given",
+            without_addresses(getattr(mirror, "refusal", None) or "no detail"),
         )
         return result
     result.fetched = True
