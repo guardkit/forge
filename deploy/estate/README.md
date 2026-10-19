@@ -152,7 +152,8 @@ render" from "that service is down"; both now say which, in those words.
 
 ## How the bus's passwords travel, and why no log has one in it
 
-The bus has eight account passwords. They live encrypted in one file, they are
+The bus has nine account passwords (the ninth, `DASHBOARD_APPROVE_NATS_PASSWORD`,
+since 19 October 2026). They live encrypted in one file, they are
 never in any file in this bundle, and `sops exec-env` puts them into the
 environment of the `docker compose` command as a child process. From there:
 
@@ -179,6 +180,40 @@ environment of the `docker compose` command as a child process. From there:
   Forge's own code reads its bus address from that one setting. That is Forge's
   code to change, not this bundle's, and it is listed with the rollout
   preconditions below.
+
+### The dashboard's answer password
+
+Since 19 October 2026 the factory dashboard can answer Forge's cards (design:
+factory-dashboard `docs/architecture/approvals-from-the-dashboard-2026-10-19.md`).
+It posts each answer as its own bus account, `dashboard_approve`, which may
+publish only on `agents.approval.forge.*.response` and subscribe only to its own
+reply inboxes. Its password is the ninth of the bus's account passwords, under
+the name `DASHBOARD_APPROVE_NATS_PASSWORD` in the same encrypted file, and the
+bus is handed it as a file exactly like the other eight.
+
+The dashboard is not part of this estate (its compose file lives in the
+factory-dashboard repository), so it never reads the bus's secret. It keeps
+**its own copy as a file**, by this convention:
+
+- **Where:** `dashboard_approve_nats_password` in the dashboard's config folder,
+  `${FACTORY_DASH_CONFIG_DIR:-$HOME/.config/factory-dashboard}`, beside its
+  `accounts.yaml` and `session_secret`. The board already mounts that folder
+  read-only at `/config`, so inside the board the file is
+  `/config/dashboard_approve_nats_password`, and the dashboard's own setting
+  names that path. Mode `0600`, owned by the account the dashboard runs as.
+- **How it is written:** from the encrypted file, by a shell builtin inside
+  `sops exec-env`, so the value is never on a command line and never printed:
+
+  ```bash
+  sops exec-env "$NATS_SECRETS_FILE" 'umask 077; d="${FACTORY_DASH_CONFIG_DIR:-$HOME/.config/factory-dashboard}"; printf %s "$DASHBOARD_APPROVE_NATS_PASSWORD" > "$d/dashboard_approve_nats_password.new" && mv "$d/dashboard_approve_nats_password.new" "$d/dashboard_approve_nats_password"'
+  ```
+
+- **When it changes:** the bus repository's `scripts/rotate-nats-password.sh
+  --account DASHBOARD_APPROVE` prints this same step after the bus has been
+  restarted with the new value; then the dashboard's board is restarted, unless
+  the dashboard reads the file at each send.
+- **Nothing in this estate needs the file.** Without it only the dashboard's
+  answers stop; the bus and every other service carry on.
 
 ## Memory — what the factory remembers
 

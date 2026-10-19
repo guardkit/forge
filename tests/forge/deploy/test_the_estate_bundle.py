@@ -69,7 +69,7 @@ _ONLY_THESE_ARE_INHERITED = (
     "XDG_RUNTIME_DIR",
 )
 
-#: The bus's eight account passwords. They never appear in a file in the
+#: The bus's nine account passwords. They never appear in a file in the
 #: bundle: they are passed into the command from a child process, which is the
 #: bus repository's own arrangement. **Nothing below sets one**, and that is
 #: the point — the estate hands each to the bus as a secret read from the
@@ -87,6 +87,7 @@ _THE_BUSS_ACCOUNT_PASSWORDS = (
     "FLEET_MEMORY_NATS_PASSWORD",
     "GUARDKIT_NATS_PASSWORD",
     "JARVIS_NATS_PASSWORD",
+    "DASHBOARD_APPROVE_NATS_PASSWORD",
 )
 
 
@@ -276,7 +277,7 @@ class TestTheEstateRenders:
     def test_no_password_reaches_a_container_environment(
         self, rendered: str
     ) -> None:
-        """The bus's eight passwords reach it as FILES. The bus repository's
+        """The bus's nine passwords reach it as FILES. The bus repository's
         own compose file puts them in ``environment:``, where ``docker
         inspect`` shows them to anybody who can reach the Docker daemon; the
         estate hands each one in as a secret instead and a wrapper puts them
@@ -288,6 +289,29 @@ class TestTheEstateRenders:
                 "'docker inspect' would show its value"
             )
         assert "/run/secrets" in rendered or "secrets:" in rendered
+
+    def test_the_bus_is_handed_every_account_password(self) -> None:
+        """EVERY PASSWORD THE BUS'S ENTRYPOINT SUBSTITUTES ARRIVES, AS A FILE.
+        The bus's accounts file names nine passwords since 19 October 2026
+        (the dashboard's answer account joined the eight), and its entrypoint
+        refuses to start with any of them empty. So the wrapper's account list,
+        the bus's own secret mounts and the secrets read from the environment
+        must name the same nine — a name left out of any one of them stops the
+        bus at start, on every machine."""
+        text = (ESTATE / "compose.yaml").read_text(encoding="utf-8")
+        loop = re.search(r"for account in ([A-Z_ ]+); do", text)
+        assert loop is not None, "the bus's password wrapper has no account list"
+        assert sorted(f"{a}_NATS_PASSWORD" for a in loop.group(1).split()) == sorted(
+            _THE_BUSS_ACCOUNT_PASSWORDS
+        ), "the bus's wrapper does not read exactly the bus's account passwords"
+        bus = text.split("\n  nats:\n", 1)[1].split("\n  nats-provision:\n", 1)[0]
+        for name in _THE_BUSS_ACCOUNT_PASSWORDS:
+            assert f"target: {name.lower()}" in bus, (
+                f"the bus is not given {name} as /run/secrets/{name.lower()}"
+            )
+            assert re.search(rf"^\s+environment: {name}\s*$", text, re.MULTILINE), (
+                f"no secret reads {name} from the environment the start runs in"
+            )
 
     def test_the_bus_still_reads_its_own_config(self, rendered: str) -> None:
         """NAMING AN ENTRYPOINT EMPTIES THE IMAGE'S OWN COMMAND. Compose drops
@@ -736,7 +760,7 @@ class TestWhatTheEstatePromises:
         self, rendered: str
     ) -> None:
         """It carries the store's password, so it is a secret and travels as a
-        file — the same way the bus's eight account passwords do, and
+        file — the same way the bus's nine account passwords do, and
         deliberately NOT the way the coordinator's bus address still does."""
         for service in ("memory", "memory-relay"):
             block = _service_block(rendered, service)
