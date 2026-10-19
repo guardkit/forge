@@ -45,7 +45,7 @@ class _Recorder:
             def __init__(self) -> None:
                 self._lines = [b"all done\n", b""]
 
-            async def readline(self) -> bytes:
+            async def read(self, n: int = -1) -> bytes:
                 return self._lines.pop(0) if self._lines else b""
 
         class _Proc:

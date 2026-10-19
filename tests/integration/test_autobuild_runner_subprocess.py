@@ -34,10 +34,10 @@ class _FakeStdout:
     """Async-iterable stdout double yielding canned bytes lines."""
 
     def __init__(self, lines: list[bytes]) -> None:
-        # Append EOF sentinel — ``readline`` returns ``b""`` on EOF.
+        # Append EOF sentinel — ``read`` returns ``b""`` on EOF.
         self._lines: list[bytes] = [*lines, b""]
 
-    async def readline(self) -> bytes:
+    async def read(self, n: int = -1) -> bytes:
         return self._lines.pop(0) if self._lines else b""
 
 
@@ -349,7 +349,7 @@ class TestRunningWaveSubprocessTimeout:
         kill_called: list[bool] = []
 
         class _HangStdout:
-            async def readline(self) -> bytes:
+            async def read(self, n: int = -1) -> bytes:
                 # Block forever — the runner's wait_for triggers the kill.
                 await asyncio.sleep(60)
                 return b""
@@ -535,7 +535,7 @@ class TestCoachScoreParsing:
         feature_id = "FEAT-COACH-TIMEOUT"
 
         class _HangStdout:
-            async def readline(self) -> bytes:
+            async def read(self, n: int = -1) -> bytes:
                 await asyncio.sleep(60)
                 return b""
 

@@ -109,6 +109,7 @@ from forge.lifecycle.feature_routing import FeatureRoutingError
 from forge.project_git import run_git, run_git_async, timeout_sentence
 from forge.subagents import build_monitor
 from forge.subagents.autobuild_worktree_lifecycle import inspect_autobuild_worktree
+from forge.subagents.output_lines import OutputLines
 from forge.launch_environment import build_launch_env
 from forge.subagents.inmem_cancel_compat import (
     install_inmem_cancel_listener_compat,
@@ -1235,7 +1236,7 @@ DEFAULT_AUTOBUILD_TIMEOUT_SECONDS: int = 86400
 #: bounded post-kill read that closes that gap.
 #:
 #: Named rather than folklore, and deliberately small: the process is already
-#: reaped when the read starts, so ``readline()`` returns buffered bytes and
+#: reaped when the read starts, so the read returns buffered bytes and
 #: then EOF. The budget only ever matters when the kill itself did not take
 #: (the leaked-pid branch below), and in that case it expires into one WARNING
 #: and changes nothing about the build's outcome.
@@ -3139,6 +3140,7 @@ async def _drain_tail(
     *,
     budget: float = TAIL_READ_BUDGET_SECONDS,
     feature_id: str = "",
+    lines: OutputLines | None = None,
 ) -> int:
     """Read the subprocess's LAST WORDS after an ordinary-timeout kill.
 
@@ -3150,7 +3152,7 @@ async def _drain_tail(
       closes the tee — the tail survives for free;
     * the ORDINARY-TIMEOUT path (wall clock, or the FEAT-UBS-002 budget cap)
       goes through ``asyncio.wait_for``, which CANCELS the gathered drain
-      BEFORE the kill. The drain dies inside ``await proc.stdout.readline()``,
+      BEFORE the kill. The drain dies inside its pending read,
       its ``finally`` closes the tee, and only then is the process killed.
       Everything in the pipe buffer at that moment was read by nobody. On a
       dying build that is precisely the interesting part: the last guardkit
@@ -3164,7 +3166,7 @@ async def _drain_tail(
 
     * ``wait_for`` awaits the cancelled gather before raising, so the original
       drain has FINISHED — there is never a second concurrent reader;
-    * the process is already reaped, so ``readline()`` returns the buffered
+    * the process is already reaped, so the read returns the buffered
       bytes and then EOF. A kill that did not take means this read simply
       expires into the WARNING below;
     * it can never change the outcome. Blanket ``except Exception`` and one
@@ -3176,20 +3178,25 @@ async def _drain_tail(
     ``stage_complete_count`` or the coach-score turns, because both are read on
     the SUCCESS path alone and this coroutine runs only after a kill.
 
+    ``lines`` is the reader the main drain used (19 October 2026): it may
+    hold the start of a line the cancelled drain had not finished, so the
+    tail read continues from it rather than from the raw stream.
+
     Returns the number of tail lines recovered (0 on any fault).
     """
-    stdout = getattr(proc, "stdout", None)
-    if stdout is None:  # defensive — PIPE was requested at spawn
-        return 0
+    if lines is None:
+        stdout = getattr(proc, "stdout", None)
+        if stdout is None:  # defensive — PIPE was requested at spawn
+            return 0
+        lines = OutputLines(stdout)
     recovered = 0
 
     async def _read() -> None:
         nonlocal recovered
         while True:
-            line = await stdout.readline()
-            if not line:
+            decoded = await lines.next_line()
+            if decoded is None:
                 break
-            decoded = line.decode("utf-8", errors="replace").rstrip()
             # The identical treatment every other line gets, in the same
             # order: liveness first, then the durable narrative.
             if monitor is not None:
@@ -3279,6 +3286,34 @@ TERMINAL_RUNNING_WAVE: str = "running_wave"
 TERMINAL_FAILED_NODE: str = "failed"
 TERMINAL_FINALIZE_GUARD: str = "finalize-guard"
 TERMINAL_GRAPH_CONSTRUCTION: str = "graph-construction"
+#: Written by the COORDINATOR, not by this runner (19 October 2026): the run
+#: ended without reporting a terminal (the runner crashed or was killed), so
+#: no terminal here wrote a pack. See
+#: :mod:`forge.lifecycle_bridge.crash_pack`.
+TERMINAL_RUNNER_CRASHED: str = "runner-crashed"
+
+#: The longest error text a failure pack or a reason carries, in characters.
+ERROR_TEXT_LIMIT: int = 2000
+
+#: "Work this out from the exit code", for :func:`_pack_evidence`.
+_DERIVE: Any = object()
+
+
+def _plain_error_text(text: str, *, limit: int = ERROR_TEXT_LIMIT) -> str:
+    """An error text safe to keep: credentials replaced, then cut to ``limit``.
+
+    The same scrubbers the runbook and shell steps use on process output.
+    """
+    from forge.memory.redaction import redact_credentials, scrub_process_output
+
+    text = str(text)
+    # Bound the scrubbers' work on a huge text first; the final cut below
+    # keeps far less than this, so nothing past it can show.
+    cleaned = scrub_process_output(redact_credentials(text[: limit * 4]))
+    if len(text) > limit * 4 or len(cleaned) > limit:
+        dropped = len(text) - limit if len(text) > limit * 4 else len(cleaned) - limit
+        cleaned = f"{cleaned[:limit]}… [cut: {dropped} characters]"
+    return cleaned
 
 #: Evidence forge cannot see from here, named in every pack's
 #: ``evidence.missing`` list so a reader knows the silence is a KNOWN gap
@@ -3314,6 +3349,10 @@ def _write_failure_manifest(
     stdout_log: Path | None = None,
     terminal_class: str = build_monitor.TERMINAL_CLASS_ERROR,
     terminal_class_evidence: str | None = None,
+    runner_error: str | None = None,
+    receipts_root: Path | None = None,
+    subprocess_ran: Any = _DERIVE,
+    extra: Mapping[str, Any] | None = None,
 ) -> Path | None:
     """Write the failure pack's machine-readable index (FEAT-DRF, Lane 1).
 
@@ -3385,13 +3424,23 @@ def _write_failure_manifest(
     pre-launch refusal). ``null`` on the wire is the honest answer there;
     ``-1`` would read as a signal kill that never happened.
 
+    The crash lane (19 October 2026) adds ``runner_error`` — the runner's own
+    error text, credentials replaced and cut (:func:`_plain_error_text`),
+    ``null`` when the runner raised nothing — and lets the coordinator write a
+    pack for a run that crashed: ``receipts_root`` names the project's own
+    receipts folder, ``subprocess_ran`` may be stated as unknown (``None``)
+    instead of derived from ``exit_code``, and ``extra`` adds fields that do
+    not overwrite any written here.
+
     Best-effort by the same principle as everything else in the pack: it never
     raises and never alters the build's outcome. Returns the manifest path on
     a successful write, else ``None`` — the caller uses that to decide whether
     a later terminal still owes the build a pack.
     """
     try:
-        dest_root = _receipts_root() / build_id
+        dest_root = (
+            receipts_root if receipts_root is not None else _receipts_root()
+        ) / build_id
         dest_root.mkdir(parents=True, exist_ok=True)
         manifest_path = dest_root / FAILURE_MANIFEST_NAME
         if manifest_path.exists():
@@ -3406,6 +3455,7 @@ def _write_failure_manifest(
             stdout_log=stdout_log,
             semantic_state=semantic_state,
             terminal_class=terminal_class,
+            subprocess_ran=subprocess_ran,
         )
         missing: list[str] = evidence["missing"]
         manifest = {
@@ -3466,7 +3516,13 @@ def _write_failure_manifest(
             # and "no clock fired at all" is worth stating out loud.
             "terminal_class": terminal_class,
             "terminal_class_evidence": terminal_class_evidence,
+            # --- crash lane (19 October 2026) ----------------------------
+            "runner_error": (
+                _plain_error_text(runner_error) if runner_error else None
+            ),
         }
+        for key, value in (extra or {}).items():
+            manifest.setdefault(key, value)
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
@@ -3510,6 +3566,7 @@ def _pack_evidence(
     stdout_log: Path | None,
     semantic_state: Mapping[str, Any] | None,
     terminal_class: str = build_monitor.TERMINAL_CLASS_ERROR,
+    subprocess_ran: Any = _DERIVE,
 ) -> dict[str, Any]:
     """Enumerate what this pack actually holds — and what it does not.
 
@@ -3557,11 +3614,17 @@ def _pack_evidence(
             "semantic_state_at_kill — no build monitor reading, so there "
             "is no named task/turn/phase at the moment of failure"
         )
+    ran = exit_code is not None if subprocess_ran is _DERIVE else subprocess_ran
+    if ran is None:
+        missing.append(
+            "whether the coding subprocess ran — the build's runner stopped "
+            "without reporting it, so nothing here can say"
+        )
     return {
         "stdout_log": str(log_path) if log_present and log_path else None,
         "worktree_kept": worktree_kept,
         "receipt_families": families,
-        "subprocess_ran": exit_code is not None,
+        "subprocess_ran": ran,
         # Timeout-truth lane: the inventory names the class too, so even a
         # THIN pack — one with no stdout, no worktree and no receipts — still
         # tells its reader whether this build ran out of time or broke.
@@ -5163,16 +5226,22 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         )
     wedge_verdict: build_monitor.WedgeVerdict | None = None
 
+    # ONE LONG LINE MUST NEVER KILL A BUILD (19 October 2026, FEAT-B874).
+    # ``readline()`` raised ValueError on a line over asyncio's 64 KiB limit
+    # and took the whole node down; this reader has no line limit and marks
+    # an over-long line as cut instead. One reader for the stream's whole
+    # life: the post-kill tail read below continues from it.
+    output_lines = OutputLines(proc.stdout) if proc.stdout is not None else None
+
     async def _drain_stdout() -> None:
         nonlocal stage_complete_count, last_coach_score, stopped_because
-        if proc.stdout is None:  # defensive — PIPE was requested above
+        if output_lines is None:  # defensive — PIPE was requested above
             return
         try:
             while True:
-                line = await proc.stdout.readline()
-                if not line:
+                decoded = await output_lines.next_line()
+                if decoded is None:
                     break
-                decoded = line.decode("utf-8", errors="replace").rstrip()
                 # Liveness first: the monitor sees every line, and classifies
                 # semantic ticks apart from heartbeats/noise itself.
                 if monitor is not None:
@@ -5259,6 +5328,12 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         watch_task = asyncio.ensure_future(_watch_for_wedge())
 
     timed_out = False
+    # An unexpected error while reading the build's output or waiting for it
+    # (19 October 2026, FEAT-B874). It used to raise straight out of this
+    # node: the run ended in an error with no terminal, no failure pack, and
+    # the GuardKit child still running unread. Now the build is stopped and
+    # fails honestly below, with the same full pack as any other failure.
+    runner_error: BaseException | None = None
     try:
         await asyncio.wait_for(
             asyncio.gather(_drain_stdout(), proc.wait()),
@@ -5327,12 +5402,12 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
                 feature_id,
             )
         # TAIL LOSS (2026-08-07). ``wait_for`` cancelled the drain BEFORE the
-        # kill above, so the drain died mid-``readline()`` and its ``finally``
+        # kill above, so the drain died mid-read and its ``finally``
         # already closed the tee — every byte still sitting in the pipe was
         # read by nobody. The wedge path never had this hole (its kill leaves
         # the drain running to EOF); this gives the ordinary-timeout path the
         # same bounded post-kill read, explicitly budgeted. It runs AFTER the
-        # reap (so there is no concurrent reader and readline() cannot block on
+        # reap (so there is no concurrent reader and the read cannot block on
         # a live writer) and BEFORE the terminal is classified below, so the
         # recovered lines actually reach the monitor's semantic state and the
         # in-band timeout evidence. Best-effort; it cannot alter the outcome.
@@ -5342,7 +5417,32 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             monitor,
             budget=TAIL_READ_BUDGET_SECONDS,
             feature_id=feature_id,
+            lines=output_lines,
         )
+        stdout_tee.close()
+    except Exception as exc:  # noqa: BLE001 — the build fails; it must not crash
+        runner_error = exc
+        if watch_task is not None and not watch_task.done():
+            watch_task.cancel()
+        logger.error(
+            "autobuild_runner: the runner hit an error while reading the "
+            "build's output (%s: %s) feature_id=%s — stopping every process "
+            "the build owns and failing the build with a failure pack",
+            type(exc).__name__,
+            _plain_error_text(str(exc)),
+            feature_id,
+        )
+        if await _stop_owned_shielded(owned_build, proc, feature_id=feature_id):
+            raise asyncio.CancelledError()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5.0)
+        except asyncio.TimeoutError:
+            logger.warning(
+                "autobuild_runner: subprocess did not exit after the stop — "
+                "leaking pid=%s feature_id=%s",
+                proc.pid,
+                feature_id,
+            )
         stdout_tee.close()
     finally:
         # The subprocess is reaped (or the node is being cancelled): stop the
@@ -5373,7 +5473,7 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     stop_requested = owned_build.stop_requested
     if await _stop_owned_shielded(owned_build, proc, feature_id=feature_id):
         raise asyncio.CancelledError()
-    if stop_requested and not timed_out:
+    if stop_requested and not timed_out and runner_error is None:
         # A relaunch of this build stopped this run (see
         # _stop_an_earlier_run_of). It finishes CANCELLED on its own thread;
         # the worktree and receipts are kept.
@@ -5396,7 +5496,12 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
 
     exit_code = proc.returncode if proc.returncode is not None else -1
 
-    if wedge_verdict is not None or timed_out or exit_code != 0:
+    if (
+        wedge_verdict is not None
+        or timed_out
+        or runner_error is not None
+        or exit_code != 0
+    ):
         # A non-zero exit also covers guardkit's own refusal on a missing
         # feature YAML in the (worktree) tree — we delegate that detection to
         # guardkit rather than reimplementing its feature-file discovery, and
@@ -5408,6 +5513,14 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             # reason is semantic and never says "timeout": it names the last
             # task, turn, decision, files_changed and phase (design §d).
             reason = wedge_verdict.reason()
+        elif runner_error is not None:
+            reason = (
+                "the build runner stopped the build after an error of its own "
+                "while reading the build's output "
+                f"({type(runner_error).__name__}: "
+                f"{_plain_error_text(str(runner_error))}); every process the "
+                "build owned was stopped"
+            )
         elif timed_out and budget_bound:
             # FEAT-UBS-002 — the per-build budget cap (not the env default) was
             # the binding bound, so name it in the honest failure reason.
@@ -5528,6 +5641,11 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             stdout_log=stdout_tee.path,
             terminal_class=terminal_class,
             terminal_class_evidence=terminal_class_evidence,
+            runner_error=(
+                f"{type(runner_error).__name__}: {str(runner_error)}"
+                if runner_error is not None
+                else None
+            ),
         )
         return _snapshot_update(
             _build_failed_snapshot(

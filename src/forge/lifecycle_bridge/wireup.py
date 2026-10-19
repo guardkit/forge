@@ -353,6 +353,13 @@ BuildStateRecorder = Callable[[PipelineEvent], Awaitable[None]]
 #: redelivery re-recording the same verdict is a no-op.
 TerminalClassRecorder = Callable[[str, str], None]
 
+#: ``(*, build_id, feature_id, correlation_id, run_status, runner_error,
+#: last_values) -> object`` — leaves a failure pack for a run that ended with
+#: no terminal (19 October 2026). Production binds
+#: :func:`forge.lifecycle_bridge.crash_pack.write_crash_pack` to the build
+#: row's project folder and branch; must not raise (the caller guards it).
+CrashPackWriter = Callable[..., object]
+
 
 def _default_identity_provider() -> IdentityProvider:
     """Return an identity provider that always reports "no identity yet".
@@ -505,6 +512,7 @@ class LifecycleBridgeWireup:
         build_mode_reader: "BuildModeReader | None" = None,
         terminal_class_recorder: "TerminalClassRecorder | None" = None,
         merge_offer_hook: Callable[[PipelineEvent], Awaitable[None]] | None = None,
+        crash_pack_writer: "CrashPackWriter | None" = None,
     ) -> None:
         if not isinstance(bridge, LifecycleBridge):
             raise TypeError(
@@ -559,6 +567,12 @@ class LifecycleBridgeWireup:
         # tiers, and any caller that has not opted in) keeps the watchdog
         # armed for EVERY build: the pre-lane behaviour, byte for byte.
         self._build_mode_reader = build_mode_reader
+        # A run that ended with no terminal leaves a failure pack the repair
+        # can read (19 October 2026). ``None`` (unit tiers) writes nothing.
+        self._crash_pack_writer = crash_pack_writer
+        # The run state the fetch-on-empty read last saw, per feature, kept
+        # for the no-terminal path that may follow it.
+        self._last_run_state: dict[str, RunStateSnapshot] = {}
         # FEAT-UBS-002 stage 2 (DETECT) — mid-run budget-breach detector.
         # ``None`` (the default, and every attended / caps-off deployment) makes
         # the observer's budget hook a strict no-op: zero extra DB / publish
@@ -983,6 +997,7 @@ class LifecycleBridgeWireup:
             # Drop the per-observer budget session (in-memory state does not
             # outlive the observer — FEAT-UBS-002 stage 2).
             self._budget_sessions.pop(feature_id, None)
+            self._last_run_state.pop(feature_id, None)
 
     # ------------------------------------------------------------------
     # SSE consumption with reconnect (TASK-FRR-PEB-008 AC-2 / AC-4)
@@ -1176,6 +1191,7 @@ class LifecycleBridgeWireup:
 
         if snapshot is None:
             return False
+        self._last_run_state[feature_id] = snapshot
 
         return await self._replay_run_state_snapshot(
             snapshot=snapshot,
@@ -2202,6 +2218,8 @@ class LifecycleBridgeWireup:
             recoverable=True,
         )
 
+        self._write_crash_pack(context, build_id)
+
         logger.warning(
             "wireup: feature_id=%s stream ended without a terminal envelope "
             "and run-state fetch did not surface a terminal state; "
@@ -2222,6 +2240,39 @@ class LifecycleBridgeWireup:
                 "message un-acked so JetStream redelivery / next-boot "
                 "recovery retries",
                 feature_id,
+            )
+
+    def _write_crash_pack(self, context: BuildContext, build_id: str) -> None:
+        """Leave a failure pack for a run that ended with no terminal.
+
+        19 October 2026 (FEAT-B874): the runner writes every failure pack
+        from a terminal, and a crashed run reaches none, so its repair was
+        refused for "no readable manifest". The injected writer records the
+        run's status, the runner's error text and the last state it reported
+        (:mod:`forge.lifecycle_bridge.crash_pack`). Best-effort: it can
+        never change the synthetic terminal that follows.
+        """
+        snapshot = self._last_run_state.pop(context.feature_id, None)
+        if self._crash_pack_writer is None:
+            return
+        try:
+            self._crash_pack_writer(
+                build_id=build_id,
+                feature_id=context.feature_id,
+                correlation_id=context.correlation_id,
+                run_status=snapshot.status if snapshot is not None else None,
+                runner_error=snapshot.error if snapshot is not None else None,
+                last_values=snapshot.values if snapshot is not None else None,
+            )
+        except Exception as exc:  # noqa: BLE001 — never block the terminal
+            logger.warning(
+                "wireup: crash failure pack NOT written for feature_id=%s "
+                "build_id=%s (%s: %s); the synthetic build-failed still "
+                "publishes",
+                context.feature_id,
+                build_id,
+                type(exc).__name__,
+                exc,
             )
 
     async def _resolve_build_id(self, feature_id: str, correlation_id: str) -> str:
