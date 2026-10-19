@@ -603,6 +603,12 @@ class LifecycleBridgeWireup:
         # :meth:`take_ack_handle`. A routine build is unchanged: its entry
         # is dropped when its observer finishes, exactly as before.
         self._handles: dict[str, BuildAckHandle] = {}
+        # Which build each held handle belongs to (its correlation id). A fix
+        # journey reuses its parent's feature id, so after one journey is
+        # cancelled a NEW build of the same feature can register here while
+        # the old journey's close-out is still to come; the take below hands
+        # a handle only to the build it belongs to (19 October 2026).
+        self._handle_correlations: dict[str, str] = {}
         # Tracks shutdown so a late ``register_ack_handle`` call after
         # ``shutdown()`` has begun raises rather than silently leaking
         # an observer that will never be cancelled.
@@ -735,6 +741,7 @@ class LifecycleBridgeWireup:
         # the row immediately after this returns.
         self._bridge.attach(build_context, bridge_ack_handle)
         self._handles[feature_id] = handle
+        self._handle_correlations[feature_id] = correlation_id
 
         # Start the observer task. ``create_task`` schedules immediately
         # and returns; the consumer's fetch loop unblocks on this
@@ -972,7 +979,7 @@ class LifecycleBridgeWireup:
             # there is what left the pipeline consumer's slot held for a
             # full hour on 2026-09-08.
             if not conductor_owns_the_ack:
-                self._handles.pop(feature_id, None)
+                self._drop_handle(feature_id, correlation_id)
             # Drop the per-observer budget session (in-memory state does not
             # outlive the observer — FEAT-UBS-002 stage 2).
             self._budget_sessions.pop(feature_id, None)
@@ -2291,6 +2298,7 @@ class LifecycleBridgeWireup:
         # (e.g. test fixtures) starts from a clean state.
         self._observers.clear()
         self._handles.clear()
+        self._handle_correlations.clear()
         self._bridge.shutdown()
         logger.info(
             "wireup.shutdown: drained %d observer task(s)",
@@ -2311,7 +2319,17 @@ class LifecycleBridgeWireup:
         """
         return sum(1 for task in self._observers.values() if not task.done())
 
-    def take_ack_handle(self, feature_id: str) -> BuildAckHandle | None:
+    def _drop_handle(self, feature_id: str, correlation_id: str) -> None:
+        """Forget this build's handle — never a later build's of the feature."""
+        held = self._handle_correlations.get(feature_id)
+        if held is not None and held != correlation_id:
+            return
+        self._handles.pop(feature_id, None)
+        self._handle_correlations.pop(feature_id, None)
+
+    def take_ack_handle(
+        self, feature_id: str, correlation_id: str | None = None
+    ) -> BuildAckHandle | None:
         """Hand out this build's queued-message handle, and forget it here.
 
         The conductor's terminal close-out calls this so a finished fix
@@ -2329,7 +2347,25 @@ class LifecycleBridgeWireup:
         line, and does nothing else. ``None`` is the ordinary answer for a
         build this bridge never registered (a journey started before the
         bridge attached, or any test).
+
+        ``correlation_id`` names the build asking. When given, a handle
+        held for a DIFFERENT build of the same feature is left where it is
+        and ``None`` is returned: a fix journey reuses its parent's feature
+        id, so once a cancelled journey has released its place a new build
+        of that feature can be holding a handle here, and the old journey's
+        close-out must never acknowledge it (19 October 2026).
         """
+        held = self._handle_correlations.get(feature_id)
+        if correlation_id is not None and held is not None and held != correlation_id:
+            logger.info(
+                "wireup.take_ack_handle: feature_id=%s — the handle held here "
+                "belongs to correlation_id=%s, not %s; leaving it registered",
+                feature_id,
+                held,
+                correlation_id,
+            )
+            return None
+        self._handle_correlations.pop(feature_id, None)
         return self._handles.pop(feature_id, None)
 
     def get_observer_task(self, feature_id: str) -> asyncio.Task[None] | None:

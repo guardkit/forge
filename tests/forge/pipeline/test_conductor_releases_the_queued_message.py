@@ -96,7 +96,7 @@ class FakeBridge:
     handles: dict[str, Any] = field(default_factory=dict)
     asked_for: list[str] = field(default_factory=list)
 
-    def take_ack_handle(self, feature_id: str) -> Any:
+    def take_ack_handle(self, feature_id: str, correlation_id: str | None = None) -> Any:
         self.asked_for.append(feature_id)
         return self.handles.pop(feature_id, None)
 

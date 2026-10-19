@@ -515,6 +515,10 @@ class ConductorTurnLoop:
         #: already addressed them. Carried onto the run report so the
         #: journey's own result says what the review seat failed to verify.
         self._unverified_findings: list[str] = []
+        #: Set once this journey's queued message has been released, so a
+        #: later close-out never asks for a handle again: after a cancel
+        #: frees the place, a new build of the same feature may hold one.
+        self._released = False
 
     async def drive(self, build_id: str) -> ConductorRunReport:
         """Walk ``build_id`` through the conductor until it stops.
@@ -1306,16 +1310,27 @@ class ConductorTurnLoop:
         await self._release(build_id)
 
     async def _release(self, build_id: str) -> None:
-        """Release the build's queued message; never raises.
+        """Release the build's queued message, once per journey; never raises.
 
-        The release seam takes the handle, so a second call for the same
-        build (the watch, then the close-out) acknowledges nothing twice.
+        Once released (the early release after a cancel from outside), a
+        later close-out does not ask again. By then the place is free and a
+        new build of the same feature may hold a handle in the bridge; the
+        bridge also checks the handle belongs to this build, so either
+        guard alone keeps that build's message held.
         """
         deps = self._deps
         if deps.release_queue_message is None:
             return
+        if self._released:
+            logger.info(
+                "conductor: build_id=%s — its queued message was already "
+                "released; not asking again",
+                build_id,
+            )
+            return
         try:
             await _maybe_await(deps.release_queue_message(build_id))
+            self._released = True
         except Exception as exc:  # noqa: BLE001 — never crash on a terminal
             logger.warning(
                 "conductor: releasing the queued message raised %s: %s for "

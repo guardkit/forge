@@ -55,6 +55,10 @@ from forge.pipeline.supervisor import TurnOutcome, TurnReport
 
 BUILD_ID = "build-FEAT-0C1A-20260101062916"
 FEATURE_ID = "FEAT-0C1A"
+#: A fix journey's correlation id names its parent build, not the feature.
+CORRELATION_ID = "fix-build-FEAT-0C1A-20260101060102"
+#: The next build of the same feature, admitted once the place is free.
+NEXT_CORRELATION_ID = "corr-next-build-of-FEAT-0C1A"
 #: Short enough that "promptly" is measured in milliseconds here.
 WATCH_SECONDS = 0.01
 #: The longest a test waits for something that should happen at once.
@@ -84,12 +88,26 @@ class FakeBridge:
     """The half of the lifecycle bridge the conductor is given.
 
     ``take_ack_handle`` hands the handle over and forgets it, exactly as
-    the real wireup does; ``handles`` is what the bridge still holds.
+    the real wireup does, and only to the build it belongs to; ``handles``
+    is what the bridge still holds. Handles given to the constructor belong
+    to this journey.
     """
 
     handles: dict[str, Any] = field(default_factory=dict)
+    owners: dict[str, str] = field(default_factory=dict)
+    asked: list[tuple[str, str | None]] = field(default_factory=list)
+    check_identity: bool = True
 
-    def take_ack_handle(self, feature_id: str) -> Any:
+    def register(self, feature_id: str, correlation_id: str, handle: Any) -> None:
+        self.handles[feature_id] = handle
+        self.owners[feature_id] = correlation_id
+
+    def take_ack_handle(self, feature_id: str, correlation_id: str | None = None) -> Any:
+        self.asked.append((feature_id, correlation_id))
+        owner = self.owners.get(feature_id, CORRELATION_ID)
+        if self.check_identity and correlation_id is not None and owner != correlation_id:
+            return None
+        self.owners.pop(feature_id, None)
         return self.handles.pop(feature_id, None)
 
 
@@ -328,11 +346,14 @@ class TestACancelDuringAStageReleasesTheMessageAtOnce:
             report = asyncio.run(scenario())
 
         assert report.outcome is ConductorRunOutcome.COMPLETED
-        # Both releases found nothing to release, and nothing raised.
+        # The early release found nothing to release; the close-out does not
+        # ask again (the journey's release is done), and nothing raised.
         released = [
             r for r in caplog.records if "nothing to release" in r.getMessage()
         ]
-        assert len(released) == 2
+        assert len(released) == 1
+        assert bridge.asked == [(FEATURE_ID, CORRELATION_ID)]
+        assert any("not asking again" in r.getMessage() for r in caplog.records)
         assert not [r for r in caplog.records if "raised" in r.getMessage()]
         assert pool.get_build_row(BUILD_ID).status is BuildState.CANCELLED
 
@@ -367,6 +388,94 @@ class TestACancelDuringAStageReleasesTheMessageAtOnce:
         assert msg.acks == 1
         # The stop's close-out does not overwrite the cancel.
         assert pool.get_build_row(BUILD_ID).status is BuildState.CANCELLED
+
+
+# ---------------------------------------------------------------------------
+# The next build of the same feature keeps its message
+# ---------------------------------------------------------------------------
+
+
+class TestTheNextBuildOfTheFeatureKeepsItsMessage:
+    """Codex R1 and the coach, 19 October 2026.
+
+    A fix journey shares its feature id with its parent and with any later
+    build of the feature. Once the cancel has released the journey's place,
+    a new build B of the same feature can be admitted and register its own
+    handle in the bridge before the cancelled journey's stage ends. The
+    journey's close-out must leave B's message held. Two guards stop it,
+    and each is pinned alone here: the journey releases at most once, and
+    the bridge hands a handle only to the build it belongs to.
+    """
+
+    def _cancel_then_admit_next_build(
+        self,
+        db_path: Path,
+        pool: SqliteLifecyclePersistence,
+        bridge: FakeBridge,
+        msg_a: FakeMsg,
+        msg_b: FakeMsg,
+    ) -> Any:
+        supervisor = StageInFlight(pool, TurnOutcome.DISPATCHED)
+
+        async def scenario() -> Any:
+            journey = asyncio.ensure_future(
+                drive_fix_journey(BUILD_ID, _deps(pool, bridge, supervisor))
+            )
+            await asyncio.wait_for(supervisor.started.wait(), PROMPT_SECONDS)
+            _forge_cancel(db_path)
+            await _until(lambda: msg_a.acks == 1)
+            # B is admitted into the freed place and registers its handle
+            # while A's stage is still running.
+            bridge.register(FEATURE_ID, NEXT_CORRELATION_ID, make_msg_ack_handle(msg_b))
+            supervisor.finish.set()
+            return await asyncio.wait_for(journey, PROMPT_SECONDS)
+
+        return asyncio.run(scenario())
+
+    def test_the_cancelled_journeys_close_out_leaves_the_next_build_held(
+        self, db_path: Path, pool: SqliteLifecyclePersistence
+    ) -> None:
+        msg_a, msg_b = FakeMsg(), FakeMsg()
+        bridge = FakeBridge(handles={FEATURE_ID: make_msg_ack_handle(msg_a)})
+
+        report = self._cancel_then_admit_next_build(db_path, pool, bridge, msg_a, msg_b)
+
+        assert report.outcome is ConductorRunOutcome.COMPLETED
+        assert msg_a.acks == 1
+        assert msg_b.acks == 0
+        assert FEATURE_ID in bridge.handles
+        assert bridge.owners[FEATURE_ID] == NEXT_CORRELATION_ID
+
+    def test_releasing_once_alone_protects_the_next_build(
+        self, db_path: Path, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """Even a bridge that hands out by feature alone is not asked twice."""
+        msg_a, msg_b = FakeMsg(), FakeMsg()
+        bridge = FakeBridge(
+            handles={FEATURE_ID: make_msg_ack_handle(msg_a)}, check_identity=False
+        )
+
+        self._cancel_then_admit_next_build(db_path, pool, bridge, msg_a, msg_b)
+
+        assert msg_b.acks == 0
+        assert len(bridge.asked) == 1
+        assert FEATURE_ID in bridge.handles
+
+    def test_the_identity_check_alone_protects_the_next_build(
+        self, db_path: Path, pool: SqliteLifecyclePersistence
+    ) -> None:
+        """A release asked for by A never takes B's handle."""
+        msg_b = FakeMsg()
+        bridge = FakeBridge()
+        bridge.register(FEATURE_ID, NEXT_CORRELATION_ID, make_msg_ack_handle(msg_b))
+        _forge_cancel(db_path)
+        deps = _deps(pool, bridge, supervisor=object())
+
+        asyncio.run(deps.release_queue_message(BUILD_ID))
+
+        assert bridge.asked == [(FEATURE_ID, CORRELATION_ID)]
+        assert msg_b.acks == 0
+        assert FEATURE_ID in bridge.handles
 
 
 # ---------------------------------------------------------------------------
