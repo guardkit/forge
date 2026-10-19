@@ -668,9 +668,22 @@ It only makes outgoing calls to Linear; nothing is exposed.
   (only the registered repositories, so each gets a Linear project), and its own small state volume
   `linear-door-state`. It is not given the Slack tokens.
 - **The dashboard's figures (optional, 18 October 2026):** for the project update it posts to Linear after each
-  merge, the door reads the dashboard's `project-summaries.json`. Add `compose.linear-dashboard.yaml` to
-  `COMPOSE_FILE` and set `FACTORY_DASHBOARD_DATA_DIR` to the dashboard's data folder; the folder is mounted
-  read-only. Without it, the updates say cost, open issues and health are not available from the dashboard.
+  merge, the door reads the dashboard's `project-summaries.json`. Set `FACTORY_DASHBOARD_DATA_DIR` in the env file
+  to the dashboard's data folder (the folder is mounted read-only) and add
+  `-f "$FACTORY_ESTATE_DIR/compose.linear-dashboard.yaml"` **after** the existing `-f` files of the start command
+  above (the explicit `-f` list replaces `COMPOSE_FILE`, so the overlay must be in it). Local bus:
+
+  ```bash
+  sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file "$FACTORY_ESTATE_ENV" --project-name "$FACTORY_ESTATE_PROJECT" -f "$FACTORY_ESTATE_DIR/compose.yaml" -f "$FACTORY_ESTATE_DIR/compose.linear-dashboard.yaml" up -d'
+  ```
+
+  External bus:
+
+  ```bash
+  sops exec-env "$NATS_SECRETS_FILE" 'docker compose --env-file "$FACTORY_ESTATE_ENV" --project-name "$FACTORY_ESTATE_PROJECT" -f "$FACTORY_ESTATE_DIR/compose.yaml" -f "$FACTORY_ESTATE_DIR/compose.external-bus.yaml" -f "$FACTORY_ESTATE_DIR/compose.linear-dashboard.yaml" up -d'
+  ```
+
+  Without the overlay, the updates say cost, open issues and health are not available from the dashboard.
 
 ## Walk (b): a cloud machine
 
