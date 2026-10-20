@@ -13,6 +13,7 @@ from forge.adapters.sqlite import connect as sqlite_connect
 from forge.config.models import ForgeConfig, SecuritySweepConfig
 from forge.lifecycle import migrations
 from forge.planning.run_store import SqlitePlanningRunStore
+from forge.planning.states import PlanningState
 from forge.planning.work_queue_store import WorkQueueStore
 from forge.security_sweep.schedule import (
     RECHECK_SECONDS,
@@ -141,6 +142,227 @@ class TestIdle:
     def test_an_unreadable_database_is_busy(self, connection) -> None:
         connection.close()
         assert not factory_is_idle(connection)
+
+
+def _insert_build(connection, build_id: str, status: str, *, mode: str = "mode-b") -> None:
+    connection.execute(
+        """
+        INSERT INTO builds (
+            build_id, feature_id, repo, branch, feature_yaml_path, status,
+            triggered_by, correlation_id, queued_at, max_turns,
+            sdk_timeout_seconds, mode
+        ) VALUES (?, 'FEAT-TEST1', 'guardkit/example-project', 'main',
+                  'feature.yaml', ?, 'cli', ?, ?, 50, 3600, ?)
+        """,
+        (build_id, status, f"corr-{build_id}", datetime.now(timezone.utc).isoformat(), mode),
+    )
+    connection.commit()
+
+
+def _offer_merge_card(connection, build_id: str, *, offered_at: datetime) -> None:
+    """A merge card on the record the way the real offer writes it."""
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence, StageLogEntry
+    from forge.pipeline.merge_offer import (
+        MERGE_OFFER_STAGE_LABEL,
+        MERGE_OFFER_TARGET_IDENTIFIER,
+    )
+
+    SqliteLifecyclePersistence(connection=connection).record_stage(
+        StageLogEntry(
+            build_id=build_id,
+            stage_label=MERGE_OFFER_STAGE_LABEL,
+            target_kind="local_tool",
+            target_identifier=MERGE_OFFER_TARGET_IDENTIFIER,
+            status="GATED",
+            gate_mode="MANDATORY_HUMAN_APPROVAL",
+            started_at=offered_at,
+            completed_at=offered_at,
+            duration_secs=0.0,
+            details={"merge_offer": {"build_id": build_id, "request_id": f"merge-{build_id}",
+                                     "resume_options": ["approve", "reject"]}},
+        )
+    )
+
+
+def _planning_run(connection, correlation_id: str, *states, target_terminal: bool = False):
+    """A planning run moved through ``states`` by the store's own transitions."""
+    from forge.planning.states import PlanningState
+
+    store = SqlitePlanningRunStore(connection, target_terminal_enabled=target_terminal)
+    store.record_queued(
+        correlation_id=correlation_id, originating_user="rich", expected_approver="rich",
+        request_text="x", triggered_by="cli",
+    )
+    for state in states:
+        assert store.transition(correlation_id, PlanningState(state), actor_identity="test") is None
+    return store
+
+
+def _answer_merge_card(connection, build_id: str) -> None:
+    """The merge word on the record, the way the merge executor writes it."""
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence, StageLogEntry
+    from forge.pipeline.merge_executor import MERGE_DECISION_TARGET_IDENTIFIER
+    from forge.pipeline.merge_offer import MERGE_OFFER_STAGE_LABEL
+
+    now = datetime.now(timezone.utc)
+    SqliteLifecyclePersistence(connection=connection).record_stage(
+        StageLogEntry(
+            build_id=build_id,
+            stage_label=MERGE_OFFER_STAGE_LABEL,
+            target_kind="local_tool",
+            target_identifier=MERGE_DECISION_TARGET_IDENTIFIER,
+            status="PASSED",
+            gate_mode="MANDATORY_HUMAN_APPROVAL",
+            started_at=now,
+            completed_at=now,
+            duration_secs=0.0,
+            details={"merge_decision": {"decision": "approve", "decided_by": "rich"}},
+        )
+    )
+
+
+#: The build states that are working: the queue's active states but PAUSED.
+WORKING_BUILD_STATES = sorted({"QUEUED", "PREPARING", "RUNNING", "FINALISING"})
+
+
+class TestWorkWaitingForAPersonDoesNotKeepTheSweepOff:
+    """20 October 2026: one merge card left waiting for a person kept the
+    sweep off all night. The sweep waits so as not to compete with builds for
+    the model and the machines; work that is only waiting for a person's
+    answer uses neither. The idle test is read through :func:`compose_sweep`,
+    which the nightly run, ``--once`` and the mid-sweep check all use, with
+    the coordinator's default settings, whose queue counts an unanswered card
+    as a place for a day."""
+
+    @pytest.fixture
+    def connection(self, tmp_path: Path):
+        cx = sqlite_connect.connect_writer(tmp_path / "forge.db")
+        migrations.apply_at_boot(cx)
+        yield cx
+        cx.close()
+
+    def _is_idle(self, connection, tmp_path: Path):
+        from forge.security_sweep.schedule import compose_sweep
+
+        config = ForgeConfig(permissions={"filesystem": {"allowlist": []}})
+        # The queue's own hold is still a day; only the sweep ignores it.
+        assert config.queue.merge_offer_hold_seconds == 24 * 60 * 60
+
+        async def publish(text: str) -> None:
+            pass
+
+        deps, is_idle = compose_sweep(
+            config, db_path=tmp_path / "forge.db", publish=publish, connection=connection
+        )
+        # The mid-sweep check ("a build started during the sweep") is the same test.
+        assert deps.is_idle is is_idle
+        return is_idle
+
+    def test_an_open_merge_card_younger_than_the_hold_and_nothing_else_is_idle(self, connection, tmp_path: Path) -> None:
+        """MUTATION CHECK: read the merge cards with the queue's hold again and this goes red."""
+        from forge.planning.work_queue_loop import count_in_flight
+
+        _insert_build(connection, "build-TEST1", "COMPLETE")
+        _offer_merge_card(connection, "build-TEST1", offered_at=datetime.now(timezone.utc) - timedelta(minutes=12))
+        # The queue still counts the card as work in flight.
+        assert count_in_flight(connection, merge_offer_hold_seconds=24 * 60 * 60) == 1
+        assert self._is_idle(connection, tmp_path)() is True
+        assert factory_is_idle(connection) is True
+
+    def test_a_planning_run_paused_at_a_card_and_nothing_else_is_idle(self, connection, tmp_path: Path) -> None:
+        """MUTATION CHECK: count a PAUSED planning run as busy again and this goes red."""
+        store = _planning_run(connection, "c-paused", "RUNNING")
+        # The planning checkpoint writes its card row, then pauses the run.
+        store._record_event(correlation_id="c-paused", stage_label="product-docs", status="GATED")
+        assert store.transition("c-paused", PlanningState.PAUSED, actor_identity="gate-check") is None
+        assert self._is_idle(connection, tmp_path)() is True
+
+    def test_a_planning_run_at_its_spec_card_and_nothing_else_is_idle(self, connection, tmp_path: Path) -> None:
+        """MUTATION CHECK: count a run whose latest event is an open card as busy and this goes red.
+
+        The spec card waits with the run still in its spec state, not PAUSED."""
+        store = _planning_run(connection, "c-spec", "RUNNING", "FEATURE_SPEC", target_terminal=True)
+        store._record_event(correlation_id="c-spec", stage_label="feature-spec-digest-review", status="GATED")
+        assert self._is_idle(connection, tmp_path)() is True
+        # A card put back after a restart is still only waiting.
+        store._record_event(correlation_id="c-spec", stage_label="feature-spec-digest-review", status="reopened")
+        assert self._is_idle(connection, tmp_path)() is True
+
+    def test_a_spec_card_once_answered_is_busy_again(self, connection, tmp_path: Path) -> None:
+        store = _planning_run(connection, "c-spec", "RUNNING", "FEATURE_SPEC", target_terminal=True)
+        store._record_event(correlation_id="c-spec", stage_label="feature-spec-digest-review", status="GATED")
+        store._record_event(correlation_id="c-spec", stage_label="feature-spec-digest-review", status="approved")
+        assert self._is_idle(connection, tmp_path)() is False
+
+    def test_a_planning_run_writing_its_spec_is_busy(self, connection, tmp_path: Path) -> None:
+        _planning_run(connection, "c-spec", "RUNNING", "FEATURE_SPEC", target_terminal=True)
+        assert self._is_idle(connection, tmp_path)() is False
+
+    def test_a_build_paused_at_its_gate_and_nothing_else_is_idle(self, connection, tmp_path: Path) -> None:
+        """MUTATION CHECK: count a PAUSED build as busy again and this goes red."""
+        _insert_build(connection, "build-TEST3", "PAUSED")
+        assert self._is_idle(connection, tmp_path)() is True
+
+    def test_a_repair_running_with_its_merge_card_open_and_nothing_else_is_idle(self, connection, tmp_path: Path) -> None:
+        """MUTATION CHECK: count every RUNNING build as busy again and this goes red.
+
+        A repair (a fix journey, mode c) publishes its merge card and leaves
+        its build RUNNING until the merge word closes it."""
+        _insert_build(connection, "build-TEST4", "RUNNING", mode="mode-c")
+        _offer_merge_card(connection, "build-TEST4", offered_at=datetime.now(timezone.utc) - timedelta(minutes=12))
+        assert self._is_idle(connection, tmp_path)() is True
+
+    def test_a_repair_running_once_its_merge_card_is_answered_is_busy(self, connection, tmp_path: Path) -> None:
+        _insert_build(connection, "build-TEST4", "RUNNING", mode="mode-c")
+        _offer_merge_card(connection, "build-TEST4", offered_at=datetime.now(timezone.utc) - timedelta(minutes=12))
+        _answer_merge_card(connection, "build-TEST4")
+        assert self._is_idle(connection, tmp_path)() is False
+
+    @pytest.mark.parametrize("status", ["QUEUED", "PREPARING", "FINALISING"])
+    def test_a_repair_run_again_with_its_merge_card_open_is_busy(self, connection, tmp_path: Path, status: str) -> None:
+        """MUTATION CHECK: leave out an open-card build in every state and this goes red.
+
+        After a coordinator restart a repair at its card is reset to PREPARING
+        and run again under the same build id; its old card is still open."""
+        _insert_build(connection, "build-TEST6", status, mode="mode-c")
+        _offer_merge_card(connection, "build-TEST6", offered_at=datetime.now(timezone.utc) - timedelta(minutes=12))
+        assert self._is_idle(connection, tmp_path)() is False
+
+    @pytest.mark.parametrize("status", WORKING_BUILD_STATES)
+    def test_every_working_build_state_is_busy(self, connection, tmp_path: Path, status: str) -> None:
+        from forge.planning.work_queue_loop import BUILD_ACTIVE_STATES
+
+        # The list here is the queue's own active states without PAUSED.
+        assert set(WORKING_BUILD_STATES) == set(BUILD_ACTIVE_STATES) - {"PAUSED"}
+        _insert_build(connection, "build-TEST5", status)
+        assert self._is_idle(connection, tmp_path)() is False
+
+    def test_an_admitted_mission_attempt_is_busy(self, connection, tmp_path: Path) -> None:
+        from forge.lifecycle.missions import ensure_tables
+
+        ensure_tables(connection)
+        connection.execute(
+            "INSERT INTO mission_attempts (mission_id, key, attempt, correlation_id, status) "
+            "VALUES ('m-test01', 'A', 1, 'corr-mission-1', 'ADMITTED')"
+        )
+        connection.commit()
+        assert self._is_idle(connection, tmp_path)() is False
+
+    def test_an_active_build_is_busy(self, connection, tmp_path: Path) -> None:
+        _insert_build(connection, "build-TEST2", "RUNNING")
+        assert self._is_idle(connection, tmp_path)() is False
+
+    def test_an_open_planning_run_is_busy(self, connection, tmp_path: Path) -> None:
+        SqlitePlanningRunStore(connection).record_queued(
+            correlation_id="c-1", originating_user="rich", expected_approver="rich",
+            request_text="x", triggered_by="cli",
+        )
+        assert self._is_idle(connection, tmp_path)() is False
+
+    def test_a_card_waiting_beside_real_work_is_busy(self, connection, tmp_path: Path) -> None:
+        _insert_build(connection, "build-TEST3", "PAUSED")
+        _planning_run(connection, "c-running", "RUNNING")
+        assert self._is_idle(connection, tmp_path)() is False
 
 
 class TestTheSettings:

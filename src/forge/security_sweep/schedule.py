@@ -3,8 +3,9 @@
 Public surface
 ==============
 
-- :func:`factory_is_idle` — nothing in flight, by the same count the work
-  queue's admission uses (``count_in_flight``), and no planning run open.
+- :func:`factory_is_idle` — nothing using the model or the machines: the
+  work the queue's admission count (``count_in_flight``) counts, and any
+  planning run not finished, except work only waiting for a person's card.
 - :class:`NightlySchedule` — the background task ``forge serve`` runs when
   ``security_sweep.enabled`` is true.
 - :func:`compose_sweep` — builds a run's :class:`~.sweep.SweepDeps` from the
@@ -43,32 +44,114 @@ RECHECK_SECONDS = 15 * 60
 SKIPPED_LINE = "Nightly security check: skipped: the factory was busy all night."
 
 
-def factory_is_idle(connection: sqlite3.Connection, *, merge_offer_hold_seconds: int = 0) -> bool:
-    """True when nothing is in flight and no planning run is open.
+#: The planning-run event statuses that mean a card is in front of a person
+#: and not yet answered: the planning driver's open-card statuses
+#: (``_AUTH_DOOR_OPEN_STATUSES`` in ``planning/driver.py``; the spec card and
+#: the sign-in question write them), which the planning checkpoint's own
+#: card row (``planning/gate_adapters.py``) also writes.
+CARD_OPEN_STATUSES = frozenset({"GATED", "reopened"})
 
-    "In flight" is the work queue's own admission count
-    (:func:`forge.planning.work_queue_loop.count_in_flight`): admitted rows not
-    yet started, active planning runs, active builds and unanswered merge
-    cards. "No planning run open" adds any planning run not yet in a terminal
-    state. A database that cannot be read counts as busy.
+
+def factory_is_idle(connection: sqlite3.Connection) -> bool:
+    """True when nothing in the factory is using the model or the machines.
+
+    The sweep waits for a quiet factory so that it does not compete with
+    builds for the model and the machines. So it counts the same work the
+    queue's admission count
+    (:func:`forge.planning.work_queue_loop.count_in_flight`) counts, read
+    from the same rows and states, with one difference: **work that is only
+    waiting for a person's answer does not count** (20 October 2026). That
+    is:
+
+    - an unanswered merge card (the build is finished);
+    - a planning run PAUSED at a person's card;
+    - a planning run whose latest event is a card still open, such as the
+      spec card, which waits with the run still in its spec state;
+    - a build PAUSED at a person's card. A build is PAUSED only at the
+      build gate, before any runner starts, or by the repair budget's pause,
+      which stops the next round; nothing runs for it while it waits;
+    - a RUNNING build whose merge card is waiting. A repair (a fix journey)
+      publishes its merge card and leaves its build RUNNING until the merge
+      word closes it; its work is finished. Only RUNNING is left out: after a
+      coordinator restart such a repair is reset to PREPARING and run again
+      under the same build id while its card is still open, and that is
+      work. The short replay inside RUNNING after the restart cannot be told
+      apart from waiting on the builds table, so it reads as waiting.
+
+    Each of these uses no model and no machine. Counted as busy, one card
+    left unanswered kept the sweep off all night, for every project, and a
+    spec card the sweep's own repair raised would have kept it off every
+    night after. Everything else still counts as busy: an admitted queue row
+    whose work has not been written yet, an admitted mission attempt, every
+    planning run not finished that is not waiting at a card (queued,
+    running, writing its spec or plan), and every build that is queued,
+    preparing, running or finishing and has no merge card waiting.
+
+    The work queue itself is unchanged: it still counts each of these as a
+    place in its own admission. That does not keep a repair the sweep files
+    waiting for a particular unanswered card: when the queue has a free
+    place, the repair is planned like any other request, and it still stops
+    at its own spec card. A database that cannot be read counts as busy.
+    The nightly start, ``forge security-sweep --once`` and the "a build
+    started during the sweep" check all use this test.
     """
-    from forge.planning.work_queue_loop import PLANNING_TERMINAL_STATES, count_in_flight
+    from forge.lifecycle.state_machine import BuildState
+    from forge.planning.states import PlanningState
+    from forge.planning.work_queue_loop import (
+        BUILD_ACTIVE_STATES,
+        PLANNING_TERMINAL_STATES,
+        _correlation_ids_in,
+        _work_is_written,
+        unanswered_merge_cards,
+    )
 
     try:
-        if count_in_flight(connection, merge_offer_hold_seconds=merge_offer_hold_seconds):
+        admitted = _correlation_ids_in(connection, "work_queue", "status", ("ADMITTED",))
+        if any(not _work_is_written(connection, cid) for cid in admitted):
+            return False
+        if _correlation_ids_in(connection, "mission_attempts", "status", ("ADMITTED",)):
+            return False
+        working = sorted(BUILD_ACTIVE_STATES - {BuildState.PAUSED.value})
+        placeholders = ",".join("?" for _ in working)
+        try:
+            builds = connection.execute(
+                f"SELECT build_id, status FROM builds WHERE status IN ({placeholders})",
+                tuple(working),
+            ).fetchall()
+        except sqlite3.OperationalError as exc:
+            if "no such table" not in str(exc).lower():
+                raise
+            builds = []
+        # A repair's build stays RUNNING while its merge card waits. In any
+        # other working state with its card open it is being run again.
+        carded = {card.build_id for card in unanswered_merge_cards(connection)}
+        for build_id, status in builds:
+            if status == BuildState.RUNNING.value and str(build_id) in carded:
+                continue
             return False
         terminal = sorted(PLANNING_TERMINAL_STATES)
         placeholders = ",".join("?" for _ in terminal)
         try:
-            row = connection.execute(
-                f"SELECT COUNT(*) FROM planning_runs WHERE state NOT IN ({placeholders})",
+            rows = connection.execute(
+                f"""
+                SELECT runs.state,
+                       (SELECT events.status FROM planning_run_events AS events
+                         WHERE events.correlation_id = runs.correlation_id
+                         ORDER BY events.id DESC LIMIT 1)
+                  FROM planning_runs AS runs
+                 WHERE runs.state NOT IN ({placeholders})
+                """,
                 tuple(terminal),
-            ).fetchone()
+            ).fetchall()
         except sqlite3.OperationalError as exc:
             if "no such table" in str(exc).lower():
                 return True
             raise
-        return not (row and int(row[0]))
+        for state, latest in rows:
+            if state == PlanningState.PAUSED.value or latest in CARD_OPEN_STATUSES:
+                continue  # waiting for a person: no model, no machine
+            return False
+        return True
     except Exception as exc:  # noqa: BLE001 — unreadable means busy, never idle
         logger.warning("security sweep: could not tell whether the factory is idle (%s)", type(exc).__name__)
         return False
@@ -206,11 +289,13 @@ def compose_sweep(
     from .state import sweep_folder
 
     settings = forge_config.security_sweep
-    hold = int(getattr(getattr(forge_config, "queue", None), "merge_offer_hold_seconds", 0) or 0)
     cx = connection if connection is not None else connect_writer(db_path)
 
     def is_idle() -> bool:
-        return factory_is_idle(cx, merge_offer_hold_seconds=hold)
+        # Work waiting at a person's card does not count: see factory_is_idle.
+        # The nightly run, ``forge security-sweep --once`` and the mid-sweep
+        # check (``deps.is_idle``) all take their idle test from here.
+        return factory_is_idle(cx)
 
     asker, why_not = default_asker()
     deps = SweepDeps(
