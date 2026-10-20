@@ -370,7 +370,45 @@ def test_a_left_port_that_was_a_preview_alone_gets_the_off_and_unpublish_lines(o
         f"8962 is {KEY}'s own port (8962: sandbox.publish 127.0.0.1:8962:8962); leave it. "
         "Taking it off this machine is the owner's decision."
     ) in out
-    assert "8963 is no longer its previews and the project does not use them" in out
+    assert (
+        "8963 is no longer a preview and the project does not use it. Stop serving it, and stop "
+        "publishing it from the sandbox unless something on this machine still needs it:"
+    ) in out
+    # Coach review 3: this move is forced by 8962, a recorded port, not by the usual pair.
+    assert "to 8960 and 8961, because the project itself uses 8962 (sandbox.publish 127.0.0.1:8962:8962)." in out
     assert "sudo -n tailscale serve --https=8963 off" in out
     assert f"sbx ports {OWN} --unpublish 127.0.0.1:8963:8963" in out
     assert "--https=8962 off" not in out and "127.0.0.1:8962:8962 " not in out.split("leave it")[1]
+
+
+
+def test_a_move_from_ports_already_moved_names_the_recorded_port_that_forces_it(own):  # noqa: F811
+    """Coach review 3: the reason names the recorded ports the project now
+    uses (8962 and 8963), not its clash with the slot's usual pair."""
+    own.write_project("deploy/profile.yaml", _profile_using([8960, 8961]))
+    assert _run_own().exit_code == 0
+    _activate(own)
+    own.write_project("deploy/profile.yaml", _profile_using([8960, 8961, 8962, 8963]))
+    out = _run_own().output
+    assert (
+        "Its previews move from 8962 and 8963 to 8966 and 8967, because the project itself uses "
+        "8962 (sandbox.publish 127.0.0.1:8962:8962); the project itself uses 8963 "
+        "(sandbox.publish 127.0.0.1:8963:8963)."
+    ) in out
+    move = next(line for line in out.splitlines() if "Its previews move" in line)
+    assert "uses 8960" not in move and "uses 8961" not in move
+
+
+def test_one_port_is_written_about_in_the_singular(own):  # noqa: F811
+    """Coach review 3: the project uses 8960 only, so its previews move to 8961
+    and 8962: one port is added and one of its own is left."""
+    own.write_project("deploy/profile.yaml", _profile_using([8960]))
+    result = _run_own()
+    assert result.exit_code == 0, result.output
+    out = result.output
+    assert "Its previews move from 8960 and 8961 to 8961 and 8962" in out
+    assert "listens on 8962 there (this prints nothing, or only this sandbox's own publish of it):" in out
+    assert "Publish 8962 from the sandbox, unless sbx ports" in out
+    assert "already lists it, and serve it over Tailscale" in out
+    assert f"8960 is {KEY}'s own port (8960: sandbox.publish 127.0.0.1:8960:8960); leave it." in out
+    assert " them" not in out.split("Its previews move")[1].split("Check with tailscale")[0]

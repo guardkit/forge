@@ -2410,18 +2410,24 @@ def _preview_move_lines(
     own_ports = dict(project_ports or {})
     added = [port for port in after if port not in before]
     removed = [port for port in before if port not in after]
+    # Why THIS move (coach review 3): the recorded ports the project now uses,
+    # which for a move from ports already moved are not the slot's usual pair.
+    forcing = [port for port in before if port in own_ports]
+    if forcing:
+        because = "; ".join(f"the project itself uses {port} ({own_ports[port]})" for port in forcing)
     lines = [
         f"    Its previews move from {_and(before)} to {_and(after)}"
         + (f", because {because}" if because else "")
         + ". On the sandbox's machine, before its next preview:"
     ]
     if added:
+        them = _them(added)
         lines += [
             f"    Check that nothing but this sandbox listens on {_and(added)} there (this prints"
-            " nothing, or only this sandbox's own publish of them):",
+            f" nothing, or only this sandbox's own publish of {them}):",
             "    " + there("ss -ltnH '( " + " or ".join(f"sport = :{p}" for p in added) + " )'"),
             f"    Publish {_and(added)} from the sandbox, unless sbx ports {sandbox} already lists"
-            " them, and serve them over Tailscale, unless tailscale serve status already does:",
+            f" {them}, and serve {them} over Tailscale, unless tailscale serve status already does:",
             "    " + there(f"sbx ports {sandbox} " + " ".join(f"--publish 127.0.0.1:{p}:{p}" for p in added)),
         ]
         lines += [
@@ -2432,17 +2438,19 @@ def _preview_move_lines(
     previews_only = [port for port in removed if port not in own_ports]
     if projects_own:
         reasons = "; ".join(f"{port}: {own_ports[port]}" for port in projects_own)
+        them = _them(projects_own)
         lines.append(
-            f"    {_and(projects_own)} {'are' if len(projects_own) > 1 else 'is'} {project}'s own "
+            f"    {_and(projects_own)} {_are(projects_own)} {project}'s own "
             f"{'ports' if len(projects_own) > 1 else 'port'} ({reasons}); leave "
-            f"{'them' if len(projects_own) > 1 else 'it'}. Taking "
-            f"{'them' if len(projects_own) > 1 else 'it'} off this machine is the owner's decision."
+            f"{them}. Taking {them} off this machine is the owner's decision."
         )
     if previews_only:
+        them = _them(previews_only)
+        what = "previews" if len(previews_only) > 1 else "a preview"
         lines += [
-            f"    {_and(previews_only)} {'are' if len(previews_only) > 1 else 'is'} no longer its"
-            " previews and the project does not use them. Stop serving them, and stop publishing"
-            " them from the sandbox unless something on this machine still needs them:",
+            f"    {_and(previews_only)} {_are(previews_only)} no longer {what} and the project does"
+            f" not use {them}. Stop serving {them}, and stop publishing {them} from the sandbox"
+            f" unless something on this machine still needs {them}:",
         ]
         lines += ["    " + there(f"sudo -n tailscale serve --https={p} off") for p in previews_only]
         lines.append(
@@ -2452,6 +2460,16 @@ def _preview_move_lines(
         )
     lines.append(f"    Check with tailscale serve status and sbx ports {sandbox}.")
     return lines
+
+
+def _them(ports: Sequence[int]) -> str:
+    """``them`` for several ports, ``it`` for one."""
+    return "them" if len(ports) > 1 else "it"
+
+
+def _are(ports: Sequence[int]) -> str:
+    """``are`` for several ports, ``is`` for one."""
+    return "are" if len(ports) > 1 else "is"
 
 
 def _and(ports: Sequence[int]) -> str:
