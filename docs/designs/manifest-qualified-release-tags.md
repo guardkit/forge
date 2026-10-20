@@ -33,13 +33,15 @@ Extend `tests/scripts/test_build_release_image.py` through the existing public s
 
 The fake engine and local Git fixtures must not contact a real Docker daemon or network. Tests should observe the public script's exit code, engine state, plan, and receipt rather than testing only a helper or matching source text. Preserve the existing tests of default plan, existing-tag refusal, sweeps and cleanup.
 
-Run the **full affected release-builder test file on the designated test host**. Set `FORGE_CHECKOUT` to the exact pinned Forge checkout on that host. Run the same commands at the pinned base before implementation and at the candidate after implementation; record both exit codes, failing test names and any difference. These are the exact checks, with xdist, the cache provider and inherited pytest options disabled:
+Run the **full affected release-builder test file through `dell-test`**. Set `FORGE_CHECKOUT` to the exact pinned Forge checkout and `FORGE_PYTHON` to an absolute path to an existing pinned Forge virtualenv interpreter; the clean checkout need not contain a `.venv` directory. Run the same commands at the pinned base before implementation and at the candidate after implementation; record both exit codes, failing test names and any difference. These are the exact checks, with xdist, the cache provider and inherited pytest options disabled:
 
 ```sh
 : "${FORGE_CHECKOUT:?set FORGE_CHECKOUT to the exact Forge checkout}"
+: "${FORGE_PYTHON:?set FORGE_PYTHON to the absolute pinned Forge virtualenv interpreter}"
+case "$FORGE_PYTHON" in /*) ;; *) echo 'FORGE_PYTHON must be absolute' >&2; exit 2 ;; esac
 cd "$FORGE_CHECKOUT"
-bash -n scripts/build-release-image.sh
-"$FORGE_CHECKOUT/.venv/bin/python" -m pytest -q -p no:xdist -p no:cacheprovider -o addopts= tests/scripts/test_build_release_image.py
+dell-test bash -n scripts/build-release-image.sh
+dell-test timeout 3600 env PYTHONPATH="$FORGE_CHECKOUT" "$FORGE_PYTHON" -m pytest -q -p no:xdist -p no:cacheprovider -o addopts= tests/scripts/test_build_release_image.py
 ```
 
 The design review checks this contract and the existing callers before source implementation. The later implementation review checks the complete candidate, actual test results and the exact commit. A release build remains a separate acceptance gate: its finalized manifest and selected tags must pass a read-only plan, then the existing preflight, image proofs, sweep, receipt and old-tag-preservation checks. A source test result alone does not establish that an image was built or installed.
