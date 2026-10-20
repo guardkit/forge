@@ -178,6 +178,10 @@ class TestHappyPathTranslation:
                 "context_entries": [
                     {"flag": "--plan", "value": "x.yaml", "kind": "path"}
                 ],
+                "routine_selection": {
+                    "seat": "openai:configured-seat",
+                    "timeout_multiplier": 1.0,
+                },
             },
         )
 
@@ -195,6 +199,10 @@ class TestHappyPathTranslation:
         assert payload["context_entries"] == [
             {"flag": "--plan", "value": "x.yaml", "kind": "path"}
         ]
+        assert payload["routine_selection"] == {
+            "seat": "openai:configured-seat",
+            "timeout_multiplier": 1.0,
+        }
 
     def test_runtime_tool_call_id_derives_from_correlation_id(self) -> None:
         tool = _RecordingTool(func_return=_command_like("task-1"))

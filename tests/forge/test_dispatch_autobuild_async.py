@@ -407,6 +407,10 @@ class TestStartAsyncTaskInvocation:
             async_task_starter=starter,
             stage_log_recorder=stage_log,
             state_channel=state_channel,
+            routine_selection={
+                "seat": "openai:configured-seat",
+                "timeout_multiplier": 1.0,
+            },
         )
 
         assert len(starter.calls) == 1
@@ -425,6 +429,46 @@ class TestStartAsyncTaskInvocation:
                 "kind": "path",
             }
         ]
+        assert context["routine_selection"] == {
+            "seat": "openai:configured-seat",
+            "timeout_multiplier": 1.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_legacy_omission_and_explicit_null_selection(
+        self,
+        builder: ForwardContextBuilder,
+        starter: FakeAsyncTaskStarter,
+        stage_log: FakeStageLogRecorder,
+        state_channel: FakeStateChannel,
+        approved_feature_plan: ApprovedStageEntry,
+        reader: FakeStageLogReader,
+    ) -> None:
+        feature_id = next(iter(reader.entries))[2]
+        common = {
+            "build_id": "build-1",
+            "feature_id": feature_id,
+            "correlation_id": "corr-1",
+            "forward_context_builder": builder,
+            "async_task_starter": starter,
+            "stage_log_recorder": stage_log,
+            "state_channel": state_channel,
+        }
+
+        await dispatch_autobuild_async(**common)
+        assert "routine_selection" not in starter.calls[-1][1]
+
+        await dispatch_autobuild_async(
+            **common,
+            routine_selection={"seat": None, "timeout_multiplier": None},
+        )
+        assert starter.calls[-1][1]["routine_selection"] == {
+            "seat": None,
+            "timeout_multiplier": None,
+        }
+
+        await dispatch_autobuild_async(**common, routine_selection={})
+        assert starter.calls[-1][1]["routine_selection"] == {}
 
 
 # ---------------------------------------------------------------------------

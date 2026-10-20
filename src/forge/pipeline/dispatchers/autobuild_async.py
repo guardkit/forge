@@ -345,6 +345,7 @@ async def dispatch_autobuild_async(
     memory_project: str | None = None,
     launch_settings: "Sequence[str] | None" = None,
     source_commit: str | None = None,
+    routine_selection: "Mapping[str, Any] | None" = None,
     feature_routing_id: str | None = None,
     feature_routing_gate: Any | None = None,
     feature_routing_required: bool = False,
@@ -475,6 +476,13 @@ async def dispatch_autobuild_async(
             the runner builds exactly that commit on a build-owned branch and
             runs GuardKit's own feature check first. ``None`` (every planned
             or hand-queued build) omits the key, and the launch is unchanged.
+        routine_selection: The coordinator's validated routine-build model and
+            timeout selection, shaped as exactly ``seat`` and
+            ``timeout_multiplier``. When present, it is copied into the launch
+            payload even when both values are ``None``; that explicit null
+            selection tells a current runner not to inherit stale settings
+            from its sandbox-local configuration. ``None`` omits the key for
+            callers from before this wire contract.
 
     Returns:
         :class:`AutobuildDispatchHandle` carrying the minted ``task_id``
@@ -646,6 +654,8 @@ async def dispatch_autobuild_async(
     # every other build, whose launch bytes are unchanged.
     if source_commit:
         launch_payload["source_commit"] = str(source_commit)
+    if routine_selection is not None:
+        launch_payload["routine_selection"] = dict(routine_selection)
     # TASK-FORGE-FRR-F010G: prefer the async launch path. The deepagents
     # middleware's sync path raises on ``url=None`` (the autobuild_runner
     # registration shape) while the async path tolerates ``url=None`` and

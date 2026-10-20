@@ -33,6 +33,7 @@ model is ever called.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import subprocess
@@ -169,18 +170,30 @@ def _make_exec_stub(recorded: dict[str, Any]):
 
 
 GUARDKIT = Path("/usr/bin/guardkit")
+_UNSET = object()
 
 
-def _launch(*, branch: str | None) -> str:
-    branch_field = f', "branch": "{branch}"' if branch is not None else ""
-    payload = (
-        f'{{"build_id": "{BUILD_ID}", "feature_id": "{FEATURE_ID}", '
-        f'"correlation_id": "{CORR}"{branch_field}}}'
+def _launch(
+    *, branch: str | None, routine_selection: Any = _UNSET
+) -> str:
+    payload: dict[str, Any] = {
+        "build_id": BUILD_ID,
+        "feature_id": FEATURE_ID,
+        "correlation_id": CORR,
+    }
+    if branch is not None:
+        payload["branch"] = branch
+    if routine_selection is not _UNSET:
+        payload["routine_selection"] = routine_selection
+    return (
+        "RUN_AUTOBUILD subagent=autobuild_runner payload="
+        f"{json.dumps(payload)}"
     )
-    return f"RUN_AUTOBUILD subagent=autobuild_runner payload={payload}"
 
 
-def _run(repo: Path, *, branch: str | None) -> dict[str, Any]:
+def _run(
+    repo: Path, *, branch: str | None, routine_selection: Any = _UNSET
+) -> dict[str, Any]:
     """Drive the real runner graph once and return what guardkit was given."""
     recorded: dict[str, Any] = {}
     stub = _make_exec_stub(recorded)
@@ -191,7 +204,18 @@ def _run(repo: Path, *, branch: str | None) -> dict[str, Any]:
     ):
         graph = ar._build_runner_graph()
         asyncio.run(
-            graph.ainvoke({"messages": [HumanMessage(content=_launch(branch=branch))]})
+            graph.ainvoke(
+                {
+                    "messages": [
+                        HumanMessage(
+                            content=_launch(
+                                branch=branch,
+                                routine_selection=routine_selection,
+                            )
+                        )
+                    ]
+                }
+            )
         )
     assert "argv" in recorded, "guardkit was never launched"
     return recorded
@@ -297,6 +321,75 @@ def test_the_seat_is_read_from_forge_config_path(
     assert recorded["argv"] == [*_todays_argv_legacy(), "--model", "flash-next"]
 
 
+def test_coordinator_selection_overrides_conflicting_local_settings(
+    throwaway_repo: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_config("routine:\n  seat: local-seat\n  timeout_multiplier: 2.0\n")
+
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        recorded = _run(
+            throwaway_repo,
+            branch=None,
+            routine_selection={"seat": SEAT, "timeout_multiplier": 1.0},
+        )
+
+    assert recorded["argv"] == [
+        *_todays_argv_legacy(),
+        "--model",
+        SEAT,
+        "--timeout-multiplier",
+        "1.0",
+    ]
+    messages = _messages(caplog)
+    assert "timeout_multiplier=1.0" in messages
+    assert "selection_source=coordinator-payload" in messages
+
+
+def test_coordinator_explicit_none_suppresses_local_settings(
+    throwaway_repo: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    _write_config(f"routine:\n  seat: {SEAT}\n  timeout_multiplier: 2.0\n")
+
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        recorded = _run(
+            throwaway_repo,
+            branch=None,
+            routine_selection={"seat": None, "timeout_multiplier": None},
+        )
+
+    assert recorded["argv"] == _todays_argv_legacy()
+    messages = _messages(caplog)
+    assert "timeout_multiplier=unnamed" in messages
+    assert "selection_source=coordinator-explicit-none" in messages
+
+
+def test_half_populated_coordinator_selection_is_not_explicit_none() -> None:
+    resolved = ar._resolve_routine_selection(
+        {
+            "routine_selection": {
+                "seat": SEAT,
+                "timeout_multiplier": None,
+            }
+        }
+    )
+
+    assert resolved.seat == SEAT
+    assert resolved.timeout_multiplier is None
+    assert resolved.source == "coordinator-payload"
+
+
+def test_absent_coordinator_selection_uses_legacy_local_file_source(
+    throwaway_repo: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.INFO, logger=LOGGER_NAME):
+        recorded = _run(throwaway_repo, branch=None)
+
+    assert recorded["argv"] == _todays_argv_legacy()
+    messages = _messages(caplog)
+    assert "timeout_multiplier=unnamed" in messages
+    assert "selection_source=legacy-local-file" in messages
+
+
 # ---------------------------------------------------------------------------
 # No seat named — today's command line, byte for byte, with a reason logged
 # ---------------------------------------------------------------------------
@@ -313,6 +406,8 @@ def test_no_configuration_at_all_leaves_the_command_line_untouched(
 
     assert recorded["argv"] == _todays_argv_legacy()
     assert "no forge.yaml found" in _messages(caplog)
+    assert "timeout_multiplier=unnamed" in _messages(caplog)
+    assert "selection_source=legacy-local-file" in _messages(caplog)
 
 
 def test_a_config_with_no_routine_section_leaves_the_command_line_untouched(
@@ -457,6 +552,69 @@ def test_the_runner_never_puts_an_option_shaped_seat_on_the_line(
     assert "starts with a dash" in _messages(caplog)
     # And the posture it is defending is still the config model's own.
     assert RoutineConfig(seat=None).seat is None
+
+
+@pytest.mark.parametrize(
+    "routine_selection",
+    [
+        None,
+        {},
+        {"seat": SEAT, "timeout_multiplier": 1.0, "future": True},
+        {"seat": "--option", "timeout_multiplier": 1.0},
+        {"seat": SEAT, "timeout_multiplier": 0},
+        {"seat": SEAT, "timeout_multiplier": 11},
+    ],
+)
+def test_malformed_coordinator_selection_fails_before_side_effects(
+    routine_selection: Any,
+) -> None:
+    state = {
+        "messages": [
+            HumanMessage(
+                content=_launch(
+                    branch=None,
+                    routine_selection=routine_selection,
+                )
+            )
+        ]
+    }
+
+    blocked = (
+        "_resolve_repo_path",
+        "_resolve_guardkit_path",
+        "_claim_repository",
+        "_sweep_prior_build_residue",
+        "_sweep_build_refs",
+        "_make_source_branch",
+        "_materialise_worktree",
+    )
+    patches = [
+        patch.object(
+            ar,
+            name,
+            side_effect=AssertionError(f"{name} must not run"),
+        )
+        for name in blocked
+    ]
+    patches.append(
+        patch.object(
+            asyncio,
+            "create_subprocess_exec",
+            side_effect=AssertionError("subprocess must not run"),
+        )
+    )
+
+    for active_patch in patches:
+        active_patch.start()
+    try:
+        result = asyncio.run(ar._run_one_build(state))
+    finally:
+        for active_patch in reversed(patches):
+            active_patch.stop()
+
+    snapshot = result["async_tasks"][FEATURE_ID]
+    assert snapshot["lifecycle"] == "failed"
+    assert "invalid routine_selection" in snapshot["error_message"]
 
 
 # ---------------------------------------------------------------------------

@@ -249,6 +249,8 @@ class TestDispatchAutobuildSignature:
         # project declared its own builds need, read at the same commit.
         # ``source_commit`` on 2026-10-04 — the exact commit a feature planned
         # elsewhere was admitted at, which the runner builds.
+        # ``routine_selection`` carries the coordinator's validated routine
+        # seat and timeout multiplier across the sandbox launch boundary.
         additive_data_and_routing_kwargs = [
             "branch",
             "repo",
@@ -256,6 +258,7 @@ class TestDispatchAutobuildSignature:
             "memory_project",
             "launch_settings",
             "source_commit",
+            "routine_selection",
             "feature_routing_id",
             "feature_routing_gate",
             "feature_routing_required",

@@ -201,6 +201,8 @@ async def test_a_prepared_feature_is_admitted_recorded_and_launched_at_its_commi
     persistence: SqliteLifecyclePersistence,
     _no_planning_capability: list[str],
 ) -> None:
+    forge_config.routine.seat = "openai:configured-seat"
+    forge_config.routine.timeout_multiplier = 1.0
     source = project.commit_on(
         BRANCH, bundle(config=config_text(settings=("PROJECT_REGION",)))
     )
@@ -230,6 +232,10 @@ async def test_a_prepared_feature_is_admitted_recorded_and_launched_at_its_commi
     assert context["memory_project"] == "synthetic_project"
     assert context["launch_settings"] == ["PROJECT_REGION"]
     assert context["branch"] == BRANCH
+    assert context["routine_selection"] == {
+        "seat": "openai:configured-seat",
+        "timeout_multiplier": 1.0,
+    }
     assert persistence.read_source_commit(row["build_id"]) == source
     # The merge press reads the deploy profile and launch settings, stamps
     # declared_at and has the sidecar enforce against, this recorded start
@@ -353,9 +359,14 @@ async def test_a_planned_build_keeps_its_planning_runs_facts_and_launch(
         "repo",
         "memory_project",
         "launch_settings",
+        "routine_selection",
         # Durable feature routing (9 October 2026, 42554fb9): the build
         # carries its planning run's correlation id as its routing key.
         "feature_routing_id",
+    }
+    assert context["routine_selection"] == {
+        "seat": None,
+        "timeout_multiplier": None,
     }
     assert context["feature_routing_id"] == CID
     assert _no_planning_capability == []

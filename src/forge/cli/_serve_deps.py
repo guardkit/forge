@@ -310,6 +310,23 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _routine_selection_for_launch(forge_config: ForgeConfig) -> dict[str, Any]:
+    """Return the coordinator's validated routine selection for one launch.
+
+    This is an explicit two-field wire contract, not a dump of
+    :class:`RoutineConfig`.  Keeping the mapping narrow prevents a future
+    configuration field from being sent to an older sandbox runner by
+    accident.  Both keys are always present so the runner can distinguish a
+    coordinator that selected no override from an older coordinator that sent
+    no selection at all.
+    """
+    routine = forge_config.routine
+    return {
+        "seat": routine.seat,
+        "timeout_multiplier": routine.timeout_multiplier,
+    }
+
+
 def _build_resume_launcher(
     forward_context_builder: Any,
     stage_log_recorder: Any,
@@ -321,6 +338,8 @@ def _build_resume_launcher(
     source_commit_reader: Callable[[str], str | None] | None = None,
     feature_routing_gate: Any | None = None,
     feature_routing_required: bool = False,
+    *,
+    routine_selection: dict[str, Any] | None = None,
 ) -> Callable[..., Any]:
     """Return the launch closure — ``dispatch_build`` minus ``record_pending_build``.
 
@@ -408,6 +427,7 @@ def _build_resume_launcher(
                 memory_project=memory_project,
                 launch_settings=launch_settings,
                 source_commit=source_commit,
+                routine_selection=routine_selection,
                 feature_routing_id=feature_routing_id,
                 feature_routing_gate=feature_routing_gate,
                 feature_routing_required=feature_routing_required,
@@ -426,6 +446,7 @@ def _build_resume_launcher(
             budget=budget,
             memory_project=memory_project,
             launch_settings=launch_settings,
+            routine_selection=routine_selection,
             feature_routing_id=feature_routing_id,
             feature_routing_gate=feature_routing_gate,
             feature_routing_required=feature_routing_required,
@@ -520,6 +541,7 @@ def build_serve_resume_launcher(
         getattr(sqlite_pool, "read_source_commit", None),
         feature_routing_gate,
         feature_routing_required,
+        routine_selection=_routine_selection_for_launch(forge_config),
     )
 
     async def guarded_launch(
@@ -933,6 +955,7 @@ def _build_dispatch_build(
         getattr(sqlite_pool, "read_source_commit", None),
         feature_routing_gate,
         feature_routing_required,
+        routine_selection=_routine_selection_for_launch(forge_config),
     )
     clock = gate_clock or _utc_now
 

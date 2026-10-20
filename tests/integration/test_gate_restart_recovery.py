@@ -1063,11 +1063,12 @@ class TestRearmNeverResumesAFixJourneyRoutine:
         pool: SqliteLifecyclePersistence,
         *,
         conductor_router: Any = None,
+        forge_config: ForgeConfig | None = None,
     ) -> Any:
         _publisher, emitter = build_publisher_and_emitter(nats)
         return build_serve_resume_launcher(
             pool,
-            _forge_config(),
+            forge_config or _forge_config(),
             lifecycle_emitter=emitter,
             async_task_starter=_RearmGuardStarter(),
             conductor_router=conductor_router,
@@ -1141,9 +1142,20 @@ class TestRearmNeverResumesAFixJourneyRoutine:
         build_id = await _seed_paused_via_first_session(
             nats, pool, feature_id="FEAT-REARMA"
         )
+        source_commit = "a" * 40
+        pool.connection.execute(
+            "UPDATE builds SET source_commit = ? WHERE build_id = ?",
+            (source_commit, build_id),
+        )
+        forge_config = _forge_config()
+        forge_config.routine.seat = "openai:configured-seat"
+        forge_config.routine.timeout_multiplier = 1.0
 
         outcome = await self._rearm_and_approve(
-            nats, pool, build_id, self._real_launcher(nats, pool)
+            nats,
+            pool,
+            build_id,
+            self._real_launcher(nats, pool, forge_config=forge_config),
         )
 
         assert outcome is GateOutcome.RESUMED
@@ -1151,6 +1163,11 @@ class TestRearmNeverResumesAFixJourneyRoutine:
         assert launched[0]["build_id"] == build_id
         # SECOND-REPO LAW: the repo still rides the resumed launch.
         assert launched[0]["repo"] == "guardkit/forge"
+        assert launched[0]["source_commit"] == source_commit
+        assert launched[0]["routine_selection"] == {
+            "seat": "openai:configured-seat",
+            "timeout_multiplier": 1.0,
+        }
         assert _row(pool, build_id) == (BuildState.RUNNING.value, None)
         assert _payloads(nats, "pipeline.build-failed.FEAT-REARMA") == []
 

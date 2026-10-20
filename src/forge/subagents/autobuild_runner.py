@@ -4922,6 +4922,11 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         )
     feature_id = feature_id_raw.strip()
 
+    try:
+        routine_selection = _resolve_routine_selection(payload)
+    except ValueError as exc:
+        return _snapshot_update(_build_failed_snapshot(payload, reason=str(exc)))
+
     # The missing-repo decision lives entirely in the resolver (the runner's
     # tests patch _resolve_repo_path, so an early guard here would bypass the
     # seam). The resolver REFUSES a repo-less launch unless the operator opted
@@ -5184,12 +5189,12 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     # conductor's own adapter over the subprocess dispatcher) and already
     # carry ``--model`` from ``conductor.seat``. Nothing here reaches
     # them, and this argv never launches one.
-    routine_seat = _load_routine_seat()
+    routine_seat = routine_selection.seat
     if routine_seat:
         argv += ["--model", routine_seat]
     # The seat's companion (2026-09-14): a slower model needs a bigger budget
     # for the same work. Unnamed adds nothing, exactly as the seat does.
-    routine_multiplier = _load_routine_timeout_multiplier()
+    routine_multiplier = routine_selection.timeout_multiplier
     if routine_multiplier is not None:
         argv += ["--timeout-multiplier", str(routine_multiplier)]
 
@@ -5232,12 +5237,15 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     )
     logger.info(
         "autobuild_runner: launching subprocess feature_id=%s cwd=%s "
-        "timeout=%ss seat=%s memory=%s settings=%s",
+        "timeout=%ss seat=%s timeout_multiplier=%s selection_source=%s "
+        "memory=%s settings=%s",
         feature_id,
         run_cwd,
         timeout_seconds,
         routine_seat
         or "unnamed (the build system's own default applies, as it always has)",
+        routine_multiplier if routine_multiplier is not None else "unnamed",
+        routine_selection.source,
         memory_project or "not recorded (this build runs with memory off)",
         # NAMES ONLY, never values: what this build was given, so a build that
         # behaved oddly can be told apart from one that was handed something
@@ -6650,6 +6658,77 @@ def _build_placeholder_graph() -> Any:
     sg.add_edge(START, "graph_construction_failed")
     sg.add_edge("graph_construction_failed", END)
     return sg.compile()
+
+
+_ROUTINE_SELECTION_KEYS = frozenset({"seat", "timeout_multiplier"})
+RoutineSelectionSource = Literal[
+    "coordinator-payload",
+    "coordinator-explicit-none",
+    "legacy-local-file",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolvedRoutineSelection:
+    """Validated routine settings and the source that selected them."""
+
+    seat: str | None
+    timeout_multiplier: float | None
+    source: RoutineSelectionSource
+
+
+def _resolve_routine_selection(
+    payload: Mapping[str, Any],
+) -> _ResolvedRoutineSelection:
+    """Resolve the two-field coordinator wire contract or its legacy fallback.
+
+    A present mapping is authoritative, including an explicit pair of nulls.
+    Only a payload from an older coordinator, where the key is absent, reads
+    sandbox-local configuration. The runner validates the coordinator values
+    again because this is the boundary where they become command-line tokens.
+    """
+    if "routine_selection" not in payload:
+        return _ResolvedRoutineSelection(
+            seat=_load_routine_seat(),
+            timeout_multiplier=_load_routine_timeout_multiplier(),
+            source="legacy-local-file",
+        )
+
+    raw_selection = payload["routine_selection"]
+    if (
+        not isinstance(raw_selection, Mapping)
+        or set(raw_selection) != _ROUTINE_SELECTION_KEYS
+    ):
+        raise ValueError(
+            "invalid routine_selection: expected exactly seat and "
+            "timeout_multiplier"
+        )
+
+    from forge.config.models import RoutineConfig
+
+    try:
+        routine = RoutineConfig.model_validate(
+            {
+                "seat": raw_selection["seat"],
+                "timeout_multiplier": raw_selection["timeout_multiplier"],
+            }
+        )
+    except ValueError:
+        raise ValueError(
+            "invalid routine_selection: seat and timeout_multiplier do not "
+            "satisfy the routine settings contract"
+        ) from None
+
+    source: RoutineSelectionSource = (
+        "coordinator-explicit-none"
+        if routine.seat is None and routine.timeout_multiplier is None
+        else "coordinator-payload"
+    )
+    return _ResolvedRoutineSelection(
+        seat=routine.seat,
+        timeout_multiplier=routine.timeout_multiplier,
+        source=source,
+    )
 
 
 def _resolve_runner_code_version() -> str:

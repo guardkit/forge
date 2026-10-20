@@ -46,6 +46,10 @@ from forge.config.models import (
 from forge.lifecycle import migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle.state_machine import BuildState
+from forge.pipeline.fix_admission import republish_build_queued
+from tests.forge.pipeline.test_fix_admission import (
+    FEATURE_ID as EXISTING_REPAIR_FEATURE_ID,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +299,8 @@ class TestDispatchBuildWiresCollaborators:
         persistence: SqliteLifecyclePersistence,
     ) -> None:
         recorded_kwargs: dict[str, Any] = {}
+        forge_config.routine.seat = "openai:configured-seat"
+        forge_config.routine.timeout_multiplier = 1.0
 
         class _FakeStarter:
             def start_async_task(self, subagent_name: str, context: dict) -> str:
@@ -364,6 +370,115 @@ class TestDispatchBuildWiresCollaborators:
                 f"dispatch_autobuild_async must be called with {key} bound; "
                 f"got {recorded_kwargs.get(key)!r}"
             )
+        assert recorded_kwargs["routine_selection"] == {
+            "seat": "openai:configured-seat",
+            "timeout_multiplier": 1.0,
+        }
+
+    @pytest.mark.asyncio
+    async def test_prepared_launch_carries_the_same_routine_selection(self) -> None:
+        recorded_kwargs: dict[str, Any] = {}
+        source_commit = "a" * 40
+        selection = {
+            "seat": "openai:configured-seat",
+            "timeout_multiplier": 1.0,
+        }
+
+        async def _fake_dispatch(**kwargs: Any) -> Any:
+            recorded_kwargs.update(kwargs)
+            return SimpleNamespace(task_id="task-A")
+
+        launcher = _serve_deps._build_resume_launcher(
+            object(),
+            object(),
+            object(),
+            object(),
+            object(),
+            source_commit_reader=lambda _build_id: source_commit,
+            routine_selection=selection,
+        )
+
+        with patch.object(_serve_deps, "dispatch_autobuild_async", _fake_dispatch):
+            await launcher(
+                build_id="build-D",
+                feature_id="feature-D",
+                correlation_id="corr-D",
+            )
+
+        assert recorded_kwargs["source_commit"] == source_commit
+        assert recorded_kwargs["routine_selection"] == selection
+
+    @pytest.mark.asyncio
+    async def test_republished_routine_repair_uses_production_selection_seam(
+        self,
+        stub_client: _StubNatsClient,
+        forge_config: ForgeConfig,
+        persistence: SqliteLifecyclePersistence,
+    ) -> None:
+        from nats_core.envelope import MessageEnvelope
+        from nats_core.events import BuildQueuedPayload
+
+        published: list[bytes] = []
+
+        async def _capture_publish(_subject: str, body: bytes) -> None:
+            published.append(body)
+
+        queued_at = datetime(2026, 5, 2, 12, tzinfo=UTC)
+        await republish_build_queued(
+            {
+                "build_id": "repair-build",
+                "feature_id": EXISTING_REPAIR_FEATURE_ID,
+                "repo": "example/repository",
+                "branch": "main",
+                "feature_yaml_path": "features/repair.yaml",
+                "max_turns": 5,
+                "sdk_timeout_seconds": 1800,
+                "triggered_by": "forge-internal",
+                "originating_adapter": "cli-wrapper",
+                "originating_user": "operator",
+                "correlation_id": "repair-correlation",
+                "parent_request_id": None,
+                "queued_at": queued_at,
+                "mode": "mode-a",
+                "task_id": None,
+            },
+            publish=_capture_publish,
+        )
+        envelope = MessageEnvelope.model_validate_json(published[0])
+        payload = BuildQueuedPayload.model_validate(envelope.payload)
+
+        forge_config.routine.seat = "openai:configured-seat"
+        forge_config.routine.timeout_multiplier = 1.0
+        captured: dict[str, Any] = {}
+
+        class _FakeStarter:
+            async def astart_async_task(
+                self, subagent_name: str, context: dict[str, Any]
+            ) -> str:
+                return "task-A"
+
+        async def _capture_dispatch(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return SimpleNamespace(task_id="task-A")
+
+        deps = build_pipeline_consumer_deps(
+            stub_client,
+            forge_config,
+            persistence,
+            async_task_starter=_FakeStarter(),
+        )
+
+        async def _noop_ack() -> None:
+            pass
+
+        with patch.object(_serve_deps, "dispatch_autobuild_async", _capture_dispatch):
+            await deps.dispatch_build(payload, _noop_ack)
+
+        assert payload.mode == "mode-a"
+        assert captured["routine_selection"] == {
+            "seat": "openai:configured-seat",
+            "timeout_multiplier": 1.0,
+        }
 
     @pytest.mark.asyncio
     async def test_dispatch_build_raises_when_async_task_starter_missing(
