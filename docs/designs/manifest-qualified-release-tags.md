@@ -19,7 +19,7 @@ This is a tag identity, not a source revision. Keep `org.opencontainers.image.re
 
 Use one selection rule in the script for plan display, floating-tag checks, the all-image existing-tag preflight, build arguments, proof and sweep references, failure cleanup, the top-level and per-image receipt, and completion output. Preserve two tags per image and the current top-level coordinator receipt duplication. A real build must still refuse **any** selected tag that already exists before fetching or building. `--allow-existing-tag` keeps its existing explicit behavior but is outside this release path; the new option must neither imply it nor delete or move old tags. A failed run removes only tags it wrote, while pre-existing tags remain at their original image IDs.
 
-The existing builder already has the necessary seams: `tags_of()` drives the plan and preflight; the build loop separately constructs `TAG_COMMIT` and `TAG_VERSION`, then passes them to buildx, sweep, proof, cleanup and receipt creation. Make the first tag selected by one helper used in both locations, so the plan cannot promise a different tag from the one actually built. Document the option in usage/help and correct the unconditional prose that currently says every image receives a bare commit tag. Avoid a new tagging subsystem or manifest schema.
+The existing builder already has the necessary seams: `tags_of()` drives the plan and preflight; the build loop separately constructs `TAG_COMMIT` and `TAG_VERSION`. It passes those names to buildx and `RUN_TAGS`, sweeps through `TAG_COMMIT`, and writes both into `BUILT`; the later proof, receipt and completion loops read them as `itagcommit` and `itagversion`. These are the actual variable names in the pinned builder, even though `TAG_COMMIT` will hold a qualified tag in the opt-in mode. Make the first tag selected by one helper used in both locations, so the plan cannot promise a different tag from the one actually built. Document the option in usage/help and correct the unconditional prose that currently says every image receives a bare commit tag. Avoid a new tagging subsystem or manifest schema.
 
 ## Verification before dependent release work
 
@@ -33,11 +33,13 @@ Extend `tests/scripts/test_build_release_image.py` through the existing public s
 
 The fake engine and local Git fixtures must not contact a real Docker daemon or network. Tests should observe the public script's exit code, engine state, plan, and receipt rather than testing only a helper or matching source text. Preserve the existing tests of default plan, existing-tag refusal, sweeps and cleanup.
 
-Run the **full affected release-builder test file on the designated Dell test machine**, without xdist. Run the same command at the pinned base before implementation and at the candidate after implementation; record both exit codes, failing test names and any difference. These are the exact checks:
+Run the **full affected release-builder test file on the designated test host**. Set `FORGE_CHECKOUT` to the exact pinned Forge checkout on that host. Run the same commands at the pinned base before implementation and at the candidate after implementation; record both exit codes, failing test names and any difference. These are the exact checks, with xdist, the cache provider and inherited pytest options disabled:
 
 ```sh
+: "${FORGE_CHECKOUT:?set FORGE_CHECKOUT to the exact Forge checkout}"
+cd "$FORGE_CHECKOUT"
 bash -n scripts/build-release-image.sh
-python3 -m pytest -q tests/scripts/test_build_release_image.py
+"$FORGE_CHECKOUT/.venv/bin/python" -m pytest -q -p no:xdist -p no:cacheprovider -o addopts= tests/scripts/test_build_release_image.py
 ```
 
 The design review checks this contract and the existing callers before source implementation. The later implementation review checks the complete candidate, actual test results and the exact commit. A release build remains a separate acceptance gate: its finalized manifest and selected tags must pass a read-only plan, then the existing preflight, image proofs, sweep, receipt and old-tag-preservation checks. A source test result alone does not establish that an image was built or installed.
