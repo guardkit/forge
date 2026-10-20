@@ -15,8 +15,10 @@ git, docker, sbx or GitHub, and every name and address is made up.
 
 from __future__ import annotations
 
+import pytest
 import yaml
 
+from forge.cli.register_repo import Refused, plan_settings_edit
 from tests.forge.cli.test_register_repo import KEY, LEAF, estate  # noqa: F401
 from tests.forge.cli.test_register_repo_sandbox import (  # noqa: F401
     COORDINATOR_ENTRY,
@@ -60,6 +62,11 @@ preview:
 CLEAR_PROFILE = CLASHING_PROFILE.replace("8960", "8901").replace("8961", "8902")
 
 PENDING = f"forge.yaml.{LEAF}-pending"
+
+
+def _activate(own):  # noqa: F811
+    own.volume["forge.yaml"] = own.volume.pop(PENDING)
+    own.sandbox_files[OWN_SETTINGS] = own.sandbox_files.pop(f"{OWN_SETTINGS}.{LEAF}-pending")
 
 
 def _staged(own):  # noqa: F811
@@ -115,13 +122,38 @@ def test_a_block_with_no_free_pair_is_refused_and_nothing_is_written(own):  # no
     assert own.writes == []
 
 
-def test_a_profile_that_cannot_be_used_is_refused_in_words(own):  # noqa: F811
+def test_a_profile_that_cannot_be_used_does_not_block_registering(own):  # noqa: F811
+    """Coach review F2: the usual pair is kept and a plain note says why."""
     own.write_project("deploy/profile.yaml", "env_id: example\n")
     result = _run_own()
-    assert result.exit_code == 1
+    assert result.exit_code == 0, result.output
     assert "deploy/profile.yaml could not be used" in result.output
-    assert "its preview ports cannot be chosen" in result.output
-    assert own.writes == []
+    assert "its preview ports are left as they are" in result.output
+    coordinator, sandbox = _staged(own)
+    assert coordinator == COORDINATOR_ENTRY and sandbox == ENTRY
+    assert "Its previews move" not in result.output
+
+
+def test_a_profile_with_no_preview_keeps_the_usual_pair_and_prints_no_steps(own):  # noqa: F811
+    """Coach review F6: its own app on 8960, but no preview will ever run."""
+    start = CLASHING_PROFILE.index("preview:")
+    own.write_project("deploy/profile.yaml", CLASHING_PROFILE[:start])
+    result = _run_own()
+    assert result.exit_code == 0, result.output
+    assert "switches no preview on" in result.output
+    coordinator, sandbox = _staged(own)
+    assert coordinator == COORDINATOR_ENTRY and sandbox == ENTRY
+    assert "Its previews move" not in result.output and "tailscale" not in result.output
+
+
+def test_an_unreadable_profile_keeps_ports_already_moved(own):  # noqa: F811
+    own.write_project("deploy/profile.yaml", CLASHING_PROFILE)
+    assert _run_own().exit_code == 0
+    _activate(own)
+    own.write_project("deploy/profile.yaml", "env_id: example\n")
+    again = _run_own()
+    assert again.exit_code == 0, again.output
+    assert "nothing is staged" in again.output, "the recorded 8962 and 8963 stay"
 
 
 def test_a_project_registered_before_has_only_its_preview_ports_line_rewritten(own):  # noqa: F811
@@ -179,11 +211,6 @@ def _profile_using(ports: list[int]) -> str:
         'publish: ["127.0.0.1:8960:8960", "127.0.0.1:8961:8961", "127.0.0.1:8950:8950", "127.0.0.1:8951:8951"]',
         f"publish: [{rules}]",
     ).replace('"http://127.0.0.1:8960"', '"http://127.0.0.1:8901"').replace('"8961"', '"8902"')
-
-
-def _activate(own):  # noqa: F811
-    own.volume["forge.yaml"] = own.volume.pop(PENDING)
-    own.sandbox_files[OWN_SETTINGS] = own.sandbox_files.pop(f"{OWN_SETTINGS}.{LEAF}-pending")
 
 
 def test_previews_skip_the_ports_of_a_slot_four_sandbox_beside_it(own):  # noqa: F811
@@ -246,3 +273,75 @@ def test_running_again_with_the_same_ports_prints_no_move(own):  # noqa: F811
     again = _run_own()
     assert again.exit_code == 0, again.output
     assert "Its previews move" not in again.output and "tailscale" not in again.output
+
+
+
+# ---------------------------------------------------------------------------
+# The rewrite's guards (coach review F3)
+
+SETTINGS = """\
+permissions:
+  filesystem:
+    allowlist:
+      - /w/example-project
+planning:
+  target_repo_paths:
+    guardkit/example-project: /w/example-project
+  sandboxes:
+    guardkit/example-project:
+      name: example-project
+      sidecar_url: http://192.0.2.10:8935
+      runner_url: http://192.0.2.10:8934
+      git_door: http://192.0.2.1:31831/
+{ports}
+"""
+MOVED = {
+    "name": "example-project",
+    "sidecar_url": "http://192.0.2.10:8935",
+    "runner_url": "http://192.0.2.10:8934",
+    "git_door": "http://192.0.2.1:31831/",
+    "preview_ports": [8962, 8963],
+}
+
+
+def _edit(ports_lines: str):
+    return plan_settings_edit(
+        SETTINGS.format(ports=ports_lines), which="sandbox", key="guardkit/example-project",
+        path="/w/example-project", entry=MOVED, ports_in_use=frozenset({8960, 8961}),
+    )
+
+
+def test_the_rewrite_changes_a_plain_one_line_list():
+    edit = _edit("      preview_ports: [8960, 8961]")
+    assert edit.staged is not None
+    assert "      preview_ports: [8962, 8963]" in edit.staged.splitlines()
+    assert "8960" not in edit.staged
+
+
+@pytest.mark.parametrize(
+    "ports_lines",
+    [
+        "      preview_ports: [8960, 8961]  # slot 1",
+        "      preview_ports:\n        - 8960\n        - 8961",
+    ],
+    ids=["a comment on the line", "a block list"],
+)
+def test_the_rewrite_refuses_a_line_it_would_lose_something_from(ports_lines):
+    with pytest.raises(Refused) as refused:
+        _edit(ports_lines)
+    assert "is not written as one [ ... ] list on its own line" in str(refused.value)
+
+
+def test_the_rewrite_refuses_a_line_that_is_in_the_file_twice():
+    other = (
+        "      preview_ports: [8960, 8961]\n"
+        "    guardkit/other-project:\n"
+        "      name: other-project\n"
+        "      sidecar_url: http://192.0.2.10:8945\n"
+        "      runner_url: http://192.0.2.10:8944\n"
+        "      git_door: http://192.0.2.1:31832/\n"
+        "      preview_ports: [8960, 8961]"
+    )
+    with pytest.raises(Refused) as refused:
+        _edit(other)
+    assert "is not in the file exactly once" in str(refused.value)

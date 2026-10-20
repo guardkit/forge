@@ -552,7 +552,7 @@ def _sandbox_preview_ports(
 #: Docker's own words when a port it was asked to publish is taken:
 #: ``Bind for 127.0.0.1:8960 failed: port is already allocated``.
 _PORT_TAKEN = re.compile(
-    r"Bind for (?P<address>[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9A-Fa-f:]+\]|):?"
+    r"Bind for (?P<address>[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9A-Fa-f:]{2,39}\]|):?"
     r"(?P<port>[0-9]{1,5}) failed: port is already allocated"
 )
 

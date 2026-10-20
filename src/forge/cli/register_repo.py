@@ -3195,10 +3195,12 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
         previews_moved_because: str | None = None
         ports_in_use: frozenset[int] = frozenset()
         if options.slot is not None:
-            previews, previews_moved_because, ports_in_use = preview_ports_for_slot(
-                Path(folder) / "project", key=options.key, slot=options.slot
+            previews, previews_moved_because, ports_in_use, previews_kept_because = (
+                preview_ports_for_slot(Path(folder) / "project", key=options.key, slot=options.slot)
             )
-            if previews_moved_because is not None:
+            if previews_kept_because is not None:
+                steps.append(Step("project", "note", previews_kept_because))
+            if previews is not None and previews_moved_because is not None:
                 steps.append(Step(
                     "project", "note",
                     f"previews on {previews[0]} and {previews[1]}, not the slot's usual "
@@ -3216,9 +3218,6 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     if options.slot is not None:
         granted_memory = _memory_name_to_grant(options.key, memory_name)
         coordinator_entry = {**(coordinator_entry or {}), "memory_projects": [granted_memory]}
-        if previews is not None:
-            coordinator_entry["preview_ports"] = list(previews)
-            sandbox_entry = {**(sandbox_entry or {}), "preview_ports": list(previews)}
 
     volume = VolumeStore(options.volume, run)
     sandbox = SandboxStore(options.sandbox, run, ssh_host=options.sandbox_ssh)
@@ -3237,6 +3236,13 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
             recorded = None  # the edit below refuses an unreadable file in its own words
         entry_before = _mapping(_mapping(_mapping(recorded).get("planning")).get("sandboxes")).get(options.key)
         previews_before = _ports_of(_mapping(entry_before).get("preview_ports"))
+        if previews is None:
+            # Nothing chosen (an unreadable profile, or no preview): the ports
+            # already recorded stay, or the usual pair for a new registration.
+            previews = tuple(previews_before) if len(previews_before) == 2 else options.slot.previews
+        if previews is not None:
+            coordinator_entry["preview_ports"] = list(previews)
+            sandbox_entry = {**(sandbox_entry or {}), "preview_ports": list(previews)}
     sandbox_text = sandbox.read(options.sandbox_settings)
     # A sandbox of its own is made without a settings file: this command
     # writes it (17 October 2026), from the few lines below plus the
@@ -3416,9 +3422,9 @@ DEPLOY_PROFILE_IN_PROJECT: str = "deploy/profile.yaml"
 
 def preview_ports_for_slot(
     checkout: Path, *, key: str, slot: SlotPorts
-) -> tuple[tuple[int, int], str | None, frozenset[int]]:
-    """A sandbox of its own's two preview ports, why they moved (or ``None``),
-    and the ports the project uses itself.
+) -> tuple[tuple[int, int] | None, str | None, frozenset[int], str | None]:
+    """A sandbox of its own's preview ports: ``(ports, why they moved, the
+    ports the project uses itself, why none were chosen)``.
 
     20 October 2026: a preview port is the same number inside the sandbox as on
     its machine, so a project that uses its slot's usual preview port itself
@@ -3427,8 +3433,15 @@ def preview_ports_for_slot(
     are kept clear: the first two free ports in the slot's block of ten are
     chosen (:func:`forge.config.sandbox_slots.choose_preview_ports`), which is
     the usual pair when there is no clash. A project with no profile uses
-    none. Refuses, in words, a profile that cannot be read and a block with
-    fewer than two free ports.
+    none. Refuses, in words, a block with fewer than two free ports.
+
+    ``ports`` is ``None``, with the last item saying why, when nothing is
+    chosen and the caller keeps the ports already recorded (the usual pair
+    when none are): a profile that cannot be read (coach review F2: that must
+    not block registering a project; a preview needs a readable profile
+    anyway, and the preview-time check catches a clash once it is fixed) and
+    a profile with no preview switched on (F6: no preview will ever run, so
+    nothing moves and no steps are printed).
     """
     from forge.config.sandbox_slots import PreviewPortsRefused, choose_preview_ports
     from forge.deploy.profile import parse_deploy_profile, ports_the_project_uses
@@ -3437,10 +3450,9 @@ def preview_ports_for_slot(
     used: dict[int, str] = {}
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file():
-            raise Refused(
-                "project",
-                f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} is not an ordinary file, so the ports "
-                "it uses cannot be read and its preview ports cannot be chosen. Nothing was written",
+            return None, None, frozenset(), (
+                f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} is not an ordinary file, so the ports it "
+                "uses cannot be read; its preview ports are left as they are"
             )
         try:
             profile = parse_deploy_profile(
@@ -3449,23 +3461,28 @@ def preview_ports_for_slot(
             )
         except Exception as exc:  # noqa: BLE001 — any refusal is the answer
             first = str(exc).strip().splitlines()
-            raise Refused(
-                "project",
+            return None, None, frozenset(), (
                 f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} could not be used ({type(exc).__name__}: "
-                f"{first[0] if first else 'no detail'}), so the ports it uses cannot be read and "
-                "its preview ports cannot be chosen. Fix it on the default branch and register "
-                "again. Nothing was written",
-            ) from None
+                f"{first[0] if first else 'no detail'}), so the ports it uses cannot be read; its "
+                "preview ports are left as they are. No preview can start until the profile is "
+                "fixed, and then a preview on a port the project uses is refused, saying to "
+                "register again"
+            )
+        if profile.preview is None or not profile.preview.enabled:
+            return None, None, frozenset(), (
+                f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} switches no preview on, so its preview "
+                "ports are left as they are"
+            )
         used = ports_the_project_uses(profile)
     try:
         chosen = choose_preview_ports(slot.slot, used)
     except PreviewPortsRefused as exc:
         raise Refused("project", f"{key}: {exc}. Nothing was written") from None
     if chosen == slot.previews:
-        return chosen, None, frozenset(used)
+        return chosen, None, frozenset(used), None
     clashes = [port for port in slot.previews if port in used]
     because = "; ".join(f"the project itself uses {port} ({used[port]})" for port in clashes)
-    return chosen, because, frozenset(used)
+    return chosen, because, frozenset(used), None
 
 
 #: The memory service's own rule for a project name (fleet-memory refuses any

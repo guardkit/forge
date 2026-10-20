@@ -107,7 +107,10 @@ class PreviewPortsRefused(ValueError):
 
 def preview_block(slot: int) -> range:
     """The ten ports slot ``slot``'s previews may use: 8950 + 10·*k* to
-    8959 + 10·*k*. No other slot's block overlaps it. Raises ``ValueError``
+    8959 + 10·*k*. No other slot's preview block overlaps it, but three of its
+    ports may be other slots' factory services (8954 + 10·*k* and 8955 + 10·*k*
+    are slot *k* + 3's runner and helper, 8958 + 10·*k* slot *k* + 4's git
+    daemon), which :func:`choose_preview_ports` skips. Raises ``ValueError``
     for a slot outside 1 to :data:`MAX_SLOT`, as :func:`slot_ports` does."""
     first = slot_ports(slot).previews[0]
     return range(first, first + SLOT_STEP)

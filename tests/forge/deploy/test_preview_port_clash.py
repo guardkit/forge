@@ -45,6 +45,7 @@ from forge.deploy.review_preview import (
     known_step_failure,
     sandbox_preview,
 )
+from forge.config.models import PlanningConfig
 from forge.deploy.stage import DeployStageResult
 from forge.lifecycle import migrations
 from tests.forge.deploy.test_review_preview import BASE_URL, FakeClock, FakeDispatch, FakeVenue
@@ -127,6 +128,7 @@ def test_a_preview_never_takes_another_slot_s_factory_service_port():
     four, five = slot_ports(4), slot_ports(5)
     assert (four.runner, four.helper, five.git_daemon) == (8964, 8965, 8968)
     assert choose_preview_ports(1, {8960, 8961, 8962, 8963}) == (8966, 8967)
+    assert choose_preview_ports(1, {8960, 8961, 8962}) == (8963, 8966), "the coach's probe"
     assert choose_preview_ports(1, {8960, 8961, 8962, 8963, 8966}) == (8967, 8969)
     services = factory_service_ports()
     for slot in range(1, 20):
@@ -308,3 +310,103 @@ def test_a_refusal_still_wins_over_the_output():
         detail={"refusal": "sidecar refused (HTTP 400)", "deploy_output": DOCKER_SAID},
     )
     assert ReviewPreviewService._why(result) == "it stopped at deploy_compose — sidecar refused (HTTP 400)"
+
+
+
+# ---------------------------------------------------------------------------
+# The safety net's other paths (coach review F4)
+
+
+def _service(tmp_path: Path, connection: sqlite3.Connection, *, profiles: dict, sandboxes: Any):
+    dispatch, venue, clock = FakeDispatch(), FakeVenue(), FakeClock()
+    leases = iter(f"pv{n:012x}" for n in range(1, 100))
+    runs = iter(f"pvrun-{n:012x}" for n in range(1, 100))
+    service = ReviewPreviewService(
+        store=PreviewLeaseStore(connection),
+        profile_reader=lambda project: profiles["now"],
+        venue_for=lambda _project: venue,
+        deploy_dispatcher=dispatch,
+        repo_paths={PROJECT: "/clone"},
+        evidence_root=tmp_path / "evidence",
+        evidence_base_url=BASE_URL,
+        public_host=PUBLIC_HOST,
+        clock=clock,
+        sleep=clock.sleep,
+        token_factory=lambda: "the-right-token",
+        lease_id_factory=lambda: next(leases),
+        run_id_factory=lambda: next(runs),
+        blocking_sleep=lambda _s: None,
+        sandboxes=sandboxes,
+    )
+    return service, dispatch
+
+
+@pytest.mark.asyncio
+async def test_with_no_sandboxes_configured_the_safety_net_still_refuses(
+    tmp_path: Path, connection: sqlite3.Connection
+) -> None:
+    clashing = _profile(
+        live_gate={"driver": ["node", "check.mjs"], "env": {"APP_BASE_URL": "http://127.0.0.1:8950"}}
+    )
+    service, dispatch = _service(tmp_path, connection, profiles={"now": clashing}, sandboxes=None)
+    evidence = await service.prepare(_request(PROJECT, "build-1", "FEAT-0001"))
+    assert evidence.state == "failed"
+    assert "preview port 8950 is a port the project itself uses" in evidence.failure_reason
+    assert dispatch.calls == []
+
+
+@pytest.mark.asyncio
+async def test_has_room_lets_a_refused_preview_through_to_say_why(
+    tmp_path: Path, connection: sqlite3.Connection
+) -> None:
+    """With both slots busy, a project whose ports now clash is not told to
+    wait for a slot: its preparation runs and says why it is refused."""
+    clear = _profile(
+        sandbox={"name": "example-project"},
+        live_gate={"driver": ["node", "check.mjs"], "env": {"APP_BASE_URL": "http://127.0.0.1:8901"}},
+        candidate={"env": {"CANDIDATE_PORT": "8902"}},
+    )
+    profiles = {"now": clear}
+    service, _dispatch = _service(
+        tmp_path, connection, profiles=profiles, sandboxes=lambda: {PROJECT: _entry([8960, 8961])}
+    )
+    for build, feature in (("build-1", "FEAT-0001"), ("build-2", "FEAT-0002")):
+        ready = await service.prepare(_request(PROJECT, build, feature))
+        assert ready.state == "ready", ready.failure_reason
+    assert not await service.has_room(PROJECT, build_id="build-3", make_room=False)
+    profiles["now"] = _profile()
+    assert await service.has_room(PROJECT, build_id="build-3", make_room=False)
+
+
+def test_the_sandbox_s_link_check_reaches_no_port_the_project_uses(monkeypatch: pytest.MonkeyPatch) -> None:
+    from types import SimpleNamespace
+
+    from forge.deploy_sidecar import service
+
+    seen: dict[str, Any] = {}
+
+    def capture(route, payload, *, repo_path, slot_ports):
+        seen["ports"] = set(slot_ports)
+        return 200, {}
+
+    monkeypatch.setattr(service, "sidecar_is_inside_sandbox", lambda: True)
+    monkeypatch.setattr(service, "profile_at_commit", lambda path: (_profile(), None))
+    monkeypatch.setattr(service, "serve_preview_operation", capture)
+    config = SimpleNamespace(
+        planning=PlanningConfig.model_validate(
+            {"target_repo_paths": {PROJECT: "/clone"}, "sandboxes": {PROJECT: _entry([8960, 8961]).model_dump()}}
+        )
+    )
+    status, _body = service.process_preview_request(
+        "/preview/probe", {"repo": PROJECT, "lease_id": "pv000000000001"}, config=config
+    )
+    assert status == 200
+    assert seen["ports"] == set(), "the project's own app ports are never probed as a preview"
+
+
+def test_the_card_s_address_is_limited_in_length():
+    """Coach review F5: a script printing a long bracketed hex string cannot
+    get it onto the card through the address."""
+    long = "Bind for [" + "deadbeef" * 8 + "]:1 failed: port is already allocated"
+    assert known_step_failure(long) is None
+    assert "on [::]" in known_step_failure("Bind for [::]:8960 failed: port is already allocated")
