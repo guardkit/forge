@@ -2394,11 +2394,20 @@ def _preview_move_lines(
     after: Sequence[int],
     because: str | None,
     there: Callable[[str], str],
+    project: str = "the project",
+    project_ports: Mapping[int, str] | None = None,
 ) -> list[str]:
     """The steps on the sandbox's machine for a move of its preview ports from
     ``before`` to ``after`` (20 October 2026), in either direction: a first
     move off the usual pair, a second move, or a move back to the usual pair.
+
+    A port it leaves that the project uses itself (``project_ports``) is the
+    normal case, since ports move only when they clash: it is named as the
+    project's own and given NO command (coach review 2), because taking it off
+    the machine could take the project's own app off it. Only a port that was a
+    preview alone gets the lines that stop serving and publishing it.
     """
+    own_ports = dict(project_ports or {})
     added = [port for port in after if port not in before]
     removed = [port for port in before if port not in after]
     lines = [
@@ -2419,15 +2428,27 @@ def _preview_move_lines(
             "    " + there(f"sudo -n tailscale serve --bg --https={p} http://127.0.0.1:{p}")
             for p in added
         ]
-    if removed:
-        lines += [
-            f"    {_and(removed)} are no longer its previews; a link to them would reach whatever"
-            " the project runs there, not a preview. Stop serving them, and stop publishing them"
-            " from the sandbox unless something on this machine still needs them:",
-        ]
-        lines += ["    " + there(f"sudo -n tailscale serve --https={p} off") for p in removed]
+    projects_own = [port for port in removed if port in own_ports]
+    previews_only = [port for port in removed if port not in own_ports]
+    if projects_own:
+        reasons = "; ".join(f"{port}: {own_ports[port]}" for port in projects_own)
         lines.append(
-            "    " + there(f"sbx ports {sandbox} " + " ".join(f"--unpublish 127.0.0.1:{p}:{p}" for p in removed))
+            f"    {_and(projects_own)} {'are' if len(projects_own) > 1 else 'is'} {project}'s own "
+            f"{'ports' if len(projects_own) > 1 else 'port'} ({reasons}); leave "
+            f"{'them' if len(projects_own) > 1 else 'it'}. Taking "
+            f"{'them' if len(projects_own) > 1 else 'it'} off this machine is the owner's decision."
+        )
+    if previews_only:
+        lines += [
+            f"    {_and(previews_only)} {'are' if len(previews_only) > 1 else 'is'} no longer its"
+            " previews and the project does not use them. Stop serving them, and stop publishing"
+            " them from the sandbox unless something on this machine still needs them:",
+        ]
+        lines += ["    " + there(f"sudo -n tailscale serve --https={p} off") for p in previews_only]
+        lines.append(
+            "    " + there(
+                f"sbx ports {sandbox} " + " ".join(f"--unpublish 127.0.0.1:{p}:{p}" for p in previews_only)
+            )
         )
     lines.append(f"    Check with tailscale serve status and sbx ports {sandbox}.")
     return lines
@@ -2453,6 +2474,7 @@ def activation_sequence(
     previews: tuple[int, int] | None = None,
     previews_moved_because: str | None = None,
     previews_before: Sequence[int] | None = None,
+    project_ports: Mapping[int, str] | None = None,
 ) -> list[str]:
     """The one-page procedure's own order, for this registration (step 7 a–h).
 
@@ -2463,6 +2485,9 @@ def activation_sequence(
     the project uses a port of the usual pair), the lines for that move are
     printed too: which ports to publish from the sandbox and serve over
     Tailscale on its machine, and which to stop serving and publishing.
+    ``project_ports`` are the ports the project uses itself, with where its
+    profile says so: a port it leaves that is one of them is named as the
+    project's own and given no command (coach review 2).
 
     ``removing`` (forge unregister-repo, 18 October 2026): the same order for
     taking a registration out; its last check is that the coordinator no
@@ -2604,7 +2629,8 @@ def activation_sequence(
         if previews is not None and tuple(previews) != before:
             lines += _preview_move_lines(
                 sandbox=q(estate.sandbox), before=before, after=tuple(previews),
-                because=previews_moved_because, there=there,
+                because=previews_moved_because, there=there, project=key,
+                project_ports=project_ports or {},
             )
         if memory_project:
             lines.append(
@@ -3193,9 +3219,9 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
         # the deploy profile in the same check clone.
         previews: tuple[int, int] | None = None
         previews_moved_because: str | None = None
-        ports_in_use: frozenset[int] = frozenset()
+        project_ports: dict[int, str] = {}
         if options.slot is not None:
-            previews, previews_moved_because, ports_in_use, previews_kept_because = (
+            previews, previews_moved_because, project_ports, previews_kept_because = (
                 preview_ports_for_slot(Path(folder) / "project", key=options.key, slot=options.slot)
             )
             if previews_kept_because is not None:
@@ -3207,6 +3233,7 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
                     f"{options.slot.previews[0]} and {options.slot.previews[1]}: "
                     f"{previews_moved_because}",
                 ))
+        ports_in_use = frozenset(project_ports)
 
     # A sandbox of its own is granted the project's declared memory name (design
     # section 2.4a): the coordinator's entry gets memory_projects, the same
@@ -3412,6 +3439,7 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
         previews=previews,
         previews_moved_because=previews_moved_because,
         previews_before=previews_before or None,
+        project_ports=project_ports,
     )
     return tail
 
@@ -3422,9 +3450,9 @@ DEPLOY_PROFILE_IN_PROJECT: str = "deploy/profile.yaml"
 
 def preview_ports_for_slot(
     checkout: Path, *, key: str, slot: SlotPorts
-) -> tuple[tuple[int, int] | None, str | None, frozenset[int], str | None]:
+) -> tuple[tuple[int, int] | None, str | None, dict[int, str], str | None]:
     """A sandbox of its own's preview ports: ``(ports, why they moved, the
-    ports the project uses itself, why none were chosen)``.
+    ports the project uses itself with where it says so, why none were chosen)``.
 
     20 October 2026: a preview port is the same number inside the sandbox as on
     its machine, so a project that uses its slot's usual preview port itself
@@ -3450,7 +3478,7 @@ def preview_ports_for_slot(
     used: dict[int, str] = {}
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_file():
-            return None, None, frozenset(), (
+            return None, None, {}, (
                 f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} is not an ordinary file, so the ports it "
                 "uses cannot be read; its preview ports are left as they are"
             )
@@ -3461,7 +3489,7 @@ def preview_ports_for_slot(
             )
         except Exception as exc:  # noqa: BLE001 — any refusal is the answer
             first = str(exc).strip().splitlines()
-            return None, None, frozenset(), (
+            return None, None, {}, (
                 f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} could not be used ({type(exc).__name__}: "
                 f"{first[0] if first else 'no detail'}), so the ports it uses cannot be read; its "
                 "preview ports are left as they are. No preview can start until the profile is "
@@ -3469,7 +3497,7 @@ def preview_ports_for_slot(
                 "register again"
             )
         if profile.preview is None or not profile.preview.enabled:
-            return None, None, frozenset(), (
+            return None, None, {}, (
                 f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} switches no preview on, so its preview "
                 "ports are left as they are"
             )
@@ -3479,10 +3507,10 @@ def preview_ports_for_slot(
     except PreviewPortsRefused as exc:
         raise Refused("project", f"{key}: {exc}. Nothing was written") from None
     if chosen == slot.previews:
-        return chosen, None, frozenset(used), None
+        return chosen, None, dict(used), None
     clashes = [port for port in slot.previews if port in used]
     because = "; ".join(f"the project itself uses {port} ({used[port]})" for port in clashes)
-    return chosen, because, frozenset(used), None
+    return chosen, because, dict(used), None
 
 
 #: The memory service's own rule for a project name (fleet-memory refuses any

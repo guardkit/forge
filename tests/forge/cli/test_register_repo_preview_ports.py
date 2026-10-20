@@ -92,9 +92,14 @@ def test_a_clash_gives_the_next_free_pair_in_both_files_and_the_spark_lines(own)
     assert "sudo -n tailscale serve --bg --https=8963 http://127.0.0.1:8963" in out
     assert "Its previews move from 8960 and 8961 to 8962 and 8963" in out
     assert "ss -ltnH '( sport = :8962 or sport = :8963 )'" in out
-    assert "sudo -n tailscale serve --https=8960 off" in out
-    assert "sudo -n tailscale serve --https=8961 off" in out
-    assert f"sbx ports {OWN} --unpublish 127.0.0.1:8960:8960 --unpublish 127.0.0.1:8961:8961" in out
+    # Coach review 2: the ports it leaves are the project's own app's; no command for them.
+    assert (
+        f"8960 and 8961 are {KEY}'s own ports (8960: sandbox.publish 127.0.0.1:8960:8960; "
+        "8961: sandbox.publish 127.0.0.1:8961:8961); leave them. Taking them off this machine "
+        "is the owner's decision."
+    ) in out
+    assert "serve --https=8960 off" not in out and "serve --https=8961 off" not in out
+    assert "--unpublish" not in out
 
 
 def test_no_clash_keeps_the_usual_pair_and_prints_no_extra_lines(own):  # noqa: F811
@@ -241,8 +246,9 @@ def test_a_second_move_prints_the_steps_from_the_recorded_ports(own):  # noqa: F
     out = second.output
     assert "Its previews move from 8962 and 8963 to 8966 and 8967" in out
     assert f"sbx ports {OWN} --publish 127.0.0.1:8966:8966 --publish 127.0.0.1:8967:8967" in out
-    assert "sudo -n tailscale serve --https=8962 off" in out and "sudo -n tailscale serve --https=8963 off" in out
-    assert f"sbx ports {OWN} --unpublish 127.0.0.1:8962:8962 --unpublish 127.0.0.1:8963:8963" in out
+    assert f"8962 and 8963 are {KEY}'s own ports" in out and "leave them" in out
+    assert "serve --https=8962 off" not in out and "serve --https=8963 off" not in out
+    assert "--unpublish" not in out
     assert "--https=8960 off" not in out, "the usual pair was left long ago; nothing to take off there"
 
 
@@ -262,8 +268,8 @@ def test_a_move_back_to_the_usual_pair_restores_them(own):  # noqa: F811
     assert "Its previews move from 8962 and 8963 to 8960 and 8961" in out
     assert "sudo -n tailscale serve --bg --https=8960 http://127.0.0.1:8960" in out
     assert "sudo -n tailscale serve --bg --https=8961 http://127.0.0.1:8961" in out
-    assert "sudo -n tailscale serve --https=8962 off" in out
-    assert f"sbx ports {OWN} --unpublish 127.0.0.1:8962:8962 --unpublish 127.0.0.1:8963:8963" in out
+    assert f"8962 and 8963 are {KEY}'s own ports" in out
+    assert "--https=8962 off" not in out and "--unpublish" not in out
 
 
 def test_running_again_with_the_same_ports_prints_no_move(own):  # noqa: F811
@@ -345,3 +351,26 @@ def test_the_rewrite_refuses_a_line_that_is_in_the_file_twice():
     with pytest.raises(Refused) as refused:
         _edit(other)
     assert "is not in the file exactly once" in str(refused.value)
+
+
+
+def test_a_left_port_that_was_a_preview_alone_gets_the_off_and_unpublish_lines(own):  # noqa: F811
+    """Coach review 2: recorded 8962 and 8963; the project now uses 8962 only,
+    so its previews go back to 8960 and 8961. 8962 is its own (left alone,
+    no command); 8963 was a preview alone (stop serving and unpublish it)."""
+    own.write_project("deploy/profile.yaml", _profile_using([8960, 8961]))
+    assert _run_own().exit_code == 0
+    _activate(own)
+    own.write_project("deploy/profile.yaml", _profile_using([8962]))
+    back = _run_own()
+    assert back.exit_code == 0, back.output
+    out = back.output
+    assert "Its previews move from 8962 and 8963 to 8960 and 8961" in out
+    assert (
+        f"8962 is {KEY}'s own port (8962: sandbox.publish 127.0.0.1:8962:8962); leave it. "
+        "Taking it off this machine is the owner's decision."
+    ) in out
+    assert "8963 is no longer its previews and the project does not use them" in out
+    assert "sudo -n tailscale serve --https=8963 off" in out
+    assert f"sbx ports {OWN} --unpublish 127.0.0.1:8963:8963" in out
+    assert "--https=8962 off" not in out and "127.0.0.1:8962:8962 " not in out.split("leave it")[1]
