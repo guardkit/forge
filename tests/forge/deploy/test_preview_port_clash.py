@@ -34,6 +34,7 @@ from forge.config.models import SandboxEntry
 from forge.config.sandbox_slots import (
     PreviewPortsRefused,
     choose_preview_ports,
+    factory_service_ports,
     preview_block,
     slot_ports,
 )
@@ -118,6 +119,29 @@ def test_a_block_with_fewer_than_two_free_ports_is_refused_in_plain_words():
     words = str(refused.value)
     assert "slot 1's preview ports are 8960 to 8969" in words
     assert "uses 9 of them" in words and "give it another slot" in words
+
+
+def test_a_preview_never_takes_another_slot_s_factory_service_port():
+    """Codex review R1: slot 4's runner and helper (8964, 8965) and slot 5's
+    git daemon (8968) sit inside slot 1's block. They are skipped."""
+    four, five = slot_ports(4), slot_ports(5)
+    assert (four.runner, four.helper, five.git_daemon) == (8964, 8965, 8968)
+    assert choose_preview_ports(1, {8960, 8961, 8962, 8963}) == (8966, 8967)
+    assert choose_preview_ports(1, {8960, 8961, 8962, 8963, 8966}) == (8967, 8969)
+    services = factory_service_ports()
+    for slot in range(1, 20):
+        assert not services & set(slot_ports(slot).previews), "every usual pair stays free"
+        for used in (set(), set(slot_ports(slot).previews), set(list(preview_block(slot))[:4])):
+            chosen = choose_preview_ports(slot, used)
+            assert not services & set(chosen) and set(chosen) <= set(preview_block(slot))
+
+
+def test_a_block_left_with_only_service_ports_is_refused_naming_them():
+    with pytest.raises(PreviewPortsRefused) as refused:
+        choose_preview_ports(1, {8960, 8961, 8962, 8963, 8966, 8967, 8969})
+    words = str(refused.value)
+    assert "uses 7 of them" in words
+    assert "the factory keeps 8964, 8965, 8968 for other slots' services" in words
 
 
 def test_each_slot_s_block_is_its_own():

@@ -21,9 +21,11 @@ from tests.forge.cli.test_register_repo import KEY, LEAF, estate  # noqa: F401
 from tests.forge.cli.test_register_repo_sandbox import (  # noqa: F401
     COORDINATOR_ENTRY,
     ENTRY,
+    OTHER_ENTRY,
     OWN,
     OWN_SETTINGS,
     _run_own,
+    _with_other_project,
     own,
 )
 
@@ -81,8 +83,11 @@ def test_a_clash_gives_the_next_free_pair_in_both_files_and_the_spark_lines(own)
     assert f"sbx ports {OWN} --publish 127.0.0.1:8962:8962 --publish 127.0.0.1:8963:8963" in out
     assert "sudo -n tailscale serve --bg --https=8962 http://127.0.0.1:8962" in out
     assert "sudo -n tailscale serve --bg --https=8963 http://127.0.0.1:8963" in out
+    assert "Its previews move from 8960 and 8961 to 8962 and 8963" in out
     assert "ss -ltnH '( sport = :8962 or sport = :8963 )'" in out
-    assert "sudo -n tailscale serve --https=8960 off and sudo -n tailscale serve --https=8961 off" in out
+    assert "sudo -n tailscale serve --https=8960 off" in out
+    assert "sudo -n tailscale serve --https=8961 off" in out
+    assert f"sbx ports {OWN} --unpublish 127.0.0.1:8960:8960 --unpublish 127.0.0.1:8961:8961" in out
 
 
 def test_no_clash_keeps_the_usual_pair_and_prints_no_extra_lines(own):  # noqa: F811
@@ -166,3 +171,78 @@ def test_recorded_ports_the_project_does_not_use_are_not_rewritten(own):  # noqa
     assert again.exit_code == 1
     assert "already has an entry" in again.output
     assert own.writes == []
+
+
+def _profile_using(ports: list[int]) -> str:
+    rules = ", ".join(f'"127.0.0.1:{p}:{p}"' for p in ports)
+    return CLASHING_PROFILE.replace(
+        'publish: ["127.0.0.1:8960:8960", "127.0.0.1:8961:8961", "127.0.0.1:8950:8950", "127.0.0.1:8951:8951"]',
+        f"publish: [{rules}]",
+    ).replace('"http://127.0.0.1:8960"', '"http://127.0.0.1:8901"').replace('"8961"', '"8902"')
+
+
+def _activate(own):  # noqa: F811
+    own.volume["forge.yaml"] = own.volume.pop(PENDING)
+    own.sandbox_files[OWN_SETTINGS] = own.sandbox_files.pop(f"{OWN_SETTINGS}.{LEAF}-pending")
+
+
+def test_previews_skip_the_ports_of_a_slot_four_sandbox_beside_it(own):  # noqa: F811
+    """Codex review R1: another project in slot 4 has its runner on 8964 and
+    its helper on 8965, inside slot 1's block. Slot 1 skips them."""
+    _with_other_project(own, {
+        **OTHER_ENTRY,
+        "sidecar_url": "http://192.0.2.10:8965",
+        "runner_url": "http://192.0.2.10:8964",
+        "git_door": "http://192.0.2.1:31834/",
+    })
+    own.write_project("deploy/profile.yaml", _profile_using([8960, 8961, 8962, 8963]))
+    result = _run_own()
+    assert result.exit_code == 0, result.output
+    coordinator, sandbox = _staged(own)
+    assert coordinator["preview_ports"] == sandbox["preview_ports"] == [8966, 8967]
+
+
+def test_a_second_move_prints_the_steps_from_the_recorded_ports(own):  # noqa: F811
+    """Codex review R2: the steps are for the actual move, not from the usual pair."""
+    own.write_project("deploy/profile.yaml", _profile_using([8960, 8961]))
+    assert _run_own().exit_code == 0
+    _activate(own)
+    own.write_project("deploy/profile.yaml", _profile_using([8960, 8961, 8962, 8963]))
+    second = _run_own()
+    assert second.exit_code == 0, second.output
+    assert f"sandboxes {KEY} preview_ports 8962, 8963 -> 8966, 8967" in second.output
+    out = second.output
+    assert "Its previews move from 8962 and 8963 to 8966 and 8967" in out
+    assert f"sbx ports {OWN} --publish 127.0.0.1:8966:8966 --publish 127.0.0.1:8967:8967" in out
+    assert "sudo -n tailscale serve --https=8962 off" in out and "sudo -n tailscale serve --https=8963 off" in out
+    assert f"sbx ports {OWN} --unpublish 127.0.0.1:8962:8962 --unpublish 127.0.0.1:8963:8963" in out
+    assert "--https=8960 off" not in out, "the usual pair was left long ago; nothing to take off there"
+
+
+def test_a_move_back_to_the_usual_pair_restores_them(own):  # noqa: F811
+    """Codex review R2: the project frees 8960 and 8961 and now uses 8962 and
+    8963, so its previews go back to the usual pair, and the steps say so."""
+    own.write_project("deploy/profile.yaml", _profile_using([8960, 8961]))
+    assert _run_own().exit_code == 0
+    _activate(own)
+    own.write_project("deploy/profile.yaml", _profile_using([8962, 8963]))
+    back = _run_own()
+    assert back.exit_code == 0, back.output
+    coordinator, sandbox = _staged(own)
+    assert coordinator == COORDINATOR_ENTRY and sandbox == ENTRY
+    out = back.output
+    assert f"sandboxes {KEY} preview_ports 8962, 8963 -> 8960, 8961" in out
+    assert "Its previews move from 8962 and 8963 to 8960 and 8961" in out
+    assert "sudo -n tailscale serve --bg --https=8960 http://127.0.0.1:8960" in out
+    assert "sudo -n tailscale serve --bg --https=8961 http://127.0.0.1:8961" in out
+    assert "sudo -n tailscale serve --https=8962 off" in out
+    assert f"sbx ports {OWN} --unpublish 127.0.0.1:8962:8962 --unpublish 127.0.0.1:8963:8963" in out
+
+
+def test_running_again_with_the_same_ports_prints_no_move(own):  # noqa: F811
+    own.write_project("deploy/profile.yaml", _profile_using([8960, 8961]))
+    assert _run_own().exit_code == 0
+    _activate(own)
+    again = _run_own()
+    assert again.exit_code == 0, again.output
+    assert "Its previews move" not in again.output and "tailscale" not in again.output

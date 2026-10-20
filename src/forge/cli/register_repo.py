@@ -2387,6 +2387,58 @@ class Estate:
     sandbox_ssh: str | None = None
 
 
+def _preview_move_lines(
+    *,
+    sandbox: str,
+    before: Sequence[int],
+    after: Sequence[int],
+    because: str | None,
+    there: Callable[[str], str],
+) -> list[str]:
+    """The steps on the sandbox's machine for a move of its preview ports from
+    ``before`` to ``after`` (20 October 2026), in either direction: a first
+    move off the usual pair, a second move, or a move back to the usual pair.
+    """
+    added = [port for port in after if port not in before]
+    removed = [port for port in before if port not in after]
+    lines = [
+        f"    Its previews move from {_and(before)} to {_and(after)}"
+        + (f", because {because}" if because else "")
+        + ". On the sandbox's machine, before its next preview:"
+    ]
+    if added:
+        lines += [
+            f"    Check that nothing but this sandbox listens on {_and(added)} there (this prints"
+            " nothing, or only this sandbox's own publish of them):",
+            "    " + there("ss -ltnH '( " + " or ".join(f"sport = :{p}" for p in added) + " )'"),
+            f"    Publish {_and(added)} from the sandbox, unless sbx ports {sandbox} already lists"
+            " them, and serve them over Tailscale, unless tailscale serve status already does:",
+            "    " + there(f"sbx ports {sandbox} " + " ".join(f"--publish 127.0.0.1:{p}:{p}" for p in added)),
+        ]
+        lines += [
+            "    " + there(f"sudo -n tailscale serve --bg --https={p} http://127.0.0.1:{p}")
+            for p in added
+        ]
+    if removed:
+        lines += [
+            f"    {_and(removed)} are no longer its previews; a link to them would reach whatever"
+            " the project runs there, not a preview. Stop serving them, and stop publishing them"
+            " from the sandbox unless something on this machine still needs them:",
+        ]
+        lines += ["    " + there(f"sudo -n tailscale serve --https={p} off") for p in removed]
+        lines.append(
+            "    " + there(f"sbx ports {sandbox} " + " ".join(f"--unpublish 127.0.0.1:{p}:{p}" for p in removed))
+        )
+    lines.append(f"    Check with tailscale serve status and sbx ports {sandbox}.")
+    return lines
+
+
+def _and(ports: Sequence[int]) -> str:
+    """``8960 and 8961`` (one port: ``8960``)."""
+    named = [str(p) for p in ports]
+    return named[0] if len(named) == 1 else ", ".join(named[:-1]) + f" and {named[-1]}"
+
+
 def activation_sequence(
     *,
     key: str,
@@ -2400,13 +2452,17 @@ def activation_sequence(
     removing: bool = False,
     previews: tuple[int, int] | None = None,
     previews_moved_because: str | None = None,
+    previews_before: Sequence[int] | None = None,
 ) -> list[str]:
     """The one-page procedure's own order, for this registration (step 7 a–h).
 
     ``previews`` (20 October 2026) are the preview ports chosen for a sandbox
-    of its own; when they are not its slot's usual pair
-    (``previews_moved_because`` says why), the lines that publish them from
-    the sandbox and serve them over Tailscale on its machine are printed too.
+    of its own, and ``previews_before`` the ones its entry recorded before this
+    run (none recorded: the slot's usual pair, which the sandbox is made
+    publishing). When they differ (``previews_moved_because`` says why, when
+    the project uses a port of the usual pair), the lines for that move are
+    printed too: which ports to publish from the sandbox and serve over
+    Tailscale on its machine, and which to stop serving and publishing.
 
     ``removing`` (forge unregister-repo, 18 October 2026): the same order for
     taking a registration out; its last check is that the coordinator no
@@ -2544,33 +2600,11 @@ def activation_sequence(
             f" {shown[1]}; its Git door port is {ports.git_door} and its memory door port"
             f" {ports.memory_door}:",
         ]
-        if previews is not None and tuple(previews) != tuple(ports.previews):
-            extra = [port for port in previews if port not in ports.previews]
-            lines += [
-                f"    Its previews use {previews[0]} and {previews[1]}, not the slot's usual"
-                f" {ports.previews[0]} and {ports.previews[1]}"
-                + (f", because {previews_moved_because}" if previews_moved_because else "")
-                + ". Before its first preview, on the sandbox's machine: check that nothing"
-                " else listens on the new ports there (this prints nothing),",
-                "    " + there("ss -ltnH '( " + " or ".join(f"sport = :{p}" for p in extra) + " )'"),
-                "    then publish them from the sandbox (the sandbox was made with the usual pair"
-                " only) and serve them over Tailscale, as the usual pair is:",
-                "    " + there(
-                    f"sbx ports {q(estate.sandbox)} "
-                    + " ".join(f"--publish 127.0.0.1:{p}:{p}" for p in extra)
-                ),
-            ]
-            lines += [
-                "    " + there(f"sudo -n tailscale serve --bg --https={p} http://127.0.0.1:{p}")
-                for p in extra
-            ]
-            dropped = [port for port in ports.previews if port not in previews]
-            lines.append(
-                "    Check with tailscale serve status. A Tailscale serve left on "
-                + " or ".join(str(p) for p in dropped)
-                + " now reaches the project's own port there, not a preview: take it off with "
-                + " and ".join(f"sudo -n tailscale serve --https={p} off" for p in dropped)
-                + " unless that is wanted."
+        before = tuple(previews_before) if previews_before else tuple(ports.previews)
+        if previews is not None and tuple(previews) != before:
+            lines += _preview_move_lines(
+                sandbox=q(estate.sandbox), before=before, after=tuple(previews),
+                because=previews_moved_because, there=there,
             )
         if memory_project:
             lines.append(
@@ -3193,6 +3227,16 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     coordinator_text = volume.read(SETTINGS_FILE_NAME)
     if coordinator_text is None:
         raise Refused("coordinator", f"could not read {SETTINGS_FILE_NAME} from the volume {options.volume}")
+    # The preview ports the coordinator recorded for it before this run, if
+    # any (20 October 2026): the printed steps are for the actual move.
+    previews_before: list[int] = []
+    if options.slot is not None:
+        try:
+            recorded = yaml.safe_load(coordinator_text)
+        except yaml.YAMLError:
+            recorded = None  # the edit below refuses an unreadable file in its own words
+        entry_before = _mapping(_mapping(_mapping(recorded).get("planning")).get("sandboxes")).get(options.key)
+        previews_before = _ports_of(_mapping(entry_before).get("preview_ports"))
     sandbox_text = sandbox.read(options.sandbox_settings)
     # A sandbox of its own is made without a settings file: this command
     # writes it (17 October 2026), from the few lines below plus the
@@ -3361,6 +3405,7 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
         memory_project=granted_memory,
         previews=previews,
         previews_moved_because=previews_moved_because,
+        previews_before=previews_before or None,
     )
     return tail
 

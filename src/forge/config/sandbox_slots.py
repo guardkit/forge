@@ -22,7 +22,8 @@ number inside the sandbox as on the sandbox's machine, so a project that uses
 8950 + 10·*k* or 8951 + 10·*k* itself (its live app, say) could never start a
 preview in slot *k*. Each slot therefore owns a block of ten preview ports,
 8950 + 10·*k* to 8959 + 10·*k*, and :func:`choose_preview_ports` takes the
-first two the project does not use itself. With no clash that is the usual
+first two the project does not use itself and no slot's factory service has
+(slot 4's runner is 8964, in slot 1's block). With no clash that is the usual
 pair, so no other project's ports move.
 """
 
@@ -37,6 +38,7 @@ __all__ = [
     "PreviewPortsRefused",
     "SlotPorts",
     "choose_preview_ports",
+    "factory_service_ports",
     "preview_block",
     "slot_ports",
 ]
@@ -111,23 +113,44 @@ def preview_block(slot: int) -> range:
     return range(first, first + SLOT_STEP)
 
 
+def factory_service_ports() -> frozenset[int]:
+    """Every port the slot layout gives a factory service of any slot, slot 0's
+    included: the build runner, the deploy helper and the git daemon, and the
+    two doors. A preview never takes one (Codex review R1, 20 October 2026):
+    slot 4's runner and helper are 8964 and 8965, inside slot 1's block. The
+    slots' usual preview pairs are never among them."""
+    reserved: set[int] = {RUNNER_BASE, HELPER_BASE, GIT_DAEMON_BASE}
+    for slot in range(1, MAX_SLOT + 1):
+        ports = slot_ports(slot)
+        reserved |= {ports.runner, ports.helper, ports.git_daemon, ports.git_door, ports.memory_door}
+    return frozenset(reserved)
+
+
 def choose_preview_ports(slot: int, used: "Iterable[int]") -> tuple[int, int]:
     """The first two ports in slot ``slot``'s block that the project does not
     use itself (``used``: the ports its deploy profile declares, see
-    :func:`forge.deploy.profile.ports_the_project_uses`).
+    :func:`forge.deploy.profile.ports_the_project_uses`) and that the slot
+    layout does not give a factory service (:func:`factory_service_ports`).
 
     With none of the usual pair in ``used`` this is the usual pair. Raises
     :class:`PreviewPortsRefused` when fewer than two are left.
     """
     block = preview_block(slot)
     taken = {int(port) for port in used}
-    free = [port for port in block if port not in taken]
+    services = factory_service_ports()
+    free = [port for port in block if port not in taken and port not in services]
     if len(free) < 2:
         mine = sorted(port for port in block if port in taken)
+        kept = sorted(port for port in block if port in services and port not in taken)
+        kept_text = (
+            f", and the factory keeps {', '.join(str(p) for p in kept)} for other slots' services"
+            if kept
+            else ""
+        )
         raise PreviewPortsRefused(
             f"slot {slot}'s preview ports are {block[0]} to {block[-1]}, and the project "
-            f"itself uses {len(mine)} of them ({', '.join(str(p) for p in mine)}), so fewer "
-            "than two are left for its previews; move some of the project's own ports "
-            f"out of {block[0]} to {block[-1]} in its deploy profile, or give it another slot"
+            f"itself uses {len(mine)} of them ({', '.join(str(p) for p in mine)}){kept_text}, "
+            "so fewer than two are left for its previews; move some of the project's own "
+            f"ports out of {block[0]} to {block[-1]} in its deploy profile, or give it another slot"
         )
     return free[0], free[1]
