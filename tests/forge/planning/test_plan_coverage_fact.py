@@ -240,11 +240,20 @@ def test_guardkits_reading_and_the_fallback_agree() -> None:
         pytest.skip("GuardKit is not importable in this environment")
     import yaml
 
+    compared = 0
     for text, declared in _READING_CASES:
-        data = yaml.safe_load(text) if isinstance(text, str) else None
+        # The public reader gives the expected answer on every case, the
+        # malformed YAML included (it is false).
+        assert cd.declares_coverage_command(text) is declared, text
+        try:
+            data = yaml.safe_load(text) if isinstance(text, str) else None
+        except yaml.YAMLError:
+            continue  # nothing for either reading to compare
         raw = data.get("toolchain") if isinstance(data, dict) else None
         if isinstance(raw, dict):
             assert cd._guardkit_reading(raw) is cd._fallback_reading(raw), text
+            compared += 1
+    assert compared >= 10
 
 
 def test_guardkits_answer_needs_the_root_and_every_component(monkeypatch) -> None:
@@ -280,3 +289,36 @@ def test_guardkits_answer_needs_the_root_and_every_component(monkeypatch) -> Non
     assert cd._guardkit_reading(one) is False
     assert cd._guardkit_reading({"components": {"a": {"coverage": "x"}}}) is False
     assert cd._guardkit_reading(blank) is False
+
+
+@pytest.mark.parametrize("broken", ["parse", "declaration"])
+def test_an_error_inside_guardkits_reading_is_never_declared(monkeypatch, broken: str) -> None:
+    """Anything unexpected on GuardKit's path is false, never "declared",
+    even where the fallback would say true (coach review 3)."""
+    import sys
+    import types
+
+    class _Broken:
+        is_empty = False
+
+        @property
+        def component_names(self):
+            raise AttributeError("no component_names here")
+
+    def parse_toolchain_block(raw):
+        if broken == "parse":
+            raise RuntimeError("the parser broke")
+        return _Broken()
+
+    module = types.ModuleType("guardkit.orchestrator.toolchain_declaration")
+    module.parse_toolchain_block = parse_toolchain_block
+    module.declared_coverage_command = lambda declaration, component=None: "make coverage"
+    monkeypatch.setitem(sys.modules, "guardkit", types.ModuleType("guardkit"))
+    monkeypatch.setitem(
+        sys.modules, "guardkit.orchestrator", types.ModuleType("guardkit.orchestrator")
+    )
+    monkeypatch.setitem(sys.modules, "guardkit.orchestrator.toolchain_declaration", module)
+
+    text = 'toolchain:\n  coverage: "make coverage"\n'
+    assert cd._fallback_reading({"coverage": "make coverage"}) is True
+    assert cd.declares_coverage_command(text) is False
