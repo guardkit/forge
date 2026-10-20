@@ -65,9 +65,28 @@ async def test_a_project_that_declares_coverage_is_said_to(
 
 
 @pytest.mark.asyncio
-async def test_a_component_coverage_command_counts(
+async def test_the_root_and_every_component_declaring_coverage_is_true(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
+    repo = tmp_path / "app"
+    _init_scratch_repo(repo)
+    _declare(
+        repo,
+        "toolchain:\n  test: \"npm test\"\n  coverage: \"npm run coverage\"\n"
+        "  components:\n    web:\n"
+        "      cwd: web\n      test: \"npm test\"\n      coverage: \"npm run coverage\"\n",
+    )
+    descriptor = await _descriptor_sent(store, repo, tmp_path)
+    assert descriptor[cd.DESCRIPTOR_FIELD] is True
+
+
+@pytest.mark.asyncio
+async def test_a_mixed_project_is_false(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """GuardKit decides task by task with no fallback between the root and a
+    component, so a project where only one component declares coverage still
+    has tasks GuardKit would stop: the plan writer's rule must stay on."""
     repo = tmp_path / "app"
     _init_scratch_repo(repo)
     _declare(
@@ -76,7 +95,7 @@ async def test_a_component_coverage_command_counts(
         "      cwd: web\n      test: \"npm test\"\n      coverage: \"npm run coverage\"\n",
     )
     descriptor = await _descriptor_sent(store, repo, tmp_path)
-    assert descriptor[cd.DESCRIPTOR_FIELD] is True
+    assert descriptor[cd.DESCRIPTOR_FIELD] is False
 
 
 @pytest.mark.asyncio
@@ -142,13 +161,22 @@ async def test_a_branch_without_the_file_falls_back_to_the_repositorys_tip(
     assert "HEAD" in asked and asked[0] != "HEAD"
 
 
-@pytest.mark.parametrize(
-    ("text", "declared"),
-    [
+_READING_CASES = [
         ('toolchain:\n  coverage: "make coverage"\n', True),
-        ("toolchain:\n  components:\n    a:\n      coverage: x\n", True),
-        ("toolchain:\n  components:\n    a:\n      test: x\n", False),
+        # Every place: the root and each listed component.
+        ("toolchain:\n  coverage: r\n  components:\n    a:\n      cwd: a\n"
+         "      coverage: x\n    b:\n      cwd: b\n      coverage: y\n", True),
+        ("toolchain:\n  coverage: r\n  components:\n    a:\n      cwd: a\n"
+         "      coverage: x\n    b:\n      cwd: b\n      test: y\n", False),
+        ("toolchain:\n  components:\n    a:\n      cwd: a\n      coverage: x\n", False),
+        ("toolchain:\n  coverage: r\n  components:\n    a:\n      cwd: a\n      test: x\n", False),
+        ("toolchain:\n  coverage: r\n  components: [a]\n", False),
+        # An empty command anywhere: GuardKit ignores the whole block.
+        ('toolchain:\n  coverage: "make coverage"\n  lint: ""\n', False),
+        ('toolchain:\n  coverage: r\n  components:\n    a:\n      cwd: a\n'
+         '      coverage: x\n      test: ""\n', False),
         ('toolchain:\n  coverage: "  "\n', False),
+        ('toolchain:\n  coverage: ""\n', False),
         ("toolchain:\n  coverage_timeout: 30\n", False),
         ("toolchain:\n  test: x\n", False),
         ("coverage: x\n", False),
@@ -156,7 +184,99 @@ async def test_a_branch_without_the_file_falls_back_to_the_repositorys_tip(
         ("not: [valid", False),
         ("", False),
         (None, False),
-    ],
-)
+]
+
+
+@pytest.mark.parametrize(("text", "declared"), _READING_CASES)
 def test_the_reading_follows_guardkits(text: str | None, declared: bool) -> None:
     assert cd.declares_coverage_command(text) is declared
+
+
+def test_guardkits_own_answer_is_used_when_guardkit_is_importable(monkeypatch) -> None:
+    """In the factory image GuardKit's parser decides; the YAML reading is
+    only the fallback. A stand-in GuardKit that disagrees with the fallback
+    shows which one answered."""
+    import sys
+    import types
+
+    calls: list[object] = []
+
+    class _Declaration:
+        is_empty = False
+        component_names: list[str] = []
+
+    def parse_toolchain_block(raw):
+        calls.append(raw)
+        if "misspelt" in raw:
+            raise ValueError("unknown key")
+        return _Declaration()
+
+    def declared_coverage_command(declaration, component=None):
+        return None  # GuardKit says: nothing declared
+
+    module = types.ModuleType("guardkit.orchestrator.toolchain_declaration")
+    module.parse_toolchain_block = parse_toolchain_block
+    module.declared_coverage_command = declared_coverage_command
+    monkeypatch.setitem(sys.modules, "guardkit", types.ModuleType("guardkit"))
+    monkeypatch.setitem(
+        sys.modules, "guardkit.orchestrator", types.ModuleType("guardkit.orchestrator")
+    )
+    monkeypatch.setitem(sys.modules, "guardkit.orchestrator.toolchain_declaration", module)
+
+    text = 'toolchain:\n  coverage: "make coverage"\n'
+    assert cd._fallback_reading({"coverage": "make coverage"}) is True
+    assert cd.declares_coverage_command(text) is False
+    assert calls == [{"coverage": "make coverage"}]
+    assert cd.declares_coverage_command('toolchain:\n  misspelt: x\n') is False
+
+
+def test_guardkits_reading_and_the_fallback_agree() -> None:
+    """Where GuardKit can be imported, its answer and the fallback's agree
+    on every case above. Skipped where it cannot (this machine's Forge
+    environment); the factory image installs it."""
+    try:
+        from guardkit.orchestrator import toolchain_declaration  # noqa: F401
+    except Exception:  # noqa: BLE001
+        pytest.skip("GuardKit is not importable in this environment")
+    import yaml
+
+    for text, declared in _READING_CASES:
+        data = yaml.safe_load(text) if isinstance(text, str) else None
+        raw = data.get("toolchain") if isinstance(data, dict) else None
+        if isinstance(raw, dict):
+            assert cd._guardkit_reading(raw) is cd._fallback_reading(raw), text
+
+
+def test_guardkits_answer_needs_the_root_and_every_component(monkeypatch) -> None:
+    """Through GuardKit's path too, one component without its own coverage
+    command makes the answer false (GuardKit decides task by task)."""
+    import sys
+    import types
+
+    class _Declaration:
+        is_empty = False
+
+        def __init__(self, raw):
+            self.raw = raw
+            self.component_names = sorted(raw.get("components") or {})
+
+    def declared_coverage_command(declaration, component=None):
+        block = declaration.raw if component is None else declaration.raw["components"][component]
+        return block.get("coverage")
+
+    module = types.ModuleType("guardkit.orchestrator.toolchain_declaration")
+    module.parse_toolchain_block = _Declaration
+    module.declared_coverage_command = declared_coverage_command
+    monkeypatch.setitem(sys.modules, "guardkit", types.ModuleType("guardkit"))
+    monkeypatch.setitem(
+        sys.modules, "guardkit.orchestrator", types.ModuleType("guardkit.orchestrator")
+    )
+    monkeypatch.setitem(sys.modules, "guardkit.orchestrator.toolchain_declaration", module)
+
+    both = {"coverage": "r", "components": {"a": {"coverage": "x"}, "b": {"coverage": "y"}}}
+    one = {"coverage": "r", "components": {"a": {"coverage": "x"}, "b": {}}}
+    blank = {"coverage": "  "}
+    assert cd._guardkit_reading(both) is True
+    assert cd._guardkit_reading(one) is False
+    assert cd._guardkit_reading({"components": {"a": {"coverage": "x"}}}) is False
+    assert cd._guardkit_reading(blank) is False
