@@ -117,7 +117,7 @@ from forge.planning.failure import (
     mark_run_failed,
     settle_routing_failure,
 )
-from forge.planning import nothing_to_build
+from forge.planning import coverage_declaration, nothing_to_build
 from forge.planning.handoff import (
     PlannedHandoffHandler,
     PreCommitCheck,
@@ -6850,6 +6850,14 @@ class PlanningRunDriver:
             ranked_source=self._ranked_source_enabled(),
             reference_paths=self._reference_paths_of(correlation_id),
         )
+        # Whether the project already declares a coverage command (20 October
+        # 2026): the plan writer holds a plan that sets the command up to
+        # declaring it before the tasks GuardKit measures, and needs to know
+        # when the project has one already. Read from the same file and the
+        # same places the stamping below reads it; unreadable is "false".
+        target_repo_descriptor[coverage_declaration.DESCRIPTOR_FIELD] = (
+            await self._coverage_command_declared(repo_path, branch)
+        )
         if descriptor_unavailable:
             self.__dict__.setdefault("_descriptor_unavailable", {})[correlation_id] = (
                 descriptor_unavailable[0]
@@ -12335,6 +12343,32 @@ class PlanningRunDriver:
                 }
             )
         return entries
+
+    async def _coverage_command_declared(self, repo_path: str, branch: str) -> bool:
+        """``True`` when the project's ``.guardkit/config.yaml`` declares a
+        coverage command, read off the planning branch, else off the
+        repository's current tip (the same two places the plan-commit
+        stamping reads it). ``False`` when it cannot be read. Never raises."""
+        git_runner = self._deps.git_runner
+        for ref in (branch, "HEAD"):
+            try:
+                text = await git_runner.read_file_from_branch(
+                    repo_path=repo_path,
+                    branch=ref,
+                    file_path=coverage_declaration.CONFIG_PATH,
+                )
+            except Exception as exc:  # noqa: BLE001 — never fail a plan over this
+                logger.warning(
+                    "planning driver: %s could not be read from %s (%s); the "
+                    "plan writer is told no coverage command is declared",
+                    coverage_declaration.CONFIG_PATH,
+                    ref,
+                    exc,
+                )
+                return False
+            if text is not None:
+                return coverage_declaration.declares_coverage_command(text)
+        return False
 
     @staticmethod
     def _build_target_repo_descriptor(
