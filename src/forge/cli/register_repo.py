@@ -551,6 +551,40 @@ def set_mapping_entry(
     lines.insert(at, f"{' ' * indent}{key}: {value}")
 
 
+def replace_flow_value(
+    lines: list[str], path: Sequence[str], key: str, value: str
+) -> tuple[str, str]:
+    """Rewrite ``key: [ ... ]`` in the block mapping at ``path`` to ``key: value``.
+
+    Only a value written on the key's own line as one ``[ ... ]`` list, with
+    no comment on that line, is rewritten; anything else is refused, so a
+    comment is never lost. Returns ``(the old line, the new line)``.
+    """
+    parent = locate(lines, path)
+    if parent is None or parent.child_indent is None:
+        raise YamlEditRefused(f"{'.'.join(path)} is not in the file, so {key} cannot be changed")
+    found = _find_key(
+        lines, key, start=parent.key_line + 1, end=parent.block_end, indent=parent.child_indent
+    )
+    if found is None:
+        raise YamlEditRefused(f"{'.'.join(path)} has no {key} line to change")
+    block = _block_extent(lines, found, parent.child_indent)
+    written = block.inline_value
+    if (
+        block.last_content_child is not None
+        or not (written.startswith("[") and written.endswith("]"))
+        or "#" in written
+    ):
+        raise YamlEditRefused(
+            f"{'.'.join(path)}.{key} is not written as one [ ... ] list on its own line, "
+            "so this command will not change it — edit it by hand"
+        )
+    old = lines[found]
+    new = f"{' ' * parent.child_indent}{key}: {value}"
+    lines[found] = new
+    return old, new
+
+
 def _scalar(value: str) -> str:
     """``value`` as a YAML scalar that reads back as exactly that text."""
     text = str(value)
@@ -1279,6 +1313,7 @@ def plan_settings_edit(
     path: str,
     fetch_address: str | None = None,
     entry: Mapping[str, str] | None = None,
+    ports_in_use: frozenset[int] = frozenset(),
 ) -> YamlEdit:
     """The entries ``key`` needs in one ``forge.yaml``, by line insertion.
 
@@ -1295,6 +1330,11 @@ def plan_settings_edit(
     nothing — when an entry already says something else, when the result would
     not load, when it would change anything but the three entries, or when a
     line of the original (a comment included) would be lost.
+
+    ``ports_in_use`` (20 October 2026) are the ports the project's deploy
+    profile says it uses itself. An entry whose recorded ``preview_ports``
+    include one of them has that one line rewritten to the entry's ports;
+    any other difference in ``preview_ports`` is refused as before.
     """
     try:
         data = yaml.safe_load(text)
@@ -1349,6 +1389,8 @@ def plan_settings_edit(
     expected = copy.deepcopy(data)
     steps: list[Step] = []
     changed = False
+    #: (the original line, its new text) for each line rewritten in place.
+    rewritten: list[tuple[str, str]] = []
     try:
         if path in allowlist:
             steps.append(Step(which, "unchanged", f"allowlist has {path}"))
@@ -1387,12 +1429,33 @@ def plan_settings_edit(
             if isinstance(current_entry, dict)
             else []
         )
-        added_only = bool(missing) and current_entry == {
-            k: v for k, v in entry.items() if k not in missing
-        }
+        # Preview ports chosen afresh (20 October 2026): the project uses one
+        # of the ports its entry names, so this run gives it others in its
+        # slot's block. That one line is rewritten; nothing else changes.
+        moved = (
+            isinstance(current_entry, dict)
+            and "preview_ports" in entry
+            and "preview_ports" in current_entry
+            and current_entry["preview_ports"] != entry["preview_ports"]
+            and isinstance(current_entry["preview_ports"], list)
+            and any(port in ports_in_use for port in current_entry["preview_ports"])
+        )
+        left_alone = {"preview_ports"} if moved else set()
+        added_only = bool(missing or moved) and {
+            k: v for k, v in current_entry.items() if k not in left_alone
+        } == {k: v for k, v in entry.items() if k not in missing and k not in left_alone}
         if current_entry == entry:
             steps.append(Step(which, "unchanged", f"sandboxes has {key} in {entry['name']}"))
         elif added_only:
+            if moved:
+                old_line, new_line = replace_flow_value(
+                    lines, ("planning", "sandboxes", _scalar(key)), "preview_ports",
+                    _entry_value(entry["preview_ports"]),
+                )
+                rewritten.append((old_line, new_line))
+                was = ", ".join(str(v) for v in current_entry["preview_ports"] or [])
+                now = ", ".join(str(v) for v in entry["preview_ports"])
+                steps.append(Step(which, "change", f"sandboxes {key} preview_ports {was} -> {now}"))
             # A project given its sandbox before these lines existed (18
             # October 2026): its entry is as this run would write it, without
             # them, so they are added to it and nothing else changes.
@@ -1468,7 +1531,17 @@ def plan_settings_edit(
             "the edited forge.yaml would change more than the project's own entries; "
             "nothing was written — edit it by hand",
         )
-    if not _keeps_every_line(plain.split("\n"), lines):
+    original_lines = plain.split("\n")
+    for old_line, new_line in rewritten:
+        # The one line rewritten in place must be one line of the original.
+        if original_lines.count(old_line) != 1:
+            raise Refused(
+                which,
+                f"the line {old_line.strip()!r} is not in the file exactly once, so this "
+                "command will not rewrite it; nothing was written — edit it by hand",
+            )
+        original_lines[original_lines.index(old_line)] = new_line
+    if not _keeps_every_line(original_lines, lines):
         raise Refused(which, "the edit would lose a line of the file; nothing was written")
     why_not = _loads_as_forge_settings(staged)
     if why_not is not None:
@@ -2325,8 +2398,15 @@ def activation_sequence(
     dry_run: bool,
     memory_project: str | None = None,
     removing: bool = False,
+    previews: tuple[int, int] | None = None,
+    previews_moved_because: str | None = None,
 ) -> list[str]:
     """The one-page procedure's own order, for this registration (step 7 a–h).
+
+    ``previews`` (20 October 2026) are the preview ports chosen for a sandbox
+    of its own; when they are not its slot's usual pair
+    (``previews_moved_because`` says why), the lines that publish them from
+    the sandbox and serve them over Tailscale on its machine are printed too.
 
     ``removing`` (forge unregister-repo, 18 October 2026): the same order for
     taking a registration out; its last check is that the coordinator no
@@ -2455,14 +2535,43 @@ def activation_sequence(
         ]
     else:
         ports = estate.slot
+        shown = previews or ports.previews
         lines += [
             f"(d) Start or restart {estate.sandbox}'s own supervisor (its own Compose project on the"
             " sandbox's machine, one per project) and confirm the helper and runner are ready."
             f" Slot {ports.slot} publishes the runner on {ports.runner}, the helper on {ports.helper},"
-            f" the git daemon on {ports.git_daemon} and previews on {ports.previews[0]} and"
-            f" {ports.previews[1]}; its Git door port is {ports.git_door} and its memory door port"
+            f" the git daemon on {ports.git_daemon} and previews on {shown[0]} and"
+            f" {shown[1]}; its Git door port is {ports.git_door} and its memory door port"
             f" {ports.memory_door}:",
         ]
+        if previews is not None and tuple(previews) != tuple(ports.previews):
+            extra = [port for port in previews if port not in ports.previews]
+            lines += [
+                f"    Its previews use {previews[0]} and {previews[1]}, not the slot's usual"
+                f" {ports.previews[0]} and {ports.previews[1]}"
+                + (f", because {previews_moved_because}" if previews_moved_because else "")
+                + ". Before its first preview, on the sandbox's machine: check that nothing"
+                " else listens on the new ports there (this prints nothing),",
+                "    " + there("ss -ltnH '( " + " or ".join(f"sport = :{p}" for p in extra) + " )'"),
+                "    then publish them from the sandbox (the sandbox was made with the usual pair"
+                " only) and serve them over Tailscale, as the usual pair is:",
+                "    " + there(
+                    f"sbx ports {q(estate.sandbox)} "
+                    + " ".join(f"--publish 127.0.0.1:{p}:{p}" for p in extra)
+                ),
+            ]
+            lines += [
+                "    " + there(f"sudo -n tailscale serve --bg --https={p} http://127.0.0.1:{p}")
+                for p in extra
+            ]
+            dropped = [port for port in ports.previews if port not in previews]
+            lines.append(
+                "    Check with tailscale serve status. A Tailscale serve left on "
+                + " or ".join(str(p) for p in dropped)
+                + " now reaches the project's own port there, not a preview: take it off with "
+                + " and ".join(f"sudo -n tailscale serve --https={p} off" for p in dropped)
+                + " unless that is wanted."
+            )
         if memory_project:
             lines.append(
                 f"    Its memory door answers for the memory {memory_project} only: the estate env"
@@ -3045,16 +3154,37 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
             publisher_uid=options.publisher_uid,
         )
         steps += project_steps
+        # A sandbox of its own's preview ports (20 October 2026): the first two
+        # in its slot's block that the project does not use itself, read from
+        # the deploy profile in the same check clone.
+        previews: tuple[int, int] | None = None
+        previews_moved_because: str | None = None
+        ports_in_use: frozenset[int] = frozenset()
+        if options.slot is not None:
+            previews, previews_moved_because, ports_in_use = preview_ports_for_slot(
+                Path(folder) / "project", key=options.key, slot=options.slot
+            )
+            if previews_moved_because is not None:
+                steps.append(Step(
+                    "project", "note",
+                    f"previews on {previews[0]} and {previews[1]}, not the slot's usual "
+                    f"{options.slot.previews[0]} and {options.slot.previews[1]}: "
+                    f"{previews_moved_because}",
+                ))
 
     # A sandbox of its own is granted the project's declared memory name (design
     # section 2.4a): the coordinator's entry gets memory_projects, the same
     # name printed for the sandbox's memory door line below, so the card's
     # priors and the door answer for one name. The shared sandbox grants none.
     coordinator_entry = options.coordinator_entry
+    sandbox_entry = options.sandbox_entry
     granted_memory: str | None = None
     if options.slot is not None:
         granted_memory = _memory_name_to_grant(options.key, memory_name)
         coordinator_entry = {**(coordinator_entry or {}), "memory_projects": [granted_memory]}
+        if previews is not None:
+            coordinator_entry["preview_ports"] = list(previews)
+            sandbox_entry = {**(sandbox_entry or {}), "preview_ports": list(previews)}
 
     volume = VolumeStore(options.volume, run)
     sandbox = SandboxStore(options.sandbox, run, ssh_host=options.sandbox_ssh)
@@ -3099,10 +3229,11 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
     # sandbox's settings never carry it: that file sits inside a project clone.
     coordinator_edit = plan_settings_edit(
         coordinator_text, which="coordinator", key=options.key, path=coordinator_path,
-        fetch_address=read_from, entry=coordinator_entry,
+        fetch_address=read_from, entry=coordinator_entry, ports_in_use=ports_in_use,
     )
     sandbox_edit = plan_settings_edit(
-        sandbox_text, which="sandbox", key=options.key, path=clone_path, entry=options.sandbox_entry,
+        sandbox_text, which="sandbox", key=options.key, path=clone_path, entry=sandbox_entry,
+        ports_in_use=ports_in_use,
     )
 
     publisher_edit: JsonEdit | None = None
@@ -3228,8 +3359,68 @@ def _register(options: Options, run: Runner, steps: list[Step]) -> list[str]:
         helper_urls=helper_urls,
         dry_run=options.dry_run,
         memory_project=granted_memory,
+        previews=previews,
+        previews_moved_because=previews_moved_because,
     )
     return tail
+
+
+#: Where a project declares how it is deployed, as the deploy stage reads it.
+DEPLOY_PROFILE_IN_PROJECT: str = "deploy/profile.yaml"
+
+
+def preview_ports_for_slot(
+    checkout: Path, *, key: str, slot: SlotPorts
+) -> tuple[tuple[int, int], str | None, frozenset[int]]:
+    """A sandbox of its own's two preview ports, why they moved (or ``None``),
+    and the ports the project uses itself.
+
+    20 October 2026: a preview port is the same number inside the sandbox as on
+    its machine, so a project that uses its slot's usual preview port itself
+    (its live app, say) could never start a preview. The ports the project's
+    committed deploy profile declares (:func:`forge.deploy.profile.ports_the_project_uses`)
+    are kept clear: the first two free ports in the slot's block of ten are
+    chosen (:func:`forge.config.sandbox_slots.choose_preview_ports`), which is
+    the usual pair when there is no clash. A project with no profile uses
+    none. Refuses, in words, a profile that cannot be read and a block with
+    fewer than two free ports.
+    """
+    from forge.config.sandbox_slots import PreviewPortsRefused, choose_preview_ports
+    from forge.deploy.profile import parse_deploy_profile, ports_the_project_uses
+
+    path = checkout / DEPLOY_PROFILE_IN_PROJECT
+    used: dict[int, str] = {}
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or not path.is_file():
+            raise Refused(
+                "project",
+                f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} is not an ordinary file, so the ports "
+                "it uses cannot be read and its preview ports cannot be chosen. Nothing was written",
+            )
+        try:
+            profile = parse_deploy_profile(
+                yaml.safe_load(path.read_text(encoding="utf-8")) or {},
+                source_ref=DEPLOY_PROFILE_IN_PROJECT,
+            )
+        except Exception as exc:  # noqa: BLE001 — any refusal is the answer
+            first = str(exc).strip().splitlines()
+            raise Refused(
+                "project",
+                f"{key}'s {DEPLOY_PROFILE_IN_PROJECT} could not be used ({type(exc).__name__}: "
+                f"{first[0] if first else 'no detail'}), so the ports it uses cannot be read and "
+                "its preview ports cannot be chosen. Fix it on the default branch and register "
+                "again. Nothing was written",
+            ) from None
+        used = ports_the_project_uses(profile)
+    try:
+        chosen = choose_preview_ports(slot.slot, used)
+    except PreviewPortsRefused as exc:
+        raise Refused("project", f"{key}: {exc}. Nothing was written") from None
+    if chosen == slot.previews:
+        return chosen, None, frozenset(used)
+    clashes = [port for port in slot.previews if port in used]
+    because = "; ".join(f"the project itself uses {port} ({used[port]})" for port in clashes)
+    return chosen, because, frozenset(used)
 
 
 #: The memory service's own rule for a project name (fleet-memory refuses any

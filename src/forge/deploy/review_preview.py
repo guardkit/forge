@@ -135,6 +135,7 @@ __all__ = [
     "UnavailableReviewPreview",
     "build_review_preview_service",
     "is_slots_busy",
+    "known_step_failure",
     "sandbox_preview",
     "serve_preview_operation",
     "slots_busy_reason",
@@ -424,6 +425,8 @@ def sandbox_preview(
     project: str,
     preview: "DeployPreview",
     sandboxes: Mapping[str, Any],
+    *,
+    profile: "DeployProfile | None" = None,
 ) -> "tuple[DeployPreview | None, str | None]":
     """``project``'s preview with its own sandbox's slots, or ``(None, why)``.
 
@@ -451,7 +454,50 @@ def sandbox_preview(
 
     A repository with no sandbox entry keeps the profile as it is; the
     preparation refuses it on its own terms.
+
+    With ``profile`` (20 October 2026), a preview port the project itself
+    uses inside its sandbox (:func:`forge.deploy.profile.ports_the_project_uses`)
+    is refused before anything is started: the preview would find the port
+    taken (Docker's "port is already allocated") and fail at its first step.
     """
+    chosen, why = _sandbox_preview_ports(project, preview, sandboxes)
+    if chosen is None or profile is None:
+        return chosen, why
+    from forge.deploy.profile import ports_the_project_uses
+
+    used = ports_the_project_uses(profile)
+    clashes = [int(slot.port) for slot in chosen.slots if int(slot.port) in used]
+    if not clashes:
+        return chosen, None
+    entry = sandboxes.get(project)
+    name = str(getattr(entry, "name", "") or "") if entry is not None else ""
+    where = f"its sandbox {name}" if name else "its sandbox"
+    own = bool(getattr(entry, "preview_ports", None)) if entry is not None else False
+    fix = (
+        "register the project again with forge register-repo --slot, which "
+        "chooses preview ports the project does not use"
+        if own
+        else "give the preview slot a port the project does not use in its deploy profile"
+    )
+    said = "; ".join(f"{port}: {used[port]}" for port in clashes)
+    which = (
+        f"preview port {clashes[0]} is a port"
+        if len(clashes) == 1
+        else f"preview ports {_ports_text(clashes)} are ports"
+    )
+    return None, (
+        f"{project}'s {which} the project itself uses inside {where} ({said}), "
+        "so no preview is started: it would find the port already taken. "
+        f"To fix it, {fix}"
+    )
+
+
+def _sandbox_preview_ports(
+    project: str,
+    preview: "DeployPreview",
+    sandboxes: Mapping[str, Any],
+) -> "tuple[DeployPreview | None, str | None]":
+    """:func:`sandbox_preview` without the check against the project's own ports."""
     from dataclasses import replace as _replace
 
     from forge.deploy.profile import PreviewSlot
@@ -501,6 +547,38 @@ def sandbox_preview(
             f"own previews, so no preview is started in {name}"
         )
     return preview, None
+
+
+#: Docker's own words when a port it was asked to publish is taken:
+#: ``Bind for 127.0.0.1:8960 failed: port is already allocated``.
+_PORT_TAKEN = re.compile(
+    r"Bind for (?P<address>[0-9]{1,3}(?:\.[0-9]{1,3}){3}|\[[0-9A-Fa-f:]+\]|):?"
+    r"(?P<port>[0-9]{1,5}) failed: port is already allocated"
+)
+
+
+def known_step_failure(output: Any) -> str | None:
+    """A card's reason for a failed step that gave none, in the factory's words.
+
+    The step's own output is NOT copied onto the card (20 October 2026). It is
+    whatever the project's script printed, scrubbed only for known credential
+    shapes, and the script is handed the preview's link token and may print
+    passwords it made itself, so a line of it could carry a secret. Only a
+    failure the factory recognises is named, and only numbers are taken from
+    it: today, Docker finding a port already in use.
+    """
+    if not isinstance(output, str) or not output:
+        return None
+    found = list(_PORT_TAKEN.finditer(output))
+    if not found:
+        return None
+    last = found[-1]
+    address = last.group("address")
+    on = f" on {address}" if address else ""
+    return (
+        f"port {last.group('port')}{on} inside the sandbox was already in use, so "
+        "Docker could not start the preview there (it said: port is already allocated)"
+    )
 
 
 def _new_lease_id() -> str:
@@ -1891,10 +1969,10 @@ class ReviewPreviewService:
         make room. A project whose profile cannot be read answers True, so the
         preparation runs and says why it failed.
         """
-        _profile, preview, unreadable = await asyncio.to_thread(self._preview_of, project)
+        profile, preview, unreadable = await asyncio.to_thread(self._preview_of, project)
         if unreadable is not None or preview is None:
             return True
-        preview, refused = self._sandbox_preview(project, preview)
+        preview, refused = self._sandbox_preview(project, preview, profile)
         if refused is not None or preview is None:
             # Its ports are refused: the preparation runs and says so.
             return True
@@ -1932,12 +2010,17 @@ class ReviewPreviewService:
             logger.exception("review preview: releasing run %s raised", run_id)
 
     def _sandbox_preview(
-        self, project: str, preview: "DeployPreview"
+        self,
+        project: str,
+        preview: "DeployPreview",
+        profile: "DeployProfile | None" = None,
     ) -> "tuple[DeployPreview | None, str | None]":
-        """The preview with its sandbox's own slots, or ``(None, why)``."""
-        if self._sandboxes is None:
-            return preview, None
-        return sandbox_preview(project, preview, self._sandboxes() or {})
+        """The preview with its sandbox's own slots, or ``(None, why)``.
+
+        A preview port the project itself uses is refused whether or not the
+        sandboxes are known (20 October 2026)."""
+        sandboxes = (self._sandboxes() or {}) if self._sandboxes is not None else {}
+        return sandbox_preview(project, preview, sandboxes, profile=profile)
 
     def _public_url_of(self, slot: "PreviewSlot") -> str | None:
         """Where a reviewer opens this slot: the profile's own ``public_url``
@@ -2073,7 +2156,7 @@ class ReviewPreviewService:
             return early("the project's deploy profile has no preview switched on")
         # The sandbox's own published ports replace the profile's (18 October
         # 2026); from here on every slot, port and link is the sandbox's.
-        own_preview, refused_ports = self._sandbox_preview(req.project, preview)
+        own_preview, refused_ports = self._sandbox_preview(req.project, preview, profile)
         if refused_ports is not None or own_preview is None:
             return early(refused_ports or "the preview has no slots in its sandbox")
         preview = own_preview
@@ -2535,7 +2618,11 @@ class ReviewPreviewService:
         if isinstance(result, _LegCrashed):
             return result.reason
         detail = getattr(result, "detail", {}) or {}
-        words = detail.get("refusal") or detail.get("reason")
+        words = (
+            detail.get("refusal")
+            or detail.get("reason")
+            or known_step_failure(detail.get("deploy_output"))
+        )
         step = getattr(result, "failed_step", None)
         if step and words:
             return f"it stopped at {step} — {words}"

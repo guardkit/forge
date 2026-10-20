@@ -71,6 +71,7 @@ __all__ = [
     "unambiguous_https_url",
     "DeployProfileError",
     "load_deploy_profile",
+    "ports_the_project_uses",
     "SANDBOX_WRAPPER_PREFIX",
     "wrapper_inner_script",
 ]
@@ -499,6 +500,96 @@ class DeployProfile:
         land in without touching the runner.
         """
         return self.rollback_image_ref
+
+
+# ---------------------------------------------------------------------------
+# The ports a project uses itself (20 October 2026)
+# ---------------------------------------------------------------------------
+
+#: Host names that mean "this machine" in a setting's address: a URL naming one
+#: of them names a port inside the project's own sandbox.
+_THIS_MACHINE = frozenset({"localhost", "127.0.0.1", "::1", "0.0.0.0"})
+
+
+def _port_in_setting(name: str, value: str) -> int | None:
+    """The port a non-secret setting names inside the sandbox, or ``None``.
+
+    Two shapes only, both written by the project: a setting whose name is
+    ``PORT`` or ends in ``_PORT`` with a port number as its value, and an
+    ``http``/``https`` address on this machine with its port written out
+    (``http://127.0.0.1:8961``). Anything else names no port here.
+    """
+    from urllib.parse import urlsplit
+
+    text = str(value).strip()
+    if (name == "PORT" or name.endswith("_PORT")) and text.isdigit():
+        port = int(text)
+        return port if 1 <= port <= 65535 else None
+    if "://" not in text:
+        return None
+    try:
+        parts = urlsplit(text)
+        port = parts.port
+    except ValueError:
+        return None
+    host = (parts.hostname or "").lower()
+    if parts.scheme not in ("http", "https") or port is None:
+        return None
+    if host in _THIS_MACHINE or host.startswith("127."):
+        return port
+    return None
+
+
+def ports_the_project_uses(profile: "DeployProfile") -> dict[int, str]:
+    """Every port the profile says the project itself uses, with where it says so.
+
+    A review preview must not be given one of these: inside the sandbox a
+    preview port is the same number as on the sandbox's machine, so the
+    preview would find the port taken (20 October 2026). Read from what the
+    profile declares, and nothing guessed:
+
+    * each ``sandbox.publish`` rule's host port and sandbox port, except a
+      rule publishing one of the profile's own preview ports (that is the
+      preview itself, whose port the sandbox may replace);
+    * ``sandbox.sidecar_publish`` and ``sandbox.runner_publish``;
+    * the port settings in ``candidate.env`` and ``live_gate.env``
+      (:func:`_port_in_setting`);
+    * each preview slot's ``internal_port``.
+
+    The project's compose file and scripts are not read: a port only they
+    name is not declared, so it is not known here.
+    """
+    used: dict[int, str] = {}
+    preview_ports = (
+        {slot.port for slot in profile.preview.slots} if profile.preview is not None else set()
+    )
+    sandbox = profile.sandbox
+    if sandbox is not None:
+        for rule in sandbox.publish:
+            parts = rule.split(":")
+            if int(parts[-1]) in preview_ports:
+                continue
+            for part in parts[-2:] if len(parts) > 1 else parts:
+                used.setdefault(int(part), f"sandbox.publish {rule}")
+        for what, rule in (
+            ("sandbox.sidecar_publish", sandbox.sidecar_publish),
+            ("sandbox.runner_publish", sandbox.runner_publish),
+        ):
+            if rule:
+                for part in rule.split(":")[1:]:
+                    used.setdefault(int(part), f"{what} {rule}")
+    for section, env in (
+        ("candidate.env", profile.candidate.env if profile.candidate is not None else {}),
+        ("live_gate.env", profile.live_gate.env if profile.live_gate is not None else {}),
+    ):
+        for name, value in env.items():
+            port = _port_in_setting(name, value)
+            if port is not None:
+                used.setdefault(port, f"{section} {name}")
+    if profile.preview is not None:
+        for index, slot in enumerate(profile.preview.slots):
+            used.setdefault(slot.internal_port, f"preview.slots[{index}].internal_port")
+    return used
 
 
 # ---------------------------------------------------------------------------

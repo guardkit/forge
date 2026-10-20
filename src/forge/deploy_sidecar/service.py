@@ -4806,7 +4806,9 @@ def process_preview_request(
         # them (one sandbox per project, 18 October 2026), else the profile's.
         from forge.config.sandboxes import sandboxes_of
 
-        own, _refused = sandbox_preview(str(payload.get("repo") or ""), preview, sandboxes_of(config))
+        own, _refused = sandbox_preview(
+            str(payload.get("repo") or ""), preview, sandboxes_of(config), profile=profile
+        )
         ports = frozenset(slot.port for slot in own.slots) if own is not None else frozenset()
     return serve_preview_operation(route, payload, repo_path=repo_path, slot_ports=ports)
 

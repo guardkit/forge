@@ -107,7 +107,10 @@
 #       deploy helper  PUBLISH_ADDRESS:(8925 + 10k) -> 8125
 #       git daemon     PUBLISH_ADDRESS:(8918 + 10k) -> 9418
 #       two previews   127.0.0.1:(8950 + 10k) and 127.0.0.1:(8951 + 10k),
-#                      the same number inside and out
+#                      the same number inside and out. When the project
+#                      uses one of those itself, register-repo chooses two
+#                      others from (8950 + 10k) to (8959 + 10k) and prints
+#                      the sbx ports line that publishes them.
 #     Slot 0 is the shared sandbox's block (api-test-deploy), which is not
 #     made by this shape; a slot sandbox is 1 or more;
 #   - may reach only its own two doors and the three shared services on the
