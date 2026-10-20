@@ -25,6 +25,7 @@ or layout: it runs one shell script over manifests written in tmp_path.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import shutil
@@ -1109,8 +1110,12 @@ _FAKE_ENGINE = r'''#!/usr/bin/env python3
 import sys, os, json, tarfile, io
 from pathlib import Path
 args = sys.argv[1:]
+if os.environ.get("FAKE_ENGINE_CALL_LOG"):
+    with Path(os.environ["FAKE_ENGINE_CALL_LOG"]).open("a") as log:
+        log.write(json.dumps(args) + "\n")
 statefile = Path(os.environ["FAKE_ENGINE_STATE"])
-s = json.loads(statefile.read_text()) if statefile.exists() else {"tags": {}, "labels": {}}
+s = json.loads(statefile.read_text()) if statefile.exists() else {"tags": {}, "images": {}}
+s.setdefault("images", {})
 def save(): statefile.write_text(json.dumps(s))
 def argvalue(flag): return args[args.index(flag) + 1]
 def tarbytes():
@@ -1122,22 +1127,26 @@ def tarbytes():
         t.addfile(m, io.BytesIO(data))
     return b.getvalue()
 if args[:2] == ["buildx", "build"]:
-    iid = "sha256:" + "a" * 64
+    iid = "sha256:" + f"{len(s['images']) + 1:064x}"
+    labels = {}
     for i, a in enumerate(args[:-1]):
         if a == "-t": s["tags"][args[i + 1]] = iid
         if a == "--label":
-            k, v = args[i + 1].split("=", 1); s["labels"][k] = v
+            k, v = args[i + 1].split("=", 1); labels[k] = v
+    s["images"][iid] = {"labels": labels}
     save(); Path(argvalue("--iidfile")).write_text(iid + "\n"); sys.exit(0)
 if args[:2] == ["image", "inspect"]:
     fmt = argvalue("--format") if "--format" in args else None
     refs = [a for i, a in enumerate(args[2:], 2) if a != "--format" and (i == 0 or args[i - 1] != "--format")]
     ref = refs[0]
-    if ref not in s["tags"] and not (ref == "sha256:" + "a" * 64 and s["labels"]): sys.exit(1)
+    iid = s["tags"].get(ref, ref)
+    if iid not in s["images"] and ref not in s["tags"]: sys.exit(1)
+    labels = s["images"].get(iid, {}).get("labels", {})
     if not fmt: print("[]")
     elif ".RootFS.Layers" in fmt: print("1")
     elif ".RepoDigests" in fmt: print("[]")
-    elif ".Config.Labels" in fmt: print(json.dumps(s["labels"]))
-    elif ".Config" in fmt: print(json.dumps({"Labels": s["labels"]}))
+    elif ".Config.Labels" in fmt: print(json.dumps(labels))
+    elif ".Config" in fmt: print(json.dumps({"Labels": labels}))
     else: raise SystemExit("unhandled format " + fmt)
     sys.exit(0)
 if args[:2] == ["image", "history"]: print("fixture image"); sys.exit(0)
@@ -1337,3 +1346,224 @@ class TestARunThatIsRefusedOrFails:
         assert tags == [], output
         assert "docker rmi" not in output
         assert "Nothing this run built is to be shipped" not in output
+
+
+def _qualified_fixture(tmp_path: Path) -> tuple[Path, Path, dict[str, str], dict[str, str], dict[str, str]]:
+    """Three images, two local repositories and old bare tags on a fake engine."""
+    work, manifest, environment = _fake_engine_fixture(tmp_path)
+    source = work / "source"
+    named = work / "named-source"
+    named.mkdir()
+    (source / "publisher").mkdir()
+    (source / "publisher" / "Dockerfile").write_text(
+        f"FROM python:review@{_BASE_DIGEST}\n", encoding="utf-8"
+    )
+    (source / "scripts").mkdir()
+    (source / "scripts" / "prove.sh").write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$1" >> "$PROOF_ARGS_FILE"\n'
+        'exit "${PROOF_EXIT_STATUS:-0}"\n',
+        encoding="utf-8",
+    )
+    (named / "Dockerfile").write_text(f"FROM python:review@{_BASE_DIGEST}\n", encoding="utf-8")
+    (named / "revision.txt").write_text("previous\n", encoding="utf-8")
+
+    def git(repo: Path, *arguments: str) -> str:
+        return subprocess.check_output(
+            ["git", *arguments], cwd=repo, env=environment, stderr=subprocess.STDOUT, text=True
+        ).strip()
+
+    def commit(repo: Path, message: str) -> str:
+        git(repo, "add", ".")
+        git(
+            repo, "-c", "user.name=Release Fixture",
+            "-c", "user.email=fixture@example.invalid", "commit", "-m", message,
+        )
+        return git(repo, "rev-parse", "HEAD")
+
+    source_commit = commit(source, "add local image proof and publisher Dockerfile")
+    git(named, "init", "-b", "main")
+    old_named_commit = commit(named, "previous named context")
+    (named / "revision.txt").write_text("current\n", encoding="utf-8")
+    named_commit = commit(named, "current named context")
+    manifest.write_text(
+        f"""schema: 2
+version: 0.0.0-drive
+image_name: review-image
+python_base_digest: {_BASE_DIGEST}
+repositories:
+  - name: source
+    url: {source.as_uri()}
+    branch: main
+    commit: {source_commit}
+    role: build-context-root
+  - name: named-source
+    url: {named.as_uri()}
+    branch: main
+    commit: {named_commit}
+    role: named-context
+images:
+  - name: review-image
+    dockerfile: Dockerfile
+    role: coordinator
+    proof: scripts/prove.sh
+  - name: review-publisher
+    dockerfile: publisher/Dockerfile
+    role: publisher
+    proof: scripts/prove.sh
+  - name: review-other
+    dockerfile: Dockerfile
+    role: other
+    context: named-source
+    proof: scripts/prove.sh
+""",
+        encoding="utf-8",
+    )
+    old_tags = {
+        f"review-image:{source_commit}": "sha256:" + "f" * 64,
+        f"review-publisher:{source_commit}": "sha256:" + "e" * 64,
+        f"review-other:{old_named_commit}": "sha256:" + "d" * 64,
+    }
+    (work / "engine.json").write_text(json.dumps({"tags": old_tags, "images": {}}))
+    environment.update({
+        "FAKE_ENGINE_STATE": str(work / "engine.json"),
+        "FAKE_ENGINE_CALL_LOG": str(work / "engine-calls.jsonl"),
+        "PROOF_ARGS_FILE": str(work / "proof-args.txt"),
+        "RELEASE_SWEEP_TERMS": _SYNTHETIC_TERM,
+    })
+    return work, manifest, environment, old_tags, {
+        "review-image": source_commit,
+        "review-publisher": source_commit,
+        "review-other": named_commit,
+    }
+
+
+def _run_qualified_fixture(
+    work: Path, manifest: Path, environment: dict[str, str],
+    *, extra: tuple[str, ...] = (), receipt: Path | None = None,
+    proof_exit_status: int = 0,
+) -> tuple[subprocess.CompletedProcess[str], dict, list[list[str]]]:
+    """Drive the public builder with local Git and a fake Docker on PATH."""
+    (work / "engine-calls.jsonl").write_text("")
+    (work / "proof-args.txt").write_text("")
+    done = subprocess.run(
+        ["bash", str(SCRIPT), str(manifest), "--receipt", str(receipt or work / "receipt.json"), *extra],
+        cwd=work,
+        env={**environment, "PROOF_EXIT_STATUS": str(proof_exit_status)},
+        capture_output=True,
+        text=True,
+        timeout=300,
+    )
+    state = json.loads((work / "engine.json").read_text())
+    calls = [json.loads(line) for line in (work / "engine-calls.jsonl").read_text().splitlines()]
+    return done, state, calls
+
+
+def _selected_tags(manifest: Path, commits: dict[str, str]) -> dict[str, list[str]]:
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    return {
+        name: [f"{name}:{commit}-{digest}", f"{name}:0.0.0-drive"]
+        for name, commit in commits.items()
+    }
+
+
+def test_help_includes_the_complete_header_and_qualified_option():
+    done = subprocess.run(["bash", str(SCRIPT), "--help"], capture_output=True, text=True)
+    assert done.returncode == 0, done.stderr
+    assert "--manifest-qualified-source-tag" in done.stdout
+    assert "schema: 1" in done.stdout and "schema: 2" in done.stdout
+    assert "The one base image digest still applies to every Dockerfile" in done.stdout
+    assert "# END RELEASE HELP" not in done.stdout
+
+
+def test_qualified_tags_preserve_old_bare_tags_and_match_plan_labels_and_receipt(tmp_path):
+    work, manifest, environment, old_tags, commits = _qualified_fixture(tmp_path)
+    selected = _selected_tags(manifest, commits)
+    default, state, calls = _run_qualified_fixture(work, manifest, environment)
+    assert default.returncode != 0
+    assert "already exists on this machine" in default.stderr
+    assert "Fetching the pinned commits" not in default.stderr
+    assert not any(call[:2] == ["buildx", "build"] for call in calls)
+    assert state["tags"] == old_tags
+
+    planned, _, calls = _run_qualified_fixture(
+        work, manifest, environment, extra=("--plan-only", "--manifest-qualified-source-tag")
+    )
+    assert planned.returncode == 0, planned.stderr
+    assert not any(call[:2] == ["buildx", "build"] for call in calls)
+    for tags in selected.values():
+        for tag in tags:
+            assert f"would tag : {tag}" in planned.stdout
+
+    done, state, calls = _run_qualified_fixture(
+        work, manifest, environment, extra=("--manifest-qualified-source-tag",)
+    )
+    assert done.returncode == 0, done.stdout + done.stderr
+    assert sum(call[:2] == ["buildx", "build"] for call in calls) == 3
+    receipt = json.loads((work / "receipt.json").read_text())
+    digest = hashlib.sha256(manifest.read_bytes()).hexdigest()
+    assert receipt["manifest_sha256"] == digest
+    assert receipt["tags"] == selected["review-image"]
+    assert receipt["image_id"] == state["tags"][selected["review-image"][0]]
+    assert receipt["labels"] == state["images"][receipt["image_id"]]["labels"]
+    assert all(state["tags"][tag] == image_id for tag, image_id in old_tags.items())
+    assert len(state["images"]) == 3
+    assert [image["name"] for image in receipt["images"]] == list(commits)
+    assert len({image["image_id"] for image in receipt["images"]}) == 3
+    for image in receipt["images"]:
+        name = image["name"]
+        assert image["tags"] == selected[name]
+        assert len(selected[name][0].split(":", 1)[1]) == 105
+        assert all(state["tags"][tag] == image["image_id"] for tag in image["tags"])
+        assert image["labels"] == state["images"][image["image_id"]]["labels"]
+        assert image["labels"]["org.opencontainers.image.revision"] == commits[name]
+        assert image["labels"]["com.guardkit.release.manifest.sha256"] == digest
+        assert image["labels"]["com.guardkit.release.commit.source"] == commits["review-image"]
+        assert image["labels"]["com.guardkit.release.commit.named-source"] == commits["review-other"]
+        expected_source = (work / ("named-source" if name == "review-other" else "source")).as_uri()
+        assert image["labels"]["org.opencontainers.image.source"] == expected_source
+
+
+@pytest.mark.parametrize("colliding_tag_index", [0, 1])
+def test_later_image_collision_refuses_before_any_fetch_or_build(tmp_path, colliding_tag_index):
+    work, manifest, environment, old_tags, commits = _qualified_fixture(tmp_path)
+    selected = _selected_tags(manifest, commits)
+    colliding_tag = selected["review-other"][colliding_tag_index]
+    before = json.loads((work / "engine.json").read_text())
+    before["tags"][colliding_tag] = "sha256:" + "c" * 64
+    (work / "engine.json").write_text(json.dumps(before))
+    done, state, calls = _run_qualified_fixture(
+        work, manifest, environment, extra=("--manifest-qualified-source-tag",)
+    )
+    assert done.returncode != 0
+    assert colliding_tag in done.stderr
+    assert "Fetching the pinned commits" not in done.stderr
+    assert not any(call[:2] == ["buildx", "build"] for call in calls)
+    assert state == before
+    assert all(state["tags"][tag] == image_id for tag, image_id in old_tags.items())
+    assert not (work / "receipt.json").exists()
+
+
+@pytest.mark.parametrize("late_failure", ["proof", "receipt"])
+def test_late_qualified_failure_removes_only_new_tags_once(tmp_path, late_failure):
+    work, manifest, environment, old_tags, commits = _qualified_fixture(tmp_path)
+    selected = _selected_tags(manifest, commits)
+    receipt = work / "missing-parent" / "receipt.json" if late_failure == "receipt" else None
+    done, state, calls = _run_qualified_fixture(
+        work, manifest, environment,
+        extra=("--manifest-qualified-source-tag",),
+        receipt=receipt, proof_exit_status=7 if late_failure == "proof" else 0,
+    )
+    assert done.returncode != 0
+    assert sum(call[:2] == ["buildx", "build"] for call in calls) == 3
+    proof_args = (work / "proof-args.txt").read_text().splitlines()
+    if late_failure == "proof":
+        assert proof_args == [selected["review-image"][0]]
+    else:
+        assert proof_args == [tags[0] for tags in selected.values()]
+        assert not receipt.exists()
+    removed = [call[1] for call in calls if call[0] == "rmi"]
+    assert sorted(removed) == sorted(tag for tags in selected.values() for tag in tags)
+    assert len(removed) == len(set(removed))
+    assert done.stderr.count("Nothing this run built is to be shipped") == 1
+    assert state["tags"] == old_tags
+    assert not (work / "receipt.json").exists()

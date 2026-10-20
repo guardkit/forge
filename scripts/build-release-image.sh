@@ -34,11 +34,12 @@
 #     directory beside this script, or beside the working directory, is read.
 #     One run, one set of clones, so the images of a release cannot be built
 #     from different code and still carry the same release name;
-#   * each resulting image is tagged by the commit it was built from and by
-#     the manifest version, and labelled with all five commits, the manifest
-#     version, the manifest's own hash and its own ROLE in the release, so any
-#     image can say both what it is made of and which of the release's images
-#     it is;
+#   * each resulting image is tagged by its context commit and by the manifest
+#     version (or, with --manifest-qualified-source-tag, by the context commit
+#     plus the full manifest hash and by the version), and labelled with all
+#     repository commits, the manifest version, its hash and the image's ROLE,
+#     so any image can say both what it is made of and which of the release's
+#     images it is;
 #   * no image is EVER tagged `latest`, and none tags over an image that
 #     already exists. A floating tag is the thing this whole path is replacing.
 #     Every refusal below applies to every image in the set, and it is made
@@ -61,6 +62,10 @@
 #                           reader, i.e. in the current directory)
 #     --allow-existing-tag permit building over a tag that already exists.
 #                          Off by default: a release tag is written once.
+#     --manifest-qualified-source-tag
+#                          tag each image by its context commit plus the full
+#                          manifest SHA-256, and by the release version. Off by
+#                          default; existing bare commit tags stay untouched.
 #     --skip-proof         skip every image's own proof step. For diagnosis
 #                          only; a release is never cut with this.
 #     --plan-only          read and check the manifest, print what would be
@@ -161,12 +166,11 @@
 # repositories, and it is built from THAT clone, at THAT pin. Two things follow
 # and both are deliberate:
 #
-#   * an image's commit tag is the commit of the repository IT was built from,
-#     not the release's root commit. `forge:<forge commit>` means what it always
-#     meant; `fleet-memory-mcp:<fleet-memory commit>` means the same kind of
-#     thing about the repository that image really comes from. The release
-#     VERSION tag is what says they were built together, and every image still
-#     carries every repository's commit in its labels;
+#   * an image's source tag uses the commit of the repository IT was built from,
+#     not the release's root commit. By default `forge:<forge commit>` means
+#     what it always meant; the opt-in qualified form also includes the full
+#     manifest hash. The release VERSION tag says they were built together,
+#     and every image still carries every repository's commit in its labels;
 #   * a proof script is still a path inside the BUILD-CONTEXT ROOT's clone. The
 #     proofs belong to the release — they are how this repository satisfies
 #     itself about an image before shipping it — and asking another repository
@@ -176,6 +180,7 @@
 # whichever repository it came from: a release has one base, or it has two
 # supply chains and one name.
 # ---------------------------------------------------------------------------
+# END RELEASE HELP
 
 set -euo pipefail
 
@@ -190,6 +195,7 @@ MANIFEST=""
 KEEP_TEMP=0
 RECEIPT=""
 ALLOW_EXISTING_TAG=0
+MANIFEST_QUALIFIED_SOURCE_TAG=0
 RUN_PROOF=1
 PLAN_ONLY=0
 # The tags this run writes, and the ones that were already on this machine
@@ -219,10 +225,11 @@ while [ "$#" -gt 0 ]; do
     case "$1" in
         --keep-temp) KEEP_TEMP=1; shift ;;
         --allow-existing-tag) ALLOW_EXISTING_TAG=1; shift ;;
+        --manifest-qualified-source-tag) MANIFEST_QUALIFIED_SOURCE_TAG=1; shift ;;
         --skip-proof) RUN_PROOF=0; shift ;;
         --plan-only) PLAN_ONLY=1; shift ;;
         --receipt) [ "$#" -ge 2 ] || die "--receipt needs a path"; RECEIPT="$2"; shift 2 ;;
-        -h|--help) sed -n '1,142p' "$0"; exit 0 ;;
+        -h|--help) awk '/^# END RELEASE HELP$/ {exit} {print}' "$0"; exit 0 ;;
         -*) die "unknown option: $1" ;;
         *) [ -z "${MANIFEST}" ] || die "more than one manifest given: ${MANIFEST} and $1"; MANIFEST="$1"; shift ;;
     esac
@@ -439,14 +446,14 @@ esac
 COORDINATOR_NAME=""
 SEEN_IMAGE_NAMES=""
 
-# One repository's pinned commit, by name. Used for an image's commit tag,
+# One repository's pinned commit, by name. Used for an image's source tag,
 # which is the commit of the repository THAT image was built from.
 commit_of_repository() {
     echo "${REPO_LINES}" | awk -F'[|]' -v n="$1" '$2 == n { print $5; exit }'
 }
 
 # One repository's address, by name. Used for an image's own
-# org.opencontainers.image.source, which — like its commit tag — names the
+# org.opencontainers.image.source, which — like its source tag — names the
 # repository THAT image was built from. See the labels section below.
 url_of_repository() {
     echo "${REPO_LINES}" | awk -F'[|]' -v n="$1" '$2 == n { print $3; exit }'
@@ -532,16 +539,22 @@ say "Release ${VERSION} — ${REPO_COUNT} repositories, ${IMAGE_COUNT} images, m
 #
 # All of them are checked first, and the run stops on the first one that is
 # wrong, so a release never lands half of its images and then refuses. The two
-# tags an image gets are the commit the release was built from and the release
-# version; the commit tag is shared by every image of the release, which is
-# what says they were built together.
+# tags an image gets are its context commit (qualified by the full manifest
+# hash when requested) and the release version. The version is what says which
+# images were built together.
 # ---------------------------------------------------------------------------
 #
-# AN IMAGE'S COMMIT TAG IS ITS OWN REPOSITORY'S COMMIT, since per-image
-# contexts (25 September 2026). For every image whose context is the
-# build-context root — which is every image of every release cut before that —
-# this is exactly what it was.
-tags_of() { echo "$1:$2 $1:${VERSION}"; }
+# AN IMAGE'S SOURCE TAG USES ITS OWN REPOSITORY'S COMMIT, since per-image
+# contexts (25 September 2026). The opt-in hash distinguishes two manifests
+# using that same commit without moving an earlier tag.
+source_tag_of() {
+    if [ "${MANIFEST_QUALIFIED_SOURCE_TAG}" = "1" ]; then
+        printf '%s:%s-%s\n' "$1" "$2" "${MANIFEST_SHA}"
+    else
+        printf '%s:%s\n' "$1" "$2"
+    fi
+}
+tags_of() { printf '%s %s:%s\n' "$(source_tag_of "$1" "$2")" "$1" "${VERSION}"; }
 
 # A FLOATING TAG IS REFUSED WHATEVER THE MODE, INCLUDING A PLAN. It is a fact
 # about the manifest — this release is called `latest` — so a plan that printed
@@ -553,7 +566,7 @@ while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
     icontext="$(context_of_image "${icontext}")"
     for t in $(tags_of "${iname}" "$(commit_of_repository "${icontext}")"); do
         case "${t}" in
-            *:latest) die "this script will not produce a '${t}' tag. A release is named by the commit it was built from; a floating tag is what this path replaces." ;;
+            *:latest) die "this script will not produce a '${t}' tag. A release is named by its pinned source and manifest or version; a floating tag is what this path replaces." ;;
         esac
     done
 done <<< "${IMAGE_LINES}"
@@ -1165,7 +1178,7 @@ while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
     icommit="$(commit_of_repository "${icontext}")"
     iurl="$(url_of_repository "${icontext}")"
     ICONTEXT_DIR="${TMP}/${icontext}"
-    TAG_COMMIT="${iname}:${icommit}"
+    TAG_COMMIT="$(source_tag_of "${iname}" "${icommit}")"
     TAG_VERSION="${iname}:${VERSION}"
     IIDFILE="${TMP}/image-id-${iname}"
 
@@ -1180,10 +1193,10 @@ while IFS='|' read -r _tag iname idockerfile irole iproof icontext; do
     # service's image said Forge's commit and Forge's address, while its own
     # tag and its com.guardkit.* labels said fleet-memory's. Two answers to one
     # question, and the one the rest of the world reads was the wrong one.
-    # They are per image now, and they say the same thing the image's commit
-    # tag says. For every image built from the build-context root — which is
-    # every image of every release cut before per-image contexts — this is
-    # exactly the value it had.
+    # They are per image now, and they say which repository and commit the
+    # source tag starts with. For every image built from the build-context
+    # root — every release cut before per-image contexts — this is exactly
+    # the value it had.
     say "Building ${TAG_COMMIT} (also tagged ${TAG_VERSION}) from ${icontext}/${idockerfile} in ${TMP} only"
     docker buildx build \
         "${BUILD_ARGS[@]}" \
