@@ -622,6 +622,7 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
     assert selected.attempt == 2
     assert selected.target_commit == moved_target
     assert after.turn == before.turn + 1
+    assert after.lease_holder is None
     assert after.checked["deploy_run_id"] == attempt_runs[2]
     assert [
         line
@@ -639,6 +640,12 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
         f"teardown-cand-{attempt_runs[2]}",
         f"live-gate-{attempt_runs[2]}",
     } <= runbooks
+    ending = PublicationRecordStore(connection).read_outcome(BUILD)
+    assert ending is not None
+    assert ending.outcome["cleanup_done"] is True
+    assert ending.outcome["candidate_may_stand"] is False
+    assert ending.outcome["leg_unanswered"] is False
+    assert ending.finished_at is not None
     recorded = TheCoordinatorsRecord(db).what_build_starts_from(BUILD)
     assert "first_deployment_profile" not in recorded
     assert "deployment_layout" not in recorded
