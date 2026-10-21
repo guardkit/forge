@@ -8,10 +8,12 @@ and the remote write are recording boundaries; no broker is contacted.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import sqlite3
 import subprocess
 import threading
+import urllib.request
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -222,6 +224,8 @@ class _Runtime:
 
     def __init__(self, *, fail_live_gate: bool = False) -> None:
         self.fail_live_gate = fail_live_gate
+        self.running_identity: str | None = None
+        self.running_answers: list[str] = []
         self.script_calls: list[dict[str, Any]] = []
         self.gate_calls: list[dict[str, Any]] = []
         self.gate_verdicts: list[str] = []
@@ -230,7 +234,9 @@ class _Runtime:
         self.script_calls.append(kwargs)
         env = dict(kwargs.get("extra_env") or {})
         if env.get("RUNNING_RELEASE") == "1":
-            return 0, "RUNNING_IDENTITY=none\n"
+            answer = self.running_identity or "none"
+            self.running_answers.append(answer)
+            return 0, f"RUNNING_IDENTITY={answer}\n"
         if env.get("CANDIDATE") == "1":
             identity = env.get("RELEASE_IDENTITY", "unknown")
             return 0, f"CHECKED_ARTIFACT=artifact-{identity}\n"
@@ -250,11 +256,15 @@ class _Runtime:
 
 
 class _SpawnRecorder:
-    def __init__(self) -> None:
+    def __init__(self, runtime: _Runtime) -> None:
+        self.runtime = runtime
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, **kwargs: Any) -> subprocess.Popen[bytes]:
         self.calls.append(dict(kwargs))
+        env = dict(kwargs.get("env") or {})
+        if env.get("PROMOTE") == "1":
+            self.runtime.running_identity = str(env["RELEASE_IDENTITY"])
         return subprocess.Popen(**kwargs)
 
 
@@ -341,7 +351,7 @@ def _services(
             "planning": {"target_repo_paths": {REPO: str(repo)}},
         }
     )
-    spawn = _SpawnRecorder()
+    spawn = _SpawnRecorder(runtime)
     executor = DeployExecutor(
         notes_root=tmp_path / "executor-notes",
         ask_the_coordinator=coordinator_owner_asker(),
@@ -410,6 +420,7 @@ def _assert_project_legs_ran_from_selected_archive(
     checked: dict[str, Any],
     reverted: bool,
     candidate_checks: int = 1,
+    candidate_cleanups: int | None = None,
 ) -> None:
     calls = _script_calls_at(runtime, candidate_cwd)
 
@@ -453,7 +464,9 @@ def _assert_project_legs_ran_from_selected_archive(
     assert len(candidate_health) == candidate_checks
     assert len(running_queries) == 1
     assert len(live_health) == 1
-    assert len(candidate_down) == candidate_checks
+    assert len(candidate_down) == (
+        candidate_checks if candidate_cleanups is None else candidate_cleanups
+    )
     assert len(reverts) == int(reverted)
     if reverted:
         assert reverts[0]["extra_env"]["ROLLBACK_IMAGE_REF"] == "service:rollback"
@@ -620,6 +633,7 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
         checked=before.checked,
         reverted=False,
         candidate_checks=2,
+        candidate_cleanups=3,
     )
     assert bus.messages
     after = PublicationRecordStore(connection).read(BUILD)
@@ -636,15 +650,25 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
         if line.kind == "about to" and line.step == "candidate-check"
     ] == candidate_checks
     runbooks = _runbook_ids(connection)
+    takeover_runs = {
+        runbook_id.removeprefix("ask-")
+        for runbook_id in runbooks
+        if runbook_id.startswith("ask-")
+    }
+    assert len(takeover_runs) == 1
+    takeover_run = takeover_runs.pop()
+    assert takeover_run not in set(attempt_runs.values())
     assert {
         f"deploy-cand-{attempt_runs[1]}",
         f"live-gate-cand-{attempt_runs[1]}",
+        f"teardown-cand-{attempt_runs[1]}",
         f"deploy-cand-{attempt_runs[2]}",
         f"live-gate-cand-{attempt_runs[2]}",
-        f"ask-{attempt_runs[2]}",
-        f"deploy-{attempt_runs[2]}",
         f"teardown-cand-{attempt_runs[2]}",
-        f"live-gate-{attempt_runs[2]}",
+        f"ask-{takeover_run}",
+        f"deploy-{takeover_run}",
+        f"teardown-cand-{takeover_run}",
+        f"live-gate-{takeover_run}",
     } <= runbooks
     ending = PublicationRecordStore(connection).read_outcome(BUILD)
     assert ending is not None
@@ -656,6 +680,206 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
     assert "first_deployment_profile" not in recorded
     assert "deployment_layout" not in recorded
     assert not (repo / "deploy" / "profile.yaml").exists()
+
+
+@pytest.mark.asyncio
+async def test_takeover_rechecks_identity_after_promote_response_is_lost(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, bare, start, candidate, candidate_tree = _project(tmp_path)
+    allow_local_remotes(monkeypatch, tmp_path / "fetch-copies")
+    build = "build-promote-takeover"
+    attempt_id = "approved-attempt-promote-takeover"
+    db = tmp_path / "promote-takeover.db"
+    connection: sqlite3.Connection = sqlite_connect.connect_writer(db)
+    migrations.apply_at_boot(connection)
+    pool = SqliteLifecyclePersistence(connection=connection, db_path=db)
+    _record_offer(
+        pool,
+        build=build,
+        feature=FEATURE,
+        start=start,
+        candidate=candidate,
+        tree=candidate_tree,
+        attempt_id=attempt_id,
+        offer_id="offer-promote-takeover",
+    )
+    runtime = _Runtime()
+    answer, helper, config, spawn = _services(
+        repo=repo, db=db, runtime=runtime, monkeypatch=monkeypatch, tmp_path=tmp_path
+    )
+    bus = _Bus()
+    real_publisher, checked = _publisher(db, repo, tmp_path, start, bare)
+    coordinator_copy = Path(config.planning.target_repo_paths[REPO])
+    publish_calls: list[dict[str, Any]] = []
+
+    async def publish(_config: Any, request: dict[str, Any]) -> dict[str, Any]:
+        publish_calls.append(dict(request))
+        return real_publisher.publish(request).to_wire()
+
+    deps = MergeExecutorDeps(
+        config=config,
+        pool=pool,
+        pipeline_publisher=_PipelineEvents(),
+        guardkit_run=_JoinsForReal(feature_id=FEATURE),
+        deploy_dispatcher=build_in_daemon_deploy_dispatcher(
+            config=config, nats_client=bus, db_path=db
+        ),
+        git_surface=compose_merge_git_surface(config),
+        publisher=publish,
+        what_the_machine_says=WhatTheMachineSays(
+            the_publisher_passed_its_self_check=True
+        ),
+        deployment_lock=lambda: DeploymentLockStore(connection),
+    )
+    real_urlopen = urllib.request.urlopen
+    lost_responses: list[dict[str, Any]] = []
+
+    def lose_the_first_promote_response(
+        request: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        raw = getattr(request, "data", None)
+        body: dict[str, Any] = {}
+        if isinstance(raw, bytes):
+            try:
+                decoded = json.loads(raw.decode("utf-8"))
+                body = decoded if isinstance(decoded, dict) else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                body = {}
+        is_promote = (
+            str(getattr(request, "full_url", "")).endswith("/run")
+            and isinstance(body.get("deploy"), dict)
+            and dict(body.get("env") or {}).get("PROMOTE") == "1"
+        )
+        if is_promote and not lost_responses:
+            with real_urlopen(request, *args, **kwargs) as response:
+                response.read()
+            lost_responses.append(body)
+            raise asyncio.CancelledError(
+                "the promote ran, but its HTTP response was lost with the press"
+            )
+        return real_urlopen(request, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", lose_the_first_promote_response)
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await execute_merge_deploy(
+                deps=deps,
+                build_id=build,
+                feature_id=FEATURE,
+                repo=REPO,
+                repo_root=coordinator_copy,
+                expect_main_sha=start,
+                correlation_id=f"corr-{build}",
+                decided_by="owner",
+                expected_candidate_sha=candidate,
+                expected_candidate_tree=candidate_tree,
+                merge_execution_attempt_id=attempt_id,
+            )
+        store = PublicationRecordStore(connection)
+        before = store.read(build)
+        before_selection = selection_from_record(before)
+        assert before_selection is not None
+        before_checked = dict(before.checked)
+        candidate_checks = [
+            line
+            for line in before.lines
+            if line.kind == "about to" and line.step == "candidate-check"
+        ]
+        assert len(candidate_checks) == 1
+        checked_run = str(candidate_checks[0].detail["deploy_run_id"])
+        assert before_checked["deploy_run_id"] == checked_run
+        assert len(lost_responses) == 1
+        assert len(spawn.calls) == 1
+        checked_identity = str(
+            before_checked["identity"]["handed_to_the_check"]
+        )
+        assert runtime.running_identity == checked_identity
+        assert runtime.running_answers == ["none"]
+        connection.execute(
+            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+            ("2000-01-01T00:00:00+00:00", build),
+        )
+        connection.commit()
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=build,
+            feature_id=FEATURE,
+            repo=REPO,
+            repo_root=coordinator_copy,
+            expect_main_sha=start,
+            correlation_id=f"corr-{build}",
+            decided_by="owner",
+            expected_candidate_sha=candidate,
+            expected_candidate_tree=candidate_tree,
+            merge_execution_attempt_id=attempt_id,
+        )
+    finally:
+        helper.shutdown()
+        helper.server_close()
+        answer.shutdown()
+        answer.server_close()
+
+    assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+    assert len(publish_calls) == 1
+    assert checked.sends == [outcome.merged_sha]
+    assert runtime.running_answers == ["none", checked_identity]
+    assert len(spawn.calls) == 1
+    after = PublicationRecordStore(connection).read(build)
+    assert after.turn == before.turn + 1
+    assert after.lease_holder is None
+    assert selection_from_record(after) == before_selection
+    assert after.checked == before_checked
+    assert [
+        line
+        for line in after.lines
+        if line.kind == "about to" and line.step == "candidate-check"
+    ] == candidate_checks
+    recovered_deploy = next(
+        line
+        for line in after.lines
+        if line.kind == "done" and line.step == "deploy"
+    )
+    assert recovered_deploy.detail["found_by_looking"] is True
+    assert recovered_deploy.detail["identity"]["identity"] == checked_identity
+    runbooks = _runbook_ids(connection)
+    ask_runs = {
+        runbook_id.removeprefix("ask-")
+        for runbook_id in runbooks
+        if runbook_id.startswith("ask-")
+    }
+    assert checked_run in ask_runs
+    assert len(ask_runs) == 2
+    takeover_run = (ask_runs - {checked_run}).pop()
+    assert takeover_run != checked_run
+    assert f"deploy-{checked_run}" in runbooks
+    assert f"deploy-{takeover_run}" not in runbooks
+    assert f"ask-{takeover_run}" in runbooks
+    assert f"teardown-cand-{takeover_run}" in runbooks
+    first_questions = connection.execute(
+        "SELECT status FROM runbook_steps WHERE runbook_id = ?",
+        (f"ask-{checked_run}",),
+    ).fetchall()
+    interrupted_promotes = connection.execute(
+        "SELECT status, result FROM runbook_steps WHERE runbook_id = ?",
+        (f"deploy-{checked_run}",),
+    ).fetchall()
+    recovery_questions = connection.execute(
+        "SELECT status FROM runbook_steps WHERE runbook_id = ?",
+        (f"ask-{takeover_run}",),
+    ).fetchall()
+    assert [tuple(row) for row in first_questions] == [("passed",)]
+    assert [tuple(row) for row in interrupted_promotes] == [("running", None)]
+    assert [tuple(row) for row in recovery_questions] == [("passed",)]
+    ending = PublicationRecordStore(connection).read_outcome(build)
+    assert ending is not None
+    assert ending.outcome["cleanup_done"] is True
+    assert ending.outcome["candidate_may_stand"] is False
+    assert ending.outcome["leg_unanswered"] is False
+    assert ending.finished_at is not None
+    recorded = TheCoordinatorsRecord(db).what_build_starts_from(build)
+    assert "first_deployment_profile" not in recorded
+    assert "deployment_layout" not in recorded
 
 
 @pytest.mark.asyncio
