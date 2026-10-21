@@ -15,6 +15,29 @@ from pathlib import PurePosixPath
 from typing import Any
 
 from forge.deploy.profile import DeployProfileError
+from forge.deploy.candidate_tree import FileAtCommit
+
+
+def validate_committed_profile_path(
+    profile: FileAtCommit, parent: FileAtCommit | None = None,
+) -> None:
+    """Prove an ordinary profile, or absence under an absent/ordinary directory.
+
+    An exact nested Git lookup alone cannot distinguish a missing file from
+    a symlink, blob or submodule occupying its fixed ``deploy`` parent.
+    Both the coordinator and helper use this same absence rule.
+    """
+    if profile.refusal:
+        raise ValueError("the committed deployment profile could not be read")
+    if profile.found:
+        if profile.mode not in ("100644", "100755") or profile.content is None:
+            raise ValueError("the deployment profile must be an ordinary committed file")
+        return
+    if profile.mode is not None:
+        raise ValueError("the deployment profile path is not absent or an ordinary file")
+    if (parent is None or parent.refusal or parent.found
+            or parent.mode not in (None, "040000")):
+        raise ValueError("the absent deployment profile has no ordinary committed parent")
 
 
 class ProfileSelectionRefusedBeforeDispatch(DeployProfileError):

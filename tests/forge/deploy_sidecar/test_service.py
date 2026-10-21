@@ -995,6 +995,46 @@ def _profile_reference(cwd: Path) -> dict[str, Any]:
     }
 
 
+@pytest.mark.parametrize("parent_kind", ["absent", "tree", "link", "blob", "submodule"])
+def test_committed_profile_absence_requires_an_ordinary_parent(
+    repo: Path, parent_kind: str,
+) -> None:
+    import shutil
+    import subprocess
+
+    from forge.deploy.candidate_tree import read_file_at_commit_sync
+    from forge.deploy.profile_selection import validate_committed_profile_path
+
+    def git(*args: str) -> str:
+        return subprocess.run(
+            ["git", "-C", str(repo), *args], capture_output=True,
+            text=True, check=True,
+        ).stdout.strip()
+
+    old_head = git("rev-parse", "HEAD")
+    shutil.rmtree(repo / "deploy")
+    if parent_kind == "tree":
+        (repo / "deploy").mkdir()
+        (repo / "deploy" / "other").write_text("ordinary directory\n")
+    elif parent_kind == "link":
+        (repo / "deploy").symlink_to("missing-directory", target_is_directory=True)
+    elif parent_kind == "blob":
+        (repo / "deploy").write_text("not a directory\n")
+    git("add", "-A")
+    if parent_kind == "submodule":
+        git("update-index", "--add", "--cacheinfo", "160000", old_head, "deploy")
+    git("-c", "user.name=Factory Test", "-c", "user.email=factory@example.invalid",
+        "commit", "-m", "Declare the profile parent")
+    profile = read_file_at_commit_sync(repo, "HEAD", "deploy/profile.yaml", raw=True)
+    parent = read_file_at_commit_sync(repo, "HEAD", "deploy", raw=True)
+    assert not profile.found and profile.mode is None
+    if parent_kind in ("absent", "tree"):
+        validate_committed_profile_path(profile, parent)
+    else:
+        with pytest.raises(ValueError, match="ordinary committed parent"):
+            validate_committed_profile_path(profile, parent)
+
+
 def test_first_profile_authority_refusal_echoes_requested_reference_before_execution(
     repo: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

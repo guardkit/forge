@@ -192,6 +192,7 @@ from forge.deploy.profile_selection import (
     parse_profile_reference,
     read_profile_approval,
     selection_from_record,
+    validate_committed_profile_path,
 )
 
 
@@ -3278,12 +3279,10 @@ async def execute_merge_deploy(
 
     async def _profile_bytes_at(commit: str) -> Any:
         answer = await git.read_file_at_commit(commit, DEPLOY_PROFILE_PATH, raw=True)
-        if answer.refusal:
-            raise ValueError(f"the deployment profile at {commit} could not be read: {answer.refusal}")
-        if answer.found and (answer.mode not in ("100644", "100755") or answer.content is None):
-            raise ValueError("the deployment profile must be an ordinary committed file")
-        if not answer.found and answer.mode is not None:
-            raise ValueError("the deployment profile path is not absent or an ordinary file")
+        parent = None
+        if not answer.found and answer.mode is None and not answer.refusal:
+            parent = await git.read_file_at_commit(commit, "deploy", raw=True)
+        validate_committed_profile_path(answer, parent)
         return answer
 
     async def _select_profile_for_join(

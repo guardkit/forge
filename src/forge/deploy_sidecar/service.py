@@ -224,7 +224,7 @@ from forge.deploy.candidate_tree import (
     is_candidate_tree_path,
     read_file_at_commit_sync,
 )
-from forge.deploy.profile_selection import parse_profile_reference
+from forge.deploy.profile_selection import parse_profile_reference, validate_committed_profile_path
 from forge.deploy.profile import (
     DeployProfile,
     DeployProfileError,
@@ -2318,7 +2318,14 @@ def _first_profile_precheck(
             return None, None, "the selected commit and tree do not match"
     for commit in (selected.start_commit, selected.target_commit):
         absent = read_file_at_commit_sync(repo_path, commit, PROFILE_PATH, raw=True)
-        if absent.refusal or absent.found or absent.mode is not None:
+        parent = None
+        if not absent.found and absent.mode is None and not absent.refusal:
+            parent = read_file_at_commit_sync(repo_path, commit, "deploy", raw=True)
+        try:
+            validate_committed_profile_path(absent, parent)
+        except ValueError:
+            return None, None, "the first profile was not provably absent at build start and target"
+        if absent.found:
             return None, None, "the first profile was not provably absent at build start and target"
     candidate, refusal = _selection_file(repo_path, selected.candidate_commit, PROFILE_PATH)
     if refusal:
