@@ -870,7 +870,10 @@ async def test_takeover_rechecks_identity_after_promote_response_is_lost(
         (f"ask-{takeover_run}",),
     ).fetchall()
     assert [tuple(row) for row in first_questions] == [("passed",)]
-    assert [tuple(row) for row in interrupted_promotes] == [("running", None)]
+    assert [tuple(row) for row in interrupted_promotes] == [
+        ("running", None),
+        ("pending", None),
+    ]
     assert [tuple(row) for row in recovery_questions] == [("passed",)]
     ending = PublicationRecordStore(connection).read_outcome(build)
     assert ending is not None
@@ -990,7 +993,7 @@ async def test_first_profile_recovery_never_uses_partial_selection(
                 body = {}
         is_candidate = (
             str(getattr(request, "full_url", "")).endswith("/run")
-            and isinstance(body.get("deploy"), dict)
+            and body.get("script") == "deploy/deploy.sh"
             and dict(body.get("env") or {}).get("CANDIDATE") == "1"
         )
         if boundary == "during-candidate" and is_candidate and not interrupted:
