@@ -175,11 +175,14 @@ def _assert_documents(payload: dict[str, Any], expected: list[str]) -> None:
         ).hexdigest()
 
 
-def _records(store: SqlitePlanningRunStore, stage: str) -> list[dict[str, Any]]:
+def _records(
+    store: SqlitePlanningRunStore, stage: str, *, status: str | None = None
+) -> list[dict[str, Any]]:
     return [
         json.loads(event["details_json"])
         for event in store.list_events(door.CID)
         if event["stage_label"] == stage
+        and (status is None or event["status"] == status)
     ]
 
 
@@ -248,10 +251,24 @@ async def test_captured_reference_reaches_real_writers_and_coaches_after_restart
             built = build_feature_spec_command_args(**fields)
             role = "product-owner"
             output = fixtures.spec._valid_triple()
+            feedback = "Add a summary sentence naming the small-file and size-limit upload cases."
+            revision = "The specification covers uploads of small files and files at the size limit."
+            revised_output = output.replace(
+                "# Feature Spec Summary: File Upload\n",
+                f"# Feature Spec Summary: File Upload\n\n{revision}\n",
+                1,
+            )
         else:
             built = build_feature_plan_command_args(**fields)
             role = "architect"
             output = _plan_output(fixtures, built)
+            feedback = "Replace the generic task acceptance criteria with the concrete upload outcome."
+            revision = "Uploads of small files and files at the size limit succeed."
+            revised_output = output.replace(
+                "- [ ] Does the thing.", f"- [ ] {revision}"
+            )
+        assert revision not in output
+        assert revision in revised_output and revised_output != output
         command, wire = build_specialist_command(
             stage, request_text=None, context_entries=[], extra_command_args=built
         )
@@ -266,13 +283,16 @@ async def test_captured_reference_reaches_real_writers_and_coaches_after_restart
             return json.dumps({
                 "criterion_scores": [
                     {"criterion_id": c.id, "weight": c.weight, "score": score,
-                     "reasoning": "scripted carriage check"} for c in criteria
+                     "reasoning": feedback if score < 1 else "The requested revision is present."}
+                    for c in criteria
                 ],
                 "detection_findings": [],
-                "feedback": ["Revise once for the carriage check."] if score < 1 else [],
+                "feedback": [feedback] if score < 1 else [],
             })
 
-        player = _RecordingSeat([output])
+        # Both fixtures make an actual content revision after rejection. The
+        # real loop's unchanged-draft safeguard remains active on plan retries.
+        player = _RecordingSeat([output, revised_output])
         exact_review = "semantic_review_artifacts" in wire
         coach = _RecordingSeat(
             [scoring_reply(1)] if exact_review else [scoring_reply(0.4), scoring_reply(1)]
@@ -309,7 +329,10 @@ async def test_captured_reference_reaches_real_writers_and_coaches_after_restart
             assert len(player.inputs) == len(coach.inputs) == 2
             for payload in player.inputs:
                 _assert_documents(payload, expected)
-            assert "Revise once for the carriage check." in _message_text(player.inputs[1])
+            assert feedback in _message_text(player.inputs[1])
+            assert output in _message_text(coach.inputs[0])
+            assert revised_output in _message_text(coach.inputs[1])
+            assert any(revision in text for text in result.artifacts.values())
         for payload in coach.inputs:
             _assert_documents(payload, expected)
             assert _REQUEST in _message_text(payload)
@@ -348,7 +371,7 @@ async def test_captured_reference_reaches_real_writers_and_coaches_after_restart
         notifications.append((level, message))
         # This is the last scope of this test. The plan receipt already exists;
         # no task execution, broker publish, deployment, or real product follows.
-        if _records(current, "feature-plan"):
+        if level == "info" and _records(current, "feature-plan", status="approved"):
             raise _PlanCommitted()
 
     def new_driver() -> PlanningRunDriver:
