@@ -20,7 +20,9 @@ from typing import Any
 import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
+from forge.cli.serve import compose_merge_git_surface
 from forge.config.models import ForgeConfig
+from forge.deploy.profile_selection import selection_from_record
 from forge.deploy_sidecar.deploy_executor import DeployExecutor
 from forge.deploy_sidecar.service import (
     COORDINATOR_OWNER_ENV,
@@ -37,6 +39,8 @@ from forge.pipeline.merge_executor import (
     execute_merge_deploy,
 )
 from forge.pipeline.publication_activation import WhatTheMachineSays
+from forge.pipeline.publication_record import PublicationRecordStore
+from forge.publisher.git_work import TheProjectsCommits
 from forge.publisher.service import Publisher
 from forge.publisher.settings import ProjectRoute, PublisherSettings
 from forge.record_answer.service import (
@@ -254,50 +258,45 @@ class _SpawnRecorder:
         return subprocess.Popen(**kwargs)
 
 
-class _CheckedGitWithRecordedSend:
-    """Real local ancestry queries; only the remote write is a stand-in."""
+class _CheckedGitWithRecordedSend(TheProjectsCommits):
+    """Production commit inspection with only remote I/O recorded."""
 
-    def __init__(self, repo: Path, start: str) -> None:
-        self.repo = repo
+    def __init__(
+        self, route: ProjectRoute, state: Path, start: str, bare_remote: Path
+    ) -> None:
+        super().__init__(route, state_dir=state, credential=None)
         self.remote = start
+        self.bare_remote = bare_remote
         self.sends: list[str] = []
 
-    @staticmethod
-    def _ok(out: str = "") -> Any:
-        return SimpleNamespace(ok=True, out=out, said="ok")
-
-    def bring_the_joined_commit_out(self, commit: str) -> Any:
-        return self._ok(commit)
-
-    def the_parents_of(self, commit: str) -> list[str]:
-        return _git(self.repo, "rev-list", "--parents", "-n", "1", commit).split()[1:]
-
     def where_the_remotes_branch_is(self, _branch: str) -> Any:
-        return self._ok(self.remote)
-
-    def is_in(self, ancestor: str, descendant: str) -> bool:
-        done = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", ancestor, descendant],
-            cwd=self.repo,
-            capture_output=True,
-        )
-        return done.returncode == 0
-
-    def what_must_not_be_published(self, *_args: Any, **_kwargs: Any) -> list[Any]:
-        return []
+        return SimpleNamespace(ok=True, out=self.remote, said="recorded remote")
 
     def send(self, commit: str, _branch: str) -> Any:
         self.sends.append(commit)
         self.remote = commit
-        return self._ok(commit)
+        subprocess.run(
+            [
+                "git",
+                "--git-dir",
+                str(self.bare_remote),
+                "update-ref",
+                "refs/heads/main",
+                commit,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return SimpleNamespace(ok=True, out=commit, said="recorded remote write")
 
 
 def _config(repo: Path, db: Path, helper_url: str) -> ForgeConfig:
+    coordinator_copy = repo.parent / "coordinator-copy"
     return ForgeConfig.model_validate(
         {
             "permissions": {"filesystem": {"allowlist": [str(repo.parent)]}},
             "planning": {
-                "target_repo_paths": {REPO: str(repo)},
+                "target_repo_paths": {REPO: str(coordinator_copy)},
                 "fetch_addresses": {REPO: origin_of(repo)},
                 "sandboxes": {
                     REPO: {
@@ -334,7 +333,12 @@ def _services(
         f"http://{answer_host}:{answer_port}{ANSWER_ROUTE}",
     )
     monkeypatch.setenv(SIDECAR_IN_SANDBOX_ENV, "1")
-    holder = {"config": _config(repo, db, "http://127.0.0.1:1")}
+    helper_config = ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": [str(repo.parent)]}},
+            "planning": {"target_repo_paths": {REPO: str(repo)}},
+        }
+    )
     spawn = _SpawnRecorder()
     executor = DeployExecutor(
         notes_root=tmp_path / "executor-notes",
@@ -344,35 +348,36 @@ def _services(
     executor.reconcile()
     helper = build_server(
         port=0,
-        config_loader=lambda: holder["config"],
+        config_loader=lambda: helper_config,
         script_runner=runtime.script,
         project_runner=runtime.project,
         deploy_executor=executor,
     )
     threading.Thread(target=helper.serve_forever, daemon=True).start()
     helper_host, helper_port = helper.server_address[:2]
-    holder["config"] = _config(repo, db, f"http://{helper_host}:{helper_port}")
-    return answer, helper, holder["config"], spawn
+    config = _config(repo, db, f"http://{helper_host}:{helper_port}")
+    return answer, helper, config, spawn
 
 
 def _publisher(
-    db: Path, repo: Path, tmp_path: Path, remote: str
+    db: Path, repo: Path, tmp_path: Path, remote: str, bare_remote: Path
 ) -> tuple[Publisher, _CheckedGitWithRecordedSend]:
     credential = db.with_suffix(".credential")
     credential.write_text("test-only credential\n", encoding="utf-8")
-    checked = _CheckedGitWithRecordedSend(repo, remote)
+    route = ProjectRoute(
+        name=REPO,
+        source=str(repo),
+        remote=str(tmp_path / "unused-remote"),
+    )
+    checked = _CheckedGitWithRecordedSend(
+        route, tmp_path / f"publisher-{db.stem}", remote, bare_remote
+    )
     publisher = Publisher(
         PublisherSettings(
             credential_file=str(credential),
             ledger=str(db),
             state_dir=str(tmp_path / f"publisher-{db.stem}"),
-            projects={
-                REPO: ProjectRoute(
-                    name=REPO,
-                    source=str(repo),
-                    remote=str(tmp_path / "unused-remote"),
-                )
-            },
+            projects={REPO: route},
             private_path_prefixes=(str(tmp_path / "unpublished"),),
         ),
         commits_for=lambda _route: checked,
@@ -381,7 +386,7 @@ def _publisher(
 
 
 @pytest.mark.asyncio
-async def test_first_profile_survives_target_movement_and_runs_the_production_chain(
+async def test_first_profile_survives_rejoin_and_landed_send_takeover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     repo, bare, start, candidate, candidate_tree = _project(tmp_path)
@@ -411,7 +416,9 @@ async def test_first_profile_survives_target_movement_and_runs_the_production_ch
         repo=repo, db=db, runtime=runtime, monkeypatch=monkeypatch, tmp_path=tmp_path
     )
     bus = _Bus()
-    real_publisher, checked = _publisher(db, repo, tmp_path, start)
+    real_publisher, checked = _publisher(db, repo, tmp_path, start, bare)
+    coordinator_copy = Path(config.planning.target_repo_paths[REPO])
+    assert not coordinator_copy.exists()
     publish_calls: list[dict[str, Any]] = []
 
     async def publish(_config: Any, request: dict[str, Any]) -> dict[str, Any]:
@@ -437,7 +444,11 @@ async def test_first_profile_survives_target_movement_and_runs_the_production_ch
                 "refusal": "the target gained work; make a new joined result",
                 "refusal_kind": "the-remote-moved",
             }
-        return real_publisher.publish(request).to_wire()
+        landed = real_publisher.publish(request)
+        assert landed.published is True, landed.refusal
+        if len(publish_calls) == 2:
+            raise RuntimeError("the remote write landed but its response was lost")
+        return landed.to_wire()
 
     deps = MergeExecutorDeps(
         config=config,
@@ -447,6 +458,7 @@ async def test_first_profile_survives_target_movement_and_runs_the_production_ch
         deploy_dispatcher=build_in_daemon_deploy_dispatcher(
             config=config, nats_client=bus, db_path=db
         ),
+        git_surface=compose_merge_git_surface(config),
         publisher=publish,
         what_the_machine_says=WhatTheMachineSays(
             the_publisher_passed_its_self_check=True
@@ -454,12 +466,40 @@ async def test_first_profile_survives_target_movement_and_runs_the_production_ch
         deployment_lock=lambda: DeploymentLockStore(connection),
     )
     try:
+        interrupted = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD,
+            feature_id=FEATURE,
+            repo=REPO,
+            repo_root=coordinator_copy,
+            expect_main_sha=start,
+            correlation_id=f"corr-{BUILD}",
+            decided_by="owner",
+            expected_candidate_sha=candidate,
+            expected_candidate_tree=candidate_tree,
+            merge_execution_attempt_id=ATTEMPT,
+        )
+        assert interrupted.result == "publication-pending", interrupted.detail
+        store = PublicationRecordStore(connection)
+        before = store.read(BUILD)
+        before_selection = selection_from_record(before)
+        assert before_selection is not None and before_selection.attempt == 2
+        candidate_checks = [
+            line
+            for line in before.lines
+            if line.kind == "about to" and line.step == "candidate-check"
+        ]
+        connection.execute(
+            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+            ("2000-01-01T00:00:00+00:00", BUILD),
+        )
+        connection.commit()
         outcome = await execute_merge_deploy(
             deps=deps,
             build_id=BUILD,
             feature_id=FEATURE,
             repo=REPO,
-            repo_root=repo,
+            repo_root=coordinator_copy,
             expect_main_sha=start,
             correlation_id=f"corr-{BUILD}",
             decided_by="owner",
@@ -474,7 +514,7 @@ async def test_first_profile_survives_target_movement_and_runs_the_production_ch
         answer.server_close()
 
     assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
-    assert len(publish_calls) == 2
+    assert len(publish_calls) == 3
     assert checked.sends == [outcome.merged_sha]
     assert runtime.gate_verdicts == ["pass", "pass", "pass"]
     assert any(
@@ -483,10 +523,19 @@ async def test_first_profile_survives_target_movement_and_runs_the_production_ch
     )
     assert spawn.calls and spawn.calls[-1]["env"]["RELEASE_IDENTITY"]
     assert bus.messages
+    after = PublicationRecordStore(connection).read(BUILD)
+    selected = selection_from_record(after)
+    assert selected is not None
+    assert selected.attempt == 2
+    assert selected.target_commit == moved_target
+    assert after.turn == before.turn + 1
+    assert [
+        line
+        for line in after.lines
+        if line.kind == "about to" and line.step == "candidate-check"
+    ] == candidate_checks
     recorded = TheCoordinatorsRecord(db).what_build_starts_from(BUILD)
-    selected = recorded["first_deployment_profile"]["selection"]
-    assert selected["attempt"] == 2
-    assert selected["target_commit"] == moved_target
+    assert "first_deployment_profile" not in recorded
     assert not (repo / "deploy" / "profile.yaml").exists()
 
 
@@ -494,7 +543,7 @@ async def test_first_profile_survives_target_movement_and_runs_the_production_ch
 async def test_second_deployment_uses_committed_profile_and_reverts_failed_live_gate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    repo, _bare, start, first_candidate, _first_tree = _project(tmp_path)
+    repo, bare, start, first_candidate, _first_tree = _project(tmp_path)
     first_folder = tmp_path / "first-join"
     _git(repo, "worktree", "add", "-q", "-b", "joined-first", str(first_folder), start)
     _git(first_folder, "merge", "--no-ff", "-q", "-m", "first join", first_candidate)
@@ -530,7 +579,9 @@ async def test_second_deployment_uses_committed_profile_and_reverts_failed_live_
         repo=repo, db=db, runtime=runtime, monkeypatch=monkeypatch, tmp_path=tmp_path
     )
     bus = _Bus()
-    real_publisher, checked = _publisher(db, repo, tmp_path, first_join)
+    real_publisher, checked = _publisher(db, repo, tmp_path, first_join, bare)
+    coordinator_copy = Path(config.planning.target_repo_paths[REPO])
+    assert not coordinator_copy.exists()
 
     async def publish(_config: Any, request: dict[str, Any]) -> dict[str, Any]:
         return real_publisher.publish(request).to_wire()
@@ -543,6 +594,7 @@ async def test_second_deployment_uses_committed_profile_and_reverts_failed_live_
         deploy_dispatcher=build_in_daemon_deploy_dispatcher(
             config=config, nats_client=bus, db_path=db
         ),
+        git_surface=compose_merge_git_surface(config),
         publisher=publish,
         what_the_machine_says=WhatTheMachineSays(
             the_publisher_passed_its_self_check=True
@@ -555,7 +607,7 @@ async def test_second_deployment_uses_committed_profile_and_reverts_failed_live_
             build_id=build,
             feature_id=feature,
             repo=REPO,
-            repo_root=repo,
+            repo_root=coordinator_copy,
             expect_main_sha=first_join,
             correlation_id=f"corr-{build}",
             decided_by="owner",
