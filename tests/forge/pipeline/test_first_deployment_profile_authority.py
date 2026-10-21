@@ -387,6 +387,99 @@ def _publisher(
     return publisher, checked
 
 
+def _runbook_ids(connection: sqlite3.Connection) -> set[str]:
+    return {
+        str(row[0])
+        for row in connection.execute("SELECT runbook_id FROM runbooks").fetchall()
+    }
+
+
+def _script_calls_at(runtime: _Runtime, candidate_cwd: str) -> list[dict[str, Any]]:
+    return [
+        call
+        for call in runtime.script_calls
+        if str(call.get("cwd") or "") == candidate_cwd
+    ]
+
+
+def _assert_project_legs_ran_from_selected_archive(
+    *,
+    runtime: _Runtime,
+    spawn: _SpawnRecorder,
+    candidate_cwd: str,
+    checked: dict[str, Any],
+    reverted: bool,
+) -> None:
+    calls = _script_calls_at(runtime, candidate_cwd)
+
+    candidate_deploy = [
+        call
+        for call in calls
+        if call.get("script") == "deploy/deploy.sh"
+        and call.get("extra_env", {}).get("CANDIDATE") == "1"
+    ]
+    candidate_health = [
+        call
+        for call in calls
+        if call.get("script") == "qa/health.sh"
+        and call.get("extra_env", {}).get("CANDIDATE_PORT") == "8902"
+    ]
+    running_queries = [
+        call
+        for call in calls
+        if call.get("script") == "deploy/deploy.sh"
+        and call.get("extra_env", {}).get("RUNNING_RELEASE") == "1"
+    ]
+    live_health = [
+        call
+        for call in calls
+        if call.get("script") == "qa/health.sh"
+        and "CANDIDATE_PORT" not in call.get("extra_env", {})
+    ]
+    candidate_down = [
+        call
+        for call in calls
+        if call.get("script") == "deploy/deploy.sh"
+        and call.get("extra_env", {}).get("CANDIDATE_DOWN") == "1"
+    ]
+    reverts = [
+        call
+        for call in calls
+        if call.get("script") == "deploy/deploy.sh"
+        and call.get("extra_env", {}).get("REVERT") == "1"
+    ]
+    assert len(candidate_deploy) == 1
+    assert len(candidate_health) == 1
+    assert len(running_queries) == 1
+    assert len(live_health) == 1
+    assert len(candidate_down) == 1
+    assert len(reverts) == int(reverted)
+    if reverted:
+        assert reverts[0]["extra_env"]["ROLLBACK_IMAGE_REF"] == "service:rollback"
+
+    gates = [
+        call
+        for call in runtime.gate_calls
+        if str(call.get("cwd") or "") == candidate_cwd
+    ]
+    assert len(gates) == 2
+    assert gates[0]["argv"][-1] == "qa/live_gate.py"
+    assert gates[0]["extra_env"]["CANDIDATE_PORT"] == "8902"
+    assert gates[1]["argv"][-1] == "qa/live_gate.py"
+    assert "CANDIDATE_PORT" not in gates[1]["extra_env"]
+
+    promotes = [
+        call
+        for call in spawn.calls
+        if str(call.get("cwd") or "") == candidate_cwd
+        and call.get("env", {}).get("PROMOTE") == "1"
+    ]
+    assert len(promotes) == 1
+    promote_env = promotes[0]["env"]
+    assert promote_env["RELEASE_IDENTITY"] == checked["identity"]
+    assert promote_env["RELEASE_ARTIFACT"] == checked["artifact"]
+
+
 @pytest.mark.asyncio
 async def test_first_profile_survives_rejoin_and_landed_send_takeover(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -480,6 +573,13 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
             for line in before.lines
             if line.kind == "about to" and line.step == "candidate-check"
         ]
+        attempt_runs = {
+            line.attempt: str(line.detail["deploy_run_id"])
+            for line in candidate_checks
+        }
+        assert set(attempt_runs) == {1, 2}
+        assert attempt_runs[1] != attempt_runs[2]
+        assert before.checked["deploy_run_id"] == attempt_runs[2]
         connection.execute(
             "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
             ("2000-01-01T00:00:00+00:00", BUILD),
@@ -508,11 +608,13 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
     assert len(publish_calls) == 3
     assert checked.sends == [outcome.merged_sha]
     assert runtime.gate_verdicts == ["pass", "pass", "pass"]
-    assert any(
-        call.get("extra_env", {}).get("CANDIDATE") == "1"
-        for call in runtime.script_calls
+    _assert_project_legs_ran_from_selected_archive(
+        runtime=runtime,
+        spawn=spawn,
+        candidate_cwd=before_selection.candidate_cwd,
+        checked=before.checked,
+        reverted=False,
     )
-    assert spawn.calls and spawn.calls[-1]["env"]["RELEASE_IDENTITY"]
     assert bus.messages
     after = PublicationRecordStore(connection).read(BUILD)
     selected = selection_from_record(after)
@@ -520,13 +622,26 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
     assert selected.attempt == 2
     assert selected.target_commit == moved_target
     assert after.turn == before.turn + 1
+    assert after.checked["deploy_run_id"] == attempt_runs[2]
     assert [
         line
         for line in after.lines
         if line.kind == "about to" and line.step == "candidate-check"
     ] == candidate_checks
+    runbooks = _runbook_ids(connection)
+    assert {
+        f"deploy-cand-{attempt_runs[1]}",
+        f"live-gate-cand-{attempt_runs[1]}",
+        f"deploy-cand-{attempt_runs[2]}",
+        f"live-gate-cand-{attempt_runs[2]}",
+        f"ask-{attempt_runs[2]}",
+        f"deploy-{attempt_runs[2]}",
+        f"teardown-cand-{attempt_runs[2]}",
+        f"live-gate-{attempt_runs[2]}",
+    } <= runbooks
     recorded = TheCoordinatorsRecord(db).what_build_starts_from(BUILD)
     assert "first_deployment_profile" not in recorded
+    assert "deployment_layout" not in recorded
     assert not (repo / "deploy" / "profile.yaml").exists()
 
 
@@ -616,8 +731,44 @@ async def test_second_deployment_uses_committed_profile_and_reverts_failed_live_
     assert outcome.result == "merged-deploy-failed", outcome.detail
     assert checked.sends == [outcome.merged_sha]
     assert runtime.gate_verdicts == ["pass", "fail"]
-    assert any(call["env"].get("REVERT") == "1" for call in spawn.calls)
+    after = PublicationRecordStore(connection).read(build)
+    candidate_line = next(
+        line
+        for line in after.lines
+        if line.kind == "about to" and line.step == "candidate-check"
+    )
+    assert "first_deployment_profile" not in candidate_line.detail
+    deploy_run_id = str(candidate_line.detail["deploy_run_id"])
+    assert after.checked["deploy_run_id"] == deploy_run_id
+    candidate_cwd = str(candidate_line.detail["candidate_cwd"])
+    _assert_project_legs_ran_from_selected_archive(
+        runtime=runtime,
+        spawn=spawn,
+        candidate_cwd=candidate_cwd,
+        checked=after.checked,
+        reverted=True,
+    )
+    assert {
+        f"deploy-cand-{deploy_run_id}",
+        f"live-gate-cand-{deploy_run_id}",
+        f"ask-{deploy_run_id}",
+        f"deploy-{deploy_run_id}",
+        f"teardown-cand-{deploy_run_id}",
+        f"live-gate-{deploy_run_id}",
+        f"revert-{deploy_run_id}",
+    } <= _runbook_ids(connection)
+    reverted_events = [
+        json.loads(payload)
+        for subject, payload in bus.messages
+        if subject == f"deploy.reverted.corr-{build}"
+    ]
+    assert len(reverted_events) == 1
+    assert reverted_events[0]["event_type"] == "deploy_reverted"
+    assert reverted_events[0]["payload"]["deploy_run_id"] == deploy_run_id
+    assert reverted_events[0]["payload"]["reverted_to_image_ref"] == "service:rollback"
+    assert selection_from_record(after) is None
     assert bus.messages
     recorded = TheCoordinatorsRecord(db).what_build_starts_from(build)
     assert "first_deployment_profile" not in recorded
+    assert "deployment_layout" not in recorded
     assert not (repo / "deploy" / "profile.yaml").exists()
