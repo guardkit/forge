@@ -2239,12 +2239,22 @@ def _driver_archive_sources(
     """
     sources: list[str] = []
     for index, token in enumerate(argv):
-        path = Path(token)
-        if index == 0 and path.is_absolute():
-            continue
         if token.startswith("-"):
-            continue
-        if path.is_absolute() or ".." in path.parts:
+            _option, equals, token = token.partition("=")
+            if not equals:
+                continue
+        path = Path(token)
+        if path.is_absolute():
+            if path.is_relative_to(archive):
+                token = path.relative_to(archive).as_posix()
+                path = Path(token)
+                # This is a directly named project executable, even at argv[0].
+                sources.append(token)
+                continue
+            if index == 0 and not path.is_relative_to(repo_path):
+                continue  # An installed runtime binary, outside the project.
+            return [], "the live driver names a source outside the candidate archive"
+        if ".." in path.parts:
             return [], "the live driver names a source outside the candidate archive"
         if not token or token in (".", ".."):
             continue

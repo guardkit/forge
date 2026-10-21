@@ -2679,3 +2679,117 @@ class TestOnlyAConfirmedGitAnswerPutsTheHoldDown:
         held = _record(pool)
         assert held.result == RESULT_PUBLICATION_PENDING
         assert (held.lease_holder is not None) is kept
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("typed", [True, False], ids=["proven-before-dispatch", "generic-profile-error"])
+async def test_only_a_proven_profile_refusal_releases_the_unanswered_hold(
+    config_with_publication_on: ForgeConfig, pool: SqliteLifecyclePersistence,
+    repo_root: Path, typed: bool,
+) -> None:
+    from dataclasses import replace
+    from forge.deploy.profile import DeployProfileError
+    from forge.deploy.profile_selection import ProfileSelectionRefusedBeforeDispatch
+
+    error = ProfileSelectionRefusedBeforeDispatch if typed else DeployProfileError
+    deps, _deploy, _joins, _bus = _deps(config_with_publication_on, pool)
+    deploy = _FakeDeploy(candidate_raises=error("no deployment profile; no request was sent"))
+    outcome = await _press(replace(deps, deploy_dispatcher=deploy), repo_root)
+    assert outcome.result == "candidate-refused"
+    assert "no deployment profile" in outcome.detail
+    assert (_record(pool).lease_holder is not None) is (not typed)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("earlier_unanswered", [False, True])
+async def test_predispatch_profile_refusal_preserves_an_earlier_unanswered_leg(
+    config_with_publication_on: ForgeConfig, pool: SqliteLifecyclePersistence,
+    repo_root: Path, earlier_unanswered: bool,
+) -> None:
+    from dataclasses import replace
+    from forge.deploy.profile_selection import ProfileSelectionRefusedBeforeDispatch
+
+    landed: list[str] = []
+
+    def move_target(_request: dict[str, Any]) -> None:
+        if not landed:
+            landed.append(_somebody_else_lands_work(repo_root, "profile-retry"))
+
+    deps, deploy, _joins, _bus = _deps_naming_the_candidate(
+        config_with_publication_on, pool,
+        publisher=_APublisherThatSays([_the_remote_moved()], before_answering=move_target),
+    )
+    checks = 0
+
+    async def dispatch(**kwargs: Any) -> Any:
+        nonlocal checks
+        if kwargs.get("leg") == "candidate_check":
+            checks += 1
+            if checks == 2:
+                raise ProfileSelectionRefusedBeforeDispatch("no deployment profile; no request was sent")
+        return await deploy(**kwargs)
+
+    surface = _ASurfaceWhoseCleanUpsSay(
+        repo_root, tree_removals=[None if earlier_unanswered else False]
+    )
+    deps = replace(deps, deploy_dispatcher=dispatch, git_surface=lambda _repo, _root: surface)
+    outcome = await _press(deps, repo_root)
+    assert checks == 2
+    assert outcome.result == "candidate-refused"
+    assert (_record(pool).lease_holder is not None) is earlier_unanswered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("reason", ["the request turn is stale", "the record contradicts the request"])
+@pytest.mark.parametrize("echo", [True, False], ids=["attested-refusal", "missing-instance"])
+async def test_selected_helper_refusals_release_only_a_confirmed_unanswered_hold(
+    config_with_publication_on: ForgeConfig, pool: SqliteLifecyclePersistence,
+    repo_root: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    reason: str, echo: bool,
+) -> None:
+    import io
+    import urllib.error
+    import urllib.request
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
+    from tests.forge.deploy_sidecar.test_service import _profile_reference
+
+    reference = _profile_reference(tmp_path / ".forge-candidates" / "selection")
+
+    class Health:
+        def __enter__(self) -> Any:
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return json.dumps({"status": "healthy", "instance": "helper-one",
+                               "capabilities": ["first_deployment_profile_v1"]}).encode()
+
+    def helper(request: Any, *, timeout: float) -> Any:
+        if request.full_url.endswith("/healthz"):
+            return Health()
+        body = {"error": reason, "execution_started": False,
+                "requested_first_deployment_profile": reference}
+        if echo:
+            body["helper_instance"] = "helper-one"
+        raise urllib.error.HTTPError(request.full_url, 400, "refused", {},
+                                     io.BytesIO(json.dumps(body).encode()))
+
+    monkeypatch.setattr(urllib.request, "urlopen", helper)
+    client = SidecarScriptRunner(base_url="http://127.0.0.1:1", repo="example/service",
+                                 first_deployment_profile=reference)
+
+    async def dispatch(**_kwargs: Any) -> Any:
+        answer = client(cwd=reference["selection"]["candidate_cwd"], script="deploy/run", env_file=None)
+        return SimpleNamespace(
+            outcome="failed", confirmed=answer.confirmed,
+            detail={"reason": "candidate_deploy_failed", "answer_lost": no_answer_came_back(answer)},
+        )
+
+    deps, _deploy, _joins, _bus = _deps(config_with_publication_on, pool)
+    outcome = await _press(replace(deps, deploy_dispatcher=dispatch), repo_root)
+    assert outcome.result == "candidate-refused"
+    assert (_record(pool).lease_holder is not None) is (not echo)

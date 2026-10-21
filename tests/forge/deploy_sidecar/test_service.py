@@ -1213,3 +1213,28 @@ def test_clone_profile_symlinks_never_count_as_absence(
     )
     assert status == 400 and "symbolic link" in body["error"]
     assert runner.calls == []
+
+
+@pytest.mark.parametrize("shape", ["absolute-executable", "option-source", "clone-executable"])
+def test_driver_source_classification_cannot_skip_project_executables(repo: Path, shape: str) -> None:
+    import subprocess
+
+    source = repo / "gate"
+    source.write_text("committed source\n", encoding="utf-8")
+    subprocess.run(["git", "add", "gate"], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "driver"], cwd=repo, check=True)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    archive = repo / ".forge-candidates" / "selection"
+    archive.mkdir(parents=True)
+    (archive / "gate").write_text("substituted source\n", encoding="utf-8")
+    argv = {
+        "absolute-executable": [str(archive / "gate")],
+        "option-source": ["node", "--require=./gate", "-e", "0"],
+        "clone-executable": [str(repo / "gate")],
+    }[shape]
+    sources, refusal = service._driver_archive_sources(repo, archive, commit, argv)
+    if shape == "clone-executable":
+        assert refusal and "outside" in refusal
+    else:
+        assert refusal is None and len(sources) == 1
+        assert "differs" in service._same_archive_source(repo, archive, commit, sources[0])
