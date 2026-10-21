@@ -35,7 +35,7 @@ import shutil
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Sequence
 
 import pytest
 import yaml
@@ -55,6 +55,7 @@ from forge.planning.driver import (
     PlanningDriverDeps,
     PlanningRunDriver,
 )
+from forge.planning.factory_deployment_context import load_bundled_document
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
 from forge.planning.states import PlanningState
@@ -604,6 +605,7 @@ def _make_driver(
         validate_feedback: str | None = None,
         request_text: str | None = None,
         repository_facts: str | None = None,
+        context: Sequence[str] | None = None,
         # The code windows (17 October 2026), as the real dispatcher takes them.
         code_evidence: dict[str, Any] | None = None,
     ) -> Any:
@@ -634,6 +636,7 @@ def _make_driver(
         repository_facts: str | None = None,
         revision_of: dict[str, str] | None = None,
         validate_feedback: str | None = None,
+        context: Sequence[str] | None = None,
         already_done_allowed: bool = False,
     ) -> Any:
         # "Already done, nothing to build" (7 October 2026): sent only with
@@ -703,6 +706,7 @@ def _make_driver(
             repository_facts=repository_facts,
             revision_of=revision_of,
             validate_feedback=validate_feedback,
+            context=context,
         )
         if revision_of is not None:
             counters.setdefault("plan_revisions", []).append(dict(revision_of))
@@ -8077,7 +8081,7 @@ async def test_the_plan_leg_is_sent_the_sentence_and_the_fact_sheet(
     assert "None of them declares an authentication dependency." in facts
 
     # And what the wire actually carries: the four required names, the spec
-    # location, and the coach's two documents. Nothing invented.
+    # location, the coach's two documents and the recorded factory contract.
     wire = counters["last_plan_wire_args"]
     assert set(wire) == {
         "feature_id",
@@ -8088,9 +8092,11 @@ async def test_the_plan_leg_is_sent_the_sentence_and_the_fact_sheet(
         "spec_feature_paths",
         "request_text",
         "repository_facts",
+        "context",
     }
     assert wire["request_text"] == "add a GET /stats endpoint"
     assert wire["repository_facts"] == facts
+    assert wire["context"] == [load_bundled_document().context_text()]
 
 
 @pytest.mark.asyncio
@@ -8136,13 +8142,11 @@ async def test_plan_instructions_do_not_become_sets_on_the_real_plan_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_a_run_with_no_sentence_sends_the_set_that_shipped_before(
+async def test_a_run_with_no_sentence_omits_the_optional_grounding_fields(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
-    """Nothing to say, nothing said. A run whose row carries no sentence puts
-    exactly the argument set on the wire that it put there before this
-    existed — which is what lets the two images be redeployed in either
-    order with no window in which planning is refused."""
+    """Nothing to say, nothing said. A row with no request sentence omits the
+    optional request and repository facts while retaining required context."""
     repo = tmp_path / "api_test"
     _init_repo_with_a_stats_route(repo)
     git = _recorded_runner(tmp_path / "wt", repo)
@@ -8163,9 +8167,9 @@ async def test_a_run_with_no_sentence_sends_the_set_that_shipped_before(
     assert counters["plan"] == 1
     assert counters["last_request_text"] == ""
     assert counters["last_repository_facts"] is None
-    # The set that shipped before this existed: the four required names plus
-    # the two optional ones this run happens to have. Neither new name is on
-    # the wire at all.
+    # The four required names, the two optional spec fields this run has, and
+    # the recorded factory contract remain. Neither absent grounding field is
+    # invented.
     wire = counters["last_plan_wire_args"]
     assert set(wire) == {
         "feature_id",
@@ -8174,7 +8178,9 @@ async def test_a_run_with_no_sentence_sends_the_set_that_shipped_before(
         "target_repo_descriptor",
         "spec_assumptions",
         "spec_feature_paths",
+        "context",
     }
+    assert wire["context"] == [load_bundled_document().context_text()]
     assert "request_text" not in wire
     assert "repository_facts" not in wire
 
