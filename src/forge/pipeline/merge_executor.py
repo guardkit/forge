@@ -2498,8 +2498,15 @@ async def execute_merge_deploy(
         "refusal": None,
     }
     gate_began = False
-    # One deploy run for both legs, so their runbooks and events belong together.
+    # One deploy run per publication attempt, shared by all of that attempt's
+    # legs and takeover presses. Unrecorded callers retain a per-press ID.
     deploy_run_id = str(uuid.uuid4())
+
+    def _deployment_run_for_attempt(attempt: int) -> str:
+        return str(uuid.uuid5(
+            uuid.NAMESPACE_URL,
+            json.dumps(["forge-publication-deploy", repo, build_id, attempt]),
+        ))
     task_id = _deploy_task_id(feature_id)
     tree_path: Path | None = None
     # The commit the laid-out tree is a tree OF, and the commit the standing
@@ -5204,7 +5211,7 @@ async def execute_merge_deploy(
 
     async def _press() -> MergeDeployOutcome:
         nonlocal tree_path, candidate_standing, gate_began, held_turn
-        nonlocal a_leg_did_not_complete
+        nonlocal a_leg_did_not_complete, deploy_run_id
 
         # IS THIS A PICK-UP? A build whose record already holds a join that
         # was made is not being merged again; it is being carried on, and
@@ -5441,6 +5448,8 @@ async def execute_merge_deploy(
             turn = grant.turn
             held_turn = grant.turn
             record = store.read(build_id)
+            if record.attempt > 0:
+                deploy_run_id = _deployment_run_for_attempt(record.attempt)
 
             # --------------------------------------------------------------
             # A SEND THAT MAY ALREADY HAVE HAPPENED IS SETTLED FIRST, BY
@@ -6500,12 +6509,15 @@ async def execute_merge_deploy(
                 return _nothing_was_published(
                     _could_not_check(str(exc)), store=store, turn=turn,
                 )
+            if store is not None:
+                deploy_run_id = _deployment_run_for_attempt(attempt)
             if store is not None and not store.about_to(
                 build_id=build_id, turn=turn, now=deps.clock(),
                 step=STEP_CANDIDATE_CHECK, attempt=attempt,
                 inputs={
                     "j_commit": j_commit, "j_tree": j_tree,
                     "feature_id": feature_id,
+                    "deploy_run_id": deploy_run_id,
                     **({"candidate_cwd": str(tree_path)} if scripts_from_the_commit else {}),
                     **({"first_deployment_profile": first_profile.to_wire()} if first_profile is not None else {}),
                 },
@@ -6521,6 +6533,7 @@ async def execute_merge_deploy(
             what_was_checked = {
                 "j_commit": j_commit,
                 "j_tree": j_tree,
+                "deploy_run_id": deploy_run_id,
                 "build_tip": candidate_sha,
                 "tree_path": str(tree_path) if tree_path else None,
                 "verdict": gate.get("verdict"),
