@@ -279,10 +279,11 @@ class _CheckedGitWithRecordedSend(TheProjectsCommits):
             [
                 "git",
                 "--git-dir",
+                str(self.where),
+                "push",
+                "--quiet",
                 str(self.bare_remote),
-                "update-ref",
-                "refs/heads/main",
-                commit,
+                f"{commit}:refs/heads/main",
             ],
             check=True,
             capture_output=True,
@@ -425,18 +426,7 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
     async def publish(_config: Any, request: dict[str, Any]) -> dict[str, Any]:
         publish_calls.append(dict(request))
         if len(publish_calls) == 1:
-            subprocess.run(
-                [
-                    "git",
-                    "--git-dir",
-                    str(bare),
-                    "update-ref",
-                    "refs/heads/main",
-                    moved_target,
-                ],
-                check=True,
-                capture_output=True,
-            )
+            _git(repo, "push", "-q", str(bare), f"{moved_target}:refs/heads/main")
             checked.remote = moved_target
             return {
                 "published": False,
