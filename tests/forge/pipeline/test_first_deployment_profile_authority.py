@@ -453,7 +453,7 @@ def _assert_project_legs_ran_from_selected_archive(
     assert len(candidate_health) == candidate_checks
     assert len(running_queries) == 1
     assert len(live_health) == 1
-    assert len(candidate_down) == 1
+    assert len(candidate_down) == candidate_checks
     assert len(reverts) == int(reverted)
     if reverted:
         assert reverts[0]["extra_env"]["ROLLBACK_IMAGE_REF"] == "service:rollback"
@@ -478,7 +478,10 @@ def _assert_project_legs_ran_from_selected_archive(
     ]
     assert len(promotes) == 1
     promote_env = promotes[0]["env"]
-    assert promote_env["RELEASE_IDENTITY"] == checked["identity"]
+    assert (
+        promote_env["RELEASE_IDENTITY"]
+        == checked["identity"]["handed_to_the_check"]
+    )
     assert promote_env["RELEASE_ARTIFACT"] == checked["artifact"]
 
 
