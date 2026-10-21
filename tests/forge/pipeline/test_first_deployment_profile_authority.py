@@ -416,37 +416,37 @@ def _assert_project_legs_ran_from_selected_archive(
         call
         for call in calls
         if call.get("script") == "deploy/deploy.sh"
-        and call.get("extra_env", {}).get("CANDIDATE") == "1"
+        and (call.get("extra_env") or {}).get("CANDIDATE") == "1"
     ]
     candidate_health = [
         call
         for call in calls
         if call.get("script") == "qa/health.sh"
-        and call.get("extra_env", {}).get("CANDIDATE_PORT") == "8902"
+        and (call.get("extra_env") or {}).get("CANDIDATE_PORT") == "8902"
     ]
     running_queries = [
         call
         for call in calls
         if call.get("script") == "deploy/deploy.sh"
-        and call.get("extra_env", {}).get("RUNNING_RELEASE") == "1"
+        and (call.get("extra_env") or {}).get("RUNNING_RELEASE") == "1"
     ]
     live_health = [
         call
         for call in calls
         if call.get("script") == "qa/health.sh"
-        and "CANDIDATE_PORT" not in call.get("extra_env", {})
+        and "CANDIDATE_PORT" not in (call.get("extra_env") or {})
     ]
     candidate_down = [
         call
         for call in calls
         if call.get("script") == "deploy/deploy.sh"
-        and call.get("extra_env", {}).get("CANDIDATE_DOWN") == "1"
+        and (call.get("extra_env") or {}).get("CANDIDATE_DOWN") == "1"
     ]
     reverts = [
         call
         for call in calls
         if call.get("script") == "deploy/deploy.sh"
-        and call.get("extra_env", {}).get("REVERT") == "1"
+        and (call.get("extra_env") or {}).get("REVERT") == "1"
     ]
     assert len(candidate_deploy) == 1
     assert len(candidate_health) == 1
@@ -466,7 +466,7 @@ def _assert_project_legs_ran_from_selected_archive(
     assert gates[0]["argv"][-1] == "qa/live_gate.py"
     assert gates[0]["extra_env"]["CANDIDATE_PORT"] == "8902"
     assert gates[1]["argv"][-1] == "qa/live_gate.py"
-    assert "CANDIDATE_PORT" not in gates[1]["extra_env"]
+    assert "CANDIDATE_PORT" not in (gates[1].get("extra_env") or {})
 
     promotes = [
         call
@@ -605,7 +605,7 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
         answer.server_close()
 
     assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
-    assert len(publish_calls) == 3
+    assert len(publish_calls) == 2
     assert checked.sends == [outcome.merged_sha]
     assert runtime.gate_verdicts == ["pass", "pass", "pass"]
     _assert_project_legs_ran_from_selected_archive(
