@@ -1359,8 +1359,70 @@ def test_clone_profile_symlinks_never_count_as_absence(
     assert runner.calls == []
 
 
-@pytest.mark.parametrize("shape", ["absolute-executable", "option-source", "clone-executable"])
-def test_driver_source_classification_cannot_skip_project_executables(repo: Path, shape: str) -> None:
+@pytest.mark.parametrize("route", ["deploy", "declared-test"])
+def test_symlinked_registered_root_preserves_ordinary_commands(
+    tmp_path: Path, route: str,
+) -> None:
+    actual = tmp_path / "projects" / "service"
+    (actual / ".guardkit").mkdir(parents=True)
+    (actual / ".forge" / "worktrees" / "journey-one").mkdir(parents=True)
+    _write_profile(actual, _minimal_profile())
+    (actual / ".guardkit" / "config.yaml").write_text(
+        "toolchain:\n  test: python -m pytest -q\n  test_timeout: 60\n",
+        encoding="utf-8",
+    )
+    _committed(actual)
+    registered = tmp_path / "registered-service"
+    registered.symlink_to(actual, target_is_directory=True)
+    config = _config({"example/service": str(registered)})
+    runner = _RecordingRunner(
+        (0, "declared output", "")
+        if route == "declared-test"
+        else (0, "deploy output")
+    )
+    payload: dict[str, Any] = {"repo": "example/service"}
+    if route == "deploy":
+        payload["script"] = "deploy.sh"
+    else:
+        payload.update({
+            "declared_test": "python -m pytest -q",
+            "cwd": str(actual / ".forge" / "worktrees" / "journey-one"),
+            "by_hand": True,
+        })
+
+    status, body = process_run_request(
+        payload,
+        config=config,
+        script_runner=runner,
+        command_runner=runner,
+        inside_sandbox=True,
+    )
+
+    assert status == 200, body
+    assert len(runner.calls) == 1
+    assert runner.calls[0]["repository"] == str(actual.resolve())
+    if route == "deploy":
+        assert runner.calls[0]["script"] == "deploy.sh"
+        assert body["cwd"] == str(actual.resolve())
+    else:
+        assert runner.calls[0]["argv"] == [
+            "/bin/sh", "-c", "python -m pytest -q",
+        ]
+        assert body["cwd"] == str(actual / ".forge" / "worktrees" / "journey-one")
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "absolute-executable",
+        "option-source",
+        "clone-executable",
+        "symlinked-clone-executable",
+    ],
+)
+def test_driver_source_classification_cannot_skip_project_executables(
+    repo: Path, tmp_path: Path, shape: str,
+) -> None:
     import subprocess
 
     source = repo / "gate"
@@ -1371,13 +1433,16 @@ def test_driver_source_classification_cannot_skip_project_executables(repo: Path
     archive = repo / ".forge-candidates" / "selection"
     archive.mkdir(parents=True)
     (archive / "gate").write_text("substituted source\n", encoding="utf-8")
+    registered = tmp_path / "registered-service"
+    registered.symlink_to(repo, target_is_directory=True)
     argv = {
         "absolute-executable": [str(archive / "gate")],
         "option-source": ["node", "--require=./gate", "-e", "0"],
         "clone-executable": [str(repo / "gate")],
+        "symlinked-clone-executable": [str(registered / "gate")],
     }[shape]
     sources, refusal = service._driver_archive_sources(repo, archive, commit, argv)
-    if shape == "clone-executable":
+    if shape in ("clone-executable", "symlinked-clone-executable"):
         assert refusal and "outside" in refusal
     else:
         assert refusal is None and len(sources) == 1

@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.config.models import ForgeConfig
@@ -72,6 +73,48 @@ class _SelectedCase:
         self.script_calls: list[dict[str, Any]] = []
         self.driver_calls: list[dict[str, Any]] = []
         self.answer_calls: list[str] = []
+        self.profile_source = PROFILE
+
+    def select_driver(
+        self,
+        driver: list[str],
+        *,
+        committed_files: dict[str, str] | None = None,
+        generated_files: dict[str, str] | None = None,
+        generated_links: dict[str, str] | None = None,
+    ) -> None:
+        """Select a real joined commit whose declared driver has this shape."""
+        _git(self.repo, "checkout", "-q", "approved")
+        profile = yaml.safe_load(PROFILE)
+        profile["live_gate"]["driver"] = driver
+        self.profile_source = yaml.safe_dump(profile, sort_keys=False)
+        (self.repo / "deploy/profile.yaml").write_text(
+            self.profile_source, encoding="utf-8",
+        )
+        for name, content in (committed_files or {}).items():
+            path = self.repo / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        _git(self.repo, "add", "-A")
+        _git(self.repo, "commit", "-q", "-m", "declare the driver shape")
+        self.candidate = _git(self.repo, "rev-parse", "HEAD")
+        _git(self.repo, "checkout", "-q", "joined")
+        _git(self.repo, "reset", "-q", "--hard", "approved")
+        _git(self.repo, "commit", "-q", "--allow-empty", "-m", "joined driver")
+        self.joined = _git(self.repo, "rev-parse", "HEAD")
+        self.tree = _git(self.repo, "rev-parse", "HEAD^{tree}")
+        _git(self.repo, "checkout", "-q", "main")
+        self.archive = asyncio.run(
+            materialise_candidate_tree(self.repo, "selected-driver", self.joined)
+        )
+        for name, content in (generated_files or {}).items():
+            path = self.archive / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+        for name, target in (generated_links or {}).items():
+            path = self.archive / name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.symlink_to(target)
 
     def answer(self, build: str) -> dict[str, Any]:
         self.answer_calls.append(build)
@@ -86,7 +129,9 @@ class _SelectedCase:
                 "candidate_commit": self.candidate, "candidate_tree": self.tree,
                 "start_commit": self.start, "target_commit": self.start,
                 "joined_commit": self.joined, "joined_tree": self.tree,
-                "profile_sha256": hashlib.sha256(PROFILE.encode()).hexdigest(),
+                "profile_sha256": hashlib.sha256(
+                    self.profile_source.encode()
+                ).hexdigest(),
                 "attempt": 1, "candidate_cwd": str(self.archive), **overrides,
             }
         )
@@ -235,6 +280,73 @@ def test_recorded_selection_runs_only_the_approved_archive(selected: _SelectedCa
         assert selected.script_calls == []
     assert not (selected.repo / "deploy/profile.yaml").exists()
     assert not (selected.archive / ".git").exists()
+
+
+@pytest.mark.parametrize(
+    "driver,committed_files,generated_files,generated_links",
+    [
+        (
+            ["python3", "-m", "pytest", "tests/live"],
+            {"tests/live/test_ready.py": "def test_ready():\n    assert True\n"},
+            {},
+            {},
+        ),
+        (
+            [
+                "python3",
+                "qa/gate.py",
+                "/var/run/example-service.sock",
+                "--report=/tmp/live-gate.json",
+            ],
+            {},
+            {},
+            {},
+        ),
+        (
+            ["node", "dist/gate.js"],
+            {},
+            {"dist/gate.js": "console.log('generated')\n"},
+            {},
+        ),
+        (
+            ["node_modules/.bin/tsx", "qa/gate.ts"],
+            {"qa/gate.ts": "console.log('committed source')\n"},
+            {"node_modules/tsx/bin.mjs": "console.log('dependency')\n"},
+            {"node_modules/.bin/tsx": "../tsx/bin.mjs"},
+        ),
+    ],
+    ids=[
+        "committed-directory-argument",
+        "external-absolute-data-and-output-arguments",
+        "generated-archive-source",
+        "generated-node-modules-executable",
+    ],
+)
+def test_selected_driver_allows_nonsource_and_generated_arguments(
+    selected: _SelectedCase,
+    driver: list[str],
+    committed_files: dict[str, str],
+    generated_files: dict[str, str],
+    generated_links: dict[str, str],
+) -> None:
+    selected.select_driver(
+        driver,
+        committed_files=committed_files,
+        generated_files=generated_files,
+        generated_links=generated_links,
+    )
+
+    payload = selected.payload("driver")
+    status, body = selected.run(payload)
+
+    assert status == 200, body
+    assert body["first_deployment_profile"] == payload["first_deployment_profile"]
+    assert body["cwd"] == str(selected.archive)
+    assert selected.answer_calls == [BUILD]
+    assert selected.script_calls == []
+    assert len(selected.driver_calls) == 1
+    assert selected.driver_calls[0]["argv"] == driver
+    assert selected.driver_calls[0]["cwd"] == str(selected.archive)
 
 
 @pytest.mark.parametrize("route,change,reason", [
