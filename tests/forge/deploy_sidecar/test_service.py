@@ -1072,8 +1072,9 @@ def test_first_profile_authority_refusal_echoes_requested_reference_before_execu
     assert runner.calls == []
 
 
+@pytest.mark.parametrize("authority", ["missing_layout", "unavailable", "wrong_start", "unstamped", "by_hand"])
 def test_missing_clone_profile_base_env_still_requires_current_layout(
-    repo: Path, monkeypatch: pytest.MonkeyPatch,
+    repo: Path, monkeypatch: pytest.MonkeyPatch, authority: str,
 ) -> None:
     import subprocess
 
@@ -1088,6 +1089,16 @@ def test_missing_clone_profile_base_env_still_requires_current_layout(
 
     def _answer(build: str) -> dict[str, Any]:
         asked.append(build)
+        if authority == "unavailable":
+            raise OSError("record unavailable")
+        if authority == "wrong_start":
+            return {
+                "build": build, service.RECORDED_START_KEY: "a" * 40,
+                "deployment_layout": {
+                    "repo": "example/service", "build": build, "start_commit": start,
+                    "candidate_cwd": str(archive), "attempt": 1, "turn": 1,
+                },
+            }
         return {"build": build, service.RECORDED_START_KEY: start}
 
     monkeypatch.setattr(service, "coordinator_recorded_build", lambda: _answer)
@@ -1095,7 +1106,8 @@ def test_missing_clone_profile_base_env_still_requires_current_layout(
     status, body = process_run_request(
         {
             "repo": "example/service",
-            "build": "build-one",
+            **({"build": "build-one"} if authority != "unstamped" else {}),
+            **({"by_hand": True} if authority == "by_hand" else {}),
             "declared_at": start,
             "script": "deploy.sh",
             "env": {},
@@ -1105,8 +1117,8 @@ def test_missing_clone_profile_base_env_still_requires_current_layout(
         script_runner=runner,
     )
     assert status == 400
-    assert "candidate archive" in body["error"]
-    assert asked == ["build-one"]
+    assert body["error"]
+    assert asked == ([] if authority in ("unstamped", "by_hand") else ["build-one"])
     assert runner.calls == []
 
 
@@ -1157,6 +1169,72 @@ def test_script_client_probes_each_selected_command_and_requires_attestation(
     uncertain = client(cwd=reference["selection"]["candidate_cwd"], script="deploy.sh", env_file=None)
     assert no_answer_came_back(uncertain)
     assert sent == ["http://127.0.0.1:1/healthz", "http://127.0.0.1:1/run"]
+
+
+@pytest.mark.parametrize("client_kind", ["script", "live_gate"])
+@pytest.mark.parametrize("reply_kind", [
+    "malformed_health", "unavailable_health", "missing_capability",
+    "changed_instance", "changed_selection",
+])
+def test_selected_clients_bind_the_probe_to_the_success_response(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_kind: str, reply_kind: str,
+) -> None:
+    from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+    reference = _profile_reference(tmp_path / ".forge-candidates" / "selection")
+    sent: list[str] = []
+
+    class Response:
+        def __init__(self, body: bytes) -> None:
+            self.body = body
+
+        def __enter__(self) -> "Response":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            pass
+
+        def read(self) -> bytes:
+            return self.body
+
+    def respond(request: Any, *, timeout: float) -> Response:
+        sent.append(request.full_url)
+        if request.full_url.endswith("/healthz"):
+            if reply_kind == "unavailable_health":
+                raise urllib.error.URLError("helper unavailable")
+            if reply_kind == "malformed_health":
+                return Response(b"not json")
+            return Response(json.dumps({
+                "status": "healthy", "instance": "one",
+                "capabilities": [] if reply_kind == "missing_capability" else ["first_deployment_profile_v1"],
+            }).encode())
+        return Response(json.dumps({
+            "exit_code": 0, "output_tail": "ok", "stdout": "{}", "stderr_tail": "",
+            "cwd": reference["selection"]["candidate_cwd"],
+            "helper_instance": "replacement" if reply_kind == "changed_instance" else "one",
+            "first_deployment_profile": {**reference, "turn": 99} if reply_kind == "changed_selection" else reference,
+        }).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", respond)
+    before_post = reply_kind in ("malformed_health", "unavailable_health", "missing_capability")
+    if client_kind == "script":
+        client = SidecarScriptRunner(
+            base_url="http://127.0.0.1:1", repo="example/service",
+            first_deployment_profile=reference,
+        )
+        answer = client(cwd=reference["selection"]["candidate_cwd"], script="deploy.sh", env_file=None)
+        assert answer[0] != 0
+        assert no_answer_came_back(answer) is not before_post
+    else:
+        gate = SidecarLiveGateInvoker(
+            base_url="http://127.0.0.1:1", repo="example/service",
+            repo_path=Path(reference["selection"]["candidate_cwd"]),
+            driver_argv=["node", "gate.mjs"], first_deployment_profile=reference,
+        )
+        answer = gate.invoke(feature="generic", target="candidate")
+        assert answer.confirmed is before_post
+        assert answer.answer_lost is not before_post
+    assert sent == ["http://127.0.0.1:1/healthz"] + ([] if before_post else ["http://127.0.0.1:1/run"])
 
 
 @pytest.mark.parametrize("client_kind", ["script", "live_gate"])
