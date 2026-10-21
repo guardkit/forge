@@ -44,7 +44,14 @@ from forge.deploy_sidecar.service import (
 )
 from forge.lifecycle import migrations as lifecycle_migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
+from forge.lifecycle.persistence import StageLogEntry
 from forge.pipeline.deployment_lock import DeploymentLockStore
+from forge.pipeline.publication_record import (
+    STEP_CANDIDATE_CHECK,
+    STEP_JOIN,
+    STEP_SEND,
+    PublicationRecordStore,
+)
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.record_answer.service import (
     ANSWER_ROUTE,
@@ -125,6 +132,134 @@ def _a_build_with_nothing_recorded(record: SqliteLifecyclePersistence) -> str:
     )
 
 
+def _profile_authority(
+    record: SqliteLifecyclePersistence,
+    build: str,
+    start_commit: str,
+    candidate_cwd: Path,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Write the real approval and publication records the answer reconciles."""
+    from forge.deploy.profile_selection import FirstDeploymentProfile
+
+    candidate = "1" * 40
+    candidate_tree = "2" * 40
+    target = "3" * 40
+    joined = "4" * 40
+    joined_tree = "5" * 40
+    offer_id = "offer-recorded-profile"
+    decision_id = "approved-recorded-profile"
+    now = datetime.now(UTC)
+    common = {
+        "build_id": build,
+        "stage_label": "merge",
+        "target_kind": "local_tool",
+        "started_at": now,
+        "completed_at": now,
+        "duration_secs": 0.0,
+    }
+    record.record_stage(
+        StageLogEntry(
+            **common,
+            target_identifier="merge_deploy_offer",
+            status="GATED",
+            details={
+                "merge_offer": {
+                    "request_id": offer_id,
+                    "repo": REPO,
+                    "candidate_sha": candidate,
+                    "candidate_tree": candidate_tree,
+                }
+            },
+        )
+    )
+    record.record_stage(
+        StageLogEntry(
+            **common,
+            target_identifier="merge_deploy_decision",
+            status="PASSED",
+            details={
+                "merge_decision": {
+                    "request_id": offer_id,
+                    "decision": "approve",
+                    "execution_attempt_id": decision_id,
+                }
+            },
+        )
+    )
+    store = PublicationRecordStore(record.connection)
+    lease = store.take_lease(
+        build_id=build,
+        holder="record-answer-test",
+        now=now,
+        feature_id="record-answer-feature",
+        repo=REPO,
+        decided_by="owner",
+        target_branch="main",
+        starts_a_press=True,
+        attempt_id=decision_id,
+    )
+    assert lease is not None
+    assert store.record(
+        build_id=build,
+        turn=lease.turn,
+        now=now,
+        g_commit=target,
+        build_tip=candidate,
+        attempt=1,
+    )
+    assert store.done(
+        build_id=build,
+        turn=lease.turn,
+        now=now,
+        step=STEP_JOIN,
+        attempt=1,
+        result={"j_commit": joined, "verify_ok": True},
+        j_commit=joined,
+    )
+    selected = FirstDeploymentProfile(
+        version=1,
+        repo=REPO,
+        build=build,
+        offer_id=offer_id,
+        decision_id=decision_id,
+        candidate_commit=candidate,
+        candidate_tree=candidate_tree,
+        start_commit=start_commit,
+        target_commit=target,
+        joined_commit=joined,
+        joined_tree=joined_tree,
+        profile_sha256="6" * 64,
+        attempt=1,
+        candidate_cwd=str(candidate_cwd),
+    )
+    assert store.about_to(
+        build_id=build,
+        turn=lease.turn,
+        now=now,
+        step=STEP_CANDIDATE_CHECK,
+        attempt=1,
+        inputs={
+            "j_commit": joined,
+            "j_tree": joined_tree,
+            "candidate_cwd": str(candidate_cwd),
+            "first_deployment_profile": selected.to_wire(),
+        },
+    )
+    return (
+        {"selection": selected.to_wire(), "turn": lease.turn},
+        {
+            "repo": REPO,
+            "build": build,
+            "start_commit": start_commit,
+            "attempt": 1,
+            "turn": lease.turn,
+            "joined_commit": joined,
+            "joined_tree": joined_tree,
+            "candidate_cwd": str(candidate_cwd),
+        },
+    )
+
+
 # ---------------------------------------------------------------------------
 # The service itself
 # ---------------------------------------------------------------------------
@@ -165,6 +300,126 @@ class TestTheAnswerService:
             "recorded": True,
             "start_commit": commit,
         }
+
+    def test_it_confirms_the_current_profile_and_archive_from_one_read_only_snapshot(
+        self, record: SqliteLifecyclePersistence, tmp_path: Path
+    ) -> None:
+        start = "a" * 40
+        build = _a_build_starting_from(record, start)
+        cwd = tmp_path / ".forge-candidates" / "recorded"
+        expected_profile, expected_layout = _profile_authority(
+            record, build, start, cwd
+        )
+        answerer = TheCoordinatorsRecord(record.db_path)
+        statements: list[str] = []
+        original_connect = answerer._connect
+
+        def traced() -> sqlite3.Connection:
+            connection = original_connect()
+            connection.set_trace_callback(statements.append)
+            return connection
+
+        answerer._connect = traced  # type: ignore[method-assign]
+
+        answer = answerer.what_build_starts_from(build)
+
+        assert answer == {
+            "build": build,
+            "recorded": True,
+            "start_commit": start,
+            "first_deployment_profile": expected_profile,
+            "deployment_layout": expected_layout,
+        }
+        assert statements[0] == "BEGIN"
+        assert sum(statement == "BEGIN" for statement in statements) == 1
+        assert not any("INSERT" in statement or "UPDATE" in statement for statement in statements)
+
+    @pytest.mark.parametrize(
+        "break_authority",
+        ["missing-offer", "rejected-offer", "stale-attempt", "stale-turn", "cross-repo"],
+    )
+    def test_it_never_widens_a_build_from_incomplete_or_stale_authority(
+        self,
+        record: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        break_authority: str,
+    ) -> None:
+        start = "b" * 40
+        build = _a_build_starting_from(record, start)
+        _profile_authority(record, build, start, tmp_path / ".forge-candidates" / "one")
+        if break_authority == "missing-offer":
+            record.connection.execute(
+                "DELETE FROM stage_log WHERE build_id = ? AND target_identifier = ?",
+                (build, "merge_deploy_offer"),
+            )
+        elif break_authority == "rejected-offer":
+            record.connection.execute(
+                "UPDATE stage_log SET status = 'FAILED' WHERE build_id = ? "
+                "AND target_identifier = ?",
+                (build, "merge_deploy_decision"),
+            )
+        elif break_authority == "stale-attempt":
+            record.connection.execute(
+                "UPDATE publication_records SET attempt = 2 WHERE build_id = ?",
+                (build,),
+            )
+        elif break_authority == "stale-turn":
+            record.connection.execute(
+                "UPDATE publication_records SET turn = turn + 1 WHERE build_id = ?",
+                (build,),
+            )
+        else:
+            record.connection.execute(
+                "UPDATE builds SET repo = 'example/other' WHERE build_id = ?",
+                (build,),
+            )
+        record.connection.commit()
+
+        answer = TheCoordinatorsRecord(record.db_path).what_build_starts_from(build)
+
+        assert answer == {
+            "build": build,
+            "recorded": True,
+            "start_commit": start,
+        }
+
+    def test_landed_send_takeover_keeps_selection_with_only_the_current_turn(
+        self, record: SqliteLifecyclePersistence, tmp_path: Path
+    ) -> None:
+        start = "c" * 40
+        build = _a_build_starting_from(record, start)
+        expected, _layout = _profile_authority(
+            record, build, start, tmp_path / ".forge-candidates" / "takeover"
+        )
+        store = PublicationRecordStore(record.connection)
+        publication = store.read(build)
+        assert store.about_to(
+            build_id=build,
+            turn=publication.turn,
+            now=datetime.now(UTC),
+            step=STEP_SEND,
+            attempt=publication.attempt,
+            inputs={"j_commit": publication.j_commit, "target_branch": "main"},
+        )
+        record.connection.execute(
+            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+            ("2000-01-01T00:00:00+00:00", build),
+        )
+        record.connection.commit()
+        taken = store.take_lease(
+            build_id=build,
+            holder="replacement-press",
+            now=datetime.now(UTC),
+            starts_a_press=True,
+            attempt_id=expected["selection"]["decision_id"],
+        )
+        assert taken is not None and taken.turn == 2
+
+        answer = TheCoordinatorsRecord(record.db_path).what_build_starts_from(build)
+
+        assert answer["first_deployment_profile"]["selection"] == expected["selection"]
+        assert answer["first_deployment_profile"]["turn"] == taken.turn
+        assert answer["deployment_layout"]["turn"] == taken.turn
 
     def test_a_build_nobody_wrote_a_commit_for_says_so(
         self, record: SqliteLifecyclePersistence
