@@ -855,7 +855,8 @@ async def test_takeover_rechecks_identity_after_promote_response_is_lost(
     assert f"deploy-{checked_run}" in runbooks
     assert f"deploy-{takeover_run}" not in runbooks
     assert f"ask-{takeover_run}" in runbooks
-    assert f"teardown-cand-{takeover_run}" in runbooks
+    assert f"teardown-cand-{checked_run}" in runbooks
+    assert f"teardown-cand-{takeover_run}" not in runbooks
     first_questions = connection.execute(
         "SELECT status FROM runbook_steps WHERE runbook_id = ?",
         (f"ask-{checked_run}",),
@@ -871,6 +872,268 @@ async def test_takeover_rechecks_identity_after_promote_response_is_lost(
     assert [tuple(row) for row in first_questions] == [("passed",)]
     assert [tuple(row) for row in interrupted_promotes] == [("running", None)]
     assert [tuple(row) for row in recovery_questions] == [("passed",)]
+    ending = PublicationRecordStore(connection).read_outcome(build)
+    assert ending is not None
+    assert ending.outcome["cleanup_done"] is True
+    assert ending.outcome["candidate_may_stand"] is False
+    assert ending.outcome["leg_unanswered"] is False
+    assert ending.finished_at is not None
+    recorded = TheCoordinatorsRecord(db).what_build_starts_from(build)
+    assert "first_deployment_profile" not in recorded
+    assert "deployment_layout" not in recorded
+
+
+@pytest.mark.parametrize(
+    "boundary",
+    ("before-selection", "after-selection-before-dispatch", "during-candidate"),
+)
+@pytest.mark.asyncio
+async def test_first_profile_recovery_never_uses_partial_selection(
+    boundary: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo, bare, start, candidate, candidate_tree = _project(tmp_path)
+    allow_local_remotes(monkeypatch, tmp_path / "fetch-copies")
+    build = f"build-recover-{boundary}"
+    attempt_id = f"approved-recover-{boundary}"
+    db = tmp_path / f"recover-{boundary}.db"
+    connection: sqlite3.Connection = sqlite_connect.connect_writer(db)
+    migrations.apply_at_boot(connection)
+    pool = SqliteLifecyclePersistence(connection=connection, db_path=db)
+    _record_offer(
+        pool,
+        build=build,
+        feature=FEATURE,
+        start=start,
+        candidate=candidate,
+        tree=candidate_tree,
+        attempt_id=attempt_id,
+        offer_id=f"offer-recover-{boundary}",
+    )
+    runtime = _Runtime()
+    answer, helper, config, spawn = _services(
+        repo=repo, db=db, runtime=runtime, monkeypatch=monkeypatch, tmp_path=tmp_path
+    )
+    bus = _Bus()
+    real_publisher, checked = _publisher(db, repo, tmp_path, start, bare)
+    coordinator_copy = Path(config.planning.target_repo_paths[REPO])
+    publish_calls: list[dict[str, Any]] = []
+
+    async def publish(_config: Any, request: dict[str, Any]) -> dict[str, Any]:
+        publish_calls.append(dict(request))
+        return real_publisher.publish(request).to_wire()
+
+    real_dispatch = build_in_daemon_deploy_dispatcher(
+        config=config, nats_client=bus, db_path=db
+    )
+    candidate_dispatches: list[dict[str, Any]] = []
+    interrupted = False
+
+    async def dispatch(**kwargs: Any) -> Any:
+        nonlocal interrupted
+        if kwargs.get("leg") == "candidate_check":
+            candidate_dispatches.append(dict(kwargs))
+            if boundary == "after-selection-before-dispatch" and not interrupted:
+                interrupted = True
+                raise asyncio.CancelledError(
+                    "the press stopped after recording selection and before dispatch"
+                )
+        return await real_dispatch(**kwargs)
+
+    real_surface = compose_merge_git_surface(config)
+    assert real_surface is not None
+    git_proxy: Any | None = None
+
+    class _GitThatStopsBeforeSelection:
+        def __init__(self, actual: Any) -> None:
+            self.actual = actual
+
+        def __getattr__(self, name: str) -> Any:
+            return getattr(self.actual, name)
+
+        async def read_file_at_commit(
+            self, commit: str, file_path: str, *args: Any, **kwargs: Any
+        ) -> Any:
+            nonlocal interrupted
+            if (
+                boundary == "before-selection"
+                and not interrupted
+                and commit == start
+                and file_path == "deploy/profile.yaml"
+            ):
+                interrupted = True
+                raise asyncio.CancelledError(
+                    "the press stopped before selecting a deployment profile"
+                )
+            return await self.actual.read_file_at_commit(
+                commit, file_path, *args, **kwargs
+            )
+
+    def git_surface(repo_name: str, repo_root: Path) -> Any:
+        nonlocal git_proxy
+        actual = real_surface(repo_name, repo_root)
+        assert actual is not None
+        if git_proxy is None:
+            git_proxy = _GitThatStopsBeforeSelection(actual)
+        return git_proxy
+
+    real_urlopen = urllib.request.urlopen
+
+    def lose_the_candidate_response(request: Any, *args: Any, **kwargs: Any) -> Any:
+        nonlocal interrupted
+        raw = getattr(request, "data", None)
+        body: dict[str, Any] = {}
+        if isinstance(raw, bytes):
+            try:
+                decoded = json.loads(raw.decode("utf-8"))
+                body = decoded if isinstance(decoded, dict) else {}
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                body = {}
+        is_candidate = (
+            str(getattr(request, "full_url", "")).endswith("/run")
+            and isinstance(body.get("deploy"), dict)
+            and dict(body.get("env") or {}).get("CANDIDATE") == "1"
+        )
+        if boundary == "during-candidate" and is_candidate and not interrupted:
+            with real_urlopen(request, *args, **kwargs) as response:
+                response.read()
+            interrupted = True
+            raise asyncio.CancelledError(
+                "the candidate ran, but its HTTP response was lost with the press"
+            )
+        return real_urlopen(request, *args, **kwargs)
+
+    monkeypatch.setattr(urllib.request, "urlopen", lose_the_candidate_response)
+    deps = MergeExecutorDeps(
+        config=config,
+        pool=pool,
+        pipeline_publisher=_PipelineEvents(),
+        guardkit_run=_JoinsForReal(feature_id=FEATURE),
+        deploy_dispatcher=dispatch,
+        git_surface=git_surface,
+        publisher=publish,
+        what_the_machine_says=WhatTheMachineSays(
+            the_publisher_passed_its_self_check=True
+        ),
+        deployment_lock=lambda: DeploymentLockStore(connection),
+    )
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await execute_merge_deploy(
+                deps=deps,
+                build_id=build,
+                feature_id=FEATURE,
+                repo=REPO,
+                repo_root=coordinator_copy,
+                expect_main_sha=start,
+                correlation_id=f"corr-{build}",
+                decided_by="owner",
+                expected_candidate_sha=candidate,
+                expected_candidate_tree=candidate_tree,
+                merge_execution_attempt_id=attempt_id,
+            )
+        assert interrupted is True
+        store = PublicationRecordStore(connection)
+        before = store.read(build)
+        candidate_lines_before = [
+            line
+            for line in before.lines
+            if line.kind == "about to" and line.step == "candidate-check"
+        ]
+        expected_lines_before = 0 if boundary == "before-selection" else 1
+        assert len(candidate_lines_before) == expected_lines_before
+        before_selection = selection_from_record(before)
+        if boundary == "before-selection":
+            assert before_selection is None
+        else:
+            assert before_selection is not None
+            assert before_selection.attempt == 1
+            assert before_selection.candidate_commit == candidate
+        assert before.checked == {}
+        assert not [
+            line
+            for line in before.lines
+            if line.kind == "done" and line.step == "candidate-check"
+        ]
+        assert publish_calls == []
+        assert checked.sends == []
+        assert spawn.calls == []
+        candidate_script_calls_before = [
+            call
+            for call in runtime.script_calls
+            if dict(call.get("extra_env") or {}).get("CANDIDATE") == "1"
+        ]
+        assert len(candidate_script_calls_before) == int(boundary == "during-candidate")
+
+        connection.execute(
+            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+            ("2000-01-01T00:00:00+00:00", build),
+        )
+        connection.commit()
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=build,
+            feature_id=FEATURE,
+            repo=REPO,
+            repo_root=coordinator_copy,
+            expect_main_sha=start,
+            correlation_id=f"corr-{build}",
+            decided_by="owner",
+            expected_candidate_sha=candidate,
+            expected_candidate_tree=candidate_tree,
+            merge_execution_attempt_id=attempt_id,
+        )
+    finally:
+        helper.shutdown()
+        helper.server_close()
+        answer.shutdown()
+        answer.server_close()
+
+    assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+    assert len(publish_calls) == 1
+    assert checked.sends == [outcome.merged_sha]
+    after = PublicationRecordStore(connection).read(build)
+    assert after.turn == before.turn + 1
+    assert after.lease_holder is None
+    candidate_lines = [
+        line
+        for line in after.lines
+        if line.kind == "about to" and line.step == "candidate-check"
+    ]
+    assert len(candidate_lines) == expected_lines_before + 1
+    selected_wires = [line.detail["first_deployment_profile"] for line in candidate_lines]
+    assert all(selection == selected_wires[-1] for selection in selected_wires)
+    assert selected_wires[-1]["attempt"] == 1
+    assert selected_wires[-1]["candidate_commit"] == candidate
+    assert selected_wires[-1]["joined_commit"] == after.j_commit
+    deploy_run_ids = [str(line.detail["deploy_run_id"]) for line in candidate_lines]
+    assert len(set(deploy_run_ids)) == len(deploy_run_ids)
+    assert after.checked["deploy_run_id"] == deploy_run_ids[-1]
+    assert selection_from_record(after) is not None
+    assert selection_from_record(after).to_wire() == selected_wires[-1]
+    candidate_profile_turns = [
+        int(call["first_deployment_profile"]["turn"])
+        for call in candidate_dispatches
+    ]
+    assert candidate_profile_turns == (
+        [2] if boundary == "before-selection" else [1, 2]
+    )
+    assert all(
+        call["first_deployment_profile"]["selection"] == selected_wires[-1]
+        for call in candidate_dispatches
+    )
+    candidate_script_calls = [
+        call
+        for call in runtime.script_calls
+        if dict(call.get("extra_env") or {}).get("CANDIDATE") == "1"
+    ]
+    assert len(candidate_script_calls) == 1 + int(boundary == "during-candidate")
+    done_checks = [
+        line
+        for line in after.lines
+        if line.kind == "done" and line.step == "candidate-check"
+    ]
+    assert len(done_checks) == 1
+    assert done_checks[0].detail["deploy_run_id"] == deploy_run_ids[-1]
     ending = PublicationRecordStore(connection).read_outcome(build)
     assert ending is not None
     assert ending.outcome["cleanup_done"] is True
