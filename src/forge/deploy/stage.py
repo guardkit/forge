@@ -2254,6 +2254,33 @@ class DeployStageRunner:
             cwd_override=cwd,
         )
         try:
+            # A lost publication reply may already have taken this attempt's
+            # candidate down. A takeover reuses its run ID: acknowledge only
+            # the exact completed cleanup, never an arbitrary duplicate.
+            prior = self._repo.load_runbook(
+                teardown_runbook.runbook_id, correlation_id=correlation_id
+            )
+            if prior is not None:
+                expected = self._with_the_checkout(teardown_runbook)
+                same_inputs = (
+                    prior.target == expected.target
+                    and [(s.sequence_index, s.step_type, dict(s.params)) for s in prior.steps]
+                    == [(s.sequence_index, s.step_type, dict(s.params)) for s in expected.steps]
+                )
+                complete = (
+                    prior.status == "passed"
+                    and prior.current_step_index == len(prior.steps)
+                    and all(
+                        step.status == "passed" and step.result is not None
+                        and step.result.exit_code == 0
+                        and bool((step.result.payload or {}).get("dry_run")) == self._dry_run
+                        for step in prior.steps
+                    )
+                )
+                if same_inputs and complete:
+                    return True
+                logger.warning("candidate teardown has an unfinished or mismatched prior runbook; not repeated")
+                return False
             run_result = await self._run_runbook(teardown_runbook, correlation_id)
             if run_result.status != "complete":
                 # Say why, not just that. When the sidecar refused the request

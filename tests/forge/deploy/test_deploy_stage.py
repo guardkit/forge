@@ -159,6 +159,55 @@ def _profile_with_rollback(rollback_image_ref: str | None) -> Any:
     return parse_deploy_profile(raw)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("prior_kind", [
+    "complete", "pending", "failed", "target", "script", "cwd", "environment", "identity", "dry_run",
+])
+async def test_takeover_reuses_only_the_exact_completed_candidate_teardown(
+    repository, runbook_publisher, tmp_path, prior_kind,
+) -> None:
+    from dataclasses import replace
+
+    from forge.deploy.runbook_builder import build_candidate_teardown_runbook
+    from forge.persistence.repositories.runbook_models import StepResult, StepStatus
+
+    profile = parse_deploy_profile({
+        "env_id": "example-service",
+        "compose": {"file": "compose.yaml", "script": "deploy/run.sh"},
+        "candidate": {"env": {"CANDIDATE_PORT": "9001"}},
+    })
+    identity = {"RELEASE_IDENTITY": "checked-candidate"}
+    runner = _runner(repository, runbook_publisher, RecordingDeployPublisher(), tmp_path, dry_run=False)
+    prior = build_candidate_teardown_runbook(
+        profile, runbook_id="teardown-cand-attempt-one", target=profile.env_id,
+        extra_env={"CANDIDATE_DOWN": "1", **profile.candidate.env, **identity},
+        now=FIXED, cwd_override=str(tmp_path / "archive"),
+    )
+    step = prior.steps[0]
+    params = dict(step.params)
+    if prior_kind in ("script", "cwd"):
+        params[prior_kind] = "different-input"
+    elif prior_kind in ("environment", "identity"):
+        key = "RELEASE_IDENTITY" if prior_kind == "identity" else "CANDIDATE_PORT"
+        params["extra_env"] = {**params["extra_env"], key: "different-input"}
+    status = StepStatus.pending if prior_kind == "pending" else StepStatus.failed if prior_kind == "failed" else StepStatus.passed
+    prior = replace(
+        prior, target="different-target" if prior_kind == "target" else prior.target,
+        current_step_index=0 if prior_kind == "pending" else 1, status=status,
+        steps=(replace(step, params=params, status=status, result=StepResult(
+            exit_code=1 if prior_kind == "failed" else 0, captured_output="done",
+            started_at=FIXED, completed_at=FIXED, payload={"dry_run": prior_kind == "dry_run"},
+        )),),
+    )
+    repository.create_runbook(prior, correlation_id="first-press")
+    runner._run_runbook = AsyncMock(side_effect=AssertionError("a recorded cleanup must not run twice"))
+    assert await runner._teardown_candidate(
+        profile, correlation_id="takeover", deploy_run_id="attempt-one",
+        identity_env=identity, cwd=str(tmp_path / "archive"),
+    ) is (prior_kind == "complete")
+    runner._run_runbook.assert_not_awaited()
+
+
 # ---------------------------------------------------------------------------
 # THE GATE: dry-run of the fleet-memory exemplar profile
 # ---------------------------------------------------------------------------
