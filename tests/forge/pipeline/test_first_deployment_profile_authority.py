@@ -312,6 +312,7 @@ def _config(repo: Path, db: Path, helper_url: str) -> ForgeConfig:
             "publication": {
                 "enabled": True,
                 "publisher_url": "http://127.0.0.1:1",
+                "builds_may_run_inside_the_coordinator": False,
                 "publisher_credential_file": str(db.with_suffix(".credential")),
             },
         }
