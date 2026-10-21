@@ -2351,14 +2351,18 @@ class TestTheSameMergeThroughTheSidecar:
 
     @staticmethod
     def _normalise(receipt: dict[str, Any]) -> dict[str, Any]:
-        """Take out the three things that cannot be equal across two runs: how
-        long each took, when each finished, and the newline a real command
+        """Take out execution IDs, timing, and the newline a real command
         prints at the end of its report where a fake in-process one does not.
         Everything else — the report, the sha, the counts, the outcome — is
         compared exactly."""
         cleaned = dict(receipt)
         for key in ("duration_secs", "completed_at"):
             cleaned.pop(key, None)
+        if isinstance(cleaned.get("checked"), dict):
+            cleaned["checked"] = {
+                key: value for key, value in cleaned["checked"].items()
+                if key != "deploy_run_id"
+            }
         if isinstance(cleaned.get("stdout_tail"), str):
             cleaned["stdout_tail"] = cleaned["stdout_tail"].strip()
         return cleaned
