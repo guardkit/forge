@@ -2236,6 +2236,8 @@ def _driver_archive_sources(
     Absolute runtime and data paths outside the project are ordinary argv.
     Registered-clone paths cannot substitute for the selected archive.
     Inline commands remain bound by the exact committed driver declaration.
+    Only exact Git entries are checked here; indirect sources reached through
+    linked directories retain the existing sandbox-trust limit.
     """
     sources: list[str] = []
     for token in argv:
@@ -2503,10 +2505,14 @@ def _process_run_request_impl(
                 f"planning.target_repo_paths. Known keys: {known}"
             )
         }
-    try:
-        repo_path = Path(paths[repo]).resolve()
-    except (OSError, RuntimeError) as exc:
-        return 400, {"error": f"the registered repository could not be resolved: {exc}"}
+    repo_path = Path(paths[repo])
+    # Journey worktree creation and the conductor retain this configured path
+    # spelling. Only deployment authority uses the canonical checkout root.
+    if payload.get("declared_test") is None:
+        try:
+            repo_path = repo_path.resolve()
+        except (OSError, RuntimeError) as exc:
+            return 400, {"error": f"the registered repository could not be resolved: {exc}"}
 
     in_sandbox = (
         sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox)

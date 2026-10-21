@@ -1367,7 +1367,6 @@ def test_symlinked_registered_root_preserves_ordinary_commands(
 ) -> None:
     actual = tmp_path / "projects" / "service"
     (actual / ".guardkit").mkdir(parents=True)
-    (actual / ".forge" / "worktrees" / "journey-one").mkdir(parents=True)
     _write_profile(actual, _minimal_profile())
     (actual / ".guardkit" / "config.yaml").write_text(
         "toolchain:\n  test: python -m pytest -q\n  test_timeout: 60\n",
@@ -1385,7 +1384,7 @@ def test_symlinked_registered_root_preserves_ordinary_commands(
         test_timeout = 60
 
     def load_toolchain_declaration(root: Path) -> _Declaration:
-        assert root == actual.resolve()
+        assert root == registered
         return _Declaration()
 
     loader.load_toolchain_declaration = load_toolchain_declaration  # type: ignore[attr-defined]
@@ -1400,32 +1399,53 @@ def test_symlinked_registered_root_preserves_ordinary_commands(
     payload: dict[str, Any] = {"repo": "example/service"}
     if route == "deploy":
         payload["script"] = "deploy.sh"
+        status, body = process_run_request(
+            payload, config=config, script_runner=runner, inside_sandbox=True,
+        )
     else:
-        payload.update({
-            "declared_test": "python -m pytest -q",
-            "cwd": str(actual / ".forge" / "worktrees" / "journey-one"),
-            "by_hand": True,
-        })
+        from types import SimpleNamespace
 
-    status, body = process_run_request(
-        payload,
-        config=config,
-        script_runner=runner,
-        command_runner=runner,
-        inside_sandbox=True,
-    )
+        from forge.cli._serve_conductor import run_declared_command_in_sandbox
+
+        cut_status, cut = service.process_git_worktree_add_request(
+            {"repo": "example/service", "leaf": "journey-one",
+             "branch": "journey-one", "base_ref": "main"},
+            config=config,
+        )
+        assert cut_status == 200 and cut["status"] == "success", cut
+        assert cut["path"] == str(registered / ".forge" / "worktrees" / "journey-one")
+        replies = []
+
+        def post(_url: str, request: dict[str, Any], _timeout: float):
+            assert request["cwd"] == cut["path"]
+            reply = process_run_request(
+                request, config=config, command_runner=runner, inside_sandbox=True,
+            )
+            replies.append(reply)
+            return reply
+
+        exit_code, detail = run_declared_command_in_sandbox(
+            command="python -m pytest -q", cwd=cut["path"], timeout_seconds=60,
+            sandbox=SimpleNamespace(name="generic", sidecar_url="http://helper.invalid"),
+            repo="example/service", post=post, by_hand=True,
+        )
+        assert exit_code == 0, detail
+        assert len(replies) == 1
+        status, body = replies[0]
 
     assert status == 200, body
     assert len(runner.calls) == 1
-    assert runner.calls[0]["repository"] == str(actual.resolve())
     if route == "deploy":
+        assert runner.calls[0]["repository"] == str(actual.resolve())
         assert runner.calls[0]["script"] == "deploy.sh"
         assert body["cwd"] == str(actual.resolve())
     else:
+        assert runner.calls[0]["repository"] == str(registered)
         assert runner.calls[0]["argv"] == [
             "/bin/sh", "-c", "python -m pytest -q",
         ]
-        assert body["cwd"] == str(actual / ".forge" / "worktrees" / "journey-one")
+        assert runner.calls[0]["cwd"] == cut["path"]
+        assert body["cwd"] == cut["path"]
 
 
 @pytest.mark.parametrize(
