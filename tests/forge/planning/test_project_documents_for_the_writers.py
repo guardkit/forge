@@ -17,8 +17,8 @@ What these hold down:
 * a re-drive reuses what was recorded and reads nothing again;
 * a missing document, a symbolic-link document and documents over the budget
   stop the run at the door with a plain sentence, with nothing dispatched;
-* a project that declares nothing has nothing read and nothing sent: the calls
-  are what they always were;
+* a project that declares nothing has no project documents read or sent;
+  its writers still receive the separate factory interface reference;
 * the generic dispatcher keeps ``context`` on the wire.
 
 Nobody's real repository, broker, model or sandbox is contacted: the git
@@ -36,6 +36,8 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+
+from forge.planning.factory_deployment_context import load_bundled_document
 
 from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.adapters.sqlite import connect as sqlite_connect
@@ -961,6 +963,7 @@ async def test_both_writers_get_the_documents_on_every_call_and_say_so(
         f"File: {DECLARED[0]}\n{MISSION_V1}",
         f"File: {DECLARED[1]}\n{TECH_V1}",
     ]
+    expected.append(load_bundled_document().text)
     first, rewrite = h.calls["spec"]
     assert first["context"] == expected
     assert rewrite["validate_feedback"] == "the second example should be a 404"
@@ -1007,7 +1010,7 @@ async def test_both_writers_get_the_documents_on_every_call_and_say_so(
 
 
 @pytest.mark.asyncio
-async def test_a_project_that_declares_nothing_sends_what_it_always_sent(
+async def test_a_project_that_declares_nothing_gets_only_factory_context(
     chain_store: SqlitePlanningRunStore,
 ) -> None:
     tree = _Tree(
@@ -1019,7 +1022,8 @@ async def test_a_project_that_declares_nothing_sends_what_it_always_sent(
     await h.driver.drive(door.CID)
 
     assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert all("context" not in call for call in h.calls["spec"] + h.calls["plan"])
+    assert all(call["context"] == [load_bundled_document().text]
+               for call in h.calls["spec"] + h.calls["plan"])
     # Only the settings file was read: not even the instruction file.
     assert [path for _c, path, _o in tree.reads] == [".guardkit/config.yaml"] * len(
         tree.reads
@@ -1128,7 +1132,8 @@ async def test_an_unknown_player_key_without_documents_is_not_refused(
     await h.driver.drive(door.CID)
 
     assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert all("context" not in call for call in h.calls["spec"] + h.calls["plan"])
+    assert all(call["context"] == [load_bundled_document().text]
+               for call in h.calls["spec"] + h.calls["plan"])
 
 
 @pytest.mark.asyncio
@@ -1150,7 +1155,8 @@ async def test_a_run_past_the_door_before_documents_were_read_says_so_once(
         await h.driver.drive(door.CID)
 
     assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert all("context" not in call for call in h.calls["spec"] + h.calls["plan"])
+    assert all(call["context"] == [load_bundled_document().text]
+               for call in h.calls["spec"] + h.calls["plan"])
     assert not any(raw for _c, _p, raw in tree.reads)
     said = [r for r in caplog.records if "has no project documents recorded" in r.getMessage()]
     assert len(said) == 1

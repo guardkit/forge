@@ -36,6 +36,8 @@ from typing import Any
 
 import pytest
 
+from forge.planning.factory_deployment_context import load_bundled_document
+
 from forge.planning import nothing_to_build
 from forge.planning.code_evidence import MAX_REFERENCE_WINDOWS
 from forge.planning.declared_memory import (
@@ -547,6 +549,7 @@ async def test_named_reference_files_reach_both_writers_on_every_call(
         f"{REFERENCE_FILE_HEADING}\nFile: reference/briefs/gadgets.md\n"
         "# Gadgets screen\n\nNewest first.\n",
     ]
+    expected.append(load_bundled_document().text)
     assert [call["context"] for call in h.calls["spec"]] == [expected, expected]
     assert [call["context"] for call in h.calls["plan"]] == [expected]
     # Recorded once, at the door, before anything was asked of a model.
@@ -572,7 +575,8 @@ async def test_a_request_naming_no_reference_file_sends_todays_call(
     await h.driver.drive(door.CID)
 
     assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert all("context" not in call for call in h.calls["spec"] + h.calls["plan"])
+    assert all(call["context"] == [load_bundled_document().text]
+               for call in h.calls["spec"] + h.calls["plan"])
     (recorded,) = _events(chain_store, REFERENCE_STAGE)
     assert recorded["reference_material"]["files"] == []
     (plan_row,) = _events(chain_store, "feature-plan")
@@ -590,7 +594,8 @@ async def test_a_project_without_the_setting_is_planned_as_before(
     await h.driver.drive(door.CID)
 
     assert chain_store.get_run(door.CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert all("context" not in call for call in h.calls["spec"] + h.calls["plan"])
+    assert all(call["context"] == [load_bundled_document().text]
+               for call in h.calls["spec"] + h.calls["plan"])
     assert _events(chain_store, REFERENCE_STAGE) == []
     assert [path for _c, path, _r in tree.reads] == [".guardkit/config.yaml"] * len(tree.reads)
     assert set(seen["descriptor"]) == {()}

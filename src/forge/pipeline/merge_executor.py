@@ -2008,6 +2008,20 @@ def _report_sha(report: dict[str, Any] | None) -> str | None:
 DEPLOY_PROFILE_PATH: str = "deploy/profile.yaml"
 
 
+def first_deployment_profile_is_usable(profile: Any) -> bool:
+    """The existing first-deployment declaration check, shared with contract tests.
+
+    Loader acceptance alone does not supply a candidate or an identity query.
+    Approval, source identity and execution checks remain the caller's work.
+    """
+    identity = declared_identity(profile)
+    return not (
+        profile.candidate is None or profile.live_gate is None
+        or not profile.live_gate.driver or not identity.declared
+        or not identity.asked_with
+    )
+
+
 def _the_profile_at(repo_root: Path | str, commit: str | None) -> tuple[Any, str | None]:
     """A project's deploy profile AS IT IS AT ``commit``, and why not if not.
 
@@ -3332,10 +3346,7 @@ async def execute_merge_deploy(
         profile, why = _the_profile_out_of(candidate, candidate_commit)
         if profile is None:
             raise ValueError(why)
-        identity = declared_identity(profile)
-        if (profile.candidate is None or profile.live_gate is None
-                or not profile.live_gate.driver or not identity.declared
-                or not identity.asked_with):
+        if not first_deployment_profile_is_usable(profile):
             raise ValueError("the first deployment profile needs a candidate, live driver and verified deployment identity")
         first_profile = FirstDeploymentProfile.from_wire({
             "version": 1, "repo": repo, "build": build_id,

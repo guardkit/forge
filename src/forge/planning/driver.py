@@ -94,6 +94,10 @@ from forge.planning.declared_memory import (
     read_declared_project_documents,
     read_declared_reference,
 )
+from forge.planning.factory_deployment_context import (
+    ensure_factory_context,
+    record_factory_dispatch,
+)
 from forge.planning.project_documents import (
     ProjectDocument,
     context_texts,
@@ -877,9 +881,10 @@ On a REWRITE round the two optional arguments carry the owner's note VERBATIM
 (``validate_feedback``) and the prior artifact set (``revision_of``). A
 first-round dispatch passes neither.
 
-``context`` (4 October 2026) is passed, on every call, only for a project that
-declares binding documents: the texts the door recorded, each after one line
-naming its path. A project that declares none is called without it."""
+``context`` carries the recorded project and reference documents in their
+existing order, followed by the immutable factory deployment interface for new
+runs. Legacy runs retain their original context. Every rewrite uses the same
+recorded bytes."""
 
 DispatchFeaturePlanFn = Callable[..., Awaitable[Any]]
 """``async (*, plan_run_id, correlation_id, feature_id, spec_feature,
@@ -3650,6 +3655,9 @@ class PlanningRunDriver:
         terminal failure.
         """
         deps = self._deps
+        _factory_document, broken = ensure_factory_context(deps.store, correlation_id)
+        if broken is not None:
+            return await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
         if self._has_leg_event(correlation_id, _FEATURE_SPEC_STAGE):
             return self._advance_after_spec(correlation_id)
 
@@ -3935,8 +3943,8 @@ class PlanningRunDriver:
         )
 
         # The project's documents, exactly as the door recorded them, on EVERY
-        # spec call, rewrites included. Sent only when there are some, so a
-        # project that declares none sends the call it always sent.
+        # spec call, rewrites included. The separate factory reference follows
+        # these and the target's reference files.
         documents, broken = self._recorded_project_documents(correlation_id)
         if broken is not None:
             await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
@@ -3949,7 +3957,13 @@ class PlanningRunDriver:
             await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
             return None
         reference_files = reference.files if reference is not None else ()
+        factory_document, broken = ensure_factory_context(deps.store, correlation_id)
+        if broken is not None:
+            await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
+            return None
         texts = context_texts(documents) + reference_context_texts(reference_files)
+        if factory_document is not None:
+            texts.append(factory_document.context_text())
         project_context: dict[str, Any] = {"context": texts} if texts else {}
         # What the repository already has where the request's words and
         # quoted examples appear (17 October 2026, FEAT-15DD): the same
@@ -3962,6 +3976,7 @@ class PlanningRunDriver:
             project_context["code_evidence"] = code_evidence
 
         try:
+            record_factory_dispatch(deps.store, correlation_id, factory_document, stage="spec")
             result = await deps.dispatch_feature_spec(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
@@ -4264,6 +4279,8 @@ class PlanningRunDriver:
             "assumption_count": len(digest_obj.get("assumptions") or []),
             "cycle": len(notes) + 1,
         }
+        if factory_document is not None:
+            draft["factory_context"] = factory_document.receipt()
         if documents:
             # Which files, which versions, were given to the spec writer.
             draft["project_documents"] = self._project_documents_receipt(documents)
@@ -6886,10 +6903,9 @@ class PlanningRunDriver:
         )
 
         # The project's documents, exactly as the door recorded them — the same
-        # texts the spec writer was given — on every plan call. Sent only when
-        # there are some: a project that declares none sends the call it always
-        # sent. An older plan writer ignores the field, so the receipt says
-        # "sent", not "used".
+        # texts the spec writer was given — on every plan call. The factory
+        # interface follows the target-owned documents. The receipt says
+        # "sent", never that the model used the evidence correctly.
         documents, broken = self._recorded_project_documents(correlation_id)
         if broken is not None:
             await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
@@ -6898,9 +6914,15 @@ class PlanningRunDriver:
         if broken is not None:
             await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
             return None
+        factory_document, broken = ensure_factory_context(self._deps.store, correlation_id)
+        if broken is not None:
+            await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
+            return None
         texts = context_texts(documents) + reference_context_texts(
             reference.files if reference is not None else ()
         )
+        if factory_document is not None:
+            texts.append(factory_document.context_text())
 
         async def _ask_the_plan_writer(
             *, note: str | None = None, prior: Mapping[str, str] | None = None
@@ -6924,6 +6946,7 @@ class PlanningRunDriver:
             # re-review must judge the same shape). Off, the call is today's.
             if self._nothing_to_build_enabled():
                 extra[nothing_to_build.REQUEST_FIELD] = True
+            record_factory_dispatch(deps.store, correlation_id, factory_document, stage="plan")
             return await deps.dispatch_feature_plan(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
@@ -8239,6 +8262,11 @@ class PlanningRunDriver:
             "branch": branch,
             "sha": attempt.sha,
         }
+        factory_document, broken = ensure_factory_context(deps.store, correlation_id)
+        if broken is not None:
+            return await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
+        if factory_document is not None:
+            details["factory_context"] = factory_document.receipt()
         if stamp_receipt is not None:
             details["stamp_normalizer"] = stamp_receipt
         if semantic_review is not None:
