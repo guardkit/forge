@@ -409,6 +409,7 @@ def _assert_project_legs_ran_from_selected_archive(
     candidate_cwd: str,
     checked: dict[str, Any],
     reverted: bool,
+    candidate_checks: int = 1,
 ) -> None:
     calls = _script_calls_at(runtime, candidate_cwd)
 
@@ -448,8 +449,8 @@ def _assert_project_legs_ran_from_selected_archive(
         if call.get("script") == "deploy/deploy.sh"
         and (call.get("extra_env") or {}).get("REVERT") == "1"
     ]
-    assert len(candidate_deploy) == 1
-    assert len(candidate_health) == 1
+    assert len(candidate_deploy) == candidate_checks
+    assert len(candidate_health) == candidate_checks
     assert len(running_queries) == 1
     assert len(live_health) == 1
     assert len(candidate_down) == 1
@@ -462,11 +463,12 @@ def _assert_project_legs_ran_from_selected_archive(
         for call in runtime.gate_calls
         if str(call.get("cwd") or "") == candidate_cwd
     ]
-    assert len(gates) == 2
-    assert gates[0]["argv"][-1] == "qa/live_gate.py"
-    assert gates[0]["extra_env"]["CANDIDATE_PORT"] == "8902"
-    assert gates[1]["argv"][-1] == "qa/live_gate.py"
-    assert "CANDIDATE_PORT" not in (gates[1].get("extra_env") or {})
+    assert len(gates) == candidate_checks + 1
+    for gate in gates[:candidate_checks]:
+        assert "qa/live_gate.py" in gate["argv"]
+        assert gate["extra_env"]["CANDIDATE_PORT"] == "8902"
+    assert "qa/live_gate.py" in gates[-1]["argv"]
+    assert "CANDIDATE_PORT" not in (gates[-1].get("extra_env") or {})
 
     promotes = [
         call
@@ -614,6 +616,7 @@ async def test_first_profile_survives_rejoin_and_landed_send_takeover(
         candidate_cwd=before_selection.candidate_cwd,
         checked=before.checked,
         reverted=False,
+        candidate_checks=2,
     )
     assert bus.messages
     after = PublicationRecordStore(connection).read(BUILD)
