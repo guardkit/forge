@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import io
+import sys
 import threading
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 import pytest
@@ -1361,7 +1363,7 @@ def test_clone_profile_symlinks_never_count_as_absence(
 
 @pytest.mark.parametrize("route", ["deploy", "declared-test"])
 def test_symlinked_registered_root_preserves_ordinary_commands(
-    tmp_path: Path, route: str,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, route: str,
 ) -> None:
     actual = tmp_path / "projects" / "service"
     (actual / ".guardkit").mkdir(parents=True)
@@ -1375,6 +1377,21 @@ def test_symlinked_registered_root_preserves_ordinary_commands(
     registered = tmp_path / "registered-service"
     registered.symlink_to(actual, target_is_directory=True)
     config = _config({"example/service": str(registered)})
+
+    loader = ModuleType(service.TOOLCHAIN_MODULE_CANDIDATES[0])
+
+    class _Declaration:
+        test = "python -m pytest -q"
+        test_timeout = 60
+
+    def load_toolchain_declaration(root: Path) -> _Declaration:
+        assert root == actual.resolve()
+        return _Declaration()
+
+    loader.load_toolchain_declaration = load_toolchain_declaration  # type: ignore[attr-defined]
+    monkeypatch.setitem(
+        sys.modules, service.TOOLCHAIN_MODULE_CANDIDATES[0], loader,
+    )
     runner = _RecordingRunner(
         (0, "declared output", "")
         if route == "declared-test"

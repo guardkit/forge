@@ -337,6 +337,7 @@ def test_selected_driver_allows_nonsource_and_generated_arguments(
     )
 
     payload = selected.payload("driver")
+    payload["driver"] = driver
     status, body = selected.run(payload)
 
     assert status == 200, body
