@@ -2231,14 +2231,14 @@ def _same_archive_source(
 def _driver_archive_sources(
     repo_path: Path, archive: Path, commit: str, argv: Sequence[str]
 ) -> tuple[list[str], str | None]:
-    """Find project files by their Git/disk identity, not a language suffix.
+    """Find directly named committed files, not directories or generated outputs.
 
-    The executable in argv[0] may be an absolute runtime binary. Other
-    absolute/escaping paths cannot introduce sources outside the archive.
+    Absolute runtime and data paths outside the project are ordinary argv.
+    Registered-clone paths cannot substitute for the selected archive.
     Inline commands remain bound by the exact committed driver declaration.
     """
     sources: list[str] = []
-    for index, token in enumerate(argv):
+    for token in argv:
         if token.startswith("-"):
             _option, equals, token = token.partition("=")
             if not equals:
@@ -2248,12 +2248,14 @@ def _driver_archive_sources(
             if path.is_relative_to(archive):
                 token = path.relative_to(archive).as_posix()
                 path = Path(token)
-                # This is a directly named project executable, even at argv[0].
-                sources.append(token)
+            else:
+                try:
+                    outside = path.resolve()
+                except (OSError, RuntimeError) as exc:
+                    return [], f"the live driver path cannot be checked: {exc}"
+                if outside.is_relative_to(repo_path):
+                    return [], "the live driver names a source outside the candidate archive"
                 continue
-            if index == 0 and not path.is_relative_to(repo_path):
-                continue  # An installed runtime binary, outside the project.
-            return [], "the live driver names a source outside the candidate archive"
         if ".." in path.parts:
             return [], "the live driver names a source outside the candidate archive"
         if not token or token in (".", ".."):
@@ -2261,8 +2263,7 @@ def _driver_archive_sources(
         answer = read_file_at_commit_sync(repo_path, commit, path.as_posix(), raw=True)
         if answer.refusal:
             return [], answer.refusal
-        actual = archive / path
-        if answer.found or answer.mode is not None or actual.exists() or actual.is_symlink():
+        if answer.mode in ("100644", "100755", "120000"):
             sources.append(token)
     return sources, None
 
@@ -2273,6 +2274,10 @@ def _first_profile_precheck(
     """Confirm the exact selection before any profile becomes executable."""
     from forge.deploy.candidate_tree import git_rev_parse
 
+    try:
+        repo_path = repo_path.resolve()
+    except (OSError, RuntimeError) as exc:
+        return None, None, f"the registered repository could not be resolved: {exc}"
     raw_ref = payload.get("first_deployment_profile")
     try:
         selected, _turn = parse_profile_reference(raw_ref)
@@ -2498,7 +2503,10 @@ def _process_run_request_impl(
                 f"planning.target_repo_paths. Known keys: {known}"
             )
         }
-    repo_path = Path(paths[repo])
+    try:
+        repo_path = Path(paths[repo]).resolve()
+    except (OSError, RuntimeError) as exc:
+        return 400, {"error": f"the registered repository could not be resolved: {exc}"}
 
     in_sandbox = (
         sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox)
@@ -2538,15 +2546,22 @@ def _process_run_request_impl(
     # A registered checkout may remain stale after publication. A missing
     # profile in that checkout is a special factory path, never by-hand
     # authority and never a reason to read implicit HEAD.
-    try:
-        if profile_path.resolve() != profile_path:
-            return 400, {"error": "the registered profile path contains a symbolic link; nothing was started"}
-        profile_path.lstat()
-        clone_profile_missing = False
-    except FileNotFoundError:
-        clone_profile_missing = True
-    except (OSError, RuntimeError) as exc:
-        return 400, {"error": f"the registered profile could not be inspected: {exc}"}
+    clone_profile_missing = False
+    if payload.get("declared_test") is None:
+        try:
+            # Preserve usable present-profile behavior. Selection and absence
+            # need a stricter check, confined below the canonical checkout root.
+            if selected_profile is not None or not profile_path.is_file():
+                component = repo_path
+                for part in Path(PROFILE_PATH).parts:
+                    component = component / part
+                    component.lstat()
+                    if component.is_symlink():
+                        return 400, {"error": "the registered profile path contains a symbolic link; nothing was started"}
+        except FileNotFoundError:
+            clone_profile_missing = True
+        except (OSError, RuntimeError) as exc:
+            return 400, {"error": f"the registered profile could not be inspected: {exc}"}
     if clone_profile_missing and selected_profile is None and payload.get("declared_test") is None:
         if not isinstance(payload.get("build"), str) or not payload["build"].strip() or payload.get("by_hand") is True:
             return 400, {"error": "target repo is not deployable: a missing registered profile needs a confirmed factory build; nothing was started"}
