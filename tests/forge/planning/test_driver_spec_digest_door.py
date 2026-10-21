@@ -4306,14 +4306,19 @@ async def test_an_example_that_quotes_a_project_document_is_not_flagged(
     monkeypatch.setattr(
         h.driver, "_recorded_project_documents", lambda correlation_id: ((document,), None)
     )
-    # The writer is sent the document; this stand-in writer takes no context.
+    # The writer sees the project document first, then the factory reference.
+    from forge.planning.factory_deployment_context import load_bundled_document
+
     dispatch = h.driver._deps.dispatch_feature_spec
 
-    async def without_context(**kwargs: Any) -> Any:
-        assert kwargs.pop("context") == [f"File: docs/rules.md\n{document.text}"]
+    async def with_recorded_context(**kwargs: Any) -> Any:
+        assert kwargs["context"] == [
+            f"File: docs/rules.md\n{document.text}",
+            load_bundled_document().context_text(),
+        ]
         return await dispatch(**kwargs)
 
-    monkeypatch.setattr(h.driver._deps, "dispatch_feature_spec", without_context)
+    monkeypatch.setattr(h.driver._deps, "dispatch_feature_spec", with_recorded_context)
     await h.driver.drive(CID)
 
     assert len(h.ctx["dispatches"]) == 1
