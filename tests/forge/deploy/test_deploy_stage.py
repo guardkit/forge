@@ -193,7 +193,7 @@ async def test_takeover_reuses_only_the_exact_completed_candidate_teardown(
     status = StepStatus.pending if prior_kind == "pending" else StepStatus.failed if prior_kind == "failed" else StepStatus.passed
     prior = replace(
         prior, target="different-target" if prior_kind == "target" else prior.target,
-        current_step_index=0 if prior_kind == "pending" else 1, status=status,
+        current_step_index=0 if prior_kind == "pending" else 1, status=StepStatus.pending,
         steps=(replace(step, params=params, status=status, result=StepResult(
             exit_code=1 if prior_kind == "failed" else 0, captured_output="done",
             started_at=FIXED, completed_at=FIXED, payload={"dry_run": prior_kind == "dry_run"},

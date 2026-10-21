@@ -2268,8 +2268,9 @@ class DeployStageRunner:
                     == [(s.sequence_index, s.step_type, dict(s.params)) for s in expected.steps]
                 )
                 complete = (
-                    prior.status == "passed"
-                    and prior.current_step_index == len(prior.steps)
+                    # The executor marks completion by advancing past all
+                    # passed steps; it does not update runbooks.status.
+                    prior.current_step_index == len(prior.steps)
                     and all(
                         step.status == "passed" and step.result is not None
                         and step.result.exit_code == 0
