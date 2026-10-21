@@ -139,6 +139,32 @@ _QUANTIFIED = re.compile(
 #: the noun ("days") comes after the number.
 _NUMBER_THEN_NOUN = re.compile(r"\s+\d+\s+[A-Za-z]")
 
+#: Instructions about the plan Forge is about to produce are not claims about
+#: members already in the target repository. Keep these grammars deliberately
+#: complete and narrow: an unfamiliar variation remains a repository-set
+#: candidate. Named groups contain only the quantified object, ending at its
+#: head noun; the broader ``_QUANTIFIED`` match may also capture ``to`` or
+#: ``and`` after that noun.
+_PLAN_LIMIT_NUMBER = r"(?:[1-9][0-9]*|one|two|three|four|five|six|seven|eight)"
+_PLAN_SIZING_INSTRUCTION = re.compile(
+    r"(?:^|(?<=[.!?;:,]))\s*(?:keep|limit)\s+"
+    r"(?P<planned_tasks>(?:all|every|each)\s+"
+    r"(?:(?:of\s+)?(?:the\s+|its\s+|our\s+)?)?planned\s+tasks?)\s+to\s+"
+    rf"{_PLAN_LIMIT_NUMBER}\s+or\s+fewer\s+acceptance\s+criteria"
+    r"(?:\s*,\s*(?:preserve|preserving)\s+"
+    r"(?P<requested_requirements>every\s+requested\s+requirements?)\s+"
+    r"and\s+leaving\s+room\s+below\s+the\s+factory\s+limit\s+of\s+"
+    rf"{_PLAN_LIMIT_NUMBER}(?=\s*(?:[.!?;:]|$)))?"
+    r"(?=\s*(?:,|[.!?;:]|$))",
+    re.IGNORECASE,
+)
+_AUTOMATIC_VERIFICATION_INSTRUCTION = re.compile(
+    r"(?:^|(?<=[.!?;:,]))\s*complete\s+"
+    r"(?P<verification>all\s+verification)\s+automatically"
+    r"(?:\s+within\s+the\s+factory)?(?=\s*(?:[.!?;:]|$))",
+    re.IGNORECASE,
+)
+
 #: The factory's own records that neither the set search nor the evidence
 #: windows ever show, beside the folders the driver already leaves out of
 #: every repository read: the pass bars the planner itself writes.
@@ -1173,6 +1199,26 @@ def _add_scenario_tests(
 # ---------------------------------------------------------------------------
 
 
+def _instruction_only_set_spans(request_text: str) -> tuple[tuple[int, int], ...]:
+    """Quantified-object spans that describe work or future plan output.
+
+    Every span begins at its quantifier and ends at its head noun. This is
+    intentionally narrower than ``_QUANTIFIED``, whose base grammar captures
+    as many as three object words and can therefore include a following
+    ``to`` or ``and``.
+    """
+    spans: list[tuple[int, int]] = []
+    for pattern, group_names in (
+        (_PLAN_SIZING_INSTRUCTION, ("planned_tasks", "requested_requirements")),
+        (_AUTOMATIC_VERIFICATION_INSTRUCTION, ("verification",)),
+    ):
+        for instruction in pattern.finditer(request_text):
+            for group_name in group_names:
+                if instruction.start(group_name) >= 0:
+                    spans.append(instruction.span(group_name))
+    return tuple(sorted(spans))
+
+
 def quantified_phrases(request_text: str) -> list[tuple[str, str, list[str]]]:
     """``[(phrase, search word, the phrase's own words)]``, at most two.
 
@@ -1181,15 +1227,26 @@ def quantified_phrases(request_text: str) -> list[tuple[str, str, list[str]]]:
     phrase cut short before its noun by a number ("each of the last 7 days")
     names no set of things in the repository and is left out.
     """
+    text = request_text or ""
+    instruction_only = _instruction_only_set_spans(text)
     found: list[tuple[str, str, list[str]]] = []
-    for match in _QUANTIFIED.finditer(request_text or ""):
+    for match in _QUANTIFIED.finditer(text):
+        # The instruction spans stop at the quantified object's head noun,
+        # while this match may continue through a following preposition or
+        # conjunction. Compare the quantifier position and that explicit
+        # object end rather than requiring the whole broad match to fit.
+        if any(
+            match.start(1) == object_start and object_end <= match.end()
+            for object_start, object_end in instruction_only
+        ):
+            continue
         # The noun comes after a number ("the last 7 days"): the phrase was
         # cut before its noun. A phrase that already ends in a plural noun
         # ("all active users 30 days after") or is followed by something
         # other than a number and a word ("2x faster") keeps its set.
         last_word = match.group(2).split()[-1].lower()
         ends_in_a_plural = _singular(last_word) != last_word
-        if _NUMBER_THEN_NOUN.match(request_text[match.end() :]) and not ends_in_a_plural:
+        if _NUMBER_THEN_NOUN.match(text[match.end() :]) and not ends_in_a_plural:
             continue
         phrase = " ".join(match.group(0).split())
         first = _singular(match.group(2).split()[0])

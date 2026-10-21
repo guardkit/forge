@@ -1107,6 +1107,98 @@ def test_a_phrase_stopped_short_by_a_number_is_not_a_set() -> None:
     ) == []
 
 
+def test_plan_sizing_objects_do_not_consume_repository_set_slots() -> None:
+    request = (
+        "All existing tests must still pass. Keep each planned task to five or fewer "
+        "acceptance criteria, preserving every requested requirement and leaving room "
+        "below the factory limit of eight."
+    )
+
+    assert quantified_phrases(request) == [
+        (
+            "All existing tests must",
+            "existing",
+            ["all", "existing", "tests", "must"],
+        )
+    ]
+
+    sizing_first = (
+        "Keep each planned task to 5 or fewer acceptance criteria, preserve every "
+        "requested requirement and leaving room below the factory limit of 8. "
+        "All existing tests must pass. Every registered handler must remain available."
+    )
+    assert [(phrase, word) for phrase, word, _ in quantified_phrases(sizing_first)] == [
+        ("All existing tests must", "existing"),
+        ("Every registered handler must", "registered"),
+    ]
+
+
+def test_plan_sizing_excludes_only_its_quantified_object_spans() -> None:
+    adjacent = (
+        "Keep each planned task to four or fewer acceptance criteria, and all existing "
+        "tests must pass."
+    )
+    assert [phrase for phrase, _, _ in quantified_phrases(adjacent)] == [
+        "all existing tests must"
+    ]
+
+    located_requirement = (
+        "Limit every planned task to three or fewer acceptance criteria, preserving "
+        "every requested requirement in requirements.yaml and leaving room below the "
+        "factory limit of six."
+    )
+    assert [phrase for phrase, _, _ in quantified_phrases(located_requirement)] == [
+        "every requested requirement in"
+    ]
+
+
+def test_only_the_complete_bare_verification_activity_is_not_a_set() -> None:
+    assert quantified_phrases("Complete all verification automatically.") == []
+    assert quantified_phrases(
+        "Complete all verification automatically within the factory."
+    ) == []
+
+    assert quantified_phrases("Run all existing tests automatically.")[0][:2] == (
+        "all existing tests automatically",
+        "existing",
+    )
+    assert quantified_phrases("Run all verification scripts automatically.")[0][:2] == (
+        "all verification scripts automatically",
+        "verification",
+    )
+
+
+def test_stored_and_unrecognized_planning_objects_remain_sets() -> None:
+    stored = quantified_phrases(
+        "Audit every planned task in the stored backlog. Check every requested "
+        "requirement in requirements.yaml."
+    )
+    assert [(phrase, word) for phrase, word, _ in stored] == [
+        ("every planned task in", "planned"),
+        ("every requested requirement in", "requested"),
+    ]
+
+    bare = quantified_phrases(
+        "Review every planned task. Review every requested requirement."
+    )
+    assert [(phrase, word) for phrase, word, _ in bare] == [
+        ("every planned task", "planned"),
+        ("every requested requirement", "requested"),
+    ]
+
+    unfamiliar = (
+        "Please keep each planned task to five or fewer acceptance criteria. "
+        "Keep every planned task to zero or fewer acceptance criteria."
+    )
+    assert [(phrase, word) for phrase, word, _ in quantified_phrases(unfamiliar)] == [
+        ("each planned task to", "planned"),
+        ("every planned task to", "planned"),
+    ]
+    assert quantified_phrases(
+        "Complete all verification automatically from stored jobs."
+    )[0][:2] == ("all verification automatically from", "verification")
+
+
 #: A project implemented in a declarations file: the set's word and the
 #: request's other words sit on separate lines.
 ROUTES_YAML = (
@@ -1180,6 +1272,28 @@ class _FakeSetReader:
     def read_text(self, path):
         self.reads += 1
         return self.files.get(path)
+
+
+def test_a_real_set_with_zero_hits_survives_beside_plan_instructions() -> None:
+    request = (
+        "All existing tests must still pass. Keep each planned task to five or fewer "
+        "acceptance criteria, preserving every requested requirement and leaving room "
+        "below the factory limit of eight."
+    )
+
+    sets = PlanningRunDriver._sets_the_request_names(request, reader=_FakeSetReader({}))
+
+    assert sets == [
+        {
+            "phrase": "All existing tests must",
+            "looked_for": "existing",
+            "candidates": [],
+            "listed": 0,
+            "matched": 0,
+            "listed_all": True,
+            "listed_all_means": LISTED_ALL_MEANS,
+        }
+    ]
 
 
 def test_a_cut_search_is_never_listed_all() -> None:

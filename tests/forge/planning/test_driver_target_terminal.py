@@ -49,6 +49,7 @@ from forge.gating.identity import derive_request_id
 from forge.lifecycle import migrations
 from forge.planning import driver as driver_module
 from forge.planning import repository_facts as repository_facts_module
+from forge.planning.code_evidence import LISTED_ALL_MEANS
 from forge.planning.driver import (
     BuildTriggerResult,
     PlanningDriverDeps,
@@ -8090,6 +8091,48 @@ async def test_the_plan_leg_is_sent_the_sentence_and_the_fact_sheet(
     }
     assert wire["request_text"] == "add a GET /stats endpoint"
     assert wire["repository_facts"] == facts
+
+
+@pytest.mark.asyncio
+async def test_plan_instructions_do_not_become_sets_on_the_real_plan_dispatch(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    request = (
+        "All existing tests must still pass. Keep each planned task to five or fewer "
+        "acceptance criteria, preserving every requested requirement and leaving room "
+        "below the factory limit of eight."
+    )
+    repo = tmp_path / "sample_project"
+    _init_scratch_repo(repo)
+    git = _recorded_runner(tmp_path / "wt", repo)
+    store.record_queued(
+        correlation_id=CID,
+        originating_user=ORIGINATOR,
+        expected_approver=ORIGINATOR,
+        request_text=request,
+        triggered_by="jarvis",
+        target_repo=TARGET_REPO,
+    )
+    h = _make_driver(store, git_runner=git, repo_path=str(repo))
+
+    await h.driver.drive(CID)
+
+    counters = h.ctx["counters"]
+    descriptor = counters["last_descriptor"]
+    wire = counters["last_plan_wire_args"]
+    assert wire["request_text"] == request
+    assert wire["target_repo_descriptor"] == descriptor
+    assert descriptor["sets_the_request_names"] == [
+        {
+            "phrase": "All existing tests must",
+            "looked_for": "existing",
+            "candidates": [],
+            "listed": 0,
+            "matched": 0,
+            "listed_all": True,
+            "listed_all_means": LISTED_ALL_MEANS,
+        }
+    ]
 
 
 @pytest.mark.asyncio
