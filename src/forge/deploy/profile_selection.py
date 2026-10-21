@@ -171,7 +171,9 @@ def confirmed_deployment_layout(connection: Any, build: str, start_commit: str) 
             or outcome.turn != record.turn or outcome.finished_at):
         raise ValueError("the deployment layout has no active publication")
     offer, decision = read_profile_approval(connection, build)
-    if (offer.get("repo") != record.repo or offer.get("candidate_sha") != record.build_tip
+    row = connection.execute("SELECT repo, start_commit FROM builds WHERE build_id = ?", (build,)).fetchone()
+    if (row is None or row[0] != record.repo or row[1] != start_commit
+            or offer.get("repo") != record.repo or offer.get("candidate_sha") != record.build_tip
             or decision.get("execution_attempt_id") != outcome.attempt_id):
         raise ValueError("the deployment layout no longer matches the approved publication")
     detail = lines[-1].detail
