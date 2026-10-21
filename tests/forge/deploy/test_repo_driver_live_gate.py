@@ -15,7 +15,9 @@ from pathlib import Path
 
 import pytest
 
-from forge.deploy.live_gate import LiveGateInvocation, RepoDriverLiveGateInvoker
+from forge.deploy.live_gate import (
+    LiveGateInvocation, RepoDriverLiveGateInvoker, SidecarLiveGateInvoker,
+)
 
 
 def _write_driver(tmp_path: Path, body: str) -> list[str]:
@@ -482,3 +484,74 @@ def _tmp_path_is_a_checkout(tmp_path):
     _subprocess.run(
         ["git", "init", "-q", str(tmp_path)], check=True, capture_output=True
     )
+
+
+def test_selected_live_gate_requires_fresh_capability_and_response_echo(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import urllib.request
+
+    reference = {
+        "selection": {
+            "version": 1, "repo": "example/service", "build": "build-one",
+            "offer_id": "offer-one", "decision_id": "decision-one",
+            "candidate_commit": "a" * 40, "candidate_tree": "b" * 40,
+            "start_commit": "c" * 40, "target_commit": "c" * 40,
+            "joined_commit": "d" * 40, "joined_tree": "e" * 40,
+            "profile_sha256": "f" * 64, "attempt": 1,
+            "candidate_cwd": str(tmp_path / ".forge-candidates" / "selection"),
+        },
+        "turn": 1,
+    }
+    sent: list[str] = []
+
+    class _Response:
+        def __init__(self, body: dict[str, object]) -> None:
+            self.body = body
+
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *_args: object) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self.body).encode()
+
+    def _answer(request: object, *, timeout: float) -> _Response:
+        url = request.full_url
+        sent.append(url)
+        if url.endswith("/healthz"):
+            return _Response({"status": "healthy", "instance": "one"})
+        raise AssertionError("an old helper must receive no selected command")
+
+    monkeypatch.setattr(urllib.request, "urlopen", _answer)
+    gate = SidecarLiveGateInvoker(
+        base_url="http://127.0.0.1:1", repo="example/service",
+        repo_path=Path(reference["selection"]["candidate_cwd"]),
+        driver_argv=["python3", "qa/driver.py"],
+        first_deployment_profile=reference,
+    )
+    refused = gate.invoke(feature="generic", target="candidate")
+    assert refused.confirmed and refused.verdict == "instrument_fail"
+    assert sent == ["http://127.0.0.1:1/healthz"]
+
+    sent.clear()
+
+    def _unattested(request: object, *, timeout: float) -> _Response:
+        url = request.full_url
+        sent.append(url)
+        if url.endswith("/healthz"):
+            return _Response({
+                "status": "healthy", "instance": "one",
+                "capabilities": ["first_deployment_profile_v1"],
+            })
+        return _Response({
+            "exit_code": 0, "stdout": "{}", "stderr_tail": "",
+            "cwd": reference["selection"]["candidate_cwd"],
+        })
+
+    monkeypatch.setattr(urllib.request, "urlopen", _unattested)
+    uncertain = gate.invoke(feature="generic", target="candidate")
+    assert uncertain.answer_lost and not uncertain.confirmed
+    assert sent == ["http://127.0.0.1:1/healthz", "http://127.0.0.1:1/run"]

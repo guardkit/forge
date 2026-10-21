@@ -137,6 +137,7 @@ def build_deploy_stage_runner(
     #: like, and the whole point is to tell the two apart.
     by_hand: bool = False,
     launch_settings: tuple[str, ...] = (),
+    first_deployment_profile: dict[str, Any] | None = None,
 ) -> DeployStageRunner | None:
     """Compose the deploy-stage runner, gated on ``config.enabled``.
 
@@ -201,6 +202,7 @@ def build_deploy_stage_runner(
         start_commit=start_commit,
         by_hand=by_hand,
         launch_settings=tuple(launch_settings),
+        **({"first_deployment_profile": first_deployment_profile} if first_deployment_profile is not None else {}),
     )
 
 
@@ -264,6 +266,7 @@ async def dispatch_deploy_stage(
     identity_env: dict[str, str] | None = None,
     ask_env: dict[str, str] | None = None,
     issued_env: Any = None,
+    first_deployment_profile: dict[str, Any] | None = None,
 ) -> DeployStageResult | None:
     """Dispatch one DEPLOY (+ optional LIVE_GATE) stage through the runner.
 
@@ -328,6 +331,7 @@ async def dispatch_deploy_stage(
         # THE BUILD'S DECLARED SETTING NAMES, for every step that runs the
         # project's own scripts (14 October 2026) — not only the compose step.
         launch_settings=tuple(launch_settings),
+        **({"first_deployment_profile": first_deployment_profile} if first_deployment_profile is not None else {}),
     )
     if runner is None:
         # Flag OFF — no dispatch. Byte-for-byte no-op.

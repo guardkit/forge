@@ -881,6 +881,7 @@ class SidecarLiveGateInvoker:
         by_hand: bool = False,
         journey_evidence: bool = False,
         issued_env: dict[str, str] | None = None,
+        first_deployment_profile: dict[str, Any] | None = None,
     ) -> None:
         self._journey_evidence = bool(journey_evidence)
         # THE VALUES THE REVIEW PREVIEW ISSUED (13 October 2026), kept apart
@@ -911,6 +912,7 @@ class SidecarLiveGateInvoker:
         self._build = str(build or "").strip() or None
         self._start_commit = str(start_commit or "").strip() or None
         self._by_hand = bool(by_hand)
+        self._first_deployment_profile = first_deployment_profile
 
     @property
     def repo_path(self) -> Path:
@@ -943,6 +945,7 @@ class SidecarLiveGateInvoker:
             "by_hand": self._by_hand,
             "journey_evidence": self._journey_evidence,
             "issued_env": dict(self._issued_env),
+            "first_deployment_profile": self._first_deployment_profile,
         }
         fields.update(changes)
         return SidecarLiveGateInvoker(**fields)
@@ -1032,6 +1035,21 @@ class SidecarLiveGateInvoker:
                 },
             )
 
+        helper_instance: str | None = None
+        if self._first_deployment_profile is not None:
+            from forge.deploy.profile_selection import parse_profile_reference
+            from forge.deploy.sidecar_runner import probe_first_deployment_helper
+
+            try:
+                parse_profile_reference(self._first_deployment_profile)
+            except ValueError as exc:
+                return _instrument(str(exc))
+            helper_instance, refusal = probe_first_deployment_helper(self._base_url)
+            if refusal is not None:
+                return _instrument(refusal)
+            body["first_deployment_profile"] = self._first_deployment_profile
+            body["helper_instance"] = helper_instance
+
         request = urllib.request.Request(
             url,
             data=json.dumps(body).encode("utf-8"),
@@ -1047,6 +1065,7 @@ class SidecarLiveGateInvoker:
             # October 2026, Codex R5); anything else is no answer. A body that
             # says the driver was stopped at its time limit is read first.
             from forge.deploy.sidecar_runner import (
+                first_deployment_answer_matches,
                 refusal_sentence_in,
                 says_it_timed_out,
                 sidecar_error_payload,
@@ -1062,6 +1081,11 @@ class SidecarLiveGateInvoker:
                 )
             # Only a 4xx is a refusal before running; any 5xx is no answer.
             sentence = refusal_sentence_in(payload) if 400 <= exc.code < 500 else None
+            if sentence is not None and helper_instance is not None and not first_deployment_answer_matches(
+                payload, instance=helper_instance,
+                reference=self._first_deployment_profile, refusal=True,
+            ):
+                sentence = None
             if sentence is None:
                 return _instrument(
                     f"the deploy sidecar at {self._base_url} answered HTTP "
@@ -1108,6 +1132,16 @@ class SidecarLiveGateInvoker:
                     ),
                 },
             )
+        if helper_instance is not None:
+            from forge.deploy.sidecar_runner import first_deployment_answer_matches
+
+            if not first_deployment_answer_matches(
+                answer, instance=helper_instance, reference=self._first_deployment_profile
+            ):
+                return _instrument(
+                    "the deploy helper did not confirm the selected profile and instance",
+                    answer_lost=True,
+                )
         if not isinstance(answer, dict) or not isinstance(
             answer.get("exit_code"), int
         ) or isinstance(answer.get("exit_code"), bool):

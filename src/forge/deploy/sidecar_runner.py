@@ -38,6 +38,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
+from typing import Any
 
 from forge.deploy.candidate_tree import CANDIDATE_TREES_DIRNAME
 from forge.executor.shell_steps import Finished, TimedOut
@@ -51,6 +52,47 @@ SIDECAR_TRANSPORT_EXIT_CODE = 1
 
 #: The owned deploy executor's result words: lowercase words joined by dashes.
 _EXECUTOR_WORD = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+FIRST_DEPLOYMENT_CAPABILITY = "first_deployment_profile_v1"
+
+
+def probe_first_deployment_helper(base_url: str) -> tuple[str | None, str | None]:
+    """Confirm selection support immediately before sending a command."""
+    try:
+        request = urllib.request.Request(f"{base_url}/healthz", method="GET")
+        with urllib.request.urlopen(request, timeout=5.0) as response:
+            answer = json.loads(response.read().decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001 — no command was sent
+        return None, f"the deploy helper capability could not be checked: {exc}"
+    if not isinstance(answer, dict) or answer.get("status") != "healthy":
+        return None, "the deploy helper did not report healthy status"
+    instance = answer.get("instance")
+    capabilities = answer.get("capabilities")
+    if not isinstance(instance, str) or not instance.strip():
+        return None, "the deploy helper did not report its instance"
+    if not isinstance(capabilities, list) or FIRST_DEPLOYMENT_CAPABILITY not in capabilities:
+        return None, "the deploy helper does not support first deployment profiles"
+    return instance, None
+
+
+def first_deployment_answer_matches(
+    answer: object, *, instance: str, reference: dict[str, Any], refusal: bool = False
+) -> bool:
+    """Accept only an exact echo from the helper instance that was probed."""
+    if not isinstance(answer, dict) or answer.get("helper_instance") != instance:
+        return False
+    def _same_wire(left: object, right: object) -> bool:
+        try:
+            return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(
+                right, sort_keys=True, allow_nan=False
+            )
+        except (TypeError, ValueError):
+            return False
+    if refusal:
+        return (
+            answer.get("execution_started") is False
+            and _same_wire(answer.get("requested_first_deployment_profile"), reference)
+        )
+    return _same_wire(answer.get("first_deployment_profile"), reference)
 
 
 class NoAnswer(tuple):
@@ -99,6 +141,7 @@ class SidecarScriptRunner:
         start_commit: str | None = None,
         by_hand: bool = False,
         http_timeout_margin: float = 30.0,
+        first_deployment_profile: dict[str, Any] | None = None,
     ):
         self._base_url = base_url.rstrip("/")
         self._repo = repo
@@ -135,6 +178,7 @@ class SidecarScriptRunner:
         # The HTTP read wall is the script timeout plus a margin, so the socket
         # does not trip before the sidecar's own subprocess timeout fires.
         self._http_timeout_margin = http_timeout_margin
+        self._first_deployment_profile = first_deployment_profile
 
     def __call__(
         self,
@@ -197,6 +241,19 @@ class SidecarScriptRunner:
             # The sidecar decides: a candidate tree is honoured, anything else
             # is ignored in favour of the profile's own working directory.
             body["cwd"] = cwd
+        helper_instance: str | None = None
+        if self._first_deployment_profile is not None:
+            from forge.deploy.profile_selection import parse_profile_reference
+
+            try:
+                parse_profile_reference(self._first_deployment_profile)
+            except ValueError as exc:
+                return Finished(SIDECAR_TRANSPORT_EXIT_CODE, str(exc))
+            helper_instance, refusal = probe_first_deployment_helper(self._base_url)
+            if refusal is not None:
+                return Finished(SIDECAR_TRANSPORT_EXIT_CODE, refusal)
+            body["first_deployment_profile"] = self._first_deployment_profile
+            body["helper_instance"] = helper_instance
         data = json.dumps(body).encode("utf-8")
         request = urllib.request.Request(
             f"{self._base_url}/run",
@@ -226,6 +283,11 @@ class SidecarScriptRunner:
             # Only a refusal BEFORE running is an answer, and only a 4xx is
             # one: any 5xx, whatever its body, is no answer (15 October 2026).
             detail = refusal_sentence_in(payload) if 400 <= exc.code < 500 else None
+            if detail is not None and helper_instance is not None and not first_deployment_answer_matches(
+                payload, instance=helper_instance,
+                reference=self._first_deployment_profile, refusal=True,
+            ):
+                detail = None
             if detail is None:
                 return NoAnswer(
                     f"sidecar answered HTTP {exc.code} with no refusal it "
@@ -253,6 +315,10 @@ class SidecarScriptRunner:
                 code = SIDECAR_TRANSPORT_EXIT_CODE
             tail = parsed.get("output_tail", "")
             return TimedOut(code, tail if isinstance(tail, str) else str(tail))
+        if helper_instance is not None and not first_deployment_answer_matches(
+            parsed, instance=helper_instance, reference=self._first_deployment_profile
+        ):
+            return NoAnswer("the deploy helper did not confirm the selected profile and instance")
         if not isinstance(parsed, dict) or "exit_code" not in parsed:
             return NoAnswer(f"sidecar response missing exit_code: {parsed!r}")
         # A DEPLOY THE EXECUTOR REFUSED is not a script that went red and not a

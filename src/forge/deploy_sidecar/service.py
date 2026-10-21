@@ -194,6 +194,7 @@ import ast
 import asyncio
 import concurrent.futures
 import contextlib
+import hashlib
 import importlib.util
 import json
 import logging
@@ -218,7 +219,12 @@ import yaml
 from forge.adapters.guardkit.context_resolver import resolve_context_flags
 from forge.config.loader import load_config
 from forge.config.models import ForgeConfig
-from forge.deploy.candidate_tree import candidate_trees_root, is_candidate_tree_path
+from forge.deploy.candidate_tree import (
+    candidate_trees_root,
+    is_candidate_tree_path,
+    read_file_at_commit_sync,
+)
+from forge.deploy.profile_selection import parse_profile_reference
 from forge.deploy.profile import (
     DeployProfile,
     DeployProfileError,
@@ -2180,6 +2186,135 @@ def process_declared_test_run(
     }
 
 
+def _selection_file(
+    repo_path: Path, commit: str, name: str
+) -> tuple[str | None, str | None]:
+    """Read an ordinary committed source file, distinguishing absence from errors."""
+    answer = read_file_at_commit_sync(repo_path, commit, name, raw=True)
+    if answer.refusal:
+        return None, answer.refusal
+    if not answer.found or not answer.ordinary or answer.content is None:
+        return None, f"{name} is not an ordinary file at {commit}"
+    return answer.content, None
+
+
+def _same_selection_wire(left: object, right: object) -> bool:
+    try:
+        return json.dumps(left, sort_keys=True, allow_nan=False) == json.dumps(
+            right, sort_keys=True, allow_nan=False
+        )
+    except (TypeError, ValueError):
+        return False
+
+
+def _same_archive_source(
+    repo_path: Path, archive: Path, commit: str, name: str
+) -> str | None:
+    """A directly named executable source must equal the checked Git blob."""
+    relative = Path(name)
+    if relative.is_absolute() or not relative.parts or ".." in relative.parts:
+        return f"executable source {name!r} is outside the selected archive"
+    actual = archive / relative
+    try:
+        if actual.resolve() != actual or not actual.is_file():
+            return f"executable source {name!r} is missing or links elsewhere"
+        expected, refusal = _selection_file(repo_path, commit, relative.as_posix())
+        if refusal:
+            return refusal
+        if actual.read_bytes() != expected.encode("utf-8"):
+            return f"executable source {name!r} differs from the joined commit"
+    except OSError as exc:
+        return f"executable source {name!r} cannot be checked: {exc}"
+    return None
+
+
+def _first_profile_precheck(
+    payload: dict[str, Any], repo_path: Path, *, inside_sandbox: bool
+) -> tuple[DeployProfile | None, Mapping[str, Any] | None, str | None]:
+    """Confirm the exact selection before any profile becomes executable."""
+    from forge.deploy.candidate_tree import git_rev_parse
+
+    raw_ref = payload.get("first_deployment_profile")
+    try:
+        selected, _turn = parse_profile_reference(raw_ref)
+    except ValueError as exc:
+        return None, None, str(exc)
+    if not inside_sandbox:
+        return None, None, "a first deployment profile runs only inside its sandbox"
+    if payload.get("helper_instance") != HELPER_INSTANCE:
+        return None, None, "the helper instance changed before the command arrived"
+    if payload.get("repo") != selected.repo or payload.get("build") != selected.build:
+        return None, None, "the selected repository or build differs from this request"
+    if payload.get("declared_at") != selected.start_commit:
+        return None, None, "the selected build start differs from this request"
+    if payload.get("by_hand") is True or payload.get("declared_test") is not None:
+        return None, None, "this first deployment selection is only for factory deployment"
+    cwd, cwd_error = _resolve_requested_cwd(repo_path, payload.get("cwd"))
+    if cwd_error or cwd is None or str(cwd) != selected.candidate_cwd:
+        return None, None, cwd_error or "the requested archive is not the selected candidate archive"
+    asker = coordinator_recorded_build()
+    if not callable(asker):
+        return None, None, "the coordinator's recorded answer is unavailable"
+    try:
+        answer = asker(selected.build)
+    except Exception as exc:  # noqa: BLE001 — uncertain authority is a refusal
+        return None, None, f"the coordinator's recorded answer could not be read: {exc}"
+    if not isinstance(answer, Mapping):
+        return None, None, "the coordinator gave no recorded deployment authority"
+    if (
+        answer.get("build") != selected.build
+        or answer.get(RECORDED_START_KEY) != selected.start_commit
+        or not _same_selection_wire(answer.get("first_deployment_profile"), raw_ref)
+    ):
+        return None, None, "the coordinator did not confirm this exact deployment profile and current turn"
+    for commit, tree in (
+        (selected.candidate_commit, selected.candidate_tree),
+        (selected.joined_commit, selected.joined_tree),
+    ):
+        try:
+            actual = _run_coroutine(git_rev_parse(repo_path, f"{commit}^{{tree}}"))
+        except Exception:  # noqa: BLE001 — unverifiable tree identity
+            actual = None
+        if actual != tree:
+            return None, None, "the selected commit and tree do not match"
+    for commit in (selected.start_commit, selected.target_commit):
+        absent = read_file_at_commit_sync(repo_path, commit, PROFILE_PATH, raw=True)
+        if absent.refusal or absent.found or absent.mode is not None:
+            return None, None, "the first profile was not provably absent at build start and target"
+    candidate, refusal = _selection_file(repo_path, selected.candidate_commit, PROFILE_PATH)
+    if refusal:
+        return None, None, refusal
+    joined, refusal = _selection_file(repo_path, selected.joined_commit, PROFILE_PATH)
+    if refusal or candidate != joined or hashlib.sha256(candidate.encode("utf-8")).hexdigest() != selected.profile_sha256:
+        return None, None, refusal or "the selected profile differs from the approved candidate or digest"
+    disk = cwd / PROFILE_PATH
+    try:
+        if disk.resolve() != disk or not disk.is_file() or disk.read_bytes() != joined.encode("utf-8"):
+            return None, None, "the archive profile differs from the selected committed profile"
+        profile = load_deploy_profile(disk)
+    except (OSError, DeployProfileError) as exc:
+        return None, None, f"the archive profile cannot be used: {exc}"
+    sources = set()
+    if payload.get("driver") is not None:
+        if profile.live_gate is not None:
+            sources.update(
+                token for token in profile.live_gate.driver
+                if _looks_like_script_path(token)
+            )
+        if not sources:
+            return None, None, "the selected live gate names no driver source file"
+    else:
+        script = payload.get("script")
+        if not isinstance(script, str) or not _looks_like_script_path(script):
+            return None, None, "the selected deployment names no direct script source file"
+        sources.add(script)
+    for name in sources:
+        refusal = _same_archive_source(repo_path, cwd, selected.joined_commit, name)
+        if refusal:
+            return None, None, refusal
+    return profile, answer, None
+
+
 def process_run_request(
     payload: Any,
     *,
@@ -2188,6 +2323,57 @@ def process_run_request(
     command_runner: "MergeRunner | None" = None,
     inside_sandbox: bool | None = None,
     deploy_executor: "DeployExecutor | None" = None,
+) -> tuple[int, dict[str, Any]]:
+    """Run a command after resolving optional first-profile authority."""
+    selected_profile = None
+    recorded_answer = None
+    raw_ref = payload.get("first_deployment_profile") if isinstance(payload, dict) else None
+    has_reference = isinstance(payload, dict) and "first_deployment_profile" in payload
+    if has_reference:
+        repo = payload.get("repo")
+        paths = config.planning.target_repo_paths
+        if not isinstance(repo, str) or repo not in paths:
+            refusal = "the selected repository is not registered"
+        else:
+            selected_profile, recorded_answer, refusal = _first_profile_precheck(
+                payload,
+                Path(paths[repo]),
+                inside_sandbox=sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox),
+            )
+        if refusal:
+            return 400, {
+                "error": refusal,
+                "helper_instance": HELPER_INSTANCE,
+                "requested_first_deployment_profile": raw_ref,
+                "execution_started": False,
+            }
+    status, body = _process_run_request_impl(
+        payload, config=config, script_runner=script_runner,
+        command_runner=command_runner, inside_sandbox=inside_sandbox,
+        deploy_executor=deploy_executor, selected_profile=selected_profile,
+        recorded_answer=recorded_answer,
+    )
+    if has_reference:
+        body = dict(body)
+        body["helper_instance"] = HELPER_INSTANCE
+        if status < 400:
+            body["first_deployment_profile"] = raw_ref
+        elif status < 500:
+            body["requested_first_deployment_profile"] = raw_ref
+            body["execution_started"] = False
+    return status, body
+
+
+def _process_run_request_impl(
+    payload: Any,
+    *,
+    config: ForgeConfig,
+    script_runner: ScriptRunner = _run_script_step,
+    command_runner: "MergeRunner | None" = None,
+    inside_sandbox: bool | None = None,
+    deploy_executor: "DeployExecutor | None" = None,
+    selected_profile: DeployProfile | None = None,
+    recorded_answer: Mapping[str, Any] | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate + execute a ``/run`` payload; return ``(http_status, body)``.
 
@@ -2303,10 +2489,59 @@ def process_run_request(
     asks_the_project_to_widen = isinstance(raw_env, dict) and any(
         str(key) not in ENV_ALLOWLIST_BASE for key in raw_env
     )
+    profile_path = repo_path / PROFILE_PATH
+    # A registered checkout may remain stale after publication. A missing
+    # profile in that checkout is a special factory path, never by-hand
+    # authority and never a reason to read implicit HEAD.
+    try:
+        profile_path.lstat()
+        clone_profile_missing = False
+    except FileNotFoundError:
+        clone_profile_missing = True
+    except OSError as exc:
+        return 400, {"error": f"the registered profile could not be inspected: {exc}"}
+    if clone_profile_missing and selected_profile is None and payload.get("declared_test") is None:
+        if not isinstance(payload.get("build"), str) or not payload["build"].strip() or payload.get("by_hand") is True:
+            return 400, {"error": "target repo is not deployable: a missing registered profile needs a confirmed factory build; nothing was started"}
+        candidate_cwd, candidate_error = _resolve_requested_cwd(repo_path, payload.get("cwd"))
+        if candidate_error or candidate_cwd is None:
+            return 400, {"error": candidate_error or "a missing registered profile needs a confirmed candidate archive; nothing was started"}
+        asker = coordinator_recorded_build()
+        if not callable(asker):
+            return 400, {"error": "the coordinator's recorded answer is unavailable; nothing was started"}
+        try:
+            recorded_answer = asker(payload["build"])
+        except Exception as exc:  # noqa: BLE001 — no authority on read failure
+            return 400, {"error": f"the coordinator's recorded answer could not be read: {exc}; nothing was started"}
+        layout = recorded_answer.get("deployment_layout") if isinstance(recorded_answer, Mapping) else None
+        if not isinstance(layout, Mapping) or (
+            layout.get("repo") != repo
+            or layout.get("build") != payload["build"]
+            or layout.get("start_commit") != recorded_answer.get(RECORDED_START_KEY)
+            or layout.get("start_commit") != payload.get("declared_at")
+            or layout.get("candidate_cwd") != str(candidate_cwd)
+            or type(layout.get("attempt")) is not int or layout["attempt"] < 1
+            or type(layout.get("turn")) is not int or layout["turn"] < 1
+        ):
+            return 400, {"error": "the coordinator did not confirm this build's candidate archive; nothing was started"}
+        joined_commit = layout.get("joined_commit")
+        joined_tree = layout.get("joined_tree")
+        if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value)
+                   for value in (joined_commit, joined_tree)):
+            return 400, {"error": "the coordinator's joined identity is invalid; nothing was started"}
+        from forge.deploy.candidate_tree import git_rev_parse
+
+        try:
+            actual_tree = _run_coroutine(git_rev_parse(repo_path, f"{joined_commit}^{{tree}}"))
+        except Exception:  # noqa: BLE001 — unverifiable archive authority
+            actual_tree = None
+        if actual_tree != joined_tree:
+            return 400, {"error": "the coordinator's joined commit and tree do not match; nothing was started"}
     launch_memory, launch_names, launch_error, bound_at = _launch_fields(
         payload,
         repo_path=repo_path,
         repo=repo,
+        ask=(lambda _build: recorded_answer) if recorded_answer is not None else FROM_THIS_SERVICES_SETTINGS,
         reads_declaration=(
             payload.get("deploy") is not None
             or asks_the_project_to_widen
@@ -2314,6 +2549,8 @@ def process_run_request(
             # committed profile switches the preview on, so a request that
             # carries them asks for that declaration to be read too.
             or payload.get("issued_env") is not None
+            or clone_profile_missing
+            or selected_profile is not None
         ),
     )
     if launch_error is not None:
@@ -2335,6 +2572,37 @@ def process_run_request(
     # make the program committed. That is a different question from "what may
     # a request name", which is the one this reader answers.
     committed_profile, _ = profile_at_commit(repo_path, bound_at)
+    if selected_profile is not None:
+        committed_profile = selected_profile
+    elif clone_profile_missing and payload.get("declared_test") is None:
+        if bound_at is None:
+            return 400, {"error": "the confirmed build start has no usable deployment profile; nothing was started"}
+        source, source_error = _selection_file(repo_path, bound_at, PROFILE_PATH)
+        if source_error:
+            return 400, {"error": f"the confirmed build start profile cannot be used: {source_error}; nothing was started"}
+        try:
+            committed_profile = parse_deploy_profile(
+                yaml.safe_load(source) or {}, source_ref=PROFILE_PATH
+            )
+        except Exception as exc:  # noqa: BLE001 — invalid project file
+            return 400, {"error": f"the confirmed build start profile is invalid: {exc}; nothing was started"}
+        archive_profile = candidate_cwd / PROFILE_PATH
+        try:
+            if archive_profile.resolve() != archive_profile or archive_profile.read_bytes() != source.encode("utf-8"):
+                return 400, {"error": "the candidate archive profile differs from the confirmed build start; nothing was started"}
+        except OSError as exc:
+            return 400, {"error": f"the candidate archive profile cannot be checked: {exc}; nothing was started"}
+        if payload.get("driver") is not None:
+            sources = [token for token in committed_profile.live_gate.driver if _looks_like_script_path(token)] if committed_profile.live_gate else []
+        else:
+            script = payload.get("script")
+            sources = [script] if isinstance(script, str) and _looks_like_script_path(script) else []
+        if not sources:
+            return 400, {"error": "the confirmed profile names no direct script or driver source; nothing was started"}
+        for source_name in sources:
+            mismatch = _same_archive_source(repo_path, candidate_cwd, joined_commit, source_name)
+            if mismatch:
+                return 400, {"error": f"{mismatch}; nothing was started"}
 
     # THE VALUES A REVIEW PREVIEW ISSUED TO THE PROJECT (13 October 2026),
     # read and checked here, where they arrive, and again where the program's
@@ -2369,11 +2637,13 @@ def process_run_request(
         )
 
     # LAW 2 (part a) — re-read the target's profile ourselves.
-    profile_path = repo_path / "deploy" / "profile.yaml"
-    try:
-        profile = load_deploy_profile(profile_path)
-    except DeployProfileError as exc:
-        return 400, {"error": f"target repo {repo!r} is not deployable: {exc}"}
+    if selected_profile is not None or clone_profile_missing:
+        profile = committed_profile
+    else:
+        try:
+            profile = load_deploy_profile(profile_path)
+        except DeployProfileError as exc:
+            return 400, {"error": f"target repo {repo!r} is not deployable: {exc}"}
 
     # SANDBOX FIRST (rule 85) — the live-gate driver, whose program comes from
     # the repository's profile rather than from ``script``. Answered whole by
@@ -8569,6 +8839,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                         "status": "healthy",
                         "rev": SIDECAR_CODE_VERSION,
                         "instance": HELPER_INSTANCE,
+                        "capabilities": ["first_deployment_profile_v1"],
                     },
                 )
                 return

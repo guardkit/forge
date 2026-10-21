@@ -168,17 +168,56 @@ class TheCoordinatorsRecord:
         question and can use one answer: the commit this coordinator recorded,
         or nothing at all.
         """
-        row = self._one_row(
-            "SELECT start_commit FROM builds WHERE build_id = ?", build
+        from forge.deploy.profile_selection import (
+            confirmed_profile_reference, confirmed_deployment_layout,
         )
-        commit = str(row[0]).strip() if row is not None and row[0] else ""
-        if not commit:
-            commit = self._what_a_planning_run_starts_from(build)
-        return {
-            "build": str(build),
-            "recorded": bool(commit),
-            "start_commit": commit or None,
-        }
+
+        connection = self._connect()
+        try:
+            # Build, approval and publication facts must come from one snapshot.
+            connection.execute("BEGIN")
+            row = connection.execute(
+                "SELECT start_commit FROM builds WHERE build_id = ?", (str(build),)
+            ).fetchone()
+            commit = str(row[0]).strip() if row is not None and row[0] else ""
+            is_build = bool(commit)
+            if not commit:
+                try:
+                    planning = connection.execute(
+                        "SELECT start_commit FROM planning_runs WHERE correlation_id = ?",
+                        (str(build),),
+                    ).fetchone()
+                    commit = str(planning[0]).strip() if planning and planning[0] else ""
+                except sqlite3.OperationalError as exc:
+                    if "no such table" not in str(exc).lower():
+                        raise
+            answer = {
+                "build": str(build),
+                "recorded": bool(commit),
+                "start_commit": commit or None,
+            }
+            if is_build:
+                try:
+                    reference = confirmed_profile_reference(connection, str(build), commit)
+                except ValueError:
+                    # Contradictory or ended authority cannot widen a build's
+                    # declarations. Its original start answer is still valid.
+                    reference = None
+                if reference is not None:
+                    answer["first_deployment_profile"] = reference
+                try:
+                    layout = confirmed_deployment_layout(connection, str(build), commit)
+                except ValueError:
+                    layout = None
+                if layout is not None:
+                    answer["deployment_layout"] = layout
+            return answer
+        except sqlite3.Error as exc:
+            raise TheRecordIsUnreadable(
+                f"the coordinator's record would not answer about {build!r} ({exc})"
+            ) from exc
+        finally:
+            connection.close()
 
     def _what_a_planning_run_starts_from(self, run: str) -> str:
         """The starting commit this coordinator recorded for a planning run.

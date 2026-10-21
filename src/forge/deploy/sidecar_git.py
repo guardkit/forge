@@ -290,7 +290,9 @@ class SidecarCandidateGit:
             return None
         return bool(answer)
 
-    async def read_file_at_commit(self, commit: str, file_path: str) -> FileAtCommit:
+    async def read_file_at_commit(
+        self, commit: str, file_path: str, *, ordinary_file_only: bool = False, raw: bool = False
+    ) -> FileAtCommit:
         """``file_path`` exactly as it is at ``commit`` in the sandbox's clone.
 
         A sandbox that could not be reached, or that refused the request, is a
@@ -299,7 +301,9 @@ class SidecarCandidateGit:
         """
         decoded, why = await self._ok(
             "/git/read-file-at-commit",
-            {"repo": self._repo, "commit": str(commit), "file_path": str(file_path)},
+            {"repo": self._repo, "commit": str(commit), "file_path": str(file_path),
+             **({"ordinary_file_only": True} if ordinary_file_only else {}),
+             **({"raw": True} if raw else {})},
             timeout=self._read_timeout_s,
         )
         if decoded is None:

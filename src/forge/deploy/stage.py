@@ -660,6 +660,7 @@ class DeployStageRunner:
         start_commit: str | None = None,
         by_hand: bool = False,
         launch_settings: tuple[str, ...] = (),
+        first_deployment_profile: dict[str, Any] | None = None,
     ) -> None:
         self._repo = repository
         self._runbook_publisher = runbook_publisher
@@ -694,6 +695,7 @@ class DeployStageRunner:
         # read off that ledger by whoever composed this stage and bound here
         # once. Every request the script runner below sends carries the pair,
         # so the far side never has to take a commit on a request's own word.
+        self._first_deployment_profile = first_deployment_profile
         self._build_id = str(build_id or "").strip() or None
         self._start_commit = str(start_commit or "").strip() or None
         # AND AN ATTENDED RUN SAYS IT IS ONE (23 September 2026). With no
@@ -744,6 +746,7 @@ class DeployStageRunner:
             build=self._build_id,
             start_commit=self._start_commit,
             by_hand=self._by_hand,
+            **({"first_deployment_profile": self._first_deployment_profile} if self._first_deployment_profile is not None else {}),
         )
 
     def _runs_inside_the_sandbox(self) -> bool:

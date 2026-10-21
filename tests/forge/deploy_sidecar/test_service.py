@@ -9,7 +9,9 @@ a live end-to-end HTTP round trip through the real subprocess core.
 from __future__ import annotations
 
 import json
+import io
 import threading
+import urllib.error
 import urllib.request
 from pathlib import Path
 from typing import Any
@@ -18,6 +20,7 @@ import pytest
 import yaml
 
 from forge.config.models import ForgeConfig
+from forge.deploy.sidecar_runner import SidecarScriptRunner, no_answer_came_back
 from forge.deploy_sidecar import service
 from forge.deploy_sidecar.service import (
     HOST,
@@ -968,3 +971,188 @@ def test_no_working_directory_is_the_profile_s(repo: Path) -> None:
     )
     assert status == 200
     assert runner.calls[0]["cwd"] == str(repo)
+
+
+def _profile_reference(cwd: Path) -> dict[str, Any]:
+    return {
+        "selection": {
+            "version": 1,
+            "repo": "example/service",
+            "build": "build-one",
+            "offer_id": "offer-one",
+            "decision_id": "decision-one",
+            "candidate_commit": "a" * 40,
+            "candidate_tree": "b" * 40,
+            "start_commit": "c" * 40,
+            "target_commit": "c" * 40,
+            "joined_commit": "d" * 40,
+            "joined_tree": "e" * 40,
+            "profile_sha256": "f" * 64,
+            "attempt": 1,
+            "candidate_cwd": str(cwd),
+        },
+        "turn": 2,
+    }
+
+
+def test_first_profile_authority_refusal_echoes_requested_reference_before_execution(
+    repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive = repo / ".forge-candidates" / "selection"
+    archive.mkdir(parents=True)
+    reference = _profile_reference(archive)
+    monkeypatch.setattr(
+        service, "coordinator_recorded_build",
+        lambda: lambda _build: {
+            "build": "build-one",
+            service.RECORDED_START_KEY: "c" * 40,
+            "first_deployment_profile": {**reference, "turn": 1},
+        },
+    )
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {
+            "repo": "example/service",
+            "build": "build-one",
+            "declared_at": "c" * 40,
+            "script": "deploy.sh",
+            "cwd": str(archive),
+            "helper_instance": service.HELPER_INSTANCE,
+            "first_deployment_profile": reference,
+        },
+        config=_config({"example/service": str(repo)}),
+        script_runner=runner,
+        inside_sandbox=True,
+    )
+    assert status == 400
+    assert body["requested_first_deployment_profile"] == reference
+    assert body["helper_instance"] == service.HELPER_INSTANCE
+    assert body["execution_started"] is False
+    assert "first_deployment_profile" not in body
+    assert runner.calls == []
+
+
+def test_missing_clone_profile_base_env_still_requires_current_layout(
+    repo: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import subprocess
+
+    start = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo, capture_output=True,
+        text=True, check=True,
+    ).stdout.strip()
+    (repo / "deploy" / "profile.yaml").unlink()
+    archive = repo / ".forge-candidates" / "selection"
+    archive.mkdir(parents=True)
+    asked: list[str] = []
+
+    def _answer(build: str) -> dict[str, Any]:
+        asked.append(build)
+        return {"build": build, service.RECORDED_START_KEY: start}
+
+    monkeypatch.setattr(service, "coordinator_recorded_build", lambda: _answer)
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {
+            "repo": "example/service",
+            "build": "build-one",
+            "declared_at": start,
+            "script": "deploy.sh",
+            "env": {},
+            "cwd": str(archive),
+        },
+        config=_config({"example/service": str(repo)}),
+        script_runner=runner,
+    )
+    assert status == 400
+    assert "candidate archive" in body["error"]
+    assert asked == ["build-one"]
+    assert runner.calls == []
+
+
+def test_script_client_probes_each_selected_command_and_requires_attestation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = _profile_reference(tmp_path / ".forge-candidates" / "selection")
+    sent: list[str] = []
+
+    class _Response:
+        def __init__(self, body: dict[str, Any]) -> None:
+            self._body = body
+
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(self._body).encode()
+
+    def _old_helper(request: Any, *, timeout: float) -> _Response:
+        sent.append(request.full_url)
+        return _Response({"status": "healthy", "instance": "one"})
+
+    monkeypatch.setattr(urllib.request, "urlopen", _old_helper)
+    client = SidecarScriptRunner(
+        base_url="http://127.0.0.1:1", repo="example/service",
+        first_deployment_profile=reference,
+    )
+    refusal = client(cwd=reference["selection"]["candidate_cwd"], script="deploy.sh", env_file=None)
+    assert refusal[0] != 0 and not no_answer_came_back(refusal)
+    assert sent == ["http://127.0.0.1:1/healthz"]
+
+    sent.clear()
+
+    def _missing_echo(request: Any, *, timeout: float) -> _Response:
+        sent.append(request.full_url)
+        if request.full_url.endswith("/healthz"):
+            return _Response({
+                "status": "healthy", "instance": "one",
+                "capabilities": ["first_deployment_profile_v1"],
+            })
+        return _Response({"exit_code": 0, "output_tail": "ok", "cwd": reference["selection"]["candidate_cwd"]})
+
+    monkeypatch.setattr(urllib.request, "urlopen", _missing_echo)
+    uncertain = client(cwd=reference["selection"]["candidate_cwd"], script="deploy.sh", env_file=None)
+    assert no_answer_came_back(uncertain)
+    assert sent == ["http://127.0.0.1:1/healthz", "http://127.0.0.1:1/run"]
+
+
+def test_script_client_accepts_only_attested_preexecution_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    reference = _profile_reference(tmp_path / ".forge-candidates" / "selection")
+
+    class _Health:
+        def __enter__(self) -> "_Health":
+            return self
+
+        def __exit__(self, *_args: Any) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps({
+                "status": "healthy", "instance": "one",
+                "capabilities": ["first_deployment_profile_v1"],
+            }).encode()
+
+    def _refusal(request: Any, *, timeout: float) -> _Health:
+        if request.full_url.endswith("/healthz"):
+            return _Health()
+        raise urllib.error.HTTPError(
+            request.full_url, 400, "refused", {}, io.BytesIO(json.dumps({
+                "error": "the current turn changed",
+                "helper_instance": "one",
+                "requested_first_deployment_profile": reference,
+                "execution_started": False,
+            }).encode()),
+        )
+
+    monkeypatch.setattr(urllib.request, "urlopen", _refusal)
+    client = SidecarScriptRunner(
+        base_url="http://127.0.0.1:1", repo="example/service",
+        first_deployment_profile=reference,
+    )
+    answer = client(cwd=reference["selection"]["candidate_cwd"], script="deploy.sh", env_file=None)
+    assert answer[0] != 0 and not no_answer_came_back(answer)

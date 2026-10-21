@@ -185,6 +185,16 @@ from forge.pipeline.deployment_lock import (
     deployment_target_name,
 )
 from forge.pipeline.only_forwards import what_to_do_about_j
+from forge.deploy.profile_selection import (
+    FirstDeploymentProfile,
+    ProfileSelectionRefusedBeforeDispatch,
+    confirmed_profile_reference,
+    parse_profile_reference,
+    read_profile_approval,
+    selection_from_record,
+)
+
+
 from forge.pipeline.publication_record import (
     LINE_DONE,
     RESULT_MERGED_AND_RUNNING,
@@ -2496,6 +2506,8 @@ async def execute_merge_deploy(
     tree_commit: str | None = None
     candidate_commit: str | None = None
     candidate_standing = False
+    first_profile: FirstDeploymentProfile | None = None
+    selected_profile: Any = None
     # THE PROJECT'S OWN STEPS RUN FROM A TREE AT THE RIGHT COMMIT, in a sandbox
     # (3 October 2026). A repository with a sandbox is deployed out of the
     # sandbox's own clone, and nothing keeps that clone's working copy up to
@@ -2940,19 +2952,24 @@ async def execute_merge_deploy(
         before = a_leg_did_not_complete
         # Until it answers; a raise leaves it set.
         a_leg_did_not_complete = True
-        result = await deps.deploy_dispatcher(
-            repo=repo,
-            repo_root=repo_root,
-            feature_id=feature_id,
-            build_id=build_id,
-            correlation_id=correlation_id,
-            decided_by=decided_by,
-            dry_run=dry_run,
-            leg=leg,
-            deploy_run_id=deploy_run_id,
-            task_id=task_id,
-            **extra,
-        )
+        try:
+            result = await deps.deploy_dispatcher(
+                repo=repo,
+                repo_root=repo_root,
+                feature_id=feature_id,
+                build_id=build_id,
+                correlation_id=correlation_id,
+                decided_by=decided_by,
+                dry_run=dry_run,
+                leg=leg,
+                deploy_run_id=deploy_run_id,
+                task_id=task_id,
+                **({"first_deployment_profile": {"selection": first_profile.to_wire(), "turn": held_turn}} if first_profile is not None else {}),
+                **extra,
+            )
+        except ProfileSelectionRefusedBeforeDispatch:
+            a_leg_did_not_complete = before
+            raise
         # AN ANSWER, WHATEVER IT SAYS, IS A LEG THAT HAS FINISHED (15 October
         # 2026, the rule a986459c set for the retained worktree). An ordinary
         # red candidate check, or one whose candidate could not start, kept
@@ -3259,6 +3276,100 @@ async def execute_merge_deploy(
         _, declaration = known
         return declaration if getattr(declaration, "declared", False) else None
 
+    async def _profile_bytes_at(commit: str) -> Any:
+        answer = await git.read_file_at_commit(commit, DEPLOY_PROFILE_PATH, raw=True)
+        if answer.refusal:
+            raise ValueError(f"the deployment profile at {commit} could not be read: {answer.refusal}")
+        if answer.found and (answer.mode not in ("100644", "100755") or answer.content is None):
+            raise ValueError("the deployment profile must be an ordinary committed file")
+        if not answer.found and answer.mode is not None:
+            raise ValueError("the deployment profile path is not absent or an ordinary file")
+        return answer
+
+    async def _select_profile_for_join(
+        *, target_commit: str, candidate_commit: str, candidate_tree: str,
+        joined_commit: str, joined_tree: str, attempt: int, store: Any,
+    ) -> None:
+        nonlocal first_profile, selected_profile
+        import hashlib
+
+        first_profile, selected_profile = None, None
+        if not scripts_from_the_commit:
+            return
+        start = _the_recorded_start_commit()
+        if not start:
+            return  # Existing dispatcher refuses a missing profile; no new authority.
+        started = await _profile_bytes_at(start)
+        if started.found:
+            profile, why = _the_profile_out_of(started, start)
+            if profile is None:
+                raise ValueError(why)
+            return  # Existing instructions always govern this build.
+        if dry_run or store is None or not held_turn:
+            raise ValueError("a first deployment profile needs a real approved publication")
+        cx = _ledger_of(deps.pool)
+        if cx is None:
+            raise ValueError("the first deployment has no readable approval record")
+        offer, decision = read_profile_approval(cx, build_id)
+        if (offer.get("repo") != repo or offer.get("candidate_sha") != candidate_commit
+                or offer.get("candidate_tree") != candidate_tree
+                or expected_candidate_sha != candidate_commit
+                or expected_candidate_tree != candidate_tree
+                or decision.get("execution_attempt_id") != merge_execution_attempt_id):
+            raise ValueError("the first deployment does not match the exact approved candidate")
+        record = store.read(build_id)
+        if (record.turn != held_turn or record.lease_holder != worker_name
+                or record.attempt != attempt or record.j_commit != joined_commit
+                or record.build_tip != candidate_commit or record.g_commit != target_commit):
+            raise ValueError("the first deployment publication changed before selection")
+        target = await _profile_bytes_at(target_commit)
+        if target.found:
+            raise ValueError("the fetched target already has deployment instructions; the first profile cannot replace them")
+        candidate = await _profile_bytes_at(candidate_commit)
+        joined = await _profile_bytes_at(joined_commit)
+        if not candidate.found or not joined.found or candidate.content != joined.content:
+            raise ValueError("the joined deployment profile must equal the approved candidate's ordinary profile")
+        profile, why = _the_profile_out_of(candidate, candidate_commit)
+        if profile is None:
+            raise ValueError(why)
+        identity = declared_identity(profile)
+        if (profile.candidate is None or profile.live_gate is None
+                or not profile.live_gate.driver or not identity.declared
+                or not identity.asked_with):
+            raise ValueError("the first deployment profile needs a candidate, live driver and verified deployment identity")
+        first_profile = FirstDeploymentProfile.from_wire({
+            "version": 1, "repo": repo, "build": build_id,
+            "offer_id": offer["request_id"],
+            "decision_id": decision["execution_attempt_id"],
+            "candidate_commit": candidate_commit, "candidate_tree": candidate_tree,
+            "start_commit": start, "target_commit": target_commit,
+            "joined_commit": joined_commit, "joined_tree": joined_tree,
+            "profile_sha256": hashlib.sha256(candidate.content.encode("utf-8")).hexdigest(),
+            "attempt": attempt, "candidate_cwd": str(tree_path),
+        })
+        selected_profile = profile
+
+    async def _recover_profile_selection(record: Any) -> None:
+        nonlocal first_profile, selected_profile
+        import hashlib
+
+        selected = selection_from_record(record)
+        if selected is None:
+            return
+        cx = _ledger_of(deps.pool)
+        if cx is None:
+            raise ValueError("the recorded first deployment has no readable authority")
+        reference = confirmed_profile_reference(cx, build_id, _the_recorded_start_commit() or "")
+        if reference is None or reference["turn"] != held_turn:
+            raise ValueError("the recorded first deployment no longer belongs to this publication")
+        answer = await _profile_bytes_at(selected.joined_commit)
+        if not answer.found or hashlib.sha256(answer.content.encode("utf-8")).hexdigest() != selected.profile_sha256:
+            raise ValueError("the recorded first deployment profile no longer matches its digest")
+        profile, why = _the_profile_out_of(answer, selected.joined_commit)
+        if profile is None:
+            raise ValueError(why)
+        first_profile, selected_profile = selected, profile
+
     async def _lay_the_tree_out(sha: str) -> MergeDeployOutcome | None:
         """Lay out the exact tree of ``sha`` for the live check. None = it is there."""
         nonlocal tree_path, tree_commit, a_leg_did_not_complete
@@ -3270,6 +3381,9 @@ async def execute_merge_deploy(
             # 2026) may still be being written: keep the hold.
             if getattr(laid_out, "confirmed", False) is not True:
                 a_leg_did_not_complete = True
+                return _could_not_check("the sandbox did not confirm the candidate archive layout")
+            if scripts_from_the_commit and laid_out.tree != await git.rev_parse(f"{sha}^{{tree}}"):
+                return _could_not_check("the sandbox candidate archive has a different tree")
             tree_path = Path(laid_out.path)
             tree_commit = str(sha)
             if excluded_now is None:
@@ -3335,6 +3449,9 @@ async def execute_merge_deploy(
             )
         if getattr(laid_out, "confirmed", False) is not True:
             a_leg_did_not_complete = True
+            return None, "the sandbox did not confirm the candidate archive layout"
+        if laid_out.tree != await git.rev_parse(f"{wanted}^{{tree}}"):
+            return None, "the sandbox candidate archive has a different tree"
         tree_path = Path(laid_out.path)
         tree_commit = wanted
         return str(tree_path), None
@@ -4028,7 +4145,10 @@ async def execute_merge_deploy(
                 )
                 return None
         at = _the_recorded_start_commit()
-        profile, why_not = await _the_profile_where_it_lives(git, repo_root, at)
+        if first_profile is not None:
+            profile, why_not = selected_profile, None
+        else:
+            profile, why_not = await _the_profile_where_it_lives(git, repo_root, at)
         if profile is None:
             logger.warning(
                 "merge-executor: %s's %s could not be read at %s (%s), so "
@@ -4138,6 +4258,17 @@ async def execute_merge_deploy(
                 turn=turn,
                 store=store,
             )
+        if scripts_from_the_commit and first_profile is None and store is not None:
+            try:
+                await _recover_profile_selection(store.read(build_id))
+            except ValueError as exc:
+                return _published_deployment_pending(
+                    j_commit=j_commit, target_branch=target_branch,
+                    g_commit=g_commit, remote_now=remote_now,
+                    checks_passed=checks_passed, checks_total=checks_total,
+                    what_was_checked=what_was_checked, attempt=attempt,
+                    turn=turn, store=store, why_not_deployed=str(exc),
+                )
         lock = _deployment_lock_store()
         if lock is None:
             return _published_deployment_pending(
@@ -6356,27 +6487,32 @@ async def execute_merge_deploy(
                     turn=turn,
                 )
 
+            # Record the archive path only after the venue confirmed its layout.
+            laid = await _lay_the_tree_out(str(j_commit))
+            if laid is not None:
+                return _nothing_was_published(laid, store=store, turn=turn)
+            try:
+                await _select_profile_for_join(
+                    target_commit=g_commit, candidate_commit=candidate_sha,
+                    candidate_tree=offered_tree, joined_commit=str(j_commit),
+                    joined_tree=str(j_tree), attempt=attempt, store=store,
+                )
+            except ValueError as exc:
+                return _nothing_was_published(
+                    _could_not_check(str(exc)), store=store, turn=turn,
+                )
             if store is not None and not store.about_to(
-                build_id=build_id,
-                turn=turn,
-                now=deps.clock(),
-                step=STEP_CANDIDATE_CHECK,
-                attempt=attempt,
+                build_id=build_id, turn=turn, now=deps.clock(),
+                step=STEP_CANDIDATE_CHECK, attempt=attempt,
                 inputs={
-                    "j_commit": j_commit,
-                    "j_tree": j_tree,
+                    "j_commit": j_commit, "j_tree": j_tree,
                     "feature_id": feature_id,
+                    **({"candidate_cwd": str(tree_path)} if scripts_from_the_commit else {}),
+                    **({"first_deployment_profile": first_profile.to_wire()} if first_profile is not None else {}),
                 },
             ):
                 return _replaced_here()
 
-            # SETTLED (15 October 2026): a tree that could not be laid out
-            # sent no leg, and a candidate check that answered has finished.
-            # A leg with no answer, or a candidate still standing, keeps the
-            # hold through the two flags the hold is decided on.
-            laid = await _lay_the_tree_out(str(j_commit))
-            if laid is not None:
-                return _nothing_was_published(laid, store=store, turn=turn)
             checked_outcome = await _run_the_candidate_check(str(j_commit))
             if checked_outcome is not None:
                 return _nothing_was_published(
@@ -6960,6 +7096,7 @@ def build_in_daemon_deploy_dispatcher(
         identity_env: dict[str, str] | None = None,
         ask_env: dict[str, str] | None = None,
         issued_env: Any = None,
+        first_deployment_profile: dict[str, Any] | None = None,
     ) -> Any:
         from forge.adapters.nats.deploy_publisher import DeployPublisher
         from forge.adapters.nats.runbook_publisher import RunbookPublisher
@@ -6989,11 +7126,15 @@ def build_in_daemon_deploy_dispatcher(
         # sandbox — every repository until an operator fills the map in — takes
         # exactly the path it took before this lane.
         sandbox = sandbox_for(config, repo)
-        profile = (
-            load_deploy_profile(repo_root / "deploy" / "profile.yaml")
-            if sandbox is None
-            else None
-        )
+        try:
+            profile = (
+                load_deploy_profile(repo_root / "deploy" / "profile.yaml")
+                if sandbox is None else None
+            )
+        except DeployProfileError as exc:
+            raise ProfileSelectionRefusedBeforeDispatch(
+                f"no deployment request was sent: {exc}"
+            ) from exc
         # WHAT THE PROJECT DECLARED FOR THIS BUILD, read once. The live check
         # needs it, and since 23 September 2026 so does the deploy step: its
         # environment is built from the factory's named list plus these, never
@@ -7001,6 +7142,37 @@ def build_in_daemon_deploy_dispatcher(
         build_memory, build_declared, build_started_at = _the_builds_declarations(
             db_path, build_id
         )
+        if first_deployment_profile is not None:
+            # Only ledger-confirmed publication inputs may select a new source.
+            # Everything here precedes construction or dispatch of any stage.
+            import hashlib
+            from forge.record_answer.service import TheCoordinatorsRecord
+
+            try:
+                selected, _turn = parse_profile_reference(first_deployment_profile)
+                if (sandbox is None or dry_run or leg not in (
+                        "candidate_check", "promote", "what_is_running", "candidate_down")
+                        or selected.repo != repo or selected.build != build_id
+                        or selected.start_commit != build_started_at
+                        or selected.candidate_cwd != candidate_cwd):
+                    raise ValueError("the first profile is outside its approved deployment work")
+                answer = TheCoordinatorsRecord(db_path).what_build_starts_from(build_id)
+                if answer.get("first_deployment_profile") != first_deployment_profile:
+                    raise ValueError("the current record does not confirm the first deployment profile")
+                file = await SidecarCandidateGit(str(sandbox.sidecar_url), repo=str(repo)).read_file_at_commit(
+                    selected.joined_commit, DEPLOY_PROFILE_PATH, raw=True,
+                )
+                if (file.refusal or not file.found or file.mode not in ("100644", "100755")
+                        or file.content is None
+                        or hashlib.sha256(file.content.encode("utf-8")).hexdigest() != selected.profile_sha256):
+                    raise ValueError("the selected committed deployment profile differs from the approved file")
+                profile, why = _the_profile_out_of(file, selected.joined_commit)
+                if profile is None:
+                    raise ValueError(why)
+            except (ValueError, RuntimeError) as exc:
+                raise ProfileSelectionRefusedBeforeDispatch(
+                    f"no deployment request was sent: {exc}"
+                ) from exc
         if profile is None:
             # THE PROFILE IS READ IN THE SANDBOX TOO (3 October 2026). Its
             # clone is the only copy of this repository; the path this
@@ -7016,7 +7188,8 @@ def build_in_daemon_deploy_dispatcher(
                 build_started_at,
             )
             if profile is None:
-                raise DeployProfileError(
+                raise ProfileSelectionRefusedBeforeDispatch(
+                    "no deployment request was sent: "
                     f"{repo}'s {DEPLOY_PROFILE_PATH} could not be read in the "
                     f"sandbox {getattr(sandbox, 'name', '')}: {why_not}"
                 )
@@ -7047,6 +7220,7 @@ def build_in_daemon_deploy_dispatcher(
                 # from. The gate goes through the same environment door.
                 build=build_id,
                 start_commit=build_started_at,
+                **({"first_deployment_profile": first_deployment_profile} if first_deployment_profile is not None else {}),
             )
         elif spec is not None:
             invoker = RepoDriverLiveGateInvoker(
@@ -7135,6 +7309,7 @@ def build_in_daemon_deploy_dispatcher(
             # apart from ``identity_env`` all the way to the helper, which
             # checks them again before a program is given them.
             issued_env=issued_env,
+            **({"first_deployment_profile": first_deployment_profile} if first_deployment_profile is not None else {}),
         )
 
     return _dispatch
