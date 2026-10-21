@@ -48,11 +48,11 @@ from forge.record_answer.service import (
     TheCoordinatorsRecord,
     serve as serve_record_answer,
 )
+from tests.forge.pipeline.test_merge_executor import FEATURE_ID as FEATURE
 from tests.forge.pipeline.test_merge_executor import _JoinsForReal
 from tests.forge.recorded_fetch_address import allow_local_remotes, origin_of
 
 REPO = "example/service"
-FEATURE = "FIRSTPROFILE"
 BUILD = "build-first-profile"
 ATTEMPT = "approved-attempt-one"
 OFFER = "offer-first-profile"
@@ -549,9 +549,10 @@ async def test_second_deployment_uses_committed_profile_and_reverts_failed_live_
     _git(first_folder, "merge", "--no-ff", "-q", "-m", "first join", first_candidate)
     first_join = _git(first_folder, "rev-parse", "HEAD")
     _git(repo, "push", "-q", "origin", f"{first_join}:refs/heads/main")
-    feature = "SECONDPROFILE"
+    feature = FEATURE
     build = "build-second-profile"
     attempt_id = "approved-attempt-two"
+    _git(repo, "branch", "-D", f"autobuild/{feature}")
     _git(repo, "checkout", "-q", "-b", f"autobuild/{feature}", first_join)
     (repo / "ordinary-change.txt").write_text("second deployment\n", encoding="utf-8")
     _git(repo, "add", "ordinary-change.txt")
