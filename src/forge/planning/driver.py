@@ -6595,6 +6595,12 @@ class PlanningRunDriver:
         the 2026-09-05 path.
         """
         deps = self._deps
+        # An approved receipt survives a stop before the build is queued. It
+        # still binds this run to its captured context on recovery; validate
+        # before the idempotent shortcut can authorize downstream build work.
+        _factory_document, broken = ensure_factory_context(deps.store, correlation_id)
+        if broken is not None:
+            return await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
         if self._has_leg_event(correlation_id, _FEATURE_PLAN_STAGE):
             logger.info(
                 "planning driver: run %s feature-plan already complete "

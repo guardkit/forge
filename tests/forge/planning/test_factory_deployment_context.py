@@ -153,6 +153,114 @@ async def test_legacy_dispatch_keeps_original_context_and_closed_card(chain_stor
     assert replay.notifications == []
 
 
+class _PlanReceiptCommitted(BaseException):
+    """Process interruption after approval is durable, before build dispatch."""
+
+
+@pytest.mark.parametrize("fault", [
+    "valid", "legacy", "missing-capture", "corrupt-capture",
+    "corrupt-expectation", "double-loss",
+])
+@pytest.mark.asyncio
+async def test_approved_plan_restart_validates_context_before_build(
+    chain_store, tmp_path, fault,
+):
+    docs.door._queue(chain_store)
+    original = docs._chain(
+        chain_store, docs._declared_tree(), answers=[docs.door._answer("approve")],
+    )
+    builds = []
+    dispatch_build = original.driver._deps.dispatch_build_trigger
+
+    async def record_build(**kwargs):
+        builds.append(kwargs)
+        return await dispatch_build(**kwargs)
+
+    original.driver._deps.dispatch_build_trigger = record_build
+    publish = original.driver._deps.publish_notification
+
+    async def interrupt_after_receipt(cid, message, level):
+        if "machine spec + plan complete and validated" in message:
+            raise _PlanReceiptCommitted()
+        await publish(cid, message, level)
+
+    original.driver._deps.publish_notification = interrupt_after_receipt
+    with pytest.raises(_PlanReceiptCommitted):
+        await original.driver.drive(docs.door.CID)
+    assert chain_store.get_run(docs.door.CID)["state"] == PlanningState.FEATURE_PLAN.value
+    assert builds == []
+    approved = [e for e in chain_store.list_events(docs.door.CID)
+                if e["stage_label"] == "feature-plan" and e["status"] == "approved"]
+    assert len(approved) == 1
+    receipt = json.loads(approved[0]["details_json"])["factory_context"]
+    assert receipt == context.load_bundled_document().receipt()
+    drafts_before = docs._drafted(chain_store)
+
+    if fault in {"missing-capture", "double-loss"}:
+        _remove(chain_store, context.CAPTURE_STAGE)
+        if fault == "double-loss":
+            _remove(chain_store, context.EXPECTATION_STAGE)
+    elif fault == "corrupt-capture":
+        document = context.load_bundled_document().to_record()
+        document["text"] += "changed after approval"
+        _remove(chain_store, context.CAPTURE_STAGE)
+        _event(chain_store, context.CAPTURE_STAGE, {"factory_context": document})
+    elif fault == "corrupt-expectation":
+        chain_store._connection.execute(
+            "UPDATE planning_run_events SET details_json='{' WHERE stage_label=?",
+            (context.EXPECTATION_STAGE,),
+        )
+        chain_store._connection.commit()
+    elif fault == "legacy":
+        _remove(chain_store, context.EXPECTATION_STAGE, context.CAPTURE_STAGE, context.DISPATCH_STAGE)
+        for event in chain_store.list_events(docs.door.CID):
+            data = json.loads(event["details_json"] or "{}")
+            if isinstance(data, dict):
+                data.pop("factory_context", None)
+                if isinstance(data.get("spec_draft"), dict):
+                    data["spec_draft"].pop("factory_context", None)
+                chain_store._connection.execute(
+                    "UPDATE planning_run_events SET details_json=? WHERE id=?",
+                    (json.dumps(data), event["id"]),
+                )
+        chain_store._connection.commit()
+        drafts_before = docs._drafted(chain_store)
+
+    # New SQLite connection and driver start from the real durable boundary.
+    connection = sqlite3.connect(str(tmp_path / "chain.db"))
+    connection.row_factory = sqlite3.Row
+    restarted_store = SqlitePlanningRunStore(connection, target_terminal_enabled=True)
+    replay = docs._chain(restarted_store, docs._declared_tree(), answers=[])
+    replay.driver._deps.git_runner = original.driver._deps.git_runner
+    replay.driver._deps.dispatch_build_trigger = record_build
+    try:
+        await replay.driver.drive(docs.door.CID)
+        assert replay.calls == {"po": [], "spec": [], "plan": []}
+        assert docs._drafted(restarted_store) == drafts_before
+        if fault in {"valid", "legacy"}:
+            assert restarted_store.get_run(docs.door.CID)["state"] == PlanningState.BUILD_QUEUED.value
+            assert len(builds) == 1
+            if fault == "legacy":
+                dispositions = [e for e in restarted_store.list_events(docs.door.CID)
+                                if e["stage_label"] == context.LEGACY_STAGE]
+                assert len(dispositions) == 1
+                assert json.loads(dispositions[0]["details_json"])["disposition"] == "legacy-spec-dispatch-without-factory-context"
+        else:
+            assert restarted_store.get_run(docs.door.CID)["state"] == PlanningState.FAILED.value
+            assert builds == []
+            assert any("factory deployment context" in message
+                       for _, message, _ in replay.notifications)
+            # The approved plan receipt survives; its presence cannot bypass
+            # the missing/corrupt context check or be classified as legacy.
+            remaining = [e for e in restarted_store.list_events(docs.door.CID)
+                         if e["stage_label"] == "feature-plan" and e["status"] == "approved"]
+            assert json.loads(remaining[0]["details_json"])["factory_context"] == receipt
+            assert not any(e["stage_label"] == context.LEGACY_STAGE
+                           for e in restarted_store.list_events(docs.door.CID))
+    finally:
+        connection.close()
+
+
 def test_reference_profile_has_real_first_deployment_declarations(tmp_path):
     from forge.deploy.profile import load_deploy_profile, parse_deploy_profile
     from forge.pipeline.deployment_identity import declared_identity
@@ -199,7 +307,10 @@ def test_reference_names_are_anchored_to_installed_handlers():
         assert flag in text and flag in inspect.getsource(live_gate.RepoDriverLiveGateInvoker.invoke)
     # Production calls the shared predicate rather than leaving a test-only facsimile.
     assert "if not first_deployment_profile_is_usable(profile):" in inspect.getsource(merge_executor)
-    assert "does not request a new feature" in text
+    assert (
+        "It does not request a new feature, override a prohibition, or enlarge an unrelated feature."
+        in " ".join(text.split())
+    )
 
 
 def test_actual_built_wheel_includes_exact_reference(tmp_path):
