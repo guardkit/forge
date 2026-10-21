@@ -2228,6 +2228,35 @@ def _same_archive_source(
     return None
 
 
+def _driver_archive_sources(
+    repo_path: Path, archive: Path, commit: str, argv: Sequence[str]
+) -> tuple[list[str], str | None]:
+    """Find project files by their Git/disk identity, not a language suffix.
+
+    The executable in argv[0] may be an absolute runtime binary. Other
+    absolute/escaping paths cannot introduce sources outside the archive.
+    Inline commands remain bound by the exact committed driver declaration.
+    """
+    sources: list[str] = []
+    for index, token in enumerate(argv):
+        path = Path(token)
+        if index == 0 and path.is_absolute():
+            continue
+        if token.startswith("-"):
+            continue
+        if path.is_absolute() or ".." in path.parts:
+            return [], "the live driver names a source outside the candidate archive"
+        if not token or token in (".", ".."):
+            continue
+        answer = read_file_at_commit_sync(repo_path, commit, path.as_posix(), raw=True)
+        if answer.refusal:
+            return [], answer.refusal
+        actual = archive / path
+        if answer.found or answer.mode is not None or actual.exists() or actual.is_symlink():
+            sources.append(token)
+    return sources, None
+
+
 def _first_profile_precheck(
     payload: dict[str, Any], repo_path: Path, *, inside_sandbox: bool
 ) -> tuple[DeployProfile | None, Mapping[str, Any] | None, str | None]:
@@ -2294,20 +2323,19 @@ def _first_profile_precheck(
         profile = load_deploy_profile(disk)
     except (OSError, DeployProfileError) as exc:
         return None, None, f"the archive profile cannot be used: {exc}"
-    sources = set()
+    sources: list[str] = []
     if payload.get("driver") is not None:
         if profile.live_gate is not None:
-            sources.update(
-                token for token in profile.live_gate.driver
-                if _looks_like_script_path(token)
+            sources, refusal = _driver_archive_sources(
+                repo_path, cwd, selected.joined_commit, profile.live_gate.driver
             )
-        if not sources:
-            return None, None, "the selected live gate names no driver source file"
+            if refusal:
+                return None, None, refusal
     else:
         script = payload.get("script")
-        if not isinstance(script, str) or not _looks_like_script_path(script):
+        if not isinstance(script, str) or not script.strip():
             return None, None, "the selected deployment names no direct script source file"
-        sources.add(script)
+        sources.append(script)
     for name in sources:
         refusal = _same_archive_source(repo_path, cwd, selected.joined_commit, name)
         if refusal:
@@ -2494,11 +2522,13 @@ def _process_run_request_impl(
     # profile in that checkout is a special factory path, never by-hand
     # authority and never a reason to read implicit HEAD.
     try:
+        if profile_path.resolve() != profile_path:
+            return 400, {"error": "the registered profile path contains a symbolic link; nothing was started"}
         profile_path.lstat()
         clone_profile_missing = False
     except FileNotFoundError:
         clone_profile_missing = True
-    except OSError as exc:
+    except (OSError, RuntimeError) as exc:
         return 400, {"error": f"the registered profile could not be inspected: {exc}"}
     if clone_profile_missing and selected_profile is None and payload.get("declared_test") is None:
         if not isinstance(payload.get("build"), str) or not payload["build"].strip() or payload.get("by_hand") is True:
@@ -2593,12 +2623,17 @@ def _process_run_request_impl(
         except OSError as exc:
             return 400, {"error": f"the candidate archive profile cannot be checked: {exc}; nothing was started"}
         if payload.get("driver") is not None:
-            sources = [token for token in committed_profile.live_gate.driver if _looks_like_script_path(token)] if committed_profile.live_gate else []
+            sources, source_error = _driver_archive_sources(
+                repo_path, candidate_cwd, joined_commit,
+                committed_profile.live_gate.driver if committed_profile.live_gate else (),
+            )
+            if source_error:
+                return 400, {"error": f"{source_error}; nothing was started"}
         else:
             script = payload.get("script")
-            sources = [script] if isinstance(script, str) and _looks_like_script_path(script) else []
-        if not sources:
-            return 400, {"error": "the confirmed profile names no direct script or driver source; nothing was started"}
+            if not isinstance(script, str) or not script.strip():
+                return 400, {"error": "the confirmed profile names no direct script source; nothing was started"}
+            sources = [script]
         for source_name in sources:
             mismatch = _same_archive_source(repo_path, candidate_cwd, joined_commit, source_name)
             if mismatch:

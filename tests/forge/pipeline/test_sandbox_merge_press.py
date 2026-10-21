@@ -423,6 +423,23 @@ async def _press(
 
 
 class TestTheWholePressRunsWhereTheRepositoryLives:
+    @pytest.fixture(autouse=True)
+    def _a_real_deployment_start(
+        self, clone: Path, pool: SqliteLifecyclePersistence
+    ) -> None:
+        # These venue tests replace the deploy stage, but still need a real
+        # ordinary start declaration. A missing Git commit is not absence.
+        profile = clone / "deploy" / "profile.yaml"
+        profile.parent.mkdir(exist_ok=True)
+        profile.write_text(
+            "env_id: example\ncompose:\n  file: compose.yaml\n  script: deploy/run\n",
+            encoding="utf-8",
+        )
+        _git(clone, "add", "deploy/profile.yaml")
+        _git(clone, "commit", "-q", "-m", "declare deployment")
+        _git(clone, "push", "-q", "origin", "main")
+        _build_row(pool, start_commit=_git(clone, "rev-parse", "HEAD"))
+
     @pytest.mark.asyncio
     async def test_candidate_merge_and_promote_all_happen_in_the_sandbox(
         self,

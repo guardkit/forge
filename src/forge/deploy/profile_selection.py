@@ -118,7 +118,9 @@ def selection_from_record(record: Any) -> FirstDeploymentProfile | None:
             or matching[-1].detail.get("j_tree") != selected.joined_tree):
         raise ValueError("the profile selection contradicts the current publication")
     checked = record.checked
-    if checked and (checked.get("j_commit") != selected.joined_commit
+    completed = any(line.kind == "done" and line.step == "candidate-check"
+                    and line.attempt == record.attempt for line in record.lines)
+    if completed and (checked.get("j_commit") != selected.joined_commit
                     or checked.get("j_tree") != selected.joined_tree):
         raise ValueError("the checked artifact contradicts the profile selection")
     return selected

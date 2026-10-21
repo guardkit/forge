@@ -1156,3 +1156,60 @@ def test_script_client_accepts_only_attested_preexecution_refusal(
     )
     answer = client(cwd=reference["selection"]["candidate_cwd"], script="deploy.sh", env_file=None)
     assert answer[0] != 0 and not no_answer_came_back(answer)
+
+
+@pytest.mark.parametrize("driver", [
+    ["node", "gate.mjs"], ["ruby", "gate.rb"],
+    ["/usr/bin/node", "gate.mjs"], ["node", "./gate.mjs"],
+])
+def test_driver_sources_follow_git_files_not_language_suffixes(repo: Path, driver: list[str]) -> None:
+    import subprocess
+
+    source = Path(driver[-1]).as_posix()
+    (repo / source).write_text("a committed driver\n", encoding="utf-8")
+    subprocess.run(["git", "add", source], cwd=repo, check=True)
+    subprocess.run(["git", "commit", "-qm", "driver"], cwd=repo, check=True)
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    archive = repo / ".forge-candidates" / "selection"
+    archive.mkdir(parents=True)
+    (archive / source).write_text("a committed driver\n", encoding="utf-8")
+    sources, refusal = service._driver_archive_sources(repo, archive, commit, driver)
+    assert refusal is None
+    assert sources == [driver[-1]]
+    assert service._same_archive_source(repo, archive, commit, sources[0]) is None
+    (archive / source).write_text("substituted driver\n", encoding="utf-8")
+    assert "differs" in service._same_archive_source(repo, archive, commit, sources[0])
+
+
+def test_inline_driver_remains_bound_to_its_profile(repo: Path) -> None:
+    import subprocess
+
+    commit = subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=repo, text=True).strip()
+    sources, refusal = service._driver_archive_sources(
+        repo, repo, commit, ["node", "-e", "console.log('ok')"]
+    )
+    assert sources == [] and refusal is None
+
+
+@pytest.mark.parametrize("where", ["profile", "missing-parent", "existing-parent"])
+def test_clone_profile_symlinks_never_count_as_absence(
+    repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, where: str,
+) -> None:
+    profile = repo / "deploy" / "profile.yaml"
+    profile.unlink()
+    if where == "profile":
+        profile.symlink_to(tmp_path / "missing-profile")
+    else:
+        profile.parent.rmdir()
+        destination = tmp_path / "other-deploy"
+        if where == "existing-parent":
+            destination.mkdir()
+        profile.parent.symlink_to(destination, target_is_directory=True)
+    monkeypatch.setattr(service, "coordinator_recorded_build", lambda: pytest.fail("symlink reached authority lookup"))
+    runner = _RecordingRunner()
+    status, body = process_run_request(
+        {"repo": "example/service", "build": "build-one", "script": "deploy.sh"},
+        config=_config({"example/service": str(repo)}), script_runner=runner,
+    )
+    assert status == 400 and "symbolic link" in body["error"]
+    assert runner.calls == []
