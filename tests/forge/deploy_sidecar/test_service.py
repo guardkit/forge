@@ -1159,9 +1159,15 @@ def test_script_client_probes_each_selected_command_and_requires_attestation(
     assert sent == ["http://127.0.0.1:1/healthz", "http://127.0.0.1:1/run"]
 
 
-def test_script_client_accepts_only_attested_preexecution_refusal(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("client_kind", ["script", "live_gate"])
+@pytest.mark.parametrize("reply_kind", [
+    "exact", "missing_instance", "changed_reference", "execution_started", "server_error", "malformed",
+])
+def test_selected_clients_accept_only_attested_preexecution_refusal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, client_kind: str, reply_kind: str,
 ) -> None:
+    from forge.deploy.live_gate import SidecarLiveGateInvoker
+
     reference = _profile_reference(tmp_path / ".forge-candidates" / "selection")
 
     class _Health:
@@ -1180,22 +1186,42 @@ def test_script_client_accepts_only_attested_preexecution_refusal(
     def _refusal(request: Any, *, timeout: float) -> _Health:
         if request.full_url.endswith("/healthz"):
             return _Health()
+        body = {
+            "error": "the current turn changed",
+            "helper_instance": "one",
+            "requested_first_deployment_profile": reference,
+            "execution_started": False,
+        }
+        if reply_kind == "missing_instance":
+            body.pop("helper_instance")
+        elif reply_kind == "changed_reference":
+            body["requested_first_deployment_profile"] = {**reference, "turn": 99}
+        elif reply_kind == "execution_started":
+            body["execution_started"] = True
+        encoded = b"not json" if reply_kind == "malformed" else json.dumps(body).encode()
         raise urllib.error.HTTPError(
-            request.full_url, 400, "refused", {}, io.BytesIO(json.dumps({
-                "error": "the current turn changed",
-                "helper_instance": "one",
-                "requested_first_deployment_profile": reference,
-                "execution_started": False,
-            }).encode()),
+            request.full_url, 500 if reply_kind == "server_error" else 400,
+            "refused", {}, io.BytesIO(encoded),
         )
 
     monkeypatch.setattr(urllib.request, "urlopen", _refusal)
-    client = SidecarScriptRunner(
-        base_url="http://127.0.0.1:1", repo="example/service",
-        first_deployment_profile=reference,
-    )
-    answer = client(cwd=reference["selection"]["candidate_cwd"], script="deploy.sh", env_file=None)
-    assert answer[0] != 0 and not no_answer_came_back(answer)
+    if client_kind == "script":
+        client = SidecarScriptRunner(
+            base_url="http://127.0.0.1:1", repo="example/service",
+            first_deployment_profile=reference,
+        )
+        answer = client(cwd=reference["selection"]["candidate_cwd"], script="deploy.sh", env_file=None)
+        assert answer[0] != 0
+        assert no_answer_came_back(answer) is (reply_kind != "exact")
+    else:
+        gate = SidecarLiveGateInvoker(
+            base_url="http://127.0.0.1:1", repo="example/service",
+            repo_path=Path(reference["selection"]["candidate_cwd"]),
+            driver_argv=["node", "gate.mjs"], first_deployment_profile=reference,
+        )
+        answer = gate.invoke(feature="generic", target="candidate")
+        assert answer.confirmed is (reply_kind == "exact")
+        assert answer.answer_lost is (reply_kind != "exact")
 
 
 @pytest.mark.parametrize("driver", [
