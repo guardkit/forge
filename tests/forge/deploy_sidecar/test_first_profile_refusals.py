@@ -334,3 +334,90 @@ def test_selected_profile_never_authorizes_other_work_or_candidate_launch_names(
     else:
         payload["launch_settings"] = ["CANDIDATE_LAUNCH"]
     selected.assert_refused(payload, reason)
+
+
+@pytest.mark.parametrize("failure", ["malformed", "unreadable"])
+def test_present_clone_profile_failure_never_uses_missing_profile_fallback(
+    selected: _SelectedCase, monkeypatch: pytest.MonkeyPatch, failure: str,
+) -> None:
+    payload = selected.payload()
+    payload.pop("first_deployment_profile")
+    profile = selected.repo / "deploy/profile.yaml"
+    profile.parent.mkdir(exist_ok=True)
+    profile.write_text("[]\n" if failure == "malformed" else PROFILE)
+    if failure == "unreadable":
+        read_text = Path.read_text
+
+        def denied(path: Path, *args: Any, **kwargs: Any) -> str:
+            if path == profile:
+                raise PermissionError("profile cannot be read")
+            return read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", denied)
+    monkeypatch.setattr(
+        service, "coordinator_recorded_build",
+        lambda: pytest.fail("a present unusable profile entered the absence fallback"),
+    )
+    status, body = selected.run(payload)
+    assert status == 400, body
+    assert selected.script_calls == selected.driver_calls == []
+
+
+@pytest.mark.parametrize("start_kind", [
+    "ordinary", "changed_candidate", "malformed", "nonordinary", "missing_commit", "refused_read",
+])
+def test_stale_clone_uses_only_the_ordinary_profile_at_the_recorded_start(
+    selected: _SelectedCase, monkeypatch: pytest.MonkeyPatch, start_kind: str,
+) -> None:
+    from forge.deploy.candidate_tree import FileAtCommit
+
+    recorded_start = selected.candidate
+    if start_kind == "changed_candidate":
+        _git(selected.repo, "checkout", "-q", "approved")
+        (selected.repo / "deploy/profile.yaml").write_text(
+            PROFILE.replace("script: deploy/deploy.sh", "script: deploy/other.sh"),
+        )
+        _git(selected.repo, "add", "deploy/profile.yaml")
+        _git(selected.repo, "commit", "-q", "-m", "candidate changes deployment profile")
+        selected.candidate = selected.joined = _git(selected.repo, "rev-parse", "HEAD")
+        selected.tree = _git(selected.repo, "rev-parse", "HEAD^{tree}")
+        _git(selected.repo, "checkout", "-q", "main")
+        selected.archive = asyncio.run(materialise_candidate_tree(selected.repo, "selected", selected.joined))
+    elif start_kind in ("malformed", "nonordinary"):
+        _git(selected.repo, "checkout", "-q", "-b", "unusable-start")
+        (selected.repo / "deploy").mkdir()
+        profile = selected.repo / "deploy/profile.yaml"
+        if start_kind == "malformed":
+            profile.write_text("[]\n")
+        else:
+            profile.symlink_to("missing-profile")
+        _git(selected.repo, "add", "deploy/profile.yaml")
+        _git(selected.repo, "commit", "-q", "-m", "unusable start profile")
+        recorded_start = _git(selected.repo, "rev-parse", "HEAD")
+        _git(selected.repo, "checkout", "-q", "main")
+    elif start_kind == "missing_commit":
+        recorded_start = "0" * 40
+    payload = selected.payload()
+    payload.pop("first_deployment_profile")
+    payload["declared_at"] = recorded_start
+    selected.record.connection.execute(
+        "UPDATE builds SET start_commit = ? WHERE build_id = ?", (recorded_start, BUILD),
+    )
+    selected.record.connection.commit()
+    if start_kind == "refused_read":
+        read_file = service.read_file_at_commit_sync
+
+        def refused(repo: Path, commit: str, name: str, **options: Any) -> FileAtCommit:
+            if commit == recorded_start and name == "deploy/profile.yaml":
+                return FileAtCommit(refusal="committed profile read unavailable")
+            return read_file(repo, commit, name, **options)
+
+        monkeypatch.setattr(service, "read_file_at_commit_sync", refused)
+    status, body = selected.run(payload)
+    assert selected.answer_calls == [BUILD]
+    if start_kind == "ordinary":
+        assert status == 200, body
+        assert len(selected.script_calls) == 1
+    else:
+        assert status == 400, body
+        assert selected.script_calls == selected.driver_calls == []
