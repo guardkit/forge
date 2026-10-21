@@ -3778,8 +3778,17 @@ class _RecordingGit:
         return await self._real.ensure_candidate_trees_excluded()
 
     async def materialise_candidate_tree(self, feature_id: str, sha: str) -> Any:
+        from dataclasses import replace
+
         self.calls.append(("materialise_candidate_tree", (feature_id, sha)))
-        return await self._real.materialise_candidate_tree(feature_id, sha)
+        laid = await self._real.materialise_candidate_tree(feature_id, sha)
+        return replace(laid, tree=await self._real.rev_parse(f"{sha}^{{tree}}"))
+
+    async def read_file_at_commit(self, commit: str, path: str, **options: Any) -> Any:
+        from forge.deploy.candidate_tree import read_file_at_commit
+
+        self.calls.append(("read_file_at_commit", (commit, path)))
+        return await read_file_at_commit(self._real._repo_root, commit, path, **options)
 
     async def remove_candidate_tree(
         self, feature_id: str, path: str | None = None
@@ -3836,6 +3845,18 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
         found the branch at all.
         """
         elsewhere = repo_root
+        (elsewhere / "deploy").mkdir()
+        (elsewhere / "deploy" / "profile.yaml").write_text(
+            "env_id: example\ncompose:\n  file: compose.yaml\n  script: deploy/run\n",
+            encoding="utf-8",
+        )
+        _git(elsewhere, "add", "deploy/profile.yaml")
+        _git(elsewhere, "commit", "-q", "-m", "existing deployment profile")
+        start = _git(elsewhere, "rev-parse", "HEAD")
+        _git(elsewhere, "push", "-q", "origin", "main")
+        _git(elsewhere, "checkout", "-q", f"autobuild/{FEATURE_ID}")
+        _git(elsewhere, "merge", "-q", "main", "-m", "carry existing profile")
+        _git(elsewhere, "checkout", "-q", "main")
         on_this_side = repo_root.parent / "no-checkout-here"
         on_this_side.mkdir()
         venue = _RecordingGit(elsewhere, origin_of(elsewhere))
@@ -3850,7 +3871,7 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
         )
         deps.git_surface = lambda repo, root: venue
 
-        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID, start_commit=start)
         outcome = await execute_merge_deploy(
             deps=deps,
             build_id=BUILD_ID,
@@ -3879,6 +3900,8 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
             "rev_parse",  # J's tree
             "ensure_candidate_trees_excluded",
             "materialise_candidate_tree",  # J's exact tree, for the check
+            "rev_parse",  # confirm the venue's archive tree receipt
+            "read_file_at_commit",  # the ordinary profile at the recorded start
             "remove_candidate_tree",
         ]
         # The candidate was laid out where the venue is, never on this side.
