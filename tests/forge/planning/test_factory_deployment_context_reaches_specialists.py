@@ -292,9 +292,14 @@ async def test_captured_reference_reaches_real_writers_and_coaches_after_restart
             return coach
 
         with (
+            monkeypatch.context() as specialist_runtime,
             patch("specialist_agent.orchestrator.session.Orchestrator._create_player", return_value=player),
             patch("specialist_agent.orchestrator.session.Orchestrator._create_coach", create_coach),
         ):
+            # The public API loads roles/ relative to the service working
+            # directory. Reproduce that supported runtime layout using this
+            # candidate's checkout; all generated output still goes to tmp_path.
+            specialist_runtime.chdir(fixtures.root)
             result = await run_specialist_mode(
                 role, command, wire, output_path=str(tmp_path / f"specialist-{len(calls)}")
             )
