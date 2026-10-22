@@ -1107,6 +1107,25 @@ def test_a_phrase_stopped_short_by_a_number_is_not_a_set() -> None:
     ) == []
 
 
+def test_a_phrase_starting_with_a_filler_or_not_yet_word_is_not_a_set() -> None:
+    # "with" is a filler word; "later" and its kin name work not yet done.
+    assert quantified_phrases(
+        "Set it up so that every later feature builds on the same base."
+    ) == []
+    assert quantified_phrases("List the plugins, each with its version file.") == []
+    for word in ("future", "next", "subsequent", "upcoming"):
+        assert quantified_phrases(f"Keep it simple so all {word} widgets can reuse it.") == []
+    # Skipped phrases take no slot: the genuine sets after them are still found.
+    mixed = quantified_phrases(
+        "Every later change reuses it, each with its own file. Fix every exporter. "
+        "Then each of its import jobs."
+    )
+    assert [(phrase, word) for phrase, word, _ in mixed] == [
+        ("every exporter", "exporter"),
+        ("each of its import jobs", "import"),
+    ]
+
+
 def test_plan_sizing_objects_do_not_consume_repository_set_slots() -> None:
     request = (
         "All existing tests must still pass. Keep each planned task to five or fewer "

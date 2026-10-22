@@ -123,6 +123,13 @@ _FILLER_WORDS = frozenset(
     {"the", "and", "for", "from", "that", "with", "this", "all", "add", "make"}
 )
 
+#: A quantified phrase starting with one of these is about work not yet
+#: done, not about things already in the repository: "every later feature
+#: builds on it" names no set to search for. English only, and short on
+#: purpose; "remaining" is not here because "every remaining handler" can
+#: mean handlers that exist now.
+_NOT_YET_WORDS = frozenset({"later", "future", "next", "subsequent", "upcoming"})
+
 _TOKEN = re.compile(r"[A-Za-z0-9]+")
 
 #: "all the count endpoints", "every route", "each of its handlers". English
@@ -1225,7 +1232,9 @@ def quantified_phrases(request_text: str) -> list[tuple[str, str, list[str]]]:
     The search word is the first word after the quantifier and determiner,
     a plural "s" removed, kept only when it is at least four letters long. A
     phrase cut short before its noun by a number ("each of the last 7 days")
-    names no set of things in the repository and is left out.
+    names no set of things in the repository and is left out. So is one whose
+    first word is a filler word ("each with its own file") or names work not
+    yet done ("every later change"): neither names things to search for.
     """
     text = request_text or ""
     instruction_only = _instruction_only_set_spans(text)
@@ -1250,7 +1259,7 @@ def quantified_phrases(request_text: str) -> list[tuple[str, str, list[str]]]:
             continue
         phrase = " ".join(match.group(0).split())
         first = _singular(match.group(2).split()[0])
-        if len(first) < 4:
+        if len(first) < 4 or first in _FILLER_WORDS or first in _NOT_YET_WORDS:
             continue
         if any(existing[0].lower() == phrase.lower() for existing in found):
             continue
