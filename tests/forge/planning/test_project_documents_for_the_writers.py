@@ -549,8 +549,8 @@ async def test_invalid_utf8_is_refused(tmp_path: Path) -> None:
 
 @pytest.mark.asyncio
 async def test_the_budget_counts_raw_bytes(tmp_path: Path) -> None:
-    """Multi-byte characters count by their bytes: 16,385 three-byte
-    characters are 49,155 bytes, over the 49,152-byte budget."""
+    """Multi-byte characters count by their bytes: 43,691 three-byte
+    characters are 131,073 bytes, over the 131,072-byte budget."""
     text = "—" * (PROJECT_DOCUMENTS_BUDGET_BYTES // 3 + 1)
     repo, sha = _commit_bytes(tmp_path, {DECLARED[0]: text.encode("utf-8")})
     runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
