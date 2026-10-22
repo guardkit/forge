@@ -787,6 +787,17 @@ def test_slot_two_names_its_own_preview_ports(own):
     assert entry["preview_ports"] == [8970, 8971]
 
 
+def test_slot_five_s_previews_skip_the_embedder_s_port_without_a_move(own):
+    """22 October 2026: 9000 is the embedder's on the sandbox's machine, so
+    slot 5's usual pair is 9001 and 9002; it is not a move off a usual pair."""
+    result = _run_own(slot="5")
+    assert result.exit_code == 0, result.output
+    entry = yaml.safe_load(own.volume[f"forge.yaml.{LEAF}-pending"])["planning"]["sandboxes"][KEY]
+    assert entry["preview_ports"] == [9001, 9002]
+    assert "previews on 9001 and 9002" in result.output
+    assert "Its previews move" not in result.output
+
+
 def test_a_sandbox_registered_before_its_preview_ports_and_grant_is_given_both_and_nothing_else(own):
     """The live case of 18 October 2026: an entry with neither line."""
     assert _run_own().exit_code == 0

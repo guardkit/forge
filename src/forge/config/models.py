@@ -1029,7 +1029,9 @@ class SandboxEntry(BaseModel):
         description=(
             "The review-preview ports this sandbox publishes on its machine "
             "(one sandbox per project, 18 October 2026): register-repo writes "
-            "slot k's 8950+10k and 8951+10k here, in the coordinator's and the "
+            "slot k's 8950+10k and 8951+10k here (slot 5's 9001 and 9002, since "
+            "no preview takes a service's port such as the embedder's 9000), in "
+            "the coordinator's and the "
             "sandbox's settings, for a sandbox of its own; when the project's "
             "deploy profile says it uses one of those itself (20 October 2026), "
             "the first two free ports from 8950+10k to 8959+10k instead. They replace the "

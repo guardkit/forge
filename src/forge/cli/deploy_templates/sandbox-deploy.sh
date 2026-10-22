@@ -107,10 +107,15 @@
 #       deploy helper  PUBLISH_ADDRESS:(8925 + 10k) -> 8125
 #       git daemon     PUBLISH_ADDRESS:(8918 + 10k) -> 9418
 #       two previews   127.0.0.1:(8950 + 10k) and 127.0.0.1:(8951 + 10k),
-#                      the same number inside and out. When the project
-#                      uses one of those itself, register-repo chooses two
-#                      others from (8950 + 10k) to (8959 + 10k) and prints
-#                      the sbx ports line that publishes them.
+#                      the same number inside and out, skipping any port a
+#                      service has (forge's sandbox_slots rule): slot 5's
+#                      are 9001 and 9002, since 9000 is the embedder's.
+#                      When the project uses one of those itself,
+#                      register-repo chooses two others from (8950 + 10k) to
+#                      (8959 + 10k), records them as the sandbox's
+#                      preview_ports and prints the sbx ports line that
+#                      publishes them; SANDBOX_PREVIEW_PORTS gives that pair
+#                      to a sandbox made (or made again) afterwards.
 #     Slot 0 is the shared sandbox's block (api-test-deploy), which is not
 #     made by this shape; a slot sandbox is 1 or more;
 #   - may reach only its own two doors and the three shared services on the
@@ -148,6 +153,10 @@
 #   SANDBOX_PUBLISH_ADDRESS  the address the runner, helper and git daemon are
 #                            published on (the machine's direct-link address)
 #   SANDBOX_GATEWAY_ADDRESS  the address the doors are reached at
+#   SANDBOX_PREVIEW_PORTS    optional: the two preview ports as first,second,
+#                            when forge chose other than the slot's usual pair
+#                            (the preview_ports register-repo recorded); both
+#                            must be in the slot's block and no service's
 #   The three shared services are FIXED for a slot sandbox (Codex R2): the
 #   model door 31823, the answer service 31821 and the embedder 9000.
 #   SANDBOX_MODEL_DOOR_PORT, SANDBOX_ANSWER_PORT and SANDBOX_EMBEDDER_PORT
@@ -250,7 +259,11 @@ NEVER_ON_THE_GATEWAY_FROM_A_SLOT=(31822 31824)
 SLOT_RUNNER_BASE=8924
 SLOT_HELPER_BASE=8925
 SLOT_GIT_DAEMON_BASE=8918
-SLOT_PREVIEW_BASES=(8950 8951)
+# A slot's preview block is (8950 + 10k) to (8959 + 10k); its usual pair is
+# the first two ports there that no service has (forge's sandbox_slots rule,
+# held equal to this by a test).
+SLOT_PREVIEW_BASE=8950
+SANDBOX_PREVIEW_PORTS="${SANDBOX_PREVIEW_PORTS:-}"
 SLOT_GIT_DOOR_BASE=31830
 SLOT_MEMORY_DOOR_BASE=31850
 # The two gateway services a project's own sandbox may never reach.
@@ -271,6 +284,27 @@ SHARED_SANDBOX_NAMES=(api-test-deploy)
 FACTORY_CHECK_RULES=(api.osv.dev:443 api.deps.dev:443)
 
 is_a_slot_sandbox() { [[ -n "${SANDBOX_SLOT}" ]]; }
+
+# True when the port is a factory service's in the slot layout (any slot's
+# runner, helper, git daemon or doors, slot 0's included) or a shared
+# service's fixed port. A preview never takes one; forge's
+# factory_service_ports() is the same set.
+is_a_service_port() {
+  local port="$1" k
+  for k in "${SLOT_EMBEDDER_PORT}" "${SLOT_MODEL_DOOR_PORT}" "${SLOT_ANSWER_PORT}"; do
+    ((port == k)) && return 0
+  done
+  for ((k = 0; k <= SLOT_MAX; k++)); do
+    if ((port == SLOT_RUNNER_BASE + 10 * k || port == SLOT_HELPER_BASE + 10 * k ||
+      port == SLOT_GIT_DAEMON_BASE + 10 * k)); then
+      return 0
+    fi
+    if ((k > 0 && (port == SLOT_GIT_DOOR_BASE + k || port == SLOT_MEMORY_DOOR_BASE + k))); then
+      return 0
+    fi
+  done
+  return 1
+}
 
 # A dotted IPv4 address, not loopback, not 0.0.0.0. Used for the two addresses
 # a slot sandbox is given; anything else is refused with a sentence.
@@ -343,8 +377,30 @@ if is_a_slot_sandbox; then
     "${SANDBOX_PUBLISH_ADDRESS}:$((SLOT_RUNNER_BASE + slot_offset)):8124"
     "${SANDBOX_PUBLISH_ADDRESS}:$((SLOT_GIT_DAEMON_BASE + slot_offset)):9418"
   )
-  for preview_base in "${SLOT_PREVIEW_BASES[@]}"; do
-    SLOT_PUBLISHES+=("127.0.0.1:$((preview_base + slot_offset)):$((preview_base + slot_offset))")
+  preview_first=$((SLOT_PREVIEW_BASE + slot_offset))
+  preview_last=$((preview_first + 9))
+  slot_previews=()
+  if [[ -n "${SANDBOX_PREVIEW_PORTS}" ]]; then
+    if [[ ! "${SANDBOX_PREVIEW_PORTS}" =~ ^([0-9]{4,5}),([0-9]{4,5})$ ]] ||
+      ((10#${BASH_REMATCH[1]} == 10#${BASH_REMATCH[2]})); then
+      log "FATAL: SANDBOX_PREVIEW_PORTS is '${SANDBOX_PREVIEW_PORTS}', and it names two different preview ports as first,second (the preview_ports forge register-repo recorded for this sandbox). Refusing to deploy."
+      exit 2
+    fi
+    for port in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}"; do
+      port=$((10#${port}))
+      if ((port < preview_first || port > preview_last)) || is_a_service_port "${port}"; then
+        log "FATAL: SANDBOX_PREVIEW_PORTS names ${port}, and slot ${SANDBOX_SLOT}'s previews take ports from ${preview_first} to ${preview_last} that no factory or shared service has. Refusing to deploy."
+        exit 2
+      fi
+      slot_previews+=("${port}")
+    done
+  else
+    for ((port = preview_first; port <= preview_last && ${#slot_previews[@]} < 2; port++)); do
+      is_a_service_port "${port}" || slot_previews+=("${port}")
+    done
+  fi
+  for port in "${slot_previews[@]}"; do
+    SLOT_PUBLISHES+=("127.0.0.1:${port}:${port}")
   done
   # Its own two doors, then the three shared services, all on the gateway.
   SLOT_DOOR_RULES=(
@@ -437,6 +493,9 @@ if is_a_slot_sandbox; then
     log "FATAL: two of the doors for ${SANDBOX_NAME} would share a port (${SLOT_DOOR_RULES[*]}). Give the model door, the answer service and the embedder ports of their own. Refusing to deploy."
     exit 2
   fi
+elif [[ -n "${SANDBOX_PREVIEW_PORTS}" ]]; then
+  log "FATAL: SANDBOX_PREVIEW_PORTS is set, and it is for a project's own sandbox only (with SANDBOX_SLOT). Leave it out. Refusing to deploy."
+  exit 2
 fi
 
 # True when the profile asked for the sandbox to carry the factory's services.

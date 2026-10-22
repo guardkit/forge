@@ -443,6 +443,8 @@ the same pinned image as the model door's, held to `estate-pins.conf`.
    estate with one sandbox, and is left unset once any sandbox has its own.
 6. The same entry, in the coordinator's and the sandbox's settings, names the
    sandbox's own review-preview ports, `preview_ports: [8950+10k, 8951+10k]`
+   (slot 5's are 9001 and 9002: no preview takes a service's port, and 9000 is
+   the embedder's)
    (`register-repo --slot <k>` writes them; running it again adds them to an
    entry registered before 18 October 2026 and changes nothing else). They
    replace the published ports in the project's deploy profile, which cannot

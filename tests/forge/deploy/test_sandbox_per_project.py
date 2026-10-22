@@ -28,6 +28,7 @@ from pathlib import Path
 import pytest
 
 import forge.cli.deploy_templates as templates
+from forge.config.sandbox_slots import ANSWER_PORT, EMBEDDER_PORT, MODEL_DOOR_PORT, slot_ports
 
 TEMPLATES = Path(templates.__file__).resolve().parent
 ROOT = Path(__file__).resolve().parents[3]
@@ -179,6 +180,51 @@ class TestAProjectsOwnSandbox:
         assert result.returncode == 2
         assert setting in result.stdout + result.stderr
         assert not [line for line in sbx if line.startswith(("create ", "policy allow "))]
+
+    @pytest.mark.parametrize("slot", range(1, 20))
+    def test_every_slot_publishes_the_preview_pair_forge_chooses(self, slot_repo, tmp_path, slot):
+        """22 October 2026: the recipe and forge's sandbox_slots rule agree for
+        every slot, slot 5 (9001 and 9002, since 9000 is the embedder's)
+        included, and slots 1 to 4 keep the ports they had."""
+        result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_SLOT=str(slot))
+        assert result.returncode == 0, result.stdout + result.stderr
+        created = [line for line in sbx if line.startswith("create ")][0]
+        published = [part for part in created.split() if part.startswith("127.0.0.1:")]
+        pair = slot_ports(slot).previews
+        assert published == [f"127.0.0.1:{port}:{port}" for port in pair]
+        if slot <= 4:
+            assert pair == (8950 + 10 * slot, 8951 + 10 * slot)
+        if slot == 5:
+            assert pair == (9001, 9002)
+
+    def test_the_recipe_s_fixed_shared_ports_are_forge_s(self):
+        text = (TEMPLATES / "sandbox-deploy.sh").read_text()
+        for setting, port in (("SLOT_EMBEDDER_PORT", EMBEDDER_PORT),
+                              ("SLOT_MODEL_DOOR_PORT", MODEL_DOOR_PORT),
+                              ("SLOT_ANSWER_PORT", ANSWER_PORT)):
+            assert f"\n{setting}={port}\n" in text
+
+    def test_the_pair_forge_chose_is_published_when_given(self, slot_repo, tmp_path):
+        result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_PREVIEW_PORTS="8962,8963")
+        assert result.returncode == 0, result.stdout + result.stderr
+        created = [line for line in sbx if line.startswith("create ")][0]
+        assert [p for p in created.split() if p.startswith("127.0.0.1:")] == [
+            "127.0.0.1:8962:8962", "127.0.0.1:8963:8963"]
+
+    @pytest.mark.parametrize("change,words", [
+        ({"SANDBOX_PREVIEW_PORTS": "8962"}, "two different preview ports"),
+        ({"SANDBOX_PREVIEW_PORTS": "8962,8962"}, "two different preview ports"),
+        ({"SANDBOX_PREVIEW_PORTS": "8970,8971"}, "from 8960 to 8969"),
+        ({"SANDBOX_PREVIEW_PORTS": "8960,8964"}, "names 8964"),
+        ({"SANDBOX_SLOT": "5", "SANDBOX_PREVIEW_PORTS": "9000,9001"}, "names 9000"),
+        ({"SANDBOX_SLOT": "", "SANDBOX_NAME": "a-shared-shape",
+          "SANDBOX_PREVIEW_PORTS": "8960,8961"}, "for a project's own sandbox only"),
+    ])
+    def test_a_preview_pair_that_will_not_do_is_refused_before_anything(self, slot_repo, tmp_path, change, words):
+        result, sbx, other = _drive(slot_repo, tmp_path, "prepare", **change)
+        assert result.returncode == 2, result.stdout
+        assert words in result.stdout
+        assert sbx == [] and other == []
 
     def test_the_shared_shape_is_created_as_before_with_no_disk_sizes(self, slot_repo, tmp_path):
         result, sbx, _ = _drive(slot_repo, tmp_path, "prepare", SANDBOX_SLOT="",

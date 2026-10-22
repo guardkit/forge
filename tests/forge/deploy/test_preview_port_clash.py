@@ -32,6 +32,7 @@ import pytest
 from forge.adapters.sqlite.connect import connect_writer
 from forge.config.models import SandboxEntry
 from forge.config.sandbox_slots import (
+    SHARED_SERVICE_PORTS,
     PreviewPortsRefused,
     choose_preview_ports,
     factory_service_ports,
@@ -144,6 +145,43 @@ def test_a_block_left_with_only_service_ports_is_refused_naming_them():
     words = str(refused.value)
     assert "uses 7 of them" in words
     assert "the factory keeps 8964, 8965, 8968 for other slots' services" in words
+
+
+def test_slots_one_to_four_keep_exactly_the_preview_ports_they_had():
+    """22 October 2026: the fixed shared ports moved only slot 5's pair."""
+    expected = {1: (8960, 8961), 2: (8970, 8971), 3: (8980, 8981), 4: (8990, 8991)}
+    for slot, pair in expected.items():
+        assert slot_ports(slot).previews == pair
+        assert choose_preview_ports(slot, set()) == pair
+
+
+def test_a_preview_never_takes_a_shared_service_s_fixed_port():
+    """The embedder listens on 9000 on every address of the sandbox's machine,
+    and 9000 is 8950 + 10 * 5, so slot 5's usual pair is 9001 and 9002."""
+    assert set(SHARED_SERVICE_PORTS) == {9000, 31821, 31823}
+    assert set(SHARED_SERVICE_PORTS) <= factory_service_ports()
+    assert slot_ports(5).previews == (9001, 9002)
+    assert choose_preview_ports(5, set()) == (9001, 9002)
+    assert choose_preview_ports(5, {9001}) == (9002, 9003)
+    for slot in range(6, 20):
+        assert slot_ports(slot).previews == (8950 + 10 * slot, 8951 + 10 * slot)
+
+
+def test_no_slot_s_usual_pair_meets_any_other_slot_s_ports():
+    every_pair = [set(slot_ports(slot).previews) for slot in range(1, 20)]
+    assert len(set().union(*every_pair)) == 2 * 19, "no two slots share a preview port"
+    services = factory_service_ports()
+    for slot in range(1, 20):
+        ports = slot_ports(slot)
+        assert not services & set(ports.previews)
+        assert set(ports.previews) <= set(preview_block(slot))
+
+
+def test_a_block_left_with_only_shared_and_service_ports_is_refused_naming_them():
+    with pytest.raises(PreviewPortsRefused) as refused:
+        choose_preview_ports(5, {9001, 9002, 9003, 9006, 9007})
+    words = str(refused.value)
+    assert "the factory keeps 9000, 9004, 9005, 9008 for other slots' services and the shared services" in words
 
 
 def test_each_slot_s_block_is_its_own():

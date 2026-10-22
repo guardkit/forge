@@ -25,6 +25,14 @@ preview in slot *k*. Each slot therefore owns a block of ten preview ports,
 first two the project does not use itself and no slot's factory service has
 (slot 4's runner is 8964, in slot 1's block). With no clash that is the usual
 pair, so no other project's ports move.
+
+The shared services' fixed ports (22 October 2026). Every slot sandbox reaches
+three shared services on the gateway at fixed ports: the embedder on 9000, the
+model door on 31823 and the answer service on 31821. 9000 is also 8950 + 10·5,
+and the embedder listens on every address of the sandbox's machine, so slot 5's
+old usual pair (9000, 9001) could never be published. A preview never takes a
+fixed shared port either, so slot 5's usual pair is 9001 and 9002; every other
+slot's usual pair is 8950 + 10·*k* and 8951 + 10·*k* as before.
 """
 
 from __future__ import annotations
@@ -33,9 +41,13 @@ from dataclasses import dataclass
 from typing import Iterable
 
 __all__ = [
+    "ANSWER_PORT",
+    "EMBEDDER_PORT",
     "LEGACY_SANDBOX",
     "MAX_SLOT",
+    "MODEL_DOOR_PORT",
     "PreviewPortsRefused",
+    "SHARED_SERVICE_PORTS",
     "SlotPorts",
     "choose_preview_ports",
     "factory_service_ports",
@@ -62,6 +74,14 @@ PREVIEW_BASES: tuple[int, int] = (8950, 8951)
 GIT_DOOR_BASE: int = 31830
 MEMORY_DOOR_BASE: int = 31850
 
+#: The three shared services every slot sandbox reaches on the gateway, at
+#: fixed ports (the recipe's SLOT_EMBEDDER_PORT, SLOT_MODEL_DOOR_PORT and
+#: SLOT_ANSWER_PORT; a test holds them equal). No preview ever takes one.
+EMBEDDER_PORT: int = 9000
+MODEL_DOOR_PORT: int = 31823
+ANSWER_PORT: int = 31821
+SHARED_SERVICE_PORTS: tuple[int, ...] = (EMBEDDER_PORT, MODEL_DOOR_PORT, ANSWER_PORT)
+
 #: The highest slot, as the recipe and rollout-sandbox take it. Nineteen keeps
 #: every Git door port (31831-31849) below the memory doors' (31851-31869);
 #: past 19 a Git door port would be another slot's memory door port.
@@ -81,21 +101,37 @@ class SlotPorts:
     memory_door: int
 
 
-def slot_ports(slot: int) -> SlotPorts:
-    """Slot ``slot``'s ports. Raises ``ValueError`` for a slot outside 1 to
-    :data:`MAX_SLOT` (slot 0 is the shared sandbox's, which gets no door)."""
+def _check_slot(slot: int) -> None:
     if isinstance(slot, bool) or not isinstance(slot, int) or not 1 <= slot <= MAX_SLOT:
         raise ValueError(
             f"a sandbox's slot is a whole number from 1 to {MAX_SLOT} (slot 0 is "
             f"the ports of {LEGACY_SANDBOX}, which has no Git door)"
         )
+
+
+def _free_in_block(slot: int, taken: "set[int] | frozenset[int]") -> list[int]:
+    """The ports of slot ``slot``'s preview block that are neither in ``taken``
+    nor a factory or shared service's (:func:`factory_service_ports`)."""
+    services = factory_service_ports()
+    return [port for port in preview_block(slot) if port not in taken and port not in services]
+
+
+def slot_ports(slot: int) -> SlotPorts:
+    """Slot ``slot``'s ports. Raises ``ValueError`` for a slot outside 1 to
+    :data:`MAX_SLOT` (slot 0 is the shared sandbox's, which gets no door).
+
+    Its ``previews`` are the slot's usual pair: the first two ports of its
+    block that no service has (:func:`choose_preview_ports` for a project that
+    uses none of them), 8950 + 10·*k* and 8951 + 10·*k* except in slot 5."""
+    _check_slot(slot)
     step = SLOT_STEP * slot
+    first, second = _free_in_block(slot, frozenset())[:2]
     return SlotPorts(
         slot=slot,
         runner=RUNNER_BASE + step,
         helper=HELPER_BASE + step,
         git_daemon=GIT_DAEMON_BASE + step,
-        previews=(PREVIEW_BASES[0] + step, PREVIEW_BASES[1] + step),
+        previews=(first, second),
         git_door=GIT_DOOR_BASE + slot,
         memory_door=MEMORY_DOOR_BASE + slot,
     )
@@ -110,22 +146,32 @@ def preview_block(slot: int) -> range:
     8959 + 10·*k*. No other slot's preview block overlaps it, but three of its
     ports may be other slots' factory services (8954 + 10·*k* and 8955 + 10·*k*
     are slot *k* + 3's runner and helper, 8958 + 10·*k* slot *k* + 4's git
-    daemon), which :func:`choose_preview_ports` skips. Raises ``ValueError``
-    for a slot outside 1 to :data:`MAX_SLOT`, as :func:`slot_ports` does."""
-    first = slot_ports(slot).previews[0]
+    daemon), and slot 5's first port is the embedder's 9000, all of which
+    :func:`choose_preview_ports` skips. Raises ``ValueError`` for a slot
+    outside 1 to :data:`MAX_SLOT`, as :func:`slot_ports` does."""
+    _check_slot(slot)
+    first = PREVIEW_BASES[0] + SLOT_STEP * slot
     return range(first, first + SLOT_STEP)
 
 
 def factory_service_ports() -> frozenset[int]:
     """Every port the slot layout gives a factory service of any slot, slot 0's
     included: the build runner, the deploy helper and the git daemon, and the
-    two doors. A preview never takes one (Codex review R1, 20 October 2026):
-    slot 4's runner and helper are 8964 and 8965, inside slot 1's block. The
+    two doors; and the three shared services' fixed ports
+    (:data:`SHARED_SERVICE_PORTS`). A preview never takes one (Codex review R1,
+    20 October 2026): slot 4's runner and helper are 8964 and 8965, inside
+    slot 1's block, and the embedder's 9000 is the first port of slot 5's. The
     slots' usual preview pairs are never among them."""
-    reserved: set[int] = {RUNNER_BASE, HELPER_BASE, GIT_DAEMON_BASE}
+    reserved: set[int] = {RUNNER_BASE, HELPER_BASE, GIT_DAEMON_BASE, *SHARED_SERVICE_PORTS}
     for slot in range(1, MAX_SLOT + 1):
-        ports = slot_ports(slot)
-        reserved |= {ports.runner, ports.helper, ports.git_daemon, ports.git_door, ports.memory_door}
+        step = SLOT_STEP * slot
+        reserved |= {
+            RUNNER_BASE + step,
+            HELPER_BASE + step,
+            GIT_DAEMON_BASE + step,
+            GIT_DOOR_BASE + slot,
+            MEMORY_DOOR_BASE + slot,
+        }
     return frozenset(reserved)
 
 
@@ -141,12 +187,17 @@ def choose_preview_ports(slot: int, used: "Iterable[int]") -> tuple[int, int]:
     block = preview_block(slot)
     taken = {int(port) for port in used}
     services = factory_service_ports()
-    free = [port for port in block if port not in taken and port not in services]
+    free = _free_in_block(slot, taken)
     if len(free) < 2:
         mine = sorted(port for port in block if port in taken)
         kept = sorted(port for port in block if port in services and port not in taken)
+        whose = (
+            "other slots' services and the shared services"
+            if any(port in SHARED_SERVICE_PORTS for port in kept)
+            else "other slots' services"
+        )
         kept_text = (
-            f", and the factory keeps {', '.join(str(p) for p in kept)} for other slots' services"
+            f", and the factory keeps {', '.join(str(p) for p in kept)} for {whose}"
             if kept
             else ""
         )
