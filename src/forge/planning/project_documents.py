@@ -54,9 +54,9 @@ __all__ = [
 ]
 
 #: The most project-document text, in bytes, given in full to a planning
-#: writer: instruction files plus binding documents together (about 12,000
+#: writer: instruction files plus binding documents together (about 32,000
 #: tokens). The same value GuardKit uses for the Coach.
-PROJECT_DOCUMENTS_BUDGET_BYTES: int = 48 * 1024
+PROJECT_DOCUMENTS_BUDGET_BYTES: int = 128 * 1024
 
 #: The repository instruction files GuardKit's selector adds automatically,
 #: in its order.

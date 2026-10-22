@@ -1160,3 +1160,13 @@ async def test_a_run_past_the_door_before_documents_were_read_says_so_once(
     assert not any(raw for _c, _p, raw in tree.reads)
     said = [r for r in caplog.records if "has no project documents recorded" in r.getMessage()]
     assert len(said) == 1
+
+
+def test_budget_is_128_kib_the_same_value_guardkit_uses_for_the_coach() -> None:
+    """Forge's planning budget and GuardKit's Coach budget are kept in step.
+
+    GuardKit's ``PROJECT_DOCUMENTS_BUDGET_BYTES`` (in
+    ``guardkit/orchestrator/harness/selector.py``) has its own test pinning
+    the same number; change both together.
+    """
+    assert PROJECT_DOCUMENTS_BUDGET_BYTES == 131_072

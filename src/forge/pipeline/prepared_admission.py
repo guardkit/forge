@@ -715,7 +715,7 @@ async def check_supplied_bundle(
     #    admission refuses exactly what planning and the Coach would refuse —
     #    declared instruction files present and resolvable, binding documents
     #    ordinary files of strict UTF-8 at their exact committed bytes, and the
-    #    48 KiB budget. Opt-in: nothing is judged unless binding documents are
+    #    128 KiB budget. Opt-in: nothing is judged unless binding documents are
     #    declared.
     declared, why = read_declared_project_documents(config_text)
     if why:
