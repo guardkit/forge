@@ -323,6 +323,7 @@ async def _build_orchestrator(
     seq_counter: Optional[list[int]] = None,
     clock: Optional[FakeClock] = None,
     default_timeout_seconds: float = 5.0,
+    tell_seat_time_budget: bool = False,
 ) -> tuple[
     DispatchOrchestrator,
     DiscoveryCache,
@@ -352,6 +353,7 @@ async def _build_orchestrator(
         timeout=timeout,
         publisher=publisher,
         db_writer=db_writer,
+        tell_seat_time_budget=tell_seat_time_budget,
     )
     return orchestrator, cache, registry, transport, publisher, db_writer
 
@@ -1040,6 +1042,161 @@ class TestSeamCorrelationKeyContract:
         import re
 
         assert re.fullmatch(r"[0-9a-f]{32}", correlation_key)
+
+
+# ---------------------------------------------------------------------------
+# The seat is told its time budget (23 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class _RecordingNats:
+    """A NATS client double that keeps every published body."""
+
+    def __init__(self) -> None:
+        self.bodies: list[bytes] = []
+
+    async def publish(
+        self, subject: str, body: bytes, headers: dict[str, str] | None = None
+    ) -> None:
+        self.bodies.append(body)
+
+
+async def _dispatch_once(
+    orchestrator: DispatchOrchestrator,
+    transport: FakeReplyChannel,
+    command_args: dict[str, Any] | None,
+) -> None:
+    """Run one dispatch to completion, answering it as the seat would."""
+    dispatch_task = asyncio.create_task(
+        orchestrator.dispatch(
+            capability="review",
+            parameters=[],
+            command="feature_plan",
+            command_args=command_args,
+        )
+    )
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if transport.subscribed_keys:
+            break
+    transport.emit_reply(
+        transport.subscribed_keys[-1],
+        source_agent_id="specialist-a",
+        payload={"agent_id": "specialist-a"},
+    )
+    await dispatch_task
+
+
+def _record_command_args(publisher: FakePublisher) -> list[dict[str, Any] | None]:
+    """Wrap ``publisher`` so each published ``command_args`` is kept."""
+    seen: list[dict[str, Any] | None] = []
+    original = publisher.publish_dispatch
+
+    async def _publish(
+        attempt: DispatchAttempt,
+        parameters: list[DispatchParameter],
+        **kwargs: Any,
+    ) -> None:
+        seen.append(kwargs.get("command_args"))
+        await original(attempt, parameters, **kwargs)
+
+    publisher.publish_dispatch = _publish  # type: ignore[method-assign]
+    return seen
+
+
+class TestSeatTimeBudget:
+    """A composition that opts in tells the seat how long it has: the same
+    cut-off the timeout coordinator enforces, less the margin. Nothing else
+    in the command changes, and a composition that does not opt in sends
+    exactly what it sent before."""
+
+    CALLER_ARGS: dict[str, Any] = {
+        "feature_id": "FEAT-0001",
+        "spec_feature": "Feature: x",
+        "spec_summary": "summary",
+        "target_repo_descriptor": {"repo": "example"},
+    }
+
+    @pytest.mark.asyncio
+    async def test_the_budget_is_off_unless_a_composition_asks_for_it(self) -> None:
+        orchestrator, cache, _r, transport, publisher, _db = (
+            await _build_orchestrator(default_timeout_seconds=3600.0)
+        )
+        await _populate_cache(cache)
+        seen = _record_command_args(publisher)
+
+        await _dispatch_once(orchestrator, transport, dict(self.CALLER_ARGS))
+
+        assert seen == [self.CALLER_ARGS]
+
+    @pytest.mark.asyncio
+    async def test_the_command_carries_the_cut_off_less_the_margin(self) -> None:
+        orchestrator, cache, _r, transport, publisher, _db = (
+            await _build_orchestrator(
+                default_timeout_seconds=3600.0, tell_seat_time_budget=True
+            )
+        )
+        await _populate_cache(cache)
+        seen = _record_command_args(publisher)
+        caller_args = dict(self.CALLER_ARGS)
+
+        await _dispatch_once(orchestrator, transport, caller_args)
+
+        assert seen == [{**self.CALLER_ARGS, "time_budget_seconds": 3480}]
+        assert isinstance(seen[0]["time_budget_seconds"], int)  # type: ignore[index]
+        # The caller's own dictionary is not changed.
+        assert caller_args == self.CALLER_ARGS
+
+    @pytest.mark.asyncio
+    async def test_a_short_cut_off_gets_a_proportionate_margin(self) -> None:
+        orchestrator, cache, _r, transport, publisher, _db = (
+            await _build_orchestrator(
+                default_timeout_seconds=60.0, tell_seat_time_budget=True
+            )
+        )
+        await _populate_cache(cache)
+        seen = _record_command_args(publisher)
+
+        await _dispatch_once(orchestrator, transport, None)
+
+        assert seen == [{"time_budget_seconds": 54}]
+
+    @pytest.mark.asyncio
+    async def test_the_budget_reaches_the_wire_as_an_argument(self) -> None:
+        from forge.adapters.nats.specialist_dispatch import (
+            NatsSpecialistDispatchAdapter,
+        )
+        import json
+
+        fake_clock = FakeClock()
+        cache = DiscoveryCache(clock=fake_clock)
+        transport = FakeReplyChannel()
+        registry = CorrelationRegistry(transport=transport)
+        timeout = TimeoutCoordinator(
+            registry=_RegistryWaitAdapter(registry),
+            clock=fake_clock,
+            default_timeout_seconds=3600.0,
+        )
+        nats = _RecordingNats()
+        orchestrator = DispatchOrchestrator(
+            cache=cache,
+            registry=registry,
+            timeout=timeout,
+            publisher=NatsSpecialistDispatchAdapter(nats, registry, clock=fake_clock),
+            db_writer=SqliteHistoryWriter.in_memory(),
+            tell_seat_time_budget=True,
+        )
+        await _populate_cache(cache)
+
+        await _dispatch_once(orchestrator, transport, dict(self.CALLER_ARGS))
+
+        (body,) = nats.bodies
+        envelope = json.loads(body)
+        assert envelope["payload"]["command"] == "feature_plan"
+        assert envelope["payload"]["args"] == {
+            **self.CALLER_ARGS,
+            "time_budget_seconds": 3480,
+        }
 
 
 # The ``integration_contract`` marker is registered project-wide in

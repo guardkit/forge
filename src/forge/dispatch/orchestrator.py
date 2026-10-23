@@ -47,7 +47,7 @@ from forge.dispatch.persistence import (
     persist_resolution,
 )
 from forge.dispatch.reply_parser import parse_reply
-from forge.dispatch.timeout import TimeoutCoordinator
+from forge.dispatch.timeout import TimeoutCoordinator, seat_time_budget_seconds
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +65,11 @@ _MIN_CONFIDENCE: float = 0.7
 # giving the ordering tests (which do not care about the verb) an ergonomic
 # call shape. It never routes to a deployed handler (M2/M3, DISPATCHFMT+ S2).
 _DEFAULT_DISPATCH_COMMAND: str = "dispatch"
+
+# The command argument that tells the seat how long it has (23 October 2026):
+# a whole number of seconds, from :func:`seat_time_budget_seconds` applied to
+# the same cut-off the timeout coordinator enforces. Optional for the seat.
+SEAT_TIME_BUDGET_ARG: str = "time_budget_seconds"
 
 
 class DispatchCommandPublisher(Protocol):
@@ -136,6 +141,10 @@ class DispatchOrchestrator:
         publisher: Transport-side :class:`DispatchCommandPublisher`.
         db_writer: SQLite-backed :class:`SqliteHistoryWriter` for the
             write-before-send persistence step.
+        tell_seat_time_budget: When true, every command carries
+            :data:`SEAT_TIME_BUDGET_ARG`, derived from ``timeout``'s own
+            cut-off, so the seat can stop before Forge's cut-off fires.
+            Off by default; compositions opt in.
     """
 
     def __init__(
@@ -145,12 +154,15 @@ class DispatchOrchestrator:
         timeout: TimeoutCoordinator,
         publisher: DispatchCommandPublisher,
         db_writer: SqliteHistoryWriter,
+        *,
+        tell_seat_time_budget: bool = False,
     ) -> None:
         self._cache = cache
         self._registry = registry
         self._timeout = timeout
         self._publisher = publisher
         self._db_writer = db_writer
+        self._tell_seat_time_budget = tell_seat_time_budget
 
     async def dispatch(
         self,
@@ -288,6 +300,15 @@ class DispatchOrchestrator:
             attempt_no=attempt_no,
             retry_of=retry_of,
         )
+        if self._tell_seat_time_budget:
+            # One source of truth: the cut-off ``wait_with_timeout`` enforces
+            # below. A new dict, so the caller's arguments are not changed.
+            command_args = {
+                **(command_args or {}),
+                SEAT_TIME_BUDGET_ARG: seat_time_budget_seconds(
+                    self._timeout.default_timeout_seconds
+                ),
+            }
         await self._publisher.publish_dispatch(
             attempt,
             parameters,

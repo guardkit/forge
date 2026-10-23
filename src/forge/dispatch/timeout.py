@@ -83,6 +83,34 @@ DEFAULT_TIMEOUT_SECONDS: float = 900.0
 # cut-off — the wait continues to the full ``DEFAULT_TIMEOUT_SECONDS``.
 INTERIM_WARN_SECONDS: float = 60.0
 
+# How much sooner than Forge's own cut-off a seat is told to finish
+# (23 October 2026). A seat that does not know the cut-off starts another
+# long round it cannot finish, and the stage ends as a bare ``local_timeout``
+# instead of with the seat's own last answer. The budget the seat is told is
+# the cut-off less 120 seconds, or less a tenth of it when the cut-off is short,
+# so the answer has time to travel back before the cut-off fires.
+SEAT_BUDGET_MARGIN_SECONDS: float = 120.0
+SEAT_BUDGET_MARGIN_FRACTION: float = 0.1
+
+
+def seat_time_budget_seconds(timeout_seconds: float) -> int:
+    """The whole seconds a seat is told it has, for a cut-off of ``timeout_seconds``.
+
+    The cut-off less :data:`SEAT_BUDGET_MARGIN_SECONDS`, or less
+    :data:`SEAT_BUDGET_MARGIN_FRACTION` of it when that is smaller; rounded
+    down, and never below one second.
+
+    Raises:
+        ValueError: If ``timeout_seconds`` is not strictly positive.
+    """
+    if timeout_seconds <= 0:
+        raise ValueError(
+            f"timeout_seconds must be strictly positive, got {timeout_seconds!r}",
+        )
+    margin = min(SEAT_BUDGET_MARGIN_SECONDS, timeout_seconds * SEAT_BUDGET_MARGIN_FRACTION)
+    return max(1, int(timeout_seconds - margin))
+
+
 # Diagnostic mirror of the reply subject the registry is awaiting on:
 # nats-core ``Topics.Agents.RESULT`` == the adapter's
 # ``RESULT_SUBJECT_TEMPLATE`` (``agents.result.{agent_id}``, 3-token, D2).

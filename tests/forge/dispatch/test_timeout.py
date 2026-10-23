@@ -45,6 +45,7 @@ from forge.dispatch.timeout import (
     DEFAULT_TIMEOUT_SECONDS,
     INTERIM_WARN_SECONDS,
     TimeoutCoordinator,
+    seat_time_budget_seconds,
 )
 
 
@@ -856,3 +857,34 @@ class TestRemainderCutoffFiresThroughAbsorbedCancel:
         )
         # Unsubscribe-on-timeout invariant holds end to end.
         assert key not in registry._bindings
+
+
+# ---------------------------------------------------------------------------
+# The budget a seat is told (23 October 2026)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("cut_off", "budget"),
+    [
+        (3600.0, 3480),  # the planning cut-off: 120 seconds of margin
+        (900.0, 810),  # a tenth is smaller than 120 seconds
+        (1200.0, 1080),  # both margins agree
+        (60.0, 54),
+        (1.5, 1),  # rounded down
+        (0.5, 1),  # never below one second
+    ],
+)
+def test_the_seat_budget_is_the_cut_off_less_the_margin(
+    cut_off: float, budget: int
+) -> None:
+    told = seat_time_budget_seconds(cut_off)
+    assert told == budget
+    assert isinstance(told, int)
+    assert told > 0
+
+
+@pytest.mark.parametrize("cut_off", [0.0, -1.0])
+def test_the_seat_budget_refuses_a_cut_off_that_is_not_positive(cut_off: float) -> None:
+    with pytest.raises(ValueError, match="strictly positive"):
+        seat_time_budget_seconds(cut_off)

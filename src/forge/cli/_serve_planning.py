@@ -1091,6 +1091,8 @@ async def compose_planning_consumer_and_dispatch(
             timeout=timeout_coordinator,
             publisher=dispatch_adapter,
             db_writer=history_writer,
+            # The seat is told the cut-off above, less a margin (23 Oct 2026).
+            tell_seat_time_budget=True,
         )
 
         # Feed the discovery cache from the fleet registry. The watcher
