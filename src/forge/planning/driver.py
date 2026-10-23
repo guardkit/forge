@@ -98,6 +98,7 @@ from forge.planning.factory_deployment_context import (
     ensure_factory_context,
     record_factory_dispatch,
 )
+from forge.planning import memory_decisions
 from forge.planning.project_documents import (
     ProjectDocument,
     context_texts,
@@ -882,7 +883,8 @@ On a REWRITE round the two optional arguments carry the owner's note VERBATIM
 first-round dispatch passes neither.
 
 ``context`` carries the recorded project and reference documents in their
-existing order, followed by the immutable factory deployment interface for new
+existing order, then the project's decision records from memory when the door
+recorded some, followed by the immutable factory deployment interface for new
 runs. Legacy runs retain their original context. Every rewrite uses the same
 recorded bytes."""
 
@@ -1796,6 +1798,10 @@ class PlanningDriverDeps:
     # identities whose answer to a planning card counts as well as the run's
     # pinned approver. Empty (the default) = only the pinned approver.
     additional_approvers: tuple[str, ...] = ()
+    # The fleet-memory reader (``read_records``) the door asks once per run for
+    # the project's decision records (23 October 2026). None, or a reader
+    # without ``read_records`` (memory off) = nothing searched, said plainly.
+    memory_reader: Any | None = None
 
 
 @dataclass(frozen=True)
@@ -3088,7 +3094,55 @@ class PlanningRunDriver:
         if declarations is None:
             return None
         memory_project, declared = declarations
+        await self._recall_memory_decisions(
+            correlation_id, target_repo, memory_project, self._request_text_of(row)
+        )
         return start_commit, target_branch, memory_project, declared
+
+    async def _recall_memory_decisions(
+        self, correlation_id: str, target_repo: str, memory_project: str, request_text: str
+    ) -> None:
+        """Search the project's memory once for its decision records and record
+        what will be sent (23 October 2026). Never fails the run: memory off, a
+        name the repository was not granted, a failed search or no records are
+        recorded as the outcome and the writers are sent what they always were.
+        A run that already has the outcome recorded searches nothing again."""
+        deps = self._deps
+        if memory_decisions.recorded(deps.store, correlation_id) is not None:
+            return
+        read = getattr(deps.memory_reader, "read_records", None)
+        if read is None:
+            records, why_not = None, "memory is not switched on for this factory"
+        else:
+            # Only a name the repository was granted at registration is read,
+            # the same rule as the build card's priors (design section 2.4a).
+            sandboxes = getattr(deps.planning_config, "sandboxes", None) or {}
+            entry = sandboxes.get(target_repo) if hasattr(sandboxes, "get") else None
+            try:
+                records, why_not = await read(
+                    memory_project=memory_project,
+                    granted_memory_projects=tuple(getattr(entry, "memory_projects", None) or ()),
+                    payload_types=(memory_decisions.PAYLOAD_TYPE,),
+                    domain_tags=(memory_decisions.DOMAIN_TAG,),
+                    query=request_text,
+                    token_budget=memory_decisions.BUDGET_BYTES // 4,
+                    purpose=f"planning run {correlation_id}",
+                )
+            except Exception as exc:  # noqa: BLE001 — evidence, never a failed leg
+                records, why_not = None, f"the memory search raised {type(exc).__name__}"
+        result = memory_decisions.outcome(memory_project, records, why_not)
+        memory_decisions.record(deps.store, correlation_id, result)
+        logger.info("planning driver: run %s — %s", correlation_id, result["detail"])
+
+    def _recorded_memory_decisions(
+        self, correlation_id: str
+    ) -> tuple[str | None, dict[str, Any] | None]:
+        """``(text to send or None, receipt or None)``; both None for a run
+        whose door ran before decision records were searched."""
+        result = memory_decisions.recorded(self._deps.store, correlation_id)
+        if result is None:
+            return None, None
+        return result.get("text"), memory_decisions.receipt(result)
 
     async def _start_point(
         self, correlation_id: str, target_repo: str, repo_path: str
@@ -3962,6 +4016,11 @@ class PlanningRunDriver:
             await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
             return None
         texts = context_texts(documents) + reference_context_texts(reference_files)
+        # The project's decision records from memory, as the door recorded
+        # them, before the factory reference. None recorded: nothing is added.
+        memory_text, memory_receipt = self._recorded_memory_decisions(correlation_id)
+        if memory_text:
+            texts.append(memory_text)
         if factory_document is not None:
             texts.append(factory_document.context_text())
         project_context: dict[str, Any] = {"context": texts} if texts else {}
@@ -4281,6 +4340,8 @@ class PlanningRunDriver:
         }
         if factory_document is not None:
             draft["factory_context"] = factory_document.receipt()
+        if memory_receipt is not None:
+            draft[memory_decisions.RECEIPT_KEY] = memory_receipt
         if documents:
             # Which files, which versions, were given to the spec writer.
             draft["project_documents"] = self._project_documents_receipt(documents)
@@ -6927,6 +6988,11 @@ class PlanningRunDriver:
         texts = context_texts(documents) + reference_context_texts(
             reference.files if reference is not None else ()
         )
+        # The same decision records the spec writer was sent; the plan
+        # writer's exact re-review is sent them too.
+        memory_text, _memory_receipt = self._recorded_memory_decisions(correlation_id)
+        if memory_text:
+            texts.append(memory_text)
         if factory_document is not None:
             texts.append(factory_document.context_text())
 
@@ -8273,6 +8339,9 @@ class PlanningRunDriver:
             return await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
         if factory_document is not None:
             details["factory_context"] = factory_document.receipt()
+        _memory_text, memory_receipt = self._recorded_memory_decisions(correlation_id)
+        if memory_receipt is not None:
+            details[memory_decisions.RECEIPT_KEY] = memory_receipt
         if stamp_receipt is not None:
             details["stamp_normalizer"] = stamp_receipt
         if semantic_review is not None:

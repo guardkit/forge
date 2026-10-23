@@ -381,6 +381,78 @@ class FleetMemoryPriorsReader:
             )
             return []
 
+    async def read_records(
+        self,
+        *,
+        memory_project: str | None,
+        granted_memory_projects: Sequence[str],
+        payload_types: Sequence[str],
+        domain_tags: Sequence[str],
+        query: str | None,
+        token_budget: int,
+        purpose: str,
+    ) -> tuple[list[dict[str, Any]], str | None]:
+        """Typed records from one granted project, best first; never raises.
+
+        The same grant rule, store, deadline and reset as :meth:`read_priors`,
+        for a caller that wants the records themselves (planning's decision
+        records, 23 October 2026). ``(records, None)`` after a search, each
+        ``{"natural_key", "score", "value"}`` in the store's rank order and
+        possibly none; ``([], why)`` when nothing was searched or the search
+        failed, ``why`` one plain clause.
+        """
+        why_not = memory_grant_refusal(memory_project, granted_memory_projects)
+        if why_not is not None:
+            return [], why_not
+        assert memory_project is not None  # memory_grant_refusal said so
+        project = memory_project.strip()
+
+        async def _search() -> list[Any]:
+            async with self._init_lock:
+                store = await self._open_store()
+            backend = self._backend
+            assert backend is not None  # _open_store resolved it
+            request = backend.request_cls(
+                project=project,
+                query=(query or "").strip() or None,
+                payload_types=list(payload_types),
+                domain_tags=list(domain_tags),
+                token_budget=token_budget,
+                include_superseded=False,
+            )
+            return list(await backend.search(request, store) or [])
+
+        try:
+            results = await asyncio.wait_for(
+                _search(), timeout=self._config.read_timeout_s
+            )
+        except (TimeoutError, asyncio.CancelledError):
+            await self._discard_store()
+            logger.error(
+                "fleet-memory: read for %s timed out after %ss — store reset",
+                purpose,
+                self._config.read_timeout_s,
+            )
+            return [], f"the memory search timed out after {self._config.read_timeout_s}s"
+        except Exception as exc:  # noqa: BLE001 — this read never raises
+            await self._discard_store()
+            logger.error("fleet-memory: read for %s failed (%s) — store discarded", purpose, exc)
+            return [], (
+                f"the memory search failed ({type(exc).__name__}: "
+                f"{redact_credentials(str(exc))[:200]})"
+            )
+        records: list[dict[str, Any]] = []
+        for item in results:
+            value = getattr(item, "value", None)
+            natural_key = value.get("natural_key") if isinstance(value, dict) else None
+            if isinstance(natural_key, str) and natural_key:
+                score = float(getattr(item, "score", None) or 0.0)
+                records.append({"natural_key": natural_key, "score": score, "value": value})
+        logger.info(
+            "fleet-memory: %d record(s) matched in %s for %s", len(records), project, purpose
+        )
+        return records, None
+
     async def aclose(self) -> None:
         """Release the store connection (idempotent; daemon shutdown)."""
         await self._discard_store()

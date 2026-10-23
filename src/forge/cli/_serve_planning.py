@@ -835,6 +835,13 @@ def _resolve_feature_yaml_path(
     return str(Path(checkout) / feature_yaml)
 
 
+def _bound_memory_reader() -> Any | None:
+    """The bound gate parts' fleet-memory reader, or ``None`` when unbound."""
+    from forge.cli import _serve_deps_gating
+
+    return getattr(_serve_deps_gating.bound_gate_parts(), "priors_reader", None)
+
+
 def _latest_po_output(store: SqlitePlanningRunStore, correlation_id: str) -> dict:
     """Most recent recorded PO output for a run (empty when none)."""
     latest: dict[str, Any] = {}
@@ -1572,6 +1579,11 @@ async def compose_planning_consumer_and_dispatch(
                 dispatch_build_trigger=dispatch_build_trigger,
                 feature_routing_gate=feature_routing_gate,
                 feature_routing_required=feature_routing_required,
+                # The project's decision records from memory (23 October
+                # 2026): the gate's own fleet-memory reader, bound before
+                # planning composes. Memory off composes a reader without
+                # ``read_records``, and the door records that nothing was read.
+                memory_reader=_bound_memory_reader(),
             )
         )
 
