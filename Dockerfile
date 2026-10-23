@@ -537,6 +537,32 @@ RUN curl -fsSL "https://github.com/dominikh/go-tools/releases/download/${STATICC
     && chmod 0755 /usr/local/bin/staticcheck \
     && ln -s /usr/local/bin/staticcheck /usr/bin/staticcheck
 
+# uv, the Python package and project manager (23 October 2026). A project that
+# declares a uv workspace ([tool.uv.sources] in its pyproject.toml) needs uv on
+# PATH: GuardKit's environment set-up refuses to install such a project with
+# pip, and a build stopped at its second wave because this image had no uv. It
+# is a toolchain like Node and Go: nothing here names a project, and a project
+# still declares its own commands. uv and uvx are the two binaries in the
+# official Linux ARM64 (glibc) release archive, pinned by version and checked
+# against the sha256 recorded here, which matches the release's own published
+# checksum. Like Go's and npm's caches, uv's cache and the Pythons it installs
+# are not set here: they resolve under the HOME each build is given (or where
+# the project's declaration puts them), so nothing in the image is shared
+# between builds. A project that needs a Python other than this image's own
+# gets it from uv, over whatever network its sandbox allows.
+ARG UV_VERSION=0.12.24
+ARG UV_SHA256=5231be65f496304623895dacdbf1de8504fec90303684bdf05805aa34414dd21
+RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-aarch64-unknown-linux-gnu.tar.gz" \
+        -o /tmp/uv.tgz \
+    && echo "${UV_SHA256}  /tmp/uv.tgz" | sha256sum --check --strict - \
+    && tar --extract --gzip --file /tmp/uv.tgz --directory /usr/local/bin \
+        --strip-components=1 --no-same-owner \
+        uv-aarch64-unknown-linux-gnu/uv uv-aarch64-unknown-linux-gnu/uvx \
+    && rm -f /tmp/uv.tgz \
+    && chmod 0755 /usr/local/bin/uv /usr/local/bin/uvx \
+    && ln -s /usr/local/bin/uv /usr/bin/uv \
+    && ln -s /usr/local/bin/uvx /usr/bin/uvx
+
 # ---------------------------------------------------------------------------
 # THE SECURITY SCANNERS (security check design, 17 October 2026, piece 2).
 #
@@ -650,6 +676,7 @@ RUN npx -y "playwright@${PLAYWRIGHT_VERSION}" install --with-deps chromium firef
 # loads both rule files and finds the factory's privileged-service rule in a
 # small Compose file and the community secret-in-build-arg rule in a two-line
 # Dockerfile (the second proves the rule about handling secrets was kept).
+# Since 23 October 2026 it also checks uv's and uvx's exact versions.
 RUN check_home="$(mktemp -d)" \
     && chown 1000:1000 "${check_home}" \
     && as_player="setpriv --reuid=1000 --regid=1000 --clear-groups env -i PATH=/usr/bin:/bin HOME=${check_home}" \
@@ -664,6 +691,8 @@ RUN check_home="$(mktemp -d)" \
     && gofmt_out="$(${as_player} gofmt -l "${check_home}/race.go")" \
     && test -z "${gofmt_out}" \
     && test "$(${as_player} staticcheck -version)" = "staticcheck ${STATICCHECK_VERSION} (0.8.1)" \
+    && test "$(${as_player} uv --version)" = "uv ${UV_VERSION} (aarch64-unknown-linux-gnu)" \
+    && test "$(${as_player} uvx --version)" = "uvx ${UV_VERSION} (aarch64-unknown-linux-gnu)" \
     && test "$(${as_player} gitleaks version)" = "${GITLEAKS_VERSION}" \
     && ${as_player} osv-scanner --version | grep -qx "osv-scanner version: ${OSV_SCANNER_VERSION}" \
     && test "$(${as_player} opengrep --version)" = "${OPENGREP_VERSION}" \

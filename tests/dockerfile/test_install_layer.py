@@ -1125,6 +1125,16 @@ class TestTheWebToolchain:
             "${STATICCHECK_VERSION}/staticcheck_linux_arm64.tar.gz",
             "/tmp/staticcheck.tgz",
         ),
+        (
+            # uv (23 October 2026): a project that declares a uv workspace
+            # cannot be installed without it. Same rule as the archives above.
+            "UV",
+            "0.12.24",
+            "5231be65f496304623895dacdbf1de8504fec90303684bdf05805aa34414dd21",
+            "https://github.com/astral-sh/uv/releases/download/"
+            "${UV_VERSION}/uv-aarch64-unknown-linux-gnu.tar.gz",
+            "/tmp/uv.tgz",
+        ),
     )
 
     @pytest.mark.parametrize(("name", "version", "digest", "url", "path"), ARCHIVES)
@@ -1166,6 +1176,8 @@ class TestTheWebToolchain:
             "go": "/usr/local/go/bin/go",
             "gofmt": "/usr/local/go/bin/gofmt",
             "staticcheck": "/usr/local/bin/staticcheck",
+            "uv": "/usr/local/bin/uv",
+            "uvx": "/usr/local/bin/uvx",
         }
         for tool, target in links.items():
             # A plain ``ln -s`` refuses to replace an existing file, so no
@@ -1223,7 +1235,16 @@ class TestTheWebToolchain:
                 r"^(?:ENV|ARG)\b(?:[^\n]*\\\n)*[^\n]*$", dockerfile_text, re.MULTILINE
             )
         )
-        for name in ("GOPATH", "GOCACHE", "GOMODCACHE", "npm_config_cache", "NPM_CONFIG_CACHE"):
+        for name in (
+            "GOPATH",
+            "GOCACHE",
+            "GOMODCACHE",
+            "npm_config_cache",
+            "NPM_CONFIG_CACHE",
+            "UV_CACHE_DIR",
+            "UV_PYTHON_INSTALL_DIR",
+            "UV_TOOL_DIR",
+        ):
             assert not re.search(rf"(?<![A-Za-z0-9_]){name}=", settings), (
                 f"{name} must resolve under each build's HOME, never a shared image path"
             )
@@ -1246,6 +1267,10 @@ class TestTheWebToolchain:
             'test -z "${gofmt_out}"',
             'test "$(${as_player} staticcheck -version)" = '
             '"staticcheck ${STATICCHECK_VERSION} (0.8.1)"',
+            'test "$(${as_player} uv --version)" = '
+            '"uv ${UV_VERSION} (aarch64-unknown-linux-gnu)"',
+            'test "$(${as_player} uvx --version)" = '
+            '"uvx ${UV_VERSION} (aarch64-unknown-linux-gnu)"',
         ):
             assert check in run, f"the self-check must include: {check}"
         assert re.search(r"^ARG\s+NODE_NPM_VERSION=11\.21\.0\s*$", runtime_body, re.MULTILINE)
@@ -1314,9 +1339,17 @@ class TestTheWebToolchain:
         runtime_body = _runtime_stage_body(dockerfile_text)
         barrier = runtime_body.index("ARG FORGE_GIT_SHA")
         node = runtime_body.index("ARG NODE_VERSION=")
+        uv = runtime_body.index("ARG UV_VERSION=")
         playwright = runtime_body.index('RUN npx -y "playwright@')
         self_check = runtime_body.index('RUN check_home="$(mktemp -d)"')
-        assert runtime_body.index("ARG RIPGREP_VERSION=") < node < playwright < self_check < barrier
+        assert (
+            runtime_body.index("ARG RIPGREP_VERSION=")
+            < node
+            < uv
+            < playwright
+            < self_check
+            < barrier
+        )
 
     def test_the_node_options_flag_is_kept(self, dockerfile_text: str) -> None:
         # Kept as the Phase 1 design records: Node 22 accepts the flag and it
