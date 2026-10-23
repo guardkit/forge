@@ -45,6 +45,8 @@ from forge.deploy_sidecar.service import (
 from forge.lifecycle import migrations as lifecycle_migrations
 from forge.lifecycle.persistence import SqliteLifecyclePersistence
 from forge.lifecycle.persistence import StageLogEntry
+from forge.lifecycle.mission_builds import landing_attempt_id
+from forge.lifecycle.missions import MissionFeature, MissionStore
 from forge.pipeline.deployment_lock import DeploymentLockStore
 from forge.pipeline.publication_record import (
     STEP_CANDIDATE_CHECK,
@@ -137,6 +139,11 @@ def _profile_authority(
     build: str,
     start_commit: str,
     candidate_cwd: Path,
+    *,
+    offer_backed: bool = True,
+    decision_id: str = "approved-recorded-profile",
+    target_branch: str = "main",
+    feature_id: str = "record-answer-feature",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Write the real approval and publication records the answer reconciles."""
     from forge.deploy.profile_selection import FirstDeploymentProfile
@@ -147,7 +154,6 @@ def _profile_authority(
     joined = "4" * 40
     joined_tree = "5" * 40
     offer_id = "offer-recorded-profile"
-    decision_id = "approved-recorded-profile"
     now = datetime.now(UTC)
     common = {
         "build_id": build,
@@ -157,21 +163,22 @@ def _profile_authority(
         "completed_at": now,
         "duration_secs": 0.0,
     }
-    record.record_stage(
-        StageLogEntry(
-            **common,
-            target_identifier="merge_deploy_offer",
-            status="GATED",
-            details={
-                "merge_offer": {
-                    "request_id": offer_id,
-                    "repo": REPO,
-                    "candidate_sha": candidate,
-                    "candidate_tree": candidate_tree,
-                }
-            },
+    if offer_backed:
+        record.record_stage(
+            StageLogEntry(
+                **common,
+                target_identifier="merge_deploy_offer",
+                status="GATED",
+                details={
+                    "merge_offer": {
+                        "request_id": offer_id,
+                        "repo": REPO,
+                        "candidate_sha": candidate,
+                        "candidate_tree": candidate_tree,
+                    }
+                },
+            )
         )
-    )
     record.record_stage(
         StageLogEntry(
             **common,
@@ -179,8 +186,9 @@ def _profile_authority(
             status="PASSED",
             details={
                 "merge_decision": {
-                    "request_id": offer_id,
+                    "request_id": offer_id if offer_backed else f"merge-{build}",
                     "decision": "approve",
+                    "execution_attempt_version": 1,
                     "execution_attempt_id": decision_id,
                 }
             },
@@ -191,10 +199,10 @@ def _profile_authority(
         build_id=build,
         holder="record-answer-test",
         now=now,
-        feature_id="record-answer-feature",
+        feature_id=feature_id,
         repo=REPO,
         decided_by="owner",
-        target_branch="main",
+        target_branch=target_branch,
         starts_a_press=True,
         attempt_id=decision_id,
     )
@@ -242,6 +250,7 @@ def _profile_authority(
             "j_commit": joined,
             "j_tree": joined_tree,
             "candidate_cwd": str(candidate_cwd),
+            "feature_id": feature_id,
             "first_deployment_profile": selected.to_wire(),
         },
     )
@@ -258,6 +267,51 @@ def _profile_authority(
             "candidate_cwd": str(candidate_cwd),
         },
     )
+
+
+def _mission_profileless_authority(
+    record: SqliteLifecyclePersistence,
+    build: str,
+    start_commit: str,
+    candidate_cwd: Path,
+) -> dict[str, Any]:
+    mission_id = "m-answer"
+    branch = f"mission/{mission_id}"
+    correlation = "corr-answer-mission-A-a1"
+    missions = MissionStore(record.connection)
+    missions.create_mission(
+        title="One generic feature",
+        target_repo=REPO,
+        correlation_id="corr-answer-mission",
+        originating_user="owner",
+        features=[MissionFeature(key="A", sentence="add the generic feature")],
+        mission_id=mission_id,
+    )
+    assert missions.record_approval(
+        mission_id, approved_by="owner", plan_request_id="mission-plan-answer"
+    )
+    missions.file_first_attempts(mission_id)
+    record.connection.execute(
+        "UPDATE mission_attempts SET correlation_id = ? WHERE mission_id = ? AND key = 'A'",
+        (correlation, mission_id),
+    )
+    record.connection.execute(
+        "UPDATE builds SET mission_id = ?, mission_role = 'feature', correlation_id = ?, "
+        "target_branch = ? WHERE build_id = ?",
+        (mission_id, correlation, branch, build),
+    )
+    record.connection.commit()
+    _profile, layout = _profile_authority(
+        record,
+        build,
+        start_commit,
+        candidate_cwd,
+        offer_backed=False,
+        decision_id=landing_attempt_id(build),
+        target_branch=branch,
+        feature_id="FEAT-ANSW",
+    )
+    return layout
 
 
 # ---------------------------------------------------------------------------
@@ -333,6 +387,174 @@ class TestTheAnswerService:
         assert statements[0] == "BEGIN"
         assert sum(statement == "BEGIN" for statement in statements) == 1
         assert not any("INSERT" in statement or "UPDATE" in statement for statement in statements)
+
+    def test_it_confirms_an_approved_mission_feature_without_an_offer(
+        self, record: SqliteLifecyclePersistence, tmp_path: Path
+    ) -> None:
+        start = "a" * 40
+        build = _a_build_starting_from(record, start)
+        expected = _mission_profileless_authority(
+            record, build, start, tmp_path / ".forge-candidates" / "mission"
+        )
+
+        answer = TheCoordinatorsRecord(record.db_path).what_build_starts_from(build)
+
+        assert answer["deployment_layout"] == expected
+        assert "first_deployment_profile" not in answer
+        offers = record.connection.execute(
+            "SELECT COUNT(*) FROM stage_log WHERE build_id = ? "
+            "AND target_identifier = 'merge_deploy_offer'",
+            (build,),
+        ).fetchone()[0]
+        assert offers == 0
+
+    @pytest.mark.parametrize(
+        "broken",
+        [
+            "ordinary", "mission-merge", "undeclared-attempt", "unapproved",
+            "wrong-mission", "repo", "target", "feature", "missing-decision",
+            "rejected-decision", "wrong-execution", "expired-lease", "turn",
+            "ended", "joined", "cwd", "contradictory-input",
+            "checked-join", "checked-tree", "attempt-zero",
+        ],
+    )
+    def test_an_offerless_layout_requires_the_whole_mission_publication(
+        self,
+        record: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        broken: str,
+    ) -> None:
+        start = "b" * 40
+        build = _a_build_starting_from(record, start)
+        _mission_profileless_authority(
+            record, build, start, tmp_path / ".forge-candidates" / "mission"
+        )
+        cx = record.connection
+        if broken == "ordinary":
+            cx.execute(
+                "UPDATE builds SET mission_id = NULL, mission_role = NULL WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "mission-merge":
+            cx.execute(
+                "UPDATE builds SET mission_role = 'mission-merge' WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "undeclared-attempt":
+            cx.execute(
+                "UPDATE builds SET correlation_id = 'corr-unrelated' WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "unapproved":
+            cx.execute("UPDATE missions SET approved_at = NULL WHERE id = 'm-answer'")
+        elif broken == "wrong-mission":
+            cx.execute("UPDATE builds SET mission_id = 'm-other' WHERE build_id = ?", (build,))
+        elif broken == "repo":
+            cx.execute(
+                "UPDATE publication_records SET repo = 'example/other' WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "target":
+            cx.execute(
+                "UPDATE publication_records SET target_branch = 'main' WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "feature":
+            cx.execute(
+                "UPDATE publication_records SET feature_id = 'FEAT-OTHER' WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "missing-decision":
+            cx.execute("DELETE FROM stage_log WHERE build_id = ?", (build,))
+        elif broken == "rejected-decision":
+            cx.execute("UPDATE stage_log SET status = 'FAILED' WHERE build_id = ?", (build,))
+        elif broken == "wrong-execution":
+            details = json.dumps({"merge_decision": {
+                "request_id": f"merge-{build}", "decision": "approve",
+                "execution_attempt_version": 1, "execution_attempt_id": "0" * 32,
+            }})
+            cx.execute("UPDATE stage_log SET details_json = ? WHERE build_id = ?", (details, build))
+        elif broken == "expired-lease":
+            cx.execute(
+                "UPDATE publication_records SET lease_expires_at = "
+                "'2000-01-01T00:00:00+00:00' WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "turn":
+            cx.execute(
+                "UPDATE publication_records SET turn = turn + 1 WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "ended":
+            cx.execute(
+                "UPDATE publication_outcomes SET finished_at = "
+                "'2026-01-01T00:00:00+00:00' WHERE build_id = ?",
+                (build,),
+            )
+        elif broken == "joined":
+            cx.execute(
+                "UPDATE publication_records SET j_commit = ? WHERE build_id = ?",
+                ("7" * 40, build),
+            )
+        elif broken in ("cwd", "contradictory-input"):
+            raw = cx.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (build,),
+            ).fetchone()[0]
+            lines = json.loads(raw)
+            if broken == "cwd":
+                lines[-1]["detail"]["candidate_cwd"] = "relative/archive"
+            else:
+                lines.append(
+                    {
+                        **lines[-1],
+                        "detail": {
+                            **lines[-1]["detail"],
+                            "candidate_cwd": str(
+                                tmp_path / ".forge-candidates" / "other"
+                            ),
+                        },
+                    }
+                )
+            cx.execute(
+                "UPDATE publication_records SET lines_json = ? WHERE build_id = ?",
+                (json.dumps(lines), build),
+            )
+        elif broken in ("checked-join", "checked-tree"):
+            checked = (
+                {"j_commit": "7" * 40}
+                if broken == "checked-join"
+                else {"j_tree": "7" * 40}
+            )
+            cx.execute(
+                "UPDATE publication_records SET checked_json = ? WHERE build_id = ?",
+                (json.dumps(checked), build),
+            )
+        else:
+            cx.execute("UPDATE publication_records SET attempt = 0 WHERE build_id = ?", (build,))
+        cx.commit()
+
+        answer = TheCoordinatorsRecord(record.db_path).what_build_starts_from(build)
+
+        assert answer == {"build": build, "recorded": True, "start_commit": start}
+
+    def test_an_ordinary_build_without_an_offer_stays_strict(
+        self, record: SqliteLifecyclePersistence, tmp_path: Path
+    ) -> None:
+        start = "c" * 40
+        build = _a_build_starting_from(record, start)
+        _profile_authority(
+            record, build, start, tmp_path / ".forge-candidates" / "ordinary"
+        )
+        record.connection.execute(
+            "DELETE FROM stage_log WHERE build_id = ? AND target_identifier = 'merge_deploy_offer'",
+            (build,),
+        )
+        record.connection.commit()
+
+        answer = TheCoordinatorsRecord(record.db_path).what_build_starts_from(build)
+
+        assert answer == {"build": build, "recorded": True, "start_commit": start}
 
     @pytest.mark.parametrize(
         "break_authority",
@@ -420,6 +642,46 @@ class TestTheAnswerService:
         assert answer["first_deployment_profile"]["selection"] == expected["selection"]
         assert answer["first_deployment_profile"]["turn"] == taken.turn
         assert answer["deployment_layout"]["turn"] == taken.turn
+
+    def test_mission_landed_send_takeover_keeps_the_same_candidate_archive(
+        self, record: SqliteLifecyclePersistence, tmp_path: Path
+    ) -> None:
+        start = "d" * 40
+        build = _a_build_starting_from(record, start)
+        expected = _mission_profileless_authority(
+            record, build, start, tmp_path / ".forge-candidates" / "takeover"
+        )
+        store = PublicationRecordStore(record.connection)
+        publication = store.read(build)
+        assert store.about_to(
+            build_id=build,
+            turn=publication.turn,
+            now=datetime.now(UTC),
+            step=STEP_SEND,
+            attempt=publication.attempt,
+            inputs={
+                "j_commit": publication.j_commit,
+                "target_branch": publication.target_branch,
+            },
+        )
+        record.connection.execute(
+            "UPDATE publication_records SET lease_expires_at = ? WHERE build_id = ?",
+            ("2000-01-01T00:00:00+00:00", build),
+        )
+        record.connection.commit()
+        taken = store.take_lease(
+            build_id=build,
+            holder="replacement-mission-press",
+            now=datetime.now(UTC),
+            starts_a_press=True,
+            attempt_id=landing_attempt_id(build),
+        )
+        assert taken is not None and taken.turn == 2
+
+        answer = TheCoordinatorsRecord(record.db_path).what_build_starts_from(build)
+
+        assert "first_deployment_profile" not in answer
+        assert answer["deployment_layout"] == {**expected, "turn": taken.turn}
 
     def test_a_build_nobody_wrote_a_commit_for_says_so(
         self, record: SqliteLifecyclePersistence

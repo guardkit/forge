@@ -190,21 +190,113 @@ def confirmed_deployment_layout(connection: Any, build: str, start_commit: str) 
     if not lines or not lines[-1].detail.get("candidate_cwd"):
         return None
     outcome = store.read_outcome(build)
-    if (not record.lease_is_live(datetime.now(UTC)) or outcome is None
+    if (not record.lease_is_live(datetime.now(UTC))
+            or record.turn < 1 or record.attempt < 1 or outcome is None
             or outcome.turn != record.turn or outcome.finished_at):
         raise ValueError("the deployment layout has no active publication")
-    offer, decision = read_profile_approval(connection, build)
-    row = connection.execute("SELECT repo, start_commit FROM builds WHERE build_id = ?", (build,)).fetchone()
-    if (row is None or row[0] != record.repo or row[1] != start_commit
-            or offer.get("repo") != record.repo or offer.get("candidate_sha") != record.build_tip
-            or decision.get("execution_attempt_id") != outcome.attempt_id):
+    row = connection.execute(
+        "SELECT feature_id, repo, start_commit, target_branch, correlation_id "
+        "FROM builds WHERE build_id = ?", (build,),
+    ).fetchone()
+    if row is None or row[1] != record.repo or row[2] != start_commit:
+        raise ValueError("the deployment layout no longer matches the approved publication")
+    try:
+        offer, decision = read_profile_approval(connection, build)
+    except ValueError:
+        offer = None
+        decision = _approved_mission_landing(
+            connection, build=build, build_row=row, record=record,
+        )
+    if offer is not None and (
+        offer.get("repo") != record.repo
+        or offer.get("candidate_sha") != record.build_tip
+    ):
+        raise ValueError("the deployment layout no longer matches the approved publication")
+    if decision.get("execution_attempt_id") != outcome.attempt_id:
         raise ValueError("the deployment layout no longer matches the approved publication")
     detail = lines[-1].detail
-    for value in (record.j_commit, detail.get("j_tree"), record.build_tip,
-                  start_commit, offer.get("candidate_tree")):
+    immutable = [record.j_commit, detail.get("j_tree"), record.build_tip,
+                 record.g_commit, start_commit]
+    if offer is not None:
+        immutable.append(offer.get("candidate_tree"))
+    for value in immutable:
         if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value):
             raise ValueError("the deployment layout needs full immutable identities")
+    candidate_cwd = detail.get("candidate_cwd")
+    if (not isinstance(candidate_cwd, str)
+            or not (path := PurePosixPath(candidate_cwd)).is_absolute()
+            or ".." in path.parts or path.parent.name != ".forge-candidates"):
+        raise ValueError("the deployment layout names no candidate archive")
+    current_inputs = [
+        (line.detail.get("j_commit"), line.detail.get("j_tree"),
+         line.detail.get("candidate_cwd"))
+        for line in record.lines
+        if line.kind == "about to" and line.step == "candidate-check"
+        and line.attempt == record.attempt
+    ]
+    expected_input = (record.j_commit, detail.get("j_tree"), candidate_cwd)
+    mission_features = [
+        line.detail.get("feature_id")
+        for line in record.lines
+        if line.kind == "about to" and line.step == "candidate-check"
+        and line.attempt == record.attempt
+    ]
+    if (any(inputs != expected_input for inputs in current_inputs)
+            or (offer is None and any(
+                feature != record.feature_id for feature in mission_features
+            ))):
+        raise ValueError("the current attempt has contradictory candidate archives")
+    checked = record.checked
+    if ((checked.get("j_commit") is not None and checked.get("j_commit") != record.j_commit)
+            or (checked.get("j_tree") is not None
+                and checked.get("j_tree") != detail.get("j_tree"))):
+        raise ValueError("the checked artifact contradicts the deployment layout")
     return {"repo": record.repo, "build": build, "start_commit": start_commit,
             "attempt": record.attempt, "turn": record.turn,
             "joined_commit": record.j_commit, "joined_tree": detail["j_tree"],
-            "candidate_cwd": detail["candidate_cwd"]}
+            "candidate_cwd": candidate_cwd}
+
+
+def _approved_mission_landing(
+    connection: Any, *, build: str, build_row: Any, record: Any,
+) -> dict[str, Any]:
+    """Read the offerless approval for one declared mission feature landing."""
+    from forge.lifecycle.mission_builds import landing_attempt_id, mission_of_build
+    from forge.lifecycle.missions import mission_membership
+
+    feature_id, repo, _start, target, correlation = build_row
+    build_mission = mission_of_build(connection, build)
+    membership = mission_membership(connection, correlation)
+    if build_mission is None or not build_mission.is_feature or membership is None:
+        raise ValueError("the offerless publication is not a mission feature")
+    mission_id = build_mission.mission_id
+    mission, attempt, feature = membership
+    if (mission is None or feature is None or mission.id != mission_id
+            or attempt.mission_id != mission_id or attempt.key != feature.key
+            or not mission.approved_at or not mission.approved_by
+            or not mission.plan_request_id or mission.target_repo != repo
+            or mission.branch != target or record.feature_id != feature_id
+            or record.repo != repo or record.target_branch != target):
+        raise ValueError("the mission feature publication does not match its approval")
+    rows = connection.execute(
+        "SELECT target_identifier, status, details_json FROM stage_log "
+        "WHERE build_id = ? AND target_identifier IN (?, ?) ORDER BY rowid",
+        (build, "merge_deploy_offer", "merge_deploy_decision"),
+    ).fetchall()
+    if any(str(row[0]) == "merge_deploy_offer" for row in rows):
+        raise ValueError("the mission feature has an offer that needs ordinary approval")
+    decisions = [row for row in rows if str(row[0]) == "merge_deploy_decision"]
+    if not decisions:
+        raise ValueError("the mission feature has no durable landing decision")
+    decided = decisions[-1]
+    try:
+        decision = json.loads(decided[2])["merge_decision"]
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ValueError("the mission feature landing decision is unreadable") from exc
+    expected_attempt = landing_attempt_id(build)
+    if (decided[1] != "PASSED" or decision.get("decision") != "approve"
+            or decision.get("request_id") != f"merge-{build}"
+            or decision.get("execution_attempt_version") != 1
+            or decision.get("execution_attempt_id") != expected_attempt):
+        raise ValueError("the mission feature has no matching approved landing decision")
+    return decision

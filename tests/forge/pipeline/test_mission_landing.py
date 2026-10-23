@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import json
 import subprocess
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -34,7 +35,8 @@ from nats_core.events import BuildCompletePayload, BuildFailedPayload
 
 from forge.adapters.guardkit.models import GuardKitResult
 from forge.config.models import ForgeConfig
-from forge.deploy.candidate_tree import RemoteStartPoint
+from forge.deploy.candidate_tree import FileAtCommit, RemoteStartPoint
+from forge.deploy_sidecar import service as deploy_sidecar
 from forge.lifecycle.mission_builds import (
     landing_attempt_id,
     mission_join_name,
@@ -65,6 +67,7 @@ from forge.pipeline.publication_record import (
     STEP_JOIN,
     PublicationRecordStore,
 )
+from forge.record_answer.service import TheCoordinatorsRecord
 from tests.forge.pipeline.test_fix_row_producer import write_pack
 from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     REPO,
@@ -339,12 +342,340 @@ def record(pool: SqliteLifecyclePersistence, build_id: str) -> Any:  # noqa: F81
     return PublicationRecordStore(pool.connection).read(build_id)
 
 
+class RecordingSidecarRunner:
+    def __init__(self) -> None:
+        self.runner_calls: list[dict[str, Any]] = []
+
+    def __call__(self, **kwargs: Any) -> tuple[int, str]:
+        self.runner_calls.append(kwargs)
+        return 0, "candidate archive accepted"
+
+
 # ---------------------------------------------------------------------------
 # Landing
 # ---------------------------------------------------------------------------
 
 
 class TestAMissionFeatureLandsOnTheMissionBranch:
+    @pytest.mark.parametrize(
+        "variant",
+        [
+            "accepted",
+            "ordinary-without-offer",
+            "nonfeature",
+            "undeclared-attempt",
+            "unapproved",
+            "wrong-mission",
+            "repo-mismatch",
+            "target-mismatch",
+            "feature-mismatch",
+            "missing-decision",
+            "rejected-decision",
+            "wrong-execution",
+            "expired-lease",
+            "durable-turn-mismatch",
+            "ended-outcome",
+            "changed-joined",
+            "changed-start",
+            "changed-cwd",
+            "changed-joined-tree",
+            "contradictory-input",
+        ],
+    )
+    def test_offerless_mission_archive_reaches_the_real_missing_profile_guard(
+        self,
+        config_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+        variant: str,
+    ) -> None:
+        profile = (
+            "env_id: generic-live\n"
+            "compose:\n"
+            "  file: compose.yaml\n"
+            "  script: deploy/check.sh\n"
+        )
+        (repo_root / "deploy").mkdir()
+        (repo_root / "deploy/profile.yaml").write_text(profile, encoding="utf-8")
+        (repo_root / "deploy/check.sh").write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        _git(repo_root, "add", "deploy")
+        _git(repo_root, "commit", "-q", "-m", "declare generic deployment")
+        start = _git(repo_root, "rev-parse", "HEAD")
+        _git(repo_root, "checkout", "-q", "autobuild/FEAT-MX1")
+        _git(repo_root, "cherry-pick", start)
+        _git(repo_root, "checkout", "-q", "main")
+        _git(repo_root, "push", "-q", "origin", "main")
+
+        a_running_mission(pool, keys=("B",), base_commit=start)
+        a_mission_feature_build(pool, build_id=B_BUILD, feature_id="FEAT-MX1", key="B")
+        pool.connection.execute(
+            "UPDATE builds SET start_commit = ? WHERE build_id = ?", (start, B_BUILD)
+        )
+        pool.connection.commit()
+        target = the_mission_branch_on_the_remote(repo_root)
+        runner = RecordingSidecarRunner()
+        deps, _joins, _deploy, _publisher, _bus = press_deps(config_on, pool, repo_root)
+        attempt_id = MergeApprovalConsumer(deps)._decide_landing(
+            B_BUILD,
+            mission_id=MISSION_ID,
+            decided_by=f"mission {MISSION_ID} (approved by rich)",
+            request_id=f"merge-{B_BUILD}",
+        )
+        assert attempt_id == landing_attempt_id(B_BUILD)
+        candidate = _git(repo_root, "rev-parse", "autobuild/FEAT-MX1")
+        joined = candidate
+        joined_tree = _git(repo_root, "rev-parse", f"{joined}^{{tree}}")
+        archive = repo_root / ".forge-candidates" / "mission-archive"
+        (archive / "deploy").mkdir(parents=True)
+        (archive / "deploy/profile.yaml").write_text(profile, encoding="utf-8")
+        (archive / "deploy/check.sh").write_text(
+            "#!/bin/sh\nexit 0\n", encoding="utf-8"
+        )
+        now = datetime.now(UTC)
+        store = PublicationRecordStore(pool.connection)
+        lease = store.take_lease(
+            build_id=B_BUILD,
+            holder="mission-archive-test",
+            now=now,
+            feature_id="FEAT-MX1",
+            repo=REPO,
+            decided_by="mission landing",
+            target_branch=MISSION_BRANCH,
+            starts_a_press=True,
+            attempt_id=attempt_id,
+        )
+        assert lease is not None
+        assert store.record(
+            build_id=B_BUILD,
+            turn=lease.turn,
+            now=now,
+            g_commit=target,
+            build_tip=candidate,
+            attempt=1,
+        )
+        assert store.done(
+            build_id=B_BUILD,
+            turn=lease.turn,
+            now=now,
+            step=STEP_JOIN,
+            attempt=1,
+            result={"j_commit": joined, "verify_ok": True},
+            j_commit=joined,
+        )
+        assert store.about_to(
+            build_id=B_BUILD,
+            turn=lease.turn,
+            now=now,
+            step="candidate-check",
+            attempt=1,
+            inputs={
+                "j_commit": joined,
+                "j_tree": joined_tree,
+                "feature_id": "FEAT-MX1",
+                "candidate_cwd": str(archive),
+            },
+        )
+        cx = pool.connection
+        if variant == "ordinary-without-offer":
+            cx.execute(
+                "UPDATE builds SET mission_id = NULL, mission_role = NULL "
+                "WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "nonfeature":
+            cx.execute(
+                "UPDATE builds SET mission_role = 'mission-merge' WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "undeclared-attempt":
+            cx.execute(
+                "UPDATE builds SET correlation_id = 'corr-unrelated' WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "unapproved":
+            cx.execute("UPDATE missions SET approved_at = NULL WHERE id = ?", (MISSION_ID,))
+        elif variant == "wrong-mission":
+            cx.execute(
+                "UPDATE builds SET mission_id = 'm-other' WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "repo-mismatch":
+            cx.execute(
+                "UPDATE publication_records SET repo = 'example/other' "
+                "WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "target-mismatch":
+            cx.execute(
+                "UPDATE publication_records SET target_branch = 'main' "
+                "WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "feature-mismatch":
+            cx.execute(
+                "UPDATE publication_records SET feature_id = 'FEAT-OTHER' "
+                "WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "missing-decision":
+            cx.execute(
+                "DELETE FROM stage_log WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_decision'",
+                (B_BUILD,),
+            )
+        elif variant == "rejected-decision":
+            cx.execute(
+                "UPDATE stage_log SET status = 'FAILED' WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_decision'",
+                (B_BUILD,),
+            )
+        elif variant == "wrong-execution":
+            row = cx.execute(
+                "SELECT details_json FROM stage_log WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_decision'",
+                (B_BUILD,),
+            ).fetchone()
+            details = json.loads(row[0])
+            details["merge_decision"]["execution_attempt_id"] = "0" * 32
+            cx.execute(
+                "UPDATE stage_log SET details_json = ? WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_decision'",
+                (json.dumps(details), B_BUILD),
+            )
+        elif variant == "expired-lease":
+            cx.execute(
+                "UPDATE publication_records SET lease_expires_at = "
+                "'2000-01-01T00:00:00+00:00' WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "durable-turn-mismatch":
+            cx.execute(
+                "UPDATE publication_records SET turn = turn + 1 WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "ended-outcome":
+            cx.execute(
+                "UPDATE publication_outcomes SET finished_at = "
+                "'2026-01-01T00:00:00+00:00' WHERE build_id = ?",
+                (B_BUILD,),
+            )
+        elif variant == "changed-joined":
+            cx.execute(
+                "UPDATE publication_records SET j_commit = ? WHERE build_id = ?",
+                ("7" * 40, B_BUILD),
+            )
+        elif variant == "contradictory-input":
+            row = cx.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (B_BUILD,),
+            ).fetchone()
+            lines = json.loads(row[0])
+            lines.append(
+                {
+                    **lines[-1],
+                    "detail": {
+                        **lines[-1]["detail"],
+                        "candidate_cwd": str(
+                            repo_root / ".forge-candidates" / "contradiction"
+                        ),
+                    },
+                }
+            )
+            cx.execute(
+                "UPDATE publication_records SET lines_json = ? WHERE build_id = ?",
+                (json.dumps(lines), B_BUILD),
+            )
+        cx.commit()
+        recorded_answers: list[dict[str, Any]] = []
+
+        def answer(build: str) -> dict[str, Any]:
+            recorded = TheCoordinatorsRecord(pool.db_path).what_build_starts_from(build)
+            recorded_answers.append(recorded)
+            return recorded
+
+        monkeypatch.setattr(deploy_sidecar, "coordinator_recorded_build", lambda: answer)
+
+        async def local_tree(_repo: Path, ref: str) -> str | None:
+            if ref != f"{joined}^{{tree}}":
+                return None
+            return "f" * 40 if variant == "changed-joined-tree" else joined_tree
+
+        def local_file(
+            repo: Path, commit: str, name: str, **_options: Any
+        ) -> FileAtCommit:
+            entry = subprocess.run(
+                ["git", "-C", str(repo), "ls-tree", commit, "--", name],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            if not entry:
+                return FileAtCommit(found=False)
+            mode, kind, _object, _path = entry.split(maxsplit=3)
+            if kind != "blob":
+                return FileAtCommit(found=False, mode=mode)
+            content = subprocess.run(
+                ["git", "-C", str(repo), "show", f"{commit}:{name}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            return FileAtCommit(content=content, found=True, ordinary=True, mode=mode)
+
+        async def local_file_async(
+            repo: Path, commit: str, name: str, **options: Any
+        ) -> FileAtCommit:
+            return local_file(repo, commit, name, **options)
+
+        monkeypatch.setattr(deploy_sidecar, "read_file_at_commit_sync", local_file)
+        monkeypatch.setattr("forge.deploy.candidate_tree.git_rev_parse", local_tree)
+        monkeypatch.setattr(
+            "forge.deploy.candidate_tree.read_file_at_commit", local_file_async
+        )
+        (repo_root / "deploy/profile.yaml").unlink()
+        requested_archive = archive
+        if variant == "changed-cwd":
+            requested_archive = repo_root / ".forge-candidates" / "other"
+            requested_archive.mkdir()
+        payload_start = "e" * 40 if variant == "changed-start" else start
+        status, body = deploy_sidecar.process_run_request(
+            {
+                "repo": REPO,
+                "build": B_BUILD,
+                "declared_at": payload_start,
+                "cwd": str(requested_archive),
+                "env": {},
+                "script": "deploy/check.sh",
+            },
+            config=config_on,
+            script_runner=runner,
+        )
+
+        assert len(recorded_answers) == 1
+        assert "first_deployment_profile" not in recorded_answers[0]
+        assert pool.connection.execute(
+            "SELECT COUNT(*) FROM stage_log WHERE build_id = ? "
+            "AND target_identifier = 'merge_deploy_offer'",
+            (B_BUILD,),
+        ).fetchone()[0] == 0
+        if variant == "accepted":
+            layout = recorded_answers[0]["deployment_layout"]
+            assert layout["candidate_cwd"] == str(archive)
+            assert status == 200, body
+            assert len(runner.runner_calls) == 1
+            assert runner.runner_calls[0]["cwd"] == str(archive)
+        else:
+            assert status == 400, body
+            assert body["error"].endswith("nothing was started")
+            assert runner.runner_calls == []
+            if variant in {"changed-start", "changed-cwd", "changed-joined-tree"}:
+                assert recorded_answers[0]["deployment_layout"]["candidate_cwd"] == str(
+                    archive
+                )
+            else:
+                assert "deployment_layout" not in recorded_answers[0]
+
     @pytest.mark.asyncio
     async def test_it_is_published_to_the_mission_branch_and_nothing_is_deployed(
         self,
