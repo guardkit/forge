@@ -28,9 +28,16 @@ from unittest.mock import patch
 import pytest
 import yaml
 
-# Needs the specialist-agent source and its test fixtures; skipped without them.
+# Needs the specialist-agent source and its test fixtures, and fleet-memory's
+# writer for the stored record shape; skipped without them.
 pytest.importorskip("specialist_agent")
+pytest.importorskip("fleet_memory")
 
+from forge.adapters.fleet_memory.priors import (
+    FleetMemoryPriorsConfig,
+    FleetMemoryPriorsReader,
+    _RetrievalBackend,
+)
 from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli._serve_planning import (
@@ -166,6 +173,34 @@ class _RecordingSeat:
         return {"messages": [{"role": "assistant", "content": reply}]}
 
 
+async def _stored_adr(i: int, decision: str, context: str, consequences: str) -> dict[str, Any]:
+    """The envelope fleet-memory's own writer stores for one ADR."""
+    from fleet_memory.payloads.models import ADRPayload
+    from fleet_memory.writer.core import DeterministicWriter
+
+    class _Store:
+        put: dict[str, Any] | None = None
+
+        async def aget(self, *_: Any) -> None:
+            return None
+
+        async def asearch(self, *_: Any, **__: Any) -> list[Any]:
+            return []
+
+        async def aput(self, _namespace: Any, _key: str, value: dict[str, Any]) -> None:
+            self.put = value
+
+    store = _Store()
+    await DeterministicWriter(store, settings=None).write(ADRPayload(  # type: ignore[arg-type]
+        project="widget_shop", identifier=f"ADR_{i}", title=f"Recorded decision {i}",
+        status="accepted", decision=decision, context=context, consequences=consequences,
+        alternatives=["other"], domain_tags=["architecture"],
+        source_ref=f"docs/decisions/ADR_{i}.md",
+    ))
+    assert store.put is not None and "decision" not in store.put
+    return store.put
+
+
 def _message_text(payload: dict[str, Any]) -> str:
     return "\n".join(
         message["content"] if isinstance(message, dict) else message.content
@@ -219,27 +254,49 @@ async def test_memory_records_reach_real_writers_and_coaches_after_restart(
     )
     start_commit = _git(project, "rev-parse", "HEAD")
     original = factory_context.load_bundled_document()
-    adr_values = [
-        {"natural_key": f"adr:widget_shop:ADR_{i}", "identifier": f"ADR_{i}",
-         "title": f"Recorded decision {i}", "status": "accepted",
-         "decision": f"Decision text number {i}.", "alternatives": ["other"],
-         "domain_tags": ["architecture"]}
+    # Two ADRs stored exactly as fleet-memory's writer stores them, read back by
+    # Forge's own reader over a stand-in store; only the search is scripted.
+    substance = [
+        (f"Decision text number {i}.", f"Context paragraph number {i}.",
+         f"Consequences paragraph number {i}.")
         for i in range(2)
     ]
-    memory_records = [{"natural_key": v["natural_key"], "score": 0.9 - i / 10, "value": v}
-                      for i, v in enumerate(adr_values)]
-    memory_text = memory_decisions.outcome("widget_shop", memory_records, None)["text"]
-    assert memory_text
+    hits = [
+        SimpleNamespace(score=0.9 - i / 10, value=await _stored_adr(i, *substance[i]))
+        for i in range(2)
+    ]
     memory_calls: list[dict[str, Any]] = []
 
-    class _MemoryReader:
-        async def read_records(self, **kwargs: Any) -> Any:
+    class _Request:
+        def __init__(self, **kwargs: Any) -> None:
             memory_calls.append(kwargs)
-            from forge.adapters.fleet_memory.priors import memory_grant_refusal
-            why = memory_grant_refusal(kwargs["memory_project"], kwargs["granted_memory_projects"])
-            if why is not None:
-                return [], why
-            return [dict(r) for r in memory_records], None
+
+    async def _search(_request: Any, _store: Any) -> list[Any]:
+        return list(hits)
+
+    class _StoreContext:
+        async def __aenter__(self) -> object:
+            return object()
+
+        async def __aexit__(self, *_: Any) -> None:
+            return None
+
+    memory_reader = FleetMemoryPriorsReader(
+        FleetMemoryPriorsConfig(enabled=True, pg_dsn="stand-in", embed_url="stand-in"),
+        backend=_RetrievalBackend(
+            settings_cls=lambda **kwargs: SimpleNamespace(**kwargs),  # type: ignore[arg-type]
+            store_context=lambda _settings: _StoreContext(),
+            request_cls=_Request,
+            search=_search,
+        ),
+    )
+    memory_text = memory_decisions.outcome(
+        "widget_shop", (await memory_reader.read_records(
+            memory_project="widget_shop", granted_memory_projects=["widget_shop"],
+            payload_types=["adr"], domain_tags=["architecture"], query=_REQUEST,
+            token_budget=10, purpose="expected text"))[0], None)["text"]
+    assert memory_text and all(part in memory_text for item in substance for part in item)
+    memory_calls.clear()
 
     expected = [
         f"File: AGENTS.md\n{AGENTS}",
@@ -428,7 +485,7 @@ async def test_memory_records_reach_real_writers_and_coaches_after_restart(
             ).model_copy(update={"sandboxes": {_REPO: SandboxEntry(
                 name="uploads", sidecar_url="http://sandbox:1", runner_url="http://sandbox:2",
                 memory_projects=["widget_shop"])}}),
-            memory_reader=_MemoryReader(),
+            memory_reader=memory_reader,
             clock=clock,
             publish_notification=notify,
             dispatch_feature_spec=dispatch_spec,
@@ -502,7 +559,9 @@ async def test_memory_records_reach_real_writers_and_coaches_after_restart(
         # Searched once across three drives, recorded once, receipts on the
         # spec draft and the plan, and both coaches saw the records.
         assert len(memory_calls) == 1, memory_calls
-        assert memory_calls[0]["granted_memory_projects"] == ("widget_shop",)
+        assert memory_calls[0]["project"] == "widget_shop"
+        assert memory_calls[0]["payload_types"] == ["adr"]
+        assert memory_calls[0]["domain_tags"] == ["architecture"]
         mem_rows = _records(current, memory_decisions.STAGE)
         assert len(mem_rows) == 1 and mem_rows[0]["memory_decisions"]["outcome"] == "given"
         assert drafts[0]["spec_draft"]["memory_decisions"]["status"] == "sent"
@@ -510,14 +569,18 @@ async def test_memory_records_reach_real_writers_and_coaches_after_restart(
         plan_coach_inputs = [p for c in calls if c["stage"] is StageClass.FEATURE_PLAN
                              for p in c["coach"].inputs]
         assert plan_coach_inputs
-        for p in plan_coach_inputs:
-            t = _message_text(p)
-            assert "Context documents supplied to the writer" in t
-            assert "### Recorded decision 0" in t and "### Recorded decision 1" in t
         spec_coach_inputs = [p for c in calls if c["stage"] is StageClass.FEATURE_SPEC
                              for p in c["coach"].inputs]
-        assert spec_coach_inputs and all("### Recorded decision 0" in _message_text(p)
-                                         for p in spec_coach_inputs)
+        writer_inputs = [p for c in calls for p in c["player"].inputs]
+        assert spec_coach_inputs and writer_inputs
+        for p in plan_coach_inputs + spec_coach_inputs + writer_inputs:
+            t = _message_text(p)
+            for decision, context, consequences in substance:
+                assert f"Decision: {decision}" in t
+                assert f"Context: {context}" in t
+                assert f"Consequences: {consequences}" in t
+        assert all("Context documents supplied to the writer" in _message_text(p)
+                   for p in plan_coach_inputs)
     finally:
         for connection in connections:
             connection.close()

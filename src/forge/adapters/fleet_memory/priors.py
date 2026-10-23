@@ -61,6 +61,7 @@ by construction.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from dataclasses import dataclass
@@ -263,6 +264,31 @@ def _to_prior_reference(item: Any) -> PriorReference | None:
     )
 
 
+def decoded_payload(value: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """A stored record's own fields, or ``(None, why)``.
+
+    fleet-memory's writer stores ``payload.model_dump()`` as canonical JSON in
+    the envelope's ``content`` and keeps only metadata (natural key, type,
+    project, identifier, version) beside it; search returns the envelope as
+    stored. This decodes ``content`` with a plain ``json.loads``, as GuardKit's
+    fleet-memory client reads a record back, and refuses content that is not
+    a JSON object or that names a different record than its envelope.
+    """
+    content = value.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None, "the record has no stored content"
+    try:
+        payload = json.loads(content)
+    except ValueError:
+        return None, "its stored content is not JSON"
+    if not isinstance(payload, dict):
+        return None, "its stored content is not a JSON object"
+    named = payload.get("natural_key")
+    if named is not None and named != value.get("natural_key"):
+        return None, f"its stored content names a different record ({named})"
+    return payload, None
+
+
 def memory_grant_refusal(
     memory_project: str | None, granted_memory_projects: Sequence[str]
 ) -> str | None:
@@ -401,9 +427,11 @@ class FleetMemoryPriorsReader:
         The same grant rule, store, deadline and reset as :meth:`read_priors`,
         for a caller that wants the records themselves (planning's decision
         records, 23 October 2026). ``(records, None)`` after a search, each
-        ``{"natural_key", "score", "value"}`` in the store's rank order and
-        possibly none; ``([], why)`` when nothing was searched or the search
-        failed, ``why`` one plain clause.
+        ``{"natural_key", "score", "payload", "problem"}`` in the store's rank
+        order and possibly none; ``([], why)`` when nothing was searched or the
+        search failed, ``why`` one plain clause. ``payload`` is the record's own
+        fields decoded from the stored envelope (:func:`decoded_payload`), or
+        ``None`` with ``problem`` saying why it could not be.
 
         The fleet-memory search returns at most :data:`SEARCH_RESULT_LIMIT`
         (ten) best matches for ``query``, so these are never all of a large
@@ -459,7 +487,9 @@ class FleetMemoryPriorsReader:
             natural_key = value.get("natural_key") if isinstance(value, dict) else None
             if isinstance(natural_key, str) and natural_key:
                 score = float(getattr(item, "score", None) or 0.0)
-                records.append({"natural_key": natural_key, "score": score, "value": value})
+                payload, problem = decoded_payload(value)
+                records.append({"natural_key": natural_key, "score": score,
+                                "payload": payload, "problem": problem})
         logger.info(
             "fleet-memory: %d record(s) matched in %s for %s", len(records), project, purpose
         )
@@ -619,6 +649,7 @@ __all__ = [
     "FleetMemoryPriorsConfig",
     "FleetMemoryPriorsReader",
     "build_priors_reader_from_env",
+    "decoded_payload",
     "load_priors_config_from_env",
     "memory_grant_refusal",
 ]

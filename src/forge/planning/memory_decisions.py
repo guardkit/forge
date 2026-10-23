@@ -39,17 +39,32 @@ _FIELDS = (
 )
 
 
-def render_record(value: dict[str, Any]) -> str:
-    """One decision record as plain text: a heading, then its filled fields."""
-    title = value.get("title") or value.get("identifier") or value.get("natural_key")
+def render_record(natural_key: str, payload: dict[str, Any]) -> str:
+    """One decoded decision record as plain text: a heading, then its filled
+    fields. ``natural_key`` (the envelope's) names it when it has no title."""
+    title = payload.get("title") or payload.get("identifier") or natural_key
     lines = [f"### {title}"]
     for key, label in _FIELDS:
-        field = value.get(key)
+        field = payload.get(key)
         if isinstance(field, list):
             field = "; ".join(str(item) for item in field if str(item).strip())
         if field is not None and str(field).strip():
             lines.append(f"{label}: {str(field).strip()}")
     return redact_credentials("\n".join(lines)) + "\n"
+
+
+def _unusable(record: dict[str, Any]) -> str | None:
+    """Why a searched record cannot be given, or ``None``. A decision record's
+    one required substance is its decision text."""
+    if record.get("problem"):
+        return str(record["problem"])
+    payload = record.get("payload")
+    if not isinstance(payload, dict):
+        return "its stored content could not be decoded"
+    decision = payload.get("decision")
+    if not isinstance(decision, str) or not decision.strip():
+        return "its stored content has no decision text"
+    return None
 
 
 def outcome(
@@ -59,11 +74,12 @@ def outcome(
 ) -> dict[str, Any]:
     """The recorded outcome: what was searched, what is sent, what was left out.
 
-    ``records`` are the search's, best first, and at most its
-    :data:`SEARCH_RESULT_LIMIT` best matches, which the detail says. They are
-    kept in that order while
-    their text fits :data:`BUDGET_BYTES`; the first that does not, and every one
-    ranked below it, is left out by name.
+    ``records`` are the reader's, best first, decoded from their stored
+    envelopes, and at most the search's :data:`SEARCH_RESULT_LIMIT` best
+    matches, which the detail says. A record that could not be decoded or has
+    no decision text is skipped and named with the reason. The rest are kept in
+    rank order while their rendered text fits :data:`BUDGET_BYTES`; the first
+    that does not, and every one ranked below it, is left out by name.
     """
     base: dict[str, Any] = {
         "memory_project": memory_project,
@@ -73,6 +89,7 @@ def outcome(
         "search_limit": SEARCH_RESULT_LIMIT,
         "records": [],
         "dropped": [],
+        "skipped": [],
         "text": None,
     }
     if why_not is not None:
@@ -85,9 +102,15 @@ def outcome(
                           f"most {SEARCH_RESULT_LIMIT} best matches for the request."}
     kept: list[tuple[dict[str, Any], str]] = []
     dropped: list[dict[str, Any]] = []
+    skipped: list[dict[str, Any]] = []
     total = 0
     for record in records:
-        text = render_record(record["value"])
+        why = _unusable(record)
+        if why is not None:
+            skipped.append({"natural_key": record["natural_key"], "score": record["score"],
+                            "why": why})
+            continue
+        text = render_record(record["natural_key"], record["payload"])
         size = len(text.encode("utf-8"))
         entry = {"natural_key": record["natural_key"], "score": record["score"], "bytes": size}
         if dropped or total + size > BUDGET_BYTES:
@@ -101,12 +124,16 @@ def outcome(
     if dropped:
         detail += (f" {len(dropped)} lower-ranked record(s) were left out to stay within "
                    f"{BUDGET_BYTES} bytes: {', '.join(d['natural_key'] for d in dropped)}.")
+    if skipped:
+        detail += (f" {len(skipped)} record(s) could not be read and were skipped: "
+                   + "; ".join(f"{s['natural_key']} ({s['why']})" for s in skipped) + ".")
     text = None
     if kept:
         text = ("Architecture decision records from this project's memory. " + detail
                 + "\n\n" + "\n".join(t for _entry, t in kept))
-    return {**base, "outcome": "given" if kept else "none-fitted", "detail": detail,
-            "records": [entry for entry, _t in kept], "dropped": dropped, "text": text}
+    result = "given" if kept else "none-fitted" if dropped else "none-readable"
+    return {**base, "outcome": result, "detail": detail, "records": [e for e, _t in kept],
+            "dropped": dropped, "skipped": skipped, "text": text}
 
 
 def record(store: Any, correlation_id: str, result: dict[str, Any]) -> None:

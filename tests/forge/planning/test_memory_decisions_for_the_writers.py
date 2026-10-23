@@ -21,6 +21,7 @@ reader, and the writers are the stand-ins of the project-documents tests.
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -54,17 +55,55 @@ from tests.forge.planning.test_project_documents_for_the_writers import (  # noq
 MEMORY = "widget_shop"
 
 
-def _adr(identifier: str, score: float, *, decision: str = "Use one database.") -> Any:
-    value = {
-        "natural_key": f"adr:{MEMORY}:{identifier}",
-        "identifier": identifier,
-        "title": f"Decision {identifier}",
-        "status": "accepted",
-        "decision": decision,
-        "alternatives": ["two databases"],
-        "domain_tags": ["architecture"],
-    }
-    return SimpleNamespace(value=value, score=score)
+class _CapturingStore:
+    """Just enough of the store for fleet-memory's writer to write one record."""
+
+    def __init__(self) -> None:
+        self.put: dict[str, Any] | None = None
+
+    async def aget(self, *_: Any) -> None:
+        return None
+
+    async def asearch(self, *_: Any, **__: Any) -> list[Any]:
+        return []
+
+    async def aput(self, _namespace: Any, _key: str, value: dict[str, Any]) -> None:
+        self.put = value
+
+
+def _adr(identifier: str, score: float, *, decision: str = "Use one database.",
+         **fields: Any) -> Any:
+    """A search hit carrying the envelope fleet-memory's own writer stores for
+    an ADR: the record's fields as canonical JSON in ``content``, metadata
+    beside it."""
+    pytest.importorskip("fleet_memory")
+    from fleet_memory.payloads.models import ADRPayload
+    from fleet_memory.writer.core import DeterministicWriter
+
+    payload = ADRPayload(
+        project=MEMORY, identifier=identifier, title=f"Decision {identifier}",
+        status="accepted", decision=decision, alternatives=["two databases"],
+        domain_tags=["architecture"], source_ref=f"docs/decisions/{identifier}.md",
+        **fields,
+    )
+    store = _CapturingStore()
+    writer = DeterministicWriter(store, settings=None)  # type: ignore[arg-type]
+    with concurrent.futures.ThreadPoolExecutor(1) as pool:
+        pool.submit(asyncio.run, writer.write(payload)).result()
+    assert store.put is not None and "decision" not in store.put  # metadata only on top
+    return SimpleNamespace(value=store.put, score=score)
+
+
+async def _read(items: list[Any]) -> list[dict[str, Any]]:
+    """The records Forge's reader makes of these search hits."""
+    reader, _requests, _store = _reader(_returning(items))
+    records, why = await reader.read_records(
+        memory_project=MEMORY, granted_memory_projects=[MEMORY],
+        payload_types=["adr"], domain_tags=["architecture"], query="q",
+        token_budget=10, purpose="test",
+    )
+    assert why is None
+    return records
 
 
 class _Store:
@@ -128,13 +167,10 @@ def _outcomes(store: SqlitePlanningRunStore) -> list[dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
-def test_over_the_cap_the_lowest_ranked_records_are_left_out_and_named() -> None:
+@pytest.mark.asyncio
+async def test_over_the_cap_the_lowest_ranked_records_are_left_out_and_named() -> None:
     big = "x" * 7000
-    records = [
-        {"natural_key": f"adr:{MEMORY}:A{i}", "score": 1.0 - i / 10,
-         "value": _adr(f"A{i}", 0.0, decision=big).value}
-        for i in range(4)
-    ]
+    records = await _read([_adr(f"A{i}", 1.0 - i / 10, decision=big) for i in range(4)])
     result = memory_decisions.outcome(MEMORY, records, None)
 
     assert result["outcome"] == "given"
@@ -152,11 +188,11 @@ def test_over_the_cap_the_lowest_ranked_records_are_left_out_and_named() -> None
     assert "at most the 10 best matches for the request" in result["text"]
 
 
-def test_under_the_cap_the_record_still_says_the_search_returns_ten_at_most() -> None:
+@pytest.mark.asyncio
+async def test_under_the_cap_the_record_still_says_the_search_returns_ten_at_most() -> None:
     """Fleet-memory returns at most ten ranked matches, so a project with many
     records never trips the cap; the record must not read as if it held them all."""
-    records = [{"natural_key": f"adr:{MEMORY}:A{i}", "score": 0.5,
-                "value": _adr(f"A{i}", 0.5).value} for i in range(10)]
+    records = await _read([_adr(f"A{i}", 0.5) for i in range(10)])
     result = memory_decisions.outcome(MEMORY, records, None)
     assert result["dropped"] == [] and result["search_limit"] == 10
     assert "at most the 10 best matches for the request" in result["detail"]
@@ -165,12 +201,46 @@ def test_under_the_cap_the_record_still_says_the_search_returns_ten_at_most() ->
     assert empty["search_limit"] == 10 and "at most 10 best matches" in empty["detail"]
 
 
-def test_a_record_renders_its_filled_fields_only() -> None:
-    text = memory_decisions.render_record(_adr("ADR_1", 0.5).value)
+@pytest.mark.asyncio
+async def test_a_stored_record_is_decoded_and_renders_its_substance() -> None:
+    """The decision, its context and consequences come out of the stored
+    envelope's ``content``; identity and rank stay the envelope's."""
+    (record,) = await _read([_adr(
+        "ADR_1", 0.7, context="One machine, one user.",
+        consequences="Simple to back up; no scaling story.")])
+    assert record["natural_key"] == f"adr:{MEMORY}:ADR_1" and record["score"] == 0.7
+    assert record["problem"] is None
+    text = memory_decisions.render_record(record["natural_key"], record["payload"])
     assert text == (
         "### Decision ADR_1\nStatus: accepted\nDecision: Use one database.\n"
-        "Alternatives considered: two databases\n"
+        "Context: One machine, one user.\n"
+        "Consequences: Simple to back up; no scaling story.\n"
+        "Alternatives considered: two databases\nSource: docs/decisions/ADR_1.md\n"
     )
+
+
+@pytest.mark.asyncio
+async def test_unreadable_records_are_skipped_by_name_and_the_rest_given() -> None:
+    good = _adr("ADR_1", 0.9)
+    not_json = _adr("ADR_2", 0.8)
+    not_json.value = {**not_json.value, "content": "not json"}
+    other = _adr("ADR_3", 0.7)
+    other.value = {**other.value, "content": _adr("ADR_9", 0.0).value["content"]}
+    blank = _adr("ADR_4", 0.6, decision=" ")
+    result = memory_decisions.outcome(MEMORY, await _read([good, not_json, other, blank]), None)
+
+    assert result["outcome"] == "given"
+    assert [r["natural_key"] for r in result["records"]] == [f"adr:{MEMORY}:ADR_1"]
+    assert [(s["natural_key"], s["why"]) for s in result["skipped"]] == [
+        (f"adr:{MEMORY}:ADR_2", "its stored content is not JSON"),
+        (f"adr:{MEMORY}:ADR_3",
+         f"its stored content names a different record (adr:{MEMORY}:ADR_9)"),
+        (f"adr:{MEMORY}:ADR_4", "its stored content has no decision text"),
+    ]
+    assert "3 record(s) could not be read and were skipped" in result["detail"]
+    assert "Decision: Use one database." in result["text"]
+    only_bad = memory_decisions.outcome(MEMORY, await _read([not_json]), None)
+    assert only_bad["outcome"] == "none-readable" and only_bad["text"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -251,7 +321,11 @@ async def test_both_writers_get_the_records_and_both_receipts_say_which(
         answers=[door._answer("reject", notes="tighten the second example"),
                  door._answer("approve", attempt=1)],
     )
-    reader, requests, _store = _reader(_returning([_adr("ADR_1", 0.9), _adr("ADR_2", 0.4)]))
+    reader, requests, _store = _reader(_returning([
+        _adr("ADR_1", 0.9, context="Only one person uses it.",
+             consequences="Backups are one file."),
+        _adr("ADR_2", 0.4, decision="Serve the pages from the API process."),
+    ]))
     _with_memory(h, reader, [MEMORY])
 
     await h.driver.drive(door.CID)
@@ -261,7 +335,10 @@ async def test_both_writers_get_the_records_and_both_receipts_say_which(
     assert len(requests) == 1
     assert result["outcome"] == "given" and result["dropped"] == []
     expected = [result["text"], load_bundled_document().text]
-    assert "### Decision ADR_1" in result["text"] and "### Decision ADR_2" in result["text"]
+    for substance in ("### Decision ADR_1", "Decision: Use one database.",
+                      "Context: Only one person uses it.", "Consequences: Backups are one file.",
+                      "Decision: Serve the pages from the API process."):
+        assert substance in result["text"]
     first, rewrite = h.calls["spec"]
     assert first["context"] == expected and rewrite["context"] == expected
     assert [call["context"] for call in h.calls["plan"]] == [expected]
