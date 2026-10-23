@@ -82,6 +82,12 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     pool,
     repo_root,
 )
+from tests.forge.record_answer.test_the_coordinators_read_only_answer import (
+    REPO as ARCHIVE_REPO,
+    _a_build_starting_from,
+    _mission_profileless_authority,
+    _profile_authority,
+)
 from tests.forge.recorded_fetch_address import origin_of
 
 MISSION_ID = "m-abc123"
@@ -371,6 +377,11 @@ class TestAMissionFeatureLandsOnTheMissionBranch:
             "feature-mismatch",
             "missing-decision",
             "rejected-decision",
+            "decision-null",
+            "decision-list",
+            "decision-string",
+            "decision-boolean",
+            "decision-integer",
             "wrong-execution",
             "expired-lease",
             "durable-turn-mismatch",
@@ -530,6 +541,19 @@ class TestAMissionFeatureLandsOnTheMissionBranch:
                 "AND target_identifier = 'merge_deploy_decision'",
                 (B_BUILD,),
             )
+        elif variant.startswith("decision-"):
+            malformed = {
+                "decision-null": None,
+                "decision-list": [],
+                "decision-string": "approve",
+                "decision-boolean": True,
+                "decision-integer": 1,
+            }[variant]
+            cx.execute(
+                "UPDATE stage_log SET details_json = ? WHERE build_id = ? "
+                "AND target_identifier = 'merge_deploy_decision'",
+                (json.dumps({"merge_decision": malformed}), B_BUILD),
+            )
         elif variant == "wrong-execution":
             row = cx.execute(
                 "SELECT details_json FROM stage_log WHERE build_id = ? "
@@ -675,6 +699,208 @@ class TestAMissionFeatureLandsOnTheMissionBranch:
                 )
             else:
                 assert "deployment_layout" not in recorded_answers[0]
+
+    @pytest.mark.parametrize("mission", [False, True], ids=["ordinary", "mission"])
+    @pytest.mark.parametrize("current_contradiction", [False, True])
+    def test_a_rejoined_archive_reaches_the_real_guard_with_only_current_checks(
+        self,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        monkeypatch: pytest.MonkeyPatch,
+        mission: bool,
+        current_contradiction: bool,
+    ) -> None:
+        profile = (
+            "env_id: generic-live\n"
+            "compose:\n"
+            "  file: compose.yaml\n"
+            "  script: deploy/check.sh\n"
+        )
+        (repo_root / "deploy").mkdir()
+        (repo_root / "deploy/profile.yaml").write_text(profile, encoding="utf-8")
+        (repo_root / "deploy/check.sh").write_text(
+            "#!/bin/sh\nexit 0\n", encoding="utf-8"
+        )
+        _git(repo_root, "add", "deploy")
+        _git(repo_root, "commit", "-q", "-m", "declare generic deployment")
+        start = _git(repo_root, "rev-parse", "HEAD")
+        build = _a_build_starting_from(pool, start)
+        first_archive = repo_root / ".forge-candidates" / "attempt-1"
+        second_archive = repo_root / ".forge-candidates" / "attempt-2"
+        (second_archive / "deploy").mkdir(parents=True)
+        (second_archive / "deploy/profile.yaml").write_text(
+            profile, encoding="utf-8"
+        )
+        (second_archive / "deploy/check.sh").write_text(
+            "#!/bin/sh\nexit 0\n", encoding="utf-8"
+        )
+        if mission:
+            previous = _mission_profileless_authority(
+                pool, build, start, first_archive
+            )
+        else:
+            _selection, previous = _profile_authority(
+                pool, build, start, first_archive
+            )
+
+        store = PublicationRecordStore(pool.connection)
+        publication = store.read(build)
+        now = datetime.now(UTC)
+        previous_checked = {
+            "j_commit": publication.j_commit,
+            "j_tree": previous["joined_tree"],
+            "verify_ok": True,
+        }
+        assert store.done(
+            build_id=build,
+            turn=publication.turn,
+            now=now,
+            step="candidate-check",
+            attempt=1,
+            result=previous_checked,
+            checked=previous_checked,
+        )
+        joined = "7" * 40
+        joined_tree = "8" * 40
+        assert store.record(
+            build_id=build,
+            turn=publication.turn,
+            now=now,
+            g_commit="9" * 40,
+        )
+        assert store.about_to(
+            build_id=build,
+            turn=publication.turn,
+            now=now,
+            step=STEP_JOIN,
+            attempt=2,
+            inputs={},
+        )
+        assert store.done(
+            build_id=build,
+            turn=publication.turn,
+            now=now,
+            step=STEP_JOIN,
+            attempt=2,
+            result={"j_commit": joined, "verify_ok": True},
+            j_commit=joined,
+        )
+        assert store.about_to(
+            build_id=build,
+            turn=publication.turn,
+            now=now,
+            step="candidate-check",
+            attempt=2,
+            inputs={
+                "j_commit": joined,
+                "j_tree": joined_tree,
+                "feature_id": publication.feature_id,
+                "candidate_cwd": str(second_archive),
+            },
+        )
+        if current_contradiction:
+            contradictory = {
+                "j_commit": "6" * 40,
+                "j_tree": joined_tree,
+                "verify_ok": True,
+            }
+            assert store.done(
+                build_id=build,
+                turn=publication.turn,
+                now=now,
+                step="candidate-check",
+                attempt=2,
+                result=contradictory,
+                checked=contradictory,
+            )
+
+        config = ForgeConfig.model_validate(
+            {
+                "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+                "planning": {"target_repo_paths": {ARCHIVE_REPO: str(repo_root)}},
+            }
+        )
+        answers: list[dict[str, Any]] = []
+
+        def answer(asked_build: str) -> dict[str, Any]:
+            recorded = TheCoordinatorsRecord(pool.db_path).what_build_starts_from(
+                asked_build
+            )
+            answers.append(recorded)
+            return recorded
+
+        monkeypatch.setattr(deploy_sidecar, "coordinator_recorded_build", lambda: answer)
+
+        async def local_tree(_repo: Path, ref: str) -> str | None:
+            return joined_tree if ref == f"{joined}^{{tree}}" else None
+
+        def local_file(
+            repo: Path, commit: str, name: str, **_options: Any
+        ) -> FileAtCommit:
+            readable_commit = start if commit == joined else commit
+            entry = subprocess.run(
+                ["git", "-C", str(repo), "ls-tree", readable_commit, "--", name],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout.strip()
+            if not entry:
+                return FileAtCommit(found=False)
+            mode, kind, _object, _path = entry.split(maxsplit=3)
+            if kind != "blob":
+                return FileAtCommit(found=False, mode=mode)
+            content = subprocess.run(
+                ["git", "-C", str(repo), "show", f"{readable_commit}:{name}"],
+                capture_output=True,
+                text=True,
+                check=True,
+            ).stdout
+            return FileAtCommit(content=content, found=True, ordinary=True, mode=mode)
+
+        async def local_file_async(
+            repo: Path, commit: str, name: str, **options: Any
+        ) -> FileAtCommit:
+            return local_file(repo, commit, name, **options)
+
+        monkeypatch.setattr(deploy_sidecar, "read_file_at_commit_sync", local_file)
+        monkeypatch.setattr("forge.deploy.candidate_tree.git_rev_parse", local_tree)
+        monkeypatch.setattr(
+            "forge.deploy.candidate_tree.read_file_at_commit", local_file_async
+        )
+        (repo_root / "deploy/profile.yaml").unlink()
+        runner = RecordingSidecarRunner()
+        status, body = deploy_sidecar.process_run_request(
+            {
+                "repo": ARCHIVE_REPO,
+                "build": build,
+                "declared_at": start,
+                "cwd": str(second_archive),
+                "env": {},
+                "script": "deploy/check.sh",
+            },
+            config=config,
+            script_runner=runner,
+        )
+
+        assert len(answers) == 1
+        history = [
+            line.attempt
+            for line in store.read(build).lines
+            if line.kind == "done" and line.step == "candidate-check"
+        ]
+        assert history == ([1, 2] if current_contradiction else [1])
+        if current_contradiction:
+            assert status == 400, body
+            assert "deployment_layout" not in answers[0]
+            assert runner.runner_calls == []
+        else:
+            assert status == 200, body
+            assert answers[0]["deployment_layout"]["attempt"] == 2
+            assert answers[0]["deployment_layout"]["candidate_cwd"] == str(
+                second_archive
+            )
+            assert len(runner.runner_calls) == 1
+            assert runner.runner_calls[0]["cwd"] == str(second_archive)
 
     @pytest.mark.asyncio
     async def test_it_is_published_to_the_mission_branch_and_nothing_is_deployed(

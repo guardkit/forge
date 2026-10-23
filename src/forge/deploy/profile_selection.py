@@ -246,10 +246,27 @@ def confirmed_deployment_layout(connection: Any, build: str, start_commit: str) 
                 feature != record.feature_id for feature in mission_features
             ))):
         raise ValueError("the current attempt has contradictory candidate archives")
+    completed_current_checks = [
+        line.detail
+        for line in record.lines
+        if line.kind == "done" and line.step == "candidate-check"
+        and line.attempt == record.attempt
+    ]
     checked = record.checked
-    if ((checked.get("j_commit") is not None and checked.get("j_commit") != record.j_commit)
-            or (checked.get("j_tree") is not None
-                and checked.get("j_tree") != detail.get("j_tree"))):
+    current_result_contradicts = any(
+        (result.get("j_commit") is not None
+         and result.get("j_commit") != record.j_commit)
+        or (result.get("j_tree") is not None
+            and result.get("j_tree") != detail.get("j_tree"))
+        for result in completed_current_checks
+    )
+    current_checked_contradicts = bool(completed_current_checks) and (
+        (checked.get("j_commit") is not None
+         and checked.get("j_commit") != record.j_commit)
+        or (checked.get("j_tree") is not None
+            and checked.get("j_tree") != detail.get("j_tree"))
+    )
+    if current_result_contradicts or current_checked_contradicts:
         raise ValueError("the checked artifact contradicts the deployment layout")
     return {"repo": record.repo, "build": build, "start_commit": start_commit,
             "attempt": record.attempt, "turn": record.turn,
@@ -290,7 +307,12 @@ def _approved_mission_landing(
         raise ValueError("the mission feature has no durable landing decision")
     decided = decisions[-1]
     try:
-        decision = json.loads(decided[2])["merge_decision"]
+        details = json.loads(decided[2])
+        if not isinstance(details, dict):
+            raise ValueError("the decision details are not an object")
+        decision = details["merge_decision"]
+        if not isinstance(decision, dict):
+            raise ValueError("the merge decision is not an object")
     except (KeyError, TypeError, ValueError) as exc:
         raise ValueError("the mission feature landing decision is unreadable") from exc
     expected_attempt = landing_attempt_id(build)

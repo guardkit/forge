@@ -408,6 +408,29 @@ class TestTheAnswerService:
         ).fetchone()[0]
         assert offers == 0
 
+    @pytest.mark.parametrize("decision", [None, [], "approve", True, 1])
+    def test_a_non_object_mission_decision_preserves_the_recorded_start(
+        self,
+        record: SqliteLifecyclePersistence,
+        tmp_path: Path,
+        decision: Any,
+    ) -> None:
+        start = "a" * 40
+        build = _a_build_starting_from(record, start)
+        _mission_profileless_authority(
+            record, build, start, tmp_path / ".forge-candidates" / "mission"
+        )
+        record.connection.execute(
+            "UPDATE stage_log SET details_json = ? WHERE build_id = ? "
+            "AND target_identifier = 'merge_deploy_decision'",
+            (json.dumps({"merge_decision": decision}), build),
+        )
+        record.connection.commit()
+
+        answer = TheCoordinatorsRecord(record.db_path).what_build_starts_from(build)
+
+        assert answer == {"build": build, "recorded": True, "start_commit": start}
+
     @pytest.mark.parametrize(
         "broken",
         [
@@ -526,9 +549,15 @@ class TestTheAnswerService:
                 if broken == "checked-join"
                 else {"j_tree": "7" * 40}
             )
-            cx.execute(
-                "UPDATE publication_records SET checked_json = ? WHERE build_id = ?",
-                (json.dumps(checked), build),
+            publication = PublicationRecordStore(cx).read(build)
+            assert PublicationRecordStore(cx).done(
+                build_id=build,
+                turn=publication.turn,
+                now=datetime.now(UTC),
+                step=STEP_CANDIDATE_CHECK,
+                attempt=publication.attempt,
+                result=checked,
+                checked=checked,
             )
         else:
             cx.execute("UPDATE publication_records SET attempt = 0 WHERE build_id = ?", (build,))
