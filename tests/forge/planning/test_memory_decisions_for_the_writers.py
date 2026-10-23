@@ -20,6 +20,7 @@ reader, and the writers are the stand-ins of the project-documents tests.
 
 from __future__ import annotations
 
+import asyncio
 import json
 from types import SimpleNamespace
 from typing import Any
@@ -69,13 +70,14 @@ def _adr(identifier: str, score: float, *, decision: str = "Use one database.") 
 class _Store:
     def __init__(self) -> None:
         self.entered = 0
+        self.exited = 0
 
     async def __aenter__(self) -> object:
         self.entered += 1
         return object()
 
     async def __aexit__(self, *_: Any) -> None:
-        return None
+        self.exited += 1
 
 
 def _reader(search: Any) -> tuple[FleetMemoryPriorsReader, list[dict[str, Any]], _Store]:
@@ -145,6 +147,22 @@ def test_over_the_cap_the_lowest_ranked_records_are_left_out_and_named() -> None
     assert "2 lower-ranked record(s) were left out" in result["detail"]
     assert f"adr:{MEMORY}:A3" in result["text"]  # the text says which, by name
     assert result["text"].count("### Decision") == 2
+    assert result["search_limit"] == 10
+    assert "at most the 10 best matches for the request" in result["detail"]
+    assert "at most the 10 best matches for the request" in result["text"]
+
+
+def test_under_the_cap_the_record_still_says_the_search_returns_ten_at_most() -> None:
+    """Fleet-memory returns at most ten ranked matches, so a project with many
+    records never trips the cap; the record must not read as if it held them all."""
+    records = [{"natural_key": f"adr:{MEMORY}:A{i}", "score": 0.5,
+                "value": _adr(f"A{i}", 0.5).value} for i in range(10)]
+    result = memory_decisions.outcome(MEMORY, records, None)
+    assert result["dropped"] == [] and result["search_limit"] == 10
+    assert "at most the 10 best matches for the request" in result["detail"]
+    assert "left out" not in result["detail"]
+    empty = memory_decisions.outcome(MEMORY, [], None)
+    assert empty["search_limit"] == 10 and "at most 10 best matches" in empty["detail"]
 
 
 def test_a_record_renders_its_filled_fields_only() -> None:
@@ -197,6 +215,24 @@ async def test_a_failed_search_is_an_answer_not_an_exception() -> None:
         token_budget=10, purpose="test",
     )
     assert records == [] and "ConnectionError" in str(why)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_resets_the_store_and_is_raised_not_recorded() -> None:
+    """A coordinator shutting down mid-search must not leave the run recorded
+    as 'timed out': the store is reset and the cancellation goes on up."""
+    async def _cancelled(_request: Any, _store: Any) -> list[Any]:
+        raise asyncio.CancelledError
+
+    reader, _requests, store = _reader(_cancelled)
+    with pytest.raises(asyncio.CancelledError):
+        await reader.read_records(
+            memory_project=MEMORY, granted_memory_projects=[MEMORY],
+            payload_types=["adr"], domain_tags=["architecture"], query=None,
+            token_budget=10, purpose="test",
+        )
+    assert reader._store is None and reader._store_cm is None
+    assert store.exited == 1
 
 
 # ---------------------------------------------------------------------------
@@ -257,7 +293,7 @@ def _boom_search() -> Any:
         ("records", [], "not-searched", "granted no memory"),
         ("records", ["other_project"], "not-searched", "not one its repository was granted"),
         ("failing", [MEMORY], "not-searched", "timed out"),
-        ("empty", [MEMORY], "none-found", "has no adr records tagged architecture"),
+        ("empty", [MEMORY], "none-found", "found no adr records tagged architecture"),
     ],
     ids=["memory-off", "no-grant", "other-name", "search-fails", "no-records"],
 )

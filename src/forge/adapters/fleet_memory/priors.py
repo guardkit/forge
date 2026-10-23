@@ -98,6 +98,10 @@ _MAX_PRIORS: int = 5
 #: Bounded head of ``lessons``/``content`` carried as the prior summary.
 _SUMMARY_HEAD_CHARS: int = 500
 
+#: The most results one fleet-memory search returns, best match first
+#: (``fleet_memory.retrieval``'s ranked page; tag filters apply after it).
+SEARCH_RESULT_LIMIT: int = 10
+
 
 @dataclass(frozen=True, slots=True)
 class FleetMemoryPriorsConfig:
@@ -400,6 +404,11 @@ class FleetMemoryPriorsReader:
         ``{"natural_key", "score", "value"}`` in the store's rank order and
         possibly none; ``([], why)`` when nothing was searched or the search
         failed, ``why`` one plain clause.
+
+        The fleet-memory search returns at most :data:`SEARCH_RESULT_LIMIT`
+        (ten) best matches for ``query``, so these are never all of a large
+        project's records. Cancellation (a shutting-down coordinator) resets the
+        store and is raised again, never reported as a failed search.
         """
         why_not = memory_grant_refusal(memory_project, granted_memory_projects)
         if why_not is not None:
@@ -426,7 +435,10 @@ class FleetMemoryPriorsReader:
             results = await asyncio.wait_for(
                 _search(), timeout=self._config.read_timeout_s
             )
-        except (TimeoutError, asyncio.CancelledError):
+        except asyncio.CancelledError:
+            await self._discard_store()
+            raise
+        except TimeoutError:
             await self._discard_store()
             logger.error(
                 "fleet-memory: read for %s timed out after %ss — store reset",
@@ -603,6 +615,7 @@ def build_priors_reader_from_env(
 
 __all__ = [
     "PRIORS_GROUP_ID",
+    "SEARCH_RESULT_LIMIT",
     "FleetMemoryPriorsConfig",
     "FleetMemoryPriorsReader",
     "build_priors_reader_from_env",

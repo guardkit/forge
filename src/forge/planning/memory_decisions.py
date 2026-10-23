@@ -18,6 +18,7 @@ import hashlib
 import json
 from typing import Any
 
+from forge.adapters.fleet_memory.priors import SEARCH_RESULT_LIMIT
 from forge.memory import redact_credentials
 
 STAGE = "memory-decisions"
@@ -58,7 +59,9 @@ def outcome(
 ) -> dict[str, Any]:
     """The recorded outcome: what was searched, what is sent, what was left out.
 
-    ``records`` are the search's, best first. They are kept in that order while
+    ``records`` are the search's, best first, and at most its
+    :data:`SEARCH_RESULT_LIMIT` best matches, which the detail says. They are
+    kept in that order while
     their text fits :data:`BUDGET_BYTES`; the first that does not, and every one
     ranked below it, is left out by name.
     """
@@ -67,6 +70,7 @@ def outcome(
         "payload_type": PAYLOAD_TYPE,
         "domain_tag": DOMAIN_TAG,
         "budget_bytes": BUDGET_BYTES,
+        "search_limit": SEARCH_RESULT_LIMIT,
         "records": [],
         "dropped": [],
         "text": None,
@@ -76,8 +80,9 @@ def outcome(
                 "detail": f"No decision records were read from memory: {why_not}."}
     if not records:
         return {**base, "outcome": "none-found",
-                "detail": f"Memory project {memory_project} has no {PAYLOAD_TYPE} records "
-                          f"tagged {DOMAIN_TAG}."}
+                "detail": f"The memory search found no {PAYLOAD_TYPE} records tagged "
+                          f"{DOMAIN_TAG} in memory project {memory_project} among the at "
+                          f"most {SEARCH_RESULT_LIMIT} best matches for the request."}
     kept: list[tuple[dict[str, Any], str]] = []
     dropped: list[dict[str, Any]] = []
     total = 0
@@ -91,7 +96,8 @@ def outcome(
         total += size
         kept.append(({**entry, "sha256": hashlib.sha256(text.encode("utf-8")).hexdigest()}, text))
     detail = (f"{len(kept)} decision record(s) from memory project {memory_project}, "
-              f"{total} bytes, best match first.")
+              f"{total} bytes, best match first. The memory search returns at most the "
+              f"{SEARCH_RESULT_LIMIT} best matches for the request.")
     if dropped:
         detail += (f" {len(dropped)} lower-ranked record(s) were left out to stay within "
                    f"{BUDGET_BYTES} bytes: {', '.join(d['natural_key'] for d in dropped)}.")
