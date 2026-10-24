@@ -123,6 +123,7 @@ class SqlitePlanningRunStore:
         originating_adapter: str | None = None,
         parent_request_id: str | None = None,
         target_repo: str | None = None,
+        requirement_amendment_paths: tuple[str, ...] = (),
     ) -> DuplicateRun | None:
         """Record a new planning run in QUEUED state.
 
@@ -154,9 +155,20 @@ class SqlitePlanningRunStore:
         DuplicateRun or None:
             :class:`DuplicateRun` if correlation_id exists, None on success.
         """
+        from forge.planning.requirement_amendments import paths, AmendmentRefused
+        scope = paths(requirement_amendment_paths)
+        columns = {r[1] for r in self._connection.execute("PRAGMA table_info(planning_runs)")}
+        has_scope = "requirement_amendment_paths" in columns
+        if scope and not has_scope:
+            raise AmendmentRefused("planning ledger has no amendment scope migration")
+        def check_existing(existing):
+            prior = paths(json.loads(existing["requirement_amendment_paths"])) if has_scope else ()
+            if (scope or prior) and (prior != scope or existing["request_text"] != request_text or existing["target_repo"] != target_repo or existing["originating_user"] != originating_user):
+                raise AmendmentRefused("conflicting original amendment request")
         # Check if correlation_id already exists
         existing = self._get_run(correlation_id)
         if existing is not None:
+            check_existing(existing)
             existing_state = existing["state"]
             is_terminal = existing_state in _TERMINAL_STATE_VALUES
             return DuplicateRun(
@@ -167,26 +179,14 @@ class SqlitePlanningRunStore:
         # Insert new row
         queued_at = datetime.now(timezone.utc).isoformat()
         try:
+            columns_sql = "correlation_id,state,originating_user,expected_approver,request_text,target_repo,triggered_by,originating_adapter,parent_request_id,queued_at"
+            values = [correlation_id, PlanningState.QUEUED.value, originating_user, expected_approver,
+                      request_text, target_repo, triggered_by, originating_adapter, parent_request_id, queued_at]
+            if has_scope:
+                columns_sql += ",requirement_amendment_paths"
+                values.append(json.dumps(list(scope)))
             self._connection.execute(
-                """
-                INSERT INTO planning_runs (
-                    correlation_id, state, originating_user, expected_approver,
-                    request_text, target_repo, triggered_by, originating_adapter,
-                    parent_request_id, queued_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    correlation_id,
-                    PlanningState.QUEUED.value,
-                    originating_user,
-                    expected_approver,
-                    request_text,
-                    target_repo,
-                    triggered_by,
-                    originating_adapter,
-                    parent_request_id,
-                    queued_at,
-                ),
+                f"INSERT INTO planning_runs ({columns_sql}) VALUES ({','.join('?' for _ in values)})", values
             )
             self._connection.commit()
 
@@ -204,6 +204,7 @@ class SqlitePlanningRunStore:
             self._connection.rollback()
             existing = self._get_run(correlation_id)
             if existing is not None:
+                check_existing(existing)
                 existing_state = existing["state"]
                 is_terminal = existing_state in _TERMINAL_STATE_VALUES
                 return DuplicateRun(

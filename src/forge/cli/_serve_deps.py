@@ -340,6 +340,7 @@ def _build_resume_launcher(
     feature_routing_required: bool = False,
     *,
     routine_selection: dict[str, Any] | None = None,
+    amendment_admitter: Any = None,
 ) -> Callable[..., Any]:
     """Return the launch closure — ``dispatch_build`` minus ``record_pending_build``.
 
@@ -410,6 +411,8 @@ def _build_resume_launcher(
             if source_commit_reader is not None and build_id
             else None
         )
+        if amendment_admitter is not None:
+            source_commit = await amendment_admitter(build_id)
         feature_routing_id = correlation_id or build_id
         if source_commit:
             return await dispatch_autobuild_async(
@@ -542,6 +545,7 @@ def build_serve_resume_launcher(
         feature_routing_gate,
         feature_routing_required,
         routine_selection=_routine_selection_for_launch(forge_config),
+        amendment_admitter=build_requirement_amendment_admission(sqlite_pool, forge_config),
     )
 
     async def guarded_launch(
@@ -956,6 +960,7 @@ def _build_dispatch_build(
         feature_routing_gate,
         feature_routing_required,
         routine_selection=_routine_selection_for_launch(forge_config),
+        amendment_admitter=build_requirement_amendment_admission(sqlite_pool, forge_config),
     )
     clock = gate_clock or _utc_now
 
@@ -2290,6 +2295,63 @@ def _prepared_feature_file_refusal(
         f"registered checkout ({wanted_abs}), the one file a build of "
         f"{feature_id} reads"
     )
+
+
+def build_requirement_amendment_admission(
+    pool: Any, config: Any, *, git_runner: Any = None, validate_only: bool = False
+) -> Any:
+    if not hasattr(pool, "connection"):
+        return None
+    runners = [git_runner] if git_runner is not None else []
+
+    async def apply(build_id: str) -> str | None:
+        from forge.planning.requirement_amendment_store import _plan, admit
+
+        cx = pool.connection
+        row = cx.execute(
+            "SELECT * FROM builds WHERE build_id=?", (build_id,)
+        ).fetchone()
+        if row is None:
+            raise ValueError("no exact build for requirement amendment admission")
+        if (
+            "requirement_amendment_required" in row.keys()
+            and not row["requirement_amendment_required"]
+        ):
+            return None if validate_only else pool.read_source_commit(build_id)
+        if not _plan(cx, row["correlation_id"]):
+            if (
+                "requirement_amendment_required" in row.keys()
+                and row["requirement_amendment_required"]
+            ):
+                raise ValueError("required amendment planning binding is unavailable")
+            return None if validate_only else pool.read_source_commit(build_id)
+        repo_path = config.planning.target_repo_paths.get(row["repo"])
+        if not repo_path:
+            raise ValueError("amendment repository is not registered")
+        if not runners:
+            from forge.cli._serve_planning import compose_planning_git_runner
+
+            runner, _resolver = compose_planning_git_runner(config.planning)
+            runners.append(runner)
+        if validate_only:
+            from forge.planning.requirement_amendment_store import freeze_final_plan
+            from forge.planning.driver import (
+                _QA_PASS_BARS_STAGE,
+                _QA_FEATURE_GATE_STAGE,
+            )
+
+            await freeze_final_plan(
+                cx,
+                row["correlation_id"],
+                runners[0],
+                str(repo_path),
+                pass_stage=_QA_PASS_BARS_STAGE,
+                gate_stage=_QA_FEATURE_GATE_STAGE,
+            )
+            return None
+        return await admit(cx, build_id, runners[0], str(repo_path))
+
+    return apply
 
 
 def build_prepared_build_admission(

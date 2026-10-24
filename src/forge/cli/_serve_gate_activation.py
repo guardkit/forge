@@ -249,13 +249,18 @@ class _MirroredApprovalPublisher:
         emitter: "PipelineLifecycleEmitter",
         build_context: BuildContext,
         clock: Callable[[], datetime],
+        amendment_pool: Any = None,
     ) -> None:
+        self._amendment_pool = amendment_pool
         self._inner = inner
         self._emitter = emitter
         self._ctx = build_context
         self._clock = clock
 
     async def publish_request(self, envelope: "MessageEnvelope") -> None:
+        if self._amendment_pool is not None:
+            from forge.planning.requirement_amendment_store import project_approval
+            envelope = project_approval(self._amendment_pool.connection, envelope)
         # 1. AGENTS approval request FIRST (jarvis captures request_id).
         await self._inner.publish_request(envelope)
 
@@ -284,6 +289,14 @@ class _MirroredApprovalPublisher:
 # ---------------------------------------------------------------------------
 # The first production gate_check call site.
 # ---------------------------------------------------------------------------
+
+
+def _bind_amendment_transport(publisher: Any, subscriber: Any, pool: Any) -> None:
+    if not hasattr(pool, "connection"):
+        return
+    from forge.planning.requirement_amendment_store import project_approval, accept_response
+    publisher.amendment_projector = lambda envelope: project_approval(pool.connection, envelope)
+    subscriber.amendment_validator = lambda build_id, envelope, response, expected, additional: accept_response(pool.connection, build_id, envelope, response, expected, additional)
 
 
 def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | None:
@@ -444,6 +457,12 @@ async def maybe_gate_build(
     # (_serve_deps_gating imports gating wrappers which import sqlite_adapters).
     from forge.cli._serve_deps_gating import make_gate_check_deps
 
+    _bind_amendment_transport(parts.publisher, parts.subscriber, sqlite_pool)
+    from forge.cli._serve_deps import build_requirement_amendment_admission
+    preflight = build_requirement_amendment_admission(sqlite_pool, forge_config, validate_only=True)
+    if preflight is not None:
+        await preflight(build_id)
+
     # 1. Idempotency pre-read — a rearm / duplicate re-entry.
     status, pending_request_id = _read_status_and_pending(sqlite_pool, build_id)
     if status is BuildState.PAUSED and pending_request_id:
@@ -505,6 +524,7 @@ async def maybe_gate_build(
             emitter=parts.emitter,
             build_context=ctx,
             clock=clock,
+            amendment_pool=sqlite_pool if hasattr(sqlite_pool, "connection") else None,
         )
 
     # 4. Run the gate. Degraded posture ⇒ MANDATORY_HUMAN_APPROVAL ⇒ pause.
@@ -1720,6 +1740,11 @@ async def rearm_paused_gates(
                     max_total_wait_seconds=parts.gate_approval_max_wait_seconds,
                 )
             )
+            _bind_amendment_transport(parts.publisher, arming_subscriber, sqlite_pool)
+            from forge.cli._serve_deps import build_requirement_amendment_admission
+            preflight = build_requirement_amendment_admission(sqlite_pool, forge_config, validate_only=True)
+            if preflight is not None:
+                await preflight(snap.build_id)
             # Wrap the arm-signalling subscriber in the per-build bound context
             # so the FW10-010 resume emit + the four-step correlation guard stay
             # live on the re-armed await (same behaviour the live path gets from
@@ -1737,6 +1762,7 @@ async def rearm_paused_gates(
                 emitter=parts.emitter,
                 build_context=ctx,
                 clock=clock,
+                amendment_pool=sqlite_pool if hasattr(sqlite_pool, "connection") else None,
             )
 
             # Start the response-await + dispatch (+ launch on approve). It

@@ -6999,6 +6999,14 @@ class PlanningRunDriver:
         if factory_document is not None:
             texts.append(factory_document.context_text())
 
+        from forge.planning.requirement_amendments import FIELD, paths
+        run_record = deps.store.get_run(correlation_id)
+        amendment_scope = paths(json.loads(run_record[FIELD])) if run_record is not None and FIELD in run_record.keys() else ()
+        if amendment_scope:
+            target_repo_descriptor[FIELD] = list(amendment_scope)
+            target_repo_descriptor["requirement_amendment_base_commit"] = run_record["start_commit"]
+            target_repo_descriptor["requirement_amendment_before_sha256"] = {doc.path: doc.sha256 for doc in documents if doc.path in amendment_scope}
+
         async def _ask_the_plan_writer(
             *, note: str | None = None, prior: Mapping[str, str] | None = None
         ) -> Any:
@@ -8337,6 +8345,58 @@ class PlanningRunDriver:
             "branch": branch,
             "sha": attempt.sha,
         }
+        from forge.planning.requirement_amendments import (
+            FIELD,
+            SUFFIX,
+            validate_proposal,
+            validate_absence,
+            AmendmentRefused,
+        )
+        from forge.planning.requirement_amendment_store import record_plan
+
+        amendment_names = [name for name in files if name.endswith(SUFFIX)]
+        run_record = deps.store.get_run(correlation_id)
+        scope = (
+            json.loads(run_record[FIELD])
+            if run_record is not None and FIELD in run_record.keys()
+            else []
+        )
+        if amendment_names or scope:
+            expected_name = f".guardkit/features/{feature_id}{SUFFIX}"
+            try:
+                if (
+                    (amendment_names and amendment_names != [expected_name])
+                    or repo_path is None
+                    or semantic_review is None
+                ):
+                    raise AmendmentRefused(
+                        "amendment artifact/feature/review identity is missing or mismatched"
+                    )
+                kwargs = dict(
+                    runner=self._git_runner_for(target_repo),
+                    repo_path=repo_path,
+                    scope=scope,
+                    base=run_record["start_commit"],
+                    plan=attempt.sha,
+                    feature_id=feature_id,
+                )
+                if amendment_names:
+                    proposal = await validate_proposal(
+                        raw=files[expected_name], **kwargs
+                    )
+                else:
+                    proposal = await validate_absence(**kwargs)
+                record_plan(
+                    deps.store._connection, correlation_id, proposal, semantic_review
+                )
+                details["requirement_amendment_digest"] = proposal["candidate_digest"]
+                details["requirement_amendment_state"] = proposal["amendment_state"]
+            except (ValueError, KeyError, IndexError, TypeError) as exc:
+                return await self._fail_leg(
+                    correlation_id,
+                    _FEATURE_PLAN_STAGE,
+                    "requirement amendment refused: " + str(exc),
+                )
         factory_document, broken = ensure_factory_context(deps.store, correlation_id)
         if broken is not None:
             return await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
@@ -8988,6 +9048,14 @@ class PlanningRunDriver:
         plan_run_id = f"plan-{correlation_id}"
 
         try:
+            from forge.planning.requirement_amendment_store import freeze_final_plan
+            resolved = deps.planning_config.target_repo_paths.get(target_repo)
+            await freeze_final_plan(deps.store._connection, correlation_id, self._git_runner_for(target_repo), str(resolved),
+                                    pass_stage=_QA_PASS_BARS_STAGE, gate_stage=_QA_FEATURE_GATE_STAGE)
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            return await self._fail_leg(correlation_id, _BUILD_QUEUED_STAGE, "final requirement amendment planning source refused: " + str(exc))
+
+        try:
             result = await deps.dispatch_build_trigger(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
@@ -9369,6 +9437,8 @@ class PlanningRunDriver:
             )
 
         try:
+            from forge.planning.requirement_amendment_store import begin_qa, finish_qa
+            amendment_qa = await begin_qa(deps.store._connection, correlation_id, git_runner, repo_path, branch, bars)
             (
                 recorded_memory,
                 recorded_settings,
@@ -9392,6 +9462,8 @@ class PlanningRunDriver:
                 feature_routing_required=self._deps.feature_routing_required,
                 feature_routing_receipt=self._feature_routing_receipt(correlation_id),
             )
+            if gitres.status != "failed":
+                amendment_qa = await finish_qa(amendment_qa, git_runner, repo_path, gitres.sha)
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(
                 correlation_id,
@@ -9412,6 +9484,7 @@ class PlanningRunDriver:
             actor_identity="planning-driver",
             details_json=json.dumps(
                 {
+                    **({"requirement_amendment_qa": amendment_qa} if amendment_qa is not None else {}),
                     "feature_id": feature_id,
                     "bar_files": sorted(bars),
                     "registered_at_sha": plan_sha,
@@ -10433,6 +10506,8 @@ class PlanningRunDriver:
 
         files = {gate_rel: filled_gate, _GATE_REGISTRY_REL: new_registry}
         try:
+            from forge.planning.requirement_amendment_store import begin_qa, finish_qa
+            amendment_qa = await begin_qa(deps.store._connection, correlation_id, git_runner, repo_path, branch, files)
             (
                 recorded_memory,
                 recorded_settings,
@@ -10457,6 +10532,8 @@ class PlanningRunDriver:
                 feature_routing_required=self._deps.feature_routing_required,
                 feature_routing_receipt=self._feature_routing_receipt(correlation_id),
             )
+            if gitres.status != "failed":
+                amendment_qa = await finish_qa(amendment_qa, git_runner, repo_path, gitres.sha)
         except Exception as exc:  # noqa: BLE001 — write boundary
             return await self._fail_leg(
                 correlation_id,
@@ -10478,6 +10555,7 @@ class PlanningRunDriver:
             actor_identity="planning-driver",
             details_json=json.dumps(
                 {
+                    **({"requirement_amendment_qa": amendment_qa} if amendment_qa is not None else {}),
                     "feature_id": feature_id,
                     "gate_file": gate_rel,
                     "registry_file": _GATE_REGISTRY_REL,
@@ -10546,6 +10624,11 @@ class PlanningRunDriver:
             ),
             reason,
         )
+        from forge.planning.requirement_amendment_store import skipped_qa
+        plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
+        bars_details = self._leg_event_details(correlation_id, _QA_PASS_BARS_STAGE)
+        amendment_qa = skipped_qa(self._deps.store._connection, correlation_id,
+            str(plan_details.get("branch") or ""), str(bars_details.get("sha") or plan_details.get("sha") or ""))
         self._deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_QA_FEATURE_GATE_STAGE,
@@ -10553,6 +10636,7 @@ class PlanningRunDriver:
             actor_identity="planning-driver",
             details_json=json.dumps(
                 {
+                    **({"requirement_amendment_qa": amendment_qa} if amendment_qa is not None else {}),
                     "skipped": True,
                     "reason": reason,
                     "reason_code": reason_code,

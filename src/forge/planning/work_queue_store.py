@@ -324,8 +324,15 @@ class WorkQueueStore:
                 f"unknown position {position!r}; expected one of {_POSITIONS}"
             )
 
+        from forge.planning.requirement_amendments import paths, AmendmentRefused
+        scope = paths((extra_details or {}).get("requirement_amendment_paths", []))
+        if scope and kind != "feature":
+            raise AmendmentRefused("only feature sentences can propose requirement amendments")
         existing = self.get_by_correlation_id(correlation_id)
         if existing is not None:
+            prior = paths(self.origin_details(int(existing["id"])).get("requirement_amendment_paths", []))
+            if (scope or prior) and (scope != prior or existing["sentence"] != sentence or existing["target_repo"] != target_repo or existing["originating_user"] != originating_user):
+                raise AmendmentRefused("conflicting original amendment request")
             # A redelivered message: the row is already there, whatever has
             # happened to the queue since.
             return FiledRow(
@@ -396,6 +403,9 @@ class WorkQueueStore:
             existing = self.get_by_correlation_id(correlation_id)
             if existing is None:
                 raise
+            prior = paths(self.origin_details(int(existing["id"])).get("requirement_amendment_paths", []))
+            if (scope or prior) and (scope != prior or existing["sentence"] != sentence or existing["target_repo"] != target_repo or existing["originating_user"] != originating_user):
+                raise AmendmentRefused("conflicting original amendment request")
             return FiledRow(
                 queue_id=int(existing["id"]),
                 ahead=self.count_ahead(int(existing["id"])),

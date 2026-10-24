@@ -129,9 +129,12 @@ class _RunningRowPool:
         self.connection = SimpleNamespace(execute=self._execute)
 
     def _execute(self, _sql: str, _params: Any) -> Any:
+        if "sqlite_master" in _sql:
+            return SimpleNamespace(fetchone=lambda: None)
         return SimpleNamespace(
             fetchone=lambda: {
                 "status": "RUNNING",
+                "correlation_id": "corr-w1",
                 "pending_approval_request_id": None,
             }
         )

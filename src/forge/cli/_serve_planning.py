@@ -1670,6 +1670,7 @@ async def compose_planning_consumer_and_dispatch(
                 originating_adapter=admission.originating_adapter,
                 parent_request_id=admission.parent_request_id,
                 target_repo=admission.target_repo,
+                requirement_amendment_paths=admission.requirement_amendment_paths,
             )
 
         # -- the fix branch (conductor rewire rules 2 and 4) ---------------

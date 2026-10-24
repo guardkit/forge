@@ -275,6 +275,10 @@ class WorktreeGitRunner:
             repo, commit, file_path, ordinary_file_only=ordinary_file_only
         )
 
+    async def rev_parse(self, repo_path: str, ref: str) -> str | None:
+        from forge.deploy.candidate_tree import git_rev_parse
+        return await git_rev_parse(repo_path, ref)
+
     async def list_tree_at_commit(self, repo_path: str, commit: str) -> TreeListing:
         """Every leaf of one commit's tree in this copy: names, modes, types
         and object ids, never any file's content (15 October 2026). Never

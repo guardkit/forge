@@ -218,6 +218,7 @@ _MIGRATIONS: Final[tuple[tuple[int, str], ...]] = (
     # table: which review preview holds which slot, with which link token,
     # until when. Purely additive: one new table and its indexes.
     (19, "schema_v19.sql"),
+    (20, "schema_v20.sql"),
 )
 
 

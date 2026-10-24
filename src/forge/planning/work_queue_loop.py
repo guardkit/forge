@@ -324,6 +324,7 @@ class Admission:
     #: admission goes to. A repair goes to the fix journey, never to a
     #: planning run.
     kind: str = "feature"
+    requirement_amendment_paths: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -2041,6 +2042,7 @@ class WorkQueueLoop:
 
     def _admission_for(self, row: sqlite3.Row) -> Admission:
         """The row's own facts, exactly as they arrived from Slack."""
+        from forge.planning.requirement_amendments import paths
         origin = self._store.origin_details(int(row["id"]))
         repo = row["target_repo"]
         return Admission(
@@ -2053,6 +2055,7 @@ class WorkQueueLoop:
             originating_adapter=origin.get("originating_adapter"),
             triggered_by=str(origin.get("triggered_by") or "jarvis"),
             kind=str(row["kind"]),
+            requirement_amendment_paths=paths(origin.get("requirement_amendment_paths", [])),
         )
 
     # -- staleness -------------------------------------------------------

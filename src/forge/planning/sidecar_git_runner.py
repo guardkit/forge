@@ -847,6 +847,7 @@ class SidecarGitRunner:
         message: str,
         *,
         pre_commit: Any = None,
+        expected_head: str | None = None,
         start_commit: str | None = None,
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
@@ -908,6 +909,8 @@ class SidecarGitRunner:
             "message": message,
             "checks": pre_commit.to_wire() if pre_commit is not None else [],
         }
+        if expected_head is not None:
+            body["expected_head"] = expected_head
         if start_commit:
             # The named starting point (one true copy, item 1): the sandbox
             # cuts a brand new branch from this commit, and leaves a branch
@@ -1136,6 +1139,9 @@ class RepoRoutedGitRunner:
             return await runner.fetch_remote_start_point(repo_path, branch)
         return await runner.fetch_remote_start_point(repo_path)
 
+    async def rev_parse(self, repo_path: str, ref: str) -> str | None:
+        return await self.runner_for_path(repo_path).rev_parse(repo_path, ref)
+
     async def list_tree_at_commit(self, repo_path: str, commit: str) -> TreeListing:
         """One commit's whole tree listing, routed exactly as the others are."""
         return await self.runner_for_path(repo_path).list_tree_at_commit(repo_path, commit)
@@ -1196,6 +1202,7 @@ class RepoRoutedGitRunner:
         message: str,
         *,
         pre_commit: Any = None,
+        expected_head: str | None = None,
         start_commit: str | None = None,
         memory_project: str | None = None,
         launch_settings: Sequence[str] | None = None,
@@ -1211,6 +1218,7 @@ class RepoRoutedGitRunner:
             files,
             message,
             pre_commit=pre_commit,
+            **({"expected_head": expected_head} if expected_head is not None else {}),
             start_commit=start_commit,
             memory_project=memory_project,
             launch_settings=launch_settings,

@@ -774,6 +774,15 @@ class ApprovalSubscriber:
                 )
                 return
 
+        amendment_validator = getattr(self, "amendment_validator", None)
+        if amendment_validator is not None:
+            try:
+                if not amendment_validator(build_id, envelope, payload, expected, additional):
+                    return
+            except (ValueError, KeyError, TypeError) as exc:
+                logger.warning("requirement amendment response refused: %s", exc)
+                return
+
         # --- 3. Dedup — atomic check-and-record (R4) -----------------
         is_duplicate = await self._check_and_record(payload.request_id)
         if is_duplicate:

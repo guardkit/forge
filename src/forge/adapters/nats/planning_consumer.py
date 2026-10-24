@@ -313,6 +313,7 @@ async def create_and_start_planning_run(
     originating_adapter: str | None = None,
     parent_request_id: str | None = None,
     target_repo: str | None = None,
+    requirement_amendment_paths: tuple[str, ...] = (),
 ) -> DuplicateRun | None:
     """Record a planning run and start the chain — the intake's own two steps.
 
@@ -335,6 +336,7 @@ async def create_and_start_planning_run(
         originating_adapter=originating_adapter,
         parent_request_id=parent_request_id,
         target_repo=target_repo,
+        requirement_amendment_paths=requirement_amendment_paths,
     )
     if isinstance(result, DuplicateRun) and result.is_terminal:
         return result
@@ -345,6 +347,15 @@ async def create_and_start_planning_run(
 # ---------------------------------------------------------------------------
 # The queue takes the sentence (contract 5)
 # ---------------------------------------------------------------------------
+
+
+def _amendment_scope_from(payload: Any) -> tuple[str, ...]:
+    from forge.planning.requirement_amendments import paths, AmendmentRefused, FIELD
+    extras = getattr(payload, "model_extra", None) or {}
+    scope = paths(extras.get(FIELD, []))
+    if scope and (extras.get("kind", "feature") != "feature" or extras.get("queue_command") is not None):
+        raise AmendmentRefused("requirement amendments are supported only on ordinary feature sentences")
+    return scope
 
 
 def _kind_from(payload: Any) -> str:
@@ -435,6 +446,7 @@ async def _handle_with_queue(
             parent_request_id=payload.parent_request_id,
             originating_adapter=payload.originating_adapter,
             triggered_by=payload.triggered_by,
+            extra_details={"requirement_amendment_paths": list(_amendment_scope_from(payload))},
         )
     except Exception as exc:  # noqa: BLE001 — never drop a sentence
         logger.error(
@@ -934,6 +946,13 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
         await msg.ack()
         return
 
+    try:
+        amendment_scope = _amendment_scope_from(payload)
+    except ValueError as exc:
+        await _notify_best_effort(deps, payload.correlation_id, str(exc), parent_request_id=payload.parent_request_id)
+        await msg.ack()
+        return
+
     # --- 2. Correlation ID validation (RT-03) ----------------------------
     correlation_id = payload.correlation_id
     if not _is_valid_correlation_id(correlation_id):
@@ -994,9 +1013,11 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
     # so the refusal has a run to attach to.
     resolution = None
     recorded_repo = payload.target_repo
-    if payload.target_repo and deps.planning_config is not None:
+    if amendment_scope and recorded_repo is None and deps.planning_config is not None:
+        recorded_repo = deps.planning_config.default_target_repo
+    if recorded_repo and deps.planning_config is not None:
         resolution = resolve_target_repo(
-            payload.target_repo, deps.planning_config.target_repo_paths
+            recorded_repo, deps.planning_config.target_repo_paths
         )
         if resolution.name is not None:
             recorded_repo = resolution.name
@@ -1023,6 +1044,7 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
             originating_adapter=payload.originating_adapter,
             parent_request_id=payload.parent_request_id,
             target_repo=recorded_repo,
+            requirement_amendment_paths=amendment_scope,
         )
     except Exception as exc:
         # Store write failed (e.g. transient SQLITE_BUSY) — request

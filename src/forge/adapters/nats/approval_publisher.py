@@ -480,8 +480,18 @@ class ApprovalPublisher:
 
         subject = self._subject_for(build_id)
 
+        projector = getattr(self, "amendment_projector", None)
+        if projector is not None:
+            envelope = projector(envelope)
         # --- Serialise + write ----------------------------------------
         body = envelope.model_dump_json().encode("utf-8")
+        if envelope.payload.get("details", {}).get("requirement_amendment") is not None:
+            from forge.planning.requirement_amendments import MAX_APPROVAL_BYTES, AmendmentRefused
+            transport_limit = getattr(self._nc, "max_payload", MAX_APPROVAL_BYTES)
+            limit = min(MAX_APPROVAL_BYTES, transport_limit) if isinstance(transport_limit, int) and transport_limit > 0 else MAX_APPROVAL_BYTES
+            if len(body) > limit:
+                raise AmendmentRefused("amendment envelope exceeds configured transport limit")
+
 
         try:
             await self._nc.publish(subject, body)

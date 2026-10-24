@@ -4593,7 +4593,9 @@ def process_git_rev_parse_request(
     if error or repo_path is None:
         return 400, {"error": error}
     ref = payload.get("ref")
-    error = _ref_error(ref, what="ref")
+    # Admission verifies exactly one parent through this existing read door.
+    parent_probe = isinstance(ref, str) and re.fullmatch(r"[0-9a-f]{40}\^[12]", ref)
+    error = None if parent_probe else _ref_error(ref, what="ref")
     if error:
         return 400, {"error": error}
     spec = str(ref) if str(ref).endswith("}") else f"{ref}^{{commit}}"

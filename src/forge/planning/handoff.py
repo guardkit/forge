@@ -340,6 +340,7 @@ class GitRunner(Protocol):
         message: str,
         *,
         pre_commit: "PreCommitHook | PreCommitChecks | None" = None,
+        expected_head: str | None = None,
         start_commit: str | None = None,
         memory_project: str | None = None,
         launch_settings: "Sequence[str] | None" = None,

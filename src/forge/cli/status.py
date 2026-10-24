@@ -841,6 +841,7 @@ def _emit_m5(db_path: Path, *, out: Console) -> None:
 
 @click.command(name="status")
 @click.argument("feature_id", required=False)
+@click.option("--requirement-amendment-diff", is_flag=True, help="Show the complete stored requirement amendment for an exact build ID.")
 @click.option(
     "--watch",
     "watch",
@@ -913,6 +914,7 @@ def status_cmd(
     db_path_opt: str | None,
     in_flight: bool,
     m5: bool,
+    requirement_amendment_diff: bool = False,
 ) -> None:
     """Show current and recent Forge builds.
 
@@ -938,6 +940,22 @@ def status_cmd(
             f"forge database not found at {db_path}. Set "
             f"{_FORGE_DB_PATH_ENV} or pass --db-path."
         )
+
+    if requirement_amendment_diff:
+        if not feature_id or watch or full or in_flight or m5:
+            raise click.ClickException("--requirement-amendment-diff requires one exact build ID and no other view flags")
+        from forge.planning.requirement_amendment_store import binding_for_build
+        from forge.planning.requirement_amendments import diff_text
+        cx = read_only_connect(db_path)
+        cx.row_factory = sqlite3.Row
+        try:
+            binding = binding_for_build(cx, feature_id, required=True)
+            click.echo(json.dumps(binding, ensure_ascii=False, sort_keys=True) if as_json else diff_text(binding))
+        except (ValueError, sqlite3.Error, KeyError, TypeError) as exc:
+            raise click.ClickException("requirement amendment diff unavailable: " + str(exc)) from exc
+        finally:
+            cx.close()
+        return
 
     # Use a deterministically-wide console so the additional MODE column
     # (TASK-MBC8-009) does not squeeze the BUILD/FEATURE columns into

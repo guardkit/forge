@@ -985,6 +985,21 @@ class SqliteLifecyclePersistence:
             columns += ", source_commit"
             placeholders += ", ?"
             values.append(getattr(admitted, "source_commit", None) or None)
+        from forge.planning.requirement_amendment_store import _plan
+        amendment = _plan(self._cx, correlation_id) if not is_a_repair and admitted is None else None
+        if not is_a_repair and admitted is None:
+            scope_column = any(row[1] == "requirement_amendment_paths" for row in self._cx.execute("PRAGMA table_info(planning_runs)"))
+            original_scope = self._cx.execute("SELECT requirement_amendment_paths FROM planning_runs WHERE correlation_id=?", (correlation_id,)).fetchone() if scope_column else None
+            if original_scope and json.loads(original_scope[0]) and amendment is None:
+                raise ValueError("scoped planning request lacks explicit proposed/absent amendment binding")
+        if amendment is not None:
+            if amendment.get("qa_receipts") is None:
+                raise ValueError("requirement amendment final planning source is not frozen")
+            if amendment["repo"] != payload.repo or amendment["feature_id"] != feature_id or amendment.get("planning_branch") != payload.branch:
+                raise ValueError("requirement amendment planning/build identity mismatch")
+            columns += ", requirement_amendment_required"
+            placeholders += ", ?"
+            values.append(1)
         # Which mission this build belongs to (missions design, 17 October
         # 2026, section 5), copied here from the mission attempt filed under
         # this correlation id. A build that is no mission's records nothing.
