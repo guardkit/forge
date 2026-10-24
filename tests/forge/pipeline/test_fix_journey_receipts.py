@@ -182,6 +182,43 @@ class TestTheBoundStateRootWinsOverHome:
 
 
 class TestReadFailurePack:
+    def test_linked_outer_family_ancestor_is_refused_without_outside_read(
+        self, tmp_path: Path
+    ) -> None:
+        pack = tmp_path / FAILED_BUILD
+        pack.mkdir()
+        outside = tmp_path / "outside"
+        evidence = outside / ".guardkit/autobuild/coach.json"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text("outside evidence")
+        evidence.chmod(0o640)
+        (pack / ".guardkit").symlink_to(
+            outside / ".guardkit", target_is_directory=True
+        )
+
+        assert read_failure_pack(FAILED_BUILD, receipts_root=tmp_path) is None
+        assert evidence.read_text() == "outside evidence"
+        assert _mode(evidence) == 0o640
+
+    def test_linked_inner_family_ancestor_is_refused_without_outside_read(
+        self, tmp_path: Path
+    ) -> None:
+        pack = tmp_path / FAILED_BUILD
+        inner = pack / "worktrees/TASK-1"
+        inner.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        evidence = outside / ".guardkit/autobuild/player.json"
+        evidence.parent.mkdir(parents=True)
+        evidence.write_text("outside player evidence")
+        evidence.chmod(0o640)
+        (inner / ".guardkit").symlink_to(
+            outside / ".guardkit", target_is_directory=True
+        )
+
+        assert read_failure_pack(FAILED_BUILD, receipts_root=tmp_path) is None
+        assert evidence.read_text() == "outside player evidence"
+        assert _mode(evidence) == 0o640
+
     def test_a_complete_pack_is_parsed(self, tmp_path: Path) -> None:
         _write_pack(tmp_path, FAILED_BUILD)
 

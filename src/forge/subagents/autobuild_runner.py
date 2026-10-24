@@ -80,6 +80,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat
 import subprocess
 import threading
 import uuid
@@ -3141,9 +3142,10 @@ def _walk_receipt_tree(root: Path) -> tuple[tuple[Path, ...], dict[Path, str]]:
     are refused: neither the worktree nor a durable pack may lead the exporter
     outside the family it was asked to copy.
     """
-    if root.is_symlink():
+    root_stat = os.lstat(root)
+    if stat.S_ISLNK(root_stat.st_mode):
         raise OSError(f"symlink refused: {root}")
-    if not root.is_dir():
+    if not stat.S_ISDIR(root_stat.st_mode):
         raise OSError(f"not a directory: {root}")
 
     directories: list[Path] = [Path(".")]
@@ -3164,11 +3166,115 @@ def _walk_receipt_tree(root: Path) -> tuple[tuple[Path, ...], dict[Path, str]]:
             if not entry.is_file(follow_symlinks=False):
                 raise OSError(f"non-regular receipt refused: {absolute / entry.name}")
             digest = hashlib.sha256()
-            with open(absolute / entry.name, "rb") as handle:
+            file_path = absolute / entry.name
+            file_fd = os.open(
+                file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+            )
+            with os.fdopen(file_fd, "rb") as handle:
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
+                    raise OSError(f"non-regular receipt refused: {file_path}")
                 for chunk in iter(lambda: handle.read(1024 * 1024), b""):
                     digest.update(chunk)
             files[rel] = digest.hexdigest()
     return tuple(sorted(directories)), dict(sorted(files.items()))
+
+
+def _inspect_receipt_directory(root: Path, relative: Path) -> Path | None:
+    """Inspect one directory below an admitted root without following links.
+
+    ``None`` means a component genuinely does not exist. Every other inability
+    to inspect the path is an error. In particular, a linked or unreadable
+    ancestor must never be collapsed into the same result as a missing receipt
+    family.
+    """
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise OSError(f"unsafe relative receipt path refused: {relative}")
+
+    current = root
+    parts = (Path("."), *[Path(part) for part in relative.parts])
+    for index, part in enumerate(parts):
+        if index:
+            current /= part
+        try:
+            current_stat = os.lstat(current)
+        except FileNotFoundError:
+            return None
+        if stat.S_ISLNK(current_stat.st_mode):
+            raise OSError(f"symlink refused: {current}")
+        if not stat.S_ISDIR(current_stat.st_mode):
+            raise OSError(f"not a directory: {current}")
+        # Require directory traversal and listing. The explicit mode check
+        # keeps this honest even in a privileged test/runtime context where
+        # os.access() could otherwise mask a mode-000 ancestor.
+        if not current_stat.st_mode & 0o111 or not current_stat.st_mode & 0o444:
+            raise PermissionError(f"directory is not readable/searchable: {current}")
+    return current
+
+
+def _ensure_receipt_directory(root: Path, relative: Path) -> Path:
+    """Create a destination directory below ``root`` without following links."""
+    if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+        raise OSError(f"unsafe relative receipt path refused: {relative}")
+    root.mkdir(parents=True, exist_ok=True)
+    current = _inspect_receipt_directory(root, Path())
+    if current is None:  # pragma: no cover - mkdir immediately above created it
+        raise OSError(f"receipt root disappeared while creating it: {root}")
+    for part in relative.parts:
+        candidate = current / part
+        try:
+            candidate_stat = os.lstat(candidate)
+        except FileNotFoundError:
+            os.mkdir(candidate, mode=0o700)
+            candidate_stat = os.lstat(candidate)
+        if stat.S_ISLNK(candidate_stat.st_mode):
+            raise OSError(f"symlink refused: {candidate}")
+        if not stat.S_ISDIR(candidate_stat.st_mode):
+            raise OSError(f"not a directory: {candidate}")
+        current = candidate
+    return current
+
+
+def _inspect_receipt_file(root: Path, relative: Path) -> Path | None:
+    """Inspect one regular file below an admitted root without following links."""
+    parent = _inspect_receipt_directory(root, relative.parent)
+    if parent is None:
+        return None
+    candidate = parent / relative.name
+    try:
+        candidate_stat = os.lstat(candidate)
+    except FileNotFoundError:
+        return None
+    if stat.S_ISLNK(candidate_stat.st_mode):
+        raise OSError(f"symlink refused: {candidate}")
+    if not stat.S_ISREG(candidate_stat.st_mode):
+        raise OSError(f"non-regular receipt refused: {candidate}")
+    return candidate
+
+
+def _copy_receipt_file_no_links(source: str, destination: str) -> str:
+    """Copy one regular receipt without following a destination file link."""
+    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        source_stat = os.fstat(source_fd)
+        if not stat.S_ISREG(source_stat.st_mode):
+            raise OSError(f"non-regular receipt refused: {source}")
+        destination_fd = os.open(
+            destination,
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_TRUNC
+            | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+        try:
+            with os.fdopen(source_fd, "rb", closefd=False) as source_handle:
+                with os.fdopen(destination_fd, "wb", closefd=False) as destination_handle:
+                    shutil.copyfileobj(source_handle, destination_handle)
+        finally:
+            os.close(destination_fd)
+    finally:
+        os.close(source_fd)
+    return destination
 
 
 def _harden_pack_permissions(root: Path) -> bool:
@@ -3892,10 +3998,13 @@ def _receipt_export_sources(
     inner_root = worktree_path / _INNER_WORKTREES_REL
     errors: list[dict[str, str]] = []
     try:
-        if inner_root.is_symlink():
-            raise OSError(f"symlink refused: {inner_root}")
+        inspected_inner_root = _inspect_receipt_directory(
+            worktree_path, Path(_INNER_WORKTREES_REL)
+        )
+        if inspected_inner_root is None:
+            return sources, errors
         inner_dirs = []
-        with os.scandir(inner_root) as entries:
+        with os.scandir(inspected_inner_root) as entries:
             ordered = sorted(entries, key=lambda entry: entry.name)
         for entry in ordered:
             path = inner_root / entry.name
@@ -3905,8 +4014,6 @@ def _receipt_export_sources(
                 inner_dirs.append(path)
             elif not entry.is_file(follow_symlinks=False):
                 raise OSError(f"non-regular worktree entry refused: {path}")
-    except FileNotFoundError:
-        inner_dirs = []
     except OSError as exc:
         inner_dirs = []
         errors.append(
@@ -3967,18 +4074,16 @@ def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
             ok = False
             skipped.extend(discovery_errors)
         for label, src in sources:
-            if src.is_symlink():
-                ok = False
-                skipped.append(
-                    {"family": label, "reason": "scan-failed: symlink refused"}
-                )
-                continue
-            if not src.is_dir():
-                skipped.append({"family": label, "reason": "missing"})
-                continue
             try:
+                source_relative = src.relative_to(worktree_path)
+                inspected_source = _inspect_receipt_directory(
+                    worktree_path, source_relative
+                )
+                if inspected_source is None:
+                    skipped.append({"family": label, "reason": "missing"})
+                    continue
                 _source_dirs, source_files = _walk_receipt_tree(src)
-            except OSError as exc:
+            except (OSError, ValueError) as exc:
                 ok = False
                 skipped.append(
                     {
@@ -4002,11 +4107,24 @@ def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
                 continue
             dest = dest_root / label
             try:
-                dest.parent.mkdir(parents=True, exist_ok=True)
-                # Preserve links as links so a source-side race can never make
-                # copytree follow one outside the family. The explicit
-                # destination inventory below rejects any link before success.
-                shutil.copytree(src, dest, dirs_exist_ok=True, symlinks=True)
+                receipt_root = _receipts_root()
+                destination_relative = Path(build_id) / Path(label)
+                _ensure_receipt_directory(receipt_root, destination_relative.parent)
+                try:
+                    os.lstat(dest)
+                except FileNotFoundError:
+                    pass
+                else:
+                    # Refuse every existing entry before copytree can follow
+                    # a destination directory or file link.
+                    _walk_receipt_tree(dest)
+                shutil.copytree(
+                    src,
+                    dest,
+                    dirs_exist_ok=True,
+                    symlinks=True,
+                    copy_function=_copy_receipt_file_no_links,
+                )
             except Exception as exc:  # noqa: BLE001 — one family must not cost the rest
                 ok = False
                 skipped.append(
@@ -4401,7 +4519,7 @@ def _export_prior_build_evidence(
             f"from its kept worktree {outer_root} — refusing to sweep "
             "un-exported evidence (F11 forensics law)"
         )
-    _write_failure_manifest(
+    manifest = _write_failure_manifest(
         build_id=prior_build_id,
         payload={"build_id": prior_build_id, "feature_id": feature_id},
         reason=(
@@ -4415,6 +4533,12 @@ def _export_prior_build_evidence(
         branch=", ".join(branches) if branches else None,
         receipts=export,
     )
+    if manifest is None:
+        raise PriorBuildSweepError(
+            f"prior build {prior_build_id!r} failure manifest could not be "
+            "written and hardened — refusing to sweep unexported evidence "
+            "(F11 forensics law)"
+        )
     if not _prior_export_is_present(prior_build_id):
         raise PriorBuildSweepError(
             f"prior build {prior_build_id!r} still has no "

@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import shutil
 from dataclasses import dataclass, field
@@ -247,32 +248,33 @@ def _present_receipt_families(
     not consult the manifest: an old or malformed historical claim must not
     erase evidence that is presently readable in the pack.
     """
+    from forge.subagents.autobuild_runner import _inspect_receipt_directory
+
     present: list[str] = []
     for family in families:
-        candidate = pack_dir / family
-        if candidate.is_symlink():
-            raise OSError(f"symlink refused: {candidate}")
-        if candidate.is_dir():
+        candidate = _inspect_receipt_directory(pack_dir, Path(family))
+        if candidate is not None:
             present.append(family)
-    inner_root = pack_dir / "worktrees"
-    if inner_root.is_symlink():
-        raise OSError(f"symlink refused: {inner_root}")
-    try:
+    inner_root = _inspect_receipt_directory(pack_dir, Path("worktrees"))
+    if inner_root is None:
         inner_dirs = []
-        for path in inner_root.iterdir():
-            if path.is_symlink():
+    else:
+        inner_dirs = []
+        with os.scandir(inner_root) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name)
+        for entry in ordered:
+            path = inner_root / entry.name
+            if entry.is_symlink():
                 raise OSError(f"symlink refused: {path}")
-            if path.is_dir():
+            if entry.is_dir(follow_symlinks=False):
                 inner_dirs.append(path)
-        inner_dirs.sort()
-    except FileNotFoundError:
-        inner_dirs = []
+            elif not entry.is_file(follow_symlinks=False):
+                raise OSError(f"non-regular worktree entry refused: {path}")
     for inner in inner_dirs:
         for family in families:
-            candidate = inner / family
-            if candidate.is_symlink():
-                raise OSError(f"symlink refused: {candidate}")
-            if candidate.is_dir():
+            relative = Path("worktrees") / inner.name / family
+            candidate = _inspect_receipt_directory(pack_dir, relative)
+            if candidate is not None:
                 present.append(f"worktrees/{inner.name}/{family}")
     return tuple(present)
 
@@ -302,13 +304,15 @@ def read_failure_pack(
     """
     from forge.subagents.autobuild_runner import (
         _RECEIPT_FAMILIES,
+        _inspect_receipt_directory,
+        _inspect_receipt_file,
         FAILURE_MANIFEST_NAME,
         STDOUT_LOG_NAME,
     )
 
     try:
         pack_dir = fix_journey_receipts_root(receipts_root, repo=repo) / build_id
-        if not pack_dir.is_dir():
+        if _inspect_receipt_directory(pack_dir, Path()) is None:
             logger.info(
                 "fix_journey_receipts: no failure pack for build_id=%s at %s",
                 build_id,
@@ -317,12 +321,14 @@ def read_failure_pack(
             return None
 
         present = _present_receipt_families(pack_dir, _RECEIPT_FAMILIES)
-        stdout_log = pack_dir / STDOUT_LOG_NAME
-        manifest_path = pack_dir / FAILURE_MANIFEST_NAME
+        stdout_log = _inspect_receipt_file(pack_dir, Path(STDOUT_LOG_NAME))
+        manifest_path = _inspect_receipt_file(
+            pack_dir, Path(FAILURE_MANIFEST_NAME)
+        )
 
         raw: dict[str, Any] = {}
         parsed_manifest: Path | None = None
-        if manifest_path.is_file():
+        if manifest_path is not None:
             try:
                 loaded = json.loads(manifest_path.read_text(encoding="utf-8"))
                 if isinstance(loaded, dict):
@@ -374,7 +380,7 @@ def read_failure_pack(
                 raw.get("evidence") if isinstance(raw.get("evidence"), dict) else None
             ),
             present_families=present,
-            stdout_log=stdout_log if stdout_log.is_file() else None,
+            stdout_log=stdout_log,
             raw=raw,
         )
     except Exception as exc:  # noqa: BLE001 — best-effort: never block a journey

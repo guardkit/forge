@@ -1009,6 +1009,114 @@ class TestInnerWorktreeReceiptsLand:
 
 
 class TestExportAccountingIsHonest:
+    def test_source_ancestor_symlink_is_refused_before_outside_read(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outside = tmp_path / "outside"
+        outside_file = outside / ".guardkit/autobuild/coach.json"
+        outside_file.parent.mkdir(parents=True)
+        outside_file.write_text("outside evidence")
+        outside_file.chmod(0o640)
+        worktree = tmp_path / "wt"
+        worktree.mkdir()
+        (worktree / ".guardkit").symlink_to(
+            outside / ".guardkit", target_is_directory=True
+        )
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        result = ar._export_receipts(worktree, "build-SOURCE-LINK")
+
+        assert result.ok is False
+        assert _skip_reason(result, ".guardkit/autobuild").startswith(
+            "scan-failed: OSError: symlink refused"
+        )
+        assert not (receipts / "build-SOURCE-LINK/.guardkit/autobuild/coach.json").exists()
+        assert outside_file.read_text() == "outside evidence"
+        assert (outside_file.stat().st_mode & 0o777) == 0o640
+
+    @pytest.mark.parametrize("link_kind", ["file", "directory"])
+    def test_destination_links_are_refused_before_outside_write(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        link_kind: str,
+    ) -> None:
+        worktree = tmp_path / "wt"
+        family = worktree / ".guardkit/autobuild"
+        family.mkdir(parents=True)
+        (family / "coach.json").write_text("current receipt")
+        receipts = tmp_path / "receipts"
+        destination = receipts / "build-DEST-LINK/.guardkit/autobuild"
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        outside_file = outside / "coach.json"
+        outside_file.write_text("must remain unchanged")
+        outside_file.chmod(0o640)
+        if link_kind == "file":
+            destination.mkdir(parents=True)
+            (destination / "coach.json").symlink_to(outside_file)
+        else:
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        result = ar._export_receipts(worktree, "build-DEST-LINK")
+
+        assert result.ok is False
+        assert _skip_reason(result, ".guardkit/autobuild").startswith(
+            "copy-failed: OSError: symlink refused"
+        )
+        assert outside_file.read_text() == "must remain unchanged"
+        assert (outside_file.stat().st_mode & 0o777) == 0o640
+
+    def test_destination_ancestor_link_is_refused_before_outside_write(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        family = worktree / ".guardkit/autobuild"
+        family.mkdir(parents=True)
+        (family / "coach.json").write_text("current receipt")
+        receipts = tmp_path / "receipts"
+        pack = receipts / "build-DEST-PARENT-LINK"
+        pack.mkdir(parents=True)
+        outside = tmp_path / "outside-guardkit"
+        outside_file = outside / "autobuild/coach.json"
+        outside_file.parent.mkdir(parents=True)
+        outside_file.write_text("must remain unchanged")
+        outside_file.chmod(0o640)
+        (pack / ".guardkit").symlink_to(outside, target_is_directory=True)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        result = ar._export_receipts(worktree, "build-DEST-PARENT-LINK")
+
+        assert result.ok is False
+        assert _skip_reason(result, ".guardkit/autobuild").startswith(
+            "copy-failed: OSError: symlink refused"
+        )
+        assert outside_file.read_text() == "must remain unchanged"
+        assert (outside_file.stat().st_mode & 0o777) == 0o640
+
+    def test_unreadable_family_ancestor_is_a_scan_failure_not_missing(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        family = worktree / "docs/state"
+        family.mkdir(parents=True)
+        (family / "state.json").write_text("must be retained")
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        docs = family.parent
+        docs.chmod(0)
+        try:
+            result = ar._export_receipts(worktree, "build-UNREADABLE")
+        finally:
+            docs.chmod(0o700)
+
+        assert result.ok is False
+        assert _skip_reason(result, "docs/state").startswith(
+            "scan-failed: PermissionError:"
+        )
+
     """The manifest must never claim an export that produced nothing."""
 
     def test_empty_family_is_skipped_not_claimed(
@@ -1285,6 +1393,35 @@ class TestFinalizeSuccessWorktree:
 
         assert calls == []  # never removed
         assert worktree.is_dir()  # kept on disk
+
+    def test_unreadable_receipt_ancestor_keeps_success_worktree(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        family = worktree / "docs/state"
+        family.mkdir(parents=True)
+        (family / "state.json").write_text("only copy")
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        removed: list[Path] = []
+
+        async def _fake_remove(_repo: Path, wt: Path) -> None:
+            removed.append(wt)
+
+        docs = family.parent
+        docs.chmod(0)
+        try:
+            with patch.object(ar, "_remove_worktree", _fake_remove):
+                asyncio.run(
+                    ar._finalize_success_worktree(
+                        tmp_path, worktree, "build-UNREADABLE-FINAL"
+                    )
+                )
+        finally:
+            docs.chmod(0o700)
+
+        assert removed == []
+        assert worktree.is_dir()
+        assert (family / "state.json").read_text() == "only copy"
 
 
 # ---------------------------------------------------------------------------
@@ -2161,6 +2298,43 @@ class TestRequeueSweepExportAbsent:
 
 
 class TestRequeueSweepFailureIsAnHonestRefusal:
+    def test_manifest_hardening_failure_preserves_prior_build(
+        self,
+        throwaway_repo: Path,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        wt_base = tmp_path / "worktrees"
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+        outer, inner = _stage_prior_kept_build(
+            throwaway_repo, wt_base, feature_yaml_in="repo"
+        )
+        real_harden = ar._harden_pack_permissions
+
+        def _fail_manifest_hardening(root: Path) -> bool:
+            if (root / ar.FAILURE_MANIFEST_NAME).exists():
+                return False
+            return real_harden(root)
+
+        monkeypatch.setattr(ar, "_harden_pack_permissions", _fail_manifest_hardening)
+        recorded: dict[str, Any] = {}
+
+        result = _invoke(
+            _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
+        )
+
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "failed"
+        message = (result["async_tasks"][ROUND17_FEATURE_ID])["error_message"]
+        assert "failure manifest could not be written and hardened" in message
+        assert "F11 forensics law" in message
+        assert outer.is_dir()
+        assert inner.is_dir()
+        assert (inner / "forensic.txt").read_text() == "evidence"
+        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
+        assert "cwd" not in recorded
+
     def test_branch_delete_failure_refuses_the_dispatch_loudly(
         self,
         throwaway_repo: Path,
