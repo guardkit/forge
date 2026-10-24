@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import weakref
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -341,6 +342,9 @@ class ApprovalSubscriber:
         # not in self._dedup`` and both push to the queue, breaking
         # first-response-wins.
         self._dedup_lock = asyncio.Lock()
+        # Durable scoped decisions are delivered once per active waiter, even
+        # after TTL expiry. Weak keys release this state with the waiter queue.
+        self._durable_responses = weakref.WeakKeyDictionary()
         # Per-build queues — a response only resumes a build whose
         # ``await_response`` is currently active. Responses arriving
         # for a different build (or after the wait loop exited) are
@@ -774,43 +778,61 @@ class ApprovalSubscriber:
                 )
                 return
 
-        amendment_validator = getattr(self, "amendment_validator", None)
-        if amendment_validator is not None:
+        # Identity checks before dedup are read-only. A malformed/stale card
+        # cannot consume a legitimate response's slot, including without a waiter.
+        scoped_identity = False
+        identity_validator = getattr(self, "amendment_identity_validator", None)
+        if identity_validator is not None:
             try:
-                if not amendment_validator(build_id, envelope, payload, expected, additional):
+                identity = identity_validator(build_id, envelope, payload, expected, additional)
+                if not identity:
                     return
+                scoped_identity = bool(getattr(identity, "durable", False))
             except (ValueError, KeyError, TypeError) as exc:
-                logger.warning("requirement amendment response refused: %s", exc)
+                logger.warning("requirement amendment response identity refused: %s", exc)
                 return
 
-        # --- 3. Dedup — atomic check-and-record (R4) -----------------
-        is_duplicate = await self._check_and_record(payload.request_id)
-        if is_duplicate:
-            logger.info(
-                "approval_subscriber: duplicate response build_id=%s "
-                "request_id=%s decision=%s — discarded",
-                build_id,
-                payload.request_id,
-                payload.decision,
-            )
-            return
-
-        # --- 4. First-arrival → publish build-resumed + enqueue ------
-        queue = self._queues.get(build_id)
-        if queue is None:
-            # No active wait loop for this build. This is normal in two
-            # cases: (a) per-build response routing means a response on
-            # a different build's mirror reached us through some
-            # over-broad subscription (defence-in-depth); (b) the wait
-            # loop already exited (timeout, cancel) but the
-            # subscription is still draining. Either way: log + drop.
-            logger.debug(
-                "approval_subscriber: response with no active waiter "
-                "build_id=%s request_id=%s — dropping",
-                build_id,
-                payload.request_id,
-            )
-            return
+        # Claim the same first response for the ordinary gate and amendment
+        # authority. No await separates the durable synchronous claim from the
+        # dedup write, and a response without an active waiter grants nothing.
+        async with self._dedup_lock:
+            now = self._deps.clock.monotonic()
+            self._evict_expired(now)
+            if payload.request_id in self._dedup and not scoped_identity:
+                logger.info(
+                    "approval_subscriber: duplicate response build_id=%s "
+                    "request_id=%s decision=%s — discarded",
+                    build_id, payload.request_id, payload.decision,
+                )
+                return
+            queue = self._queues.get(build_id)
+            if queue is None:
+                # Preserve ordinary subscriber bookkeeping without invoking a
+                # mutation-capable scoped callback for a dropped response.
+                if not scoped_identity:
+                    self._dedup[payload.request_id] = now + self._deps.dedup_ttl_seconds
+                logger.debug(
+                    "approval_subscriber: response with no active waiter "
+                    "build_id=%s request_id=%s — dropping",
+                    build_id, payload.request_id,
+                )
+                return
+            if payload.request_id in self._durable_responses.get(queue, ()):
+                return
+            amendment_validator = getattr(self, "amendment_validator", None)
+            if amendment_validator is not None:
+                try:
+                    acceptance = amendment_validator(
+                        build_id, envelope, payload, expected, additional
+                    )
+                    if not acceptance:
+                        return
+                    if getattr(acceptance, "durable", False):
+                        self._durable_responses.setdefault(queue, set()).add(payload.request_id)
+                except (ValueError, KeyError, TypeError) as exc:
+                    logger.warning("requirement amendment response refused: %s", exc)
+                    return
+            self._dedup[payload.request_id] = now + self._deps.dedup_ttl_seconds
 
         # TASK-FW10-010 AC: publish ``pipeline.build-resumed.<feature_id>``
         # BEFORE the orchestrator advances. The order is part of the

@@ -270,7 +270,7 @@ class TestBootLogEmitsAppliedCount:
         # schema_v18.sql adds the coordinator's durable seed-once authority;
         # schema_v19.sql added on 12 October 2026 for the preview_leases
         # table — one live review-preview lease per port).
-        assert "applied 20" in applied_lines[0], applied_lines[0]
+        assert "applied 21" in applied_lines[0], applied_lines[0]
 
 
 # ---------------------------------------------------------------------------

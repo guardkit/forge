@@ -22,7 +22,7 @@ from tests.forge.lifecycle.planning_handoff_fixture import (
 )
 
 
-@pytest.mark.parametrize("version", [17, 18, 19, 20])
+@pytest.mark.parametrize("version", [17, 18, 19, 20, 21])
 def test_real_shaped_receipt_is_validated_read_only(
     tmp_path: Path, version: int
 ) -> None:
@@ -105,7 +105,7 @@ def test_full_reader_refuses_linked_work_and_future_schema(tmp_path: Path) -> No
                 "INSERT INTO feature_routing_seeds VALUES (?, 'FAILED')", (CORRELATION,)
             )
         else:
-            connection.execute("INSERT INTO schema_version VALUES (21, 'later')")
+            connection.execute("INSERT INTO schema_version VALUES (22, 'later')")
         connection.commit()
         connection.close()
 

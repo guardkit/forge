@@ -294,8 +294,9 @@ class _MirroredApprovalPublisher:
 def _bind_amendment_transport(publisher: Any, subscriber: Any, pool: Any) -> None:
     if not hasattr(pool, "connection"):
         return
-    from forge.planning.requirement_amendment_store import project_approval, accept_response
+    from forge.planning.requirement_amendment_store import project_approval, accept_response, validate_response_identity
     publisher.amendment_projector = lambda envelope: project_approval(pool.connection, envelope)
+    subscriber.amendment_identity_validator = lambda build_id, envelope, response, expected, additional: validate_response_identity(pool.connection, build_id, envelope, response, expected, additional)
     subscriber.amendment_validator = lambda build_id, envelope, response, expected, additional: accept_response(pool.connection, build_id, envelope, response, expected, additional)
 
 

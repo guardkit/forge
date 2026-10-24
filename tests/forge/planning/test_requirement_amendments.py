@@ -408,19 +408,20 @@ async def test_approval_exact_diff_admission_and_protection(
 
 
 @pytest.mark.asyncio
-async def test_no_approval_and_mismatched_identities_never_apply(planned):
+@pytest.mark.parametrize("decision", ["defer", "reject"])
+async def test_no_approval_and_mismatched_identities_never_apply(planned, decision):
     x = planned
     with pytest.raises(AmendmentRefused):
         await admit(x.cx, x.bid, x.runner, str(x.repo))
     project_approval(x.cx, x.envelope)
-    for who, req, corr, decision in [
+    for who, req, corr, bad_decision in [
         ("other", "request-1", "amendment-request", "approve"),
         ("owner", "old-request", "amendment-request", "approve"),
         ("owner", "request-1", None, "approve"),
         ("owner", "request-1", "amendment-request", "override"),
     ]:
         response = ApprovalResponsePayload(
-            request_id=req, decision=decision, decided_by=who, decided_at=NOW
+            request_id=req, decision=bad_decision, decided_by=who, decided_at=NOW
         )
         assert not accept_response(
             x.cx,
@@ -429,16 +430,15 @@ async def test_no_approval_and_mismatched_identities_never_apply(planned):
             response,
             "owner",
         )
-    for decision in ("defer", "reject"):
-        response = ApprovalResponsePayload(
-            request_id="request-1",
-            decision=decision,
-            decided_by="owner",
-            decided_at=NOW,
-        )
-        assert accept_response(x.cx, x.bid, x.envelope, response, "owner")
-        with pytest.raises(AmendmentRefused):
-            await admit(x.cx, x.bid, x.runner, str(x.repo))
+    response = ApprovalResponsePayload(
+        request_id="request-1",
+        decision=decision,
+        decided_by="owner",
+        decided_at=NOW,
+    )
+    assert accept_response(x.cx, x.bid, x.envelope, response, "owner")
+    with pytest.raises(AmendmentRefused):
+        await admit(x.cx, x.bid, x.runner, str(x.repo))
     assert git(x.repo, "rev-parse", "planning/amendment") == x.plan
     assert x.pool.read_source_commit(x.bid) is None
 
@@ -1546,7 +1546,7 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
 
 @pytest.mark.asyncio
 async def test_real_gate_restart_reuses_frozen_card_and_common_launcher(
-    planned, monkeypatch
+    planned, monkeypatch, crash_after_response=False
 ):
     import asyncio
     from unittest.mock import AsyncMock
@@ -1597,6 +1597,35 @@ async def test_real_gate_restart_reuses_frozen_card_and_common_launcher(
     assert original["payload"]["details"]["requirement_amendment"] == binding_for_build(
         x.cx, x.bid
     )
+    if crash_after_response:
+        # Interrupt the actual subscriber after its durable claim but before
+        # queue delivery. The real boot path must recover this exact winner.
+        emitter = parts.subscriber._resume_publish_ctx[x.bid][0]
+        monkeypatch.setattr(
+            emitter, "emit_resumed", AsyncMock(side_effect=asyncio.CancelledError)
+        )
+        first = MessageEnvelope(
+            source_id="owner",
+            event_type=EventType.APPROVAL_RESPONSE,
+            correlation_id="amendment-request",
+            payload={
+                "request_id": original["payload"]["request_id"],
+                "decision": "approve",
+                "decided_by": "owner",
+            },
+        )
+        with pytest.raises(asyncio.CancelledError):
+            await wire.publish(
+                subject + ".response", first.model_dump_json().encode("utf-8")
+            )
+        assert parts.subscriber._queues[x.bid].empty()
+        assert (
+            x.cx.execute(
+                "SELECT decision FROM build_requirement_amendment_responses WHERE build_id=?",
+                (x.bid,),
+            ).fetchone()[0]
+            == "approve"
+        )
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task

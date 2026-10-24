@@ -9336,6 +9336,11 @@ class PlanningRunDriver:
                 "bars to register",
                 correlation_id,
             )
+            from forge.planning.requirement_amendment_store import skipped_qa
+
+            amendment_qa = skipped_qa(
+                deps.store._connection, correlation_id, branch, plan_sha
+            )
             deps.store._record_event(
                 correlation_id=correlation_id,
                 stage_label=_QA_PASS_BARS_STAGE,
@@ -9344,6 +9349,11 @@ class PlanningRunDriver:
                 details_json=json.dumps(
                     {
                         "feature_id": feature_id,
+                        "skipped": True,
+                        "reason_code": "no_tasks",
+                        "reason": "The validated plan has no tasks requiring per-task pass bars.",
+                        **({"requirement_amendment_qa": amendment_qa}
+                           if amendment_qa is not None else {}),
                         "bar_files": [],
                         "registered_at_sha": plan_sha,
                         "branch": branch,

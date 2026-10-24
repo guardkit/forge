@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sqlite3
+from dataclasses import dataclass
 from typing import Any
 
 from forge.planning.requirement_amendments import (
@@ -162,6 +163,20 @@ def binding_for_build(
         accepted != binding["request_id"] or not stored["accepted_responder"]
     ):
         raise AmendmentRefused("amendment accepted responder/request mismatch")
+    if accepted:
+        if not has_table(cx, "build_requirement_amendment_responses"):
+            raise AmendmentRefused("durable amendment response ledger is unavailable")
+        winner = cx.execute(
+            "SELECT * FROM build_requirement_amendment_responses WHERE build_id=? AND request_id=?",
+            (build_id, accepted),
+        ).fetchone()
+        if (
+            winner is None
+            or winner["decision"] != "approve"
+            or winner["responder"] != stored["accepted_responder"]
+            or winner["binding_sha256"] != stored["binding_sha256"]
+        ):
+            raise AmendmentRefused("amendment acceptance differs from first response")
     if stored["source_commit"] and stored["source_commit"] != build["source_commit"]:
         raise AmendmentRefused("amendment admitted source mismatch")
     return binding
@@ -271,14 +286,21 @@ def project_approval(cx: sqlite3.Connection, envelope: Any) -> Any:
     return answer
 
 
-def accept_response(
+@dataclass(frozen=True)
+class ScopedAmendmentResponse:
+    """A validated scoped response using durable first-winner dedup semantics."""
+
+    durable: bool = True
+
+
+def validate_response_identity(
     cx: sqlite3.Connection,
     build_id: str,
     envelope: Any,
     response: Any,
     expected: str | None,
     additional: Any = (),
-) -> bool:
+) -> bool | ScopedAmendmentResponse:
     if not has_table(cx, "build_requirement_amendments"):
         return True
     exists = cx.execute(
@@ -295,15 +317,94 @@ def accept_response(
         or response.request_id != binding["request_id"]
     ):
         return False
-    if response.decision == "override":
+    if response.decision not in ("approve", "reject", "defer"):
         return False
-    if response.decision == "approve":
-        cx.execute(
-            "UPDATE build_requirement_amendments SET accepted_request_id=?, accepted_responder=? WHERE build_id=? AND accepted_request_id IS NULL",
-            (response.request_id, response.decided_by, build_id),
-        )
-        cx.commit()
-    return True
+    return ScopedAmendmentResponse()
+
+
+def accept_response(
+    cx: sqlite3.Connection,
+    build_id: str,
+    envelope: Any,
+    response: Any,
+    expected: str | None,
+    additional: Any = (),
+) -> bool | ScopedAmendmentResponse:
+    if not validate_response_identity(
+        cx, build_id, envelope, response, expected, additional
+    ):
+        return False
+    if (
+        not has_table(cx, "build_requirement_amendments")
+        or not cx.execute(
+            "SELECT 1 FROM build_requirement_amendments WHERE build_id=?", (build_id,)
+        ).fetchone()
+    ):
+        return True
+    binding = binding_for_build(cx, build_id, required=True)
+    if not has_table(cx, "build_requirement_amendment_responses"):
+        raise AmendmentRefused("durable amendment response ledger is unavailable")
+    # The insert arbitrates all subscribers/processes, not just one short-TTL
+    # dedup buffer. Bind the claim to the still-pending, exact frozen card in
+    # the same transaction that can grant authority. Reject/defer consume the
+    # request too; a new rearm request has its own first-winner slot.
+    from forge.lifecycle.card_revisions import immediate_transaction
+
+    if cx.in_transaction:
+        raise AmendmentRefused("amendment response requires an idle ledger transaction")
+    try:
+        with immediate_transaction(cx):
+            claimed = cx.execute(
+                """INSERT OR IGNORE INTO build_requirement_amendment_responses
+                    (build_id, request_id, binding_sha256, decision, responder)
+                    SELECT a.build_id, ?, a.binding_sha256, ?, ?
+                    FROM build_requirement_amendments a JOIN builds b USING (build_id)
+                    WHERE a.build_id=? AND a.binding_sha256=?
+                      AND a.accepted_request_id IS NULL
+                      AND b.pending_approval_request_id=? AND b.status='PAUSED'""",
+                (
+                    response.request_id,
+                    response.decision,
+                    response.decided_by,
+                    build_id,
+                    digest(binding),
+                    response.request_id,
+                ),
+            )
+            if claimed.rowcount != 1:
+                # A crash may have persisted the first response before the gate
+                # dequeued it. A new waiter can recover only that exact decision;
+                # an existing waiter suppresses its duplicate independently of TTL.
+                winner = cx.execute(
+                    """SELECT r.decision, r.responder FROM build_requirement_amendment_responses r
+                       JOIN build_requirement_amendments a USING (build_id)
+                       JOIN builds b USING (build_id)
+                       WHERE r.build_id=? AND r.request_id=? AND r.binding_sha256=?
+                         AND a.binding_sha256=r.binding_sha256
+                         AND b.pending_approval_request_id=r.request_id AND b.status='PAUSED'""",
+                    (build_id, response.request_id, digest(binding)),
+                ).fetchone()
+                if winner is None or (winner["decision"], winner["responder"]) != (
+                    response.decision,
+                    response.decided_by,
+                ):
+                    return False
+                return ScopedAmendmentResponse()
+            if response.decision == "approve":
+                changed = cx.execute(
+                    "UPDATE build_requirement_amendments SET accepted_request_id=?, accepted_responder=? WHERE build_id=? AND accepted_request_id IS NULL AND binding_sha256=?",
+                    (
+                        response.request_id,
+                        response.decided_by,
+                        build_id,
+                        digest(binding),
+                    ),
+                )
+                if changed.rowcount != 1:
+                    raise AmendmentRefused("amendment response lost its frozen binding")
+    except sqlite3.DatabaseError as exc:
+        raise AmendmentRefused("amendment response transaction failed") from exc
+    return ScopedAmendmentResponse()
 
 
 # In-process contenders share a lock; Git CAS and the write-once ledger update
