@@ -59,11 +59,17 @@ from forge.pipeline.stage_taxonomy import StageClass
 class FakePersistence:
     """In-memory stand-in for :class:`SqliteLifecyclePersistence`.
 
-    Only ``find_active_or_recent`` is exercised by the wrappers — the
-    field is a dict so tests can pre-seed it per-feature.
+    The field is a dict so tests can pre-seed it per-feature. Exact build-id
+    lookup is separate from the existing feature lookup, like production.
     """
 
     builds: dict[str, Build] = field(default_factory=dict)
+
+    def get_build_row(self, build_id: str) -> Build | None:
+        for build in self.builds.values():
+            if build.build_id == build_id:
+                return build
+        return None
 
     def find_active_or_recent(self, identifier: str) -> Build | None:
         # Match either by feature_id key or by build_id directly.
@@ -254,6 +260,31 @@ class TestCancelIdentifierResolution:
         assert result.exit_code == 0, result.output + result.stderr
         assert len(handler.cancel_calls) == 1
         assert handler.cancel_calls[0]["build_id"] == "build-FEAT-A1B2-001"
+
+    def test_exact_build_id_wins_when_the_feature_has_a_newer_build(
+        self, monkeypatch: pytest.MonkeyPatch, db_path: Path
+    ) -> None:
+        older = Build(
+            build_id="build-FEAT-A1B2-001",
+            status=BuildState.FAILED,
+        )
+        newer = Build(
+            build_id="build-FEAT-A1B2-002",
+            status=BuildState.RUNNING,
+        )
+        persistence = FakePersistence(
+            builds={"older-row": older, "FEAT-A1B2": newer}
+        )
+        handler = FakeHandler(snapshot_reader=FakeSnapshotReader())
+        _patch_runtime(monkeypatch, persistence, handler)
+
+        result = CliRunner().invoke(
+            cancel_module.cancel_cmd,
+            [older.build_id, "--db", str(db_path)],
+        )
+
+        assert result.exit_code == 0, result.output + result.stderr
+        assert handler.cancel_calls[0]["build_id"] == older.build_id
 
 
 # ---------------------------------------------------------------------------

@@ -133,11 +133,11 @@ def fix_journey_receipts_root(
     return _receipts_root()
 
 
-def _harden(root: Path) -> None:
+def _harden(root: Path) -> bool:
     """Apply the routine path's 0700/0600 hardening to ``root``."""
     from forge.subagents.autobuild_runner import _harden_pack_permissions
 
-    _harden_pack_permissions(root)
+    return _harden_pack_permissions(root)
 
 
 # ---------------------------------------------------------------------------
@@ -237,6 +237,46 @@ class FailurePackIndex:
         }
 
 
+def _present_receipt_families(
+    pack_dir: Path, families: tuple[str, ...]
+) -> tuple[str, ...]:
+    """Inventory outer and namespaced inner receipt families on disk.
+
+    The exporter stores inner task-worktree evidence at
+    ``worktrees/<name>/<family>``. This read-side inventory deliberately does
+    not consult the manifest: an old or malformed historical claim must not
+    erase evidence that is presently readable in the pack.
+    """
+    present: list[str] = []
+    for family in families:
+        candidate = pack_dir / family
+        if candidate.is_symlink():
+            raise OSError(f"symlink refused: {candidate}")
+        if candidate.is_dir():
+            present.append(family)
+    inner_root = pack_dir / "worktrees"
+    if inner_root.is_symlink():
+        raise OSError(f"symlink refused: {inner_root}")
+    try:
+        inner_dirs = []
+        for path in inner_root.iterdir():
+            if path.is_symlink():
+                raise OSError(f"symlink refused: {path}")
+            if path.is_dir():
+                inner_dirs.append(path)
+        inner_dirs.sort()
+    except FileNotFoundError:
+        inner_dirs = []
+    for inner in inner_dirs:
+        for family in families:
+            candidate = inner / family
+            if candidate.is_symlink():
+                raise OSError(f"symlink refused: {candidate}")
+            if candidate.is_dir():
+                present.append(f"worktrees/{inner.name}/{family}")
+    return tuple(present)
+
+
 def read_failure_pack(
     build_id: str,
     *,
@@ -276,9 +316,7 @@ def read_failure_pack(
             )
             return None
 
-        present = tuple(
-            family for family in _RECEIPT_FAMILIES if (pack_dir / family).is_dir()
-        )
+        present = _present_receipt_families(pack_dir, _RECEIPT_FAMILIES)
         stdout_log = pack_dir / STDOUT_LOG_NAME
         manifest_path = pack_dir / FAILURE_MANIFEST_NAME
 
@@ -480,7 +518,8 @@ def export_stage_receipts(
         for name, text in (extra_files or {}).items():
             (dest_root / name).write_text(text, encoding="utf-8")
 
-        _harden(pack_root)
+        if not _harden(pack_root):
+            raise PermissionError(f"could not harden receipt pack {pack_root}")
         logger.info(
             "fix_journey_receipts: stage receipts exported for %s -> %s (%s)",
             build_id,
@@ -572,7 +611,8 @@ def write_fix_journey_failure_pack(
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
-        _harden(pack_root)
+        if not _harden(pack_root):
+            raise PermissionError(f"could not harden receipt pack {pack_root}")
         logger.info(
             "fix_journey_receipts: fix-journey failure pack written for %s -> %s",
             build_id,

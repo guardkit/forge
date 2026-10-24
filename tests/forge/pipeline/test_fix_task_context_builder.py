@@ -25,7 +25,7 @@ from forge.lifecycle.modes import BuildMode
 from forge.pipeline.fix_task_context_builder import FixTaskContextBuilder
 from forge.pipeline.forward_context_builder import ContextEntry, FixTaskRef
 from forge.pipeline.stage_taxonomy import StageClass
-from forge.subagents.autobuild_runner import FAILURE_MANIFEST_NAME
+from forge.subagents.autobuild_runner import FAILURE_MANIFEST_NAME, _RECEIPT_FAMILIES
 
 FIX_BUILD = "build-FEAT-CTX-20260731090000"
 FAILED_BUILD = "build-FEAT-CTX-20260730120000"
@@ -157,6 +157,26 @@ class TestFailurePackExtension:
 
         assert context["failure_pack"] is None
         assert context["context_entries"] == []
+
+    def test_outer_and_inner_receipts_reach_the_repair_context_despite_old_claims(
+        self, tmp_path: Path
+    ) -> None:
+        _write_manifest(tmp_path, FIX_BUILD, receipt_families_exported=[])
+        pack = tmp_path / FIX_BUILD
+        outer = _RECEIPT_FAMILIES[0]
+        inner = f"worktrees/TASK-1/{_RECEIPT_FAMILIES[2]}"
+        (pack / outer).mkdir(parents=True)
+        (pack / outer / "coach.json").write_text("{}")
+        (pack / inner).mkdir(parents=True)
+        (pack / inner / "player.json").write_text("{}")
+        builder = FixTaskContextBuilder(
+            _RecordingForwardBuilder(), receipts_root=tmp_path
+        )
+
+        context = builder(StageClass.TASK_WORK, FIX_BUILD, _fix_task())
+
+        assert context["failure_pack"]["receipt_families_exported"] == []
+        assert context["failure_pack"]["present_families"] == [outer, inner]
 
     def test_the_source_reader_points_at_the_failed_builds_pack(
         self, tmp_path: Path

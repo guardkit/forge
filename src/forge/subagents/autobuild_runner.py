@@ -73,6 +73,7 @@ flips this contract.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import logging
 import os
@@ -3130,26 +3131,82 @@ def _receipts_root() -> Path:
     return _receipts.receipts_root(bound_state_root=BOUND_STATE_ROOT)
 
 
-def _harden_pack_permissions(root: Path) -> None:
+def _walk_receipt_tree(root: Path) -> tuple[tuple[Path, ...], dict[Path, str]]:
+    """Return an explicit, hashed inventory without following links.
+
+    ``Path.rglob`` may turn a directory scan failure into an incomplete
+    iterator. Receipt accounting cannot distinguish that from an empty tree,
+    so this walker uses ``os.scandir`` directly and lets every inspection or
+    read error reach its caller. Symlinks and non-regular filesystem objects
+    are refused: neither the worktree nor a durable pack may lead the exporter
+    outside the family it was asked to copy.
+    """
+    if root.is_symlink():
+        raise OSError(f"symlink refused: {root}")
+    if not root.is_dir():
+        raise OSError(f"not a directory: {root}")
+
+    directories: list[Path] = [Path(".")]
+    files: dict[Path, str] = {}
+    pending: list[tuple[Path, Path]] = [(root, Path("."))]
+    while pending:
+        absolute, relative = pending.pop()
+        with os.scandir(absolute) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name)
+        for entry in ordered:
+            rel = relative / entry.name
+            if entry.is_symlink():
+                raise OSError(f"symlink refused: {absolute / entry.name}")
+            if entry.is_dir(follow_symlinks=False):
+                directories.append(rel)
+                pending.append((absolute / entry.name, rel))
+                continue
+            if not entry.is_file(follow_symlinks=False):
+                raise OSError(f"non-regular receipt refused: {absolute / entry.name}")
+            digest = hashlib.sha256()
+            with open(absolute / entry.name, "rb") as handle:
+                for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                    digest.update(chunk)
+            files[rel] = digest.hexdigest()
+    return tuple(sorted(directories)), dict(sorted(files.items()))
+
+
+def _harden_pack_permissions(root: Path) -> bool:
     """Restrict a receipts pack to the owner (0700 dirs / 0600 files).
 
     FEAT-DRF coach finding: the pack persists the FULL guardkit subprocess
     narrative durably (and ~/forge-state is bind-mounted into forge-prod);
     under the operator umask the defaults were group/world-readable — the
     wrong posture for an estate with a live credential-exposure history.
-    Best-effort: permission errors are swallowed (the pack's existence beats
-    its mode; never fail an export over chmod).
+    Returns ``False`` and logs the exact failure when the tree cannot be
+    completely inventoried or chmodded. Callers that decide whether an export
+    succeeded must use that result; best-effort callers still retain the pack,
+    but no longer mistake a partial hardening pass for a complete one.
     """
     try:
         if not root.exists():
-            return
-        for path in [root, *root.rglob("*")]:
-            try:
-                path.chmod(0o700 if path.is_dir() else 0o600)
-            except OSError:
-                continue
-    except OSError:
-        pass
+            return True
+        directories, files = _walk_receipt_tree(root)
+        for relative in directories:
+            path = root / relative
+            path.chmod(0o700)
+            if (path.stat().st_mode & 0o777) != 0o700:
+                raise OSError(f"directory mode verification failed: {path}")
+        for relative in files:
+            path = root / relative
+            path.chmod(0o600)
+            if (path.stat().st_mode & 0o777) != 0o600:
+                raise OSError(f"file mode verification failed: {path}")
+        return True
+    except OSError as exc:
+        logger.warning(
+            "autobuild_runner: receipt permission hardening FAILED for %s "
+            "(%s: %s)",
+            root,
+            type(exc).__name__,
+            exc,
+        )
+        return False
 
 
 def _resolve_receipt_build_id(
@@ -3238,7 +3295,10 @@ class _StdoutTee:
                 self._handle = self._path.open(
                     "a", encoding="utf-8", errors="replace", buffering=1
                 )
-                _harden_pack_permissions(self._path.parent)
+                if not _harden_pack_permissions(self._path.parent):
+                    raise PermissionError(
+                        f"could not harden receipt pack {self._path.parent}"
+                    )
                 if self._run_header is not None and not self._header_written:
                     self._handle.write(f"{self._run_header}\n")
                     self._header_written = True
@@ -3672,7 +3732,14 @@ def _write_failure_manifest(
         manifest_path.write_text(
             json.dumps(manifest, indent=2) + "\n", encoding="utf-8"
         )
-        _harden_pack_permissions(dest_root)
+        if not _harden_pack_permissions(dest_root):
+            logger.warning(
+                "autobuild_runner: failure manifest for %s was written but "
+                "its pack could not be fully hardened; treating the write as "
+                "failed",
+                build_id,
+            )
+            return None
         logger.info(
             "autobuild_runner: failure manifest written for %s -> %s "
             "(terminal=%s)",
@@ -3806,15 +3873,9 @@ class ReceiptExport:
     file_counts: dict[str, int] = field(default_factory=dict)
 
 
-def _count_files(root: Path) -> int:
-    """Number of regular files under ``root`` (0 when absent/unreadable)."""
-    try:
-        return sum(1 for p in root.rglob("*") if p.is_file())
-    except OSError:  # pragma: no cover — unreadable mid-walk
-        return 0
-
-
-def _receipt_export_sources(worktree_path: Path) -> list[tuple[str, Path]]:
+def _receipt_export_sources(
+    worktree_path: Path,
+) -> tuple[list[tuple[str, Path]], list[dict[str, str]]]:
     """``[(label, source_dir)]`` — every family this build could export.
 
     The OUTER worktree's families come first under their plain
@@ -3822,21 +3883,43 @@ def _receipt_export_sources(worktree_path: Path) -> list[tuple[str, Path]]:
     ``.guardkit/worktrees/<name>/`` contributes its own families under a
     ``worktrees/<name>/.guardkit/<family>`` label, so both survive side by
     side and neither overwrites the other. Path arithmetic + one directory
-    listing; never raises.
+    listing. A failed inner-worktree scan is returned as an explicit skipped
+    row instead of silently becoming "there were no inner worktrees".
     """
     sources: list[tuple[str, Path]] = [
         (family, worktree_path / family) for family in _RECEIPT_FAMILIES
     ]
     inner_root = worktree_path / _INNER_WORKTREES_REL
+    errors: list[dict[str, str]] = []
     try:
-        inner_dirs = sorted(p for p in inner_root.iterdir() if p.is_dir())
-    except OSError:
+        if inner_root.is_symlink():
+            raise OSError(f"symlink refused: {inner_root}")
         inner_dirs = []
+        with os.scandir(inner_root) as entries:
+            ordered = sorted(entries, key=lambda entry: entry.name)
+        for entry in ordered:
+            path = inner_root / entry.name
+            if entry.is_symlink():
+                raise OSError(f"symlink refused: {path}")
+            if entry.is_dir(follow_symlinks=False):
+                inner_dirs.append(path)
+            elif not entry.is_file(follow_symlinks=False):
+                raise OSError(f"non-regular worktree entry refused: {path}")
+    except FileNotFoundError:
+        inner_dirs = []
+    except OSError as exc:
+        inner_dirs = []
+        errors.append(
+            {
+                "family": _INNER_WORKTREES_REL,
+                "reason": f"scan-failed: {type(exc).__name__}: {exc}",
+            }
+        )
     for inner in inner_dirs:
         for family in _RECEIPT_FAMILIES:
             label = f"{_INNER_EXPORT_PREFIX}/{inner.name}/{family}"
             sources.append((label, inner / family))
-    return sources
+    return sources, errors
 
 
 def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
@@ -3879,12 +3962,40 @@ def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
     ok = True
     dest_root = _receipts_root() / build_id
     try:
-        for label, src in _receipt_export_sources(worktree_path):
+        sources, discovery_errors = _receipt_export_sources(worktree_path)
+        if discovery_errors:
+            ok = False
+            skipped.extend(discovery_errors)
+        for label, src in sources:
+            if src.is_symlink():
+                ok = False
+                skipped.append(
+                    {"family": label, "reason": "scan-failed: symlink refused"}
+                )
+                continue
             if not src.is_dir():
                 skipped.append({"family": label, "reason": "missing"})
                 continue
-            n_files = _count_files(src)
-            if n_files == 0:
+            try:
+                _source_dirs, source_files = _walk_receipt_tree(src)
+            except OSError as exc:
+                ok = False
+                skipped.append(
+                    {
+                        "family": label,
+                        "reason": f"scan-failed: {type(exc).__name__}: {exc}",
+                    }
+                )
+                logger.warning(
+                    "autobuild_runner: receipt family %s NOT inventoried for %s "
+                    "(%s: %s) — the worktree will be KEPT",
+                    label,
+                    build_id,
+                    type(exc).__name__,
+                    exc,
+                )
+                continue
+            if not source_files:
                 # An empty directory copies to an empty directory: the pack
                 # would carry a family that produced NOTHING. Say so instead.
                 skipped.append({"family": label, "reason": "empty"})
@@ -3892,7 +4003,10 @@ def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
             dest = dest_root / label
             try:
                 dest.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copytree(src, dest, dirs_exist_ok=True)
+                # Preserve links as links so a source-side race can never make
+                # copytree follow one outside the family. The explicit
+                # destination inventory below rejects any link before success.
+                shutil.copytree(src, dest, dirs_exist_ok=True, symlinks=True)
             except Exception as exc:  # noqa: BLE001 — one family must not cost the rest
                 ok = False
                 skipped.append(
@@ -3911,13 +4025,36 @@ def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
                     exc,
                 )
                 continue
-            landed = _count_files(dest)
-            if landed == 0:  # pragma: no cover — copytree landed nothing
+            try:
+                _dest_dirs, dest_files = _walk_receipt_tree(dest)
+            except OSError as exc:
                 ok = False
-                skipped.append({"family": label, "reason": "copied-nothing"})
+                skipped.append(
+                    {
+                        "family": label,
+                        "reason": f"verify-failed: {type(exc).__name__}: {exc}",
+                    }
+                )
+                continue
+            mismatched = [
+                str(relative)
+                for relative, digest in source_files.items()
+                if dest_files.get(relative) != digest
+            ]
+            if mismatched:
+                ok = False
+                skipped.append(
+                    {
+                        "family": label,
+                        "reason": "verify-failed: copied bytes differ or are missing: "
+                        + ", ".join(mismatched[:5]),
+                    }
+                )
                 continue
             exported.append(label)
-            file_counts[label] = landed
+            # Count only this invocation's independently hashed source set.
+            # Extra destination files may be stale residue from a reused pack.
+            file_counts[label] = len(source_files)
         if exported:
             logger.info(
                 "autobuild_runner: receipts exported for %s -> %s (%s)",
@@ -3932,7 +4069,14 @@ def _export_receipts(worktree_path: Path, build_id: str) -> ReceiptExport:
                 worktree_path,
                 build_id,
             )
-        _harden_pack_permissions(dest_root)
+        if not _harden_pack_permissions(dest_root):
+            ok = False
+            for label in list(exported):
+                exported.remove(label)
+                file_counts.pop(label, None)
+                skipped.append(
+                    {"family": label, "reason": "permission-hardening-failed"}
+                )
     except Exception as exc:  # noqa: BLE001 — best-effort: never block the terminal flow
         logger.warning(
             "autobuild_runner: receipt export FAILED for %s (%s: %s) — the "

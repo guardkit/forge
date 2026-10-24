@@ -1078,6 +1078,147 @@ class TestExportAccountingIsHonest:
             "copy-failed:"
         )
 
+    def test_destination_scan_failure_after_copy_is_not_reported_as_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        family = worktree / ".guardkit/qav-shadow"
+        family.mkdir(parents=True)
+        (family / "queue.jsonl").write_text("one\n")
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+        real_walk = ar._walk_receipt_tree
+        destination = receipts / "build-SCAN-1/.guardkit/qav-shadow"
+
+        def fail_destination(root: Path):
+            if root == destination:
+                raise OSError("destination scan unavailable")
+            return real_walk(root)
+
+        monkeypatch.setattr(ar, "_walk_receipt_tree", fail_destination)
+        result = ar._export_receipts(worktree, "build-SCAN-1")
+
+        assert result.ok is False
+        assert result.exported == []
+        assert _skip_reason(result, ".guardkit/qav-shadow").startswith(
+            "verify-failed: OSError: destination scan unavailable"
+        )
+
+    def test_source_scan_failure_is_distinct_from_an_empty_family(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        family = worktree / ".guardkit/qav-shadow"
+        family.mkdir(parents=True)
+        (family / "queue.jsonl").write_text("one\n")
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        real_walk = ar._walk_receipt_tree
+
+        def fail_source(root: Path):
+            if root == family:
+                raise PermissionError("source unreadable")
+            return real_walk(root)
+
+        monkeypatch.setattr(ar, "_walk_receipt_tree", fail_source)
+        result = ar._export_receipts(worktree, "build-SCAN-2")
+
+        assert result.ok is False
+        assert _skip_reason(result, ".guardkit/qav-shadow").startswith(
+            "scan-failed: PermissionError: source unreadable"
+        )
+        assert _skip_reason(result, ".guardkit/qav-shadow") != "empty"
+
+    def test_partial_copy_is_a_copy_failure_and_keeps_no_success_count(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        family = worktree / ".guardkit/qav-shadow"
+        family.mkdir(parents=True)
+        (family / "one.json").write_text("one")
+        (family / "two.json").write_text("two")
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+        real_copytree = ar.shutil.copytree
+
+        def partial_copy(src: Any, dst: Any, **kwargs: Any) -> Any:
+            if Path(src) == family:
+                Path(dst).mkdir(parents=True, exist_ok=True)
+                (Path(dst) / "one.json").write_text("one")
+                raise OSError("disk filled after one file")
+            return real_copytree(src, dst, **kwargs)
+
+        monkeypatch.setattr(ar.shutil, "copytree", partial_copy)
+        result = ar._export_receipts(worktree, "build-PARTIAL-1")
+
+        assert result.ok is False
+        assert ".guardkit/qav-shadow" not in result.file_counts
+        assert _skip_reason(result, ".guardkit/qav-shadow").startswith(
+            "copy-failed: OSError: disk filled after one file"
+        )
+
+    def test_symlink_escape_is_refused_without_copying_its_target(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        outside = tmp_path / "outside-secret"
+        outside.write_text("not a receipt")
+        worktree = tmp_path / "wt"
+        family = worktree / ".guardkit/qav-shadow"
+        family.mkdir(parents=True)
+        (family / "escape").symlink_to(outside)
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        result = ar._export_receipts(worktree, "build-LINK-1")
+
+        assert result.ok is False
+        assert _skip_reason(result, ".guardkit/qav-shadow").startswith(
+            "scan-failed: OSError: symlink refused"
+        )
+        assert not (receipts / "build-LINK-1/.guardkit/qav-shadow/escape").exists()
+
+    def test_count_hash_and_modes_are_checked_independently(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        files = _make_receipt_tree(worktree)
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+
+        result = ar._export_receipts(worktree, "build-VERIFY-1")
+
+        assert result.ok is True
+        pack = receipts / "build-VERIFY-1"
+        copied = {
+            relative: (pack / relative).read_bytes()
+            for relative in files
+        }
+        assert len(copied) == sum(result.file_counts.values())
+        assert copied == {
+            relative: source.read_bytes() for relative, source in files.items()
+        }
+        for path in [pack, *(p for p in pack.rglob("*") if p.is_dir())]:
+            assert (path.stat().st_mode & 0o777) == 0o700
+        for path in (p for p in pack.rglob("*") if p.is_file()):
+            assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_permission_hardening_failure_makes_export_fail_honestly(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        worktree = tmp_path / "wt"
+        _make_receipt_tree(worktree)
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
+        monkeypatch.setattr(ar, "_harden_pack_permissions", lambda _root: False)
+
+        result = ar._export_receipts(worktree, "build-MODE-1")
+
+        assert result.ok is False
+        assert result.exported == []
+        assert result.file_counts == {}
+        assert all(
+            _skip_reason(result, family) == "permission-hardening-failed"
+            for family in _OUTER_SEEDED_FAMILIES
+        )
+
 
 class TestFinalizeSuccessWorktree:
     def test_export_success_then_removal(
@@ -1379,6 +1520,18 @@ class TestStdoutTee:
         ]
         assert len(warnings) == 1
 
+    def test_hardening_failure_disables_before_receipt_text_is_written(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        log = tmp_path / "pack" / ar.STDOUT_LOG_NAME
+        monkeypatch.setattr(ar, "_harden_pack_permissions", lambda _root: False)
+
+        tee = ar._StdoutTee(log)
+        tee.write("must not land")
+
+        assert tee.disabled is True
+        assert log.read_text() == ""
+
 
 class TestFailureManifest:
     def test_legacy_no_worktree_failure_still_gets_a_manifest(
@@ -1427,6 +1580,26 @@ class TestFailureManifest:
         assert "failure manifest NOT written" in " ".join(
             r.getMessage() for r in caplog.records
         )
+
+    def test_manifest_hardening_failure_is_reported_as_write_failure(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        receipts = tmp_path / "receipts"
+        monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(receipts))
+        monkeypatch.setattr(ar, "_harden_pack_permissions", lambda _root: False)
+
+        written = ar._write_failure_manifest(
+            build_id="build-DRF-MODE",
+            payload={},
+            reason="boom",
+            timed_out=False,
+            exit_code=2,
+            worktree_path=None,
+            branch=None,
+            receipts=None,
+        )
+
+        assert written is None
 
 
 # ---------------------------------------------------------------------------

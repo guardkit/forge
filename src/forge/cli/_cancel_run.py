@@ -118,7 +118,11 @@ def execute_cancel(
         sys.exit(2)
 
     runtime = build_cli_runtime(resolved_db)
-    build = runtime.persistence.find_active_or_recent(identifier)
+    # A build id selects that exact row even if its feature has a newer run;
+    # only an exact miss falls back to the established feature lookup.
+    build = runtime.persistence.get_build_row(identifier)
+    if build is None:
+        build = runtime.persistence.find_active_or_recent(identifier)
     if build is None:
         # Loud, DB-named failure — NOT a silent no-op. A stale/wrong ledger is
         # the usual cause, so surfacing the resolved path is the fix's whole

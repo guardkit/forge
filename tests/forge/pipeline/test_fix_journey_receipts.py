@@ -249,6 +249,42 @@ class TestReadFailurePack:
         assert index.receipt_families_exported == tuple(_RECEIPT_FAMILIES)
         assert index.present_families == ()
 
+    def test_inner_worktree_families_are_observed_beside_outer_families(
+        self, tmp_path: Path
+    ) -> None:
+        pack = tmp_path / FAILED_BUILD
+        outer = _RECEIPT_FAMILIES[0]
+        inner = f"worktrees/TASK-1/{_RECEIPT_FAMILIES[2]}"
+        (pack / outer).mkdir(parents=True)
+        (pack / outer / "coach.json").write_text("{}")
+        (pack / inner).mkdir(parents=True)
+        (pack / inner / "player.json").write_text("{}")
+        (pack / FAILURE_MANIFEST_NAME).write_text(
+            json.dumps({"receipt_families_exported": []}), encoding="utf-8"
+        )
+
+        index = read_failure_pack(FAILED_BUILD, receipts_root=tmp_path)
+
+        assert index is not None
+        assert index.receipt_families_exported == ()
+        assert index.present_families == (outer, inner)
+
+    def test_malformed_manifest_does_not_erase_inner_receipts(
+        self, tmp_path: Path
+    ) -> None:
+        pack = tmp_path / FAILED_BUILD
+        inner = f"worktrees/TASK-9/{_RECEIPT_FAMILIES[0]}"
+        (pack / inner).mkdir(parents=True)
+        (pack / inner / "coach.json").write_text("{}")
+        (pack / FAILURE_MANIFEST_NAME).write_text("{broken", encoding="utf-8")
+
+        index = read_failure_pack(FAILED_BUILD, receipts_root=tmp_path)
+
+        assert index is not None
+        assert index.has_manifest is False
+        assert index.receipt_families_exported == ()
+        assert index.present_families == (inner,)
+
     def test_to_context_is_json_safe(self, tmp_path: Path) -> None:
         _write_pack(tmp_path, FAILED_BUILD)
         index = read_failure_pack(FAILED_BUILD, receipts_root=tmp_path)
