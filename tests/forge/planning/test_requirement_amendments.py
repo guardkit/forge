@@ -387,7 +387,9 @@ async def test_approval_exact_diff_admission_and_protection(
     (work / "requirements/sibling.contract").unlink()
     (work / "requirements/extra.txt").write_text("unauthorized sibling\n")
     git(work, "add", "-A")
+    git(work, "commit", "-qm", "Unauthorized shell checkpoint fixture")
     assert restore_protected_paths(work, ref) is not None
+    assert git(work, "show", "player:" + DOC) == NEW.rstrip()
     hold_protected_index(work, ref)
     assert (work / DOC).read_text() == NEW
     assert (work / "requirements/sibling.contract").read_text() == x.files[
