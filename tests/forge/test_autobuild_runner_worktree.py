@@ -2297,7 +2297,7 @@ class TestRequeueSweepExportAbsent:
         assert f"prior build {PRIOR_BUILD_ID} evidence exported" in joined
 
 
-class TestRequeueSweepFailureIsAnHonestRefusal:
+class TestRequeueSweepFailureKeepsTheEvidenceAndCarriesOn:
     def test_manifest_hardening_failure_preserves_prior_build(
         self,
         throwaway_repo: Path,
@@ -2325,23 +2325,23 @@ class TestRequeueSweepFailureIsAnHonestRefusal:
             _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
         )
 
-        assert _lifecycle(result, ROUND17_FEATURE_ID) == "failed"
-        message = (result["async_tasks"][ROUND17_FEATURE_ID])["error_message"]
-        assert "failure manifest could not be written and hardened" in message
-        assert "F11 forensics law" in message
+        # Step 1 (24 October 2026): the sweep still destroys nothing it could
+        # not export, and the fresh build goes ahead instead of being refused.
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
         assert outer.is_dir()
         assert inner.is_dir()
         assert (inner / "forensic.txt").read_text() == "evidence"
-        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
-        assert "cwd" not in recorded
+        # The ordinary per-task ref pass that runs next may still clear the
+        # branch name; the kept tree holds the commit and the files.
+        assert "cwd" in recorded
 
-    def test_branch_delete_failure_refuses_the_dispatch_loudly(
+    def test_branch_delete_failure_is_logged_and_the_dispatch_goes_ahead(
         self,
         throwaway_repo: Path,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """A sweep it cannot finish is a REFUSAL — guardkit is never launched."""
+        """Step 1: a sweep it cannot finish is retried once, then logged."""
         wt_base = tmp_path / "worktrees"
         receipts = tmp_path / "receipts"
         monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
@@ -2358,29 +2358,24 @@ class TestRequeueSweepFailureIsAnHonestRefusal:
             return await real_run_git(args, cwd=cwd)
 
         monkeypatch.setattr(ar, "_run_git", _fail_branch_delete)
+        monkeypatch.setattr(ar, "RETRY_PAUSE_SECONDS", 0.0)
 
         recorded: dict[str, Any] = {}
         result = _invoke(
             _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
         )
 
-        assert _lifecycle(result, ROUND17_FEATURE_ID) == "failed"
-        message = (result["async_tasks"][ROUND17_FEATURE_ID])["error_message"]
-        assert "refusing the fresh dispatch" in message
-        assert PRIOR_BUILD_ID in message
-        assert f"git branch -D {PRIOR_BRANCH}" in message
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
+        assert "cwd" in recorded, "the fresh build goes ahead"
 
-        # No half-state handed onward: guardkit never ran, no fresh worktree.
-        assert "cwd" not in recorded, "guardkit must NOT be launched on a refusal"
-        assert not (wt_base / REQUEUE_BUILD_ID).exists()
-
-    def test_un_exportable_evidence_refuses_before_destroying_anything(
+    def test_un_exportable_evidence_is_never_destroyed(
         self,
         throwaway_repo: Path,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """F11 is a HARD gate: an export that fails stops the sweep dead."""
+        """F11 still stops the sweep: nothing un-exported is destroyed (step 1:
+        the fresh build then goes ahead)."""
         wt_base = tmp_path / "worktrees"
         receipts = tmp_path / "receipts"
         monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
@@ -2390,23 +2385,21 @@ class TestRequeueSweepFailureIsAnHonestRefusal:
             throwaway_repo, wt_base, feature_yaml_in="repo"
         )
         monkeypatch.setattr(ar, "_export_receipts", lambda wt, bid: ar.ReceiptExport(ok=False))
+        monkeypatch.setattr(ar, "RETRY_PAUSE_SECONDS", 0.0)
 
         recorded: dict[str, Any] = {}
         result = _invoke(
             _requeue_launch(), throwaway_repo, exit_code=0, recorded=recorded
         )
 
-        assert _lifecycle(result, ROUND17_FEATURE_ID) == "failed"
-        message = (result["async_tasks"][ROUND17_FEATURE_ID])["error_message"]
-        assert "refusing the fresh dispatch" in message
-        assert "F11 forensics law" in message
-
+        assert _lifecycle(result, ROUND17_FEATURE_ID) == "completed"
         # NOTHING was destroyed: the evidence is still exactly where it was.
         assert outer.is_dir()
         assert inner.is_dir()
         assert (inner / "forensic.txt").read_text() == "evidence"
-        assert _branch_exists(throwaway_repo, PRIOR_BRANCH)
-        assert "cwd" not in recorded
+        # The ordinary per-task ref pass that runs next may still clear the
+        # branch name; the kept tree holds the commit and the files.
+        assert "cwd" in recorded
 
     def test_unexpected_failure_surfaces_as_a_sweep_refusal(
         self, throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2974,7 +2967,8 @@ class TestFeatureModeResidueIsSwept:
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
     ) -> None:
-        """F11 holds for the feature shape too: an export that fails stops it dead."""
+        """F11 holds for the feature shape too: an export that fails destroys
+        nothing (step 1: the fresh build is no longer refused for it)."""
         wt_base = tmp_path / "worktrees"
         monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(wt_base))
         monkeypatch.setenv(ar.RECEIPTS_DIR_ENV, str(tmp_path / "receipts"))
@@ -2990,16 +2984,14 @@ class TestFeatureModeResidueIsSwept:
             _make_feature_mode_exec_stub(recorded),
         )
 
-        assert _lifecycle(result, FLV1_FEATURE_ID) == "failed"
-        message = (result["async_tasks"][FLV1_FEATURE_ID])["error_message"]
-        assert "refusing the fresh dispatch" in message
-        assert "F11 forensics law" in message
-        # Nothing destroyed, and guardkit never ran.
+        message = (result["async_tasks"][FLV1_FEATURE_ID])["error_message"] or ""
+        assert "refusing the fresh dispatch" not in message
+        # Nothing destroyed.
         assert inner.is_dir()
         assert (inner / "forensic.txt").read_text() == "evidence"
         assert outer.is_dir()
         assert _branch_exists(throwaway_repo, FLV1_BRANCH)
-        assert "cwd" not in recorded
+        assert recorded, "the fresh build goes ahead"
 
     def test_a_stale_registration_whose_directory_is_gone_is_pruned(
         self,
@@ -3094,14 +3086,15 @@ class TestFeatureModeResidueIsSwept:
         assert "already-swept" in joined
         assert "could not remove its kept outer worktree" not in joined
 
-    def test_a_mid_walk_race_is_refused_not_misread_as_already_swept(
+    def test_a_mid_walk_race_is_not_misread_as_already_swept(
         self,
         throwaway_repo: Path,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
         caplog: pytest.LogCaptureFixture,
     ) -> None:
-        """rmtree dying on a vanishing ENTRY while the tree remains = REFUSE.
+        """rmtree dying on a vanishing ENTRY while the tree remains is a failed
+        sweep, never "already gone" (step 1: logged, and the build goes ahead).
 
         The already-swept branch keys on FileNotFoundError, but rmtree also
         raises it when a concurrent deletion removes an entry mid-walk — and
@@ -3136,11 +3129,8 @@ class TestFeatureModeResidueIsSwept:
                 _make_feature_mode_exec_stub({}),
             )
 
-        assert _lifecycle(result, FLV1_FEATURE_ID) == "failed"
-        message = (result["async_tasks"][FLV1_FEATURE_ID])["error_message"]
-        assert "concurrent-deletion race" in message
-        assert "already-swept" not in message.split("not an ")[0]
         joined = " ".join(r.getMessage() for r in caplog.records)
+        assert "concurrent-deletion race" in joined
         assert "was ALREADY GONE" not in joined
         # The tree is left in place for forensics — refusal destroys nothing.
         assert outer.exists()

@@ -1238,12 +1238,12 @@ async def test_an_answered_card_is_never_asked_again(
 
 
 @pytest.mark.asyncio
-async def test_a_digest_that_does_not_match_the_committed_spec_stops_the_run(
+async def test_a_digest_that_does_not_match_the_committed_spec_is_carded(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """The normalizer rewrites the .feature in place at pre-commit, and the
-    committed file is what the build is checked against. A digest proven only
-    against the pre-normalization text is a digest about a different artifact."""
+    """FRG-045 (24 October 2026): the digest is still re-checked against the
+    committed spec, and a mismatch is a line on the card, never the end of the
+    run."""
 
     async def _drop_a_scenario(worktree: Path, feature_rel: str) -> ToolOutcome:
         path = worktree / feature_rel
@@ -1260,19 +1260,18 @@ async def test_a_digest_that_does_not_match_the_committed_spec_stops_the_run(
 
     await h.driver.drive(CID)
 
-    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert _digest_cards(h) == [], "an unproven digest must never reach a person"
-    assert "spec digest" in store.get_run(CID)["error"]
-    told = " ".join(m for _c, m, _l in h.ctx["notifications"])
-    assert "did not match the spec" in told
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    summary = _digest_cards(h)[0].payload["details"]["summary"]
+    assert "could not confirm it matches the examples" in summary["what_happened"]
+    assert summary["summary_problems"]
 
 
 @pytest.mark.asyncio
-async def test_a_reply_with_no_digest_at_all_stops_the_run(
+async def test_a_reply_with_no_digest_at_all_is_carded_and_passes(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """Never a "summary unavailable" card: an approval that rests on a summary
-    nobody checked is an approval of a lie."""
+    """FRG-044 (24 October 2026): a missing digest is bookkeeping. The card
+    says so, the worked examples ride along, and the person decides."""
     _queue(store)
     h = _make_driver(
         store,
@@ -1282,10 +1281,10 @@ async def test_a_reply_with_no_digest_at_all_stops_the_run(
 
     await h.driver.drive(CID)
 
-    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert _digest_cards(h) == []
-    told = " ".join(m for _c, m, _l in h.ctx["notifications"])
-    assert "no plain-language summary" in told
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    summary = _digest_cards(h)[0].payload["details"]["summary"]
+    assert "no plain-language summary" in summary["what_happened"]
+    assert summary["worked_examples"]
 
 
 @pytest.mark.asyncio
@@ -1310,11 +1309,12 @@ async def test_an_ordinary_self_check_failure_still_only_warns(
 
 
 @pytest.mark.asyncio
-async def test_a_digest_error_from_the_spec_writer_stops_the_leg(
+async def test_a_digest_error_from_the_spec_writer_is_shown_on_the_card(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """...and the digest is the exception, because there is no oracle after it —
-    only a person's eyes."""
+    """FRG-039 (24 October 2026): the digest check is advice too. The card
+    shows the digest it has, with what the check found as a line, and the
+    person reading it decides."""
     _queue(store)
     h = _make_driver(
         store,
@@ -1328,8 +1328,10 @@ async def test_a_digest_error_from_the_spec_writer_stops_the_leg(
 
     await h.driver.drive(CID)
 
-    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert _digest_cards(h) == []
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    summary = _digest_cards(h)[0].payload["details"]["summary"]
+    assert "the digest is missing an example" in summary["what_happened"]
+    assert summary["what_it_will_do"], "the digest it has is still shown"
 
 
 @pytest.mark.asyncio
@@ -2358,32 +2360,103 @@ async def test_the_wait_the_card_promises_is_the_wait_the_door_really_keeps(
 
     await h.driver.drive(CID)
 
-    # What happened: one window, then the end. No second round, no re-target.
+    # What happened (FRG-035, 24 October 2026): one window, the SAME card
+    # posted once more with the same request id, one more window, then the end.
     assert store.get_run(CID)["state"] == PlanningState.FAILED.value
     assert [status for status, _d in _events(store, _DIGEST_STAGE)] == [
         "GATED",
         "timed_out",
     ]
-    assert len(_digest_cards(h)) == 1
+    cards = _digest_cards(h)
+    assert len(cards) == 2
+    assert cards[0].payload["request_id"] == cards[1].payload["request_id"]
+    assert cards[0].payload == cards[1].payload
 
     # What the card said would happen, in the same words.
-    card = _digest_cards(h)[0]
+    card = cards[0]
     said = card.payload["details"]["summary"]["no_answer_means"]
     assert "1 second" in said
+    assert "sent once more" in said
     assert "the run stops" in said
 
-    # And the Slack line that opened the door said the same one wait.
+    # And the Slack line that opened the door said the same thing.
     ping = next(
         m for _c, m, _l in h.ctx["notifications"] if "You have a card listing" in m
     )
     assert "1 second" in ping
+    assert "same card once more" in ping
     assert "stops the run" in ping
 
-    # Neither surface promises a reminder or a second window: this door sends
-    # no reminder, and the escalated wait (4 hours by default) never applies.
+    # The escalated wait (4 hours by default) still never applies.
     for words in (_card_text(card).lower(), ping.lower()):
-        assert "remind" not in words
         assert "4 hours" not in words
+
+
+class _AnswersTheSecondCopy:
+    """Silent until the same card has been posted twice, then answers it."""
+
+    def __init__(self, h: Any, answer: Any) -> None:
+        self.h = h
+        self.answer = answer
+
+    def __call__(self, expected_approver: Any, armed: Any) -> Any:
+        outer = self
+
+        class _Subscriber:
+            async def await_response(self, build_id: str, **kwargs: Any) -> Any:
+                armed.set()
+                if len(_digest_cards(outer.h)) >= 2 and outer.answer is not None:
+                    answer, outer.answer = outer.answer, None
+                    return answer
+                return None
+
+        return _Subscriber()
+
+
+@pytest.mark.asyncio
+async def test_the_card_posted_again_takes_a_later_answer(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """FRG-035 (24 October 2026): an answer after the first window, to the
+    same card posted once more, is taken and the run carries on."""
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        originator_wait_seconds=1,
+    )
+    h.driver._deps.subscriber_factory = _AnswersTheSecondCopy(h, _answer("approve"))
+
+    await h.driver.drive(CID)
+
+    assert len(_digest_cards(h)) == 2
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+
+
+@pytest.mark.asyncio
+async def test_cancelling_the_run_still_ends_the_wait_after_the_card_is_posted_again(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([]),
+        originator_wait_seconds=1,
+    )
+    h.driver._deps.subscriber_factory = _AnswersTheSecondCopy(h, None)
+
+    task = asyncio.create_task(h.driver.drive(CID))
+    for _ in range(100):
+        if len(_digest_cards(h)) >= 2:
+            break
+        await asyncio.sleep(0.1)
+    assert len(_digest_cards(h)) == 2
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not any(
+        status == "approved" for status, _d in _events(store, _DIGEST_STAGE)
+    )
 
 
 def test_the_sign_in_cards_own_words_about_silence_match_the_same_one_wait(
@@ -2410,7 +2483,6 @@ def test_the_sign_in_cards_own_words_about_silence_match_the_same_one_wait(
     assert "stops the run" in ping
 
     for words in (json.dumps(card).lower(), ping.lower()):
-        assert "remind" not in words
         assert "4 hours" not in words
 
 
@@ -2462,20 +2534,18 @@ def test_all_four_silence_sentences_name_the_one_wait_the_config_sets(
     ]
     for sentence in said:
         assert "No answer within " + in_words in sentence
-        # The whole promise, in one window: silence ends the run.
+        # The whole promise: the same card once more, then silence ends the run.
+        assert "once more" in sentence
         assert "stops" in sentence
 
-    # Nothing anywhere on either card, or in either line, offers a reminder or
-    # a second window. The escalated wait is four hours and is never reached.
+    # The escalated wait is four hours and is never reached.
     for words in (
         json.dumps(spec_card).lower(),
         spec_ping.lower(),
         json.dumps(auth_card).lower(),
         auth_ping.lower(),
     ):
-        assert "remind" not in words
         assert "4 hours" not in words
-        assert "try again" not in words
 
 
 def test_no_sentence_in_the_driver_promises_a_reminder_nobody_sends() -> None:

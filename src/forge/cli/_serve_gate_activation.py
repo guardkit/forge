@@ -302,11 +302,16 @@ def _bind_amendment_transport(publisher: Any, subscriber: Any, pool: Any) -> Non
 
 def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | None:
     """The plain lines the planning run left for the build gate's card, in
-    order: the repository line, then the size line. ``None`` when there are
+    order: the repository line, the size line, then the plan review line.
+    ``None`` when there are
     none. A ledger that cannot answer is no line: a card line must never stop
     the gate."""
     lines: list[str] = []
-    for name in ("read_planning_repository_unavailable", "read_planning_plan_size_note"):
+    for name in (
+        "read_planning_repository_unavailable",
+        "read_planning_plan_size_note",
+        "read_planning_plan_review_note",
+    ):
         reader = getattr(sqlite_pool, name, None)
         try:
             line = reader(correlation_id) if callable(reader) else None

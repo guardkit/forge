@@ -9,10 +9,12 @@ its rows, in one transaction per change:
    not exist (the forge stopped between the two) goes back to WAITING.
 1. **Closes.** Each ADMITTED attempt's planning run and build are read by its
    correlation id, with the same readers the queue uses. Landed on the mission
-   branch is LANDED; a conflict on attempt 1 closes it FAILED and files
-   attempt 2 WAITING in the same transaction; a failed planning run or build,
-   or the landing press's own FAILED report or refusal, is FAILED, with the
-   reason's first sentence. A finished build with no landing report yet waits:
+   branch is LANDED. A first failure on attempt 1 (a conflict, a failed
+   planning run or build, or the landing press's own FAILED report or
+   refusal) closes it FAILED and files attempt 2 WAITING in the same
+   transaction (step 1, 24 October 2026); a cancelled run or build, a declined
+   merge, a second attempt or a mission asked to stop closes FAILED with no
+   further attempt. Each closes with the reason's first sentence. A finished build with no landing report yet waits:
    resuming a press that stopped is the merge side's job, never a timer's.
 2. **Holds.** A WAITING attempt is HELD ("<key> did not land") when a key it
    needs has its final attempt FAILED or HELD. While a rebuild is pending the
@@ -309,7 +311,11 @@ class MissionStep:
             state = str(run["state"])
             if state in wq.PLANNING_FAILURE_STATES:
                 reason = self._failure_reason(run, state, attempt.correlation_id)
-                closed += self._fail(mission, attempt, reason)
+                # A cancelled run is never rebuilt (step 1, 24 October 2026).
+                if state == "CANCELLED":
+                    closed += self._fail(mission, attempt, reason)
+                else:
+                    closed += self._fail_with_rebuild(mission, attempt, reason)
                 continue
             if state not in wq.PLANNING_SUCCESS_STATES:
                 continue
@@ -332,8 +338,48 @@ class MissionStep:
                     )
                     closed += 1
             elif answer in wq.WILL_NOT_LAND_ON_ITS_OWN:
-                closed += self._fail(mission, attempt, reason or answer)
+                # A declined merge or a cancelled build is never rebuilt.
+                if answer == wq.MERGE_DECLINED or self._build_was_cancelled(
+                    attempt.correlation_id
+                ):
+                    closed += self._fail(mission, attempt, reason or answer)
+                else:
+                    closed += self._fail_with_rebuild(
+                        mission, attempt, reason or answer
+                    )
         return closed
+
+    def _fail_with_rebuild(
+        self, mission: Mission, attempt: MissionAttempt, reason: str
+    ) -> int:
+        """Close a first failure with its one rebuild (step 1, 24 October 2026).
+
+        Attempt 1 closes FAILED and attempt 2 is filed WAITING, together; a
+        second attempt, or a mission asked to stop, closes FAILED with no
+        further attempt.
+        """
+        from forge.planning.work_queue_loop import first_sentence
+
+        sentence = first_sentence(reason) or reason
+        if self._missions.fail_with_rebuild(attempt.correlation_id, sentence):
+            logger.warning(
+                "missions: %s %s attempt %d did not land — %s%s",
+                mission.id,
+                attempt.key,
+                attempt.attempt,
+                sentence,
+                "; rebuilding it once" if attempt.attempt == 1 else "",
+            )
+            return 1
+        return 0
+
+    def _build_was_cancelled(self, correlation_id: str) -> bool:
+        row = self._missions.connection.execute(
+            "SELECT status FROM builds WHERE correlation_id = ? "
+            "ORDER BY queued_at DESC LIMIT 1",
+            (correlation_id,),
+        ).fetchone()
+        return row is not None and str(row[0]) == "CANCELLED"
 
     def _fail(self, mission: Mission, attempt: MissionAttempt, reason: str) -> int:
         from forge.planning.work_queue_loop import first_sentence

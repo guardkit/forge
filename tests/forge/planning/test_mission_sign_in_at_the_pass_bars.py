@@ -136,9 +136,16 @@ async def test_the_pass_bars_leg_reads_the_mission_when_the_spec_recorded_no_ans
     run = store.get_run(CID)
     assert h.ctx["publisher"].envelopes == []
     assert [s for s, _d in _events(store, _AUTH_DOOR_STAGE)] == []
-    assert run["state"] == PlanningState.FAILED.value
     if no_sign_in:
-        # Past the sign-in check: it stops later, for want of a plan here.
-        assert "no feature id / plan commit sha" in run["error"]
+        # Past the sign-in check. With no plan recorded here the bars are
+        # skipped as bookkeeping (24 October 2026) and the run carries on.
+        assert run["state"] != PlanningState.FAILED.value
+        bars = [
+            json.loads(e["details_json"])
+            for e in store.list_events(CID)
+            if e["stage_label"] == "qa-pass-bars" and e["status"] == "approved"
+        ]
+        assert bars and bars[-1]["reason_code"] == "plan_record_incomplete"
     else:
+        assert run["state"] == PlanningState.FAILED.value
         assert "the mission didn't say it has none" in run["error"]

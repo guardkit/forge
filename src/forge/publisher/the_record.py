@@ -49,6 +49,7 @@ __all__ = [
     "TheLedgerIsUnreadable",
     "TheRecord",
     "TheRecordReader",
+    "a_step_that_could_not_run_on",
     "a_step_that_passed_on",
 ]
 
@@ -122,6 +123,37 @@ def a_step_that_passed_on(
             continue
         found = dict(line)
     return found
+
+
+def a_step_that_could_not_run_on(
+    record: TheRecord, step: str, joined_commit: str
+) -> str | None:
+    """Why this step could not run on exactly this commit, or ``None``.
+
+    Step 1 (24 October 2026): a check that could not run is recorded as
+    exactly that — ``unavailable`` with its reason and a ``verify_ok`` that is
+    never ``True`` — and is advice, not a refusal. Only the LAST ``done`` line
+    for the step on this commit counts, so a later red or green line wins. A
+    red line (``verify_ok`` false with no ``unavailable``) is never this.
+    """
+    wanted = str(joined_commit)
+    last: dict[str, Any] | None = None
+    for line in record.lines:
+        if str(line.get("kind")) != LINE_DONE or str(line.get("step")) != str(step):
+            continue
+        detail = line.get("detail")
+        if not isinstance(detail, dict):
+            continue
+        ran_on = str(detail.get("ran_on") or detail.get("j_commit") or "")
+        if ran_on != wanted:
+            continue
+        last = detail
+    if last is None or last.get("verify_ok") is True:
+        return None
+    why = last.get("unavailable")
+    if not isinstance(why, str) or not why.strip():
+        return None
+    return why.strip()
 
 
 class TheRecordReader:

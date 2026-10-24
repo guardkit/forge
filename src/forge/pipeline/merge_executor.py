@@ -186,6 +186,7 @@ from forge.pipeline.deployment_lock import (
 )
 from forge.pipeline.only_forwards import what_to_do_about_j
 from forge.deploy.profile_selection import (
+    CANDIDATE_ARCHIVE_NOT_CONFIRMED,
     FirstDeploymentProfile,
     ProfileSelectionRefusedBeforeDispatch,
     confirmed_profile_reference,
@@ -1969,8 +1970,12 @@ def _merge_branch_of_record(
     """The build row's recorded ``merge_branch``, or ``None`` (Part M, rule 54).
 
     The row is the record; the durable offer's ``merge_branch`` (what the
-    card promised) is the fallback when the row cannot be read. ``None``
-    means "the feature's own branch" and every reader derives
+    card promised) is the fallback when the row cannot be read OR names no
+    branch (step 1, 24 October 2026): a card offered for a build's approved
+    tasks names ``autobuild/<feature id>-approved``, and when writing that
+    choice onto the row failed the row is readable but blank. Falling back to
+    the feature's own branch there would merge the unapproved work too.
+    ``None`` means "the feature's own branch" and every reader derives
     ``autobuild/<feature id>`` from it, exactly as before the column existed.
     """
     try:
@@ -1986,9 +1991,30 @@ def _merge_branch_of_record(
         row = None
     if row is not None:
         recorded = str(getattr(row, "merge_branch", None) or "").strip()
-        return recorded or None
+        if recorded:
+            return recorded
     recorded = str((offer or {}).get("merge_branch") or "").strip()
     return recorded or None
+
+
+#: How long the press waits before it tries a bookkeeping step once more
+#: (step 1, 24 October 2026): one retry at the step's owner, then the reason is
+#: recorded and the press carries on. No holds and no tick machinery.
+BOOKKEEPING_RETRY_PAUSE_SECONDS: float = 5.0
+
+
+def _the_archive_was_not_confirmed(checked: Any) -> bool:
+    """Did the live check never run because the archive was not confirmed?
+
+    The deploy stage carries the sidecar's own sentence for a step it never
+    ran in the candidate summary's ``failed_step``; this is the one about the
+    coordinator's record, which is bookkeeping, not the product."""
+    if checked is None or getattr(checked, "outcome", None) == "complete":
+        return False
+    detail = getattr(checked, "detail", None) or {}
+    summary = detail.get("gate_summary") if isinstance(detail, dict) else None
+    said = str((summary or {}).get("failed_step") or "")
+    return CANDIDATE_ARCHIVE_NOT_CONFIRMED in said
 
 
 def _report_sha(report: dict[str, Any] | None) -> str | None:
@@ -2512,6 +2538,13 @@ async def execute_merge_deploy(
         "refusal": None,
     }
     gate_began = False
+    # WHY THE FACTORY'S OWN LIVE CHECK COULD NOT RUN, when it could not (step
+    # 1, 24 October 2026). No profile, the deploy stage switched off, no
+    # candidate section, or a candidate archive the coordinator's record did
+    # not confirm after one retry: none of these is a red check, so the join
+    # is still published and the press ends "published, deployment pending"
+    # with this reason. Nothing unchecked is ever deployed. ``None`` = it ran.
+    live_check_could_not_run: str | None = None
     # One runbook group per execution. A takeover must ask the target afresh;
     # the durable checked artifact and selection carry identity across presses.
     deploy_run_id = str(uuid.uuid4())
@@ -3035,6 +3068,28 @@ async def execute_merge_deploy(
             f"{why}; nothing was merged and the branch is kept."
         )
 
+    def _the_live_check_could_not_run(why: str) -> None:
+        """The live check did not run: advice, never a red check (step 1).
+
+        Recorded so the record, the publisher and the report all say "could
+        not run" with the reason; the press carries on to publish and stops
+        before any deploy."""
+        nonlocal live_check_could_not_run
+        live_check_could_not_run = why
+        # Nothing an earlier attempt's check said may stand for this one: an
+        # old "pass" left here would be recorded as a pass it never was.
+        for key in ("verdict", "checks_passed", "checks_total", "failed_checks"):
+            gate[key] = None
+        gate["refusal"] = f"could not run: {why}"
+        logger.warning(
+            "merge-executor: %s's live check could not run (%s) — this is "
+            "advice, not a red check: the join is still published and nothing "
+            "is deployed",
+            build_id,
+            why,
+        )
+        return None
+
     async def _the_identity_a_teardown_must_name() -> tuple[dict[str, str] | None, str]:
         """``({setting: identity}, "")`` for a teardown, or ``(None, why not)``.
 
@@ -3475,7 +3530,9 @@ async def execute_merge_deploy(
         on the JOINED commit and only there: checking the build's own branch
         was not enough once the remote could have moved under it.
         """
-        nonlocal candidate_standing, candidate_commit
+        nonlocal candidate_standing, candidate_commit, deploy_run_id
+        nonlocal live_check_could_not_run
+        live_check_could_not_run = None
         # THE IDENTITY IS HANDED TO THE CHECK, not only to the deploy (24
         # September 2026). The check is the only moment at which the thing that
         # was checked certainly still exists, so it is the only moment at which
@@ -3496,6 +3553,41 @@ async def execute_merge_deploy(
                 candidate_cwd=str(tree_path),
                 identity_env=identity_env,
             )
+            if _the_archive_was_not_confirmed(checked):
+                # BOOKKEEPING, RETRIED ONCE AT ITS OWNER (step 1, 24 October
+                # 2026): the coordinator's record did not confirm the
+                # candidate archive, so the check never ran. One more try
+                # after a short pause, in a fresh runbook group; still
+                # unconfirmed, the live check "could not run" (below).
+                logger.warning(
+                    "merge-executor: %s's candidate archive was not confirmed "
+                    "by the coordinator's record — trying the live check once "
+                    "more in %ss",
+                    build_id,
+                    BOOKKEEPING_RETRY_PAUSE_SECONDS,
+                )
+                await asyncio.sleep(BOOKKEEPING_RETRY_PAUSE_SECONDS)
+                deploy_run_id = str(uuid.uuid4())
+                checked = await _dispatch(
+                    "candidate_check",
+                    candidate_cwd=str(tree_path),
+                    identity_env=identity_env,
+                )
+        except ProfileSelectionRefusedBeforeDispatch as exc:
+            # NO USABLE PROFILE (FRG-194): nothing was dispatched, so the
+            # live check could not run. That is not a red check.
+            _write_receipt(
+                "merge_deploy_candidate.json",
+                {
+                    "step": "candidate",
+                    "dry_run": dry_run,
+                    "candidate_sha": sha,
+                    "candidate_tree": gate["candidate_tree"],
+                    "tree_path": str(tree_path),
+                    "could_not_run": str(exc),
+                },
+            )
+            return _the_live_check_could_not_run(str(exc))
         except Exception as exc:  # noqa: BLE001 — the sidecar-surface ValueError crack
             _write_receipt(
                 "merge_deploy_candidate.json",
@@ -3573,12 +3665,16 @@ async def execute_merge_deploy(
                 },
             )
         if checked is None:
-            return _could_not_check(
+            return _the_live_check_could_not_run(
                 "the deploy stage is disabled (deploy.enabled=false)"
             )
         if reason == "no_candidate_section":
-            return _could_not_check(
+            return _the_live_check_could_not_run(
                 "the repository's deploy profile has no candidate section"
+            )
+        if _the_archive_was_not_confirmed(checked):
+            return _the_live_check_could_not_run(
+                f"{CANDIDATE_ARCHIVE_NOT_CONFIRMED}, after one retry"
             )
         if c_outcome != "complete":
             return _candidate_refusal(checked, summary)
@@ -3720,8 +3816,13 @@ async def execute_merge_deploy(
         store: Any,
         why_not_deployed: str = "",
         already_running: bool = False,
+        live_check_could_not_run: str = "",
     ) -> MergeDeployOutcome:
         """The remote has it. The deploy has not run, and IT IS NOT CLAIMED TO.
+
+        ``live_check_could_not_run`` (step 1, 24 October 2026) is the reason
+        the factory's own live check did not run; the sentence then says the
+        joined result was not checked live, rather than that it was checked.
 
         The second result of the design's three-name vocabulary. It is never
         called a merge that is running: what is running is not this, and
@@ -3810,8 +3911,14 @@ async def execute_merge_deploy(
             detail=(
                 f"{named} was joined onto {target_branch} at {g_commit[:10]} "
                 f"in a working folder of its own, the joined result "
-                f"{j_commit[:10]} was checked{_the_checks_sentence()}, and it "
-                f"was published: the branch {target_branch} on the remote "
+                f"{j_commit[:10]} "
+                + (
+                    "could not be checked live (advice, not a failed check: "
+                    f"{live_check_could_not_run})"
+                    if live_check_could_not_run
+                    else f"was checked{_the_checks_sentence()}"
+                )
+                + f", and it was published: the branch {target_branch} on the remote "
                 f"named origin is at {remote_now[:10]} and contains it. "
                 "Nothing has been deployed, so this is published, deployment "
                 f"pending: {why_not_deployed or 'the deploy did not run'}."
@@ -4256,6 +4363,23 @@ async def execute_merge_deploy(
         to its mission's branch is the whole of what it does.
         """
         nonlocal candidate_standing
+        unchecked = str((what_was_checked or {}).get("unavailable") or "").strip()
+        if unchecked and deploy:
+            # NOTHING UNCHECKED IS DEPLOYED (step 1, 24 October 2026). The live
+            # check could not run, so the join was published as advice and
+            # the press ends here, published, deployment pending, saying why.
+            return _published_deployment_pending(
+                j_commit=j_commit, target_branch=target_branch,
+                g_commit=g_commit, remote_now=remote_now,
+                checks_passed=checks_passed, checks_total=checks_total,
+                what_was_checked=what_was_checked, attempt=attempt,
+                turn=turn, store=store,
+                why_not_deployed=(
+                    f"the factory's own live check could not run ({unchecked}), "
+                    "so there is nothing checked to deploy"
+                ),
+                live_check_could_not_run=unchecked,
+            )
         if not deploy:
             return _published_to_the_mission_branch(
                 j_commit=j_commit,
@@ -5338,6 +5462,10 @@ async def execute_merge_deploy(
             checked_outcome = await _run_the_candidate_check(candidate_sha)
             if checked_outcome is not None:
                 return checked_outcome
+            if live_check_could_not_run is not None:
+                # A dry run proves the plumbing; one whose check could not
+                # run has proved nothing, and says so.
+                return _could_not_check(live_check_could_not_run)
             _write_receipt(
                 "merge_deploy_merge.json",
                 {
@@ -5591,6 +5719,13 @@ async def execute_merge_deploy(
             # exist on the installed build system, so the build stays GATED and
             # the sentence names it.
             check_join_said: CheckJoinAnswer | None = None
+            # FRG-178, AS ADVICE (step 1, 24 October 2026): why the build
+            # system's own checks could not be run on a join this press picked
+            # up — the usual case is an installed build system with no
+            # check-join command. Recorded as "unavailable", never as a pass;
+            # the press and the publisher treat it as advice, and only a red
+            # result blocks. ``None`` = they ran, or were never asked.
+            merge_checks_unavailable: str | None = None
 
             def _the_recorded_line(step: str) -> Any | None:
                 """The last ``done`` line for this step, on THIS attempt and THIS J.
@@ -6447,6 +6582,40 @@ async def execute_merge_deploy(
                         feature_id,
                         str(j_commit)[:10],
                     )
+                elif check_join_said.report is None:
+                    # NO ANSWER FROM THE CHECKS THEMSELVES: the installed
+                    # build system has no check-join, the door refused it, or
+                    # its answer was lost. A report saying its own checks
+                    # could not run (an install that failed, say) is the
+                    # build system's verdict and keeps today's ending.
+                    merge_checks_unavailable = check_join_said.sentence or (
+                        "the build system's own checks could not be run on a "
+                        "join an earlier press made"
+                    )
+                    logger.warning(
+                        "merge-executor: the build system's own checks are "
+                        "unavailable on %s's reused join (%s): %s — recorded "
+                        "as unavailable and treated as advice",
+                        feature_id,
+                        str(j_commit)[:10],
+                        merge_checks_unavailable,
+                    )
+                    if store is not None and not store.done(
+                        build_id=build_id,
+                        turn=turn,
+                        now=deps.clock(),
+                        step=STEP_MERGE_CHECKS,
+                        attempt=attempt,
+                        result={
+                            "ran_on": j_commit,
+                            "verify_ran": False,
+                            # Never a pass, and never red: it did not run.
+                            "verify_ok": None,
+                            "unavailable": merge_checks_unavailable,
+                            "asked_the_build_system_about_a_reused_join": True,
+                        },
+                    ):
+                        return _replaced_here()
 
             # ------------------------------------------------------------------
             # THE FACTORY'S OWN LIVE CHECK, ON J AND ONLY ON J. Its exact tree is
@@ -6552,6 +6721,16 @@ async def execute_merge_deploy(
                 # because the publisher's rule is "verify_ok is exactly
                 # True", and a step with no verdict must not read as a pass.
                 "verify_ok": gate.get("verdict") == "pass",
+                # THE CHECK THAT COULD NOT RUN (step 1, 24 October 2026) is
+                # recorded as exactly that, with its reason, and never as a
+                # pass: ``verify_ok`` stays false. The publisher reads it as
+                # advice; only a red line blocks the send. Nothing unchecked
+                # is deployed (see _deploy_what_was_checked).
+                **(
+                    {"unavailable": live_check_could_not_run}
+                    if live_check_could_not_run is not None
+                    else {}
+                ),
                 "checks_passed": gate.get("checks_passed"),
                 "checks_total": gate.get("checks_total"),
                 # THE IDENTITY OF WHAT WAS CHECKED, as the check itself
@@ -6612,17 +6791,25 @@ async def execute_merge_deploy(
                 # flatly. The record is the thing a publisher reads; the
                 # sentence is the thing a person reads, and it says the same.
                 both_kinds_ran = _the_build_systems_checks_ran_on_j()
+                # Unavailable checks are advice (step 1): the join is ready.
+                advice = [
+                    f"advice: {why}"
+                    for why in (merge_checks_unavailable, live_check_could_not_run)
+                    if why
+                ]
+                ready_to_publish = both_kinds_ran or merge_checks_unavailable is not None
                 # WHY IT IS OFF, in the sentence a person reads. "Publication
                 # is switched off" on its own tells somebody nothing they can
                 # act on; the reason names the setting that is not set, or the
                 # one of the activation check's three conditions that does not hold.
                 why_off = why_publication_is_off(deps.config, machine_now)
-                if both_kinds_ran:
+                if ready_to_publish:
                     detail = (
                         f"{named} was joined onto {target_branch} at "
                         f"{g_commit[:10]} in a working folder of its own, and "
                         f"the joined result {str(j_commit)[:10]} was checked{checks}. "
-                        "It is checked and ready to publish; publication is "
+                        + (f"({'; '.join(advice)}) " if advice else "")
+                        + "It is checked and ready to publish; publication is "
                         f"switched off ({why_off}), so nothing was sent to the "
                         "remote and nothing was deployed. The branch is kept."
                     )
@@ -6665,13 +6852,14 @@ async def execute_merge_deploy(
                         "turn": turn,
                         "checked": what_was_checked,
                         "both_kinds_of_check_ran_on_j": both_kinds_ran,
-                        "ready_to_publish": both_kinds_ran,
+                        "ready_to_publish": ready_to_publish,
+                        "advice": advice,
                     },
                 )
                 switched_off = MergeDeployOutcome(
                     result=RESULT_WORD_PUBLICATION_PENDING,
                     # A pass only when BOTH kinds of check ran and passed on J.
-                    status="PASSED" if both_kinds_ran else "GATED",
+                    status="PASSED" if ready_to_publish else "GATED",
                     merged_sha=j_commit,
                     detail=detail,
                     checks_passed=checks_passed,
@@ -6691,7 +6879,10 @@ async def execute_merge_deploy(
             # publisher would refuse it anyway, reading the record for itself;
             # this refuses it before it is ever asked, and says the same thing.
             # ------------------------------------------------------------------
-            if not _the_build_systems_checks_ran_on_j():
+            if (
+                not _the_build_systems_checks_ran_on_j()
+                and merge_checks_unavailable is None
+            ):
                 return _not_wholly_checked(
                     j_commit=str(j_commit),
                     target_branch=target_branch,

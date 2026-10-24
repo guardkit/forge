@@ -673,11 +673,21 @@ async def dispatch_specialist_stage(
         from forge.lifecycle.feature_routing import validate_feature_routing_id
 
         feature_routing_id = validate_feature_routing_id(feature_routing_id)
+    # A missing routing id or gate is bookkeeping: logged, and the dispatch
+    # carries on unrouted (step 1, 24 October 2026; FRG-095).
     if feature_routing_required and feature_routing_id is None:
-        raise ValueError("required specialist dispatch has no feature_routing_id")
+        logger.warning(
+            "dispatch_specialist_stage: %s has no feature routing id; "
+            "dispatching unrouted",
+            correlation_id,
+        )
     if feature_routing_id is not None:
         if feature_routing_gate is None and feature_routing_required:
-            raise ValueError("required specialist dispatch has no durable routing gate")
+            logger.warning(
+                "dispatch_specialist_stage: %s has no routing gate; "
+                "dispatching unrouted",
+                correlation_id,
+            )
         if feature_routing_gate is not None:
             await feature_routing_gate.ensure_seeded(
                 feature_routing_id,

@@ -8,7 +8,8 @@ prepared still reaches the card, with the reason and without Approve.
 
 Every other offer is byte for byte what it was: the routine card and the fix
 journey's checkpoint card are compared with a golden copy taken from Forge
-``cbd1fc48`` before any of this existed.
+``cbd1fc48`` before any of this existed, plus the details step 1 added to
+every card on 24 October 2026 (the tasks not included and the change).
 """
 
 from __future__ import annotations

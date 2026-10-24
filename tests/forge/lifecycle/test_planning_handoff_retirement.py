@@ -168,3 +168,15 @@ def test_deep_unselected_ordinary_json_is_tolerated(tmp_path: Path) -> None:
     connection.close()
 
     assert preflight_retired_planning_handoff_correlations(db_path) == frozenset()
+
+
+def test_an_unreadable_ledger_is_logged_and_read_as_nothing_retired(
+    tmp_path: Path,
+) -> None:
+    """FRG-017 (24 October 2026): a ledger file that cannot be read at all is
+    bookkeeping. The preflight logs it and carries on; a readable receipt that
+    fails verification still refuses (the tests above)."""
+    db_path = tmp_path / "forge.db"
+    db_path.write_bytes(b"this is not a database file at all" * 100)
+
+    assert preflight_retired_planning_handoff_correlations(db_path) == frozenset()

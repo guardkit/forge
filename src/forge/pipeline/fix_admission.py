@@ -1744,6 +1744,21 @@ def _repair_base_refusal(source_build_id: str, detail: str) -> FixAdmissionRefus
     )
 
 
+def _repair_from_the_feature_branch(
+    source_build_id: str, parent_feature: str, why: str
+) -> RepairBase:
+    """FRG-142 as advice: repair from ``autobuild/<feature>``, saying why."""
+    branch = f"autobuild/{parent_feature}"
+    logger.warning(
+        "fix admission: %s has no verified failed terminal (%s) — the repair "
+        "is cut from %s, where the failed build's work is",
+        source_build_id,
+        why,
+        branch,
+    )
+    return RepairBase(branch=branch)
+
+
 async def _retained_candidate_base(
     *,
     source_build_id: str,
@@ -1772,8 +1787,11 @@ async def _retained_candidate_base(
 
     pack = read_failure_pack(source_build_id, receipts_root=receipts_root)
     if pack is None or not pack.has_manifest:
-        raise _repair_base_refusal(
-            source_build_id, "the failure pack has no readable manifest"
+        # FRG-142 (step 1, 24 October 2026): a missing failure pack is
+        # bookkeeping. The feature's own branch holds whatever work was done,
+        # so the repair is cut from it rather than refused.
+        return _repair_from_the_feature_branch(
+            source_build_id, parent_feature, "the failure pack has no readable manifest"
         )
     recorded_build = str(pack.raw.get("build_id") or "")
     if recorded_build != source_build_id:
@@ -1806,18 +1824,16 @@ async def _retained_candidate_base(
     )
     if pack.terminal == TERMINAL_RUNNER_CRASHED and subprocess_ran is None:
         # 19 October 2026 (FEAT-B874): the coordinator's pack for a run whose
-        # runner stopped without reporting an end. It says honestly that
-        # nobody checked for a candidate, so the refusal names that rather
-        # than a missing manifest.
-        raise FixAdmissionRefused(
-            f"Nothing was queued: {source_build_id} ended without a terminal "
-            f"({pack.reason or 'the build runner stopped without reporting an end'})"
-            ". Nothing checked whether coding began or which candidate it "
-            "left, so there is no verified candidate to repair. Refusing to "
-            "fall back to main because that could discard the failed build's "
-            "work.",
-            reason=REPAIR_BASE_REASON,
-            permanent=True,
+        # runner stopped without reporting an end. Nobody checked for a
+        # candidate. FRG-142 (step 1, 24 October 2026): the repair is cut from
+        # the feature's own branch, which keeps the failed build's work,
+        # instead of being refused; main is still never the fallback.
+        return _repair_from_the_feature_branch(
+            source_build_id,
+            parent_feature,
+            "it ended without a terminal ("
+            + (pack.reason or "the build runner stopped without reporting an end")
+            + ")",
         )
     if subprocess_ran is False:
         return RepairBase(branch=fallback_branch)

@@ -3,6 +3,8 @@
 The SQLite row, rather than an in-process lock or lifecycle row, is the safety
 boundary.  A STARTED claim is committed before its caller may perform HTTP and
 a SUCCEEDED compare-and-swap is committed before a receipt may be released.
+A completed, rejected seed (FAILED) is reclaimed once for the gate's single
+retry; an UNKNOWN outcome is never reclaimed (step 1, 24 October 2026).
 """
 
 from __future__ import annotations
@@ -196,6 +198,33 @@ class FeatureRoutingSeedStore:
         raise FeatureRoutingBlocked(
             f"feature routing identity {key!r} is permanently blocked in {state}"
         )
+
+    def retry_failed_seed(self, feature_routing_id: str, attempt_id: str) -> bool:
+        """Reclaim a FAILED seed for its one retry; True when this call owns it.
+
+        Only a completed, rejected exchange is FAILED; UNKNOWN is never
+        reclaimed. The gate calls this once, straight after the rejection it
+        recorded, so an identity is asked at most twice.
+        """
+        key = validate_feature_routing_id(feature_routing_id)
+        if not isinstance(attempt_id, str) or not attempt_id or len(attempt_id) > 256:
+            raise ValueError("attempt_id must be a nonempty string of at most 256 characters")
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock:
+            self._begin()
+            try:
+                cursor = self._connection.execute(
+                    "UPDATE feature_routing_seeds SET state='STARTED', attempt_id=?, "
+                    "started_at=?, completed_at=NULL, server_id=NULL, error=NULL "
+                    "WHERE feature_routing_id=? AND state='FAILED'",
+                    (attempt_id, now, key),
+                )
+                self._connection.execute("COMMIT")
+            except BaseException:
+                if self._connection.in_transaction:
+                    self._connection.execute("ROLLBACK")
+                raise
+        return cursor.rowcount == 1
 
     def complete_seed(
         self, feature_routing_id: str, attempt_id: str, server_id: int

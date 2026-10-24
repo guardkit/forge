@@ -85,6 +85,30 @@ def test_autobuild_payload_carries_committed_receipt_before_dispatch():
     }
 
 
+def test_a_missing_routing_gate_is_logged_and_the_build_dispatches_unrouted(caplog):
+    """Step 1, 24 October 2026 (FRG-095): routing bookkeeping never ends a build."""
+    starter = _Starter()
+    asyncio.run(
+        dispatch_autobuild_async(
+            "build-A",
+            "FEAT-A",
+            "planning_A-build",
+            forward_context_builder=_Context(),
+            async_task_starter=starter,
+            stage_log_recorder=_Recorder(),
+            state_channel=_State(),
+            feature_routing_id="planning_A-build",
+            feature_routing_gate=None,
+            feature_routing_required=True,
+        )
+    )
+    assert starter.context["feature_routing_id"] == "planning_A-build"
+    # No receipt, so the runner is not told routing is required.
+    assert "feature_routing_required" not in starter.context
+    assert "feature_routing_receipt" not in starter.context
+    assert "dispatching unrouted" in caplog.text
+
+
 def test_runner_refuses_required_checkpoint_before_supersession_without_receipt():
     with pytest.raises(FeatureRoutingBlocked, match="receipt is missing"):
         _validated_feature_routing(

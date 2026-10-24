@@ -180,6 +180,37 @@ class TestBothKindsOfCheckHaveToHavePassedOnThisCommit:
         _nothing_moved(project, before)
 
 
+class TestACheckThatCouldNotRunIsAdvice:
+    """Step 1 (24 October 2026): FRG-178 and the live check's "could not run"
+    are recorded as unavailable, never as a pass, and the publisher treats
+    them as advice. A red line still blocks (the class above)."""
+
+    def test_the_build_systems_checks_unavailable_on_a_reused_join_publishes(
+        self, tmp_path: Path, project: dict
+    ) -> None:
+        publisher = _publisher(tmp_path, project, merge_checks="unavailable")
+        answer = publisher.publish(a_request(project))
+        assert answer.published is True, answer.refusal
+        assert answer.contains_j is True
+
+    def test_the_live_check_that_could_not_run_publishes(
+        self, tmp_path: Path, project: dict
+    ) -> None:
+        publisher = _publisher(tmp_path, project, candidate_check="unavailable")
+        answer = publisher.publish(a_request(project))
+        assert answer.published is True, answer.refusal
+
+    def test_unavailable_on_a_different_commit_is_still_refused(
+        self, tmp_path: Path, project: dict
+    ) -> None:
+        publisher = _publisher(
+            tmp_path, project, merge_checks="unavailable", ran_on=project["g"]
+        )
+        answer = publisher.publish(a_request(project))
+        assert answer.published is False
+        assert answer.refusal_kind == "the-checks-are-not-recorded-as-passed"
+
+
 class TestWhatItWasNotToldAbout:
     def test_a_project_it_has_no_addresses_for(
         self, tmp_path: Path, project: dict

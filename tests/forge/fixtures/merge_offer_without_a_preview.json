@@ -20,6 +20,7 @@
         "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
         "tasks_completed": 5,
         "tasks_total": 5,
+        "tasks_not_included": "task list not available",
         "finished_feature_check": {
           "budget_characters": 900,
           "state": "unavailable",
@@ -32,6 +33,10 @@
             "Feature-check evidence unavailable: nothing was exported for this build"
           ]
         },
+        "change_basis": "merge-base",
+        "change_summary": "the change could not be read",
+        "change_text": "",
+        "change_text_truncated": false,
         "baseline_failing": null,
         "resume_options": [
           "approve",
@@ -60,6 +65,10 @@
         "candidate_identity_version": 1,
         "candidate_sha": "cccccccccccccccccccccccccccccccccccccccc",
         "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+        "change_basis": "merge-base",
+        "change_summary": "the change could not be read",
+        "change_text": "",
+        "change_text_truncated": false,
         "correlation_id": "corr-mo-1",
         "expect_main_sha": "mainsha1234",
         "feature_id": "FEAT-MO1",
@@ -84,6 +93,7 @@
           "reject"
         ],
         "tasks_completed": 5,
+        "tasks_not_included": "task list not available",
         "tasks_total": 5
       }
     }
@@ -107,6 +117,10 @@
         "candidate_identity_version": 1,
         "candidate_sha": "cccccccccccccccccccccccccccccccccccccccc",
         "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+        "change_basis": "merge-base",
+        "change_summary": "the change could not be read",
+        "change_text": "",
+        "change_text_truncated": false,
         "baseline_failing": null,
         "resume_options": [
           "approve",
@@ -135,6 +149,10 @@
         "candidate_identity_version": 1,
         "candidate_sha": "cccccccccccccccccccccccccccccccccccccccc",
         "candidate_tree": "dddddddddddddddddddddddddddddddddddddddd",
+        "change_basis": "merge-base",
+        "change_summary": "the change could not be read",
+        "change_text": "",
+        "change_text_truncated": false,
         "correlation_id": "corr-mo-2",
         "expect_main_sha": "mainsha1234",
         "feature_id": "FEAT-MO1",

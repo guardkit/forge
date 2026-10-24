@@ -223,12 +223,12 @@ class TestGates:
         assert recorder.events == []
 
     @pytest.mark.asyncio
-    async def test_tasks_failed_gate(self, config, pool) -> None:
+    async def test_a_failed_task_no_longer_withholds_the_card(self, config, pool) -> None:
+        """Step 1 (24 October 2026) deleted the all-tasks-must-pass refusal."""
         _insert_build(pool)
         recorder = _Recorder()
         await _service(config, pool, recorder).maybe_offer(_event(tasks_failed=1))
-        assert recorder.events == []
-        assert _offer_rows(pool) == []
+        assert len(_offer_rows(pool)) == 1
 
     @pytest.mark.asyncio
     async def test_missing_builds_row_skips_loudly(self, config, pool) -> None:

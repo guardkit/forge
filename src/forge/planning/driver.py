@@ -1209,6 +1209,28 @@ PLAN_REPOSITORY_UNAVAILABLE_KEY = "repository_unavailable"
 PLAN_SIZE_NOTE_KEY = "plan_size_note"
 PLAN_SIZE_KEY = "plan_size"
 
+#: Where the plan leg's approved record carries the build card's line when the
+#: plan's review record could not be read (24 October 2026), read beside the
+#: two lines above.
+PLAN_REVIEW_NOTE_KEY = "plan_review_note"
+
+#: The build card's line for an unreadable plan review record.
+_PLAN_REVIEW_UNREADABLE_CARD_LINE = (
+    "Plan review record unreadable ({reason}), so nothing confirmed the plan "
+    "reviewer's verdict; this card decides."
+)
+
+#: The plan reviewer's own refusals: a readable verdict that did not approve.
+#: These still end the run. Every other problem with the review record is
+#: bookkeeping (24 October 2026).
+_SEMANTIC_VERDICT_REFUSALS: frozenset[str] = frozenset(
+    {
+        "specialist semantic decision is not approved",
+        "request_traceability did not pass",
+        "Coach verdict is not accepting",
+    }
+)
+
 #: The spec card's line when the planner could not read the repository
 #: (the 1 October planner fix, 1 October 2026). Plain words; the reason is the
 #: reader's own clause.
@@ -1474,6 +1496,9 @@ class _PlanAttempt:
     #: ``None`` only where the attempt never got as far as a reviewed tree.
     #: The legacy field name is retained to avoid widening this private record.
     traceability: Mapping[str, Any] | None = None
+    #: Why the plan's review record could not be read, after the one
+    #: re-review (24 October 2026): the build card says so and decides.
+    review_unreadable: str | None = None
     #: Set when the plan writer answered "already done, nothing to build"
     #: (7 October 2026): nothing was written, and the caller ends the run
     #: through :meth:`PlanningRunDriver._finish_nothing_to_build`.
@@ -2789,17 +2814,20 @@ class PlanningRunDriver:
         *,
         target_repo: str,
         feature_id: str,
-    ) -> None:
-        """End a run whose plan writer answered "already done, nothing to build".
+    ) -> str | None:
+        """End a run whose plan writer answered "already done, nothing to build",
+        or say what to tell the plan writer when it must plan as usual.
 
-        the accepted design (already-done-outcome): Forge ends the run with one plain
-        message listing the proof: no build, no merge, no card, no new
-        approval. Three steps:
+        Returns ``None`` when the run has ended here, and otherwise the note
+        for the one ordinary plan the caller then asks for (step 1
+        simplification, 24 October 2026: an incomplete proof is advice, not
+        the end of the run). Three steps:
 
         1. **Check the proof against Forge's own windows.** Every citation must
-           lie inside a code window Forge sent the plan writer. A miss, a
-           malformed answer, or the switch off ends the run FAILED through
-           :meth:`_fail_leg`, with an honest sentence and nothing built.
+           lie inside a code window Forge sent the plan writer. A miss or a
+           malformed answer means "plan as usual": the parts that were proven
+           go back to the plan writer as its note. Only the switch being off
+           still ends the run FAILED through :meth:`_fail_leg`.
         2. **End the run in the existing success state.** FEATURE_PLAN →
            PLANNED_HANDOFF, labelled :data:`nothing_to_build.STAGE_LABEL`,
            with the marker, the proof and the owner's sentence in the
@@ -2827,26 +2855,32 @@ class PlanningRunDriver:
                 f"The planner answered that {quoted} is already done, but this "
                 "factory does not take that answer yet, so the run stopped.",
             )
-            return
+            return None
         claim = answer.claim
         if claim is None:
             problem = answer.problem or "it could not be read"
-            await refuse(
-                problem,
-                f"The planner answered that {quoted} is already done, but its "
-                f"proof was incomplete: {problem}.",
-            )
-            return
+            return self._plan_as_usual(correlation_id, problem, proven=())
         outside = nothing_to_build.citations_outside(claim, answer.windows)
         if outside:
-            await refuse(
-                "citations outside the windows sent: " + ", ".join(outside),
-                f"The planner found every part of {quoted} already done, but it "
-                "pointed at lines outside the code it was shown ("
-                + ", ".join(outside)
-                + "), so the claim could not be checked.",
+            proven = nothing_to_build.Claim(
+                parts=tuple(
+                    (quote, cited)
+                    for quote, cited in claim.parts
+                    if not set(cited) & set(outside)
+                ),
+                scenarios=tuple(
+                    (title, cited)
+                    for title, cited in claim.scenarios
+                    if not set(cited) & set(outside)
+                ),
             )
-            return
+            return self._plan_as_usual(
+                correlation_id,
+                "it pointed at lines outside the code it was shown ("
+                + ", ".join(outside)
+                + ")",
+                proven=nothing_to_build.proof_lines(proven),
+            )
 
         message = nothing_to_build.owner_message(
             self._request_text_of(row), target_repo, claim
@@ -2868,7 +2902,7 @@ class PlanningRunDriver:
                 correlation_id,
                 refused.current_state,
             )
-            return
+            return None
         logger.info(
             "planning driver: run %s ended already done, nothing to build "
             "(%d proof lines; no build queued)",
@@ -2896,6 +2930,36 @@ class PlanningRunDriver:
                     correlation_id,
                 )
         await self._notify(correlation_id, message, level="info")
+        return None
+
+    @staticmethod
+    def _plan_as_usual(
+        correlation_id: str, problem: str, *, proven: Sequence[str]
+    ) -> str:
+        """The note for the one ordinary plan after an already-done answer
+        whose proof could not be used (step 1 simplification, 24 October 2026).
+
+        Logged as advice. The parts that were proven ride the note so the plan
+        writer can build on them rather than rebuild them; nothing is refused.
+        """
+        logger.warning(
+            "planning driver: run %s already-done answer not used (%s) — "
+            "ADVISORY; asking once for an ordinary plan (%d proven part(s) "
+            "carried as its note)",
+            correlation_id,
+            problem,
+            len(proven),
+        )
+        note = (
+            "Your answer that the request is already done could not be used: "
+            f"{problem}. Write an ordinary plan to build the request."
+        )
+        if proven:
+            note += (
+                " These parts were shown to exist already; the plan may rely on "
+                "them rather than rebuild them: " + "; ".join(proven) + "."
+            )
+        return note
 
     async def _enter_target_terminal(self, row: Any, correlation_id: str) -> bool:
         """Write the handoff file (the 007 input) and transition RUNNING → FEATURE_SPEC.
@@ -4153,12 +4217,10 @@ class PlanningRunDriver:
         # note while the coach scored 0.985). So those are surfaced LOUDLY,
         # verbatim, and the oracles decide.
         #
-        # The DIGEST gate is the exception, and the reason is structural: there
-        # is no oracle downstream of it. The only thing after the digest is a
-        # person's eyes, and this check is the whole reason that read can be
-        # trusted to be complete. Asking someone to approve a digest we cannot
-        # prove is a compression is asking them to approve a lie — so a digest
-        # error STOPS the run here.
+        # The DIGEST gate was the exception until 24 October 2026: its failure
+        # stopped the run. It is advice now, like the rest: a digest the
+        # spec-writer's own check doubted is still shown, and the card says
+        # what the check found, so the person reading it decides.
         spec_val_errors = self._validation_failures(role_output)
         digest_errors = [e for e in spec_val_errors if e.startswith(DIGEST_ERROR_PREFIX)]
         other_errors = [
@@ -4172,20 +4234,12 @@ class PlanningRunDriver:
                 "; ".join(other_errors),
             )
         if digest_errors:
-            await self._fail_leg(
+            logger.warning(
+                "007 validation.json digest self-check reported failures for %s "
+                "(ADVISORY — the card says so): %s",
                 correlation_id,
-                _FEATURE_SPEC_STAGE,
-                "the spec-writer's own digest check failed and the digest is "
-                "what a person reads instead of the spec: "
-                + "; ".join(digest_errors),
-                owner_message=(
-                    f"Planning run {correlation_id} stopped at "
-                    f"{plain_stage_name(_FEATURE_SPEC_STAGE)}: the plain-language "
-                    "summary of the spec did not match the spec, so there was "
-                    "nothing safe to show you. Nothing was built."
-                ),
+                "; ".join(digest_errors),
             )
-            return None
 
         feature_rel = self._feature_file_rel(files)
         normalize = deps.normalize_feature_spec
@@ -4297,9 +4351,8 @@ class PlanningRunDriver:
             digest_text=digest_text,
             slug=slug,
             seed=seed,
+            problems=digest_errors,
         )
-        if proof is None:
-            return None
         digest_obj, card = proof
 
         # DID THE NOTE ACTUALLY CHANGE ANYTHING? On a rewrite round the owner
@@ -5662,40 +5715,26 @@ class PlanningRunDriver:
         digest_text: str | None,
         slug: str,
         seed: Mapping[str, Any] | None = None,
-    ) -> tuple[dict[str, Any], dict[str, Any]] | None:
+        problems: Sequence[str] = (),
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Re-run the digest check against the COMMITTED spec, then build the card.
 
-        Returns ``(digest, card)`` or ``None`` when the leg has already failed
-        loudly. A missing digest is a failure, not a degrade: the run must never
-        publish an unproven digest and must never fall back to a "summary
-        unavailable" card — that posture is right for a supplementary summary
-        and wrong for the thing an approval rests on.
+        Returns ``(digest, card)``. Since 24 October 2026 nothing here ends the
+        run: a missing or unreadable digest, or one that does not match the
+        committed spec, is shown as it is, and each problem is a line on the
+        card (``problems`` carries any the spec-writer's own check found). The
+        person reading the card decides; the worked examples ride along.
         """
+        found = [str(p) for p in problems]
+        digest_obj: Any = {}
         if not digest_text or not str(digest_text).strip():
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_SPEC_STAGE,
-                "the 007 reply shipped no spec digest (<slug>_digest.yaml); "
-                "there is no checked plain-language summary to show, and an "
-                "unchecked one must never be shown in its place",
-                owner_message=(
-                    f"Planning run {correlation_id} stopped at "
-                    f"{plain_stage_name(_FEATURE_SPEC_STAGE)}: the spec-writer "
-                    "produced no plain-language summary to show you, so there "
-                    "was nothing you could safely say yes to. Nothing was built."
-                ),
-            )
-            return None
-
-        try:
-            digest_obj = yaml.safe_load(str(digest_text))
-        except yaml.YAMLError as exc:
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_SPEC_STAGE,
-                f"the spec digest is not parseable YAML: {exc}",
-            )
-            return None
+            found.append("the spec-writer sent no plain-language summary")
+        else:
+            try:
+                digest_obj = yaml.safe_load(str(digest_text))
+            except yaml.YAMLError as exc:
+                found.append(f"the summary could not be read ({exc})")
+                digest_obj = {}
 
         feature_rel = self._feature_file_rel(files)
         assumptions_rel = next(
@@ -5711,14 +5750,6 @@ class PlanningRunDriver:
             committed_assumptions = await self._deps.git_runner.read_file_from_branch(
                 repo_path=repo_path, branch=branch, file_path=assumptions_rel
             )
-        if committed_feature is None:
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_SPEC_STAGE,
-                "could not read the committed .feature back off "
-                f"{branch} to re-prove the spec digest against it",
-            )
-            return None
 
         manifest: dict[str, Any] = {}
         if committed_assumptions:
@@ -5729,33 +5760,45 @@ class PlanningRunDriver:
             if isinstance(parsed, Mapping):
                 manifest = dict(parsed)
 
-        errors = check_digest_consistency(
-            digest_obj, committed_feature, manifest, slug
-        )
-        if errors:
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_SPEC_STAGE,
-                "the spec digest does not match the committed spec: "
-                + "; ".join(errors),
-                owner_message=(
-                    f"Planning run {correlation_id} stopped at "
-                    f"{plain_stage_name(_FEATURE_SPEC_STAGE)}: the plain-language "
-                    "summary of the spec did not match the spec it was supposed "
-                    "to summarise, so there was nothing safe to show you. "
-                    "Nothing was built."
-                ),
+        if committed_feature is None:
+            found.append(
+                "the committed worked examples could not be read back, so the "
+                "summary was not checked against them"
             )
-            return None
+        elif isinstance(digest_obj, Mapping) and digest_obj:
+            found.extend(
+                check_digest_consistency(
+                    digest_obj, committed_feature, manifest, slug
+                )
+            )
+        if not isinstance(digest_obj, Mapping):
+            found.append("the summary is not a list of sentences")
+            digest_obj = {}
+        if found:
+            logger.warning(
+                "planning driver: run %s spec summary problems (ADVISORY — shown "
+                "on the card): %s",
+                correlation_id,
+                "; ".join(found),
+            )
 
         card = self._digest_review_card(
             correlation_id,
-            digest_obj=digest_obj if isinstance(digest_obj, Mapping) else {},
-            feature_text=committed_feature,
+            digest_obj=digest_obj,
+            feature_text=committed_feature or "",
             seed=seed,
             target_repo=target_repo,
         )
-        return dict(digest_obj) if isinstance(digest_obj, dict) else {}, card
+        if found:
+            card["what_happened"] = (
+                "The spec-writer has written the worked examples this build "
+                "will be checked against. Below is the plain-language summary "
+                "it wrote, but ordinary code could not confirm it matches the "
+                "examples: " + "; ".join(found) + ". Read the worked examples "
+                "before saying yes."
+            )
+            card["summary_problems"] = list(found)
+        return dict(digest_obj), card
 
     def _record_spec_approved(
         self,
@@ -6457,8 +6500,10 @@ class PlanningRunDriver:
                 "never have to."
             ),
             "no_answer_means": (
-                f"No answer within {self._plain_wait(wait_seconds)}: the run "
-                "stops and says so — nothing is built."
+                f"No answer within {self._plain_wait(wait_seconds)}: the same "
+                "card is sent once more, and with no answer after another "
+                f"{self._plain_wait(wait_seconds)} the run stops and says so — "
+                "nothing is built."
             ),
             # One click deeper. Never the ask, never in front of the reader.
             "worked_examples": feature_text,
@@ -6559,8 +6604,9 @@ class PlanningRunDriver:
             "build will be checked against. Say yes and the machine writes the "
             "task plan and the quality checklist; send a note and it rewrites "
             f"the spec from what you say. No answer within "
-            f"{self._plain_wait(wait_seconds)} stops the run — nothing is built "
-            "either way until you give the go-ahead."
+            f"{self._plain_wait(wait_seconds)} sends the same card once more, "
+            "and silence after that stops the run — nothing is built either "
+            "way until you give the go-ahead."
         )
 
     async def _escalate_spec_review(
@@ -6731,17 +6777,41 @@ class PlanningRunDriver:
         )
         if first is None:
             return False  # already loud and terminal
+        # "Already done, nothing to build" (7 October 2026): a proven answer
+        # ends the run; one whose proof could not be used is followed by one
+        # ordinary plan (24 October 2026), which carries on below as usual.
+        plan_note: str | None = None
         if first.nothing_to_build is not None:
-            # "Already done, nothing to build" (7 October 2026): the run ends
-            # here whichever way the finish goes, so this drive stops.
-            await self._finish_nothing_to_build(
+            plan_note = await self._finish_nothing_to_build(
                 row,
                 correlation_id,
                 first.nothing_to_build,
                 target_repo=target_repo,
                 feature_id=feature_id,
             )
-            return False
+            if plan_note is None:
+                return False
+            first = await self._plan_attempt(
+                row,
+                correlation_id,
+                target_repo=target_repo,
+                repo_path=repo_path,
+                branch=branch,
+                plan_run_id=plan_run_id,
+                feature_id=feature_id,
+                round_label="first (an ordinary plan after an already-done answer)",
+                rules_only=self._rewrite_round_could_fire(correlation_id),
+                plan_note=plan_note,
+            )
+            if first is None:
+                return False
+            if first.nothing_to_build is not None:
+                return await self._fail_leg(
+                    correlation_id,
+                    _FEATURE_PLAN_STAGE,
+                    "the planner answered already done again when asked for an "
+                    "ordinary plan",
+                )
         attempt = first
         rewrite: dict[str, Any] | None = None
         if not first.committed:
@@ -6798,18 +6868,50 @@ class PlanningRunDriver:
                     else "second (after the machine's rewrite, round 1)"
                 ),
                 rules_only=False,
+                plan_note=plan_note,
             )
             if second is None:
                 return False
             if second.nothing_to_build is not None:
-                await self._finish_nothing_to_build(
+                if plan_note is not None:
+                    return await self._fail_leg(
+                        correlation_id,
+                        _FEATURE_PLAN_STAGE,
+                        "the planner answered already done again when asked "
+                        "for an ordinary plan",
+                    )
+                plan_note = await self._finish_nothing_to_build(
                     row,
                     correlation_id,
                     second.nothing_to_build,
                     target_repo=target_repo,
                     feature_id=feature_id,
                 )
-                return False
+                if plan_note is None:
+                    return False
+                second = await self._plan_attempt(
+                    row,
+                    correlation_id,
+                    target_repo=target_repo,
+                    repo_path=repo_path,
+                    branch=branch,
+                    plan_run_id=plan_run_id,
+                    feature_id=feature_id,
+                    round_label=(
+                        "second (an ordinary plan after an already-done answer)"
+                    ),
+                    rules_only=False,
+                    plan_note=plan_note,
+                )
+                if second is None:
+                    return False
+                if second.nothing_to_build is not None:
+                    return await self._fail_leg(
+                        correlation_id,
+                        _FEATURE_PLAN_STAGE,
+                        "the planner answered already done again when asked "
+                        "for an ordinary plan",
+                    )
             attempt = second
             if not second.committed:
                 stamps2 = second.stamps
@@ -6877,6 +6979,7 @@ class PlanningRunDriver:
         feature_id: str,
         round_label: str,
         rules_only: bool = False,
+        plan_note: str | None = None,
     ) -> "_PlanAttempt | None":
         """One pass of the plan leg's work, from the top: read the approved spec
         back off the branch, dispatch the plan-writer, write the tree with the
@@ -6896,6 +6999,11 @@ class PlanningRunDriver:
         rule only — no model fallback — which it does where the routing law
         is enforced for the repo/feature. True on the first attempt exactly
         when the rewrite round could fire; False on the second.
+
+        ``plan_note`` (step 1 simplification, 24 October 2026): set for the one
+        ordinary plan asked for after an already-done answer that could not be
+        used. It goes to the plan writer as its note, and the already-done
+        answer is not offered on that call.
 
         Returns the attempt record, or ``None`` after failing the run loudly
         for any reason other than the normalizer's stop (which the caller
@@ -7020,6 +7128,8 @@ class PlanningRunDriver:
             extra: dict[str, Any] = {}
             if note is not None:
                 extra["validate_feedback"] = note
+            elif plan_note is not None:
+                extra["validate_feedback"] = plan_note
             if prior is not None:
                 extra["revision_of"] = dict(prior)
             if texts:
@@ -7027,7 +7137,9 @@ class PlanningRunDriver:
             # "Already done, nothing to build" (7 October 2026): asked for only
             # with the switch on, on every plan call of the run (the exact
             # re-review must judge the same shape). Off, the call is today's.
-            if self._nothing_to_build_enabled():
+            # Not on the ordinary plan asked for after an already-done answer
+            # that could not be used (24 October 2026).
+            if self._nothing_to_build_enabled() and plan_note is None:
                 extra[nothing_to_build.REQUEST_FIELD] = True
             record_factory_dispatch(deps.store, correlation_id, factory_document, stage="plan")
             return await deps.dispatch_feature_plan(
@@ -7090,14 +7202,26 @@ class PlanningRunDriver:
         # Semantic judgement belongs to the specialist Player/Coach. Forge's
         # caller enforces that exact decision and the identity of the exact
         # artifact tree it is about; it does not infer intent from phrases.
+        #
+        # A refusing verdict still ends the run. A record that cannot be read
+        # as a verdict about this tree is bookkeeping (24 October 2026): the
+        # existing exact-artifact re-review below is asked, and if its record
+        # cannot be read either the build card says so and the card decides.
         traceability, semantic_error = self._semantic_review_of(role_output, files)
-        if semantic_error is not None:
+        if semantic_error in _SEMANTIC_VERDICT_REFUSALS:
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
                 "008 semantic review refused: " + semantic_error,
             )
             return None
+        if semantic_error is not None:
+            logger.warning(
+                "planning driver: run %s plan review record unreadable (%s) — "
+                "ADVISORY; asking the existing re-review",
+                correlation_id,
+                semantic_error,
+            )
 
         # "ALREADY DONE, NOTHING TO BUILD" (7 October 2026). The plan writer
         # may answer that every part of the request is already in the
@@ -7106,6 +7230,10 @@ class PlanningRunDriver:
         # caller checks the proof against the code windows Forge sent, and
         # ends the run. A reply without the marker goes on exactly as today.
         claim, claim_problem = nothing_to_build.read_claim(role_output, files)
+        if claim is not None and semantic_error is not None:
+            # Never an approval invented: an already-done answer whose review
+            # cannot be read is not taken, and an ordinary plan is asked for.
+            claim, claim_problem = None, "its review record could not be read"
         if claim is not None or claim_problem is not None:
             return _PlanAttempt(
                 committed=False,
@@ -7128,42 +7256,70 @@ class PlanningRunDriver:
         semantic_state: dict[str, Any] = {
             "role_output": role_output,
             "review": traceability,
+            "unreadable": None,
         }
 
         async def _ensure_semantic_review(
             candidate_files: Mapping[str, str],
         ) -> str | None:
+            """``None`` to carry on, or the reason a REFUSING verdict ends the
+            run. A record that cannot be read, after the one re-review, is
+            kept as the card's line and never asked about again."""
+            if semantic_state["unreadable"] is not None:
+                return None
             current, current_error = self._semantic_review_of(
                 semantic_state["role_output"], candidate_files
             )
             if current_error is None:
                 semantic_state["review"] = current
                 return None
+            unreadable: str | None = None
             try:
                 reviewed_result = await _ask_the_plan_writer(
                     note=FINAL_PLAN_REVIEW_FEEDBACK,
                     prior=candidate_files,
                 )
             except Exception as exc:  # noqa: BLE001 - dispatch boundary
-                return f"exact-artifact re-review raised {type(exc).__name__}: {exc}"
-            reviewed_ok, reviewed_reason = self._dispatch_ok(reviewed_result)
-            if not reviewed_ok:
-                return "exact-artifact re-review " + reviewed_reason
-            reviewed_output = self._role_output_of(reviewed_result)
-            reviewed_files = self._plan_tree_files(reviewed_output)
-            if reviewed_files is None:
-                return "exact-artifact re-review returned no plan tree"
-            if dict(reviewed_files) != dict(candidate_files):
-                return "exact-artifact re-review rewrote the supplied plan tree"
-            review, review_error = self._semantic_review_of(
-                reviewed_output, candidate_files
+                reviewed_result = None
+                unreadable = (
+                    f"exact-artifact re-review raised {type(exc).__name__}: {exc}"
+                )
+            if unreadable is None:
+                reviewed_ok, reviewed_reason = self._dispatch_ok(reviewed_result)
+            if unreadable is None and not reviewed_ok:
+                unreadable = "exact-artifact re-review " + reviewed_reason
+            if unreadable is None:
+                reviewed_output = self._role_output_of(reviewed_result)
+                reviewed_files = self._plan_tree_files(reviewed_output)
+                review, review_error = self._semantic_review_of(
+                    reviewed_output, candidate_files
+                )
+                if reviewed_files is None:
+                    unreadable = "exact-artifact re-review returned no plan tree"
+                elif dict(reviewed_files) != dict(candidate_files):
+                    unreadable = (
+                        "exact-artifact re-review rewrote the supplied plan tree"
+                    )
+                elif review_error in _SEMANTIC_VERDICT_REFUSALS:
+                    return "exact-artifact re-review refused: " + review_error
+                elif review_error is not None:
+                    unreadable = "exact-artifact re-review: " + review_error
+                elif review is None or review.get("reviewed_after_rewrite") is not True:
+                    unreadable = (
+                        "exact-artifact re-review did not mark the rewritten tree"
+                    )
+                else:
+                    semantic_state["role_output"] = reviewed_output
+                    semantic_state["review"] = review
+                    return None
+            logger.warning(
+                "planning driver: run %s plan review record unreadable after the "
+                "re-review (%s) — ADVISORY; the build card says so and decides",
+                correlation_id,
+                unreadable,
             )
-            if review_error is not None:
-                return "exact-artifact re-review refused: " + review_error
-            if review is None or review.get("reviewed_after_rewrite") is not True:
-                return "exact-artifact re-review did not mark the rewritten tree"
-            semantic_state["role_output"] = reviewed_output
-            semantic_state["review"] = review
+            semantic_state["review"] = None
+            semantic_state["unreadable"] = unreadable
             return None
 
         # VALIDATION CHANNEL (C5): advisory self-check data, not an oracle —
@@ -7180,6 +7336,17 @@ class PlanningRunDriver:
                 "(ADVISORY — proceeding to the guardkit validate oracle): %s",
                 correlation_id,
                 "; ".join(plan_val_errors),
+            )
+        # The specialist's plan advice (24 October 2026): findings that used to
+        # send the plan back are shown, never refused. ``plan_advice`` is
+        # ``[{"rule", "text"}]``; absent means none.
+        plan_advice = self._plan_advice(role_output)
+        if plan_advice:
+            logger.warning(
+                "008 validation.json plan_advice for %s (ADVISORY — proceeding "
+                "to the guardkit validate oracle): %s",
+                correlation_id,
+                "; ".join(plan_advice),
             )
 
         validate = deps.validate_feature_plan
@@ -7372,6 +7539,7 @@ class PlanningRunDriver:
             slug=slug,
             sha=gitres.sha,
             traceability=semantic_state["review"],
+            review_unreadable=semantic_state["unreadable"],
         )
 
     # -- the plan leg's pre-commit checks, declared (sandbox first, rule 70) --
@@ -8409,6 +8577,10 @@ class PlanningRunDriver:
             details["stamp_normalizer"] = stamp_receipt
         if semantic_review is not None:
             details["semantic_review"] = semantic_review
+        if attempt.review_unreadable:
+            details[PLAN_REVIEW_NOTE_KEY] = _PLAN_REVIEW_UNREADABLE_CARD_LINE.format(
+                reason=attempt.review_unreadable
+            )
         documents, _broken = self._recorded_project_documents(correlation_id)
         if documents:
             # Which files, which versions, were given to the plan writer.
@@ -9034,26 +9206,35 @@ class PlanningRunDriver:
             )
 
         plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
-        feature_id = str(plan_details.get("feature_id") or "")
-        if not feature_id:
-            return await self._fail_leg(
-                correlation_id,
-                _BUILD_QUEUED_STAGE,
-                "no feature id recorded on the feature-plan leg — cannot queue "
-                "the build",
-            )
+        # FRG-067 (24 October 2026): minted from the run, as the plan leg did.
+        feature_id = str(
+            plan_details.get("feature_id") or self._mint_feature_id(correlation_id)
+        )
         target_repo = str(plan_details.get("target_repo") or "")
         branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
         plan_files = plan_details.get("plan_files") or []
         plan_run_id = f"plan-{correlation_id}"
 
-        try:
-            from forge.planning.requirement_amendment_store import freeze_final_plan
-            resolved = deps.planning_config.target_repo_paths.get(target_repo)
-            await freeze_final_plan(deps.store._connection, correlation_id, self._git_runner_for(target_repo), str(resolved),
-                                    pass_stage=_QA_PASS_BARS_STAGE, gate_stage=_QA_FEATURE_GATE_STAGE)
-        except (ValueError, KeyError, TypeError, AttributeError) as exc:
-            return await self._fail_leg(correlation_id, _BUILD_QUEUED_STAGE, "final requirement amendment planning source refused: " + str(exc))
+        # FRG-063 (24 October 2026): freezing an amendment run's final plan
+        # source is bookkeeping. One retry, then the problem is logged and the
+        # build is queued as planned; the amendment's own fence still decides
+        # whether its approved bytes are applied.
+        from forge.planning.requirement_amendment_store import freeze_final_plan
+        resolved = deps.planning_config.target_repo_paths.get(target_repo)
+        for attempt in (1, 2):
+            try:
+                await freeze_final_plan(deps.store._connection, correlation_id, self._git_runner_for(target_repo), str(resolved),
+                                        pass_stage=_QA_PASS_BARS_STAGE, gate_stage=_QA_FEATURE_GATE_STAGE)
+                break
+            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+                logger.warning(
+                    "planning driver: run %s final requirement amendment planning "
+                    "source not frozen (attempt %d of 2): %s — ADVISORY; the "
+                    "build is queued as planned",
+                    correlation_id,
+                    attempt,
+                    exc,
+                )
 
         try:
             result = await deps.dispatch_build_trigger(
@@ -9295,17 +9476,24 @@ class PlanningRunDriver:
                 auth_confirmation = dict(confirmed)
 
         plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
-        feature_id = str(plan_details.get("feature_id") or "")
+        # FRG-067 (24 October 2026): the feature id is minted from the run, so
+        # a record that lost it is read the same way it was made.
+        feature_id = str(
+            plan_details.get("feature_id") or self._mint_feature_id(correlation_id)
+        )
         plan_sha = str(plan_details.get("sha") or "")
         branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
         plan_files = [str(f) for f in (plan_details.get("plan_files") or [])]
-        if not feature_id or not plan_sha:
-            return await self._fail_leg(
+        if not plan_sha:
+            plan_tasks = []
+            logger.warning(
+                "planning driver: run %s feature-plan record names no plan "
+                "commit — ADVISORY; no per-task pass bars are registered and "
+                "the run carries on",
                 correlation_id,
-                _QA_PASS_BARS_STAGE,
-                "no feature id / plan commit sha recorded on the feature-plan "
-                "leg — cannot register per-task pass bars",
             )
+        else:
+            plan_tasks = None
         resolved = await self._resolve_repo(
             row, correlation_id, stage_label=_QA_PASS_BARS_STAGE
         )
@@ -9315,9 +9503,10 @@ class PlanningRunDriver:
 
         # The per-task bar ids ARE the validated plan's task ids — the SAME
         # source ``guardkit feature validate`` reads: the committed feature YAML.
-        plan_tasks = await self._read_plan_tasks(
-            repo_path, branch, feature_id, plan_files
-        )
+        if plan_tasks is None:
+            plan_tasks = await self._read_plan_tasks(
+                repo_path, branch, feature_id, plan_files
+            )
         if plan_tasks is None:
             return await self._fail_leg(
                 correlation_id,
@@ -9350,8 +9539,12 @@ class PlanningRunDriver:
                     {
                         "feature_id": feature_id,
                         "skipped": True,
-                        "reason_code": "no_tasks",
-                        "reason": "The validated plan has no tasks requiring per-task pass bars.",
+                        "reason_code": "no_tasks" if plan_sha else "plan_record_incomplete",
+                        "reason": (
+                            "The validated plan has no tasks requiring per-task pass bars."
+                            if plan_sha
+                            else "The plan record names no plan commit, so no pass bars were registered."
+                        ),
                         **({"requirement_amendment_qa": amendment_qa}
                            if amendment_qa is not None else {}),
                         "bar_files": [],
@@ -9586,16 +9779,14 @@ class PlanningRunDriver:
         stranding a half-paused row.
 
         WHAT THAT MEANS FOR THE WORDS ON THESE CARDS, said here because it has
-        already been got wrong once (2026-09-05): there is no reminder and no
-        second window. ``planning/escalation.py`` — wait, remind the same
-        person, wait again — refuses anything that is not durably PAUSED
-        (``evaluate_escalation_phase`` returns CONTINUE_WAITING, and every
-        transition below it is a compare-and-swap from PAUSED), so
+        already been got wrong once (2026-09-05). ``planning/escalation.py``
+        refuses anything that is not durably PAUSED, so
         ``PlanningConfig.escalated_wait_seconds`` has NO effect on any card
-        this door sends. One window off ``originator_wait_seconds``, then the
-        leg ends and the owner is told it stopped. Every "No answer within…"
-        sentence on these cards must say exactly that and no more; if the door
-        ever gains a reminder, the words change in the same act.
+        this door sends. Since 24 October 2026 (FRG-035) the door itself posts
+        the same card, with the same ``request_id``, once more when the first
+        ``originator_wait_seconds`` window closes, and waits one more window of
+        the same length; then the leg ends and the owner is told it stopped.
+        Every "No answer within…" sentence on these cards says exactly that.
         ``tests/forge/planning/test_driver_spec_digest_door.py`` holds them
         together.
 
@@ -9760,8 +9951,35 @@ class PlanningRunDriver:
 
         deadline = time.monotonic() + float(wait_seconds)
         published = False
+        # FRG-035 (24 October 2026): at the first deadline the SAME card, with
+        # the same request_id, is posted once more and the door waits one more
+        # window. An answer to either copy is taken; cancellation still ends it.
+        posted_again = False
         while True:
             remaining = deadline - time.monotonic()
+            if remaining <= 0 and published and not posted_again:
+                posted_again = True
+                deadline = time.monotonic() + float(wait_seconds)
+                remaining = float(wait_seconds)
+                logger.warning(
+                    "planning driver: run %s %s window (%ds) closed with no "
+                    "answer — posting the same card %s once more and waiting "
+                    "one more window",
+                    correlation_id,
+                    log_noun,
+                    wait_seconds,
+                    request_id,
+                )
+                try:
+                    await deps.approval_publisher.publish_request(envelope)
+                except Exception:  # noqa: BLE001 — the first card is still live
+                    logger.exception(
+                        "planning driver: %s card could not be posted again for "
+                        "%s (request_id=%s); the first card still answers it",
+                        log_noun,
+                        correlation_id,
+                        request_id,
+                    )
             if remaining <= 0:
                 if not published:
                     # The window closed without the card EVER reaching the wire
@@ -10213,8 +10431,10 @@ class PlanningRunDriver:
                 "answered. Start the feature again when you want to decide it."
             ),
             "no_answer_means": (
-                f"No answer within {self._plain_wait(wait_seconds)}: the run "
-                "stops, the same as Reject."
+                f"No answer within {self._plain_wait(wait_seconds)}: the same "
+                "card is sent once more, and with no answer after another "
+                f"{self._plain_wait(wait_seconds)} the run stops, the same as "
+                "Reject."
             ),
         }
         feature = str(seed.get("feature_slug") or "").strip()
@@ -10242,7 +10462,8 @@ class PlanningRunDriver:
             "and the quality checklist registers as authless and the build "
             "carries on; reject and the run stops so the checklist is "
             "registered by hand. No "
-            f"answer within {self._plain_wait(wait_seconds)} stops the run too."
+            f"answer within {self._plain_wait(wait_seconds)} sends the same "
+            "card once more, and silence after that stops the run too."
         )
 
     @staticmethod
@@ -10346,7 +10567,9 @@ class PlanningRunDriver:
         # The feature id is read BEFORE any skip, so every skip record names
         # the feature it is about (4 October 2026).
         plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
-        feature_id = str(plan_details.get("feature_id") or "")
+        feature_id = str(
+            plan_details.get("feature_id") or self._mint_feature_id(correlation_id)
+        )
 
         # The digest's optional endpoint field first (the spec author stated it
         # outright); the criterion-prose regex stays as the fallback so every
@@ -10397,12 +10620,14 @@ class PlanningRunDriver:
 
         plan_sha = str(plan_details.get("sha") or "")
         branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
-        if not feature_id or not plan_sha:
-            return await self._fail_leg(
+        if not plan_sha:
+            # FRG-067 (24 October 2026): bookkeeping, never the end of the run.
+            return self._skip_feature_gate(
                 correlation_id,
-                _QA_FEATURE_GATE_STAGE,
-                "no feature id / plan commit sha recorded on the feature-plan "
-                "leg — cannot register the per-feature live gate",
+                "the plan record names no plan commit — no gate registered",
+                reason_code="plan_record_incomplete",
+                feature_id=feature_id,
+                address=endpoint,
             )
 
         # The first minted pass bar is the gate's ``pass_bar_ref`` (the gate and
@@ -11306,6 +11531,32 @@ class PlanningRunDriver:
         if not isinstance(digest, str) or digest != actual["digest"]:
             return None, "semantic review artifact digest does not match the plan tree"
         return dict(parsed), None
+
+    @staticmethod
+    def _plan_advice(role_output: Mapping[str, Any]) -> list[str]:
+        """The specialist's ``plan_advice`` as ``rule: text`` lines, or ``[]``.
+
+        Read from the same ``validation.json`` as :meth:`_validation_failures`;
+        anything unreadable is simply no advice.
+        """
+        raw = role_output.get("validation.json")
+        data: Any = raw
+        if isinstance(raw, str):
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                return []
+        advice = data.get("plan_advice") if isinstance(data, Mapping) else None
+        if not isinstance(advice, list):
+            return []
+        lines: list[str] = []
+        for item in advice:
+            if isinstance(item, Mapping):
+                rule = str(item.get("rule") or "").strip()
+                text = str(item.get("text") or "").strip()
+                if text:
+                    lines.append(f"{rule}: {text}" if rule else text)
+        return lines
 
     @staticmethod
     def _validation_failures(role_output: Mapping[str, Any]) -> list[str]:

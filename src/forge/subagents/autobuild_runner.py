@@ -257,6 +257,11 @@ class AutobuildState(BaseModel):
     # Correlation (FEAT-FORGE-002)
     correlation_id: str | None = None
 
+    # The approved part's branch (step 1, 24 October 2026). Read from a
+    # snapshot that carries it; never dumped, so every other snapshot is
+    # byte for byte what it was.
+    merge_branch: str | None = Field(default=None, exclude=True)
+
 
 # ---------------------------------------------------------------------------
 # Protocols (the only I/O surfaces the subagent depends on)
@@ -674,7 +679,9 @@ class LifecycleEmitterAdapter:
                 # actually reads.) Same rule as the SSE producer's
                 # ``StreamEventTranslator._build_complete``, applied to this
                 # producer's own source of feature_id.
-                branch=f"autobuild/{self._ctx.feature_id}",
+                # The approved part's branch when the build finished on one
+                # (step 1, 24 October 2026); otherwise the feature's own.
+                branch=state.merge_branch or f"autobuild/{self._ctx.feature_id}",
                 tasks_completed=state.tasks_completed,
                 tasks_failed=state.tasks_failed,
                 tasks_total=state.tasks_completed + state.tasks_failed,
@@ -1366,6 +1373,132 @@ GUARDKIT_STOPPED_BECAUSE_MARKER: str = "GUARDKIT_STOPPED_BECAUSE"
 _STOPPED_BECAUSE_MAX_CHARS: int = 2000
 
 
+def _stopped_because_object(
+    line: str, feature_id: str | None = None
+) -> dict[str, Any] | None:
+    """The JSON object on one ``GUARDKIT_STOPPED_BECAUSE`` line, or None.
+
+    ``None`` for any other line, bad JSON, or an object naming another
+    feature.
+    """
+    prefix = GUARDKIT_STOPPED_BECAUSE_MARKER + " "
+    if not isinstance(line, str) or not line.startswith(prefix):
+        return None
+    try:
+        payload = json.loads(line[len(prefix):])
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    named = payload.get("feature_id")
+    if feature_id and isinstance(named, str) and named and named != feature_id:
+        return None
+    return payload
+
+
+#: A full commit id as git prints it (SHA-1 or SHA-256).
+_COMMIT_ID = re.compile(r"[0-9a-f]{40}([0-9a-f]{24})?")
+
+
+def _parse_approved_head_line(
+    line: str, feature_id: str | None = None
+) -> str | None:
+    """The ``approved_head`` on one ``GUARDKIT_STOPPED_BECAUSE`` line, or None.
+
+    THE APPROVED PART OF A FEATURE (step 1, 24 October 2026). GuardKit adds
+    the last approved task's commit to the same line when some tasks were
+    approved and no real test, lint, smoke or whole-feature check is still
+    red. Only a full commit id is taken; anything else reads as absent, which
+    is today's behaviour.
+    """
+    payload = _stopped_because_object(line, feature_id)
+    if payload is None:
+        return None
+    head = payload.get("approved_head")
+    if not isinstance(head, str) or not _COMMIT_ID.fullmatch(head.strip()):
+        return None
+    return head.strip()
+
+
+#: GuardKit's exit code for a feature build that ended with a failed task.
+GUARDKIT_PARTIAL_EXIT_CODE: int = 2
+
+#: The snapshot field naming the branch the merge word merges, when it is not
+#: the feature's own ``autobuild/<FEAT>`` (the approved part's branch).
+MERGE_BRANCH_FIELD: str = "merge_branch"
+
+#: The snapshot field listing the tasks the offered branch does not include:
+#: ``[{"id", "status", "final_decision"}]``, or :data:`TASK_LIST_NOT_AVAILABLE`.
+TASKS_NOT_INCLUDED_FIELD: str = "tasks_not_included"
+TASK_LIST_NOT_AVAILABLE: str = "task list not available"
+
+
+def approved_branch_for(feature_id: str) -> str:
+    """``autobuild/<FEAT>-approved``: the approved part of a feature build."""
+    return f"autobuild/{feature_id}-approved"
+
+
+async def _point_approved_branch(
+    repo_path: Path, feature_id: str, approved_head: str
+) -> tuple[str | None, str | None]:
+    """Point ``autobuild/<FEAT>-approved`` at ``approved_head``; one retry.
+
+    Returns ``(branch, None)`` when the branch is made, else ``(None,
+    sentence)`` saying why; the build then ends as it would have.
+    """
+    branch = approved_branch_for(feature_id)
+    said = ""
+    for attempt in (1, 2):
+        try:
+            code, said = await _run_git(
+                ["branch", "-f", branch, approved_head], cwd=repo_path
+            )
+        except Exception as exc:  # noqa: BLE001 — said in the reason instead
+            code, said = -1, f"{type(exc).__name__}: {exc}"
+        if code == 0:
+            return branch, None
+        logger.warning(
+            "autobuild_runner: could not point %s at %s (attempt %d): %s",
+            branch,
+            approved_head,
+            attempt,
+            said,
+        )
+        if attempt == 1:
+            await asyncio.sleep(RETRY_PAUSE_SECONDS)
+    return None, (
+        f"the approved tasks (up to {approved_head}) could not be put on "
+        f"{branch} ({said or 'git refused'}), so nothing was offered"
+    )
+
+
+#: The pause before the one retry of a bookkeeping step (step 1).
+RETRY_PAUSE_SECONDS: float = 2.0
+
+
+def _tasks_not_included(
+    run_cwd: Path, feature_id: str
+) -> list[dict[str, str | None]] | str:
+    """The tasks the build did not complete, as the card's details list them.
+
+    ``[{"id", "status", "final_decision"}]`` from the build's own ledger, or
+    :data:`TASK_LIST_NOT_AVAILABLE` when there is no readable ledger.
+    """
+    ledger = build_monitor.read_feature_ledger(run_cwd, feature_id)
+    if ledger is None:
+        return TASK_LIST_NOT_AVAILABLE
+    results = build_monitor.read_task_results(run_cwd, feature_id)
+    return [
+        {
+            "id": task_id,
+            "status": status,
+            "final_decision": results.get(task_id, (None, None))[0],
+        }
+        for task_id, status in ledger.task_statuses
+        if status != "completed"
+    ]
+
+
 def _parse_stopped_because_line(
     line: str, feature_id: str | None = None
 ) -> str | None:
@@ -1378,20 +1511,11 @@ def _parse_stopped_because_line(
     is ignored. Whitespace in the sentence is collapsed to single spaces and
     the sentence is bounded, so it stays one plain line in any reason.
     """
-    prefix = GUARDKIT_STOPPED_BECAUSE_MARKER + " "
-    if not isinstance(line, str) or not line.startswith(prefix):
-        return None
-    try:
-        payload = json.loads(line[len(prefix):])
-    except (ValueError, TypeError):
-        return None
-    if not isinstance(payload, dict):
+    payload = _stopped_because_object(line, feature_id)
+    if payload is None:
         return None
     sentence = payload.get("sentence")
     if not isinstance(sentence, str):
-        return None
-    named = payload.get("feature_id")
-    if feature_id and isinstance(named, str) and named and named != feature_id:
         return None
     sentence = " ".join(sentence.split())
     if not sentence:
@@ -4586,6 +4710,34 @@ async def _sweep_prior_build_residue(
         ) from exc
 
 
+async def _sweep_prior_build_residue_or_carry_on(
+    repo_path: Path, feature_id: str, *, current_build_id: str
+) -> None:
+    """Sweep a prior build's leftovers; one retry, then carry on (step 1).
+
+    Bookkeeping never ends a feature (24 October 2026): a sweep that still
+    fails after one retry is logged and the fresh build goes ahead. If the
+    leftovers really are in its way, making the worktree fails on its own
+    and says so.
+    """
+    for attempt in (1, 2):
+        try:
+            await _sweep_prior_build_residue(
+                repo_path, feature_id, current_build_id=current_build_id
+            )
+            return
+        except PriorBuildSweepError as exc:
+            logger.warning(
+                "autobuild_runner: a prior same-feature build's residue could "
+                "not be swept (attempt %d): %s%s",
+                attempt,
+                exc,
+                "" if attempt == 1 else " — carrying on with the fresh build",
+            )
+        if attempt == 1:
+            await asyncio.sleep(RETRY_PAUSE_SECONDS)
+
+
 async def _sweep_prior_source_branches(
     repo_path: Path, feature_id: str, *, current_build_id: str
 ) -> None:
@@ -5249,20 +5401,9 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         if isinstance(branch_raw, str) and branch_raw.strip():
             payload_branch = branch_raw.strip()
         _claim_repository(repo_path, shared_checkout=False)
-        try:
-            await _sweep_prior_build_residue(
-                repo_path, feature_id, current_build_id=build_id
-            )
-        except PriorBuildSweepError as exc:
-            return _snapshot_update(
-                _build_failed_snapshot(
-                    payload,
-                    reason=(
-                        "refusing the fresh dispatch: a prior same-feature "
-                        f"build's residue could not be swept — {exc}"
-                    ),
-                )
-            )
+        await _sweep_prior_build_residue_or_carry_on(
+            repo_path, feature_id, current_build_id=build_id
+        )
         await _sweep_build_refs(repo_path, feature_id)
         refused = await _make_source_branch(repo_path, build_id, source_commit)
         if refused is not None:
@@ -5318,22 +5459,12 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         # that tree still claims the feature's autobuild/<task_id> branch, so
         # this fresh dispatch would die in seconds ("branch already exists").
         # Runs FIRST (before the non-destructive F3 pass) and only after the
-        # prior build's evidence is durable. A sweep it cannot complete is an
-        # honest refusal, never a half-swept repo handed to guardkit.
-        try:
-            await _sweep_prior_build_residue(
-                repo_path, feature_id, current_build_id=build_id
-            )
-        except PriorBuildSweepError as exc:
-            return _snapshot_update(
-                _build_failed_snapshot(
-                    payload,
-                    reason=(
-                        "refusing the fresh dispatch: a prior same-feature "
-                        f"build's residue could not be swept — {exc}"
-                    ),
-                )
-            )
+        # prior build's evidence is durable. A sweep it cannot complete is
+        # retried once and logged, and the build goes ahead (step 1); nothing
+        # un-exported is ever destroyed.
+        await _sweep_prior_build_residue_or_carry_on(
+            repo_path, feature_id, current_build_id=build_id
+        )
         # F3 — preflight residue sweep, scoped to THIS feature's task refs,
         # BEFORE materialising the worktree so a poisoned prior run cannot
         # collide with the fresh add. Never crashes the build.
@@ -5603,6 +5734,9 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     # GuardKit's early-stop sentence, from THIS process's stdout only
     # (18 October 2026). The last parsable line wins; None when absent.
     stopped_because: str | None = None
+    # The approved part's last commit, from the same line (step 1, 24 October
+    # 2026). The last parsable value wins; None when absent.
+    approved_head: str | None = None
     # Tasks GuardKit printed as a configuration error on THIS process's stdout
     # (19 October 2026), task id -> turns, in the order first printed. Counted
     # as a stop only when the ledger agrees (see _configuration_errors).
@@ -5661,6 +5795,7 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
 
     async def _drain_stdout() -> None:
         nonlocal stage_complete_count, last_coach_score, stopped_because
+        nonlocal approved_head
         if output_lines is None:  # defensive — PIPE was requested above
             return
         try:
@@ -5685,6 +5820,9 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
                 stop_sentence = _parse_stopped_because_line(decoded, feature_id)
                 if stop_sentence is not None:
                     stopped_because = stop_sentence
+                approved = _parse_approved_head_line(decoded, feature_id)
+                if approved is not None:
+                    approved_head = approved
                 # GuardKit's configuration-error stop (19 October 2026): the
                 # task's result line on this run's own stdout.
                 stopped_task = _parse_configuration_error_line(decoded)
@@ -5927,6 +6065,67 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
 
     exit_code = proc.returncode if proc.returncode is not None else -1
 
+    # THE APPROVED PART OF A FEATURE (step 1, 24 October 2026). GuardKit exits
+    # 2 when a task failed, and names the last approved task's commit when the
+    # tasks before it were approved and no real check is still red. That
+    # commit gets a branch of its own and the build finishes on it, so the
+    # card offers exactly the approved tasks; everything else stays on
+    # ``autobuild/<FEAT>`` in the kept worktree. A kill, a timeout or the
+    # runner's own error ends as before.
+    approved_branch: str | None = None
+    approved_branch_refused: str | None = None
+    if (
+        approved_head is not None
+        and exit_code == GUARDKIT_PARTIAL_EXIT_CODE
+        and wedge_verdict is None
+        and not timed_out
+        and runner_error is None
+    ):
+        approved_branch, approved_branch_refused = await _point_approved_branch(
+            repo_path, feature_id, approved_head
+        )
+    if approved_branch is not None:
+        # The build's own ledger, read here whether or not the monitor ran.
+        approved_ledger = build_monitor.read_feature_ledger(run_cwd, feature_id)
+        approved_counts = build_monitor.resolve_task_counts(
+            approved_ledger,
+            stdout_task_ids=(
+                monitor.stdout_task_ids if monitor is not None else ()
+            ),
+            succeeded=False,
+        )
+        if worktree_path is not None:
+            # The card reads what was checked from the exported receipts; the
+            # worktree is kept, because the unapproved work lives in it.
+            await asyncio.to_thread(
+                _export_receipts, worktree_path, receipt_build_id
+            )
+        approved = _build_snapshot(
+            payload,
+            lifecycle="running_wave",
+            wave_index=approved_counts.wave_index,
+            task_index=0,
+            tasks_completed=approved_counts.tasks_completed,
+            tasks_failed=approved_counts.tasks_failed,
+        )
+        approved["last_coach_score"] = last_coach_score
+        approved["tasks_completed_source"] = approved_counts.source
+        approved[MERGE_BRANCH_FIELD] = approved_branch
+        approved[TASKS_NOT_INCLUDED_FIELD] = _tasks_not_included(
+            run_cwd, feature_id
+        )
+        logger.warning(
+            "autobuild_runner: %s finished part-built — the approved tasks up "
+            "to %s are offered on %s; the rest stays on autobuild/%s "
+            "(worktree %s kept)",
+            feature_id,
+            approved_head,
+            approved_branch,
+            feature_id,
+            worktree_path,
+        )
+        return _snapshot_update(approved)
+
     if (
         wedge_verdict is not None
         or timed_out
@@ -5975,6 +6174,8 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
             # for byte; the sentence follows it. Absent line, same reason.
             if stopped_because:
                 reason = f"{reason}: {stopped_because}"
+            if approved_branch_refused:
+                reason = f"{reason}: {approved_branch_refused}"
 
         # 19 October 2026: GuardKit stopped a task because the project's setup
         # cannot support it. The reason so far stays byte for byte; the plain
@@ -6134,6 +6335,7 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         stdout_task_ids=(monitor.stdout_task_ids if monitor is not None else ()),
         succeeded=True,
     )
+    success_not_included = _tasks_not_included(run_cwd, feature_id)
     if success_counts.source == build_monitor.SOURCE_ASSUMED_SINGLE_UNIT:
         logger.warning(
             "autobuild_runner: no readable task ledger and no task-start lines "
@@ -6194,6 +6396,7 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
     snapshot["tasks_completed_source"] = success_counts.source
     if retained_worktree is not None:
         snapshot["worktree_retention"] = retained_worktree
+    snapshot[TASKS_NOT_INCLUDED_FIELD] = success_not_included
     logger.info(
         "autobuild_runner: %s succeeded — %s checkpoint TURNS seen on stdout, "
         "tasks_completed=%s tasks_failed=%s (source=%s). Turns are NOT tasks: "
@@ -6498,6 +6701,10 @@ def _node_completed(state: AutobuildRunnerState) -> dict[str, Any]:
         snapshot["tasks_completed_source"] = measured_source
     if isinstance(worktree_retention, Mapping):
         snapshot["worktree_retention"] = dict(worktree_retention)
+    if isinstance(prev_snapshot, Mapping):
+        for field_name in (MERGE_BRANCH_FIELD, TASKS_NOT_INCLUDED_FIELD):
+            if prev_snapshot.get(field_name) is not None:
+                snapshot[field_name] = prev_snapshot[field_name]
     return _snapshot_update(snapshot)
 
 

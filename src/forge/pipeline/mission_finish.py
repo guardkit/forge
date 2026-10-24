@@ -161,8 +161,12 @@ def mission_card_words(
     risky: Sequence[str] | None,
     risky_unread: str | None = None,
     left_standing: Sequence[str] = (),
+    advice: Sequence[str] = (),
 ) -> str:
     """The mission merge card's own sentences (design section 7).
+
+    ``advice`` (step 1, 24 October 2026) is bookkeeping that no longer ends
+    a mission, said on the card instead: one line each.
 
     The offer adds the preview line and the merge-check line under these,
     as it does for every card.
@@ -208,6 +212,8 @@ def mission_card_words(
     # the same sentence the mission's thread was given.
     for sentence in left_standing:
         lines.append(f"Left standing: {sentence}")
+    for sentence in advice:
+        lines.append(sentence)
     lines.append(
         "Approve = merge the mission into main and deploy. Reject = nothing "
         "reaches main; the branch is kept."
@@ -923,26 +929,6 @@ async def _offer_the_mission(
             "something else changed the branch",
         )
 
-    if deps.feature_routing_required:
-        try:
-            if deps.feature_routing_gate is None:
-                raise RuntimeError("no routing gate is composed")
-            deps.feature_routing_gate.require_committed_success(mission.correlation_id)
-        except Exception as exc:  # noqa: BLE001 — missing is final, never retried
-            logger.warning(
-                "missions: %s has no committed routing receipt (%s: %s)",
-                mission.id,
-                type(exc).__name__,
-                exc,
-            )
-            return await _not_merged(
-                deps,
-                store,
-                mission,
-                "the factory's model routing for this mission has no committed "
-                "receipt, so its merge cannot run",
-            )
-
     if not store.set_final_commit(mission.id, tip):
         if _stopping(store, mission.id):
             return "stopping"  # a stop arrived first: nothing is recorded
@@ -1056,6 +1042,33 @@ async def _the_risky_files(
     return risky_files(changed), None
 
 
+def _routing_advice(deps: MissionFinishDeps, mission: Mission) -> tuple[str, ...]:
+    """FRG-161 as a card line (step 1, 24 October 2026).
+
+    A fully built mission whose routing receipt is missing used to end
+    NOT_MERGED, never retried. The receipt is bookkeeping about the work, not
+    the work, so its absence is now one plain line on the card."""
+    if not deps.feature_routing_required:
+        return ()
+    try:
+        if deps.feature_routing_gate is None:
+            raise RuntimeError("no routing gate is composed")
+        deps.feature_routing_gate.require_committed_success(mission.correlation_id)
+    except Exception as exc:  # noqa: BLE001 — bookkeeping, said on the card
+        logger.warning(
+            "missions: %s has no committed routing receipt (%s: %s) — said on "
+            "the card",
+            mission.id,
+            type(exc).__name__,
+            exc,
+        )
+        return (
+            "Note: the factory's model routing record for this mission is "
+            "missing; the work itself is unaffected.",
+        )
+    return ()
+
+
 async def _freeze_and_offer(
     deps: MissionFinishDeps,
     store: MissionStore,
@@ -1103,6 +1116,7 @@ async def _freeze_and_offer(
         risky=risky,
         risky_unread=unread,
         left_standing=_left_standing_sentences(deps.pool, mission_id=mission.id),
+        advice=_routing_advice(deps, mission),
     )
     row = deps.pool.get_build_row(build_id)
     landed = [f.key for f in features if _status(latest, f.key) == "LANDED"]

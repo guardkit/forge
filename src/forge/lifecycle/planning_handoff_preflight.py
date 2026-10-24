@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 from forge.adapters.sqlite.connect import read_only_connect
@@ -13,6 +14,8 @@ from forge.lifecycle.planning_handoff_retirement import (
     retired_planning_handoff_correlations,
 )
 
+logger = logging.getLogger(__name__)
+
 
 def preflight_retired_planning_handoff_correlations(
     db_path: Path,
@@ -23,6 +26,8 @@ def preflight_retired_planning_handoff_correlations(
     legacy databases may likewise proceed to the existing migration runner.
     Once the canonical selector sees retirement-looking history, or the ledger
     is new enough to support a receipt, the full shared reader is authoritative.
+    A ledger that cannot be read at all is logged and read as nothing retired
+    (24 October 2026).
     """
 
     path = Path(db_path).expanduser()
@@ -52,13 +57,19 @@ def preflight_retired_planning_handoff_correlations(
         if connection is not None and started:
             connection.rollback()
         raise
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 — an unreadable ledger is bookkeeping
         if connection is not None and started:
             connection.rollback()
-        raise PlanningHandoffRetirementError(
-            f"planning handoff retirement preflight could not read {path}: "
-            f"{type(exc).__name__}: {exc}"
-        ) from exc
+        # FRG-017 (24 October 2026): a ledger that cannot be read is logged and
+        # read as "nothing known retired"; it never stops the factory.
+        logger.warning(
+            "planning handoff retirement preflight could not read %s (%s: %s) "
+            "— ADVISORY; carrying on with no retired handoffs known",
+            path,
+            type(exc).__name__,
+            exc,
+        )
+        return frozenset()
     finally:
         if connection is not None:
             connection.close()

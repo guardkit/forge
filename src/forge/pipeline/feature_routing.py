@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 import urllib.error
 import urllib.request
 import uuid
@@ -20,6 +21,8 @@ FEATURE_HEADER = "x-feature-id"
 STORED_SERVER_HEADER = "x-feature-stored-server-id"
 ACTUAL_SERVER_HEADER = "x-feature-actual-server-id"
 SEED_SERVER_HEADER = "x-feature-seed-server"
+
+logger = logging.getLogger(__name__)
 
 
 class SeedResponseRejected(FeatureRoutingBlocked):
@@ -70,58 +73,109 @@ class FeatureRoutingGate:
                 if claim.receipt is not None:
                     return claim.receipt
                 try:
-                    if inspect.iscoroutinefunction(self._request):
-                        pending = self._request(
-                            self._router_url, key, self._timeout, preference
-                        )
-                    else:
-                        pending = asyncio.to_thread(
-                            self._request,
-                            self._router_url,
-                            key,
-                            self._timeout,
-                            preference,
-                        )
-                    status, headers = await asyncio.wait_for(
-                        pending, timeout=self._timeout
-                    )
-                    if status != 200:
-                        raise SeedResponseRejected(f"seed-http-status-{status}")
-                    stored = self._header(headers, STORED_SERVER_HEADER)
-                    actual = self._header(headers, ACTUAL_SERVER_HEADER)
-                    try:
-                        stored_id, actual_id = int(stored), int(actual)
-                    except (TypeError, ValueError) as exc:
-                        raise SeedResponseRejected("seed-ack-invalid") from exc
-                    if stored_id not in (1, 2) or stored_id != actual_id:
-                        raise SeedResponseRejected("seed-ack-mismatch")
-                    return self._store.complete_seed(key, attempt_id, stored_id)
-                except asyncio.CancelledError:
-                    try:
-                        self._store.fail_seed(
-                            key, attempt_id, state="UNKNOWN", reason="seed-cancelled"
-                        )
-                    except BaseException:
-                        # Cancellation must still propagate.  A failed best-effort
-                        # CAS leaves STARTED, which remains blocking and is
-                        # poisoned to UNKNOWN at the next coordinator boot.
-                        pass
-                    raise
-                except SeedResponseRejected as exc:
-                    self._store.fail_seed(
-                        key, attempt_id, state="FAILED", reason=str(exc)
-                    )
-                    raise
-                except BaseException as exc:
-                    self._store.fail_seed(
-                        key,
-                        attempt_id,
-                        state="UNKNOWN",
-                        reason=f"seed-transport-ambiguous:{type(exc).__name__}",
-                    )
-                    raise FeatureRoutingBlocked(
-                        "feature routing seed outcome is unknown"
-                    ) from exc
+                    stored_id = await self._seed_once(key, attempt_id, preference)
+                except SeedResponseRejected as first:
+                    # RETRY ONCE (step 1, 24 October 2026): a completed,
+                    # rejected response is asked once more under the same
+                    # routing id. An unknown outcome (timeout, partial
+                    # response, cancellation, restart) is never replayed.
+                    attempt_id = uuid.uuid4().hex
+                    if not self._store.retry_failed_seed(key, attempt_id):
+                        raise first
+                    stored_id = await self._seed_once(key, attempt_id, preference)
+                return self._record_success(key, attempt_id, stored_id)
+
+    async def _seed_once(self, key: str, attempt_id: str, preference: int) -> int:
+        """One seed request for the claimed attempt; the acknowledged server.
+
+        A completed rejection is recorded FAILED and raised as
+        :class:`SeedResponseRejected`; anything else that stops the exchange
+        is recorded UNKNOWN. The success record is written by the caller,
+        outside this exchange, so a failed write is never mistaken for an
+        unknown HTTP result.
+        """
+        try:
+            if inspect.iscoroutinefunction(self._request):
+                pending = self._request(self._router_url, key, self._timeout, preference)
+            else:
+                pending = asyncio.to_thread(
+                    self._request,
+                    self._router_url,
+                    key,
+                    self._timeout,
+                    preference,
+                )
+            status, headers = await asyncio.wait_for(pending, timeout=self._timeout)
+            if status != 200:
+                raise SeedResponseRejected(f"seed-http-status-{status}")
+            stored = self._header(headers, STORED_SERVER_HEADER)
+            actual = self._header(headers, ACTUAL_SERVER_HEADER)
+            try:
+                stored_id, actual_id = int(stored), int(actual)
+            except (TypeError, ValueError) as exc:
+                raise SeedResponseRejected("seed-ack-invalid") from exc
+            if stored_id not in (1, 2) or stored_id != actual_id:
+                raise SeedResponseRejected("seed-ack-mismatch")
+            return stored_id
+        except asyncio.CancelledError:
+            try:
+                self._store.fail_seed(
+                    key, attempt_id, state="UNKNOWN", reason="seed-cancelled"
+                )
+            except BaseException:
+                # Cancellation must still propagate.  A failed best-effort
+                # CAS leaves STARTED, which remains blocking and is
+                # poisoned to UNKNOWN at the next coordinator boot.
+                pass
+            raise
+        except SeedResponseRejected as exc:
+            self._store.fail_seed(key, attempt_id, state="FAILED", reason=str(exc))
+            raise
+        except BaseException as exc:
+            self._store.fail_seed(
+                key,
+                attempt_id,
+                state="UNKNOWN",
+                reason=f"seed-transport-ambiguous:{type(exc).__name__}",
+            )
+            raise FeatureRoutingBlocked(
+                "feature routing seed outcome is unknown"
+            ) from exc
+
+    def _record_success(
+        self, key: str, attempt_id: str, stored_id: int
+    ) -> FeatureRoutingReceipt:
+        """Write a valid acknowledgement's record, retrying the write once.
+
+        The router has answered; only the record failed. The request is never
+        sent again for it.
+        """
+        try:
+            return self._store.complete_seed(key, attempt_id, stored_id)
+        except Exception as first:  # noqa: BLE001 — the write is retried once
+            logger.warning(
+                "feature routing: %s was acknowledged but its record was not "
+                "written (%s: %s); writing it once more",
+                key,
+                type(first).__name__,
+                first,
+            )
+        try:
+            return self._store.complete_seed(key, attempt_id, stored_id)
+        except Exception as exc:
+            try:
+                self._store.fail_seed(
+                    key,
+                    attempt_id,
+                    state="UNKNOWN",
+                    reason="seed-acknowledged-record-not-written",
+                )
+            except Exception:  # noqa: BLE001 — the raise below says what happened
+                pass
+            raise FeatureRoutingBlocked(
+                "feature routing seed was acknowledged but its record could not "
+                "be written"
+            ) from exc
 
     def _preferred_server(self) -> int:
         """Prefer the server with fewer live pins; ties go to server 1."""

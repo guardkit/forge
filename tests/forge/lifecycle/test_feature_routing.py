@@ -598,3 +598,149 @@ def test_eight_long_admissions_a_minute_apart_split_four_and_four(tmp_path):
     assert [preference for _key, preference in seen] == [1, 2] * 4
     assert store.live_pin_counts() == {1: 4, 2: 4}
     connection.close()
+
+
+# ---------------------------------------------------------------------------
+# One retry of a completed rejection (step 1, 24 October 2026; FRG-015/166)
+# ---------------------------------------------------------------------------
+
+
+def _counting_gate(store, responses):
+    """A gate whose router answers from ``responses`` in order, counting calls."""
+    calls = []
+
+    async def request(_url, key, _timeout, _preference):
+        calls.append(key)
+        answer = responses[len(calls) - 1]
+        if isinstance(answer, BaseException):
+            raise answer
+        return answer
+
+    return FeatureRoutingGate(store, "http://router.invalid", request=request), calls
+
+
+def test_a_rejection_then_success_is_two_requests_under_the_same_id(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    gate, calls = _counting_gate(store, [(503, Message()), (200, _headers("2", "2"))])
+    receipt = asyncio.run(
+        gate.ensure_seeded("retry_A", origin_kind="planning", origin_id="A")
+    )
+    assert calls == ["retry_A", "retry_A"]
+    assert receipt.server_id == 2
+    assert store.state_for("retry_A") == "SUCCEEDED"
+    # A SUCCEEDED receipt is reused with no new request.
+    again = asyncio.run(
+        gate.ensure_seeded("retry_A", origin_kind="planning", origin_id="A")
+    )
+    assert again == receipt
+    assert len(calls) == 2
+    connection.close()
+
+
+def test_a_second_rejection_makes_no_third_request(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    gate, calls = _counting_gate(store, [(503, Message()), (503, Message())])
+    with pytest.raises(FeatureRoutingBlocked):
+        asyncio.run(gate.ensure_seeded("twice_A", origin_kind="planning", origin_id="A"))
+    with pytest.raises(FeatureRoutingBlocked):
+        asyncio.run(gate.ensure_seeded("twice_A", origin_kind="planning", origin_id="A"))
+    assert len(calls) == 2
+    assert store.state_for("twice_A") == "FAILED"
+    connection.close()
+
+
+@pytest.mark.parametrize(
+    "first",
+    (TimeoutError("partial headers"), ConnectionResetError("reset")),
+)
+def test_an_unknown_outcome_is_never_replayed(tmp_path, first):
+    _path, connection, store = _store(tmp_path)
+    gate, calls = _counting_gate(store, [first, (200, _headers())])
+    with pytest.raises(FeatureRoutingBlocked):
+        asyncio.run(gate.ensure_seeded("unknown_A", origin_kind="planning", origin_id="A"))
+    assert len(calls) == 1
+    assert store.state_for("unknown_A") == "UNKNOWN"
+    connection.close()
+
+
+def test_a_cancelled_seed_is_not_asked_again(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    calls = []
+
+    async def scenario():
+        started = asyncio.Event()
+
+        async def request(_url, key, _timeout, _preference):
+            calls.append(key)
+            started.set()
+            await asyncio.Event().wait()
+
+        gate = FeatureRoutingGate(store, "http://router.invalid", request=request)
+        task = asyncio.create_task(
+            gate.ensure_seeded("cancel_A", origin_kind="planning", origin_id="A")
+        )
+        await asyncio.wait_for(started.wait(), timeout=2)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        with pytest.raises(FeatureRoutingBlocked):
+            await gate.ensure_seeded("cancel_A", origin_kind="planning", origin_id="A")
+
+    asyncio.run(scenario())
+    assert calls == ["cancel_A"]
+    assert store.state_for("cancel_A") == "UNKNOWN"
+    connection.close()
+
+
+def test_a_seed_left_started_by_a_restart_is_not_asked_again(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    store.claim_initial_seed("restart_A", "old", origin_kind="planning", origin_id="A")
+    store.poison_unfinished_seeds_on_boot()
+    gate, calls = _counting_gate(store, [(200, _headers())])
+    with pytest.raises(FeatureRoutingBlocked):
+        asyncio.run(gate.ensure_seeded("restart_A", origin_kind="planning", origin_id="A"))
+    assert calls == []
+    connection.close()
+
+
+def test_a_failed_record_write_after_an_ack_retries_only_the_write(tmp_path):
+    _path, connection, store = _store(tmp_path)
+    real_complete = store.complete_seed
+    writes = []
+
+    def flaky_complete(key, attempt_id, server_id):
+        writes.append(attempt_id)
+        if len(writes) == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return real_complete(key, attempt_id, server_id)
+
+    store.complete_seed = flaky_complete
+    gate, calls = _counting_gate(store, [(200, _headers("2", "2"))])
+    receipt = asyncio.run(
+        gate.ensure_seeded("write_A", origin_kind="planning", origin_id="A")
+    )
+    assert calls == ["write_A"]
+    assert len(writes) == 2 and writes[0] == writes[1]
+    assert receipt.server_id == 2
+    assert store.state_for("write_A") == "SUCCEEDED"
+    connection.close()
+
+
+def test_a_record_write_that_fails_twice_is_not_called_an_unknown_http_result(
+    tmp_path, caplog
+):
+    _path, connection, store = _store(tmp_path)
+
+    def broken_complete(*_args):
+        raise sqlite3.OperationalError("disk I/O error")
+
+    store.complete_seed = broken_complete
+    gate, calls = _counting_gate(store, [(200, _headers())])
+    with pytest.raises(FeatureRoutingBlocked, match="acknowledged"):
+        asyncio.run(gate.ensure_seeded("write_B", origin_kind="planning", origin_id="B"))
+    assert calls == ["write_B"]
+    row = connection.execute(
+        "SELECT state, error FROM feature_routing_seeds WHERE feature_routing_id='write_B'"
+    ).fetchone()
+    assert row == ("UNKNOWN", "seed-acknowledged-record-not-written")
+    connection.close()

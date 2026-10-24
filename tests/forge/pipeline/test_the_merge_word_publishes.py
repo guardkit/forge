@@ -775,12 +775,15 @@ class TestNothingHalfCheckedIsEverSent:
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
     ) -> None:
-        """The press that reuses a join does not re-run them, so it must not send.
+        """The press that reuses a join does not re-run them; it says so.
 
         Press one is killed after the join is made but before its checks can
         be reported, which is the shape that leaves a joined commit with only
-        one kind of check ever run on it. Press two picks that join up — and
-        refuses to send it, saying so.
+        one kind of check ever run on it. Press two picks that join up. Since
+        step 1 (24 October 2026, FRG-178) the build system's checks being
+        unavailable is recorded as exactly that and treated as advice: the
+        join is sent, nothing claims those checks passed, and a red result
+        would still block.
         """
         from tests.forge.pipeline.test_merge_executor import _DiesWhileMerging
 
@@ -806,19 +809,20 @@ class TestNothingHalfCheckedIsEverSent:
         )
         second = await _press(deps_two, repo_root)
 
-        assert second.result == "publication-pending"
-        assert second.status == "GATED"
-        assert "It is NOT yet checked" in second.detail
-        assert "nothing was sent to the remote" in second.detail
+        assert second.result == "published-deployment-pending", second.detail
         # THE MERGE COMMAND WAS NOT RUN AGAIN. The only thing asked of the
-        # build system is the question this stage added — check a join this
-        # press did not make — and the installed one has no such sub-command,
-        # so the sentence names it and the build stays gated.
+        # build system is the check-join question, and the installed one has
+        # no such sub-command: the record says "unavailable", never a pass.
         assert [call["args"][0] for call in joins_two.calls] == ["check-join"]
-        assert "autobuild check-join" in second.detail
-        assert "does not have it" in second.detail
+        merge_checks = [
+            line
+            for line in _record(pool).lines
+            if (line.kind, line.step) == ("done", "merge-checks")
+        ]
+        assert merge_checks[-1].detail["verify_ok"] is None
+        assert "autobuild check-join" in merge_checks[-1].detail["unavailable"]
         assert _legs(deploy_two).count("candidate_check") == 1
-        assert publisher.asked == []
+        assert len(publisher.asked) == 1
 
 
 class TestThePressAndThePublisherReadTheRecordTheSameWay:
@@ -884,12 +888,12 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         # system has no sub-command for, so those checks never run on this
         # commit at all.
         assert [call["args"][0] for call in joins_two.calls] == ["check-join"]
-        assert second.result == "publication-pending"
-        assert "It is NOT yet checked" in second.detail
-        assert "autobuild check-join" in second.detail
-        # AND NOTHING WAS ASKED OF THE PUBLISHER, which is the point: the
-        # press stops where the publisher would have refused it.
-        assert publisher.asked == []
+        # The line naming no commit did not count. The press then recorded
+        # the build system's checks as UNAVAILABLE on this commit (step 1,
+        # FRG-178), which both readers take as advice, so it was sent — and
+        # the publisher, reading the same record, agreed.
+        assert second.result == "published-deployment-pending", second.detail
+        assert len(publisher.asked) == 1
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("publication", ["on", "off"])
@@ -984,7 +988,14 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         second = await _press(deps_two, repo_root)
 
         assert [a[0] for a in asked] == ["check-join"]
-        assert second.result == "publication-pending", second.detail
+        # Step 1 (24 October 2026, FRG-178): with no answer from the checks
+        # themselves they are unavailable, which is advice, so with
+        # publication on the join is sent. A report saying the checks could
+        # not run is the build system's own verdict and still holds it back.
+        sent = publication == "on" and answer != "could-not-run"
+        assert second.result == (
+            "published-deployment-pending" if sent else "publication-pending"
+        ), second.detail
         assert "candidate_down" in _legs(deploy_two)
         assert (_record(pool).lease_holder is not None) is kept
 
@@ -2692,10 +2703,19 @@ async def test_only_a_proven_profile_refusal_releases_the_unanswered_hold(
     from forge.deploy.profile_selection import ProfileSelectionRefusedBeforeDispatch
 
     error = ProfileSelectionRefusedBeforeDispatch if typed else DeployProfileError
-    deps, _deploy, _joins, _bus = _deps(config_with_publication_on, pool)
+    deps, _deploy, _joins, _bus = _deps(
+        config_with_publication_on,
+        pool,
+        publisher=_APublisherThatSays([_published("c" * 40)]),
+    )
     deploy = _FakeDeploy(candidate_raises=error("no deployment profile; no request was sent"))
     outcome = await _press(replace(deps, deploy_dispatcher=deploy), repo_root)
-    assert outcome.result == "candidate-refused"
+    # Step 1 (FRG-194): a proven "no profile" means the live check could not
+    # run — advice, so the join is published and nothing is deployed. Any
+    # other profile error is still a refusal.
+    assert outcome.result == (
+        "published-deployment-pending" if typed else "candidate-refused"
+    ), outcome.detail
     assert "no deployment profile" in outcome.detail
     assert (_record(pool).lease_holder is not None) is (not typed)
 
@@ -2725,7 +2745,7 @@ async def test_predispatch_profile_refusal_preserves_an_earlier_unanswered_leg(
         nonlocal checks
         if kwargs.get("leg") == "candidate_check":
             checks += 1
-            if checks == 2:
+            if checks >= 2:
                 raise ProfileSelectionRefusedBeforeDispatch("no deployment profile; no request was sent")
         return await deploy(**kwargs)
 
@@ -2734,8 +2754,13 @@ async def test_predispatch_profile_refusal_preserves_an_earlier_unanswered_leg(
     )
     deps = replace(deps, deploy_dispatcher=dispatch, git_surface=lambda _repo, _root: surface)
     outcome = await _press(deps, repo_root)
-    assert checks == 2
-    assert outcome.result == "candidate-refused"
+    # Step 1 (FRG-194): the refused profile means the live check could not
+    # run, which no longer ends the press; each later attempt is sent, and
+    # the remote keeps moving, so it ends publication pending. The earlier
+    # unanswered leg still keeps the hold.
+    assert checks == 3
+    assert outcome.result == "publication-pending", outcome.detail
+    assert "was checked — checks" not in outcome.detail
     assert (_record(pool).lease_holder is not None) is earlier_unanswered
 
 
@@ -2793,3 +2818,170 @@ async def test_selected_helper_refusals_release_only_a_confirmed_unanswered_hold
     outcome = await _press(replace(deps, deploy_dispatcher=dispatch), repo_root)
     assert outcome.result == "candidate-refused"
     assert (_record(pool).lease_holder is not None) is (not echo)
+
+
+# ---------------------------------------------------------------------------
+# Step 1 (24 October 2026): bookkeeping after the build never ends a feature.
+# A live check that could not run is advice: the join is published and the
+# press ends "published, deployment pending" with the reason. A red live
+# check still blocks.
+# ---------------------------------------------------------------------------
+
+
+def _an_unconfirmed_archive() -> Any:
+    """What the deploy stage answers when the sidecar refused the step because
+    the coordinator's record did not confirm the candidate archive."""
+    from types import SimpleNamespace
+
+    from forge.deploy.profile_selection import CANDIDATE_ARCHIVE_NOT_CONFIRMED
+
+    return SimpleNamespace(
+        confirmed=True,
+        outcome="failed",
+        verdict=None,
+        failed_step="deploy_compose",
+        events=("DeployQueued", "DeployFailed"),
+        detail={
+            "reason": "candidate_deploy_failed",
+            "gate_summary": {
+                "verdict": None,
+                "failed_step": (
+                    f"deploy_compose — {CANDIDATE_ARCHIVE_NOT_CONFIRMED}; "
+                    "nothing was started"
+                ),
+            },
+        },
+    )
+
+
+class TestALiveCheckThatCouldNotRunIsAdvice:
+    @pytest.fixture(autouse=True)
+    def _no_pause(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        from forge.pipeline import merge_executor
+
+        monkeypatch.setattr(merge_executor, "BOOKKEEPING_RETRY_PAUSE_SECONDS", 0)
+
+    def _dispatcher(self, deploy: _FakeDeploy, unconfirmed: int) -> Any:
+        said = {"checks": 0}
+
+        async def dispatch(**kwargs: Any) -> Any:
+            if kwargs.get("leg") == "candidate_check":
+                said["checks"] += 1
+                if said["checks"] <= unconfirmed:
+                    deploy.calls.append(kwargs)
+                    return _an_unconfirmed_archive()
+            return await deploy(**kwargs)
+
+        dispatch.said = said  # type: ignore[attr-defined]
+        return dispatch
+
+    @pytest.mark.asyncio
+    async def test_an_unconfirmed_archive_is_retried_once_then_published(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        import dataclasses
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deps, deploy, _joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=publisher
+        )
+        dispatch = self._dispatcher(deploy, unconfirmed=99)
+        outcome = await _press(
+            dataclasses.replace(deps, deploy_dispatcher=dispatch), repo_root
+        )
+
+        # Tried once more, then "could not run": published, nothing deployed.
+        assert dispatch.said["checks"] == 2  # type: ignore[attr-defined]
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert outcome.status == "PASSED"
+        assert "could not be checked live" in outcome.detail
+        assert "did not confirm this build's candidate archive" in outcome.detail
+        assert "promote" not in _legs(deploy)
+        assert len(publisher.asked) == 1
+        line = [
+            line
+            for line in _record(pool).lines
+            if (line.kind, line.step) == ("done", "candidate-check")
+        ][-1]
+        # Recorded as unavailable, never as a pass.
+        assert line.detail["verify_ok"] is False
+        assert "candidate archive" in line.detail["unavailable"]
+
+    @pytest.mark.asyncio
+    async def test_an_archive_confirmed_on_the_retry_is_checked_as_usual(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        import dataclasses
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deps, deploy, _joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=publisher
+        )
+        dispatch = self._dispatcher(deploy, unconfirmed=1)
+        outcome = await _press(
+            dataclasses.replace(deps, deploy_dispatcher=dispatch), repo_root
+        )
+
+        assert dispatch.said["checks"] == 2  # type: ignore[attr-defined]
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert "could not be checked live" not in outcome.detail
+        line = [
+            line
+            for line in _record(pool).lines
+            if (line.kind, line.step) == ("done", "candidate-check")
+        ][-1]
+        assert line.detail["verify_ok"] is True
+        assert "unavailable" not in line.detail
+
+    @pytest.mark.asyncio
+    async def test_a_project_with_no_candidate_section_is_published(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        import dataclasses
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=publisher
+        )
+        deploy = _FakeDeploy(
+            candidate_outcome="failed", candidate_reason="no_candidate_section"
+        )
+        outcome = await _press(
+            dataclasses.replace(deps, deploy_dispatcher=deploy), repo_root
+        )
+
+        assert outcome.result == "published-deployment-pending", outcome.detail
+        assert "has no candidate section" in outcome.detail
+        assert "promote" not in _legs(deploy)
+        assert len(publisher.asked) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_red_live_check_still_blocks(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        import dataclasses
+
+        publisher = _APublisherThatSays([_published("c" * 40)])
+        deps, _deploy, _joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=publisher
+        )
+        deploy = _FakeDeploy(candidate_outcome="failed")
+        outcome = await _press(
+            dataclasses.replace(deps, deploy_dispatcher=deploy), repo_root
+        )
+
+        assert outcome.result == "candidate-refused"
+        assert outcome.status == "FAILED"
+        assert publisher.asked == []

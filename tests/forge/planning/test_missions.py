@@ -1142,7 +1142,15 @@ async def test_a_refusal_before_a_build_row_fails_the_attempt_and_the_mission_fi
     attempt = missions.attempt_by_correlation_id(_cid("A"))
     assert attempt.status == "FAILED"
     assert attempt.reason == "the feature file is outside the allowed folders"
+    # A first failure is rebuilt once (step 1, 24 October 2026).
+    assert missions.attempt_by_correlation_id(_cid("A", 2)).status == "WAITING"
     await step.run_once()
+    run.planning(_cid("A", 2), "BUILD_QUEUED")
+    assert recorder(_cid("A", 2), "the feature file is outside the allowed folders.")
+    assert missions.attempt_by_correlation_id(_cid("A", 2)).status == "FAILED"
+    await step.run_once()
+    # No third attempt.
+    assert [a.attempt for a in missions.attempts(mission.id) if a.key == "A"] == [1, 2]
     assert set(_statuses(missions, mission.id).values()) == {"FAILED", "HELD"}
     assert missions.get(mission.id).status == "READY"
 
@@ -1157,6 +1165,65 @@ async def test_a_failed_planning_run_fails_the_attempt(cx, tmp_path) -> None:
     await step.run_once()
     attempt = missions.attempt_by_correlation_id(_cid("A"))
     assert attempt.status == "FAILED" and "FAILED" in attempt.reason
+
+
+@pytest.mark.asyncio
+async def test_a_first_failure_is_rebuilt_once_and_never_a_third_time(
+    cx, tmp_path
+) -> None:
+    """Step 1, 24 October 2026 (FRG-158): one rebuild after any first failure."""
+    missions = _running_mission(cx)
+    mission = missions.get_by_correlation_id(CID)
+    run = _Run(cx, tmp_path)
+    step = _step(missions, run)
+    await step.run_once()
+    run.planning(_cid("A"), "FAILED")
+    await step.run_once()
+    statuses = _statuses(missions, mission.id)
+    assert statuses["A1"] == "FAILED"
+    assert statuses["A2"] in ("WAITING", "ADMITTED")
+    await step.run_once()
+    assert missions.attempt_by_correlation_id(_cid("A", 2)).status == "ADMITTED"
+    run.planning(_cid("A", 2), "TIMED_OUT")
+    await step.run_once()
+    await step.run_once()
+    assert [a.attempt for a in missions.attempts(mission.id) if a.key == "A"] == [1, 2]
+    assert _statuses(missions, mission.id)["A2"] == "FAILED"
+
+
+@pytest.mark.asyncio
+async def test_a_cancelled_planning_run_is_not_rebuilt(cx, tmp_path) -> None:
+    missions = _running_mission(cx)
+    mission = missions.get_by_correlation_id(CID)
+    run = _Run(cx, tmp_path)
+    step = _step(missions, run)
+    await step.run_once()
+    run.planning(_cid("A"), "CANCELLED")
+    await step.run_once()
+    assert [a.attempt for a in missions.attempts(mission.id) if a.key == "A"] == [1]
+    assert _statuses(missions, mission.id)["A1"] == "FAILED"
+
+
+def test_a_cancelled_build_is_not_rebuilt(cx, tmp_path) -> None:
+    missions = _running_mission(cx)
+    run = _Run(cx, tmp_path)
+    cid = _admitted_with_run(missions, run)
+    run.build(cid, "FEAT-AAA1", "CANCELLED")
+    _step(missions, run).close(missions.get_by_correlation_id(CID))
+    attempt = missions.attempt_by_correlation_id(cid)
+    assert attempt.status == "FAILED"
+    assert [a.attempt for a in missions.attempts(attempt.mission_id) if a.key == "A"] == [1]
+
+
+def test_a_failed_build_is_rebuilt_once(cx, tmp_path) -> None:
+    missions = _running_mission(cx)
+    run = _Run(cx, tmp_path)
+    cid = _admitted_with_run(missions, run)
+    run.build(cid, "FEAT-AAA1", "FAILED")
+    _step(missions, run).close(missions.get_by_correlation_id(CID))
+    attempt = missions.attempt_by_correlation_id(cid)
+    assert attempt.status == "FAILED"
+    assert _statuses(missions, attempt.mission_id)["A2"] == "WAITING"
 
 
 def test_a_mission_build_never_reads_as_no_merge_card(cx, tmp_path) -> None:
@@ -1364,7 +1431,8 @@ def test_the_presss_own_failed_report_fails_the_attempt(cx, tmp_path) -> None:
     _step(missions, run).close(missions.get_by_correlation_id(CID))
     attempt = missions.attempt_by_correlation_id(cid)
     assert attempt.status == "FAILED" and attempt.reason == "the check failed"
-    assert [a.attempt for a in missions.attempts(attempt.mission_id) if a.key == "A"] == [1]
+    # A first failure is rebuilt once (step 1, 24 October 2026).
+    assert _statuses(missions, attempt.mission_id)["A2"] == "WAITING"
 
 
 def test_a_landing_the_merge_side_gave_up_on_fails_with_its_sentence(cx, tmp_path) -> None:

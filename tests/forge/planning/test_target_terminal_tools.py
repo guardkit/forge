@@ -24,7 +24,6 @@ from forge.planning.target_terminal_tools import (
     comment_box_drawing_dividers,
     FrontmatterIdRepair,
     FrontmatterRepairResult,
-    is_repairable_truncation,
     read_frontmatter_feature_id,
     repair_frontmatter_feature_id,
     repair_plan_task_frontmatter,
@@ -959,12 +958,13 @@ def test_p8_repair_preserves_quoting_style() -> None:
     assert 'feature_id: "FEAT-0482"\n' in new_text
 
 
-def test_p8_repair_negative_non_prefix_is_untouched() -> None:
-    # A NON-prefix mismatch must NOT be touched (conservative by law).
+def test_p8_repair_rewrites_a_non_prefix_mismatch_too() -> None:
+    # FRG-083 (24 October 2026): any differing id is bookkeeping and is set to
+    # the issued id; the caller's scope fence decides which documents.
     doc = _task_doc("FEAT-9999")  # canonical FEAT-07F3
     new_text, before = repair_frontmatter_feature_id(doc, "FEAT-07F3")
-    assert before is None
-    assert new_text == doc  # byte-identical
+    assert before == "FEAT-9999"
+    assert new_text == doc.replace("feature_id: FEAT-9999\n", "feature_id: FEAT-07F3\n")
 
 
 def test_p8_repair_clean_doc_byte_untouched() -> None:
@@ -1044,13 +1044,14 @@ def test_p8_tree_run4_shape_only_drifted_doc_repaired(tmp_path: Path) -> None:
     assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == clean_before
 
 
-def test_p8_tree_negative_non_prefix_untouched(tmp_path: Path) -> None:
+def test_p8_tree_non_prefix_in_this_runs_own_doc_is_repaired(tmp_path: Path) -> None:
     docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-9999", "TASK-A001")}
     _write_task_tree(tmp_path, docs)
-    original = (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
     result = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
-    assert not result.fired
-    assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == original
+    assert result.fired
+    assert read_frontmatter_feature_id(
+        (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
+    ) == "FEAT-07F3"
 
 
 def test_p8_tree_clean_docs_do_not_fire(tmp_path: Path) -> None:
@@ -1142,16 +1143,16 @@ async def test_p8_wired_run4_one_repaired_validate_proceeds(tmp_path: Path) -> N
 
 
 @pytest.mark.asyncio
-async def test_p8_wired_negative_non_prefix_still_refuses(tmp_path: Path) -> None:
+async def test_p8_wired_non_prefix_in_own_doc_is_repaired_and_validate_proceeds(
+    tmp_path: Path,
+) -> None:
     docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-9999", "TASK-A001")}
     _write_task_tree(tmp_path, docs)
-    original = (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
     run_fn, _calls = _parity_validate_seam("FEAT-07F3")
     validate = make_validate_feature_plan(run_fn=run_fn)
     outcome = await validate(tmp_path, "FEAT-07F3")
-    assert not outcome.ok  # refuse path unchanged — repair never touched it
-    assert "FRONTMATTER PARITY FAILED" in outcome.detail
-    assert (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8") == original
+    assert outcome.ok
+    assert "rewrote 1" in outcome.detail
 
 
 @pytest.mark.asyncio
@@ -1297,36 +1298,16 @@ def test_p8_a_doc_this_run_wrote_with_a_last_character_truncation_is_repaired(
     )
 
 
-def test_p8_a_written_doc_whose_id_is_a_real_feature_is_refused(
+def test_p8_a_doc_this_run_wrote_is_set_to_the_issued_id_whatever_it_named(
     tmp_path: Path,
 ) -> None:
-    """Even inside the run's own writing, an id the repository already knows as
-    a feature is never renamed — a feature file under .guardkit/features/ is
-    the repository saying so."""
+    """FRG-083 (24 October 2026): inside this run's own writing the front matter
+    is bookkeeping. A document this run wrote belongs to the feature it was
+    issued, even when its id names a feature the repository already has; the
+    other feature's own documents are never touched."""
     features = tmp_path / ".guardkit" / "features"
     features.mkdir(parents=True)
     (features / "FEAT-DB.yaml").write_text("id: FEAT-DB\n", encoding="utf-8")
-    rel = "tasks/backlog/TASK-DB-005-create-initial-migration.md"
-    _write_task_tree(tmp_path, {rel: _task_doc("FEAT-DB", "TASK-DB-005")})
-    original = (tmp_path / rel).read_bytes()
-
-    result = repair_plan_task_frontmatter(
-        tmp_path, "FEAT-DBB5", written_rel_paths=[rel]
-    )
-
-    assert not result.repairs
-    assert (tmp_path / rel).read_bytes() == original
-    assert [r.rule for r in result.refusals] == [ttt.REFUSAL_ALREADY_A_FEATURE]
-    receipt = result.receipt("FEAT-DBB5")
-    assert rel in receipt and "FEAT-DB" in receipt and "FEAT-DBB5" in receipt
-    assert "already a feature of this repository" in receipt
-
-
-def test_p8_a_written_doc_whose_id_another_doc_declares_is_refused(
-    tmp_path: Path,
-) -> None:
-    """FEAT-DB has no feature file in api_test — it is recorded only by its own
-    task documents, and that counts as the repository knowing it."""
     mine = "tasks/backlog/TASK-DB-009-new.md"
     theirs = "tasks/design_approved/TASK-DB-001-create-database-infrastructure.md"
     _write_task_tree(
@@ -1336,43 +1317,20 @@ def test_p8_a_written_doc_whose_id_another_doc_declares_is_refused(
             theirs: _task_doc("FEAT-DB", "TASK-DB-001"),
         },
     )
-    original = (tmp_path / mine).read_bytes()
+    their_bytes = (tmp_path / theirs).read_bytes()
 
     result = repair_plan_task_frontmatter(
         tmp_path, "FEAT-DBB5", written_rel_paths=[mine]
     )
 
-    assert not result.repairs
-    assert (tmp_path / mine).read_bytes() == original
-    rules = {r.rel_path: r.rule for r in result.refusals}
-    assert rules[mine] == ttt.REFUSAL_ALREADY_A_FEATURE
-    assert rules[theirs] == ttt.REFUSAL_NOT_WRITTEN_BY_THIS_RUN
-
-
-@pytest.mark.skipif(os.geteuid() == 0, reason="root can read an unreadable directory")
-def test_p8_a_repository_that_cannot_be_consulted_refuses_rather_than_rewrites(
-    tmp_path: Path,
-) -> None:
-    """Unknown is not permission: with the repository's own features
-    unreadable, a rewrite that cannot be shown to be safe is refused."""
-    features = tmp_path / ".guardkit" / "features"
-    features.mkdir(parents=True)
-    (features / "FEAT-07F3.yaml").write_text("id: FEAT-07F3\n", encoding="utf-8")
-    rel = "tasks/backlog/TASK-A001.md"
-    _write_task_tree(tmp_path, {rel: _task_doc("FEAT-07F", "TASK-A001")})
-    original = (tmp_path / rel).read_bytes()
-    os.chmod(features, 0o000)
-    try:
-        result = repair_plan_task_frontmatter(
-            tmp_path, "FEAT-07F3", written_rel_paths=[rel]
-        )
-    finally:
-        os.chmod(features, 0o755)
-
-    assert not result.repairs
-    assert (tmp_path / rel).read_bytes() == original  # the same bytes, refused
-    assert [r.rule for r in result.refusals] == [ttt.REFUSAL_FEATURES_UNREADABLE]
-    assert "unknown is not permission" in result.receipt("FEAT-07F3")
+    assert [r.rel_path for r in result.repairs] == [mine]
+    assert read_frontmatter_feature_id(
+        (tmp_path / mine).read_text(encoding="utf-8")
+    ) == "FEAT-DBB5"
+    assert (tmp_path / theirs).read_bytes() == their_bytes
+    assert {r.rel_path: r.rule for r in result.refusals} == {
+        theirs: ttt.REFUSAL_NOT_WRITTEN_BY_THIS_RUN
+    }
 
 
 def test_p8_when_this_runs_own_writing_cannot_be_read_nothing_is_rewritten(
@@ -1415,25 +1373,15 @@ def test_p8_no_repository_is_decided_by_the_git_entry_not_by_gits_words(
     assert ttt._is_git_worktree(repo) is True
 
 
-def test_p8_the_shape_bound_is_the_observed_defect_and_no_wider(tmp_path: Path) -> None:
-    """A one- or two-character truncation is the defect; three is not."""
-    assert ttt.MAX_TRUNCATION_CHARS == 2
-    assert is_repairable_truncation("FEAT-07F", "FEAT-07F3")
-    assert is_repairable_truncation("FEAT-07", "FEAT-07F3")
-    assert not is_repairable_truncation("FEAT-0", "FEAT-07F3")
-    assert not is_repairable_truncation("FEAT-9999", "FEAT-07F3")
-    assert not is_repairable_truncation("", "FEAT-07F3")
-
+def test_p8_any_length_of_difference_in_own_doc_is_repaired(tmp_path: Path) -> None:
+    """No shape bound since 24 October 2026: the scope fence is the safety."""
     rel = "tasks/backlog/TASK-A001.md"
     _write_task_tree(tmp_path, {rel: _task_doc("FEAT-0", "TASK-A001")})
-    original = (tmp_path / rel).read_bytes()
     result = repair_plan_task_frontmatter(
         tmp_path, "FEAT-07F3", written_rel_paths=[rel]
     )
-    assert not result.repairs
-    assert (tmp_path / rel).read_bytes() == original
-    assert [r.rule for r in result.refusals] == [ttt.REFUSAL_NOT_A_TRUNCATION]
-    assert "more missing than a truncation" in result.receipt("FEAT-07F3")
+    assert [r.before for r in result.repairs] == ["FEAT-0"]
+    assert not result.refusals
 
 
 def test_p8_an_empty_written_list_means_this_run_wrote_nothing(tmp_path: Path) -> None:

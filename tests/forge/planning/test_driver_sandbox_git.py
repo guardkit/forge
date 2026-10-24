@@ -306,14 +306,14 @@ async def test_the_plan_legs_checks_run_in_the_sandbox_and_the_stamps_ride_the_c
 
 
 @pytest.mark.asyncio
-async def test_sidecar_normalizer_review_refusal_fails_after_commit_before_build(
+async def test_sidecar_normalizer_review_error_is_carded_after_commit(
     store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path
 ) -> None:
     """A mutating declared check cannot inherit the pre-normalization receipt.
 
     The sidecar has already made the immutable plan commit when Forge can ask
-    the async specialist to judge its exact bytes. A refused review therefore
-    leaves that audit commit in place but stops before the build trigger.
+    the async specialist to judge its exact bytes. A re-review that errors is
+    bookkeeping: the build card names it and decides.
     """
     repo, _, _ = sandbox_repo
     _queue(store)
@@ -337,15 +337,19 @@ async def test_sidecar_normalizer_review_refusal_fails_after_commit_before_build
 
     h = _driver(store, sandbox_repo, plan_dispatch=reviewer)
 
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert h.ctx["counters"]["build_trigger"] == 0
+    # A re-review call that errored is a record that cannot be read as a
+    # verdict (24 October 2026): the plan carries on, and the build card says
+    # the review record was unreadable and decides.
+    await h.driver.drive(CID)
     assert len(normalize_calls(fake_guardkit)) == 1
     assert _plan_yaml_on_branch(repo, f"planning/{CID}")
-    assert any(
-        "committed plan semantic re-review failed" in message
-        and "Coach refused normalized tree" in message
-        for _, message, _ in h.ctx["notifications"]
-    )
+    plan = [
+        json.loads(e["details_json"])
+        for e in store.list_events(CID)
+        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
+    ]
+    assert plan
+    assert "Coach refused normalized tree" in plan[-1]["plan_review_note"]
 
 
 @pytest.mark.asyncio

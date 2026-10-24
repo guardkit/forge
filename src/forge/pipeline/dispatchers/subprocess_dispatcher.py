@@ -1085,11 +1085,21 @@ async def dispatch_subprocess_stage(
             from forge.lifecycle.feature_routing import validate_feature_routing_id
 
             feature_routing_id = validate_feature_routing_id(feature_routing_id)
+        # A missing routing id, gate or receipt is bookkeeping: logged, and
+        # the leg carries on unrouted (step 1, 24 October 2026; FRG-095).
         if feature_routing_required and feature_routing_id is None:
-            raise ValueError("required subprocess dispatch has no feature_routing_id")
+            logger.warning(
+                "dispatch_subprocess_stage: %s has no feature routing id; "
+                "dispatching unrouted",
+                build_id,
+            )
         if feature_routing_id is not None:
             if feature_routing_gate is None and feature_routing_required:
-                raise ValueError("required subprocess dispatch has no durable routing gate")
+                logger.warning(
+                    "dispatch_subprocess_stage: %s has no routing gate; "
+                    "dispatching unrouted",
+                    build_id,
+                )
             if feature_routing_gate is not None:
                 committed = await feature_routing_gate.ensure_seeded(
                     feature_routing_id,
@@ -1136,9 +1146,9 @@ async def dispatch_subprocess_stage(
             runner_kwargs["launch_settings"] = tuple(str(n) for n in launch_settings)
         if feature_routing_id is not None:
             runner_kwargs["feature_routing_id"] = feature_routing_id
-        if feature_routing_required:
-            runner_kwargs["feature_routing_required"] = True
         if feature_routing_receipt is not None:
+            if feature_routing_required:
+                runner_kwargs["feature_routing_required"] = True
             runner_kwargs["feature_routing_receipt"] = feature_routing_receipt
 
         guardkit_result = await subprocess_runner(**runner_kwargs)

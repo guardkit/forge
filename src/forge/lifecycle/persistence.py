@@ -1719,6 +1719,12 @@ class SqliteLifecyclePersistence:
         forgiveness as :meth:`read_planning_repository_unavailable`."""
         return self._planning_plan_line(correlation_id, "plan_size_note")
 
+    def read_planning_plan_review_note(self, correlation_id: str | None) -> str | None:
+        """The plain line the planning run recorded when the plan's review
+        record could not be read, or ``None`` (24 October 2026). The same
+        query and forgiveness as the two readers above."""
+        return self._planning_plan_line(correlation_id, "plan_review_note")
+
     def _planning_plan_line(self, correlation_id: str | None, key: str) -> str | None:
         """One plain line off the latest approved ``feature-plan`` record."""
         if not correlation_id:
@@ -1865,10 +1871,12 @@ class SqliteLifecyclePersistence:
         Last write wins. The reuse arm re-records the same branch on a
         redelivery, which is a no-op in value terms.
 
-        A feature build never calls this: its column stays NULL and every
-        reader falls back to ``autobuild/<feature id>``, so an empty value is
-        refused rather than written as a marker that reads like the fallback
-        without being it.
+        A whole feature build never calls this: its column stays NULL and
+        every reader falls back to ``autobuild/<feature id>``, so an empty
+        value is refused rather than written as a marker that reads like the
+        fallback without being it. A feature build that finished on its
+        approved part records ``autobuild/<feature id>-approved`` here (the
+        merge offer, step 1, 24 October 2026).
 
         Args:
             build_id: The build whose journey branch was cut.

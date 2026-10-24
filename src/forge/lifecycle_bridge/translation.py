@@ -240,6 +240,12 @@ class _Snapshot:
     #: BuildCompletePayload object for the merge-offer hook and deliberately
     #: remains outside the v1 wire schema.
     worktree_retention: dict[str, Any] | None = None
+    #: The approved part's branch, when the build finished on one (step 1,
+    #: 24 October 2026); ``None`` means the feature's own ``autobuild/<FEAT>``.
+    merge_branch: str | None = None
+    #: The tasks the offered branch does not include, as the runner listed
+    #: them. Attached beside the payload like ``worktree_retention``.
+    tasks_not_included: Any = None
 
 
 def _extract_error_metadata(
@@ -344,6 +350,12 @@ def _extract_state(data: Mapping[str, Any], feature_id: str) -> _Snapshot | None
                 if isinstance(snap.get("worktree_retention"), Mapping)
                 else None
             ),
+            merge_branch=(
+                str(snap["merge_branch"]).strip() or None
+                if snap.get("merge_branch")
+                else None
+            ),
+            tasks_not_included=snap.get("tasks_not_included"),
         )
     except (KeyError, TypeError, ValueError) as exc:
         logger.debug(
@@ -591,7 +603,9 @@ class StreamEventTranslator:
             # mode checks the build out on ``autobuild/<FEATURE_ID>`` — "the ref
             # is named after the FEATURE, not any task id". That is the branch
             # holding the built code, which is what jarvis tells the owner.
-            branch=f"autobuild/{snap.feature_id}",
+            # The approved part's branch when the build finished on one
+            # (step 1, 24 October 2026); otherwise the feature's own.
+            branch=snap.merge_branch or f"autobuild/{snap.feature_id}",
             tasks_completed=snap.tasks_completed,
             tasks_failed=max(total - snap.tasks_completed, 0),
             tasks_total=total,
@@ -603,6 +617,12 @@ class StreamEventTranslator:
         if snap.worktree_retention is not None:
             object.__setattr__(
                 payload, "worktree_retention", dict(snap.worktree_retention)
+            )
+        if snap.merge_branch is not None:
+            object.__setattr__(payload, "merge_branch", snap.merge_branch)
+        if snap.tasks_not_included is not None:
+            object.__setattr__(
+                payload, "tasks_not_included", snap.tasks_not_included
             )
         return payload
 

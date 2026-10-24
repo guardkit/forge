@@ -44,6 +44,14 @@ class ProfileSelectionRefusedBeforeDispatch(DeployProfileError):
     """Profile validation refused before any deployment request was sent."""
 
 
+#: The deploy sidecar's sentence when the coordinator's record did not confirm
+#: the build's candidate archive. Shared so the merge press can tell this
+#: bookkeeping refusal (the live check never ran) from a red check.
+CANDIDATE_ARCHIVE_NOT_CONFIRMED: str = (
+    "the coordinator did not confirm this build's candidate archive"
+)
+
+
 @dataclass(frozen=True)
 class FirstDeploymentProfile:
     version: int

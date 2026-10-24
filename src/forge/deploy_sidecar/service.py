@@ -224,7 +224,11 @@ from forge.deploy.candidate_tree import (
     is_candidate_tree_path,
     read_file_at_commit_sync,
 )
-from forge.deploy.profile_selection import parse_profile_reference, validate_committed_profile_path
+from forge.deploy.profile_selection import (
+    CANDIDATE_ARCHIVE_NOT_CONFIRMED,
+    parse_profile_reference,
+    validate_committed_profile_path,
+)
 from forge.deploy.profile import (
     DeployProfile,
     DeployProfileError,
@@ -2591,7 +2595,7 @@ def _process_run_request_impl(
             or type(layout.get("attempt")) is not int or layout["attempt"] < 1
             or type(layout.get("turn")) is not int or layout["turn"] < 1
         ):
-            return 400, {"error": "the coordinator did not confirm this build's candidate archive; nothing was started"}
+            return 400, {"error": f"{CANDIDATE_ARCHIVE_NOT_CONFIRMED}; nothing was started"}
         joined_commit = layout.get("joined_commit")
         joined_tree = layout.get("joined_tree")
         if not all(isinstance(value, str) and re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", value)

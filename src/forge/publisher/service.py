@@ -116,6 +116,7 @@ from forge.publisher.the_record import (
     TheLedgerIsUnreadable,
     TheRecord,
     TheRecordReader,
+    a_step_that_could_not_run_on,
     a_step_that_passed_on,
 )
 
@@ -1333,7 +1334,22 @@ class Publisher:
             (STEP_MERGE_CHECKS, "the build system's own checks after the join"),
             (STEP_CANDIDATE_CHECK, "the factory's own live check of the joined result"),
         ):
-            if a_step_that_passed_on(record, step, j_commit) is None:
+            if a_step_that_passed_on(record, step, j_commit) is not None:
+                continue
+            # FRG-178 AS ADVICE (step 1, 24 October 2026): a check recorded
+            # as unavailable on this commit did not run, so it is not a red
+            # result. It is logged and the send goes ahead; red still blocks.
+            unavailable = a_step_that_could_not_run_on(record, step, j_commit)
+            if unavailable is not None:
+                logger.warning(
+                    "publisher: build %s — %s could not run on %s (%s); "
+                    "advice, not a refusal",
+                    build_id,
+                    said,
+                    j_commit[:10],
+                    unavailable,
+                )
+            else:
                 return _refused(
                     "the-checks-are-not-recorded-as-passed",
                     f"build {build_id}'s record does not show {said} passing "

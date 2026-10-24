@@ -199,15 +199,32 @@ class TheCoordinatorsRecord:
             if is_build:
                 try:
                     reference = confirmed_profile_reference(connection, str(build), commit)
-                except ValueError:
+                except ValueError as exc:
                     # Contradictory or ended authority cannot widen a build's
                     # declarations. Its original start answer is still valid.
+                    # The reason is said, not swallowed (step 1, 24 October
+                    # 2026): a missing confirmation is otherwise invisible.
+                    logger.warning(
+                        "record answer: no first deployment profile is "
+                        "confirmed for %r (%s)",
+                        str(build),
+                        exc,
+                    )
                     reference = None
                 if reference is not None:
                     answer["first_deployment_profile"] = reference
                 try:
                     layout = confirmed_deployment_layout(connection, str(build), commit)
-                except ValueError:
+                except ValueError as exc:
+                    # Said, not swallowed (Python run 10, 23 October 2026: a
+                    # mission landing has no per-feature offer, so the layout
+                    # was refused here and the sidecar only saw it missing).
+                    logger.warning(
+                        "record answer: the candidate archive of %r is not "
+                        "confirmed (%s)",
+                        str(build),
+                        exc,
+                    )
                     layout = None
                 if layout is not None:
                     answer["deployment_layout"] = layout

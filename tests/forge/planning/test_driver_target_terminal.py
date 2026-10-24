@@ -1614,29 +1614,76 @@ async def test_plan_invalid_artifacts_fails(store: SqlitePlanningRunStore) -> No
 
 
 @pytest.mark.asyncio
-async def test_plan_missing_semantic_review_fails_before_write(
+async def test_plan_missing_semantic_review_passes_and_the_build_card_says_so(
     store: SqlitePlanningRunStore,
 ) -> None:
+    """A missing review record is bookkeeping (24 October 2026): the existing
+    re-review is asked once; when its record is missing too, the plan carries
+    on and the build card says the review record was unreadable."""
     _queue(store)
     files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    calls: list[dict[str, Any]] = []
+
+    async def _no_review_ever(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="completed"),
+            role_output={"files": dict(files)},
+            reason=None,
+        )
+
+    h = _make_driver(store, plan_dispatch=_no_review_ever)
+
+    await h.driver.drive(CID)
+
+    # The existing re-review was asked exactly once, then never again.
+    assert [c.get("revision_of") is not None for c in calls] == [False, True]
+    # And the line reaches the build gate's card through the real reader.
+    from forge.cli._serve_gate_activation import _planning_card_lines
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence
+
+    ledger = SqliteLifecyclePersistence(connection=store._connection)
+    assert "Plan review record unreadable" in (_planning_card_lines(ledger, CID) or "")
+
+    plan = [
+        json.loads(e["details_json"])
+        for e in store.list_events(CID)
+        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
+    ]
+    assert plan, "the plan was recorded, not refused"
+    assert "semantic_review" not in plan[-1]
+    assert "Plan review record unreadable" in plan[-1]["plan_review_note"]
+    assert "semantic_review.json is missing" in plan[-1]["plan_review_note"]
+
+
+@pytest.mark.asyncio
+async def test_a_refusing_plan_review_verdict_still_fails_before_write(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """A readable verdict that did not approve is never turned into a yes."""
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    review = json.loads(_semantic_review_json(files))
+    review["decision"] = "rejected"
     h = _make_driver(
         store,
         plan_result=SimpleNamespace(
             outcome=SimpleNamespace(value="completed"),
-            role_output={"files": files},
+            role_output={"files": files, "semantic_review.json": json.dumps(review)},
             reason=None,
         ),
     )
 
     assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
     assert any(
-        "semantic review" in message.lower()
+        "semantic review refused" in message.lower()
+        or "semantic review" in message.lower()
         for _, message, _ in h.ctx["notifications"]
     )
 
 
 @pytest.mark.asyncio
-async def test_plan_rewrite_with_stale_semantic_review_fails_before_write(
+async def test_plan_rewrite_with_stale_semantic_review_is_carded_not_refused(
     store: SqlitePlanningRunStore,
 ) -> None:
     _queue(store)
@@ -1649,11 +1696,18 @@ async def test_plan_rewrite_with_stale_semantic_review_fails_before_write(
     }
     h = _make_driver(store, plan_result=result)
 
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert any(
-        "digest does not match" in message
-        for _, message, _ in h.ctx["notifications"]
-    )
+    await h.driver.drive(CID)
+
+    # The stale record is not used; the existing re-review judges the tree
+    # actually sent, and its verdict is the one recorded.
+    plan = [
+        json.loads(e["details_json"])
+        for e in store.list_events(CID)
+        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
+    ]
+    assert plan
+    assert plan[-1]["semantic_review"]["reviewed_after_rewrite"] is True
+    assert "plan_review_note" not in plan[-1]
 
 
 @pytest.mark.asyncio
@@ -2015,13 +2069,17 @@ class _NamedAnswer(ApprovalResponsePayload):
 
 
 def _auth_door_card(h: _Harness) -> dict[str, Any]:
-    """The ONE auth-confirmation card the run put in front of the owner."""
+    """The ONE auth-confirmation card the run put in front of the owner.
+
+    Since 24 October 2026 (FRG-035) an unanswered card is posted once more,
+    the same card with the same request id, so it may appear twice."""
     cards = [
         env.payload["details"]
         for env in h.ctx["publisher"].envelopes
         if env.payload["details"].get("checkpoint_type") == _AUTH_DOOR_CHECKPOINT_TYPE
     ]
-    assert len(cards) == 1, f"expected exactly one auth card, got {len(cards)}"
+    assert len(cards) in (1, 2), f"expected one auth card, got {len(cards)}"
+    assert all(card == cards[0] for card in cards)
     return cards[0]
 
 
@@ -8278,7 +8336,7 @@ async def test_normalizer_rewrite_requests_exact_semantic_rereview(
 
 
 @pytest.mark.asyncio
-async def test_failed_exact_re_review_stops_normalized_plan_before_commit(
+async def test_unmarked_exact_re_review_is_carded_not_refused(
     store: SqlitePlanningRunStore,
     tmp_path: Path,
 ) -> None:
@@ -8308,11 +8366,17 @@ async def test_failed_exact_re_review_stops_normalized_plan_before_commit(
         normalize_stamps_fn=_stamping_normalizer(sink, write=True),
     )
 
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert any(
-        "did not mark the rewritten tree" in message
-        for _, message, _ in h.ctx["notifications"]
-    )
+    # An unmarked re-review is a record that cannot be read as a verdict about
+    # this tree (24 October 2026): the plan carries on and the build card says
+    # so.
+    await h.driver.drive(CID)
+    plan = [
+        json.loads(e["details_json"])
+        for e in store.list_events(CID)
+        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
+    ]
+    assert plan
+    assert "did not mark the rewritten tree" in plan[-1]["plan_review_note"]
 
 
 # ---------------------------------------------------------------------------
@@ -8650,3 +8714,74 @@ async def test_the_planner_reads_the_commit_the_run_starts_from_not_the_checkout
     inventory = counters["last_descriptor"]["repository_inventory"]["files"]
     assert "src/arrived_on_main.py" in inventory
     assert "src/local_only.py" not in inventory
+
+
+# ---------------------------------------------------------------------------
+# Bookkeeping before the build never ends the run (24 October 2026)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_a_final_plan_source_that_will_not_freeze_is_retried_once_then_queued(
+    store: SqlitePlanningRunStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """FRG-063: freezing the final plan source is bookkeeping. One retry, then
+    the build is queued as planned."""
+    from forge.planning import requirement_amendment_store
+
+    calls: list[str] = []
+
+    async def refuses(*_args: Any, **_kwargs: Any) -> None:
+        calls.append("freeze")
+        raise requirement_amendment_store.AmendmentRefused("receipts out of order")
+
+    monkeypatch.setattr(requirement_amendment_store, "freeze_final_plan", refuses)
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _queue(store)
+    h = _make_driver(
+        store, git_runner=_recorded_runner(tmp_path / "wt", repo), repo_path=str(repo)
+    )
+
+    await h.driver.drive(CID)
+
+    assert calls == ["freeze", "freeze"]
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+
+
+@pytest.mark.asyncio
+async def test_a_plan_record_without_its_commit_skips_the_bars_and_gate_and_queues(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """FRG-067: a plan record that lost its commit or feature id is bookkeeping.
+    The id is minted from the run as before; the bars and the gate are skipped
+    with the reason recorded; the build is still queued."""
+    repo = tmp_path / "api_test"
+    _init_scratch_repo(repo)
+    _queue(store)
+    h = _make_driver(
+        store, git_runner=_recorded_runner(tmp_path / "wt", repo), repo_path=str(repo)
+    )
+    real_record = store._record_event
+
+    def drop_the_commit(**kwargs: Any) -> Any:
+        if kwargs.get("stage_label") == "feature-plan" and kwargs.get("status") == "approved":
+            details = json.loads(kwargs["details_json"])
+            details.pop("sha", None)
+            details.pop("feature_id", None)
+            kwargs["details_json"] = json.dumps(details)
+        return real_record(**kwargs)
+
+    store._record_event = drop_the_commit  # type: ignore[method-assign]
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    skipped = {
+        e["stage_label"]: json.loads(e["details_json"])
+        for e in store.list_events(CID)
+        if e["stage_label"] in ("qa-pass-bars", "qa-feature-gate")
+        and e["status"] == "approved"
+    }
+    assert skipped["qa-pass-bars"]["reason_code"] == "plan_record_incomplete"
+    assert skipped["qa-feature-gate"]["skipped"] is True

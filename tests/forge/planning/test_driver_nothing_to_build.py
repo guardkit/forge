@@ -325,10 +325,51 @@ async def test_a_refused_transition_sends_nothing(
 # ---------------------------------------------------------------------------
 
 
+def _then_an_ordinary_plan(h: Any, rec: _Recorder, first_reply: Any) -> None:
+    """The plan writer answers "already done" when asked for that answer, and
+    with an ordinary plan when it is not (24 October 2026)."""
+    deps = h.driver._deps
+
+    async def dispatch_plan(**kwargs: Any) -> Any:
+        rec.plan_calls.append(kwargs)
+        if rec.notifications_before_plan is None:
+            rec.notifications_before_plan = len(h.ctx["notifications"])
+            rec.cards_before_plan = len(h.ctx["publisher"].envelopes)
+        if kwargs.get(nothing_to_build.REQUEST_FIELD):
+            return first_reply(kwargs["target_repo_descriptor"])
+        return _plan_result_native(kwargs["feature_id"])
+
+    deps.dispatch_feature_plan = dispatch_plan
+
+    async def build_trigger(row: Any, correlation_id: str) -> bool:
+        # The spy stops the drive here: the row stays FEATURE_PLAN.
+        rec.legs.append("_build_trigger_leg")
+        return False
+
+    h.driver._build_trigger_leg = build_trigger
+
+
+def _reached_the_normal_handoff(store: SqlitePlanningRunStore, rec: _Recorder) -> None:
+    assert rec.legs == [
+        "_register_pass_bars_leg",
+        "_register_feature_gate_leg",
+        "_build_trigger_leg",
+    ]
+    assert any(
+        e["stage_label"] == "feature-plan" and e["status"] == "approved"
+        for e in store.list_events(CID)
+    )
+    assert rec.complete == [] and rec.failed == []
+
+
 @pytest.mark.asyncio
-async def test_a_citation_outside_the_windows_sent_fails_once_and_runs_no_leg(
+async def test_a_partly_proven_claim_is_planned_as_usual_and_reaches_the_handoff(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
+    """FRG-070 (24 October 2026): one citation outside the windows sent is
+    advice. One ordinary plan is asked for, without the already-done option,
+    carrying the proven parts as its note, and it goes into the normal
+    handoff."""
     repo = _scratch_repo(tmp_path)
     _queue(store)
     h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
@@ -341,26 +382,72 @@ async def test_a_citation_outside_the_windows_sent_fails_once_and_runs_no_leg(
         return _nothing_reply(parts, scenarios)
 
     _wire(h, rec, reply)
+    _then_an_ordinary_plan(h, rec, reply)
 
     await h.driver.drive(CID)
 
-    run = store.get_run(CID)
-    assert run["state"] == PlanningState.FAILED.value
-    after = _messages_after_plan(h, rec)
-    assert len(after) == 1
-    _, message, level = after[0]
-    assert level == "error"
-    assert "src/stats.py:900" in message
-    assert "outside the code it was shown" in message
-    assert message.endswith("Nothing was built.")
-    assert rec.complete == []
-    assert len(rec.failed) == 1
+    first, second = rec.plan_calls[0], rec.plan_calls[1]
+    assert first.get(nothing_to_build.REQUEST_FIELD) is True
+    assert nothing_to_build.REQUEST_FIELD not in second
+    note = second["validate_feedback"]
+    assert "src/stats.py:900" in note
+    assert "Write an ordinary plan" in note
+    # The scenario's proof was inside the windows: it is carried as proven;
+    # the part with the outside citation is not.
+    assert f'"{SCENARIO}" is checked by an existing test' in note
+    assert '"add a GET /stats endpoint" is already done' not in note
+    assert store.get_run(CID)["state"] != PlanningState.FAILED.value
+    _reached_the_normal_handoff(store, rec)
+
+
+@pytest.mark.asyncio
+async def test_a_nothing_to_build_reply_that_also_plans_work_is_planned_as_usual(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    repo = _scratch_repo(tmp_path)
+    _queue(store)
+    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
+    _switch_on(h)
+    rec = _Recorder()
+
+    def reply(descriptor: Any) -> Any:
+        result = _nothing_reply(*_proof_from_windows(descriptor))
+        files = {
+            GUIDE: result.role_output[GUIDE],
+            ".guardkit/features/FEAT-0000.yaml": "id: FEAT-0000\n",
+        }
+        result.role_output[".guardkit/features/FEAT-0000.yaml"] = files[
+            ".guardkit/features/FEAT-0000.yaml"
+        ]
+        result.role_output["semantic_review.json"] = _semantic_review_json(files)
+        return result
+
+    _wire(h, rec, reply)
+    _then_an_ordinary_plan(h, rec, reply)
+
+    await h.driver.drive(CID)
+
+    assert len(rec.plan_calls) == 2
+    assert "also sent a plan to build" in rec.plan_calls[1]["validate_feedback"]
+    _reached_the_normal_handoff(store, rec)
+
+
+@pytest.mark.asyncio
+async def test_the_switch_off_still_refuses_the_answer(
+    store: SqlitePlanningRunStore, tmp_path: Path
+) -> None:
+    """Only the switch being off still ends the run (24 October 2026)."""
+    repo = _scratch_repo(tmp_path)
+    _queue(store)
+    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
+    rec = _Recorder()
+    _wire(h, rec, lambda descriptor: _nothing_reply(*_proof_from_windows(descriptor)))
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
+    assert len(rec.plan_calls) == 1
     assert rec.legs == []
-    assert h.ctx["counters"]["build_trigger"] == 0
-    assert not any(
-        e["stage_label"] == "feature-plan" and e["status"] == "approved"
-        for e in store.list_events(CID)
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -487,39 +574,6 @@ async def test_the_flag_rides_on_the_exact_re_review_call_too(
         ("plan", True),
         ("re-review", True),
     ]
-
-
-@pytest.mark.asyncio
-async def test_a_nothing_to_build_reply_that_also_plans_work_is_refused(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    repo = _scratch_repo(tmp_path)
-    _queue(store)
-    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
-    _switch_on(h)
-    rec = _Recorder()
-
-    def reply(descriptor: Any) -> Any:
-        result = _nothing_reply(*_proof_from_windows(descriptor))
-        files = {
-            GUIDE: result.role_output[GUIDE],
-            ".guardkit/features/FEAT-0000.yaml": "id: FEAT-0000\n",
-        }
-        result.role_output[".guardkit/features/FEAT-0000.yaml"] = files[
-            ".guardkit/features/FEAT-0000.yaml"
-        ]
-        result.role_output["semantic_review.json"] = _semantic_review_json(files)
-        return result
-
-    _wire(h, rec, reply)
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    after = _messages_after_plan(h, rec)
-    assert len(after) == 1
-    assert "also sent a plan to build" in after[0][1]
-    assert rec.complete == [] and rec.legs == []
 
 
 def test_the_stage_label_is_never_the_plan_legs() -> None:

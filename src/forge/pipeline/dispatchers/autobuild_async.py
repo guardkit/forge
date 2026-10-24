@@ -530,11 +530,22 @@ async def dispatch_autobuild_async(
         from forge.lifecycle.feature_routing import validate_feature_routing_id
 
         feature_routing_id = validate_feature_routing_id(feature_routing_id)
+    # A missing routing id, gate or receipt is bookkeeping: logged, and the
+    # build carries on unrouted (step 1, 24 October 2026; FRG-095). The seed
+    # itself, when there is one to make, is unchanged.
     if feature_routing_required and feature_routing_id is None:
-        raise ValueError("required autobuild dispatch has no feature_routing_id")
+        logger.warning(
+            "dispatch_autobuild_async: %s has no feature routing id; "
+            "dispatching unrouted",
+            build_id,
+        )
     if feature_routing_id is not None:
         if feature_routing_gate is None and feature_routing_required:
-            raise ValueError("required autobuild dispatch has no durable routing gate")
+            logger.warning(
+                "dispatch_autobuild_async: %s has no routing gate; "
+                "dispatching unrouted",
+                build_id,
+            )
         if feature_routing_gate is not None:
             routing_receipt = await feature_routing_gate.ensure_seeded(
                 feature_routing_id,
@@ -595,10 +606,9 @@ async def dispatch_autobuild_async(
     }
     if feature_routing_id is not None:
         launch_payload["feature_routing_id"] = feature_routing_id
-    if feature_routing_required:
-        launch_payload["feature_routing_required"] = True
-        if routing_receipt is None:
-            raise ValueError("required autobuild dispatch has no committed routing receipt")
+    if routing_receipt is not None:
+        if feature_routing_required:
+            launch_payload["feature_routing_required"] = True
         launch_payload["feature_routing_receipt"] = routing_receipt.to_wire()
     # DEFECT #19 activation (B4 round-17): thread ``branch`` (and ``repo`` when
     # equally available) from the ALREADY-VALIDATED BuildQueuedPayload the

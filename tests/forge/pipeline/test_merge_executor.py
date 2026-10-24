@@ -1129,16 +1129,31 @@ class TestExecutorSequencing:
     async def test_deploy_flag_off_reports_honestly(
         self, config, pool, repo_root
     ) -> None:
-        """With the deploy stage switched off the candidate cannot be
-        checked, and since protect-main an unchecked branch is not merged."""
+        """With the deploy stage switched off the live check cannot run.
+
+        Step 1 (24 October 2026): a check that could not run is advice, not
+        a red check. The join goes on to publication with the reason said,
+        and nothing is deployed (here publication is switched off)."""
         dp = _FakeDeploy(outcome=None)
         deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
         outcome = await _run_executor(deps, repo_root)
-        assert outcome.result == "candidate-refused"
+        assert outcome.result == "publication-pending"
+        assert outcome.status == "PASSED"
         assert "deploy.enabled=false" in outcome.detail
-        # The join was made — it is what gets checked — and nothing was
-        # published, because the check could not be run at all.
+        assert "advice:" in outcome.detail
         assert len(gk.calls) == 1
+        assert _legs(dp) == ["candidate_check"]
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        checked = [
+            l for l in lines if (l["kind"], l["step"]) == ("done", "candidate-check")
+        ]
+        assert checked[-1]["detail"]["verify_ok"] is False
+        assert "deploy.enabled=false" in checked[-1]["detail"]["unavailable"]
 
     @pytest.mark.asyncio
     async def test_dry_run_merges_nothing_claims_nothing_publishes_nothing(
@@ -1511,9 +1526,12 @@ class TestExecutorSequencing:
                 ).fetchone()[0]
             )
         ]
+        # The build system's checks could not be run on the reused join; that
+        # is recorded as unavailable (step 1, 24 October 2026), never a pass.
         assert steps == [
             ("about to", "join"),
             ("done", "join"),
+            ("done", "merge-checks"),
             ("about to", "candidate-check"),
             ("done", "candidate-check"),
         ]
@@ -1527,9 +1545,10 @@ class TestExecutorSequencing:
         A press that picks an already-made join up does not re-run the build
         system's own post-merge checks on it — only the factory's live check
         runs, and its counts are the ones in the sentence. So the sentence
-        must not call the joined result "checked" flatly; and the record,
-        which is what a publisher reads, must have no "done merge-checks"
-        line for that attempt.
+        must not record them as passed. Since step 1 (24 October 2026,
+        FRG-178) the record says they were UNAVAILABLE, with the build
+        system's own sentence, and that is advice: the join is ready to
+        publish, and the sentence says what could not run.
         """
         dying = _DiesWhileMerging()
         deps, publisher, gk, dp = _deps(config, pool, guardkit=dying)
@@ -1540,43 +1559,26 @@ class TestExecutorSequencing:
         deps, publisher, gk, dp = _deps(config, pool)
         outcome = await _run_executor(deps, repo_root)
         assert outcome.result == "publication-pending"
-        steps = [
-            (l["kind"], l["step"])
-            for l in json.loads(
-                pool.connection.execute(
-                    "SELECT lines_json FROM publication_records WHERE build_id = ?",
-                    (BUILD_ID,),
-                ).fetchone()[0]
-            )
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        merge_checks = [
+            l for l in lines if (l["kind"], l["step"]) == ("done", "merge-checks")
         ]
-        assert ("done", "merge-checks") not in steps
-        assert f"the joined result {str(outcome.merged_sha)[:10]} was checked" not in (
-            outcome.detail
-        )
-        assert "the factory's own live check ran on the joined result" in outcome.detail
-        assert (
-            "the build system's own checks after a join have not run on "
-            in outcome.detail
-        )
-        # AND IT NAMES WHAT WOULD RUN THEM (23 September 2026). The press asks
-        # the installed build system for a sub-command that checks an
-        # already-joined commit; it has none, so the sentence says which one
-        # by name rather than leaving a reader to wonder what is missing.
+        assert len(merge_checks) == 1
+        # Recorded as exactly what it was: never a pass, never red.
+        assert merge_checks[0]["detail"]["verify_ok"] is None
+        assert "autobuild check-join" in merge_checks[0]["detail"]["unavailable"]
+        # AND IT NAMES WHAT WOULD RUN THEM (23 September 2026): the installed
+        # build system has no check-join, and the sentence says so as advice.
+        assert "advice:" in outcome.detail
         assert "autobuild check-join" in outcome.detail
         assert "does not have it" in outcome.detail
-        # NOT a pass (22 September 2026, the second reviewer's first finding):
-        # one kind of check never ran on this J, so the press must not say
-        # "checked and ready to publish", must not report PASSED (which would
-        # close the build row as COMPLETE), and the receipt says the same.
-        assert "NOT yet checked and not ready to publish" in outcome.detail
-        assert "checked and ready to publish" not in outcome.detail
-        assert outcome.status == "GATED"
-        receipt = json.loads(
-            (repo_root / ".forge" / "receipts" / "merge_deploy_publication.json").read_text()
-        ) if (repo_root / ".forge" / "receipts" / "merge_deploy_publication.json").exists() else None
-        if receipt is not None:
-            assert receipt["both_kinds_of_check_ran_on_j"] is False
-            assert receipt["ready_to_publish"] is False
+        assert "checked and ready to publish" in outcome.detail
+        assert outcome.status == "PASSED"
 
     @pytest.mark.asyncio
     async def test_checks_derived_from_the_live_gate_verdict(
@@ -2770,7 +2772,8 @@ class TestWhereTheDeployRan:
         _write_deploy_profile(repo_root, SANDBOX_PROFILE)
         deps, publisher, gk, dp = _deps(config, pool, deploy=_FakeDeploy(outcome=None))
         outcome = await _run_executor(deps, repo_root)
-        assert outcome.result == "candidate-refused"
+        # The live check could not run: advice (step 1), and nothing ran.
+        assert outcome.result == "publication-pending"
         assert outcome.deployed_in is None
 
     def test_the_question_answered_on_its_own(self, tmp_path) -> None:
@@ -2980,13 +2983,13 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
         deps, publisher, gk, dp = _deps(config, pool, deploy=dp)
         with caplog.at_level("INFO"):
             outcome = await _run_executor(deps, repo_root)
-        assert outcome.result == "candidate-refused"
+        # Step 1 (24 October 2026): could not run is advice, not a refusal.
+        assert outcome.result == "publication-pending"
         assert "has no candidate section" in outcome.detail
         assert len(gk.calls) == 1
         assert _repair_rows(pool) == []
         assert any(
-            "could not run, so no repair was filed" in r.getMessage()
-            for r in caplog.records
+            "live check could not run" in r.getMessage() for r in caplog.records
         )
 
     @pytest.mark.asyncio
@@ -3600,6 +3603,16 @@ class TestTheBranchTheBuildMade:
         )
         assert _merge_branch_of_record(pool, REPAIR_BUILD_ID, {}) == REPAIR_BRANCH
         assert _merge_branch_of_record(pool, BUILD_ID, {"merge_branch": ""}) is None
+        # STEP 1 (24 October 2026): a readable row whose merge_branch is blank
+        # — writing the approved branch onto it failed — takes the offer's
+        # copy, never the feature's own branch with the unapproved work on it.
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        assert pool.get_build_row(BUILD_ID).merge_branch is None
+        approved = f"autobuild/{FEATURE_ID}-approved"
+        assert (
+            _merge_branch_of_record(pool, BUILD_ID, {"merge_branch": approved})
+            == approved
+        )
         assert repair_tip  # the branch exists; only the row read was refused
 
 

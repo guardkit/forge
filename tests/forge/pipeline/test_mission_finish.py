@@ -423,12 +423,15 @@ class TestTheTipIsChecked:
 
 class TestTheRoutingReceipt:
     @pytest.mark.asyncio
-    async def test_a_missing_receipt_is_not_merged_and_never_retried(
+    async def test_a_missing_receipt_is_a_card_line_not_an_ending(
         self,
         config_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
     ) -> None:
+        """FRG-161, step 1 (24 October 2026): a fully built mission whose own
+        routing receipt is missing used to end NOT_MERGED, never retried. The
+        receipt is bookkeeping, so it is one line on the card instead."""
         a_running_mission(pool, keys=("B", "C"))
         the_mission_branch_on_the_remote(repo_root)
         attempts = {attempt_correlation_id(MISSION_CORRELATION, "B", 1)}
@@ -442,12 +445,13 @@ class TestTheRoutingReceipt:
 
         deps, _thread = _finish_deps(config_on, pool, offer=offer, router=router)
 
-        assert await finish_ready_mission(deps, MISSION_ID) == "not merged"
-        assert await finish_ready_mission(deps, MISSION_ID) == "nothing to do"
+        assert await finish_ready_mission(deps, MISSION_ID) == "offered"
         assert router.asked == [MISSION_CORRELATION]
-        assert store.get(MISSION_ID).status == "NOT_MERGED"
-        assert "routing" in str(store.get(MISSION_ID).closed_reason)
-        assert offered == [] and mission_merge_build_id(pool, MISSION_ID) is None
+        assert store.get(MISSION_ID).status != "NOT_MERGED"
+        assert len(offered) == 1
+        words = offered[0]["card_words"]("", None)
+        assert "model routing record for this mission is missing" in words
+        assert mission_merge_build_id(pool, MISSION_ID) is not None
 
 
 class TestTheMissionsMergeCard:

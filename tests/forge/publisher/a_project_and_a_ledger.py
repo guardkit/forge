@@ -148,8 +148,8 @@ def make_the_ledger(
     project: dict[str, Any],
     build_id: str = BUILD,
     turn_takes: int = 1,
-    merge_checks: bool | None = True,
-    candidate_check: bool | None = True,
+    merge_checks: bool | str | None = True,
+    candidate_check: bool | str | None = True,
     ran_on: str | None = None,
     attempt: int = 1,
     repo: str = PROJECT,
@@ -158,7 +158,9 @@ def make_the_ledger(
 
     ``merge_checks`` / ``candidate_check``: ``True`` writes a done line that
     passed, ``False`` writes one that went red, ``None`` writes none at all —
-    which is the GATED case the merge word leaves when it picks a join up.
+    which is the GATED case the merge word leaves when it picks a join up —
+    and ``"unavailable"`` writes one saying the check could not run (step 1,
+    24 October 2026), never a pass.
     """
     connection = sqlite_connect.connect_writer(path)
     migrations.apply_at_boot(connection)
@@ -197,7 +199,21 @@ def make_the_ledger(
         result={"j_commit": project["j"], "verify_ok": True},
         j_commit=project["j"],
     )
-    if merge_checks is not None:
+    if merge_checks == "unavailable":
+        store.done(
+            build_id=build_id,
+            turn=turn,
+            now=now,
+            step=STEP_MERGE_CHECKS,
+            attempt=attempt,
+            result={
+                "ran_on": on,
+                "verify_ran": False,
+                "verify_ok": None,
+                "unavailable": "the installed build system has no check-join",
+            },
+        )
+    elif merge_checks is not None:
         store.done(
             build_id=build_id,
             turn=turn,
@@ -212,7 +228,21 @@ def make_the_ledger(
                 "checks_total": 12,
             },
         )
-    if candidate_check is not None:
+    if candidate_check == "unavailable":
+        store.done(
+            build_id=build_id,
+            turn=turn,
+            now=now,
+            step=STEP_CANDIDATE_CHECK,
+            attempt=attempt,
+            result={
+                "ran_on": on,
+                "j_commit": on,
+                "verify_ok": False,
+                "unavailable": "the deploy stage is disabled",
+            },
+        )
+    elif candidate_check is not None:
         store.done(
             build_id=build_id,
             turn=turn,

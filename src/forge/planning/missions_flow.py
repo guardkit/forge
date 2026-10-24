@@ -586,8 +586,9 @@ class MissionFlow:
         Run on every pass over a STARTING mission — straight after the
         approval and again after a restart — before the branch is asked for.
         The seed is idempotent: one that SUCCEEDED returns its stored receipt
-        and makes no second seed. One that is UNKNOWN or FAILED is never
-        retried (the gate's seed-once rule): the mission becomes NOT_STARTED.
+        and makes no second seed. The gate asks once more after a completed
+        rejection; an unknown outcome, or a second rejection, is not asked
+        again: the mission becomes NOT_STARTED.
         """
         current = self._missions.get(mission.id)
         if current is not None and current.stopping:
@@ -604,7 +605,7 @@ class MissionFlow:
             await self._routing_gate.ensure_seeded(
                 mission.correlation_id, origin_kind="mission", origin_id=mission.id
             )
-        except Exception as exc:  # noqa: BLE001 — never retried (seed once)
+        except Exception as exc:  # noqa: BLE001 — the gate made its one retry
             logger.warning(
                 "missions: %s routing seed did not succeed (%s: %s); NOT_STARTED",
                 mission.id,

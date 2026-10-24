@@ -1540,6 +1540,130 @@ def card_line_about_the_preview(evidence: Any) -> str:
     )
 
 
+#: The card's line when a retained worktree is not the build's own (step 1).
+RETENTION_MISMATCH_LINE: str = (
+    "The worktree kept for this build did not match it, so it will be left "
+    "alone after the merge."
+)
+
+#: The card's change summary when the change could not be read.
+CHANGE_NOT_READ: str = "the change could not be read"
+
+#: What the card's details say when the build listed no tasks.
+TASK_LIST_NOT_AVAILABLE: str = "task list not available"
+
+
+def approved_branch_of(event: Any) -> str | None:
+    """The approved part's branch a finished build names, or ``None``.
+
+    The runner attaches ``merge_branch`` beside the payload; the payload's own
+    ``branch`` carries the same name on the wire. ``None`` for the feature's
+    own ``autobuild/<FEAT>``, so every other build reads as before.
+    """
+    feature_id = str(getattr(event, "feature_id", "") or "")
+    for named in (getattr(event, "merge_branch", None), getattr(event, "branch", None)):
+        branch = str(named or "").strip()
+        if branch and branch != default_merge_branch(feature_id):
+            return branch
+    return None
+
+
+def card_line_about_tasks_not_included(not_included: Any) -> str:
+    """The card's line naming the tasks the approved part leaves out."""
+    if not isinstance(not_included, list):
+        named = TASK_LIST_NOT_AVAILABLE
+    else:
+        parts = []
+        for task in not_included:
+            if not isinstance(task, Mapping):
+                continue
+            why = ": ".join(
+                str(task.get(key))
+                for key in ("status", "final_decision")
+                if task.get(key)
+            )
+            parts.append(f"{task.get('id')} ({why})" if why else str(task.get("id")))
+        named = ", ".join(parts) or "none listed"
+    return f"Not included: {named}. Approving merges only the approved tasks."
+
+
+class _RowWithBranch:
+    """A build row read with the approved branch in place of its own column."""
+
+    def __init__(self, row: Any, merge_branch: str) -> None:
+        self._row = row
+        self.merge_branch = merge_branch
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._row, name)
+
+
+def read_the_change(
+    config: Any, repo_key: str, base: str, head: str, feature_id: str
+) -> dict[str, Any]:
+    """The card's change details: what ``head`` changes from its merge base
+    with ``base``, read where the repository lives (step 1, 24 October 2026).
+
+    ``change_summary`` lists each changed file with git's status letter,
+    ``change_text`` is the diff text cut at 120,000 characters. Never raises:
+    a reading that fails says so in ``change_summary`` and carries no text.
+    """
+    from forge.config.sandboxes import sandbox_for
+    from forge.pipeline.branch_scope import (
+        read_branch_scope,
+        read_branch_scope_in_sandbox,
+    )
+    from forge.pipeline.merge_ready_checkpoint import parse_changed_files
+
+    details: dict[str, Any] = {
+        "change_basis": "merge-base",
+        "change_summary": "",
+        "change_text": "",
+        "change_text_truncated": False,
+    }
+    try:
+        sandbox = sandbox_for(config, repo_key)
+        if sandbox is not None:
+            reading = read_branch_scope_in_sandbox(
+                sandbox=sandbox, repo=repo_key, base=base, head=head,
+                feature_id=feature_id,
+            )
+        else:
+            repo_root = config.planning.target_repo_paths.get(repo_key)
+            reading = read_branch_scope(
+                repo_root=Path(repo_root), base=base, head=head,
+                feature_id=feature_id,
+            )
+        if reading.error:
+            logger.warning(
+                "merge-offer: the change from %s to %s could not be read: %s",
+                base,
+                head,
+                reading.error,
+            )
+            details["change_summary"] = CHANGE_NOT_READ
+            return details
+        lines = []
+        for change in parse_changed_files(reading.name_status):
+            old = str(getattr(change, "old_path", "") or "")
+            path = str(getattr(change, "path", "") or "")
+            moved = f"{old} -> {path}" if old and old != path else path
+            lines.append(f"{getattr(change, 'status', '')} {moved}".strip())
+        details["change_summary"] = "\n".join(lines) or "no files changed"
+        details["change_text"] = reading.patch
+        details["change_text_truncated"] = reading.patch_truncated
+    except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+        logger.warning(
+            "merge-offer: the change from %s to %s could not be read (%s: %s)",
+            base,
+            head,
+            type(exc).__name__,
+            exc,
+        )
+        details["change_summary"] = CHANGE_NOT_READ
+    return details
+
+
 def run_the_scope_pass(
     *,
     config: Any,
@@ -1924,16 +2048,22 @@ class MergeOfferService:
             await self._mission_lander(event.build_id, tasks_failed=event.tasks_failed)
             return
 
-        if event.tasks_failed != 0:
-            logger.info(
-                "merge-offer: %s finished with %d failed task(s) — no merge "
-                "card is offered for a build that is not clean",
-                event.build_id,
-                event.tasks_failed,
-            )
-            return
+        # THE APPROVED PART OF A FEATURE (step 1, 24 October 2026). A build
+        # with a failed task used to get no card. When GuardKit named the
+        # approved tasks' commit, the build finished on its own branch,
+        # ``autobuild/<FEAT>-approved``, and the card offers exactly that
+        # branch. The choice is recorded on the build row with the existing
+        # writer and also handed to the offer itself, so a record that cannot
+        # be written never sends the card back to ``autobuild/<FEAT>``.
+        approved_branch = approved_branch_of(event)
+        if approved_branch is not None:
+            self._record_the_approved_branch(event.build_id, approved_branch)
+        not_included = getattr(event, "tasks_not_included", None)
 
+        # A RETAINED WORKTREE THAT IS NOT THE BUILD'S OWN is advice (step 1):
+        # the card says so and the worktree is never used for cleanup.
         retained = getattr(event, "worktree_retention", None)
+        retention_advice = ""
         if isinstance(retained, Mapping) and retained.get("ok"):
             path = str(retained.get("path") or "").strip()
             if (
@@ -1941,20 +2071,23 @@ class MergeOfferService:
                 or not path
                 or Path(path).name != event.build_id
             ):
-                logger.error(
-                    "merge-offer: refusing %s — its retained worktree identity "
-                    "does not bind the build id and path",
+                logger.warning(
+                    "merge-offer: %s — its retained worktree identity does not "
+                    "bind the build id and path; the card is offered and the "
+                    "worktree is left alone",
                     event.build_id,
                 )
-                return
-            self._pool.record_worktree_path(event.build_id, path)
+                retention_advice = RETENTION_MISMATCH_LINE
+                retained = None
+            else:
+                self._pool.record_worktree_path(event.build_id, path)
 
         # THE SCOPE PASS (the planner fix, 2026-09-15). Read the finished
         # branch once, here, before the card is built: what it changed that
         # the plan did not name, and what it built that the request never
         # asked for. It is a REPORT and never a refusal — anything it cannot
         # read is a sentence on its own receipt and the card simply says less.
-        scope = await self._take_the_scope_pass(event)
+        scope = await self._take_the_scope_pass(event, merge_branch=approved_branch)
 
         # WHAT WAS ACTUALLY CHECKED (parts 1, 2 and 3a, 2026-09-21). Beside
         # the scope pass, and on exactly the same terms: one reading, off the
@@ -2017,6 +2150,10 @@ class MergeOfferService:
             # the not-checked line and each "Asked / Answered" pair without
             # reading a paragraph.
             lines = [" ".join(opening)]
+            if approved_branch is not None:
+                lines.append(card_line_about_tasks_not_included(not_included))
+            if retention_advice:
+                lines.append(retention_advice)
             if supplied:
                 lines.append(supplied)
             # BUILT FROM A SIGNED-OFF PROTOTYPE (17 October 2026): one line,
@@ -2048,6 +2185,11 @@ class MergeOfferService:
         details: dict[str, Any] = {
             "tasks_completed": event.tasks_completed,
             "tasks_total": event.tasks_total,
+            "tasks_not_included": (
+                not_included
+                if isinstance(not_included, list)
+                else TASK_LIST_NOT_AVAILABLE
+            ),
         }
         if isinstance(retained, Mapping) and retained.get("ok"):
             details["runner_worktree_retention"] = dict(retained)
@@ -2060,6 +2202,7 @@ class MergeOfferService:
             feature_id=event.feature_id,
             card_words=_words,
             extra_details=details,
+            merge_branch=approved_branch,
             changed_files=(
                 getattr(scope, "changes", None)
                 if scope is not None and getattr(scope, "read", False)
@@ -2155,7 +2298,31 @@ class MergeOfferService:
             return None
         return getattr(row, "repo", None) if row is not None else None
 
-    async def _take_the_scope_pass(self, event: Any) -> Any | None:
+    def _record_the_approved_branch(self, build_id: str, branch: str) -> None:
+        """Record the approved branch on the build row; one retry, then advice.
+
+        The offer carries the branch itself either way, so a failed write is
+        logged and changes nothing about which branch is offered or merged.
+        """
+        for attempt in (1, 2):
+            try:
+                self._pool.record_merge_branch(build_id, branch)
+                return
+            except Exception as exc:  # noqa: BLE001 — bookkeeping never ends a feature
+                logger.warning(
+                    "merge-offer: could not record %s as the merge branch of %s "
+                    "(attempt %d: %s: %s)%s",
+                    branch,
+                    build_id,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                    "" if attempt == 1 else " — the offer carries it instead",
+                )
+
+    async def _take_the_scope_pass(
+        self, event: Any, *, merge_branch: str | None = None
+    ) -> Any | None:
         """Run the scope pass off the event loop; ``None`` if nobody counted.
 
         Never raises and never delays the card by more than the reading
@@ -2167,6 +2334,8 @@ class MergeOfferService:
             row = self._pool.get_build_row(event.build_id)
             if row is None:
                 return None
+            if merge_branch is not None:
+                row = _RowWithBranch(row, merge_branch)
             return await asyncio.to_thread(
                 self._scope_pass,
                 config=self._config,
@@ -2472,6 +2641,7 @@ class MergeOfferService:
         extra_details: Mapping[str, Any] | None = None,
         changed_files: Sequence[Any] | None = None,
         on_refusal: Callable[[str, bool], None] | None = None,
+        merge_branch: str | None = None,
     ) -> bool:
         """:meth:`_offer`, with the project's own sandbox held up while it runs.
 
@@ -2496,6 +2666,7 @@ class MergeOfferService:
                     extra_details=extra_details,
                     changed_files=changed_files,
                     on_refusal=on_refusal,
+                    merge_branch=merge_branch,
                 )
         except SandboxNotReady as exc:
             # Refused before anything was written or asked of the sandbox
@@ -2517,6 +2688,7 @@ class MergeOfferService:
         extra_details: Mapping[str, Any] | None = None,
         changed_files: Sequence[Any] | None = None,
         on_refusal: Callable[[str, bool], None] | None = None,
+        merge_branch: str | None = None,
     ) -> bool:
         """Latch the offer and put ONE merge card in front of the owner.
 
@@ -2616,7 +2788,13 @@ class MergeOfferService:
             return _refuse("the build has no correlation id", may_pass=False)
 
         # (b) Pin the RECORDED target branch and the exact offered candidate.
-        merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
+        # A branch handed in by the caller (the approved part, step 1) wins
+        # over the row, so a record that could not be written changes nothing.
+        merge_branch = (
+            str(merge_branch or "").strip()
+            or str(getattr(row, "merge_branch", None) or "").strip()
+            or None
+        )
         branch = branch_to_merge(feature_id, merge_branch)
         git = self._git_for(row, repo_root)
         # WHICH BRANCH OF THE REMOTE THIS WORK IS AIMED AT, off the build's own
@@ -2703,41 +2881,61 @@ class MergeOfferService:
             )
             return _refuse(f"the candidate {branch} could not be pinned", may_pass=True)
 
+        # THE CANDIDATE IS THE BRANCH'S OWN COMMIT, pinned above. The retained
+        # worktree is only for cleaning up after the merge, so one that does
+        # not match is advice on the card and is never used for cleanup
+        # (step 1, 24 October 2026).
         retained_identity: dict[str, Any] | None = None
+        advice_lines: list[str] = []
         runner_identity = (extra_details or {}).get("runner_worktree_retention")
         worktree_path = str(getattr(row, "worktree_path", None) or "").strip()
         if isinstance(runner_identity, Mapping):
-            if not worktree_path:
-                logger.error(
-                    "merge-offer: refusing %s — the runner retained a worktree "
-                    "but the build row has no recorded path",
-                    build_id,
+            inspected: Mapping[str, Any] = {}
+            candidate_registration: list[Any] = []
+            if worktree_path:
+                inspected = await git.inspect_autobuild_worktree(
+                    build_id, worktree_path
                 )
-                return _refuse("the retained worktree has no recorded path", may_pass=False)
-            retained_identity = await git.inspect_autobuild_worktree(
-                build_id, worktree_path
-            )
-            registrations = list(
-                retained_identity.get("nested_registrations") or []
-            )
-            candidate_registration = [
-                item
-                for item in registrations
-                if item.get("branch") == f"refs/heads/{branch}"
-                and item.get("head") == candidate_sha
-            ]
-            if not retained_identity.get("ok") or len(candidate_registration) != 1:
-                logger.error(
-                    "merge-offer: refusing %s — the retained worktree does not "
-                    "carry exactly one registered checkout of %s at %s (%s)",
+                candidate_registration = [
+                    item
+                    for item in list(inspected.get("nested_registrations") or [])
+                    if item.get("branch") == f"refs/heads/{branch}"
+                    and item.get("head") == candidate_sha
+                ]
+            if inspected.get("ok") and len(candidate_registration) == 1:
+                retained_identity = dict(inspected)
+                retained_identity["cleanup_registrations"] = candidate_registration
+            else:
+                logger.warning(
+                    "merge-offer: %s — the retained worktree (%s) does not carry "
+                    "exactly one registered checkout of %s at %s (%s); the card "
+                    "is offered and the worktree is left alone",
                     build_id,
+                    worktree_path or "no recorded path",
                     branch,
                     candidate_sha,
-                    retained_identity.get("detail"),
+                    inspected.get("detail"),
                 )
-                return _refuse("the retained worktree does not match", may_pass=False)
-            retained_identity = dict(retained_identity)
-            retained_identity["cleanup_registrations"] = candidate_registration
+                advice_lines.append(RETENTION_MISMATCH_LINE)
+        if advice_lines:
+            words_before_advice = card_words
+
+            def card_words(branch: str, merge_branch: str | None) -> str:
+                return "\n".join(
+                    [words_before_advice(branch, merge_branch), *advice_lines]
+                )
+
+        # WHAT THE CARD WOULD MERGE (step 1, 24 October 2026): the change from
+        # the merge base of the pinned target and the candidate, read where the
+        # repository lives, for whoever answers the card.
+        change = await asyncio.to_thread(
+            read_the_change,
+            self._config,
+            row.repo,
+            expect_main_sha,
+            candidate_sha,
+            feature_id,
+        )
 
         # The build's own project's receipts (one sandbox per project); a
         # reader put here by something else is asked as it always was.
@@ -2778,6 +2976,7 @@ class MergeOfferService:
                 else {}
             ),
             **dict(extra_details or {}),
+            **change,
             "baseline_failing": baseline_failing,
             "resume_options": ["approve", "reject"],
         }

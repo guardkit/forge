@@ -97,7 +97,8 @@ MISSION_ROLE_MERGE: str = "mission-merge"
 MISSION_KEY_PATTERN: str = r"^[A-Z0-9]{1,12}$"
 
 #: The reason an attempt-1 closes with when its merge into the mission branch
-#: stopped on a conflict, and the one reason that files attempt 2.
+#: stopped on a conflict. Any first failure files attempt 2 (step 1, 24
+#: October 2026); cancellation, a declined merge and a stop do not.
 CONFLICT_REASON: str = "conflict"
 
 #: The reasons a stop (section 11) closes attempts with: a WAITING one is
@@ -731,7 +732,7 @@ class MissionStore:
         """May ``key`` start now? Read from the latest attempt of each key it needs.
 
         A needed key whose latest attempt FAILED or was HELD is final: an
-        attempt 1 that failed on a conflict always has its attempt 2 filed in
+        attempt 1 that failed and is rebuilt always has its attempt 2 filed in
         the same transaction, so it is never the latest.
         """
         needs = next(
@@ -826,7 +827,7 @@ class MissionStore:
             return self._close_attempt(correlation_id, "HELD", reason, ("WAITING",))
 
     def fail_with_rebuild(self, correlation_id: str, reason: str = CONFLICT_REASON) -> bool:
-        """Close attempt 1 FAILED on a conflict and file attempt 2 WAITING, together.
+        """Close attempt 1 FAILED on a first failure and file attempt 2 WAITING, together.
 
         One transaction, so the dependants never see a final failure while the
         rebuild is pending. Only an ADMITTED attempt 1 is closed this way; for

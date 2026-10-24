@@ -12,7 +12,9 @@ admission's real base resolution:
 * the pack is readable by ``read_failure_pack``, says the runner crashed and
   why (credentials replaced), records the row's branch and the tasks the last
   state reported, and says nothing verified a candidate;
-* the repair is refused for that stated reason, never "no readable manifest";
+* the repair is cut from the feature's own ``autobuild/<feature>`` branch,
+  where the failed build's work is (FRG-142, step 1, 24 October 2026), with
+  the reason logged — never refused, and never from main;
 * a pack this run already has is never replaced, and an error text is cut.
 """
 
@@ -51,7 +53,7 @@ from forge.lifecycle_bridge.wireup import (
 from forge.persistence.migrations import lifecycle_bridge_registry as bridge_migration
 from forge.persistence.repositories.bridge_registry import BridgeRegistry
 from forge.pipeline.build_ack_handle import BuildAckHandle
-from forge.pipeline.fix_admission import FixAdmissionRefused, resolve_repair_base
+from forge.pipeline.fix_admission import resolve_repair_base
 from forge.pipeline.fix_journey_receipts import read_failure_pack
 from forge.pipeline.fix_row_producer import SOURCE_BUILD_FAILED
 from forge.subagents import autobuild_runner as ar
@@ -241,46 +243,40 @@ class TestTheNoTerminalPathLeavesAPack:
             "why": CANDIDATE_NOT_VERIFIED,
         }
 
-        with pytest.raises(FixAdmissionRefused) as caught:
-            await resolve_repair_base(
-                minted={"source": SOURCE_BUILD_FAILED},
-                branch="main",
-                parent_feature=_FEATURE_ID,
-                source_build_id=build_id,
-                source_build=row,
-                repo_path=tmp_path,
-                receipts_root=receipts,
-                sidecar=None,
-            )
-        message = caught.value.message
-        assert "no readable manifest" not in message
-        assert "ended without a terminal" in message
-        assert "no verified candidate to repair" in message
-        assert "Separator is not found" in message
-        assert caught.value.reason == "repair-base"
-        assert caught.value.permanent is True
+        base = await resolve_repair_base(
+            minted={"source": SOURCE_BUILD_FAILED},
+            branch="main",
+            parent_feature=_FEATURE_ID,
+            source_build_id=build_id,
+            source_build=row,
+            repo_path=tmp_path,
+            receipts_root=receipts,
+            sidecar=None,
+        )
+        assert base.branch == f"autobuild/{_FEATURE_ID}"
+        assert base.expected_commit is None
 
     @pytest.mark.asyncio
-    async def test_without_a_pack_the_old_refusal_still_stands(
+    async def test_without_a_pack_the_repair_uses_the_feature_branch(
         self,
         persistence: SqliteLifecyclePersistence,
         receipts: Path,
         tmp_path: Path,
     ) -> None:
-        # The control: the refusal this lane replaces, when nothing is written.
+        # FRG-142 (step 1): nothing was written, and the repair is still cut
+        # from the feature's own branch rather than refused.
         build_id = _queued_build(persistence)
-        with pytest.raises(FixAdmissionRefused) as caught:
-            await resolve_repair_base(
-                minted={"source": SOURCE_BUILD_FAILED},
-                branch="main",
-                parent_feature=_FEATURE_ID,
-                source_build_id=build_id,
-                source_build=persistence.get_build_row(build_id),
-                repo_path=tmp_path,
-                receipts_root=receipts,
-                sidecar=None,
-            )
-        assert "no readable manifest" in caught.value.message
+        base = await resolve_repair_base(
+            minted={"source": SOURCE_BUILD_FAILED},
+            branch="main",
+            parent_feature=_FEATURE_ID,
+            source_build_id=build_id,
+            source_build=persistence.get_build_row(build_id),
+            repo_path=tmp_path,
+            receipts_root=receipts,
+            sidecar=None,
+        )
+        assert base.branch == f"autobuild/{_FEATURE_ID}"
 
 
 class TestAMissingWriterIsNeverSilent:

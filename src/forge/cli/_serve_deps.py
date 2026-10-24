@@ -2508,7 +2508,11 @@ def _mission_build_gate_decision(
             log=logger,
         )
         if connection is not None:
-            MissionStore(connection).mark_failed(attempt.correlation_id, refusal)
+            # The first failure is rebuilt once (step 1, 24 October 2026); a
+            # mission asked to stop files no second attempt.
+            missions = MissionStore(connection)
+            if not missions.fail_with_rebuild(attempt.correlation_id, refusal):
+                missions.mark_failed(attempt.correlation_id, refusal)
         raise MissionBuildRefused(refusal)
     decision = {
         "mission_id": mission.id,
@@ -2546,7 +2550,7 @@ def _work_queue_rejection_recorder(
     A refusal of a mission feature's build (missions design, 17 October 2026,
     section 2a) has no queue row; it is written against the mission attempt
     filed under the same correlation id instead, which closes FAILED with the
-    refusal's first sentence, once. The mission step reads that directly, so
+    refusal's first sentence, once, and a first attempt is rebuilt once. The mission step reads that directly, so
     the features that need it are held and the mission can finish.
     """
 
@@ -2561,9 +2565,12 @@ def _work_queue_rejection_recorder(
             mission_noted = False
             missions = MissionStore(connection)
             if missions.attempt_by_correlation_id(correlation_id) is not None:
-                mission_noted = missions.mark_failed(
-                    correlation_id, first_sentence(reason) or reason
-                )
+                # A first failure is rebuilt once (step 1, 24 October 2026);
+                # a second attempt or a stopped mission closes FAILED.
+                sentence = first_sentence(reason) or reason
+                mission_noted = missions.fail_with_rebuild(correlation_id, sentence)
+                if not mission_noted:
+                    mission_noted = missions.mark_failed(correlation_id, sentence)
             queue_noted = WorkQueueStore(connection).record_build_rejection(
                 correlation_id, reason
             )
