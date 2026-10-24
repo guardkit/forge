@@ -1475,46 +1475,68 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
             # The runner outer checkout is detached. GuardKit creates its
             # Player branch beneath that source; model that process boundary
             # with a temporary Git worktree and run its real protection code.
-            player = tmp_path / "consumer-player"
-            if not player.exists():
-                git(
+            from guardkit.worktrees import WorktreeManager
+            from guardkit.orchestrator.task_work_scope import (
+                bind_fresh_footprint,
+                checkout_lease,
+                collect_changes,
+            )
+
+            if not hasattr(self, "player"):
+                self.player = WorktreeManager(work).create("amendment-scope", a)
+                self.inputs = bind_fresh_footprint(
+                    self.player.path,
                     work,
-                    "worktree",
-                    "add",
-                    "-q",
-                    "-b",
-                    "fixture-player",
-                    str(player),
-                    a,
+                    f".guardkit/features/{feature}.yaml",
+                    kind="feature",
+                    expected=[],
                 )
-            ref = load_protected_reference(player, a, "fixture-player")
-            assert any(
-                doc.text == NEW
-                for doc in load_project_documents_at_commit(player, a).documents
-            )
-            backend = PathConfinedBackend(
-                SimpleNamespace(), [player], protected_paths=[player / "requirements"]
-            )
-            assert backend.write(str(player / DOC), "forbidden").error
-            assert backend.edit(str(player / DOC), "version 2", "version 1").error
-            (player / DOC).write_text("unauthorized shell edit\n")
-            git(player, "add", DOC)
-            restore_protected_paths(player, ref)
-            hold_protected_index(player, ref)
-            assert (player / DOC).read_text() == NEW
-            assert git(player, "diff", "--cached", "--name-only") == ""
-            item["qa_present"] = all(
-                (work / out["path"]).is_file()
-                for ev in bound["qa_receipts"]
-                for out in ev["receipt"]["requirement_amendment_qa"]["outputs"]
-            )
+            player = self.player.path
+            with checkout_lease(player, self.inputs) as lease:
+                scope = lease.admit("TASK-DEMO-001", feature)
+                assert scope.baseline_commit == a and scope.build_id
+                assert scope.source_declaration == git(
+                    work, "rev-parse", a + f":.guardkit/features/{feature}.yaml"
+                )
+                changes = collect_changes(scope)
+                assert changes["baseline_commit"] == a
+                assert not any(
+                    changes[key] for key in ("created", "modified", "deleted")
+                )
+                item["admitted_scope"] = scope.baseline_commit
+                ref = load_protected_reference(player, a, self.player.branch_name)
+                assert any(
+                    doc.text == NEW
+                    for doc in load_project_documents_at_commit(player, a).documents
+                )
+                backend = PathConfinedBackend(
+                    SimpleNamespace(),
+                    [player],
+                    protected_paths=[player / "requirements"],
+                )
+                assert backend.write(str(player / DOC), "forbidden").error
+                assert backend.edit(str(player / DOC), "version 2", "version 1").error
+                (player / DOC).write_text("unauthorized shell edit\n")
+                git(player, "add", DOC)
+                restore_protected_paths(player, ref)
+                hold_protected_index(player, ref)
+                assert (player / DOC).read_text() == NEW
+                assert git(player, "diff", "--cached", "--name-only") == ""
+                item["qa_present"] = all(
+                    (work / out["path"]).is_file()
+                    for ev in bound["qa_receipts"]
+                    for out in ev["receipt"]["requirement_amendment_qa"]["outputs"]
+                )
             super().append(item)
 
     calls = Calls()
     result = await asyncio.to_thread(_run, repo, launched[0], calls)
     assert result["async_tasks"][feature]["lifecycle"] == "completed"
     assert len(calls) == 2 and all(
-        call["head"] == a and call["requirement"] == NEW and call["qa_present"]
+        call["head"] == a
+        and call["requirement"] == NEW
+        and call["qa_present"]
+        and call["admitted_scope"] == a
         for call in calls
     )
     assert calls[0]["argv"][1:3] == ["feature", "validate"]
