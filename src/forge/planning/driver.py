@@ -1238,7 +1238,8 @@ def _partial_card_line(reason: str) -> str:
 #: draft as first written (rule 45, the spec's own words). The titles are
 #: verbatim, quoted, separated by semicolons.
 _PROVABILITY_UNPROVABLE_CARD_LINE = (
-    "{n} of the worked examples cannot be proven as written: {titles}. If you "
+    "The rules-only check could not assign a verifier to {n} worked example(s): "
+    "{titles}. This is not a semantic impossibility. If you "
     "approve, the plan stage will ask the model fallback to place them; or "
     "send a note."
 )
@@ -1274,7 +1275,8 @@ _PROVABILITY_NOT_WIRED_DETAIL = (
 #: The machine's note to the spec writer — the refused titles verbatim, one
 #: per line, and one ask. Rule 2 of the lane's spec; the words are the spec's.
 _MACHINE_REWRITE_NOTE = (
-    "These worked examples cannot be proven as written:\n"
+    "The rules-only check could not assign a verifier to these worked examples; "
+    "this is not a semantic impossibility:\n"
     "{titles}\n"
     "\n"
     "Revise only these examples using facts in the supplied request and context. "
@@ -5434,7 +5436,8 @@ class PlanningRunDriver:
             correlation_id,
             changes or "nothing on the list changed",
             (
-                f"{len(still)} example(s) still cannot be proven by rule: {still}"
+                f"the rules-only check still could not assign a verifier to "
+                f"{len(still)} example(s): {still}"
                 if still
                 else "every example can now be proven by rule"
                 if second.checked
@@ -11909,6 +11912,17 @@ class PlanningRunDriver:
                     "the factory's build and specification records left out"
                 ),
                 "file_count": len(files),
+                "status": "complete",
+                "covered_namespaces": [""],
+                "excluded_prefixes": [
+                    *_REPO_INVENTORY_SKIP_PREFIXES,
+                    *reference_paths,
+                ],
+                "base_identity": (
+                    {"status": "bound", "commit": reader.commit}
+                    if getattr(reader, "commit", None)
+                    else {"status": "unavailable"}
+                ),
             }
             if reference_lines:
                 inventory["reference_material"] = reference_lines
@@ -11927,6 +11941,7 @@ class PlanningRunDriver:
             # Said out loud, because a seat reading a list of directories must
             # know it is reading the repository's shape and not its file list.
             inventory["directories_only"] = True
+            inventory["status"] = "summarized"
             return inventory
         except Exception as exc:  # noqa: BLE001 — never fail a plan over this
             logger.warning(
@@ -12601,6 +12616,11 @@ class PlanningRunDriver:
                 if not is_reference_path(f"{root.rstrip('/')}/", reference_paths)
             ]
         descriptor: dict[str, Any] = {"repo": target_repo, "test_roots": test_roots}
+        if getattr(reader, "commit", None):
+            descriptor["planning_base_identity"] = {
+                "status": "bound",
+                "commit": reader.commit,
+            }
         # The repo's own architecture rules, when it keeps a rules file. Before
         # this, the plan-writer was never shown them, and two features built the
         # week of 2026-08-24 drifted from rules nobody had told it about.

@@ -3194,15 +3194,17 @@ def classify_scenarios_result(
         surface = payload.get("repo_has_http_surface")
         partial = bool(payload.get("partial"))
         detail = (
-            f"{len(refused)} of {count} scenario(s) cannot be proven by rule"
+            f"the rules-only check could not assign a verifier to {len(refused)} "
+            f"of {count} scenario(s)"
             if count is not None and refused
             else f"every one of the {count} scenario(s) can be proven by rule"
             if count is not None
             else (
-                f"{len(refused)} scenario(s) cannot be proven by rule "
+                f"the rules-only check could not assign a verifier to "
+                f"{len(refused)} scenario(s) "
                 "(the rest of the answer was clipped)"
                 if refused
-                else "no scenario is refused (the rest of the answer was clipped)"
+                else "no refused title was recoverable (the rest of the answer was clipped)"
             )
         )
         return ScenarioProvabilityOutcome(

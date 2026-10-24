@@ -4254,6 +4254,10 @@ def test_the_inventory_is_the_repositorys_own_tracked_files_sorted(
         "tests/users/test_crud.py",
     ]
     assert inventory["file_count"] == 7
+    assert inventory["status"] == "complete"
+    assert inventory["covered_namespaces"] == [""]
+    assert inventory["base_identity"] == {"status": "unavailable"}
+    assert "tasks/" in inventory["excluded_prefixes"]
     assert "directories" not in inventory
     # The rest of the descriptor is untouched.
     assert descriptor["repo"] == "appmilla/api_test"
@@ -4270,6 +4274,28 @@ def test_the_same_tree_read_twice_gives_the_same_bytes(tmp_path: Path) -> None:
     second = PlanningRunDriver._read_repository_inventory(str(repo))
     assert first == second
     assert json.dumps(first) == json.dumps(second)
+
+
+def test_a_pinned_reader_binds_inventory_and_descriptor_to_the_same_base(
+    tmp_path: Path,
+) -> None:
+    from forge.planning.repository_facts import LocalCheckoutReader
+
+    repo = _repo_with_files(tmp_path, ["src/a.py"])
+    commit = subprocess.check_output(
+        ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+    ).strip()
+    reader = LocalCheckoutReader(str(repo), commit=commit)
+    descriptor = PlanningRunDriver._build_target_repo_descriptor(
+        "appmilla/api_test", str(repo), reader=reader
+    )
+    assert descriptor["planning_base_identity"] == {
+        "status": "bound",
+        "commit": commit,
+    }
+    assert descriptor["repository_inventory"]["base_identity"] == descriptor[
+        "planning_base_identity"
+    ]
 
 
 def test_untracked_files_are_not_in_the_inventory(tmp_path: Path) -> None:
@@ -4317,7 +4343,7 @@ def test_the_factorys_own_paperwork_is_left_out(tmp_path: Path) -> None:
         "src/users/router.py",
     ]
     assert inventory["file_count"] == 3
-    listed = json.dumps(inventory)
+    listed = json.dumps(inventory["files"])
     for paperwork in (
         ".guardkit",
         ".forge",
@@ -4326,6 +4352,7 @@ def test_the_factorys_own_paperwork_is_left_out(tmp_path: Path) -> None:
         "feature_spec_inputs",
     ):
         assert paperwork not in listed
+    assert ".guardkit/" in inventory["excluded_prefixes"]
 
 
 def test_a_big_repository_teaches_its_shape_not_a_cut_off_list(
@@ -4344,6 +4371,7 @@ def test_a_big_repository_teaches_its_shape_not_a_cut_off_list(
     inventory = PlanningRunDriver._read_repository_inventory(str(repo))
     assert inventory is not None
     assert inventory["directories_only"] is True
+    assert inventory["status"] == "summarized"
     assert "files" not in inventory
     assert inventory["file_count"] == 451
     assert inventory["directories"] == [
@@ -5805,7 +5833,8 @@ _MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
 
 #: Rule 2, the spec's own words, with the two fixture titles verbatim.
 _MACHINE_NOTE_FOR_TITLES = (
-    "These worked examples cannot be proven as written:\n"
+    "The rules-only check could not assign a verifier to these worked examples; "
+    "this is not a semantic impossibility:\n"
     f"- {_MOON_TITLE}\n"
     "- Another undecidable one\n"
     "\n"
@@ -6705,7 +6734,8 @@ async def test_a_refused_rewrite_gives_the_model_its_turn_and_carries_on(
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     assert h.ctx["counters"]["spec"] == 2
     assert h.ctx["counters"]["spec_revisions"][0]["validate_feedback"] == (
-        "These worked examples cannot be proven as written:\n"
+        "The rules-only check could not assign a verifier to these worked examples; "
+        "this is not a semantic impossibility:\n"
         f"- {_MOON_TITLE}\n"
         "\n"
         "Revise only these examples using facts in the supplied request and context. "
@@ -7807,7 +7837,8 @@ async def test_after_a_pre_card_round_the_plan_stage_asks_the_model_and_never_se
     # The one card a person read carried rule 45's cannot-be-proven line.
     card = h.ctx["publisher"].envelopes[0].payload["details"]["summary"]
     assert card["what_happened"].endswith(
-        "1 of the worked examples cannot be proven as written: “ok”. If you "
+        "The rules-only check could not assign a verifier to 1 worked example(s): "
+        "“ok”. This is not a semantic impossibility. If you "
         "approve, the plan stage will ask the model fallback to place them; or "
         "send a note."
     )

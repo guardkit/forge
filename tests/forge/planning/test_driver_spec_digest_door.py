@@ -2647,7 +2647,8 @@ _HOMED_TITLE = "Version endpoint returns the running build"
 
 #: Rule 2's note, the spec's own words, with the fixture's refused title.
 _PRE_CARD_NOTE = (
-    "These worked examples cannot be proven as written:\n"
+    "The rules-only check could not assign a verifier to these worked examples; "
+    "this is not a semantic impossibility:\n"
     f"- {_REFUSED_TITLE}\n"
     "\n"
     "Revise only these examples using facts in the supplied request and context. "
@@ -2669,7 +2670,8 @@ _REWROTE_LINE = (
     "What changed: 1 example changed."
 )
 _UNPROVABLE_LINE = (
-    f"1 of the worked examples cannot be proven as written: “{_REFUSED_TITLE}”. "
+    f"The rules-only check could not assign a verifier to 1 worked example(s): "
+    f"“{_REFUSED_TITLE}”. This is not a semantic impossibility. "
     "If you approve, the plan stage will ask the model fallback to place them; "
     "or send a note."
 )

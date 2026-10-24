@@ -262,6 +262,11 @@ class SidecarCodeReader:
         #: The route of the last request that failed on the wire, if any.
         self._last_transport_failure: str | None = None
 
+    @property
+    def commit(self) -> str | None:
+        """The immutable planning base this reader serves, when one was bound."""
+        return self._commit
+
     def begin(self, budget_s: float = FACT_GATHERING_BUDGET_S) -> None:
         """Start one fact-gathering pass with its own time budget. A helper
         already found unreachable stays so."""
