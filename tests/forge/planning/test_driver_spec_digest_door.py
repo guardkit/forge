@@ -57,7 +57,7 @@ from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.states import PlanningState
-from forge.planning.target_terminal_tools import ToolOutcome
+from forge.planning.target_terminal_tools import ToolOutcome, make_classify_scenarios
 from nats_core.events import ApprovalResponsePayload, AssumptionDisposition
 
 CID = "digest-run-0001"
@@ -2721,6 +2721,78 @@ class _RecordingClassify:
         return self._outcomes[min(len(self.calls) - 1, len(self._outcomes) - 1)]
 
 
+def _classify_payload(refused: list[str]) -> str:
+    rows = []
+    for title in (_HOMED_TITLE, _REFUSED_TITLE):
+        is_refused = title in refused
+        rows.append(
+            {
+                "title": title,
+                "home": None if is_refused else "hurl",
+                "rule": None if is_refused else "R9",
+                "refused": is_refused,
+            }
+        )
+    return json.dumps(
+        {
+            "feature_file": "/tmp/draft.feature",
+            "repo_has_http_surface": True,
+            "http_surface_evidence": "declared test fixture",
+            "scenarios": rows,
+            "refused_titles": refused,
+        },
+        indent=2,
+    )
+
+
+class _ClassifierSeamRun:
+    """Frozen guardkit-run seam answers; no process, network or broker."""
+
+    def __init__(self, states: list[str]) -> None:
+        self.states = states
+        self.calls: list[dict[str, Any]] = []
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        self.calls.append(kwargs)
+        state = self.states[min(len(self.calls) - 1, len(self.states) - 1)]
+        if state == "clean":
+            return SimpleNamespace(
+                status="success",
+                exit_code=0,
+                stdout_tail=_classify_payload([]),
+                stderr="",
+            )
+        if state == "refused":
+            return SimpleNamespace(
+                status="success",
+                exit_code=0,
+                stdout_tail=_classify_payload([_REFUSED_TITLE]),
+                stderr="",
+            )
+        if state == "clipped":
+            payload = _classify_payload([_REFUSED_TITLE])
+            return SimpleNamespace(
+                status="success",
+                exit_code=0,
+                stdout_tail=payload[payload.index('"refused_titles"') :],
+                stderr="",
+            )
+        if state == "unavailable":
+            return SimpleNamespace(
+                status="failed",
+                exit_code=2,
+                stdout_tail="",
+                stderr="Error: No such command 'classify-scenarios'.\n",
+            )
+        assert state == "failed"
+        return SimpleNamespace(
+            status="failed",
+            exit_code=1,
+            stdout_tail="",
+            stderr="fixture classifier failure\n",
+        )
+
+
 def _not_ok_reply(reason: str) -> Any:
     """The checker refusing a revision round (the must-pass note-honoured
     criterion failed twice): a not-ok dispatch with the checker's reason."""
@@ -2860,6 +2932,83 @@ async def test_one_refused_example_runs_the_machines_note_round_before_the_card(
     assert approved[-1]["provability"]["round"] == 1
     # Nothing was said to a person beyond the card and its opening ping.
     assert not [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("states", "spec_replies", "expected_dispatches", "expected_status"),
+    [
+        (["clean"], [_spec_reply()], 1, "checked"),
+        (
+            ["refused", "clean"],
+            [
+                _spec_reply(),
+                _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
+            ],
+            2,
+            "checked",
+        ),
+        (
+            ["clipped", "clean"],
+            [
+                _spec_reply(),
+                _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
+            ],
+            2,
+            "checked",
+        ),
+        (["unavailable"], [_spec_reply()], 1, "unavailable"),
+        (["failed"], [_spec_reply()], 1, "failed"),
+    ],
+    ids=["successful", "refused-rewritten", "clipped-rewritten", "unavailable", "failed"],
+)
+async def test_real_classifier_seam_reaches_revision_card_and_normalizer(
+    store: SqlitePlanningRunStore,
+    states: list[str],
+    spec_replies: list[Any],
+    expected_dispatches: int,
+    expected_status: str,
+) -> None:
+    """Classifier bytes drive the normal revision/card path and committed normalizer."""
+    _queue(store)
+    seam = _ClassifierSeamRun(states)
+    normalized: list[str] = []
+
+    async def normalize(worktree: Path, feature_rel: str) -> ToolOutcome:
+        normalized.append((worktree / feature_rel).read_text(encoding="utf-8"))
+        return ToolOutcome(ok=True)
+
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=spec_replies,
+        classify=make_classify_scenarios(run_fn=seam),
+        normalize=normalize,
+    )
+
+    await h.driver.drive(CID)
+
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+    assert len(h.ctx["dispatches"]) == expected_dispatches
+    assert len(seam.calls) == expected_dispatches
+    assert len(normalized) == expected_dispatches
+    assert normalized[0] == FEATURE_TEXT
+    receipt = _draft_rows(store)[-1][1]["provability"]
+    assert receipt["check"]["status"] == expected_status
+
+    if expected_dispatches == 2:
+        assert h.ctx["dispatches"][1]["validate_feedback"] == _PRE_CARD_NOTE
+        assert normalized[-1] == _REWRITTEN_FEATURE
+        assert receipt["rewritten"] is True
+        assert receipt["refused_titles"] == [_REFUSED_TITLE]
+        assert receipt["second_check"]["status"] == "checked"
+        assert _card_summary(h)["what_happened"].startswith(
+            f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
+        )
+    else:
+        assert normalized == [FEATURE_TEXT]
+        assert receipt["rewritten"] is False
+        assert _card_summary(h)["what_happened"] == _ROUND_ONE_TEXT
 
 
 @pytest.mark.asyncio

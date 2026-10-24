@@ -676,6 +676,8 @@ def _make_driver(
             # (2026-09-11): what the repository ALREADY contains, so the seat
             # stops planning to build what is already there.
             "repository_inventory",
+            # The immutable base to which complete inventory absence is bound.
+            "planning_base_identity",
             # Where the request's and the specification's words already
             # appear, with the code round them since 6 October 2026, and the
             # files that may hold a set the request names ("all the X").
@@ -1229,7 +1231,17 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     assert descriptor["repository_inventory"]["files"] == [
         "README.md", "tests/health/test_health.py", "tests/users/test_users.py",
     ]
-    assert {k: v for k, v in descriptor.items() if k != "repository_inventory"} == {
+    assert descriptor["planning_base_identity"] == {
+        "status": "bound",
+        "commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip(),
+    }
+    assert {
+        k: v
+        for k, v in descriptor.items()
+        if k not in {"repository_inventory", "planning_base_identity"}
+    } == {
         "repo": TARGET_REPO,
         "test_roots": ["tests/health", "tests/users"],
         # The scratch project declares no coverage command (20 October 2026).
@@ -1419,7 +1431,17 @@ async def test_replay_invented_tests_smoke_fails_the_real_validate(
     # (a) the descriptor forge threaded to 008 carried the EXACT roots (and,
     # since 2026-09-11, the repository's own inventory beside them).
     descriptor = h.ctx["counters"]["last_descriptor"]
-    assert {k: v for k, v in descriptor.items() if k != "repository_inventory"} == {
+    assert descriptor["planning_base_identity"] == {
+        "status": "bound",
+        "commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
+        ).strip(),
+    }
+    assert {
+        k: v
+        for k, v in descriptor.items()
+        if k not in {"repository_inventory", "planning_base_identity"}
+    } == {
         "repo": TARGET_REPO,
         "test_roots": ["tests/health", "tests/users"],
         # The scratch project declares no coverage command (20 October 2026).
