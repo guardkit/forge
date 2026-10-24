@@ -1567,3 +1567,102 @@ def test_late_qualified_failure_removes_only_new_tags_once(tmp_path, late_failur
     assert done.stderr.count("Nothing this run built is to be shipped") == 1
     assert state["tags"] == old_tags
     assert not (work / "receipt.json").exists()
+
+
+@pytest.mark.parametrize("preserve", [False, True])
+@pytest.mark.parametrize("failure", ["proof", "receipt", "sweep", "INT", "TERM"])
+def test_failed_image_preservation_is_explicit_and_keeps_failure(tmp_path, preserve, failure):
+    """Drive the real shell with the existing refusing fake engine; no daemon."""
+    work, manifest, environment, old_tags, commits = _qualified_fixture(tmp_path)
+    selected = _selected_tags(manifest, commits)
+    if failure == "sweep":
+        environment["FAKE_IMAGE_TEXT"] = _SYNTHETIC_TERM
+    if failure in {"INT", "TERM"}:
+        engine = work / "bin/docker"
+        code = engine.read_text()
+        marker = 'if args[0] == "save":'
+        assert marker in code
+        code = code.replace(
+            marker,
+            f'if args[0] == "save":\n'
+            f'    import signal\n'
+            f'    os.kill(os.getppid(), signal.SIG{failure})\n'
+            f'    sys.exit(0)\n' + marker,
+            1,
+        )
+        engine.write_text(code)
+    receipt = work / "absent/receipt.json" if failure == "receipt" else None
+    extra = ("--manifest-qualified-source-tag",)
+    if preserve:
+        extra += ("--preserve-failed-images",)
+    done, state, calls = _run_qualified_fixture(
+        work, manifest, environment, extra=extra, receipt=receipt,
+        proof_exit_status=7 if failure == "proof" else 0,
+    )
+    assert done.returncode != 0
+    if failure in {"INT", "TERM"}:
+        assert done.returncode == {"INT": 130, "TERM": 143}[failure]
+    assert not (work / "receipt.json").exists()
+    assert all(state["tags"][tag] == image for tag, image in old_tags.items())
+    built_names = [
+        call[call.index("--label") + 1] for call in calls if call[:2] == ["buildx", "build"]
+    ]
+    assert len(built_names) == (3 if failure in {"proof", "receipt"} else 1)
+    new_tags = [tag for name in list(commits)[:len(built_names)] for tag in selected[name]]
+    removed = [call[1] for call in calls if call[0] == "rmi"]
+    if preserve:
+        assert removed == []
+        assert set(state["tags"]) == set(old_tags) | set(new_tags)
+        assert "retained for diagnosis (--preserve-failed-images)" in done.stderr
+        assert done.stderr.count("Nothing this run built is to be shipped") == 1
+    else:
+        assert sorted(removed) == sorted(new_tags)
+        assert len(removed) == len(set(removed))
+        assert state["tags"] == old_tags
+    if failure == "proof":
+        assert (work / "proof-args.txt").read_text().splitlines() == [selected["review-image"][0]]
+
+
+def test_preservation_option_does_not_change_success_proofs(tmp_path):
+    work, manifest, environment, old_tags, commits = _qualified_fixture(tmp_path)
+    done, state, calls = _run_qualified_fixture(
+        work, manifest, environment,
+        extra=("--manifest-qualified-source-tag", "--preserve-failed-images"),
+    )
+    assert done.returncode == 0, done.stderr
+    assert json.loads((work / "receipt.json").read_text())["release_version"] == "0.0.0-drive"
+    assert len((work / "proof-args.txt").read_text().splitlines()) == 3
+    assert all(state["tags"][tag] == image for tag, image in old_tags.items())
+    assert not any(call[0] == "rmi" for call in calls)
+
+
+@pytest.mark.parametrize("preserve", [False, True])
+def test_ordinary_shell_error_uses_actual_cleanup_disposition(tmp_path, preserve):
+    source = SCRIPT.read_text()
+    functions = "\n".join(
+        name + "() {" + source.split(name + "() {", 1)[1].split("\n}\n", 1)[0] + "\n}"
+        for name in ("cleanup", "remove_this_runs_tags")
+    )
+    command_log = tmp_path / "commands.txt"
+    program = r'''
+set -euo pipefail
+KEEP_TEMP=1
+BUILD_SUCCEEDED=0
+TAGS_ALREADY_REMOVED=0
+RUN_TAGS='existing:tag new:commit new:version'
+PRE_EXISTING_TAGS='existing:tag'
+TMP=fixture
+say() { :; }
+docker() {
+    test "$1" = rmi || return 91
+    printf '%s\n' "$2" >> "$COMMAND_LOG"
+}
+''' + functions + "\ntrap cleanup EXIT\nfalse\n"
+    done = subprocess.run(
+        ["bash", "-c", program], capture_output=True, text=True,
+        env={"PATH": "/usr/bin:/bin", "COMMAND_LOG": str(command_log),
+             "PRESERVE_FAILED_IMAGES": str(int(preserve))}, timeout=10,
+    )
+    assert done.returncode == 1
+    commands = command_log.read_text().splitlines() if command_log.exists() else []
+    assert commands == ([] if preserve else ["new:commit", "new:version"])

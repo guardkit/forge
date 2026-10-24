@@ -57,6 +57,9 @@
 #
 #     manifest-path        default: ./manifest.yaml in the current directory
 #     --keep-temp          leave the fetched clones behind (for diagnosis)
+#     --preserve-failed-images
+#                          keep this run's tags/images after any failed ending
+#                          for diagnosis. Failure remains non-zero; never ship them.
 #     --receipt <path>     where to write the JSON receipt
 #                          (default: ./<image>-<version>.json beside the manifest's
 #                           reader, i.e. in the current directory)
@@ -106,7 +109,9 @@
 # image and the file — and says WHICH of the words matched by its position in
 # RELEASE_SWEEP_TERMS rather than printing it, because a build log is kept and
 # the word is one of this machine's own names. The tags this run wrote are
-# removed, and so they are on any other unfinished ending.
+# removed, and so they are on any other unfinished ending, unless the explicit
+# --preserve-failed-images diagnostic option keeps them. That option does not
+# change proof, sweep, receipt or exit-status requirements.
 #
 # WHY THE LAYERS AND NOT ONLY THE FILESYSTEM. An export is the flattened FINAL
 # filesystem: a file a Dockerfile copies in and a later step deletes is gone
@@ -193,6 +198,7 @@ export GIT_CONFIG_NOSYSTEM=1
 
 MANIFEST=""
 KEEP_TEMP=0
+PRESERVE_FAILED_IMAGES=0
 RECEIPT=""
 ALLOW_EXISTING_TAG=0
 MANIFEST_QUALIFIED_SOURCE_TAG=0
@@ -224,6 +230,7 @@ say() { echo "$*" >&2; }
 while [ "$#" -gt 0 ]; do
     case "$1" in
         --keep-temp) KEEP_TEMP=1; shift ;;
+        --preserve-failed-images) PRESERVE_FAILED_IMAGES=1; shift ;;
         --allow-existing-tag) ALLOW_EXISTING_TAG=1; shift ;;
         --manifest-qualified-source-tag) MANIFEST_QUALIFIED_SOURCE_TAG=1; shift ;;
         --skip-proof) RUN_PROOF=0; shift ;;
@@ -842,7 +849,14 @@ sweep_exception_reason() {
 # started — which only happens with --allow-existing-tag — is left exactly as
 # it was found, because it is not this run's to remove.
 remove_this_runs_tags() {
+    # Both explicit proof/sweep refusal and EXIT cleanup use this disposition.
+    # Mark it handled even when preserving, so EXIT cannot remove the same tags.
     TAGS_ALREADY_REMOVED=1
+    if [ "${PRESERVE_FAILED_IMAGES}" = "1" ]; then
+        echo "       This run's tags and images were retained for diagnosis (--preserve-failed-images)." >&2
+        echo "       Nothing this run built is to be shipped." >&2
+        return 0
+    fi
     local t
     for t in ${RUN_TAGS}; do
         case " ${PRE_EXISTING_TAGS} " in
@@ -1257,7 +1271,7 @@ if [ "${RUN_PROOF}" = "1" ]; then
         if ! bash "${ROOT_DIR}/${iproof}" "${itagcommit}" </dev/null; then
             echo "ERROR: the proof of image '${iname}' failed for ${itagcommit}." >&2
             remove_this_runs_tags
-            die "the proof of image '${iname}' failed; this run's tags were removed. Do not ship anything from it."
+            die "the proof of image '${iname}' failed. Do not ship anything from it."
         fi
     done < "${BUILT}"
 fi
@@ -1351,7 +1365,7 @@ COORDINATOR_TAG_VERSION="$(coordinator_field 6)"
 # by the EXIT trap on any ending, so a release that nobody can read afterwards
 # does not leave images behind that look shippable.
 [ -s "${RECEIPT}" ] \
-    || die "the receipt at ${RECEIPT} is empty or was not written, so this release has nothing that says what it is made of. The images this run built have been removed."
+    || die "the receipt at ${RECEIPT} is empty or was not written, so this release has nothing that says what it is made of. Do not ship any images from this run."
 BUILD_SUCCEEDED=1
 
 say "Receipt written to ${RECEIPT}"
