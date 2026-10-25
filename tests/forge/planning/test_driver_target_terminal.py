@@ -8926,10 +8926,14 @@ async def test_a_retained_objection_returned_by_the_re_review_fails(
     async def _the_specialist(**kwargs: Any) -> Any:
         if kwargs.get("revision_of") is None:
             return _a_reply(files)
+        # The specialist's own failed-command reply for a retained objection.
         return SimpleNamespace(
             outcome=SimpleNamespace(value="error"),
             role_output=None,
-            reason="ModeValidateRefusedError: A6 the plan leaves a part unbuilt",
+            reason=(
+                "Command 'feature_plan' failed: architect_feature_plan plan "
+                "content check refused: A6 the plan leaves a part unbuilt"
+            ),
         )
 
     h = _make_driver(store, plan_dispatch=_the_specialist)
@@ -8937,3 +8941,29 @@ async def test_a_retained_objection_returned_by_the_re_review_fails(
     assert any(
         "re-review refused" in message for _, message, _ in h.ctx["notifications"]
     )
+    assert _approved_plan_events(store) == []
+
+
+@pytest.mark.asyncio
+async def test_a_re_review_returned_as_an_infrastructure_error_is_advice(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """An error with no reviewer verdict in it is the unreadable-record advice:
+    the plan carries on and the build card says so."""
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+
+    async def _the_specialist(**kwargs: Any) -> Any:
+        if kwargs.get("revision_of") is None:
+            return _a_reply(files)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="error"),
+            role_output=None,
+            reason="connection_closed: specialist reply unavailable",
+        )
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    await h.driver.drive(CID)
+    plan = _approved_plan_events(store)
+    assert plan, "the plan was recorded, not refused"
+    assert "connection_closed" in plan[-1]["plan_review_note"]

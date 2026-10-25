@@ -78,6 +78,7 @@ from tests.forge.planning.test_driver_target_terminal import (
     _queue,
     _recorded_runner,
     _rewritten_spec_result,
+    _semantic_review_json,
     _seed_gate_surface,
     _spec_by_round,
     _spec_result_native,
@@ -332,7 +333,11 @@ async def test_sidecar_normalizer_review_refusal_fails_after_commit_before_build
         return SimpleNamespace(
             outcome=SimpleNamespace(value="error"),
             role_output={},
-            reason="Coach refused normalized tree",
+            # The specialist's own wording for a refused exact review.
+            reason=(
+                "Command 'feature_plan' failed: architect_feature_plan exact "
+                "semantic re-review refused: Coach refused normalized tree"
+            ),
         )
 
     h = _driver(store, sandbox_repo, plan_dispatch=reviewer)
@@ -346,6 +351,96 @@ async def test_sidecar_normalizer_review_refusal_fails_after_commit_before_build
         and "Coach refused normalized tree" in message
         for _, message, _ in h.ctx["notifications"]
     )
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_plan_from_the_final_review_after_the_commit_reaches_handoff(
+    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path
+) -> None:
+    """The final review of the committed, normalized tree answers with the
+    plan writer's one ordinary-plan recovery (code review R2, finding 2, 25
+    October 2026). That plan goes through the same normalization, validation
+    and plan write, on a branch of its own cut from the approved spec, and its
+    committed files and commit are what is handed off. The audit commit of the
+    first plan stays where it was."""
+    from forge.planning.driver import BuildTriggerResult
+
+    repo, _, _ = sandbox_repo
+    _queue(store)
+    state = {"recovered": False}
+
+    def _recovered(feature_id: str) -> Any:
+        role_output = {
+            f".guardkit/features/{feature_id}.yaml": (
+                f"id: {feature_id}\ntasks:\n- id: TASK-RECOVERED-001\n"
+            ),
+            "tasks/backlog/stats-endpoint/TASK-RECOVERED-001.md": "# recovered\n",
+            "validation.json": json.dumps(
+                {"accepted": True, "errors": [], "gates_run": ["feature_validate"]}
+            ),
+        }
+        plan_files = PlanningRunDriver._plan_tree_files(role_output)
+        assert plan_files is not None
+        role_output["semantic_review.json"] = _semantic_review_json(plan_files)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="completed"),
+            role_output=role_output,
+            reason=None,
+        )
+
+    async def reviewer(**kwargs: Any) -> Any:
+        revision = kwargs.get("revision_of")
+        if revision is None:
+            return _plan_result_native(kwargs["feature_id"])
+        plan_yaml = revision[_plan_yaml_rel(kwargs["feature_id"])]
+        if "scenarios:" in plan_yaml and not state["recovered"]:
+            # The retained objection at final review, recovered by the
+            # specialist with its one ordinary plan.
+            state["recovered"] = True
+            return _recovered(kwargs["feature_id"])
+        return _plan_result(
+            kwargs["feature_id"], dict(revision), reviewed_after_rewrite=True
+        )
+
+    triggered: list[dict[str, Any]] = []
+
+    async def trigger(**kwargs: Any) -> Any:
+        triggered.append(kwargs)
+        return BuildTriggerResult(queued=True, build_id="build-1")
+
+    h = _driver(store, sandbox_repo, plan_dispatch=reviewer, build_trigger_fn=trigger)
+    await h.driver.drive(CID)
+
+    recovered_branch = f"planning/{CID}-recovered"
+    plan = _leg_details(store, "feature-plan")
+    assert plan["branch"] == recovered_branch
+    assert "tasks/backlog/stats-endpoint/TASK-RECOVERED-001.md" in plan["plan_files"]
+    # The handed-off commit is the recovered plan's, on its branch (later
+    # planning steps may add commits on top).
+    assert subprocess.run(
+        ["git", "merge-base", "--is-ancestor", plan["sha"], recovered_branch],
+        cwd=repo,
+    ).returncode == 0
+    assert "tasks/backlog/stats-endpoint/TASK-RECOVERED-001.md" in subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", plan["sha"]],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout
+    # The recovered plan went through the normalizer again, and none of the
+    # first plan's files ride along on its branch.
+    assert len(normalize_calls(fake_guardkit)) == 2
+    listed = subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", recovered_branch],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout.splitlines()
+    assert "tasks/backlog/stats-endpoint/TASK-RECOVERED-001.md" in listed
+    assert "tasks/backlog/stats-endpoint/TASK-STAT-001.md" not in listed
+    # The first plan's audit commit is still on the planning branch.
+    assert "tasks/backlog/stats-endpoint/TASK-STAT-001.md" in subprocess.run(
+        ["git", "ls-tree", "-r", "--name-only", f"planning/{CID}"],
+        cwd=repo, capture_output=True, text=True, check=True,
+    ).stdout
+    assert [t["branch"] for t in triggered] == [recovered_branch]
+    assert "plan_review_note" not in plan
 
 
 @pytest.mark.asyncio

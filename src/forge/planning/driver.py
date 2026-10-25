@@ -1237,6 +1237,23 @@ _SEMANTIC_VERDICT_REFUSALS: frozenset[str] = frozenset(
 #: 2026): the plan attempt takes that plan and starts its checks again.
 _PLAN_RECOVERED = "the re-review answered with the plan writer's recovered plan"
 
+def _names_a_reviewer_refusal(reason: str) -> bool:
+    """Does a returned dispatch error carry the plan writer's own refusal?
+
+    The specialist reports a reviewer's refusal in one form, ``<mode> ...
+    refused: <reasons>`` (its retained objections, a refused exact review),
+    inside the failed command's message. An error with no such verdict (an
+    unavailable reply, a closed connection, a timeout) names no refusal and
+    is the unreadable-record advice instead (25 October 2026). The generic
+    error category alone is never a verdict.
+    """
+    return " refused: " in f" {reason}".lower()
+
+
+#: The suffix of the branch a recovered plan is written on when the planning
+#: branch already carries the first plan's commit (25 October 2026).
+_RECOVERED_BRANCH_SUFFIX = "-recovered"
+
 #: The note on the recovered plan's later calls: an ordinary plan, so the
 #: already-done answer is not offered again.
 _RECOVERED_PLAN_NOTE = (
@@ -1515,6 +1532,11 @@ class _PlanAttempt:
     #: (7 October 2026): nothing was written, and the caller ends the run
     #: through :meth:`PlanningRunDriver._finish_nothing_to_build`.
     nothing_to_build: "_NothingToBuildAnswer | None" = None
+    #: The branch the plan was committed on when it is not the planning
+    #: branch: the plan writer's recovered plan after the final review of an
+    #: already committed tree (25 October 2026). ``None`` means the planning
+    #: branch itself.
+    branch: str | None = None
 
 
 @dataclass(frozen=True)
@@ -6974,7 +6996,7 @@ class PlanningRunDriver:
             attempt,
             feature_id=feature_id,
             target_repo=target_repo,
-            branch=branch,
+            branch=attempt.branch or branch,
             rewrite=rewrite,
             repo_path=repo_path,
         )
@@ -6993,6 +7015,8 @@ class PlanningRunDriver:
         rules_only: bool = False,
         plan_note: str | None = None,
         recovered_result: Any | None = None,
+        write_branch: str | None = None,
+        write_start_commit: str | None = None,
     ) -> "_PlanAttempt | None":
         """One pass of the plan leg's work, from the top: read the approved spec
         back off the branch, dispatch the plan-writer, write the tree with the
@@ -7024,6 +7048,11 @@ class PlanningRunDriver:
         attempt's reply, with no new dispatch, and goes through the ordinary
         normalization, validation and handoff. It is never recovered again.
 
+        ``write_branch`` / ``write_start_commit``: where that recovered plan is
+        written when the final review answered after the planning branch
+        already carried a committed plan (the audit commit stays where it is).
+        The spec is still read off ``branch``.
+
         Returns the attempt record, or ``None`` after failing the run loudly
         for any reason other than the normalizer's stop (which the caller
         decides on).
@@ -7031,6 +7060,9 @@ class PlanningRunDriver:
         deps = self._deps
         spec_details = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
         slug = str(spec_details.get("slug") or self._slug_of({}, correlation_id))
+        # Where this attempt writes its plan: the planning branch, or the
+        # recovered plan's own branch (25 October 2026).
+        plan_branch = write_branch or branch
 
         # The 008 contract needs the CONTENTS of the committed spec triple, not
         # paths. Read them back off the planning branch (they are no longer in
@@ -7325,11 +7357,12 @@ class PlanningRunDriver:
             if unreadable is None:
                 reviewed_ok, reviewed_reason = self._dispatch_ok(reviewed_result)
             if unreadable is None and not reviewed_ok:
-                if reviewed_reason.startswith("error:"):
-                    # The plan writer answered and refused (its retained
-                    # objection): a refusal, as on the first call. Only no
-                    # answer (a timeout, a raise) is bookkeeping.
+                if _names_a_reviewer_refusal(reviewed_reason):
+                    # The plan writer's reviewer answered and refused (its
+                    # retained objection): a refusal, as on the first call.
                     return "exact-artifact re-review refused: " + reviewed_reason
+                # An error with no verdict in it (the reply was unavailable,
+                # the connection closed, the call timed out) is bookkeeping.
                 unreadable = "exact-artifact re-review " + reviewed_reason
             if unreadable is None:
                 reviewed_output = self._role_output_of(reviewed_result)
@@ -7473,7 +7506,7 @@ class PlanningRunDriver:
                 spec_feature_paths,
                 rules_only=rules_only,
                 repo_path=repo_path,
-                branch=branch,
+                branch=plan_branch,
             )
             files = declared.files
             if declared.stamps is not None:
@@ -7492,13 +7525,25 @@ class PlanningRunDriver:
                     )
             pre_commit = declared.checks
 
-        async def _take_the_recovered_plan() -> "_PlanAttempt | None":
+        async def _take_the_recovered_plan(
+            *, after_commit: str | None = None
+        ) -> "_PlanAttempt | None":
+            """The recovered plan, through the usual checks and plan write.
+
+            ``after_commit`` is the plan commit already on the planning branch
+            when the final review answered: that audit commit stays, and the
+            recovered plan is written on a branch of its own, cut from the
+            approved spec's commit, so none of the first plan's files ride
+            along. The recovered plan is never recovered again.
+            """
             logger.warning(
                 "planning driver: run %s — the plan writer answered the "
                 "re-review with its one ordinary-plan recovery; that plan "
-                "replaces this attempt's and goes through the usual checks",
+                "replaces this attempt's and goes through the usual checks%s",
                 correlation_id,
+                f" (the committed plan {after_commit} is kept)" if after_commit else "",
             )
+            start = str(spec_details.get("sha") or "").strip() or None
             return await self._plan_attempt(
                 row,
                 correlation_id,
@@ -7511,6 +7556,10 @@ class PlanningRunDriver:
                 rules_only=rules_only,
                 plan_note=plan_note or _RECOVERED_PLAN_NOTE,
                 recovered_result=semantic_state["recovered"],
+                write_branch=(
+                    f"{branch}{_RECOVERED_BRANCH_SUFFIX}" if after_commit else None
+                ),
+                write_start_commit=start if after_commit else None,
             )
 
         semantic_error = await _ensure_semantic_review(files)
@@ -7533,13 +7582,18 @@ class PlanningRunDriver:
             ) = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
-                branch=branch,
+                branch=plan_branch,
                 files=files,
                 message=(
                     f"planning: feature plan {feature_id} for {correlation_id} "
                     "(Lane B 008)"
                 ),
                 pre_commit=pre_commit,
+                **(
+                    {"start_commit": write_start_commit}
+                    if write_start_commit
+                    else {}
+                ),
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
                 build=whose_work,
@@ -7585,7 +7639,7 @@ class PlanningRunDriver:
         committed_files: dict[str, str] = {}
         for rel in files:
             content = await git_runner.read_file_from_branch(
-                repo_path=repo_path, branch=branch, file_path=str(rel)
+                repo_path=repo_path, branch=plan_branch, file_path=str(rel)
             )
             if content is None:
                 await self._fail_leg(
@@ -7603,10 +7657,27 @@ class PlanningRunDriver:
         # use the same Coach-only exact-artifact review here. The helper is
         # idempotent when the approved bytes are unchanged and fails closed for
         # every missing, rejected, malformed, or tree-rewriting response.
-        # The tree is committed: a rewritten tree from here on is the card's
-        # line, never a second plan written over the first.
-        semantic_state["may_recover"] = False
+        # The tree is committed. A first recovery the final review answers with
+        # still goes through the usual checks and plan write, on a branch of
+        # its own; the committed plan stays as the record of what was asked.
         semantic_error = await _ensure_semantic_review(committed_files)
+        if semantic_state["recovered"] is not None:
+            if str(spec_details.get("sha") or "").strip():
+                return await _take_the_recovered_plan(after_commit=gitres.sha)
+            # No recorded spec commit to cut its branch from: the committed
+            # plan stands and the card says the review answered differently.
+            logger.warning(
+                "planning driver: run %s — the final review answered with a "
+                "recovered plan, but the spec's commit is not on record; the "
+                "committed plan stands and the card says so",
+                correlation_id,
+            )
+            semantic_state["recovered"] = None
+            semantic_state["review"] = None
+            semantic_state["unreadable"] = (
+                "exact-artifact re-review rewrote the supplied plan tree"
+            )
+            semantic_error = None
         if semantic_error is not None:
             await self._fail_leg(
                 correlation_id,
@@ -7622,6 +7693,7 @@ class PlanningRunDriver:
             sha=gitres.sha,
             traceability=semantic_state["review"],
             review_unreadable=semantic_state["unreadable"],
+            branch=plan_branch if plan_branch != branch else None,
         )
 
     # -- the plan leg's pre-commit checks, declared (sandbox first, rule 70) --
