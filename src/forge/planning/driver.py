@@ -7017,6 +7017,7 @@ class PlanningRunDriver:
         recovered_result: Any | None = None,
         write_branch: str | None = None,
         write_start_commit: str | None = None,
+        carried_files: Mapping[str, str] | None = None,
     ) -> "_PlanAttempt | None":
         """One pass of the plan leg's work, from the top: read the approved spec
         back off the branch, dispatch the plan-writer, write the tree with the
@@ -7051,7 +7052,11 @@ class PlanningRunDriver:
         ``write_branch`` / ``write_start_commit``: where that recovered plan is
         written when the final review answered after the planning branch
         already carried a committed plan (the audit commit stays where it is).
-        The spec is still read off ``branch``.
+        The branch is cut from ``write_start_commit`` and its settings are read
+        from that same commit. The spec is still read off ``branch``.
+        ``carried_files`` are written beside the plan and are not part of it:
+        the approved spec's files, when the branch is cut from the run's start
+        commit because the spec's own commit is not on record.
 
         Returns the attempt record, or ``None`` after failing the run loudly
         for any reason other than the normalizer's stop (which the caller
@@ -7506,7 +7511,9 @@ class PlanningRunDriver:
                 spec_feature_paths,
                 rules_only=rules_only,
                 repo_path=repo_path,
-                branch=plan_branch,
+                # The settings of the commit the plan is written on: the
+                # recovered branch's start commit, before that branch exists.
+                branch=write_start_commit or plan_branch,
             )
             files = declared.files
             if declared.stamps is not None:
@@ -7543,7 +7550,29 @@ class PlanningRunDriver:
                 correlation_id,
                 f" (the committed plan {after_commit} is kept)" if after_commit else "",
             )
+            # ONE COMMIT FOR THE CUT AND THE SETTINGS (25 October 2026): the
+            # approved spec's commit when it is on record, else the commit this
+            # run started from. A spec record without its commit is a
+            # bookkeeping gap: said as advice, and the recovered plan is kept.
             start = str(spec_details.get("sha") or "").strip() or None
+            carried: dict[str, str] | None = None
+            if after_commit and start is None:
+                start, _target = self._deps.store.get_start_point(correlation_id)
+                logger.warning(
+                    "planning driver: run %s — ADVISORY: the approved spec's "
+                    "record names no commit; the recovered plan's branch is cut "
+                    "from the run's start commit %s and carries the approved "
+                    "spec's files",
+                    correlation_id,
+                    start,
+                )
+                carried = {}
+                for rel in spec_details.get("spec_files") or []:
+                    text = await git_runner.read_file_from_branch(
+                        repo_path=repo_path, branch=branch, file_path=str(rel)
+                    )
+                    if text is not None:
+                        carried[str(rel)] = text
             return await self._plan_attempt(
                 row,
                 correlation_id,
@@ -7560,6 +7589,7 @@ class PlanningRunDriver:
                     f"{branch}{_RECOVERED_BRANCH_SUFFIX}" if after_commit else None
                 ),
                 write_start_commit=start if after_commit else None,
+                carried_files=carried,
             )
 
         semantic_error = await _ensure_semantic_review(files)
@@ -7583,7 +7613,7 @@ class PlanningRunDriver:
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
                 branch=plan_branch,
-                files=files,
+                files={**dict(carried_files or {}), **files},
                 message=(
                     f"planning: feature plan {feature_id} for {correlation_id} "
                     "(Lane B 008)"
@@ -7662,22 +7692,7 @@ class PlanningRunDriver:
         # its own; the committed plan stays as the record of what was asked.
         semantic_error = await _ensure_semantic_review(committed_files)
         if semantic_state["recovered"] is not None:
-            if str(spec_details.get("sha") or "").strip():
-                return await _take_the_recovered_plan(after_commit=gitres.sha)
-            # No recorded spec commit to cut its branch from: the committed
-            # plan stands and the card says the review answered differently.
-            logger.warning(
-                "planning driver: run %s — the final review answered with a "
-                "recovered plan, but the spec's commit is not on record; the "
-                "committed plan stands and the card says so",
-                correlation_id,
-            )
-            semantic_state["recovered"] = None
-            semantic_state["review"] = None
-            semantic_state["unreadable"] = (
-                "exact-artifact re-review rewrote the supplied plan tree"
-            )
-            semantic_error = None
+            return await _take_the_recovered_plan(after_commit=gitres.sha)
         if semantic_error is not None:
             await self._fail_leg(
                 correlation_id,

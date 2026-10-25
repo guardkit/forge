@@ -354,20 +354,42 @@ async def test_sidecar_normalizer_review_refusal_fails_after_commit_before_build
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("case", ["as-recorded", "spec-without-sha", "main-moved"])
 async def test_a_recovered_plan_from_the_final_review_after_the_commit_reaches_handoff(
-    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path
+    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path, case: str, caplog
 ) -> None:
     """The final review of the committed, normalized tree answers with the
-    plan writer's one ordinary-plan recovery (code review R2, finding 2, 25
-    October 2026). That plan goes through the same normalization, validation
-    and plan write, on a branch of its own cut from the approved spec, and its
-    committed files and commit are what is handed off. The audit commit of the
-    first plan stays where it was."""
+    plan writer's one ordinary-plan recovery (code review R2 and R3, finding 2
+    and 12, 25 October 2026). That plan goes through the same normalization,
+    validation and plan write, on a branch of its own, and its committed files
+    and commit are what is handed off. The audit commit of the first plan
+    stays where it was.
+
+    One commit is used both to cut the recovered branch and to read its
+    settings: the approved spec's commit, or the run's start commit when the
+    spec's record names none (``spec-without-sha``: a bookkeeping gap, said as
+    advice, and the spec's files are carried). ``main-moved``: main changes
+    its routing setting before the recovered branch's settings are read; the
+    branch's own commit still governs."""
     from forge.planning.driver import BuildTriggerResult
 
     repo, _, _ = sandbox_repo
     _queue(store)
     state = {"recovered": False}
+    if case == "spec-without-sha":
+        real_record = store._record_event
+
+        def without_the_spec_commit(**kwargs: Any) -> Any:
+            if (
+                kwargs.get("stage_label") == "feature-spec"
+                and kwargs.get("status") == "approved"
+            ):
+                details = json.loads(kwargs["details_json"])
+                details.pop("sha", None)
+                kwargs["details_json"] = json.dumps(details)
+            return real_record(**kwargs)
+
+        store._record_event = without_the_spec_commit  # type: ignore[method-assign]
 
     def _recovered(feature_id: str) -> Any:
         role_output = {
@@ -397,6 +419,8 @@ async def test_a_recovered_plan_from_the_final_review_after_the_commit_reaches_h
             # The retained objection at final review, recovered by the
             # specialist with its one ordinary plan.
             state["recovered"] = True
+            if case == "main-moved":
+                _commit_repo_routing_law(repo, "off")
             return _recovered(kwargs["feature_id"])
         return _plan_result(
             kwargs["feature_id"], dict(revision), reviewed_after_rewrite=True
@@ -409,7 +433,8 @@ async def test_a_recovered_plan_from_the_final_review_after_the_commit_reaches_h
         return BuildTriggerResult(queued=True, build_id="build-1")
 
     h = _driver(store, sandbox_repo, plan_dispatch=reviewer, build_trigger_fn=trigger)
-    await h.driver.drive(CID)
+    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
 
     recovered_branch = f"planning/{CID}-recovered"
     plan = _leg_details(store, "feature-plan")
@@ -441,6 +466,26 @@ async def test_a_recovered_plan_from_the_final_review_after_the_commit_reaches_h
     ).stdout
     assert [t["branch"] for t in triggered] == [recovered_branch]
     assert "plan_review_note" not in plan
+    # The recovered plan's checks were declared from its own commit's
+    # settings: the routing law enforced, as on the first plan.
+    normalizes = normalize_calls(fake_guardkit)
+    assert all("--no-model" in call for call in normalizes)
+    declared = [
+        r.getMessage()
+        for r in caplog.records
+        if "the plan leg's pre-commit checks" in r.getMessage()
+    ]
+    assert len(declared) == 2
+    assert all("normalize-stamps(blocking, --no-model)" in line for line in declared)
+    if case == "spec-without-sha":
+        # Cut from the run's start commit, carrying the approved spec's files,
+        # and said as advice.
+        spec_files = _leg_details(store, "feature-spec")["spec_files"]
+        assert spec_files and all(path in listed for path in spec_files)
+        assert any(
+            "ADVISORY: the approved spec's record names no commit" in r.getMessage()
+            for r in caplog.records
+        )
 
 
 @pytest.mark.asyncio
