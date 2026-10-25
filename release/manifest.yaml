@@ -174,7 +174,11 @@ schema: 2
 # from it needs the one-off ownership step for the relay's existing volume
 # (ai-transition RUNBOOK-factory-release-to-both-machines, "One-off: the memory
 # images stop running as root"). Version names the next release candidate.
-version: 2026.10.16-1
+# 25 October 2026: release 2026.10.25-1, step 1 of the simplification (Forge
+# 26bfb157, GuardKit bb4f97db, guardkitfactory acc9885). nats-core, fleet-memory
+# and Jarvis stay at live release 2026.10.24-2's pins. This file is the one
+# manifest: edit it in place for each release, never a copy kept elsewhere.
+version: 2026.10.25-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -222,46 +226,9 @@ images:
     dockerfile: src/forge/publisher/Dockerfile
     role: publisher
     proof: scripts/verify-publisher-image.sh
-  # THE TWO MEMORY IMAGES. Built as part of a release for the first time on
-  # 25 September 2026. Before that they were built by hand on one machine out
-  # of a checkout, with `docker compose up -d --build`, on a floating base tag,
-  # so "the same memory service on two machines" was not something anybody
-  # could have had.
-  #
-  # They are the first images of a release built from a repository OTHER than
-  # the one the release is cut from. `context:` names which of the pinned
-  # repositories below each one's Dockerfile and build context come from, so
-  # these two are built from the fleet-memory clone at the fleet-memory pin and
-  # tagged by THAT commit. Their proof is one of this repository's own scripts,
-  # because a release's proofs belong to the release.
-  - name: fleet-memory-mcp
-    context: fleet-memory
-    dockerfile: deploy/mcp/Dockerfile
-    role: memory
-    proof: scripts/verify-fleet-memory-image.sh
-  - name: fleet-memory-relay
-    context: fleet-memory
-    dockerfile: deploy/relay/Dockerfile
-    role: memory-relay
-    proof: scripts/verify-fleet-memory-image.sh
-  # THE JARVIS IMAGE. Built as part of a release for the first time on 25
-  # September 2026. Before that the Slack front door and the bus gateway ran as
-  # host units out of a checkout and a virtual environment under a home
-  # directory, so "the same front door on two machines" was not something
-  # anybody could have.
-  #
-  # ONE IMAGE, TWO SERVICES, which is why there is one entry here and not two:
-  # the front door serves the graphs that repository declares, the gateway is
-  # the same package's own command on the bus, and they share every dependency.
-  # The estate starts them with two different commands out of this one image —
-  # the same shape the coordinator and the answer service already have. The
-  # role says 'front-door' because that is the service the image's own CMD is,
-  # and its proof holds the estate's two commands to what the image can run.
-  - name: jarvis
-    context: jarvis
-    dockerfile: deploy/Dockerfile
-    role: front-door
-    proof: scripts/verify-jarvis-image.sh
+  # The memory and Jarvis images are built only by a release that changes
+  # them; their entries (and the reasons for them) are in this file's history
+  # up to 25 October 2026. Add them back for such a release.
 
 # The six repositories that make up the images above.
 #   role: build-context-root  — the Dockerfile and the main build context
@@ -272,27 +239,27 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 5c45fef7fa00d126369e2bff0d7a3889e7713077
+    commit: 26bfb1571435fe19a00bc11dee97ab95b8b4859d
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 1973b84db5586ec2d366dacc0fd62808622d6ced
+    commit: bb4f97dbe9b8b6ac0ca678d8c8acaad9205e4cd0
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
     branch: main
-    commit: ecf69eb1d22358e12076ca700df226c07f28f5e8
+    commit: ef4d8fd704ceb7ad10f9a9563bd3fed722e106de
     role: named-context
   - name: fleet-memory
     url: https://github.com/guardkit/fleet-memory.git
     branch: main
-    commit: ee7c2777b75b248955f7a6d93922d5a6baef6162
+    commit: e8ccf1283ff6ddab4882d6a63a3e7fe9b5980a1f
     role: named-context
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
-    commit: 40615a7e0ff6952b5a5492ada0d3a66dc10c8533
+    commit: acc9885f7c6a5398ee7c10406541a401476f8a2a
     role: named-context
   # THE SIXTH REPOSITORY (25 September 2026). It is a named context like the
   # four above — the jarvis image is built from ITS clone, at this pin, and
@@ -304,7 +271,7 @@ repositories:
   - name: jarvis
     url: https://github.com/guardkit/jarvis.git
     branch: main
-    commit: 8eabb71ac8ea9bf7207bb1c40010634c2c247ebc
+    commit: ee58c258968f0346eeb50d9176efcd27112a8bb1
     role: named-context
 
 # ---------------------------------------------------------------------------
