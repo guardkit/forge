@@ -134,6 +134,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from collections.abc import Mapping
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from nats_core.events import ApprovalResponsePayload, StageCompletePayload
@@ -1962,6 +1963,20 @@ def git_surface_for(
 # so the publisher stage, which needs "where is the remote's branch now" and
 # "did the send land", reaches for the join's own helpers instead of writing
 # ``main`` into central code again.
+
+
+def _could_not_run(report: Mapping[str, Any]) -> bool:
+    """Did the build system say its own checks could not run (not red)?
+
+    ``verify_status: unverified`` or ``verify_ran: false``, as the merge and
+    check-join commands report it, or as the record keeps it. Step 1 (25
+    October 2026): such checks are advice, never a pass and never a block.
+    """
+    if not isinstance(report, Mapping):
+        return False
+    return report.get("verify_ran") is False or (
+        str(report.get("verify_status") or "").strip().lower() == "unverified"
+    )
 
 
 def _merge_branch_of_record(
@@ -5779,6 +5794,9 @@ async def execute_merge_deploy(
                 line = _the_recorded_line(step)
                 if line is None or line.detail.get("verify_ok") is not False:
                     return None
+                if _could_not_run(line.detail):
+                    # It did not run: advice, asked about again (step 1).
+                    return None
                 return str(
                     line.detail.get("verify_detail")
                     or line.detail.get("verify_status")
@@ -6260,6 +6278,15 @@ async def execute_merge_deploy(
                 # their own "about to" line.
                 checks_passed = _report_int(report, "checks_passed")
                 checks_total = _report_int(report, "checks_total")
+                # CHECKS THAT COULD NOT RUN ARE ADVICE (step 1, 25 October
+                # 2026): an install that failed, say. Recorded as unavailable,
+                # never as a pass; only checks that ran and went red block.
+                if merged_in_report and _could_not_run(report or {}):
+                    merge_checks_unavailable = str(
+                        (report or {}).get("verify_detail")
+                        or "the build system's own checks after the join could "
+                        "not run"
+                    )
                 if store is not None and not store.done(
                     build_id=build_id,
                     turn=turn,
@@ -6284,10 +6311,23 @@ async def execute_merge_deploy(
                     attempt=attempt,
                     result={
                         "ran_on": j_commit,
-                        "verify_ran": (report or {}).get("verify_ran"),
-                        "verify_ok": (report or {}).get("verify_ok"),
+                        "verify_ran": (
+                            False
+                            if merge_checks_unavailable is not None
+                            else (report or {}).get("verify_ran")
+                        ),
+                        "verify_ok": (
+                            None
+                            if merge_checks_unavailable is not None
+                            else (report or {}).get("verify_ok")
+                        ),
                         "verify_status": (report or {}).get("verify_status"),
                         "verify_detail": (report or {}).get("verify_detail"),
+                        **(
+                            {"unavailable": merge_checks_unavailable}
+                            if merge_checks_unavailable is not None
+                            else {}
+                        ),
                         "checks_passed": checks_passed,
                         "checks_total": checks_total,
                         # Shown names for a person, and each name exactly
@@ -6331,31 +6371,24 @@ async def execute_merge_deploy(
                 digest_conformance.update(conformance)
                 _write_receipt("digest_conformance.json", conformance)
 
-                if merged_in_report and report.get("verify_ok") is False:
+                if (
+                    merged_in_report
+                    and report.get("verify_ok") is False
+                    and merge_checks_unavailable is None
+                ):
                     charged = report.get("charged_failures") or []
-                    could_not_run = (
-                        str(report.get("verify_status") or "").strip().lower()
-                        == "unverified"
-                    )
                     why = str(
                         report.get("verify_detail")
                         or report.get("verify_status")
                         or "verification failed"
                     )
-                    if could_not_run:
-                        detail = (
-                            f"{feature_id} was joined onto {target_branch} "
-                            f"({(j_commit or '')[:10]}), but the checks after the "
-                            f"join could not run: {why}. Nothing was published."
-                        )
-                    else:
-                        detail = (
-                            f"{feature_id} was joined onto {target_branch} "
-                            f"({(j_commit or '')[:10]}), but the checks after the "
-                            f"join did not pass: {why}"
-                            + (f" — {len(charged)} charged failure(s)" if charged else "")
-                            + ". Nothing was published."
-                        )
+                    detail = (
+                        f"{feature_id} was joined onto {target_branch} "
+                        f"({(j_commit or '')[:10]}), but the checks after the "
+                        f"join did not pass: {why}"
+                        + (f" — {len(charged)} charged failure(s)" if charged else "")
+                        + ". Nothing was published."
+                    )
                     if store is not None:
                         store.record(
                             build_id=build_id,
@@ -6371,7 +6404,7 @@ async def execute_merge_deploy(
                         detail=detail,
                         checks_passed=checks_passed,
                         checks_total=checks_total,
-                        verify_status="unverified" if could_not_run else "failed",
+                        verify_status="failed",
                     )
 
             # ------------------------------------------------------------------
@@ -6397,39 +6430,20 @@ async def execute_merge_deploy(
             recorded_why = _why_the_recorded_step_failed(STEP_MERGE_CHECKS)
             if recorded_why is not None and not merge_checks_ran_here:
                 recorded_line = _the_recorded_line(STEP_MERGE_CHECKS)
-                # "COULD NOT RUN" STAYS "COULD NOT RUN" (13 October 2026, the
-                # merge-install design, item 9). The record keeps the status
-                # the first press was given. When that was "unverified" — an
-                # install that failed, a judge file the build changed, a
-                # declaration nobody could read — the checks never ran, so this
-                # is the first press's wording, not a red result, and no repair.
-                recorded_could_not_run = (
-                    recorded_line is not None
-                    and str(recorded_line.detail.get("verify_status") or "")
-                    .strip()
-                    .lower()
-                    == "unverified"
+                # Checks recorded as unable to run are advice (step 1), and
+                # never reach here: this is a red result, said as it was.
+                detail = (
+                    f"{feature_id} was joined onto {target_branch} "
+                    f"({(j_commit or '')[:10]}), but the checks after the join "
+                    f"did not pass: {recorded_why}. Nothing was published."
                 )
-                if recorded_could_not_run:
-                    detail = (
-                        f"{feature_id} was joined onto {target_branch} "
-                        f"({(j_commit or '')[:10]}), but the checks after the "
-                        f"join could not run: {recorded_why}. Nothing was "
-                        "published."
-                    )
-                else:
-                    detail = (
-                        f"{feature_id} was joined onto {target_branch} "
-                        f"({(j_commit or '')[:10]}), but the checks after the join "
-                        f"did not pass: {recorded_why}. Nothing was published."
-                    )
                 logger.warning(
                     "merge-executor: %s's join (%s) was checked by an earlier "
                     "press and %s (%s) — this press re-runs nothing and says "
                     "so; it is not 'checked'",
                     feature_id,
                     str(j_commit)[:10],
-                    "its checks could not run" if recorded_could_not_run else "went red",
+                    "went red",
                     recorded_why,
                 )
                 if store is not None:
@@ -6455,9 +6469,7 @@ async def execute_merge_deploy(
                         if recorded_line is not None
                         else None
                     ),
-                    verify_status=(
-                        "unverified" if recorded_could_not_run else "failed"
-                    ),
+                    verify_status="failed",
                 )
 
             # ------------------------------------------------------------------
@@ -6506,22 +6518,21 @@ async def execute_merge_deploy(
                 # refusal before running) has finished.
                 if check_join_said.answer_lost or not check_join_said.confirmed:
                     a_leg_did_not_complete = True
-                if check_join_said.ran:
-                    checks_passed = check_join_said.checks_passed
-                    checks_total = check_join_said.checks_total
-                    # The build system may say its checks on the join could
-                    # not run (13 October 2026, item 9). That is "could not
-                    # run", not a red result, and files no repair; the record
-                    # says so in the same words, so a later press reads it
-                    # back exactly as this one says it.
-                    joined_could_not_run = not check_join_said.passed and (
-                        str(check_join_said.verify_status or "").strip().lower()
+                # The build system may say its checks on the join could not
+                # run (13 October 2026, item 9): an install that failed, say.
+                # That is "could not run", not a red result, and since step 1
+                # (25 October 2026) it is advice, like no answer at all.
+                joined_could_not_run = check_join_said.ran and (
+                    _could_not_run(check_join_said.report or {})
+                    or (
+                        not check_join_said.passed
+                        and str(check_join_said.verify_status or "").strip().lower()
                         == "unverified"
                     )
-                    why_not = str(
-                        (check_join_said.report or {}).get("verify_detail")
-                        or check_join_said.sentence
-                    )
+                )
+                if check_join_said.ran and not joined_could_not_run:
+                    checks_passed = check_join_said.checks_passed
+                    checks_total = check_join_said.checks_total
                     if store is not None and not store.done(
                         build_id=build_id,
                         turn=turn,
@@ -6530,14 +6541,10 @@ async def execute_merge_deploy(
                         attempt=attempt,
                         result={
                             "ran_on": j_commit,
-                            "verify_ran": not joined_could_not_run,
+                            "verify_ran": True,
                             "verify_ok": check_join_said.passed,
                             "verify_status": check_join_said.verify_status,
-                            "verify_detail": (
-                                why_not
-                                if joined_could_not_run
-                                else check_join_said.sentence
-                            ),
+                            "verify_detail": check_join_said.sentence,
                             "checks_passed": check_join_said.checks_passed,
                             "checks_total": check_join_said.checks_total,
                             "asked_the_build_system_about_a_reused_join": True,
@@ -6552,13 +6559,6 @@ async def execute_merge_deploy(
                                 now=deps.clock(),
                                 result=RESULT_PUBLICATION_PENDING,
                             )
-                        if joined_could_not_run:
-                            said = (
-                                "the checks after the join could not run: "
-                                f"{why_not}"
-                            )
-                        else:
-                            said = check_join_said.sentence
                         return MergeDeployOutcome(
                             result="merged-verify-failed",
                             status="FAILED",
@@ -6567,13 +6567,11 @@ async def execute_merge_deploy(
                             detail=(
                                 f"{feature_id} was joined onto {target_branch} "
                                 f"({str(j_commit)[:10]}) by an earlier press, and "
-                                f"{said}. Nothing was published."
+                                f"{check_join_said.sentence}. Nothing was published."
                             ),
                             checks_passed=check_join_said.checks_passed,
                             checks_total=check_join_said.checks_total,
-                            verify_status=(
-                                "unverified" if joined_could_not_run else "failed"
-                            ),
+                            verify_status="failed",
                         )
                     logger.info(
                         "merge-executor: the build system checked %s's reused "
@@ -6582,14 +6580,15 @@ async def execute_merge_deploy(
                         feature_id,
                         str(j_commit)[:10],
                     )
-                elif check_join_said.report is None:
-                    # NO ANSWER FROM THE CHECKS THEMSELVES: the installed
-                    # build system has no check-join, the door refused it, or
-                    # its answer was lost. A report saying its own checks
-                    # could not run (an install that failed, say) is the
-                    # build system's verdict and keeps today's ending.
-                    merge_checks_unavailable = check_join_said.sentence or (
-                        "the build system's own checks could not be run on a "
+                else:
+                    # THE CHECKS DID NOT RUN: the installed build system has no
+                    # check-join, the door refused it, its answer was lost, or
+                    # it said its own checks could not run. Recorded as
+                    # unavailable, never as a pass, and treated as advice.
+                    merge_checks_unavailable = str(
+                        (check_join_said.report or {}).get("verify_detail")
+                        or check_join_said.sentence
+                        or "the build system's own checks could not be run on a "
                         "join an earlier press made"
                     )
                     logger.warning(
@@ -6611,6 +6610,7 @@ async def execute_merge_deploy(
                             "verify_ran": False,
                             # Never a pass, and never red: it did not run.
                             "verify_ok": None,
+                            "verify_status": check_join_said.verify_status,
                             "unavailable": merge_checks_unavailable,
                             "asked_the_build_system_about_a_reused_join": True,
                         },

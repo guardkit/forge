@@ -148,34 +148,28 @@ class FeatureRoutingGate:
         """Write a valid acknowledgement's record, retrying the write once.
 
         The router has answered; only the record failed. The request is never
-        sent again for it.
+        sent again for it, and the acknowledgement is never turned into an
+        unknown outcome: after the one retry the failure is logged and the
+        acknowledged placement is used for this dispatch (step 1, 25 October
+        2026). Bookkeeping never ends a feature.
         """
-        try:
-            return self._store.complete_seed(key, attempt_id, stored_id)
-        except Exception as first:  # noqa: BLE001 — the write is retried once
-            logger.warning(
-                "feature routing: %s was acknowledged but its record was not "
-                "written (%s: %s); writing it once more",
-                key,
-                type(first).__name__,
-                first,
-            )
-        try:
-            return self._store.complete_seed(key, attempt_id, stored_id)
-        except Exception as exc:
+        for attempt in (1, 2):
             try:
-                self._store.fail_seed(
+                return self._store.complete_seed(key, attempt_id, stored_id)
+            except Exception as exc:  # noqa: BLE001 — the write is retried once
+                logger.warning(
+                    "feature routing: %s was acknowledged (server %s) but its "
+                    "record was not written (attempt %d: %s: %s)%s",
                     key,
-                    attempt_id,
-                    state="UNKNOWN",
-                    reason="seed-acknowledged-record-not-written",
+                    stored_id,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                    ""
+                    if attempt == 1
+                    else " — the acknowledged placement is used for this dispatch",
                 )
-            except Exception:  # noqa: BLE001 — the raise below says what happened
-                pass
-            raise FeatureRoutingBlocked(
-                "feature routing seed was acknowledged but its record could not "
-                "be written"
-            ) from exc
+        return FeatureRoutingReceipt(key, attempt_id, stored_id)
 
     def _preferred_server(self) -> int:
         """Prefer the server with fewer live pins; ties go to server 1."""

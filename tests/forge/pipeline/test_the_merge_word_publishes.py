@@ -923,10 +923,10 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
     ) -> None:
         """15 October 2026, Codex R6 (settled by default): the second press
         picks the join up and asks the build system to check it. When the
-        build system ANSWERS that its checks could not run, the press ends
-        GATED (publication off) or not wholly checked (publication on), its
-        candidate's teardown answers that it is down, and the hold is put
-        down. When the check-join's answer is lost (no report of its own),
+        build system ANSWERS that its checks could not run, they are advice
+        (step 1): the join is ready (publication off) or sent (publication
+        on), its candidate's teardown answers that it is down, and the hold
+        is put down. When the check-join's answer is lost (no report of its own),
         the command may still be running, and the hold is kept."""
         from forge.adapters.guardkit.models import GuardKitResult
 
@@ -988,11 +988,11 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         second = await _press(deps_two, repo_root)
 
         assert [a[0] for a in asked] == ["check-join"]
-        # Step 1 (24 October 2026, FRG-178): with no answer from the checks
-        # themselves they are unavailable, which is advice, so with
-        # publication on the join is sent. A report saying the checks could
-        # not run is the build system's own verdict and still holds it back.
-        sent = publication == "on" and answer != "could-not-run"
+        # Step 1 (24 and 25 October 2026, FRG-178): with no answer from the
+        # checks, or an answer saying they could not run, they are
+        # unavailable, which is advice, so with publication on the join is
+        # sent. Only checks that ran and went red hold it back.
+        sent = publication == "on"
         assert second.result == (
             "published-deployment-pending" if sent else "publication-pending"
         ), second.detail

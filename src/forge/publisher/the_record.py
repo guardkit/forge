@@ -134,7 +134,7 @@ def a_step_that_could_not_run_on(
     exactly that — ``unavailable`` with its reason and a ``verify_ok`` that is
     never ``True`` — and is advice, not a refusal. Only the LAST ``done`` line
     for the step on this commit counts, so a later red or green line wins. A
-    red line (``verify_ok`` false with no ``unavailable``) is never this.
+    red line (checks that ran, ``verify_ok`` false) is never this.
     """
     wanted = str(joined_commit)
     last: dict[str, Any] | None = None
@@ -151,9 +151,15 @@ def a_step_that_could_not_run_on(
     if last is None or last.get("verify_ok") is True:
         return None
     why = last.get("unavailable")
-    if not isinstance(why, str) or not why.strip():
-        return None
-    return why.strip()
+    if isinstance(why, str) and why.strip():
+        return why.strip()
+    # A line that says the checks did not run (``verify_ran`` false, or the
+    # build system's ``unverified``) reads the same way (25 October 2026).
+    if last.get("verify_ran") is False or (
+        str(last.get("verify_status") or "").strip().lower() == "unverified"
+    ):
+        return str(last.get("verify_detail") or "the checks could not run").strip()
+    return None
 
 
 class TheRecordReader:

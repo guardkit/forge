@@ -8785,3 +8785,155 @@ async def test_a_plan_record_without_its_commit_skips_the_bars_and_gate_and_queu
     }
     assert skipped["qa-pass-bars"]["reason_code"] == "plan_record_incomplete"
     assert skipped["qa-feature-gate"]["skipped"] is True
+
+
+# ---------------------------------------------------------------------------
+# The plan writer's one ordinary-plan recovery reaches the handoff, and a
+# readable refusal stays a refusal (code review R1, findings 2 and 3,
+# 25 October 2026)
+# ---------------------------------------------------------------------------
+
+
+def _approved_plan_events(store: SqlitePlanningRunStore) -> list[dict[str, Any]]:
+    return [
+        json.loads(e["details_json"])
+        for e in store.list_events(CID)
+        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
+    ]
+
+
+def _a_reply(files: dict[str, str], review: str | None = None) -> Any:
+    role_output: dict[str, Any] = {"files": dict(files)}
+    if review is not None:
+        role_output["semantic_review.json"] = review
+    return SimpleNamespace(
+        outcome=SimpleNamespace(value="completed"), role_output=role_output, reason=None
+    )
+
+
+@pytest.mark.asyncio
+async def test_the_recovered_ordinary_plan_from_the_re_review_is_the_plan_handed_off(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """specialist-agent answers the exact re-review with its one ordinary plan
+    (a retained objection, recovered). That plan, not the first one, goes
+    through the usual checks and is the plan recorded for the handoff."""
+    _queue(store)
+    first = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    recovered = {
+        "features/x/FEAT-X.yaml": "id: FEAT-X\ntasks: [TASK-R1]\n",
+        "tasks/backlog/TASK-R1.md": "---\nid: TASK-R1\nfeature_id: FEAT-X\n---\n",
+    }
+    calls: list[dict[str, Any]] = []
+
+    async def _the_specialist(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if kwargs.get("revision_of") is None:
+            return _a_reply(first)  # no review record: the re-review is asked
+        return _a_reply(recovered, _semantic_review_json(recovered))
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    await h.driver.drive(CID)
+
+    assert [c.get("revision_of") is not None for c in calls] == [False, True]
+    plan = _approved_plan_events(store)
+    assert plan, "the recovered plan was recorded"
+    assert "tasks/backlog/TASK-R1.md" in plan[-1]["plan_files"]
+    assert "plan_review_note" not in plan[-1]
+    assert plan[-1]["semantic_review"]["decision"] == "approved"
+
+
+@pytest.mark.asyncio
+async def test_a_recovered_plan_is_never_recovered_twice(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """One recovery: a recovered plan with no record of its own is re-reviewed
+    once more, and a second different tree from that is only the card's line."""
+    _queue(store)
+    first = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    recovered = {"features/x/FEAT-X.yaml": "id: FEAT-X\ntasks: [TASK-R1]\n"}
+    another = {"features/x/FEAT-X.yaml": "id: FEAT-X\ntasks: [TASK-R2]\n"}
+    calls: list[dict[str, Any]] = []
+
+    async def _the_specialist(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if len(calls) == 1:
+            return _a_reply(first)
+        if len(calls) == 2:
+            return _a_reply(recovered)
+        return _a_reply(another, _semantic_review_json(another))
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    await h.driver.drive(CID)
+
+    assert len(calls) == 3
+    # The tree re-reviewed the second time is the recovered plan, and its
+    # re-review offers no already-done answer again.
+    assert calls[2]["revision_of"] == recovered
+    assert "already_done_allowed" not in calls[2]
+    plan = _approved_plan_events(store)
+    assert plan
+    assert "rewrote the supplied plan tree" in plan[-1]["plan_review_note"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("dropped", ["artifact_identity", "reviewed_after_rewrite"])
+async def test_a_readable_rejection_with_missing_fields_still_fails(
+    store: SqlitePlanningRunStore, dropped: str
+) -> None:
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    review = json.loads(_semantic_review_json(files))
+    review["decision"] = "rejected"
+    review.pop(dropped)
+    h = _make_driver(store, plan_result=_a_reply(files, json.dumps(review)))
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert _approved_plan_events(store) == []
+
+
+@pytest.mark.asyncio
+async def test_an_accepting_review_with_missing_fields_is_re_reviewed_not_refused(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    review = json.loads(_semantic_review_json(files))
+    review.pop("reviewed_after_rewrite")
+    review["extra_receipt_field"] = "bookkeeping"
+    calls: list[dict[str, Any]] = []
+
+    async def _the_specialist(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        if kwargs.get("revision_of") is None:
+            return _a_reply(files, json.dumps(review))
+        return _a_reply(files, _semantic_review_json(files, reviewed_after_rewrite=True))
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    await h.driver.drive(CID)
+    assert [c.get("revision_of") is not None for c in calls] == [False, True]
+    plan = _approved_plan_events(store)
+    assert plan and "plan_review_note" not in plan[-1]
+
+
+@pytest.mark.asyncio
+async def test_a_retained_objection_returned_by_the_re_review_fails(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """The plan writer answered the re-review and refused: that is its verdict."""
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+
+    async def _the_specialist(**kwargs: Any) -> Any:
+        if kwargs.get("revision_of") is None:
+            return _a_reply(files)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="error"),
+            role_output=None,
+            reason="ModeValidateRefusedError: A6 the plan leaves a part unbuilt",
+        )
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    assert any(
+        "re-review refused" in message for _, message, _ in h.ctx["notifications"]
+    )

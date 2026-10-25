@@ -49,6 +49,7 @@ import logging
 import math
 import os
 import re
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -1229,6 +1230,17 @@ _SEMANTIC_VERDICT_REFUSALS: frozenset[str] = frozenset(
         "request_traceability did not pass",
         "Coach verdict is not accepting",
     }
+)
+
+#: What the exact-artifact re-review answers when the plan writer returned
+#: its one ordinary-plan recovery instead of a review (step 1, 25 October
+#: 2026): the plan attempt takes that plan and starts its checks again.
+_PLAN_RECOVERED = "the re-review answered with the plan writer's recovered plan"
+
+#: The note on the recovered plan's later calls: an ordinary plan, so the
+#: already-done answer is not offered again.
+_RECOVERED_PLAN_NOTE = (
+    "An earlier answer was objected to; this is the ordinary plan with its tasks."
 )
 
 #: The spec card's line when the planner could not read the repository
@@ -6980,6 +6992,7 @@ class PlanningRunDriver:
         round_label: str,
         rules_only: bool = False,
         plan_note: str | None = None,
+        recovered_result: Any | None = None,
     ) -> "_PlanAttempt | None":
         """One pass of the plan leg's work, from the top: read the approved spec
         back off the branch, dispatch the plan-writer, write the tree with the
@@ -7004,6 +7017,12 @@ class PlanningRunDriver:
         ordinary plan asked for after an already-done answer that could not be
         used. It goes to the plan writer as its note, and the already-done
         answer is not offered on that call.
+
+        ``recovered_result`` (step 1, 25 October 2026): the plan writer's one
+        ordinary-plan recovery, returned by the exact-artifact re-review
+        instead of a review of the tree it was sent. It is taken as this
+        attempt's reply, with no new dispatch, and goes through the ordinary
+        normalization, validation and handoff. It is never recovered again.
 
         Returns the attempt record, or ``None`` after failing the run loudly
         for any reason other than the normalizer's stop (which the caller
@@ -7163,7 +7182,11 @@ class PlanningRunDriver:
             )
 
         try:
-            result = await _ask_the_plan_writer()
+            result = (
+                recovered_result
+                if recovered_result is not None
+                else await _ask_the_plan_writer()
+            )
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
                 correlation_id,
@@ -7230,6 +7253,17 @@ class PlanningRunDriver:
         # caller checks the proof against the code windows Forge sent, and
         # ends the run. A reply without the marker goes on exactly as today.
         claim, claim_problem = nothing_to_build.read_claim(role_output, files)
+        if recovered_result is not None and (
+            claim is not None or claim_problem is not None
+        ):
+            # The one recovery was for an ordinary plan; there is no third ask.
+            await self._fail_leg(
+                correlation_id,
+                _FEATURE_PLAN_STAGE,
+                "the planner answered already done again when asked for an "
+                "ordinary plan",
+            )
+            return None
         if claim is not None and semantic_error is not None:
             # Never an approval invented: an already-done answer whose review
             # cannot be read is not taken, and an ordinary plan is asked for.
@@ -7257,6 +7291,10 @@ class PlanningRunDriver:
             "role_output": role_output,
             "review": traceability,
             "unreadable": None,
+            # The plan writer's one ordinary-plan recovery, when the re-review
+            # answers with it before anything is written (step 1).
+            "recovered": None,
+            "may_recover": recovered_result is None,
         }
 
         async def _ensure_semantic_review(
@@ -7287,6 +7325,11 @@ class PlanningRunDriver:
             if unreadable is None:
                 reviewed_ok, reviewed_reason = self._dispatch_ok(reviewed_result)
             if unreadable is None and not reviewed_ok:
+                if reviewed_reason.startswith("error:"):
+                    # The plan writer answered and refused (its retained
+                    # objection): a refusal, as on the first call. Only no
+                    # answer (a timeout, a raise) is bookkeeping.
+                    return "exact-artifact re-review refused: " + reviewed_reason
                 unreadable = "exact-artifact re-review " + reviewed_reason
             if unreadable is None:
                 reviewed_output = self._role_output_of(reviewed_result)
@@ -7296,6 +7339,15 @@ class PlanningRunDriver:
                 )
                 if reviewed_files is None:
                     unreadable = "exact-artifact re-review returned no plan tree"
+                elif (
+                    dict(reviewed_files) != dict(candidate_files)
+                    and semantic_state["may_recover"]
+                ):
+                    # The plan writer answered with its one ordinary plan
+                    # (specialist-agent's recovery after a retained objection).
+                    # It replaces this attempt's plan; nothing has been written.
+                    semantic_state["recovered"] = reviewed_result
+                    return _PLAN_RECOVERED
                 elif dict(reviewed_files) != dict(candidate_files):
                     unreadable = (
                         "exact-artifact re-review rewrote the supplied plan tree"
@@ -7440,7 +7492,30 @@ class PlanningRunDriver:
                     )
             pre_commit = declared.checks
 
+        async def _take_the_recovered_plan() -> "_PlanAttempt | None":
+            logger.warning(
+                "planning driver: run %s — the plan writer answered the "
+                "re-review with its one ordinary-plan recovery; that plan "
+                "replaces this attempt's and goes through the usual checks",
+                correlation_id,
+            )
+            return await self._plan_attempt(
+                row,
+                correlation_id,
+                target_repo=target_repo,
+                repo_path=repo_path,
+                branch=branch,
+                plan_run_id=plan_run_id,
+                feature_id=feature_id,
+                round_label=f"{round_label} (the plan writer's recovered plan)",
+                rules_only=rules_only,
+                plan_note=plan_note or _RECOVERED_PLAN_NOTE,
+                recovered_result=semantic_state["recovered"],
+            )
+
         semantic_error = await _ensure_semantic_review(files)
+        if semantic_state["recovered"] is not None:
+            return await _take_the_recovered_plan()
         if semantic_error is not None:
             await self._fail_leg(
                 correlation_id,
@@ -7484,6 +7559,10 @@ class PlanningRunDriver:
             stamps_read = self._stamps_from_declared_checks(gitres, declared, feature_id)
             if stamps_read is not None:
                 stamp_state["outcome"] = stamps_read
+        if gitres.status == "failed" and semantic_state["recovered"] is not None:
+            # The re-review after normalization answered with the recovered
+            # plan, which stopped the commit before anything was written.
+            return await _take_the_recovered_plan()
         if gitres.status == "failed":
             stamps = stamp_state.get("outcome")
             if stamps is not None and stamps.stops_the_run:
@@ -7524,6 +7603,9 @@ class PlanningRunDriver:
         # use the same Coach-only exact-artifact review here. The helper is
         # idempotent when the approved bytes are unchanged and fails closed for
         # every missing, rejected, malformed, or tree-rewriting response.
+        # The tree is committed: a rewritten tree from here on is the card's
+        # line, never a second plan written over the first.
+        semantic_state["may_recover"] = False
         semantic_error = await _ensure_semantic_review(committed_files)
         if semantic_error is not None:
             await self._fail_leg(
@@ -9226,7 +9308,14 @@ class PlanningRunDriver:
                 await freeze_final_plan(deps.store._connection, correlation_id, self._git_runner_for(target_repo), str(resolved),
                                         pass_stage=_QA_PASS_BARS_STAGE, gate_stage=_QA_FEATURE_GATE_STAGE)
                 break
-            except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            except (
+                ValueError,
+                KeyError,
+                TypeError,
+                AttributeError,
+                sqlite3.Error,
+                OSError,
+            ) as exc:
                 logger.warning(
                     "planning driver: run %s final requirement amendment planning "
                     "source not frozen (attempt %d of 2): %s — ADVISORY; the "
@@ -11474,6 +11563,26 @@ class PlanningRunDriver:
             return None, "semantic_review.json is missing"
         if not isinstance(parsed, Mapping):
             return None, "semantic_review.json is not an object"
+
+        # THE VERDICT FIRST (step 1, 25 October 2026): a refusal that can be
+        # read is a refusal, whatever is wrong with the rest of the record.
+        # Only the record's shape is bookkeeping.
+        if isinstance(parsed.get("decision"), str) and parsed["decision"] != "approved":
+            return None, "specialist semantic decision is not approved"
+        read_score = parsed.get("criterion_score")
+        if (
+            isinstance(read_score, (int, float))
+            and not isinstance(read_score, bool)
+            and (
+                (isinstance(read_score, float) and not math.isfinite(read_score))
+                or read_score < 0.5
+            )
+        ):
+            return None, "request_traceability did not pass"
+        if isinstance(parsed.get("coach_verdict"), str) and parsed[
+            "coach_verdict"
+        ] not in {"ACCEPTABLE", "GOOD"}:
+            return None, "Coach verdict is not accepting"
 
         expected_keys = {
             "schema_version",

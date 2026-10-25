@@ -193,6 +193,15 @@ class TestACheckThatCouldNotRunIsAdvice:
         assert answer.published is True, answer.refusal
         assert answer.contains_j is True
 
+    def test_checks_that_said_they_could_not_run_publish(
+        self, tmp_path: Path, project: dict
+    ) -> None:
+        """25 October 2026: a failed install is advice, read off the record
+        the same way whatever shape the line has."""
+        publisher = _publisher(tmp_path, project, merge_checks="unverified")
+        answer = publisher.publish(a_request(project))
+        assert answer.published is True, answer.refusal
+
     def test_the_live_check_that_could_not_run_publishes(
         self, tmp_path: Path, project: dict
     ) -> None:

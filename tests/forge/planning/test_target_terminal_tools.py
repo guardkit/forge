@@ -1047,7 +1047,11 @@ def test_p8_tree_run4_shape_only_drifted_doc_repaired(tmp_path: Path) -> None:
 def test_p8_tree_non_prefix_in_this_runs_own_doc_is_repaired(tmp_path: Path) -> None:
     docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-9999", "TASK-A001")}
     _write_task_tree(tmp_path, docs)
-    result = repair_plan_task_frontmatter(tmp_path, "FEAT-07F3")
+    # This run's own writing is named, so the scope fence is not left to
+    # whatever repository the temporary folder happens to sit inside.
+    result = repair_plan_task_frontmatter(
+        tmp_path, "FEAT-07F3", written_rel_paths=list(docs)
+    )
     assert result.fired
     assert read_frontmatter_feature_id(
         (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
@@ -1146,13 +1150,39 @@ async def test_p8_wired_run4_one_repaired_validate_proceeds(tmp_path: Path) -> N
 async def test_p8_wired_non_prefix_in_own_doc_is_repaired_and_validate_proceeds(
     tmp_path: Path,
 ) -> None:
+    # A real repository of its own, holding this run's task file uncommitted,
+    # as the live planning worktree does; somebody else's committed task
+    # document beside it is never edited.
+    subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+    theirs = "tasks/design_approved/TASK-B001.md"
+    _write_task_tree(tmp_path, {theirs: _task_doc("FEAT-9999", "TASK-B001")})
+    subprocess.run(
+        [
+            "git", "-C", str(tmp_path), "-c", "user.email=t@example.invalid",
+            "-c", "user.name=t", "-c", "commit.gpgsign=false",
+            "add", theirs,
+        ],
+        check=True,
+    )
+    subprocess.run(
+        [
+            "git", "-C", str(tmp_path), "-c", "user.email=t@example.invalid",
+            "-c", "user.name=t", "-c", "commit.gpgsign=false",
+            "commit", "-q", "-m", "theirs",
+        ],
+        check=True,
+    )
+    their_bytes = (tmp_path / theirs).read_bytes()
     docs = {"tasks/backlog/TASK-A001.md": _task_doc("FEAT-9999", "TASK-A001")}
     _write_task_tree(tmp_path, docs)
     run_fn, _calls = _parity_validate_seam("FEAT-07F3")
     validate = make_validate_feature_plan(run_fn=run_fn)
     outcome = await validate(tmp_path, "FEAT-07F3")
-    assert outcome.ok
     assert "rewrote 1" in outcome.detail
+    assert read_frontmatter_feature_id(
+        (tmp_path / "tasks/backlog/TASK-A001.md").read_text(encoding="utf-8")
+    ) == "FEAT-07F3"
+    assert (tmp_path / theirs).read_bytes() == their_bytes
 
 
 @pytest.mark.asyncio

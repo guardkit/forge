@@ -131,6 +131,12 @@ class BranchScopeReading:
     patch: str = ""
     #: True when :attr:`patch` was cut short.
     patch_truncated: bool = False
+    #: True when the diff text was read at all, so an empty :attr:`patch`
+    #: means the branch changed nothing. False for a reading that could not
+    #: get it, including an older sandbox helper that never sends it.
+    patch_read: bool = False
+    #: ``diff --stat <base>...<head>``, cut at :data:`CHANGE_TEXT_LIMIT_CHARS`.
+    stat: str = ""
     #: The commit that was read, when git could say.
     head_sha: str | None = None
     #: One plain sentence when the branch could not be read at all.
@@ -265,12 +271,18 @@ def read_branch_scope(
     read_whole = False
     patch_text = ""
     patch_truncated = False
+    patch_read = False
+    stat = ""
     try:
         patch = _git(repo_root, "diff", "-U0", "--no-color", f"{base}...{head}")
         if patch.returncode == 0:
             body = patch.stdout or ""
             patch_text = body[:CHANGE_TEXT_LIMIT_CHARS]
             patch_truncated = len(body) > CHANGE_TEXT_LIMIT_CHARS
+            patch_read = True
+            stat_run = _git(repo_root, "diff", "--stat", "--no-color", f"{base}...{head}")
+            if stat_run.returncode == 0:
+                stat = (stat_run.stdout or "")[:CHANGE_TEXT_LIMIT_CHARS]
             if len(body.encode("utf-8")) <= BRANCH_SCOPE_LIMIT_BYTES:
                 added = added_lines_by_file(body)
                 read_whole = True
@@ -320,6 +332,8 @@ def read_branch_scope(
         plan_documents=documents,
         patch=patch_text,
         patch_truncated=patch_truncated,
+        patch_read=patch_read,
+        stat=stat,
         head_sha=sha,
     )
 
@@ -362,6 +376,8 @@ def reading_to_answer(reading: BranchScopeReading) -> dict[str, Any]:
         "plan_documents": dict(reading.plan_documents),
         "patch": reading.patch,
         "patch_truncated": reading.patch_truncated,
+        "patch_read": reading.patch_read,
+        "stat": reading.stat,
         "head": reading.head_sha,
         "error": reading.error,
     }
@@ -402,6 +418,9 @@ def reading_from_answer(answer: Any) -> BranchScopeReading:
         plan_documents=documents,
         patch=str(answer.get("patch") or "")[:CHANGE_TEXT_LIMIT_CHARS],
         patch_truncated=bool(answer.get("patch_truncated")),
+        # An older helper sends no diff text at all: not read, never "empty".
+        patch_read=answer.get("patch_read") is True,
+        stat=str(answer.get("stat") or "")[:CHANGE_TEXT_LIMIT_CHARS],
         head_sha=str(answer["head"]) if answer.get("head") else None,
         error=str(error) if error else None,
     )

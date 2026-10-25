@@ -416,3 +416,88 @@ class TestARetainedWorktreeMismatchIsAdvice:
         assert "worktree_retention" not in offer
         card = service.wire.cards[0]["payload"]["action_description"]  # type: ignore[attr-defined]
         assert "did not match it, so it will be left alone" in card
+
+
+class TestTheCardsChangeEvidence:
+    """Finding 7 of the code review (25 October 2026): the summary is git's
+    diff stat, and an answer with no diff text is never an empty change."""
+
+    @pytest.mark.asyncio
+    async def test_the_summary_is_the_diff_stat(
+        self, tmp_path: Path, repo_root: Path, config: Any, pool: Any
+    ) -> None:
+        await TestOneCardAndOneMergeHoldOnlyTheApprovedTasks()._offered(
+            tmp_path, repo_root, config, pool
+        )
+        summary = _the_offer(pool)["change_summary"]
+        assert f"{FEATURE_ID}.txt" in summary
+        assert "1 file changed" in summary
+
+    def test_an_older_helper_without_diff_text_reads_as_not_read(self) -> None:
+        from forge.pipeline import branch_scope
+        from forge.pipeline.merge_offer import CHANGE_NOT_READ, read_the_change
+
+        older = {"name_status": "M\0README.md\0", "added_by_file": {}, "head": "a" * 40}
+        reading = branch_scope.reading_from_answer(older)
+        assert reading.patch_read is False
+
+        class _Sandbox:
+            name = "older"
+            sidecar_url = "http://sandbox.invalid"
+
+        with patch("forge.config.sandboxes.sandbox_for", lambda *_a: _Sandbox()), patch.object(
+            branch_scope, "read_branch_scope_in_sandbox", lambda **_k: reading
+        ):
+            details = read_the_change(None, REPO, "a" * 40, "b" * 40, FEATURE_ID)
+        assert details["change_summary"] == CHANGE_NOT_READ
+        assert details["change_text"] == ""
+
+    def test_an_empty_diff_says_no_files_changed(self, repo_root: Path, config: Any) -> None:
+        from forge.pipeline.merge_offer import read_the_change
+
+        main = _git(repo_root, "rev-parse", "main")
+        details = read_the_change(config, REPO, main, main, FEATURE_ID)
+        assert details["change_summary"] == "no files changed"
+        assert details["change_text"] == ""
+
+
+class TestARetainedWorktreeThatCannotBeRecorded:
+    """Finding 5 (25 October 2026): one retry, then the card is offered and
+    the worktree is left alone."""
+
+    @pytest.mark.asyncio
+    async def test_the_card_is_offered_and_the_worktree_left_alone(
+        self, config: Any, pool: Any
+    ) -> None:
+        from nats_core.events import BuildCompletePayload
+
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        writes: list[str] = []
+
+        def _cannot(_self: Any, build_id: str, _path: str) -> None:
+            writes.append(build_id)
+            raise RuntimeError("disk is full")
+
+        event = BuildCompletePayload(
+            feature_id=FEATURE_ID,
+            build_id=BUILD_ID,
+            tasks_completed=1,
+            tasks_failed=0,
+            tasks_total=1,
+            duration_seconds=1,
+            summary="done",
+        )
+        object.__setattr__(
+            event,
+            "worktree_retention",
+            {"ok": True, "build_id": BUILD_ID, "path": f"/x/{BUILD_ID}"},
+        )
+        service = _offer_service(config, pool)
+        with patch.object(type(pool), "record_worktree_path", _cannot):
+            await service.maybe_offer(event)
+        assert writes == [BUILD_ID, BUILD_ID]
+        offer = _the_offer(pool)
+        assert "worktree_retention" not in offer
+        assert "runner_worktree_retention" not in offer
+        card = service.wire.cards[0]["payload"]["action_description"]  # type: ignore[attr-defined]
+        assert "could not be recorded, so it will be left alone" in card

@@ -160,7 +160,8 @@ def make_the_ledger(
     passed, ``False`` writes one that went red, ``None`` writes none at all —
     which is the GATED case the merge word leaves when it picks a join up —
     and ``"unavailable"`` writes one saying the check could not run (step 1,
-    24 October 2026), never a pass.
+    24 October 2026), never a pass; ``"unverified"`` (merge checks only) the
+    older shape of the same answer.
     """
     connection = sqlite_connect.connect_writer(path)
     migrations.apply_at_boot(connection)
@@ -199,7 +200,24 @@ def make_the_ledger(
         result={"j_commit": project["j"], "verify_ok": True},
         j_commit=project["j"],
     )
-    if merge_checks == "unavailable":
+    if merge_checks == "unverified":
+        # An older line: the build system said its checks could not run
+        # (an install that failed), with no ``unavailable`` key.
+        store.done(
+            build_id=build_id,
+            turn=turn,
+            now=now,
+            step=STEP_MERGE_CHECKS,
+            attempt=attempt,
+            result={
+                "ran_on": on,
+                "verify_ran": False,
+                "verify_ok": False,
+                "verify_status": "unverified",
+                "verify_detail": "the declared install failed",
+            },
+        )
+    elif merge_checks == "unavailable":
         store.done(
             build_id=build_id,
             turn=turn,

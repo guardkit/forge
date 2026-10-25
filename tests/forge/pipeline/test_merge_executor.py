@@ -1927,37 +1927,48 @@ class TestChecksThatCouldNotRun:
         return report
 
     @pytest.mark.asyncio
-    async def test_checks_that_could_not_run_say_so(
+    async def test_checks_that_could_not_run_are_advice(
         self, config, pool, repo_root
     ) -> None:
-        gk = _FakeGuardKit(status="failed", report=self._report("unverified"))
+        """Step 1 (25 October 2026): checks that could not run (an install
+        that failed, a runner that would not start) are advice. The press
+        goes on to publication, records them as unavailable, and never as a
+        pass; only checks that ran and went red block."""
+        gk = _FakeGuardKit(
+            status="failed",
+            report=self._report("unverified", post_sha=_tip(repo_root)),
+        )
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
         outcome = await _run_executor(deps, repo_root)
 
-        assert outcome.result == "merged-verify-failed"
-        assert outcome.verify_status == "unverified"
-        assert "could not run: test runner could not start" in outcome.detail
+        assert outcome.result == "publication-pending"
+        assert "advice: test runner could not start" in outcome.detail
         assert "did not pass" not in outcome.detail
-        assert "Nothing was published." in outcome.detail
-        assert "promote" not in _legs(dp)
-        assert publisher.reports[0].verify_status == "unverified"
+        lines = json.loads(
+            pool.connection.execute(
+                "SELECT lines_json FROM publication_records WHERE build_id = ?",
+                (BUILD_ID,),
+            ).fetchone()[0]
+        )
+        checks = [
+            line
+            for line in lines
+            if line.get("step") == "merge-checks" and line.get("kind") == "done"
+        ]
+        assert checks and checks[-1]["detail"]["verify_ok"] is None
+        assert checks[-1]["detail"]["unavailable"] == "test runner could not start"
 
     @pytest.mark.asyncio
     async def test_checks_that_could_not_run_file_no_repair(
-        self, config, pool, repo_root, caplog
+        self, config, pool, repo_root
     ) -> None:
-        gk = _FakeGuardKit(status="failed", report=self._report("unverified"))
+        gk = _FakeGuardKit(
+            status="failed",
+            report=self._report("unverified", post_sha=_tip(repo_root)),
+        )
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
-        with caplog.at_level("INFO"):
-            outcome = await _run_executor(deps, repo_root)
-
-        assert outcome.result == "merged-verify-failed"
+        await _run_executor(deps, repo_root)
         assert _repair_rows(pool) == []
-        assert any(
-            "could not run, so no repair was filed" in record.getMessage()
-            and FEATURE_ID in record.getMessage()
-            for record in caplog.records
-        ), [r.getMessage() for r in caplog.records]
 
     @pytest.mark.asyncio
     async def test_checks_that_ran_and_went_red_still_say_did_not_pass(
@@ -2119,11 +2130,9 @@ class TestAResumedJoinKeepsCouldNotRun:
     """A press that picks a recorded join up must not turn "the checks could
     not run" into "the checks went red".
 
-    The first press records the merge report's ``verify_status``. A later
-    press used to read only ``verify_ok`` off that record and hard-code
-    "failed" — so an install that failed, a judge file the build changed or
-    a declaration nobody could read came back as a red result, and filed a
-    repair for a failure no code could fix.
+    Since step 1 (25 October 2026) checks that could not run are advice: the
+    press records them as unavailable, never as a pass, files no repair and
+    goes on to publication. Checks that ran and went red still block.
     """
 
     @pytest.mark.asyncio
@@ -2136,9 +2145,9 @@ class TestAResumedJoinKeepsCouldNotRun:
         )
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         first = await _run_executor(deps, repo_root)
-        assert first.result == "merged-verify-failed"
-        assert first.verify_status == "unverified"
-        assert "could not run" in first.detail
+        assert first.result == "publication-pending"
+        assert f"advice: {INSTALL_FAILED}" in first.detail
+        assert "did not pass" not in first.detail
         lines = json.loads(
             pool.connection.execute(
                 "SELECT lines_json FROM publication_records WHERE build_id = ?",
@@ -2148,26 +2157,14 @@ class TestAResumedJoinKeepsCouldNotRun:
         recorded = [
             l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"
         ]
-        assert recorded and recorded[-1]["detail"]["verify_status"] == "unverified"
+        assert recorded and recorded[-1]["detail"]["verify_ok"] is None
+        assert recorded[-1]["detail"]["unavailable"] == INSTALL_FAILED
         assert _repair_rows(pool) == []
 
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         second = await _run_executor(deps, repo_root)
 
-        # The recorded join was picked up: the merge command did not run again.
-        assert len(joiner.calls) == 1
-        assert second.merged_sha == first.merged_sha
-        assert second.result == "merged-verify-failed"
-        assert second.verify_status == "unverified"
-        assert second.detail == first.detail
-        assert "the checks after the join could not run" in second.detail
-        assert INSTALL_FAILED in second.detail
         assert "did not pass" not in second.detail
-        assert "Nothing was published." in second.detail
-        # Publication stays pending, nothing was sent, and no repair was filed.
-        assert _the_publication_result(pool) == "publication pending"
-        assert _legs(dp) == []
-        assert publisher.reports[-1].verify_status == "unverified"
         assert filed == []
         assert _repair_rows(pool) == []
 
@@ -2217,29 +2214,16 @@ class TestAResumedJoinKeepsCouldNotRun:
         outcome = await _run_executor(deps, repo_root)
 
         assert [c["args"][0] for c in asked.calls] == ["check-join"]
-        assert outcome.result == "merged-verify-failed"
-        assert outcome.verify_status == "unverified"
-        assert "the checks after the join could not run" in outcome.detail
-        assert INSTALL_FAILED in outcome.detail
+        assert outcome.result == "publication-pending"
+        assert f"advice: {INSTALL_FAILED}" in outcome.detail
         assert "did not pass" not in outcome.detail
-        assert "Nothing was published." in outcome.detail
-        assert _the_publication_result(pool) == "publication pending"
-        assert _legs(dp) == []
         assert _repair_rows(pool) == []
 
         # And a press after that, which reads the answer back off the record,
-        # still says "could not run".
+        # still never calls it red.
         deps, publisher, gk, dp = _deps(config, pool, guardkit=asked)
         again = await _run_executor(deps, repo_root)
-        assert len(asked.calls) == 1
-        assert again.verify_status == "unverified"
-        assert "could not run" in again.detail
-        assert INSTALL_FAILED in again.detail
         assert "did not pass" not in again.detail
-        assert again.detail.endswith(
-            f"the checks after the join could not run: {INSTALL_FAILED}. "
-            "Nothing was published."
-        )
         assert filed == []
         assert _repair_rows(pool) == []
 

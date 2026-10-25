@@ -1549,6 +1549,12 @@ RETENTION_MISMATCH_LINE: str = (
 #: The card's change summary when the change could not be read.
 CHANGE_NOT_READ: str = "the change could not be read"
 
+#: The card's line when the retained worktree's path could not be recorded.
+RETENTION_NOT_RECORDED_LINE: str = (
+    "The worktree kept for this build could not be recorded, so it will be "
+    "left alone after the merge."
+)
+
 #: What the card's details say when the build listed no tasks.
 TASK_LIST_NOT_AVAILABLE: str = "task list not available"
 
@@ -1604,9 +1610,10 @@ def read_the_change(
     """The card's change details: what ``head`` changes from its merge base
     with ``base``, read where the repository lives (step 1, 24 October 2026).
 
-    ``change_summary`` lists each changed file with git's status letter,
-    ``change_text`` is the diff text cut at 120,000 characters. Never raises:
-    a reading that fails says so in ``change_summary`` and carries no text.
+    ``change_summary`` is git's diff stat, ``change_text`` the diff text cut
+    at 120,000 characters. Never raises: a reading that fails, or one with no
+    diff text in it, says :data:`CHANGE_NOT_READ` in ``change_summary`` and
+    carries no text; "no files changed" is kept for a diff that is empty.
     """
     from forge.config.sandboxes import sandbox_for
     from forge.pipeline.branch_scope import (
@@ -1634,22 +1641,25 @@ def read_the_change(
                 repo_root=Path(repo_root), base=base, head=head,
                 feature_id=feature_id,
             )
-        if reading.error:
+        if reading.error or not reading.patch_read:
             logger.warning(
                 "merge-offer: the change from %s to %s could not be read: %s",
                 base,
                 head,
-                reading.error,
+                reading.error or "the reading carried no diff text",
             )
             details["change_summary"] = CHANGE_NOT_READ
             return details
-        lines = []
-        for change in parse_changed_files(reading.name_status):
-            old = str(getattr(change, "old_path", "") or "")
-            path = str(getattr(change, "path", "") or "")
-            moved = f"{old} -> {path}" if old and old != path else path
-            lines.append(f"{getattr(change, 'status', '')} {moved}".strip())
-        details["change_summary"] = "\n".join(lines) or "no files changed"
+        summary = reading.stat.strip()
+        if not summary:
+            lines = []
+            for change in parse_changed_files(reading.name_status):
+                old = str(getattr(change, "old_path", "") or "")
+                path = str(getattr(change, "path", "") or "")
+                moved = f"{old} -> {path}" if old and old != path else path
+                lines.append(f"{getattr(change, 'status', '')} {moved}".strip())
+            summary = "\n".join(lines)
+        details["change_summary"] = summary or "no files changed"
         details["change_text"] = reading.patch
         details["change_text_truncated"] = reading.patch_truncated
     except Exception as exc:  # noqa: BLE001 — a reader never stops a card
@@ -2079,8 +2089,9 @@ class MergeOfferService:
                 )
                 retention_advice = RETENTION_MISMATCH_LINE
                 retained = None
-            else:
-                self._pool.record_worktree_path(event.build_id, path)
+            elif not self._record_the_retained_worktree(event.build_id, path):
+                retention_advice = RETENTION_NOT_RECORDED_LINE
+                retained = None
 
         # THE SCOPE PASS (the planner fix, 2026-09-15). Read the finished
         # branch once, here, before the card is built: what it changed that
@@ -2297,6 +2308,28 @@ class MergeOfferService:
         except Exception:  # noqa: BLE001 — a reading never stops a card
             return None
         return getattr(row, "repo", None) if row is not None else None
+
+    def _record_the_retained_worktree(self, build_id: str, path: str) -> bool:
+        """Record the retained worktree's path; one retry, then advice.
+
+        ``False`` when it could not be recorded: the card is offered and the
+        worktree is left alone after the merge (step 1, 25 October 2026).
+        """
+        for attempt in (1, 2):
+            try:
+                self._pool.record_worktree_path(build_id, path)
+                return True
+            except Exception as exc:  # noqa: BLE001 — bookkeeping never ends a feature
+                logger.warning(
+                    "merge-offer: could not record the retained worktree of %s "
+                    "(attempt %d: %s: %s)%s",
+                    build_id,
+                    attempt,
+                    type(exc).__name__,
+                    exc,
+                    "" if attempt == 1 else " — it will be left alone",
+                )
+        return False
 
     def _record_the_approved_branch(self, build_id: str, branch: str) -> None:
         """Record the approved branch on the build row; one retry, then advice.
@@ -2917,14 +2950,6 @@ class MergeOfferService:
                     inspected.get("detail"),
                 )
                 advice_lines.append(RETENTION_MISMATCH_LINE)
-        if advice_lines:
-            words_before_advice = card_words
-
-            def card_words(branch: str, merge_branch: str | None) -> str:
-                return "\n".join(
-                    [words_before_advice(branch, merge_branch), *advice_lines]
-                )
-
         # WHAT THE CARD WOULD MERGE (step 1, 24 October 2026): the change from
         # the merge base of the pinned target and the candidate, read where the
         # repository lives, for whoever answers the card.
@@ -2936,6 +2961,14 @@ class MergeOfferService:
             candidate_sha,
             feature_id,
         )
+        if advice_lines:
+            words_before_advice = card_words
+
+            def card_words(branch: str, merge_branch: str | None) -> str:
+                return "\n".join(
+                    [words_before_advice(branch, merge_branch), *advice_lines]
+                )
+
 
         # The build's own project's receipts (one sandbox per project); a
         # reader put here by something else is asked as it always was.

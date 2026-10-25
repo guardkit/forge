@@ -726,21 +726,44 @@ def test_a_failed_record_write_after_an_ack_retries_only_the_write(tmp_path):
     connection.close()
 
 
-def test_a_record_write_that_fails_twice_is_not_called_an_unknown_http_result(
-    tmp_path, caplog
-):
+def test_a_record_write_that_fails_twice_still_dispatches_the_build(tmp_path, caplog):
+    """Step 1 (25 October 2026): the acknowledged placement is used for the
+    dispatch; the request is not sent again and is never called unknown."""
+    from forge.pipeline.dispatchers.autobuild_async import dispatch_autobuild_async
+    from forge.subagents.autobuild_runner import _validated_feature_routing
+    from tests.forge.test_feature_routing_launch import (
+        _Context,
+        _Recorder,
+        _Starter,
+        _State,
+    )
+
     _path, connection, store = _store(tmp_path)
 
     def broken_complete(*_args):
         raise sqlite3.OperationalError("disk I/O error")
 
     store.complete_seed = broken_complete
-    gate, calls = _counting_gate(store, [(200, _headers())])
-    with pytest.raises(FeatureRoutingBlocked, match="acknowledged"):
-        asyncio.run(gate.ensure_seeded("write_B", origin_kind="planning", origin_id="B"))
+    gate, calls = _counting_gate(store, [(200, _headers("2", "2"))])
+    starter = _Starter()
+    asyncio.run(
+        dispatch_autobuild_async(
+            "build-B",
+            "FEAT-B",
+            "write_B",
+            forward_context_builder=_Context(),
+            async_task_starter=starter,
+            stage_log_recorder=_Recorder(),
+            state_channel=_State(),
+            feature_routing_id="write_B",
+            feature_routing_gate=gate,
+            feature_routing_required=True,
+        )
+    )
     assert calls == ["write_B"]
-    row = connection.execute(
-        "SELECT state, error FROM feature_routing_seeds WHERE feature_routing_id='write_B'"
-    ).fetchone()
-    assert row == ("UNKNOWN", "seed-acknowledged-record-not-written")
+    assert starter.context["feature_routing_receipt"]["server_id"] == 2
+    # The runner takes the receipt it was handed.
+    assert _validated_feature_routing(starter.context) == ("write_B", True)
+    assert store.state_for("write_B") != "UNKNOWN"
+    assert "the acknowledged placement is used for this dispatch" in caplog.text
     connection.close()
