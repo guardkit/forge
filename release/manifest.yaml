@@ -181,7 +181,10 @@ schema: 2
 # 26 October 2026: release 2026.10.26-1, after the step 1 measurement: Forge
 # e6c1e0fa (route reading) and GuardKit eaf3929e (the writer settles); the
 # other pins as 2026.10.25-1.
-version: 2026.10.26-1
+# 26 October 2026, evening: release 2026.10.26-2, GuardKit a1dc4ca3 (a repair's
+# work step adopts the checkout Forge prepared; every repair step had been refused
+# since 24 October). Other pins as 2026.10.26-1.
+version: 2026.10.26-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -247,7 +250,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: eaf3929e17f406c513f62013413d4eb9402fbc6b
+    commit: a1dc4ca356555a1ba16bdb66a3e385ca778baf05
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
