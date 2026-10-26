@@ -747,7 +747,7 @@ def scope_of_the_build(
             for piece in _pieces_of_a_web_address(route)
         }
         declares: list[str] = []
-        for route in _route_shaped(added):
+        for route in _route_shaped(added, opening_a_string=True):
             trimmed = route.rstrip("/")
             if _is_a_place_on_disk(trimmed, roots or ("tests", "test", "spec", "specs")):
                 continue

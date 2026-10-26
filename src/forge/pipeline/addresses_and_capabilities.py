@@ -107,17 +107,32 @@ _DEVICE_FILES: tuple[str, ...] = (
 )
 
 
-def _route_shaped(text: str) -> list[str]:
+#: The characters that open a string literal in code, in every language.
+_STRING_OPENERS: str = "\"'`"
+
+
+def _route_shaped(text: str, *, opening_a_string: bool = False) -> list[str]:
     """Every route-shaped string in ``text``, by the route reader's own rule:
     a slash-led path longer than three characters with a letter in it.
 
     A closing markup tag (``</span>``, ``</time>``) is not one: the slash right
-    after ``<`` put "/span" and "/time" on FEAT-7F19's card (15 October 2026)."""
+    after ``<`` put "/span" and "/time" on FEAT-7F19's card (15 October 2026).
+
+    ``opening_a_string`` is for code a build wrote: a web address that code
+    declares opens a string literal (``"/health"``, ``'/version'``), in any
+    language. A slash in the middle of a string is a path being built, not an
+    address: ``"${folder}/node_modules"`` in a check script and the import
+    ``"./config/settings"`` were both read as addresses the build answers at,
+    and the first cost FEAT-8AD7 its merge (step 1 measurement, 26 October
+    2026)."""
     found: list[str] = []
     source = str(text or "")
     for hit in _ROUTE_PATH.finditer(source):
         match = hit.group(0)
-        if hit.start() > 0 and source[hit.start() - 1] == "<":
+        before = source[hit.start() - 1] if hit.start() > 0 else ""
+        if before == "<":
+            continue
+        if opening_a_string and (not before or before not in _STRING_OPENERS):
             continue
         if len(match) > 3 and re.search(r"[A-Za-z]", match) and match not in found:
             found.append(match)

@@ -311,6 +311,38 @@ class TestAgainstTheSentence:
         assert report.capabilities_the_request_did_not_name == []
         assert report.routes_read is True
 
+    def test_a_path_built_inside_a_string_is_not_an_address(self, repo: Path) -> None:
+        """FEAT-8AD7 and FEAT-3B15 (step 1 measurement, 26 October 2026): a
+        check script's ``"${folder}/node_modules"`` and the import
+        ``"./config/settings"`` were read as addresses the build answers at,
+        and the first cost the feature its merge. An address in code opens a
+        string; a slash in the middle of one is a path being built."""
+        _build_on(
+            repo,
+            {
+                "scripts/check.sh": (
+                    "#!/bin/sh\n"
+                    'for folder in apps/api; do\n'
+                    '  [ -d "$folder/node_modules" ] || echo '
+                    '"check.sh: ${folder}/node_modules is missing" >&2\n'
+                    "done\n"
+                ),
+                "src/users/router.ts": (
+                    'import { settings } from "./config/settings";\n'
+                    'import { db } from "../db/client";\n'
+                    "router.get('/users/created-per-day', counts);\n"
+                ),
+            },
+        )
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert report.routes_read is True
+        assert report.routes_the_branch_declares == ["/users/created-per-day"]
+        assert report.routes_the_request_did_not_name == []
+
     def test_no_sentence_means_the_comparison_is_not_taken(self, repo: Path) -> None:
         _build_on(repo, {"src/analytics/service.py": "x = 1\n"})
         reading = read_branch_scope(
