@@ -178,7 +178,10 @@ schema: 2
 # 26bfb157, GuardKit bb4f97db, guardkitfactory acc9885). nats-core, fleet-memory
 # and Jarvis stay at live release 2026.10.24-2's pins. This file is the one
 # manifest: edit it in place for each release, never a copy kept elsewhere.
-version: 2026.10.25-1
+# 26 October 2026: release 2026.10.26-1, after the step 1 measurement: Forge
+# e6c1e0fa (route reading) and GuardKit eaf3929e (the writer settles); the
+# other pins as 2026.10.25-1.
+version: 2026.10.26-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -239,12 +242,12 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 26bfb1571435fe19a00bc11dee97ab95b8b4859d
+    commit: e6c1e0fa1f06d37012aee76ffcf0f49fcea76537
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: bb4f97dbe9b8b6ac0ca678d8c8acaad9205e4cd0
+    commit: eaf3929e17f406c513f62013413d4eb9402fbc6b
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
