@@ -1,4 +1,5 @@
-"""Forge enforces specialist semantic decisions and exact plan identity."""
+"""Forge reads specialist semantic decisions and exact plan identity; the
+traceability score and the Coach's verdict are advice (step 2)."""
 
 from __future__ import annotations
 
@@ -77,11 +78,10 @@ def test_missing_or_malformed_review_fails_closed(
     [
         ({"decision": "rejected"}, "not approved"),
         ({"criterion": "wave_sanity"}, "wrong criterion"),
-        ({"criterion_score": 0.0}, "did not pass"),
-        ({"criterion_score": float("nan")}, "did not pass"),
-        ({"criterion_score": float("inf")}, "did not pass"),
-        ({"criterion_score": 1.5}, "did not pass"),
-        ({"coach_verdict": "REVISE"}, "not accepting"),
+        ({"criterion_score": float("nan")}, "not a number from 0 to 1"),
+        ({"criterion_score": float("inf")}, "not a number from 0 to 1"),
+        ({"criterion_score": 1.5}, "not a number from 0 to 1"),
+        ({"coach_verdict": 3}, "not text"),
         ({"reviewed_after_rewrite": "yes"}, "not boolean"),
     ],
 )
@@ -95,6 +95,25 @@ def test_non_approving_semantic_decisions_fail_closed(
     )
     assert review is None
     assert error is not None and expected in error
+
+
+@pytest.mark.parametrize(
+    "override",
+    [{"criterion_score": 0.0}, {"criterion_score": 0.4}, {"coach_verdict": "REVISE"}],
+)
+def test_a_low_score_or_verdict_is_advice_not_a_refusal(
+    files: dict[str, str],
+    override: dict[str, object],
+) -> None:
+    """Step 2 (26 October 2026): the traceability score and the Coach's
+    verdict are read and kept for the build card; they never refuse."""
+    review, error = PlanningRunDriver._semantic_review_of(
+        _role_output(files, _receipt(files, **override)), files
+    )
+    assert error is None
+    assert review is not None
+    for key, value in override.items():
+        assert review[key] == value
 
 
 def test_changed_artifact_loses_old_approval(files: dict[str, str]) -> None:
@@ -148,4 +167,4 @@ def test_huge_integer_semantic_score_fails_closed_without_float_conversion(
     review, error = PlanningRunDriver._semantic_review_of(role_output, files)
 
     assert review is None
-    assert error is not None and "did not pass" in error
+    assert error is not None and "not a number from 0 to 1" in error

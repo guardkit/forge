@@ -1,8 +1,10 @@
 """The merge offer — the card that makes the merge word a mechanism.
 
 Make-merge-work build spec (2026-08-24): when a routine build's terminal
-publish succeeds and the build finished clean (``tasks_failed == 0``), this
-module offers the owner a [Merge & deploy] card.
+publish succeeds, this module offers the owner a [Merge & deploy] card. A
+build with a failed task finishes complete only when GuardKit named the
+approved tasks' commit (step 1, 24 October 2026); the card then offers that
+approved branch, and no Forge check refuses it for the failed task.
 
 Since 2026-09-09 it offers the fix journey's card too. The merge-ready
 checkpoint used to build its own card through the ordinary approval gate,
@@ -90,6 +92,7 @@ __all__ = [
     "SKIP_NO_PASS_BARS",
     "SKIP_NO_REGISTRY",
     "SKIP_NO_TEMPLATE",
+    "SKIP_REGISTRATION_FAILED",
     "SKIP_PLACEHOLDER_IN_ADDRESS",
     "SKIP_UNSUPPORTED_ADDRESS",
     "SKIP_UNSUPPORTED_METHOD",
@@ -1189,6 +1192,9 @@ SKIP_NO_ENDPOINT_NAMED: str = "no_endpoint_named"
 SKIP_NO_PASS_BARS: str = "no_pass_bars"
 SKIP_NO_TEMPLATE: str = "no_template"
 SKIP_NO_REGISTRY: str = "no_registry"
+#: Registering the check failed (a template that would not fill, a registry
+#: GuardKit's validator refused, a write that failed): step 2, 26 October 2026.
+SKIP_REGISTRATION_FAILED: str = "registration_failed"
 
 #: The one sentence both merge cards carry, with the reason in plain words.
 NO_AFTER_DEPLOY_CHECK_SENTENCE: str = (
@@ -1248,6 +1254,8 @@ def _plain_reason(details: Mapping[str, Any]) -> str:
         return "the project has no gate template"
     if code == SKIP_NO_REGISTRY:
         return "the project has no gate registry"
+    if code == SKIP_REGISTRATION_FAILED:
+        return "registering the check failed"
     # A record from before the reason codes, or a code this reader does not
     # know: the one old wording that is not plain gets plain words, and any
     # other text is passed on exactly as it was recorded.
@@ -1682,7 +1690,7 @@ def run_the_scope_pass(
     feature_id: str,
     row: Any,
 ) -> Any | None:
-    """Read the finished branch and hold it against the plan and the request.
+    """Read the finished branch and hold it against the plan.
 
     Returns the scope report, or ``None`` when the pass could not even be
     attempted — no repository path, say — which the card reads as "nobody
@@ -1717,7 +1725,7 @@ def run_the_scope_pass(
 
     merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
     head = branch_to_merge(feature_id, merge_branch)
-    request, source, why_not = request_behind_the_build(pool, row)
+    request, source, _why_not = request_behind_the_build(pool, row)
 
     # WHAT THE BRANCH IS HELD AGAINST (3 October 2026). The commit this build
     # started from, as the record has it, so the count is the build's own
@@ -1779,7 +1787,6 @@ def run_the_scope_pass(
         reading=reading,
         request=request,
         request_source=source,
-        request_why_not=why_not,
     )
     report.compared_against = base
     if report.read:
@@ -2095,8 +2102,8 @@ class MergeOfferService:
 
         # THE SCOPE PASS (the planner fix, 2026-09-15). Read the finished
         # branch once, here, before the card is built: what it changed that
-        # the plan did not name, and what it built that the request never
-        # asked for. It is a REPORT and never a refusal — anything it cannot
+        # the plan did not name (facts, not verdicts: step 2, 26 October
+        # 2026). It is a REPORT and never a refusal — anything it cannot
         # read is a sentence on its own receipt and the card simply says less.
         scope = await self._take_the_scope_pass(event, merge_branch=approved_branch)
 

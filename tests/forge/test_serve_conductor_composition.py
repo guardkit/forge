@@ -138,9 +138,11 @@ class TestSupervisorFactory:
     ) -> None:
         """§c.3 holding by construction, not by intention.
 
-        The precondition is PROVEN green, never "not proven red". With no
-        gate reader wired the checkpoint reads UNKNOWN, treats it as red,
-        and publishes nothing — so a half-wired conductor cannot deliver.
+        With nothing wired the specification fence cannot read what the
+        branch changed, so it cannot show the protected files are untouched,
+        and nothing is published — a half-wired conductor cannot deliver.
+        (Tests that could not run are advice since step 2, 26 October 2026;
+        the fence on protected files is kept.)
         """
         published: list[Any] = []
         supervisor = _supervisor_factory(

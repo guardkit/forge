@@ -759,25 +759,10 @@ async def check_supplied_bundle(
                 return _cannot(why)
             checked.add(key)
 
-    # 8. The QA files both producers write, whatever the tier-1 enforcement
-    #    setting: a pass bar per task and a seed per spec file.
-    for task_id in task_ids:
-        bar = f"qa/pass-bar-{task_id}.yaml"
-        content, why = await _read(runner, repo_path, commit, bar)
-        if why:
-            return _cannot(why)
-        if content is None:
-            return _missing(f"the pass bar for {task_id}", bar, at)
-    for spec in specs:
-        name = posixpath.basename(spec)
-        if name.endswith(".feature"):
-            name = name[: -len(".feature")]
-        seed = f"qa/pass-bar-seed-{name}.yaml"
-        content, why = await _read(runner, repo_path, commit, seed)
-        if why:
-            return _cannot(why)
-        if content is None:
-            return _missing("the spec's QA seed", seed, at)
+    # 8. (Step 2, 26 October 2026, census FRG-101.) The pass bars and spec
+    #    seeds are no longer required here: GuardKit's own task-start
+    #    precondition requires a pinned pass bar where a project switches it
+    #    on, so this copy went (one rule in one place).
 
     # 9. The leak-sweep manifest, exactly when one of a guide's Integration
     #    Contracts sections, read as the specialist emitter reads them,

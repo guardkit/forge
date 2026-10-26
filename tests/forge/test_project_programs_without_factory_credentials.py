@@ -1994,7 +1994,6 @@ ALLOWED: dict[tuple[str, str], str] = {
         "OSV-Scanner and Opengrep, by absolute path) with an environment of "
         "PATH and a fresh HOME only"
     ),
-    ("subagents/autobuild_runner.py", "_guardkit_feature_validate"): "guardkit feature validate, a factory program",
     ("subagents/autobuild_runner.py", "_run_one_build"): "starts GuardKit's build with the factory's launch list",
 }
 

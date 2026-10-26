@@ -11,8 +11,8 @@ What is pinned:
 
 * the branch's own changed files come back, with the span held to
   ``<base>...<head>`` so what main has done since is not counted;
-* the lines the branch ADDS come back, because a web address nobody asked for
-  and a capability nobody asked for are both things the branch wrote;
+* the branch's diff comes back, for the merge card's details (step 2,
+  26 October 2026, deleted the separate reading of added lines);
 * the plan of record behind the build comes back — the feature's own file and
   every task document it names — so the files the plan declared can be
   compared with the files the build changed;
@@ -140,17 +140,14 @@ class TestWhatComesBack:
         assert "src/analytics/service.py" in body["name_status"]
         assert body["head"]
 
-    def test_the_lines_the_branch_added(self, cfg: ForgeConfig) -> None:
+    def test_the_branch_s_diff(self, cfg: ForgeConfig) -> None:
         status, body = _ask(cfg)
 
         assert status == 200, body
-        assert body["added_lines_read_whole"] is True
-        added = body["added_by_file"]
-        # the file each line came from is kept: the same words mean different
-        # things in a test file and in the code that was asked for
-        assert "/stats/users-created-per-day" in added["src/users/router.py"]
-        # a header is not a line the branch added
-        assert "+++ b/src/users/router.py" not in "\n".join(added.values())
+        assert body["patch_read"] is True
+        assert "/stats/users-created-per-day" in body["patch"]
+        assert "added_by_file" not in body
+        assert "added_lines_read_whole" not in body
 
     def test_the_plan_of_record_behind_the_build(self, cfg: ForgeConfig) -> None:
         status, body = _ask(cfg)
@@ -311,9 +308,9 @@ class TestTheSandboxAndTheHostCannotDrift:
         )
         assert reading.error is None
         assert reading.name_status == answer["name_status"]
-        assert reading.added_by_file == answer["added_by_file"]
+        assert reading.patch == answer["patch"]
         assert reading.plan_documents == answer["plan_documents"]
-        assert reading.added_lines_read_whole is True
+        assert reading.patch_read is True
 
     def test_a_sidecar_that_never_heard_of_the_question_is_said_plainly(
         self,

@@ -1720,10 +1720,19 @@ class SqliteLifecyclePersistence:
         return self._planning_plan_line(correlation_id, "plan_size_note")
 
     def read_planning_plan_review_note(self, correlation_id: str | None) -> str | None:
-        """The plain line the planning run recorded when the plan's review
-        record could not be read, or ``None`` (24 October 2026). The same
-        query and forgiveness as the two readers above."""
+        """The plain line the planning run recorded about the plan's review,
+        or ``None``: the plan reviewer's request-traceability score (step 2,
+        26 October 2026, advice), or that the review record could not be read
+        (24 October 2026). The same query and forgiveness as the two readers
+        above."""
         return self._planning_plan_line(correlation_id, "plan_review_note")
+
+    def read_planning_plan_advice_note(self, correlation_id: str | None) -> str | None:
+        """The planning seat's advice for the approver (its ``Missing
+        prerequisite:`` lines first) as one plain line, or ``None`` (step 2,
+        26 October 2026). Display only. The same query and forgiveness as the
+        readers above."""
+        return self._planning_plan_line(correlation_id, "plan_advice_note")
 
     def _planning_plan_line(self, correlation_id: str | None, key: str) -> str | None:
         """One plain line off the latest approved ``feature-plan`` record."""

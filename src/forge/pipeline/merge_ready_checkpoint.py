@@ -165,11 +165,16 @@ class GateStatus(StrEnum):
     """Outcome of the full gate set on the candidate branch.
 
     Members:
-        GREEN: Every gate passed. The only status that may publish a card.
-        RED: At least one gate failed.
+        GREEN: Every gate passed.
+        RED: At least one gate failed. No card; the repair loops back.
         UNKNOWN: The gate set could not be evaluated (no reader wired, a
-            reader raised, a probe timed out). Treated exactly as RED —
-            the precondition is "proven green", never "not proven red".
+            reader raised, a probe timed out). Since step 2 (26 October
+            2026, census FRG-138) this is advice: tests that could not run
+            are not tests that ran and failed. The card is published with a
+            plain "the tests could not be run" line, and the merge press
+            still runs the project's own checks on the joined code. An
+            UNKNOWN that names failed gates is the routing law's own block,
+            kept as it was: no card, as for RED.
     """
 
     GREEN = "green"
@@ -1454,7 +1459,16 @@ class MergeReadyCheckpointPublisher:
             else {}
         )
 
-        if not gates.is_green:
+        if gates.status is GateStatus.UNKNOWN and not gates.failed_gates:
+            logger.warning(
+                "%s: the tests could not be run for build_id=%s (%s) — "
+                "ADVISORY; the card says so and the merge press still runs "
+                "the project's checks on the joined code",
+                MERGE_READY_CHECKPOINT_LABEL,
+                build_id,
+                gates.detail or "no detail",
+            )
+        elif not gates.is_green:
             return await self._red_gate_decision(
                 build_id=build_id,
                 feature_id=feature_id,
@@ -1842,10 +1856,7 @@ class MergeReadyCheckpointPublisher:
         if self._gates_green_reader is None:
             return GatesReport(
                 status=GateStatus.UNKNOWN,
-                detail=(
-                    "no gates_green_reader is wired; the merge-ready "
-                    "checkpoint requires PROVEN green and refuses to assume it"
-                ),
+                detail="no reader of this repository's tests is wired",
             )
         try:
             raw = await _maybe_await(
@@ -1855,8 +1866,8 @@ class MergeReadyCheckpointPublisher:
             return GatesReport(
                 status=GateStatus.UNKNOWN,
                 detail=(
-                    f"gates_green_reader raised {type(exc).__name__}: {exc}; "
-                    "treated as red (the precondition is proven green)"
+                    f"the reader of this repository's tests raised "
+                    f"{type(exc).__name__}: {exc}"
                 ),
             )
         if isinstance(raw, GatesReport):
@@ -1870,8 +1881,8 @@ class MergeReadyCheckpointPublisher:
         return GatesReport(
             status=GateStatus.UNKNOWN,
             detail=(
-                f"gates_green_reader returned {type(raw).__name__}, which is "
-                "neither a GatesReport nor a bool; treated as red"
+                f"the reader of this repository's tests answered "
+                f"{type(raw).__name__}, which is neither a report nor a yes or no"
             ),
         )
 

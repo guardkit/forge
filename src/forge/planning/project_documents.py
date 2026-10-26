@@ -15,7 +15,8 @@ rule GuardKit applies for the Coach, so every role is given the same bytes:
 2. *Bytes:* the raw committed bytes, decoded strictly as UTF-8 (invalid UTF-8
    is refused), line endings kept; hash and size are of those bytes, and the
    :data:`PROJECT_DOCUMENTS_BUDGET_BYTES` budget is the sum of raw sizes after
-   de-duplication.
+   de-duplication. The budget is a guide (step 2, 26 October 2026): documents
+   over it are still given in full and the overrun is logged as advice.
 3. *Links:* a ``required_documents`` entry must be an ordinary file; a link is
    refused. An instruction file may be a link: it is resolved inside the commit
    the way a filesystem would (each path component, linked folders included,
@@ -35,6 +36,7 @@ plain sentence.
 from __future__ import annotations
 
 import hashlib
+import logging
 from collections import deque
 from dataclasses import dataclass
 from typing import Any
@@ -43,6 +45,8 @@ from forge.planning.declared_memory import (
     BINDING_DOCUMENTS_FIELD,
     DeclaredProjectDocuments,
 )
+
+logger = logging.getLogger(__name__)
 
 __all__ = [
     "INSTRUCTION_FILES",
@@ -366,12 +370,15 @@ async def read_project_documents_at_commit(
 
     total = sum(document.bytes for document in delivered)
     if total > PROJECT_DOCUMENTS_BUDGET_BYTES:
+        # A rough guide, never a refusal (step 2, 26 October 2026, census
+        # FRG-025): the documents are given in full and the overrun is said.
         sizes = ", ".join(f"{d.path} ({d.bytes} bytes)" for d in delivered)
-        return (), (
-            f"the project's instruction files and binding documents come to "
-            f"{total} bytes, over the {PROJECT_DOCUMENTS_BUDGET_BYTES}-byte limit "
-            f"for documents given to the spec and plan writers in full: {sizes}. "
-            f"A binding document is never cut short; shorten the documents or "
-            f"declare fewer in {BINDING_DOCUMENTS_FIELD}."
+        logger.warning(
+            "the project's instruction files and binding documents come to %d "
+            "bytes, over the %d-byte guide for documents given to the spec and "
+            "plan writers in full (%s) — ADVISORY; given in full",
+            total,
+            PROJECT_DOCUMENTS_BUDGET_BYTES,
+            sizes,
         )
     return tuple(delivered), None

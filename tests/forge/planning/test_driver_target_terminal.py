@@ -1406,13 +1406,14 @@ def _plan_result_native_smoke(smoke_path: str, slug: str = "stats-endpoint"):
 
 
 @pytest.mark.asyncio
-async def test_replay_invented_tests_smoke_fails_the_real_validate(
-    store: SqlitePlanningRunStore, tmp_path: Path
+async def test_replay_invented_tests_smoke_is_advice_from_the_real_validate(
+    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     """(a)+(b): the fixed descriptor carries the exact roots, and an 008 reply
-    whose feature YAML references the invented ``tests/smoke`` is REFUSED loudly
-    by the pre-commit validate (the round-10 live failure, still caught) — the
-    plan is NOT committed and the run never reaches BUILD_QUEUED."""
+    whose feature YAML references the invented ``tests/smoke`` is reported by
+    the pre-commit validate. Since step 2 (26 October 2026, census FRG-082)
+    that is advice: GuardKit validates the feature itself when it builds, so
+    the plan is committed and the complaint is logged."""
     repo = tmp_path / "api_test"
     _init_api_test_shaped_repo(repo)
     git = _recorded_runner(tmp_path / "wt", repo)
@@ -1426,7 +1427,8 @@ async def test_replay_invented_tests_smoke_fails_the_real_validate(
         validate_fn=_guardkit_smoke_gate_validate,
     )
 
-    await h.driver.drive(CID)
+    with caplog.at_level("WARNING"):
+        await h.driver.drive(CID)
 
     # (a) the descriptor forge threaded to 008 carried the EXACT roots (and,
     # since 2026-09-11, the repository's own inventory beside them).
@@ -1447,15 +1449,9 @@ async def test_replay_invented_tests_smoke_fails_the_real_validate(
         # The scratch project declares no coverage command (20 October 2026).
         "declares_coverage_command": False,
     }
-    # (b) the pre-commit validate refused the invented path — loudly, verbatim.
-    run = store.get_run(CID)
-    assert run["state"] != PlanningState.BUILD_QUEUED.value
+    # (b) the pre-commit validate reported the invented path — as advice.
     assert h.ctx["counters"]["validate"] == 1
-    assert h.ctx["counters"]["build_trigger"] == 0
-    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "tests/smoke" in reasons
-    assert "Available test roots: tests/health, tests/users" in reasons
-    # The plan tree was NOT committed to the branch.
+    assert "tests/smoke" in caplog.text and "ADVISORY" in caplog.text
     branch = f"planning/{CID}"
     feature_id = h.ctx["counters"]["last_feature_id"]
     show = subprocess.run(
@@ -1464,7 +1460,7 @@ async def test_replay_invented_tests_smoke_fails_the_real_validate(
         capture_output=True,
         text=True,
     )
-    assert show.returncode != 0  # the path does not exist on the branch
+    assert show.returncode == 0  # the plan was committed
 
 
 @pytest.mark.asyncio
@@ -1617,9 +1613,10 @@ async def test_plan_invalid_artifacts_fails(store: SqlitePlanningRunStore) -> No
 async def test_plan_missing_semantic_review_passes_and_the_build_card_says_so(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """A missing review record is bookkeeping (24 October 2026): the existing
-    re-review is asked once; when its record is missing too, the plan carries
-    on and the build card says the review record was unreadable."""
+    """A missing review record is bookkeeping (24 October 2026). Since step 2
+    (26 October 2026) the seat hands on an unaccepted best draft this way, so
+    no re-review is asked: the plan carries on and the build card says the
+    review record was unreadable."""
     _queue(store)
     files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
     calls: list[dict[str, Any]] = []
@@ -1636,8 +1633,8 @@ async def test_plan_missing_semantic_review_passes_and_the_build_card_says_so(
 
     await h.driver.drive(CID)
 
-    # The existing re-review was asked exactly once, then never again.
-    assert [c.get("revision_of") is not None for c in calls] == [False, True]
+    # No re-review is asked for a plan with no review record at all.
+    assert [c.get("revision_of") is not None for c in calls] == [False]
     # And the line reaches the build gate's card through the real reader.
     from forge.cli._serve_gate_activation import _planning_card_lines
     from forge.lifecycle.persistence import SqliteLifecyclePersistence
@@ -1683,6 +1680,171 @@ async def test_a_refusing_plan_review_verdict_still_fails_before_write(
 
 
 @pytest.mark.asyncio
+async def test_a_missing_routing_gate_is_advice_and_planning_carries_on(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Step 2 (26 October 2026, census FRG-022): routing required with no
+    routing gate wired no longer ends the run; the dispatchers already carry
+    on unrouted, and so does planning."""
+    _queue(store)
+    h = _make_driver(store)
+    h.driver._deps.feature_routing_required = True
+    assert h.driver._deps.feature_routing_gate is None
+
+    await h.driver.drive(CID)
+
+    plan = [
+        e
+        for e in store.list_events(CID)
+        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
+    ]
+    assert plan, "the plan was written, not refused for the missing gate"
+    assert not [
+        e for e in store.list_events(CID) if e["stage_label"] == "feature-routing"
+    ]
+
+
+def _card_lines_of(store: SqlitePlanningRunStore) -> str:
+    from forge.cli._serve_gate_activation import _planning_card_lines
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence
+
+    return _planning_card_lines(SqliteLifecyclePersistence(connection=store._connection), CID) or ""
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_prerequisite", [True, False])
+async def test_the_planners_missing_prerequisite_line_is_shown_on_the_card(
+    store: SqlitePlanningRunStore, with_prerequisite: bool
+) -> None:
+    """Step 2 (26 October 2026): the planning seat's ``plan_advice`` is
+    information for the approver. A ``Missing prerequisite:`` line is shown on
+    the build card first; a plan without advice shows no extra line. It
+    changes nothing else: the plan is recorded either way."""
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    advice = (
+        [
+            {"rule": "scenario_ownership", "text": "Scenario B has no owner task."},
+            {
+                "rule": "missing_prerequisite",
+                "text": "Missing prerequisite: the project has no settings module yet; this plan adds one",
+            },
+        ]
+        if with_prerequisite
+        else []
+    )
+    validation = json.dumps({"accepted": True, "errors": [], "plan_advice": advice})
+
+    async def _the_specialist(**kwargs: Any) -> Any:
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="completed"),
+            role_output={
+                "files": dict(files),
+                "semantic_review.json": _semantic_review_json(files),
+                "validation.json": validation,
+            },
+            reason=None,
+        )
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    await h.driver.drive(CID)
+
+    plan = [
+        json.loads(e["details_json"])
+        for e in store.list_events(CID)
+        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
+    ]
+    assert plan, "the plan was recorded"
+    line = _card_lines_of(store)
+    if with_prerequisite:
+        note = plan[-1]["plan_advice_note"]
+        assert note.startswith(
+            "The planner's notes for you: Missing prerequisite: the project has "
+            "no settings module yet; this plan adds one."
+        )
+        assert "Scenario B has no owner task." in note
+        assert "scenario_ownership" not in note
+        assert note in line
+    else:
+        assert "plan_advice_note" not in plan[-1]
+        assert "The planner's notes" not in line
+
+
+@pytest.mark.asyncio
+async def test_a_plan_with_no_review_record_is_carded_without_a_re_review(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Step 2 (26 October 2026): the seat hands on its unaccepted best draft
+    with the reviewer's objections in ``plan_advice`` and no review record.
+    That is bookkeeping: no re-review, the plan is recorded, and the build
+    card says so beside the objections."""
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    calls: list[dict[str, Any]] = []
+    validation = json.dumps({"accepted": True, "errors": [], "plan_advice": [
+        {"rule": "review_not_accepted", "text": "The reviewer wanted a clearer task 2."},
+    ]})
+
+    async def _the_specialist(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="completed"),
+            role_output={"files": dict(files), "validation.json": validation},
+            reason=None,
+        )
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    await h.driver.drive(CID)
+
+    assert [c.get("revision_of") is not None for c in calls] == [False]
+    line = _card_lines_of(store)
+    assert "Plan review record unreadable" in line
+    assert "The reviewer wanted a clearer task 2." in line
+
+
+@pytest.mark.asyncio
+async def test_a_low_traceability_score_is_advice_on_the_build_card(
+    store: SqlitePlanningRunStore,
+) -> None:
+    """Step 2 (26 October 2026, first run feature 10): a plan the reviewer
+    scored 0.40 for following the request, with a verdict that is not GOOD or
+    ACCEPTABLE, is not refused or re-reviewed. The score reaches the build
+    gate's card as a plain line through the real reader."""
+    _queue(store)
+    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
+    review = json.loads(_semantic_review_json(files))
+    review["criterion_score"] = 0.4
+    review["coach_verdict"] = "REVISE"
+    calls: list[dict[str, Any]] = []
+
+    async def _the_specialist(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        return SimpleNamespace(
+            outcome=SimpleNamespace(value="completed"),
+            role_output={"files": dict(files), "semantic_review.json": json.dumps(review)},
+            reason=None,
+        )
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    await h.driver.drive(CID)
+
+    assert [c.get("revision_of") is not None for c in calls] == [False]
+    plan = [
+        json.loads(e["details_json"])
+        for e in store.list_events(CID)
+        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
+    ]
+    assert plan, "the plan was recorded, not refused"
+    assert plan[-1]["semantic_review"]["criterion_score"] == 0.4
+    from forge.cli._serve_gate_activation import _planning_card_lines
+    from forge.lifecycle.persistence import SqliteLifecyclePersistence
+
+    line = _planning_card_lines(SqliteLifecyclePersistence(connection=store._connection), CID)
+    assert line is not None
+    assert "0.40 out of 1" in line and "REVISE" in line
+
+
+@pytest.mark.asyncio
 async def test_plan_rewrite_with_stale_semantic_review_is_carded_not_refused(
     store: SqlitePlanningRunStore,
 ) -> None:
@@ -1707,13 +1869,15 @@ async def test_plan_rewrite_with_stale_semantic_review_is_carded_not_refused(
     ]
     assert plan
     assert plan[-1]["semantic_review"]["reviewed_after_rewrite"] is True
-    assert "plan_review_note" not in plan[-1]
+    assert plan[-1]["plan_review_note"].startswith("The plan reviewer scored")
 
 
 @pytest.mark.asyncio
-async def test_validate_red_fails_and_plan_not_committed(
+async def test_validate_red_is_advice_and_the_plan_is_committed(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
+    """Step 2 (26 October 2026, census FRG-082): GuardKit validates the
+    feature when it builds; Forge's copy at planning is advice."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     git = _recorded_runner(tmp_path / "wt", repo)
@@ -1724,8 +1888,8 @@ async def test_validate_red_fails_and_plan_not_committed(
         repo_path=str(repo),
         validate=ToolOutcome(ok=False, detail="schema errors"),
     )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    # The spec landed (spec leg succeeded) but the plan YAML never committed.
+    await h.driver.drive(CID)
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     branch = f"planning/{CID}"
     plan_show = subprocess.run(
         ["git", "show", f"{branch}:features/stats-endpoint"],
@@ -1733,7 +1897,7 @@ async def test_validate_red_fails_and_plan_not_committed(
         capture_output=True,
         text=True,
     )
-    assert "FEAT-" not in plan_show.stdout
+    assert "FEAT-" in plan_show.stdout
 
 
 @pytest.mark.asyncio
@@ -2818,12 +2982,13 @@ def _leg_event_sha_field(
 
 
 @pytest.mark.asyncio
-async def test_round19_no_seed_fails_loudly_before_the_build(
+async def test_round19_no_seed_is_advice_and_the_build_is_queued(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
-    """(c) An older specialist that ships NO seed → loud, named failure at the
-    cheaper plan-commit layer (never a silent skip — the B2 gate would refuse the
-    build anyway); no bars, no BUILD_QUEUED."""
+    """(c) An older specialist that ships NO seed: since step 2 (26 October
+    2026, census FRG-065) no bars are registered, the reason is recorded, and
+    the build is queued. GuardKit's own task-start precondition is the one
+    place a missing pass bar is refused, where a project enforces it."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     git = _recorded_runner(tmp_path / "wt", repo)
@@ -2839,12 +3004,13 @@ async def test_round19_no_seed_fails_loudly_before_the_build(
     await h.driver.drive(CID)
 
     run = store.get_run(CID)
-    assert run["state"] == PlanningState.FAILED.value
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
     assert h.ctx["counters"]["pass_bar_validate"] == 0
-    assert h.ctx["counters"]["build_trigger"] == 0
-    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "no pass-bar seed" in reasons
-    assert any(level == "error" for _, _, level in h.ctx["notifications"])
+    assert h.ctx["counters"]["build_trigger"] == 1
+    ev = _leg_event_details_of(store, "qa-pass-bars")
+    assert ev["skipped"] is True and ev["bar_files"] == []
+    assert "no pass-bar seed" in ev["reason"]
+    assert not any(level == "error" for _, _, level in h.ctx["notifications"])
 
 
 @pytest.mark.asyncio
@@ -3523,11 +3689,12 @@ async def test_f2_missing_registry_skip_names_its_reason(
 
 
 @pytest.mark.asyncio
-async def test_f2_validator_red_fails_loudly_zero_branch_mutation(
+async def test_f2_validator_red_is_a_skip_with_zero_branch_mutation(
     store: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
     """(4) Derivable + surface adopted but guardkit qa validate gate-registry is
-    RED → loud FAILED, no gate/registry mutation on the branch, no build."""
+    RED → an honest skip (step 2, 26 October 2026, census FRG-069): no
+    gate/registry mutation on the branch, and the build is queued."""
     repo = tmp_path / "api_test"
     _init_scratch_repo(repo)
     _seed_gate_surface(repo)
@@ -3547,20 +3714,17 @@ async def test_f2_validator_red_fails_loudly_zero_branch_mutation(
     await h.driver.drive(CID)
 
     run = store.get_run(CID)
-    assert run["state"] == PlanningState.FAILED.value
-    assert h.ctx["counters"]["build_trigger"] == 0
+    assert run["state"] == PlanningState.BUILD_QUEUED.value
+    assert h.ctx["counters"]["build_trigger"] == 1
     # The pre-commit oracle aborted the commit: zero branch mutation.
     assert _show_on_branch(repo, "qa/gates/version_endpoint_gate.py").returncode != 0
     reg_data = yaml.safe_load(_show_on_branch(repo, "qa/gates/registry.yaml").stdout)
     assert {g["id"] for g in reg_data["gates"]} == {"health", "stats", "version"}
-    # No approved qa-feature-gate sentinel (the leg failed, not completed/skipped).
-    assert not any(
-        e["stage_label"] == "qa-feature-gate" and e["status"] == "approved"
-        for e in store.list_events(CID)
-    )
-    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "gate-registry" in reasons
-    assert any(level == "error" for _, _, level in h.ctx["notifications"])
+    ev = _leg_event_details_of(store, "qa-feature-gate")
+    assert ev.get("skipped") is True
+    assert ev["reason_code"] == "registration_failed"
+    assert "gate-registry" in ev["reason"]
+    assert not any(level == "error" for _, _, level in h.ctx["notifications"])
 
 
 @pytest.mark.asyncio
@@ -7831,181 +7995,6 @@ def test_the_rule_6b_line_keeps_the_specs_shape_for_one_example_and_bends_for_mo
 
 
 # ---------------------------------------------------------------------------
-# THE PROVABILITY CHECK BEFORE THE CARD MEETS THE PLAN STAGE (Part K, rule 47:
-# "the plan stage's rule 1a path runs as today"). The machine's one note was
-# sent before the card, so the plan stage never sends it again: its first
-# stamping runs with the model fallback allowed — as the card told the owner
-# it would — and a title still refused stops with the plan-stop card and rule
-# 6's sentence for how the one rewrite went. Never a third try.
-# ---------------------------------------------------------------------------
-
-from forge.planning.target_terminal_tools import ScenarioProvabilityOutcome  # noqa: E402
-
-
-def _classify_by_call(*refusals: list[str]):
-    """A fake ``classify_scenarios`` seam answering, per call, which of the
-    fixture's titles the rules refuse (the last answer repeats)."""
-    calls: list[str] = []
-
-    async def _classify(repo_path: Path, feature_text: str) -> ScenarioProvabilityOutcome:
-        calls.append(feature_text)
-        refused = refusals[min(len(calls) - 1, len(refusals) - 1)]
-        return ScenarioProvabilityOutcome(
-            status="checked",
-            detail=f"{len(refused)} of 1 scenario(s) cannot be proven by rule",
-            refused_titles=tuple(refused),
-            homes={} if refused else {"ok": "hurl"},
-            rules={} if refused else {"ok": "R9"},
-            scenario_count=1,
-            repo_has_http_surface=True,
-        )
-
-    _classify.calls = calls  # type: ignore[attr-defined]
-    return _classify
-
-
-def _refusal_of_ok() -> StampNormalizerOutcome:
-    """The plan stage's normalizer refusing the fixture's one example after
-    the model had its turn (the model could not settle it either)."""
-    return StampNormalizerOutcome(
-        status="refused",
-        detail="1 scenario(s) undecidable by rule (R1–R10) — the model fallback was asked and could not settle them; nothing was written",
-        refused_titles=("ok",),
-        model_outcome={"status": "answer_rejected", "detail": "the answer named no verifier"},
-    )
-
-
-_STOP_REFUSED_BY_CHECKER = (
-    "The machine already asked the spec writer once to express these as observable "
-    "behaviour through the supplied interface; the rewrite was refused by the "
-    "checker: could not carry out what this round required, after 2 attempts. "
-    "'feedback_resolved' must be met."
-)
-
-
-@pytest.mark.asyncio
-async def test_after_a_pre_card_round_the_plan_stage_asks_the_model_and_never_sends_the_note_again(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The pre-card round rewrote the example and the check still refused it;
-    the card said so and the owner approved. At the plan stage the FIRST
-    stamping runs with the model allowed (never by rule only: the round is
-    spent), and when it refuses the title the run stops with the plan-stop
-    card and rule 6's "still could not be proven" sentence — the spec writer
-    ran exactly twice in the whole run."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    classify = _classify_by_call(["ok"], ["ok"])
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_of_ok()]),
-        classify_fn=classify,
-    )
-    _share_order(sink, h)
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert h.ctx["counters"]["spec"] == 2  # the pre-card round, never a third try
-    assert len(h.ctx["counters"]["spec_revisions"]) == 1
-    assert classify.calls == [_FIXTURE_FEATURE, _FIXTURE_FEATURE]
-    # The one card a person read carried rule 45's cannot-be-proven line.
-    card = h.ctx["publisher"].envelopes[0].payload["details"]["summary"]
-    assert card["what_happened"].endswith(
-        "The rules-only check could not assign a verifier to 1 worked example(s): "
-        "“ok”. This is not a semantic impossibility. If you "
-        "approve, the plan stage will ask the model fallback to place them; or "
-        "send a note."
-    )
-    assert "The machine rewrote 1 of the worked examples" in card["what_happened"]
-    # The plan stage stamped ONCE, called the old way (the model allowed —
-    # never by rule only: the round is spent), and stopped.
-    assert sink["rules_only"] == [None]
-    assert sink["order"] == ["normalize_stamps"]
-    assert h.ctx["counters"]["plan"] == 1
-    cards = _error_cards(h)
-    assert len(cards) == 1
-    assert _STOP_STILL_UNPROVEN in cards[0]
-    assert "ok" in cards[0]
-    assert "its answer was not one the check accepts" in cards[0]
-    # The approved spec row carries the pre-card round; no plan-stage rewrite.
-    approved = _approved_spec_rows(store)
-    assert len(approved) == 1
-    assert approved[0]["provability"]["round"] == 1
-    assert approved[0]["provability"]["rewritten"] is True
-    assert "rewritten_by_machine" not in approved[0]
-
-
-@pytest.mark.asyncio
-async def test_after_a_checker_refused_pre_card_round_the_plan_stage_asks_the_model(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The checker refused the machine's rewrite before the card; the card
-    opened on the original draft and the owner approved. The plan stage's
-    first stamping asks the model; when it settles the title the plan carries
-    on to the build with no second note — and when it cannot, the stop card
-    says the rewrite was refused by the checker, with the reason."""
-    reason = (
-        "could not carry out what this round required, after 2 attempts. "
-        "'feedback_resolved' must be met"
-    )
-
-    # Carried on: the model settles it.
-    repo, git = _enforced_repo(tmp_path / "a")
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _error_result(reason=reason)),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [None]),
-        classify_fn=_classify_by_call(["ok"]),
-    )
-    _share_order(sink, h)
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["spec"] == 2
-    assert sink["rules_only"] == [None]  # called the old way: the model allowed
-    assert sink["order"] == ["normalize_stamps", "validate"]
-    assert _error_cards(h) == []
-    approved = _approved_spec_rows(store)
-    assert approved[0]["provability"]["refused_by_checker"] is True
-    assert approved[0]["provability"]["rewritten"] is False
-
-    # Stopped: the model could not settle it either.
-    cx = sqlite_connect.connect_writer(tmp_path / "b.db")
-    migrations.apply_at_boot(cx)
-    store_b = SqlitePlanningRunStore(cx, target_terminal_enabled=True)
-    repo_b, git_b = _enforced_repo(tmp_path / "b")
-    _queue(store_b)
-    sink_b: dict[str, Any] = {}
-    h_b = _make_driver(
-        store_b,
-        git_runner=git_b,
-        repo_path=str(repo_b),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _error_result(reason=reason)),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink_b, [_refusal_of_ok()]),
-        classify_fn=_classify_by_call(["ok"]),
-    )
-    _share_order(sink_b, h_b)
-    await h_b.driver.drive(CID)
-    assert store_b.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert h_b.ctx["counters"]["spec"] == 2
-    assert sink_b["rules_only"] == [None]  # the model allowed
-    cards = _error_cards(h_b)
-    assert len(cards) == 1
-    assert _STOP_REFUSED_BY_CHECKER in cards[0]
-
-
-# ---------------------------------------------------------------------------
 # Names were not enough (2026-09-13, FEAT-19C4)
 #
 # The seat knew src/users/router.py existed and could not know that
@@ -8802,6 +8791,11 @@ def _approved_plan_events(store: SqlitePlanningRunStore) -> list[dict[str, Any]]
     ]
 
 
+#: A review record whose shape is wrong: bookkeeping that is asked about once
+#: in the exact re-review (a record missing altogether is not, since step 2).
+_MALFORMED_REVIEW = json.dumps({"decision": "approved"})
+
+
 def _a_reply(files: dict[str, str], review: str | None = None) -> Any:
     role_output: dict[str, Any] = {"files": dict(files)}
     if review is not None:
@@ -8829,7 +8823,7 @@ async def test_the_recovered_ordinary_plan_from_the_re_review_is_the_plan_handed
     async def _the_specialist(**kwargs: Any) -> Any:
         calls.append(kwargs)
         if kwargs.get("revision_of") is None:
-            return _a_reply(first)  # no review record: the re-review is asked
+            return _a_reply(first, _MALFORMED_REVIEW)  # the re-review is asked
         return _a_reply(recovered, _semantic_review_json(recovered))
 
     h = _make_driver(store, plan_dispatch=_the_specialist)
@@ -8839,7 +8833,7 @@ async def test_the_recovered_ordinary_plan_from_the_re_review_is_the_plan_handed
     plan = _approved_plan_events(store)
     assert plan, "the recovered plan was recorded"
     assert "tasks/backlog/TASK-R1.md" in plan[-1]["plan_files"]
-    assert "plan_review_note" not in plan[-1]
+    assert plan[-1]["plan_review_note"].startswith("The plan reviewer scored")
     assert plan[-1]["semantic_review"]["decision"] == "approved"
 
 
@@ -8858,9 +8852,9 @@ async def test_a_recovered_plan_is_never_recovered_twice(
     async def _the_specialist(**kwargs: Any) -> Any:
         calls.append(kwargs)
         if len(calls) == 1:
-            return _a_reply(first)
+            return _a_reply(first, _MALFORMED_REVIEW)
         if len(calls) == 2:
-            return _a_reply(recovered)
+            return _a_reply(recovered, _MALFORMED_REVIEW)
         return _a_reply(another, _semantic_review_json(another))
 
     h = _make_driver(store, plan_dispatch=_the_specialist)
@@ -8912,7 +8906,9 @@ async def test_an_accepting_review_with_missing_fields_is_re_reviewed_not_refuse
     await h.driver.drive(CID)
     assert [c.get("revision_of") is not None for c in calls] == [False, True]
     plan = _approved_plan_events(store)
-    assert plan and "plan_review_note" not in plan[-1]
+    assert plan and plan[-1]["plan_review_note"].startswith(
+        "The plan reviewer scored"
+    )
 
 
 @pytest.mark.asyncio
@@ -8925,7 +8921,7 @@ async def test_a_retained_objection_returned_by_the_re_review_fails(
 
     async def _the_specialist(**kwargs: Any) -> Any:
         if kwargs.get("revision_of") is None:
-            return _a_reply(files)
+            return _a_reply(files, _MALFORMED_REVIEW)
         # The specialist's own failed-command reply for a retained objection.
         return SimpleNamespace(
             outcome=SimpleNamespace(value="error"),
@@ -8955,7 +8951,7 @@ async def test_a_re_review_returned_as_an_infrastructure_error_is_advice(
 
     async def _the_specialist(**kwargs: Any) -> Any:
         if kwargs.get("revision_of") is None:
-            return _a_reply(files)
+            return _a_reply(files, _MALFORMED_REVIEW)
         return SimpleNamespace(
             outcome=SimpleNamespace(value="error"),
             role_output=None,

@@ -473,46 +473,51 @@ async def _settle_retired_planning_handoff(
     envelope: MessageEnvelope,
     payload: BuildQueuedPayload,
 ) -> bool:
-    """Refuse a retired correlation or hold intake on invalid history.
+    """Refuse a retired correlation; carry on when the history cannot be read.
 
-    Returns ``True`` when the caller must stop processing this message. Reader
-    failures are contained here because the daemon's outer exception fallback
-    acknowledges messages; returning normally without ack keeps this build
-    pending and therefore fails closed.
+    Returns ``True`` when the caller must stop processing this message. A
+    correlation the ledger names as retired is refused: that is a person's
+    decision. A ledger that is not wired, cannot be read or answers something
+    that is not a list of ids is bookkeeping (step 2, 26 October 2026, census
+    FRG-001): it is logged and read as "nothing known retired", the same as
+    the boot preflight does, and the build goes on.
     """
 
     reader = deps.retired_planning_handoffs
     if reader is None:
-        logger.error(
+        logger.warning(
             "pipeline_consumer: planning handoff retirement validator is not "
-            "wired; holding feature_id=%s correlation_id=%s WITHOUT ack",
+            "wired — ADVISORY; nothing known retired, carrying on with "
+            "feature_id=%s correlation_id=%s",
             payload.feature_id,
             payload.correlation_id,
         )
-        return True
+        return False
     try:
         retired = reader()
     except Exception as exc:  # noqa: BLE001 — must not reach ack-on-error wrapper
-        logger.error(
-            "pipeline_consumer: planning handoff retirement history is invalid "
-            "(%s: %s); holding feature_id=%s correlation_id=%s WITHOUT ack",
+        logger.warning(
+            "pipeline_consumer: planning handoff retirement history could not "
+            "be read (%s: %s) — ADVISORY; nothing known retired, carrying on "
+            "with feature_id=%s correlation_id=%s",
             type(exc).__name__,
             exc,
             payload.feature_id,
             payload.correlation_id,
         )
-        return True
+        return False
 
     if type(retired) is not frozenset or not all(
         isinstance(correlation_id, str) for correlation_id in retired
     ):
-        logger.error(
+        logger.warning(
             "pipeline_consumer: planning handoff retirement validator returned "
-            "an invalid result; holding feature_id=%s correlation_id=%s WITHOUT ack",
+            "an invalid result — ADVISORY; nothing known retired, carrying on "
+            "with feature_id=%s correlation_id=%s",
             payload.feature_id,
             payload.correlation_id,
         )
-        return True
+        return False
 
     if (
         payload.correlation_id not in retired

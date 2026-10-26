@@ -1238,12 +1238,13 @@ async def test_an_answered_card_is_never_asked_again(
 
 
 @pytest.mark.asyncio
-async def test_a_digest_that_does_not_match_the_committed_spec_is_carded(
+async def test_forge_no_longer_rechecks_the_digest_against_the_committed_spec(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """FRG-045 (24 October 2026): the digest is still re-checked against the
-    committed spec, and a mismatch is a line on the card, never the end of the
-    run."""
+    """Step 2 (26 October 2026): one rule in one place. The spec writer's own
+    digest check (which lets the writer repair the digest) is the one check;
+    Forge's mirror of it went. A committed spec that no longer matches the
+    digest opens the card as usual, with the worked examples as committed."""
 
     async def _drop_a_scenario(worktree: Path, feature_rel: str) -> ToolOutcome:
         path = worktree / feature_rel
@@ -1262,8 +1263,8 @@ async def test_a_digest_that_does_not_match_the_committed_spec_is_carded(
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     summary = _digest_cards(h)[0].payload["details"]["summary"]
-    assert "could not confirm it matches the examples" in summary["what_happened"]
-    assert summary["summary_problems"]
+    assert "could not confirm it matches the examples" not in summary["what_happened"]
+    assert "summary_problems" not in summary
 
 
 @pytest.mark.asyncio
@@ -2715,49 +2716,13 @@ from forge.planning.target_terminal_tools import ScenarioProvabilityOutcome  # n
 _REFUSED_TITLE = "Version endpoint rejects an unknown format"
 _HOMED_TITLE = "Version endpoint returns the running build"
 
-#: Rule 2's note, the spec's own words, with the fixture's refused title.
-_PRE_CARD_NOTE = (
-    "The rules-only check could not assign a verifier to these worked examples; "
-    "this is not a semantic impossibility:\n"
-    f"- {_REFUSED_TITLE}\n"
-    "\n"
-    "Revise only these examples using facts in the supplied request and context. "
-    "Keep the behaviour each example specifies unchanged, including its "
-    "concurrency, timing, and other multi-interaction behaviour; never turn that "
-    "behaviour into sequential or single-interaction behaviour. Describe only "
-    "what a caller or user can observe through the interface the request or "
-    "context actually supplies (for example, an HTTP, command, screen, or message "
-    "interface). Do not invent an interface, status, field, implementation detail, "
-    "test name, or verifier. If the supplied facts cannot support a faithful "
-    "provable revision, leave that example unchanged; do not add an assumption or "
-    "ask a question. Keep every other worked example exactly as it is."
-)
-_PRE_CARD_AUTHOR = "planning-driver (stamp normalizer refusal)"
-
-#: Rule 45's two lines, the spec's own words, with the fixture's numbers.
-_REWROTE_LINE = (
-    "The machine rewrote 1 of the worked examples after their provability check. "
-    "What changed: 1 example changed."
-)
+#: Rule 45's cannot-be-proven line, the spec's own words.
 _UNPROVABLE_LINE = (
     f"The rules-only check could not assign a verifier to 1 worked example(s): "
     f"“{_REFUSED_TITLE}”. This is not a semantic impossibility. "
     "If you approve, the plan stage will ask the model fallback to place them; "
     "or send a note."
 )
-
-#: The rewrite: the refused example said as observable interface behaviour.
-_REWRITTEN_FEATURE = FEATURE_TEXT.replace(
-    "    When an unpublished format is asked for\n    Then the request is refused\n",
-    "    When GET /version?format=xml is sent\n    Then the reply is 406\n",
-)
-_REWRITTEN_DIGEST = DIGEST_YAML.replace(
-    "  sentence: Asking for the version in a format the service does not publish is\n"
-    "    refused rather than guessed at.\n",
-    "  sentence: GET /version with a format the service does not publish answers\n"
-    "    406.\n",
-)
-
 
 def _checked(refused: list[str]) -> ScenarioProvabilityOutcome:
     """A rules-only answer over the fixture's two examples."""
@@ -2863,14 +2828,6 @@ class _ClassifierSeamRun:
         )
 
 
-def _not_ok_reply(reason: str) -> Any:
-    """The checker refusing a revision round (the must-pass note-honoured
-    criterion failed twice): a not-ok dispatch with the checker's reason."""
-    return SimpleNamespace(
-        outcome=SimpleNamespace(value="failed"), role_output={}, reason=reason
-    )
-
-
 def _draft_rows(store: SqlitePlanningRunStore) -> list[tuple[str, dict]]:
     return [(status, d.get("spec_draft") or {}) for status, d in _events(store, _DRAFT_STAGE)]
 
@@ -2920,87 +2877,39 @@ async def test_a_clean_spec_leaves_the_card_and_the_dispatch_count_unchanged(
 
 
 @pytest.mark.asyncio
-async def test_one_refused_example_runs_the_machines_note_round_before_the_card(
+async def test_one_refused_example_is_named_on_the_card_and_not_sent_back(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """Rules 44–46: one example refused by rule → the spec writer is
-    dispatched with the machine's note VERBATIM as ``validate_feedback`` and
-    the prior spec as ``revision_of`` → the rewrite is checked again, clean →
-    ONE card, opening on the rewrite, with rule 45's rewrite line → the draft
-    row carries the receipt, the machine log names the round, and the
-    owner's touches are unchanged."""
+    """Step 2 (26 October 2026, census FRG-043): one example refused by rule
+    is advice. The spec writer is asked once, the card opens on the draft as
+    written with the cannot-be-proven line naming the title, and the draft
+    row's receipt says which example it was. No rewrite round."""
     _queue(store)
-    classify = _RecordingClassify([_checked([_REFUSED_TITLE]), _checked([])])
+    classify = _RecordingClassify([_checked([_REFUSED_TITLE])])
     h = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[
-            _spec_reply(),
-            _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
-        ],
+        spec_replies=[_spec_reply()],
         classify=classify,
     )
 
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    first, second = h.ctx["dispatches"]
-    assert first["revision_of"] is None and first["validate_feedback"] is None
-    # ...and, since 2026-09-13, the coach's ground truth rides the first
-    # round too: the run's own sentence, word for word.
-    assert first["request_text"] == "add a GET /version endpoint"
-    assert second["validate_feedback"] == _PRE_CARD_NOTE
-    assert set(second["revision_of"]) == {
-        f"{SLUG}.feature",
-        f"{SLUG}_assumptions.yaml",
-        f"{SLUG}_summary.md",
-        f"{SLUG}_digest.yaml",
-    }
-    assert second["revision_of"][f"{SLUG}.feature"] == FEATURE_TEXT
-    # The check ran twice: on the draft as first written, then on the rewrite.
-    assert [c["feature_text"] for c in classify.calls] == [FEATURE_TEXT, _REWRITTEN_FEATURE]
-    # ONE card, on the rewrite, saying what the machine did in the spec's words.
+    assert len(h.ctx["dispatches"]) == 1
+    assert [c["feature_text"] for c in classify.calls] == [FEATURE_TEXT]
     assert len(_digest_cards(h)) == 1
     card = _card_summary(h)
-    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
-    assert [row["sentence"] for row in card["what_it_will_do"]][1] == (
-        "GET /version with a format the service does not publish answers 406."
-    )
-    assert card["worked_examples"] == _REWRITTEN_FEATURE
-    assert "Your note" not in json.dumps(card)
-    # The rows: the first draft superseded by the machine's note (no card on
-    # it — the spec text belongs on the row a card opens from), then the
-    # rewrite's drafted row with the receipt.
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_UNPROVABLE_LINE}"
+    assert card["worked_examples"] == FEATURE_TEXT
     rows = _draft_rows(store)
-    assert [status for status, _ in rows] == ["superseded", "drafted"]
-    superseded = rows[0][1]
-    assert superseded["superseded_by_note"] == _PRE_CARD_NOTE
-    assert superseded["author"] == _PRE_CARD_AUTHOR
-    assert superseded["refused_titles"] == [_REFUSED_TITLE]
-    assert "card" not in superseded
-    receipt = rows[1][1]["provability"]
-    assert receipt["checked_by_rule"] is True
+    assert [status for status, _ in rows] == ["drafted"]
+    receipt = rows[0][1]["provability"]
     assert receipt["refused_titles"] == [_REFUSED_TITLE]
-    assert receipt["rewritten"] is True
-    assert receipt["changes"] == "1 example changed"
-    assert receipt["round"] == 1
-    assert receipt["author"] == _PRE_CARD_AUTHOR
-    assert receipt["note"] == _PRE_CARD_NOTE
-    assert receipt["refused_by_checker"] is False
-    assert receipt["still_refused"] == []
-    assert receipt["second_check"]["status"] == "checked"
-    assert receipt["card_line"] == _REWROTE_LINE
-    # The machine's round is not one of the owner's: no revise row, the
-    # owner's budget untouched, and the row the door replays carries no
-    # "your note" record.
-    assert [status for status, _ in _events(store, _DIGEST_STAGE)] == ["GATED", "approved"]
-    assert "rewrite" not in rows[1][1]
-    assert rows[1][1]["cycle"] == 1
-    # The approved row carries the round, so the plan stage never sends the
-    # note again.
-    approved = [d for status, d in _events(store, _SPEC_STAGE) if status == "approved"]
-    assert approved[-1]["provability"]["round"] == 1
-    # Nothing was said to a person beyond the card and its opening ping.
+    assert receipt["still_refused"] == [_REFUSED_TITLE]
+    assert receipt["rewritten"] is False
+    assert "round" not in receipt
+    assert receipt["card_line"] == _UNPROVABLE_LINE
     assert not [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
 
 
@@ -3009,28 +2918,12 @@ async def test_one_refused_example_runs_the_machines_note_round_before_the_card(
     ("states", "spec_replies", "expected_dispatches", "expected_status"),
     [
         (["clean"], [_spec_reply()], 1, "checked"),
-        (
-            ["refused", "clean"],
-            [
-                _spec_reply(),
-                _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
-            ],
-            2,
-            "checked",
-        ),
-        (
-            ["clipped", "clean"],
-            [
-                _spec_reply(),
-                _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
-            ],
-            2,
-            "checked",
-        ),
+        (["refused"], [_spec_reply()], 1, "checked"),
+        (["clipped"], [_spec_reply()], 1, "checked"),
         (["unavailable"], [_spec_reply()], 1, "unavailable"),
         (["failed"], [_spec_reply()], 1, "failed"),
     ],
-    ids=["successful", "refused-rewritten", "clipped-rewritten", "unavailable", "failed"],
+    ids=["successful", "refused", "clipped", "unavailable", "failed"],
 )
 async def test_real_classifier_seam_reaches_revision_card_and_normalizer(
     store: SqlitePlanningRunStore,
@@ -3066,137 +2959,16 @@ async def test_real_classifier_seam_reaches_revision_card_and_normalizer(
     receipt = _draft_rows(store)[-1][1]["provability"]
     assert receipt["check"]["status"] == expected_status
 
-    if expected_dispatches == 2:
-        assert h.ctx["dispatches"][1]["validate_feedback"] == _PRE_CARD_NOTE
-        assert normalized[-1] == _REWRITTEN_FEATURE
-        assert receipt["rewritten"] is True
+    assert normalized == [FEATURE_TEXT]
+    assert receipt["rewritten"] is False
+    if states[0] in ("refused", "clipped"):
+        # Advice since step 2: the refused example is named on the card.
         assert receipt["refused_titles"] == [_REFUSED_TITLE]
-        assert receipt["second_check"]["status"] == "checked"
-        assert _card_summary(h)["what_happened"].startswith(
-            f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
+        assert _card_summary(h)["what_happened"] == (
+            f"{_ROUND_ONE_TEXT} {_UNPROVABLE_LINE}"
         )
     else:
-        assert normalized == [FEATURE_TEXT]
-        assert receipt["rewritten"] is False
         assert _card_summary(h)["what_happened"] == _ROUND_ONE_TEXT
-
-
-@pytest.mark.asyncio
-async def test_still_refused_after_the_round_says_so_on_the_card(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """Rule 45's second line: the rewrite landed and changed the list, but
-    the example still cannot be proven by rule — the card carries the rewrite
-    line AND the cannot-be-proven line naming the title verbatim; the receipt
-    says which is still refused; the run goes on to the owner's yes."""
-    _queue(store)
-    classify = _RecordingClassify([_checked([_REFUSED_TITLE]), _checked([_REFUSED_TITLE])])
-    h = _make_driver(
-        store,
-        subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[
-            _spec_reply(),
-            _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
-        ],
-        classify=classify,
-    )
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(h.ctx["dispatches"]) == 2
-    assert len(_digest_cards(h)) == 1
-    assert _card_summary(h)["what_happened"] == (
-        f"{_ROUND_ONE_TEXT} {_REWROTE_LINE} {_UNPROVABLE_LINE}"
-    )
-    receipt = _draft_rows(store)[-1][1]["provability"]
-    assert receipt["rewritten"] is True
-    assert receipt["changes"] == "1 example changed"
-    assert receipt["still_refused"] == [_REFUSED_TITLE]
-    assert receipt["card_line"] == f"{_REWROTE_LINE} {_UNPROVABLE_LINE}"
-
-
-@pytest.mark.asyncio
-async def test_a_rewrite_that_changed_nothing_on_the_list_and_is_still_refused_gets_only_the_cannot_be_proven_line(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """The rewrite came back with the same list and the check still refuses
-    the example: saying "the machine rewrote it" would be a lie, so the card
-    carries only the cannot-be-proven line. The receipt keeps the truth: a
-    rewrite landed, nothing on the list changed."""
-    _queue(store)
-    classify = _RecordingClassify([_checked([_REFUSED_TITLE])])
-    h = _make_driver(
-        store,
-        subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[_spec_reply(), _spec_reply()],
-        classify=classify,
-    )
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(h.ctx["dispatches"]) == 2
-    assert _card_summary(h)["what_happened"] == f"{_ROUND_ONE_TEXT} {_UNPROVABLE_LINE}"
-    receipt = _draft_rows(store)[-1][1]["provability"]
-    assert receipt["rewritten"] is True
-    assert receipt["changes"] is None
-    assert receipt["still_refused"] == [_REFUSED_TITLE]
-
-
-@pytest.mark.asyncio
-async def test_a_checker_refused_pre_card_rewrite_opens_the_card_on_the_original_draft(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """Rule 44's last sentence: the checker refused the machine's rewrite
-    (the note-honoured criterion failed twice). The run does NOT stop — the
-    card opens on the draft as first written, with the cannot-be-proven line,
-    and the owner's yes carries on to the plan stage as today."""
-    _queue(store)
-    classify = _RecordingClassify([_checked([_REFUSED_TITLE])])
-    reason = (
-        "could not carry out what this round required, after 2 attempts. "
-        "'feedback_resolved' must be met"
-    )
-    h = _make_driver(
-        store,
-        subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[_spec_reply(), _not_ok_reply(reason)],
-        classify=classify,
-    )
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(h.ctx["dispatches"]) == 2
-    assert h.ctx["dispatches"][1]["validate_feedback"] == _PRE_CARD_NOTE
-    # Only the first draft was checked: there was no rewrite to check again.
-    assert [c["feature_text"] for c in classify.calls] == [FEATURE_TEXT]
-    assert len(_digest_cards(h)) == 1
-    card = _card_summary(h)
-    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_UNPROVABLE_LINE}"
-    assert card["worked_examples"] == FEATURE_TEXT
-    assert [row["sentence"] for row in card["what_it_will_do"]][1] == (
-        "Asking for the version in a format the service does not publish is "
-        "refused rather than guessed at."
-    )
-    rows = _draft_rows(store)
-    assert [status for status, _ in rows] == ["superseded", "drafted"]
-    assert rows[1][1]["sha"] == rows[0][1]["sha"]  # the draft of record
-    receipt = rows[1][1]["provability"]
-    assert receipt["round"] == 1
-    assert receipt["rewritten"] is False
-    assert receipt["changes"] is None
-    assert receipt["refused_by_checker"] is True
-    assert receipt["checker_reason"] == reason
-    assert receipt["still_refused"] == [_REFUSED_TITLE]
-    # Nobody was told the run stopped, because it did not. The words looked
-    # for are "stopped at", which is how every stop card in this driver opens
-    # ("stopped at the spec", "stopped at writing the task plan"); a bare
-    # "stopped" also matches the plan review's own plain line, which says the
-    # opposite — that the run was NOT stopped.
-    assert not [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
-    assert not any("stopped at" in m for _, m, _ in h.ctx["notifications"])
 
 
 @pytest.mark.asyncio
@@ -3302,20 +3074,18 @@ async def test_a_restart_re_opens_the_card_with_the_provability_line_word_for_wo
 ) -> None:
     """The line is on the row the door replays from: a daemon killed with the
     card live re-opens the SAME card, rewrite line and all, and neither the
-    spec writer nor the check runs again."""
+    spec writer nor the check runs again (the line is the cannot-be-proven
+    one since step 2)."""
     _queue(store)
     publisher = FakePublisher()
     git = RecordingGitRunner()
-    classify = _RecordingClassify([_checked([_REFUSED_TITLE]), _checked([])])
+    classify = _RecordingClassify([_checked([_REFUSED_TITLE])])
     boot1 = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([]),
         publisher=publisher,
         git=git,
-        spec_replies=[
-            _spec_reply(),
-            _spec_reply(feature=_REWRITTEN_FEATURE, digest=_REWRITTEN_DIGEST),
-        ],
+        spec_replies=[_spec_reply()],
         classify=classify,
     )
     task = asyncio.create_task(boot1.driver.drive(CID))
@@ -3329,8 +3099,8 @@ async def test_a_restart_re_opens_the_card_with_the_provability_line_word_for_wo
         await task
     except asyncio.CancelledError:
         pass
-    assert _card_summary(boot1)["what_happened"] == f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
-    assert [s for s, _ in _draft_rows(store)] == ["superseded", "drafted"]
+    assert _card_summary(boot1)["what_happened"] == f"{_ROUND_ONE_TEXT} {_UNPROVABLE_LINE}"
+    assert [s for s, _ in _draft_rows(store)] == ["drafted"]
 
     classify2 = _RecordingClassify([_checked([])])
     boot2 = _make_driver(
@@ -3349,7 +3119,7 @@ async def test_a_restart_re_opens_the_card_with_the_provability_line_word_for_wo
     assert len(cards) == 2
     assert cards[0].payload["details"]["summary"] == cards[1].payload["details"]["summary"]
     assert cards[1].payload["details"]["summary"]["what_happened"] == (
-        f"{_ROUND_ONE_TEXT} {_REWROTE_LINE}"
+        f"{_ROUND_ONE_TEXT} {_UNPROVABLE_LINE}"
     )
 
 
@@ -3374,55 +3144,25 @@ _INVENTING_DIGEST = DIGEST_YAML + (
 
 
 @pytest.mark.asyncio
-async def test_an_invented_requirement_goes_back_to_the_writer_once_and_the_card_says_so(
+async def test_an_invented_requirement_is_shown_on_the_card_with_its_finding(
     store: SqlitePlanningRunStore,
 ) -> None:
     """Arm B's defect, replayed: the first draft assumes authentication nobody
-    asked for; the reviewer sends it back as the machine's note; the writer
-    drops it; the card carries one line saying what happened."""
+    asked for. Step 2 (26 October 2026, census FRG-029): advice. The spec is
+    not sent back; the card shows the reviewer's finding under that
+    assumption, and nothing is asked twice."""
     _queue(store)
     h = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([_answer("approve")]),
         spec_replies=[
             _spec_reply(assumptions=_INVENTING_ASSUMPTIONS, digest=_INVENTING_DIGEST),
-            _spec_reply(),  # the rewrite: the invented assumption is gone
         ],
     )
     await h.driver.drive(CID)
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    dispatches = h.ctx["dispatches"]
-    assert len(dispatches) == 2, "exactly one machine round, never a third try"
-    note = dispatches[1]["validate_feedback"]
-    assert note.startswith("The reviewer found 1 assumption(s) that add something the request did not ask for")
-    assert "ASSUM-002" in note and "authentication was not asked for" in note
-    assert note.endswith("Change nothing else.")
-    superseded = [d for status, d in _events(store, "feature-spec-draft") if status == "superseded"]
-    assert superseded and superseded[0]["spec_draft"]["author"] == "planning-driver (assumption review)"
-    assert superseded[0]["spec_draft"]["flagged_assumptions"] == ["ASSUM-002"]
-    cards = _digest_cards(h)
-    assert len(cards) == 1
-    text = json.dumps(cards[0].payload)
-    assert "The machine's reviewer removed 1 assumption(s) the request did not ask for (authentication)." in text
-    assert "not asked for" not in json.dumps(cards[0].payload["details"]["summary"].get("what_the_machine_assumed"))
-
-
-@pytest.mark.asyncio
-async def test_an_invented_requirement_the_writer_keeps_is_shown_with_its_finding(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """The writer would not drop it: the card opens on the rewritten draft with
-    the reviewer's finding under that assumption, and nothing is asked twice."""
-    _queue(store)
-    inventing = _spec_reply(assumptions=_INVENTING_ASSUMPTIONS, digest=_INVENTING_DIGEST)
-    h = _make_driver(
-        store,
-        subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[inventing, inventing],
-    )
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(h.ctx["dispatches"]) == 2
+    assert len(h.ctx["dispatches"]) == 1, "no machine rewrite round"
+    assert not [d for status, d in _events(store, "feature-spec-draft") if status == "superseded"]
     cards = _digest_cards(h)
     assert len(cards) == 1
     assumed = cards[0].payload["details"]["summary"]["what_the_machine_assumed"]
@@ -3431,7 +3171,9 @@ async def test_an_invented_requirement_the_writer_keeps_is_shown_with_its_findin
     assert "authentication was not asked for" in kept["why"]
     untouched = next(a for a in assumed if a["assumption"].startswith("The version string"))
     assert "not asked for" not in untouched["why"]
-    assert "reviewer removed" not in json.dumps(cards[0].payload)
+    drafted = [d["spec_draft"] for status, d in _events(store, "feature-spec-draft") if status == "drafted"]
+    assert drafted[-1]["assumption_review"]["still_flagged"] == ["ASSUM-002"]
+    assert drafted[-1]["assumption_review"]["round"] == 0
 
 
 @pytest.mark.asyncio
@@ -3726,12 +3468,6 @@ _PADDED_DIGEST = DIGEST_YAML.replace(
     "  sentence: Sending the version endpoint a POST is refused.\n"
     "assumptions:\n",
 )
-#: The writer kept the example and quoted the request in its # Why: line.
-_PADDED_KEPT_FEATURE = _PADDED_FEATURE.replace(
-    f"  @negative\n  Scenario: {_PADDED_TITLE}\n",
-    f'  # Why: the request says "a GET /version endpoint"\n  @negative\n  Scenario: {_PADDED_TITLE}\n',
-)
-
 _SPEC_EXAMPLES_CONFIG = (
     "memory:\n"
     "  project: scratch_project\n"
@@ -3742,19 +3478,6 @@ _SPEC_EXAMPLES_CONFIG = (
     '      request_words: ["POST", "other methods"]\n'
 )
 
-_EXAMPLE_NOTE = (
-    "These worked examples look like things the request does not mention:\n"
-    f'- "{_PADDED_TITLE}" (another request method)\n'
-    "\n"
-    "Remove each one unless the request needs it. If you keep one, say in its # Why: "
-    "line which part of the request needs it, and the example asks for nothing more "
-    "than that part does. Remove any assumption written only for an example you "
-    "remove. Do not add other examples of the same kind. Keep every other worked "
-    "example exactly as it is."
-)
-_REMOVED_LINE = (
-    f'Removed as not asked for: "{_PADDED_TITLE}". If one of them was needed, send a note.'
-)
 _KEPT_LINE = (
     f'Not asked for, but kept: "{_PADDED_TITLE}" (another request method). If you '
     "approve, it will be built; to drop it, send a note."
@@ -3783,64 +3506,39 @@ def _padded() -> Any:
 
 
 @pytest.mark.asyncio
-async def test_a_padded_example_goes_back_once_and_the_card_names_what_was_removed(
+async def test_a_padded_example_is_named_on_the_card_and_not_sent_back(
     store: SqlitePlanningRunStore,
 ) -> None:
+    """Step 2 (26 October 2026, census FRG-048): advice. An example about
+    something the request does not mention, by the project's own words, is
+    named on the card as kept; the spec is not sent back."""
     _queue(store)
     h = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[_padded(), _spec_reply()],
+        spec_replies=[_padded()],
         git=_declaring_git(),
     )
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    dispatches = h.ctx["dispatches"]
-    assert len(dispatches) == 2
-    assert dispatches[1]["validate_feedback"] == _EXAMPLE_NOTE
-    superseded = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "superseded"]
-    assert superseded[0]["author"] == "planning-driver (spec example check)"
-    assert superseded[0]["flagged_examples"] == [_PADDED_TITLE]
-    assert superseded[0]["flagged_assumptions"] == []
-    cards = _digest_cards(h)
-    assert len(cards) == 1
-    card = cards[0].payload["details"]["summary"]
-    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_REMOVED_LINE}"
-    assert card["worked_examples"] == FEATURE_TEXT
-    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
-    receipt = drafted[-1]["example_review"]
-    assert receipt["checked"] is True
-    assert receipt["first"]["flagged"] == [{"title": _PADDED_TITLE, "kinds": ["another request method"]}]
-    assert receipt["final"]["flagged"] == []
-    assert receipt["card_lines"] == [_REMOVED_LINE]
-
-
-@pytest.mark.asyncio
-async def test_a_padded_example_the_writer_keeps_with_a_reason_is_named_and_the_card_still_goes(
-    store: SqlitePlanningRunStore,
-) -> None:
-    _queue(store)
-    kept = _spec_reply(feature=_PADDED_KEPT_FEATURE, digest=_PADDED_DIGEST)
-    h = _make_driver(
-        store,
-        subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[_padded(), kept],
-        git=_declaring_git(),
-    )
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(h.ctx["dispatches"]) == 2
+    assert len(h.ctx["dispatches"]) == 1
+    assert [status for status, _ in _events(store, _DRAFT_STAGE)] == ["drafted"]
     cards = _digest_cards(h)
     assert len(cards) == 1
     card = cards[0].payload["details"]["summary"]
     assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_KEPT_LINE}"
-    assert card["worked_examples"] == _PADDED_KEPT_FEATURE
+    assert card["worked_examples"] == _PADDED_FEATURE
+    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
+    receipt = drafted[-1]["example_review"]
+    assert receipt["checked"] is True
+    assert receipt["first"]["flagged"] == [{"title": _PADDED_TITLE, "kinds": ["another request method"]}]
+    assert receipt["final"]["flagged"] == receipt["first"]["flagged"]
+    assert receipt["card_lines"] == [_KEPT_LINE]
 
 
 @pytest.mark.asyncio
-async def test_assumptions_and_examples_share_one_rewrite_not_two(
+async def test_assumptions_and_examples_are_both_shown_and_nothing_is_sent_back(
     store: SqlitePlanningRunStore,
 ) -> None:
     _queue(store)
@@ -3858,62 +3556,21 @@ async def test_assumptions_and_examples_share_one_rewrite_not_two(
     h = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[both, _spec_reply()],
+        spec_replies=[both],
         git=_declaring_git(),
     )
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    dispatches = h.ctx["dispatches"]
-    assert len(dispatches) == 2, "one shared machine round, never two"
-    note = dispatches[1]["validate_feedback"]
-    assert note.startswith("The reviewer found 1 assumption(s) that add something the request did not ask for:\n- ASSUM-002: ")
-    assert (
-        "\n\nThese worked examples look like things the request does not mention:\n"
-        f'- "{_PADDED_TITLE}" (another request method)\n\n'
-    ) in note
-    assert note.endswith(
-        "\n\nRemove these assumptions and every worked example that depends on them. "
-        "Remove each worked example listed above unless the request needs it; if you "
-        "keep one, say in its # Why: line which part of the request needs it, and "
-        "the example asks for nothing more than that part does. Remove any "
-        "assumption written only for an example you remove. Do not add other "
-        "assumptions or examples of the same kind. Change nothing else."
+    assert len(h.ctx["dispatches"]) == 1, "advice, never a rewrite round"
+    assert not [d for status, d in _events(store, _DRAFT_STAGE) if status == "superseded"]
+    summary = _digest_cards(h)[0].payload["details"]["summary"]
+    assert summary["what_happened"] == f"{_ROUND_ONE_TEXT} {_KEPT_LINE}"
+    kept = next(
+        a for a in summary["what_the_machine_assumed"]
+        if a["assumption"] == "The endpoint requires authentication"
     )
-    # One closing instruction, not two that contradict each other.
-    assert note.count("Change nothing else.") == 1
-    assert "Keep every other worked example exactly as it is." not in note
-    superseded = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "superseded"]
-    assert len(superseded) == 1
-    assert superseded[0]["author"] == "planning-driver (assumption review)"
-    assert superseded[0]["flagged_assumptions"] == ["ASSUM-002"]
-    assert superseded[0]["flagged_examples"] == [_PADDED_TITLE]
-    what_happened = _digest_cards(h)[0].payload["details"]["summary"]["what_happened"]
-    assert what_happened == (
-        f"{_ROUND_ONE_TEXT} The machine's reviewer removed 1 assumption(s) the request "
-        f"did not ask for (authentication). {_REMOVED_LINE}"
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_checker_refused_rewrite_opens_on_the_first_draft_and_names_what_was_kept(
-    store: SqlitePlanningRunStore,
-) -> None:
-    _queue(store)
-    h = _make_driver(
-        store,
-        subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[_padded(), _not_ok_reply("'feedback_resolved' must be met")],
-        git=_declaring_git(),
-    )
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(h.ctx["dispatches"]) == 2
-    card = _digest_cards(h)[0].payload["details"]["summary"]
-    assert card["worked_examples"] == _PADDED_FEATURE
-    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_KEPT_LINE}"
-    assert not [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
+    assert "⚠ not asked for — " in kept["why"]
 
 
 @pytest.mark.asyncio
@@ -4007,7 +3664,7 @@ async def test_a_sandboxed_projects_list_is_read_through_its_helper(
         h = _make_driver(
             store,
             subscriber_factory=SharedScriptFactory([_answer("approve")]),
-            spec_replies=[_padded(), _spec_reply()],
+            spec_replies=[_padded()],
             git=git,
         )
         await h.driver.drive(CID)
@@ -4015,16 +3672,16 @@ async def test_a_sandboxed_projects_list_is_read_through_its_helper(
         srv.shutdown()
         srv.server_close()
 
-    assert len(h.ctx["dispatches"]) == 2
-    assert h.ctx["dispatches"][1]["validate_feedback"] == _EXAMPLE_NOTE
-    assert _digest_cards(h)[0].payload["details"]["summary"]["what_happened"].endswith(_REMOVED_LINE)
+    assert len(h.ctx["dispatches"]) == 1
+    assert _digest_cards(h)[0].payload["details"]["summary"]["what_happened"].endswith(_KEPT_LINE)
 
 
 @pytest.mark.asyncio
-async def test_an_assumption_review_that_cannot_read_still_sends_the_flagged_examples_back(
+async def test_an_assumption_review_that_cannot_read_still_names_the_flagged_examples(
     store: SqlitePlanningRunStore, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The card never names as kept an example the writer was never asked about."""
+    """The example check still speaks when the assumption review cannot read:
+    the flagged example is named on the card as kept (advice since step 2)."""
     _queue(store)
 
     async def boom(*_: object, **__: object) -> None:
@@ -4033,19 +3690,18 @@ async def test_an_assumption_review_that_cannot_read_still_sends_the_flagged_exa
     h = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[_padded(), _spec_reply()],
+        spec_replies=[_padded()],
         git=_declaring_git(),
     )
     monkeypatch.setattr(type(h.driver), "_review_assumptions_on_branch", boom, raising=True)
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(h.ctx["dispatches"]) == 2
-    assert h.ctx["dispatches"][1]["validate_feedback"] == _EXAMPLE_NOTE
+    assert len(h.ctx["dispatches"]) == 1
     card = _digest_cards(h)[0].payload["details"]["summary"]
-    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_REMOVED_LINE}"
+    assert card["what_happened"] == f"{_ROUND_ONE_TEXT} {_KEPT_LINE}"
     drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
-    assert drafted[-1]["example_review"]["card_lines"] == [_REMOVED_LINE]
+    assert drafted[-1]["example_review"]["card_lines"] == [_KEPT_LINE]
 
 
 @pytest.mark.asyncio
@@ -4064,7 +3720,7 @@ async def test_a_slow_spec_writer_does_not_use_up_the_sandbox_reading_allowance(
         h = _make_driver(
             store,
             subscriber_factory=SharedScriptFactory([_answer("approve")]),
-            spec_replies=[_padded(), _spec_reply()],
+            spec_replies=[_padded()],
             git=git,
         )
         # Each spec dispatch takes 200 seconds on this clock.
@@ -4076,10 +3732,9 @@ async def test_a_slow_spec_writer_does_not_use_up_the_sandbox_reading_allowance(
         srv.shutdown()
         srv.server_close()
 
-    assert len(h.ctx["dispatches"]) == 2
-    assert h.ctx["dispatches"][1]["validate_feedback"] == _EXAMPLE_NOTE
+    assert len(h.ctx["dispatches"]) == 1
     what_happened = _digest_cards(h)[0].payload["details"]["summary"]["what_happened"]
-    assert what_happened.endswith(_REMOVED_LINE)
+    assert what_happened.endswith(_KEPT_LINE)
 
 
 # ---------------------------------------------------------------------------
@@ -4560,29 +4215,22 @@ _BEYOND = {
     ids=["exact-quote", "paraphrase"],
 )
 @pytest.mark.asyncio
-async def test_an_example_the_checker_reads_as_asking_for_more_is_sent_back_and_shown_kept(
+async def test_an_example_the_checker_reads_as_asking_for_more_is_shown_kept(
     store: SqlitePlanningRunStore, why: str
 ) -> None:
     """Whether its # Why: line quotes the request exactly or paraphrases it,
     an example the checker judges to ask for more than the request (a restart
-    nobody asked about), in the first and the final draft, is sent back once
-    and named as kept."""
+    nobody asked about) is named on the card as kept; since step 2 it is not
+    sent back."""
     _queue(store)
     h = _make_driver(
         store,
         subscriber_factory=SharedScriptFactory([_answer("approve")]),
-        spec_replies=[
-            _reply_with_example(_UNQUOTED_TITLE, why, support=_BEYOND),
-            _reply_with_example(_UNQUOTED_TITLE, why, support=_BEYOND),
-        ],
+        spec_replies=[_reply_with_example(_UNQUOTED_TITLE, why, support=_BEYOND)],
     )
     await h.driver.drive(CID)
 
-    dispatches = h.ctx["dispatches"]
-    assert len(dispatches) == 2
-    note = dispatches[1]["validate_feedback"]
-    assert f'- "{_UNQUOTED_TITLE}" (it asks for more than the request does)' in note
-    assert "copied exactly" not in note
+    assert len(h.ctx["dispatches"]) == 1
     card = _digest_cards(h)[0].payload["details"]["summary"]
     assert card["what_happened"] == (
         f'{_ROUND_ONE_TEXT} Not asked for, but kept: "{_UNQUOTED_TITLE}" (it asks for '

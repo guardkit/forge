@@ -15,9 +15,9 @@ holds the plain rules for that material, read at one commit:
   parses, and names a repository and a full 40-character commit;
 * :func:`gather_reference_material` — all of the above for one planning run,
   in the step that records the project's documents, with the named files read
-  whole at the commit the work starts from (each at most
-  :data:`MAX_REFERENCE_FILE_BYTES`, together at most
-  :data:`MAX_REFERENCE_FILES_BYTES`; never cut);
+  whole at the commit the work starts from (each about
+  :data:`MAX_REFERENCE_FILE_BYTES`, together about
+  :data:`MAX_REFERENCE_FILES_BYTES`, a guide logged when passed; never cut);
 * :func:`card_line_about_the_prototype` — the merge card's one line.
 
 A project that declares no ``reference:`` block never reaches any of this:
@@ -84,8 +84,10 @@ MAX_REFERENCE_FILE_BYTES: int = 12 * 1024
 #: All named reference files together.
 MAX_REFERENCE_FILES_BYTES: int = 24 * 1024
 
-#: The refusal for a request that uses one of the project's marker words and
-#: names no reference file (design 2.2, Codex R2 round 3), word for word.
+#: What is logged for a request that uses one of the project's marker words
+#: and names no reference file (design 2.2, Codex R2 round 3), word for word.
+#: Advice since step 2 (26 October 2026, census FRG-027): the run carries on
+#: without reference material.
 NAMES_NO_BRIEF: str = (
     "This request mentions the prototype but names no screen brief, so the "
     "spec writer would not see the prototype's behaviour. Ask for a screen "
@@ -376,11 +378,12 @@ async def gather_reference_material(
     """The run's reference material, or ``(None, why)`` to stop the run.
 
     In order: the signed-off record, when one is declared, is checked; each
-    file the request names under the declared folders must lie inside them,
-    be an ordinary file at ``commit`` and fit the limits whole; a request
-    that uses one of the project's marker words and names no such file is
-    refused (:data:`NAMES_NO_BRIEF`). ``(None, None)`` when nothing is
-    declared.
+    file the request names under the declared folders must lie inside them
+    and be an ordinary file at ``commit``. The size limits are a guide and a
+    request that uses one of the project's marker words but names no such
+    file carries on without reference material (:data:`NAMES_NO_BRIEF`);
+    both are logged as advice (step 2, 26 October 2026). ``(None, None)``
+    when nothing is declared.
     """
     if not declared.declared:
         return None, None
@@ -393,7 +396,7 @@ async def gather_reference_material(
 
     names = named_reference_files(request_text, declared.paths)
     if not names and mentions_a_request_word(request_text, declared.request_words):
-        return None, NAMES_NO_BRIEF
+        logger.warning("reference material: %s — ADVISORY; carrying on", NAMES_NO_BRIEF)
 
     short = commit[:12]
     folders = ", ".join(declared.paths)
@@ -429,11 +432,13 @@ async def gather_reference_material(
     if any(d.bytes > MAX_REFERENCE_FILE_BYTES for d in read) or (
         sum(d.bytes for d in read) > MAX_REFERENCE_FILES_BYTES
     ):
-        return None, (
-            f"the prototype files named are too large to give the spec writer "
-            f"whole; prepare a screen brief and name that instead. Each file "
-            f"may be at most {MAX_REFERENCE_FILE_BYTES} bytes and all of them "
-            f"together at most {MAX_REFERENCE_FILES_BYTES}: {sizes}."
+        # A guide, never a refusal (step 2, census FRG-026): given whole.
+        logger.warning(
+            "reference material: the prototype files named are over the guide "
+            "of %d bytes each and %d together (%s) — ADVISORY; given whole",
+            MAX_REFERENCE_FILE_BYTES,
+            MAX_REFERENCE_FILES_BYTES,
+            sizes,
         )
     return (
         ReferenceMaterial(

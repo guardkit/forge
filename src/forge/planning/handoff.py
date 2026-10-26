@@ -192,8 +192,10 @@ class PreCommitCheck:
     ``blocking`` says whether a failing verdict refuses the commit. The
     driver sets it from the routing law's enforcement for the stamp
     normalizer (an unenforced repository proceeds past a refusal, as its
-    closure does) and always for ``feature validate``; ``classify-scenarios``
-    never blocks whatever is declared.
+    closure does); the driver declares ``feature validate`` and
+    ``validate-pass-bar`` not blocking since step 2 (26 October 2026: advice;
+    the sidecar's own default for a caller that does not say is unchanged);
+    ``classify-scenarios`` never blocks whatever is declared.
     """
 
     name: str

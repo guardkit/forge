@@ -2375,15 +2375,19 @@ def make_gates_green_reader(
 
     _repo_root = repo_root_reader or _default_repo_root
 
-    def _unknown(detail: str, build_id: str) -> Any:
+    def _unknown(
+        detail: str, build_id: str, failed_gates: tuple[str, ...] = ()
+    ) -> Any:
         logger.warning(
-            "conductor gates: build_id=%s — %s. The gate set answers UNKNOWN, "
-            "which the merge-ready checkpoint treats as RED: no merge card "
-            "will be published for this journey",
+            "conductor gates: build_id=%s — %s. The gate set answers UNKNOWN: "
+            "the tests could not be run, which the merge card says (advice "
+            "since step 2, 26 October 2026)",
             build_id,
             detail,
         )
-        return GatesReport(status=GateStatus.UNKNOWN, detail=detail)
+        return GatesReport(
+            status=GateStatus.UNKNOWN, detail=detail, failed_gates=failed_gates
+        )
 
     def _apply_stamps_leg(
         *,
@@ -2435,6 +2439,9 @@ def make_gates_green_reader(
                 f"law's stamps leg raised {type(exc).__name__}: {exc}, so the "
                 "stamped verifiers cannot be proven to have run",
                 build_id,
+                # The routing law is kept as it was (step 2): a gate it names
+                # still stops the card.
+                failed_gates=("routing law: the stamps leg raised",),
             )
         stamps_detail = getattr(verdict, "detail", "") or ""
         if str(getattr(verdict, "status", "")) == "not-enforced":
@@ -2460,8 +2467,8 @@ def make_gates_green_reader(
             logger.warning(
                 "conductor gates: build_id=%s — the declared suite is GREEN "
                 "but the ROUTING LAW reads %s: %s The gate set answers "
-                "UNKNOWN, which the merge-ready checkpoint treats as RED: no "
-                "merge card will be published for this journey",
+                "UNKNOWN naming the routing law's gates, which still stops "
+                "the merge card for this journey",
                 build_id,
                 getattr(verdict, "status", "absent"),
                 stamps_detail,

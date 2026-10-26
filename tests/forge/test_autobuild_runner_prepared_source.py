@@ -4,9 +4,10 @@
 launch carries ``source_commit``, the runner makes its own local branch
 ``forge/source/<build_id>`` at that commit in the build clone (refusing if the
 commit is absent — it never fetches), lays its detached worktree there, passes
-that branch as ``--base-branch``, runs ``guardkit feature validate <id>
---json`` in the worktree before ``guardkit autobuild feature``, and deletes the
-branch when it removes the worktree. Without ``source_commit`` nothing changes.
+that branch as ``--base-branch``, runs ``guardkit autobuild feature`` in the
+worktree (which validates the feature itself; Forge's separate validate went
+in step 2, 26 October 2026), and deletes the branch when it removes the
+worktree. Without ``source_commit`` nothing changes.
 
 A throwaway repository stands in for the build clone; only the guardkit
 subprocess is stubbed, and real git runs everywhere else.
@@ -96,8 +97,6 @@ class _Proc:
 def _stub(
     calls: list[dict[str, Any]],
     *,
-    validate_code: int = 0,
-    validate_out: bytes = b"{}",
     build_code: int = 0,
 ):
     real = asyncio.create_subprocess_exec
@@ -108,8 +107,6 @@ def _stub(
             cwd = kwargs.get("cwd")
             head = _git(Path(cwd), "rev-parse", "HEAD") if cwd else None
             calls.append({"argv": list(args), "cwd": cwd, "head": head})
-            if len(args) > 2 and args[1] == "feature" and args[2] == "validate":
-                return _Proc(validate_code, validate_out)
             return _Proc(build_code, b"guardkit running\n")
         return await real(*args, **kwargs)
 
@@ -160,12 +157,11 @@ def test_the_admitted_commit_is_built_even_after_the_branch_moves(
     calls: list[dict[str, Any]] = []
     result = _run(repo, _payload(admitted), calls)
 
-    validate, build = calls
+    # Step 2 (26 October 2026, census FRG-109): no separate ``guardkit feature
+    # validate`` first; GuardKit validates the feature when the build loads it.
+    (build,) = calls
     worktree = str((tmp_path / "wt" / BUILD_ID).resolve())
-    # GuardKit's own check ran first, in the worktree, at the admitted commit.
-    assert validate["argv"][1:] == ["feature", "validate", FEATURE, "--json"]
-    assert validate["cwd"] == worktree and validate["head"] == admitted
-    # Then the build, in the same worktree, on the build's own base branch.
+    # The build, in the worktree, at the admitted commit, on its own base branch.
     assert build["argv"][1:4] == ["autobuild", "feature", FEATURE]
     assert build["cwd"] == worktree and build["head"] == admitted
     bb = build["argv"].index("--base-branch")
@@ -176,34 +172,6 @@ def test_the_admitted_commit_is_built_even_after_the_branch_moves(
     assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
     # The shared checkout was never moved.
     assert _git(repo, "rev-parse", "--abbrev-ref", "HEAD") == "main"
-
-
-def test_a_failed_feature_validate_stops_the_build_with_guardkits_words(
-    clone: tuple[Path, str], tmp_path: Path, monkeypatch, caplog
-) -> None:
-    repo, admitted = clone
-    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(tmp_path / "wt"))
-    said = json.dumps(
-        {
-            "feature_id": FEATURE,
-            "valid": False,
-            "errors": ["Task file not found: tasks/backlog/x/TASK-AB12-001.md"],
-        }
-    ).encode()
-
-    calls: list[dict[str, Any]] = []
-    with caplog.at_level(logging.WARNING, logger="forge.subagents.autobuild_runner"):
-        result = _run(repo, _payload(admitted), calls, validate_code=1, validate_out=said)
-
-    assert _lifecycle(result) == "failed"
-    assert len(calls) == 1 and calls[0]["argv"][1] == "feature"  # never built
-    joined = " ".join(r.getMessage() for r in caplog.records)
-    assert "guardkit feature validate refused FEAT-AB12" in joined
-    assert "Task file not found: tasks/backlog/x/TASK-AB12-001.md" in joined
-    # Kept for forensics, like every other failed build's worktree; the
-    # build's own branch goes anyway (the kept tree is detached at the commit).
-    assert (tmp_path / "wt" / BUILD_ID).exists()
-    assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
 
 
 def test_a_commit_missing_from_the_clone_is_refused_without_fetching(
@@ -253,7 +221,7 @@ def test_a_failed_build_deletes_its_own_branch_and_keeps_its_worktree(
     result = _run(repo, _payload(admitted), calls, build_code=1)
 
     assert _lifecycle(result) == "failed"
-    assert len(calls) == 2  # validate, then the build that failed
+    assert len(calls) == 1  # the build that failed
     assert (tmp_path / "wt" / BUILD_ID).exists()
     assert _git(repo, "branch", "--list", SOURCE_BRANCH) == ""
 

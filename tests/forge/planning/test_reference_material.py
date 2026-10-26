@@ -248,21 +248,6 @@ async def test_named_files_are_read_whole_at_the_start_commit() -> None:
         ("build reference/briefs/missing.md", {}, "is not there"),
         ("build reference/../src/app.code", {}, "lies outside the reference folders"),
         ("build reference/briefs", {"reference/briefs/a.md": "x"}, "is not an ordinary file"),
-        (
-            "build reference/a.md",
-            {"reference/a.md": "x" * (MAX_REFERENCE_FILE_BYTES + 1)},
-            "too large to give the spec writer whole",
-        ),
-        (
-            "build reference/a.md and reference/b.md and reference/c.md",
-            {
-                "reference/a.md": "x" * MAX_REFERENCE_FILE_BYTES,
-                "reference/b.md": "x" * MAX_REFERENCE_FILE_BYTES,
-                "reference/c.md": "x",
-            },
-            "too large to give the spec writer whole",
-        ),
-        ("build the page from the prototype", {}, NAMES_NO_BRIEF),
     ],
 )
 @pytest.mark.asyncio
@@ -272,6 +257,45 @@ async def test_what_stops_the_run_and_why(
     material, why = await _gather(_Tree({RECORD: GOOD_RECORD, **files}), request_text)
     assert material is None
     assert why is not None and said in why
+
+
+@pytest.mark.parametrize(
+    ("request_text", "files", "said"),
+    [
+        (
+            "build reference/a.md",
+            {"reference/a.md": "x" * (MAX_REFERENCE_FILE_BYTES + 1)},
+            "over the guide",
+        ),
+        (
+            "build reference/a.md and reference/b.md and reference/c.md",
+            {
+                "reference/a.md": "x" * MAX_REFERENCE_FILE_BYTES,
+                "reference/b.md": "x" * MAX_REFERENCE_FILE_BYTES,
+                "reference/c.md": "x",
+            },
+            "over the guide",
+        ),
+        ("build the page from the prototype", {}, NAMES_NO_BRIEF),
+    ],
+)
+@pytest.mark.asyncio
+async def test_what_is_advice_and_carries_on(
+    request_text: str,
+    files: dict[str, str],
+    said: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Step 2 (26 October 2026, census FRG-026 and FRG-027): the size limits
+    are a guide, and a marker word with no screen brief named is advice. The
+    run carries on; the named files are given whole."""
+    with caplog.at_level("WARNING"):
+        material, why = await _gather(
+            _Tree({RECORD: GOOD_RECORD, **files}), request_text
+        )
+    assert why is None and material is not None
+    assert [d.path for d in material.files] == sorted(files)
+    assert said in caplog.text and "ADVISORY" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -605,15 +629,7 @@ async def test_a_project_without_the_setting_is_planned_as_before(
 @pytest.mark.parametrize(
     ("request_text", "change", "said"),
     [
-        ("build the page from the prototype", None, NAMES_NO_BRIEF),
         ("build reference/briefs/missing.md", None, "reference/briefs/missing.md"),
-        (
-            "build reference/briefs/gadgets.md",
-            lambda t: t.files.__setitem__(
-                "reference/briefs/gadgets.md", "x" * (MAX_REFERENCE_FILE_BYTES + 1)
-            ),
-            "too large to give the spec writer whole",
-        ),
         ("add a GET /version endpoint", lambda t: t.files.pop(RECORD), RECORD),
         (
             "add a GET /version endpoint",
@@ -624,7 +640,7 @@ async def test_a_project_without_the_setting_is_planned_as_before(
             "end with '/'",
         ),
     ],
-    ids=["marker-word-names-nothing", "missing", "too-large", "no-record", "malformed"],
+    ids=["missing", "no-record", "malformed"],
 )
 @pytest.mark.asyncio
 async def test_a_refusal_stops_the_run_before_any_model_is_asked(

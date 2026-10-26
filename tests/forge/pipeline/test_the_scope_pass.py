@@ -21,13 +21,8 @@ from pathlib import Path
 import pytest
 
 from forge.pipeline.branch_scope import (
-    BranchScopeReading,
-    added_lines_by_file,
-    added_lines_of,
     plan_document_paths,
     read_branch_scope,
-    reading_from_answer,
-    reading_to_answer,
 )
 from forge.pipeline.scope_report import (
     SCOPE_REPORT_NAME,
@@ -35,7 +30,6 @@ from forge.pipeline.scope_report import (
     files_the_plan_named,
     read_declared_files,
     scope_of_the_build,
-    what_the_branch_declares,
     write_scope_report,
 )
 
@@ -235,88 +229,17 @@ class TestAgainstThePlan:
         assert "names no files" in report.why_not
 
 
-class TestAgainstTheSentence:
-    def test_a_build_inside_its_plan_still_says_the_web_address_moved(
+class TestFactsNotVerdicts:
+    def test_an_echo_line_and_an_import_path_are_not_stated_as_routes(
         self, repo: Path
     ) -> None:
-        """Rich's item 5, on its own: every file this build changed was named
-        in the plan, and it still answers somewhere nobody asked for."""
-        _build_on(
-            repo,
-            {
-                "src/users/router.py": (
-                    "# the users router\n"
-                    "@router.get('/stats/users-created-per-day')\n"
-                    "def counts():\n    return []\n"
-                ),
-                "src/users/crud.py": "# the users queries\ndef counts():\n    return []\n",
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
+        """First step 1 run, feature 2 (26 October 2026): the card said the
+        build serves ``${folder}/node_modules``, read from an ``echo`` line in
+        ``scripts/check.sh``, and the local merge judge declined good work
+        over it; feature 8 read ``./config/settings`` the same way. The card
+        now states only the files the build changed, against the plan."""
+        from forge.cli._serve_gate_activation import card_line_about_scope
 
-        assert report.files_the_plan_did_not_name == []
-        assert report.routes_read is True
-        assert report.routes_in_the_request == ["/users/created-per-day"]
-        assert "/stats/users-created-per-day" in report.routes_the_request_did_not_name
-        assert "/users/created-per-day" not in report.routes_the_request_did_not_name
-
-    def test_it_names_a_capability_the_request_never_asked_for(
-        self, repo: Path
-    ) -> None:
-        _build_on(
-            repo,
-            {
-                "src/users/router.py": (
-                    "# the users router\n"
-                    "# /users/created-per-day\n"
-                    "@router.get('/users/created-per-day')\n"
-                    "def counts(user = Depends(require_authentication)):\n"
-                    "    return []\n"
-                ),
-                "migrations/versions/0001_add_created_at.py": (
-                    "# alembic revision\nrevision = '0001'\n"
-                ),
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert "authentication" in report.capabilities_the_request_did_not_name
-        assert "a database migration" in report.capabilities_the_request_did_not_name
-
-    def test_a_clean_build_says_nothing_was_added(self, repo: Path) -> None:
-        _build_on(
-            repo,
-            {
-                "src/users/router.py": (
-                    "# the users router\n"
-                    "@router.get('/users/created-per-day')\n"
-                    "def counts():\n    return []\n"
-                ),
-                "src/users/crud.py": "# the users queries\ndef counts():\n    return []\n",
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert report.files_the_plan_did_not_name == []
-        assert report.routes_the_request_did_not_name == []
-        assert report.capabilities_the_request_did_not_name == []
-        assert report.routes_read is True
-
-    def test_a_path_built_inside_a_string_is_not_an_address(self, repo: Path) -> None:
-        """FEAT-8AD7 and FEAT-3B15 (step 1 measurement, 26 October 2026): a
-        check script's ``"${folder}/node_modules"`` and the import
-        ``"./config/settings"`` were read as addresses the build answers at,
-        and the first cost the feature its merge. An address in code opens a
-        string; a slash in the middle of one is a path being built."""
         _build_on(
             repo,
             {
@@ -329,7 +252,7 @@ class TestAgainstTheSentence:
                 ),
                 "src/users/router.ts": (
                     'import { settings } from "./config/settings";\n'
-                    'import { db } from "../db/client";\n'
+                    'res.setHeader("Access-Control-Allow-Origin", origin);\n'
                     "router.get('/users/created-per-day', counts);\n"
                 ),
             },
@@ -339,427 +262,19 @@ class TestAgainstTheSentence:
         )
         report = scope_of_the_build(reading=reading, request=REQUEST)
 
-        assert report.routes_read is True
-        assert report.routes_the_branch_declares == ["/users/created-per-day"]
-        assert report.routes_the_request_did_not_name == []
-
-    def test_no_sentence_means_the_comparison_is_not_taken(self, repo: Path) -> None:
-        _build_on(repo, {"src/analytics/service.py": "x = 1\n"})
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(
-            reading=reading,
-            request=None,
-            request_why_not="there is no planning record for corr-1",
-        )
-        assert report.routes_read is False
-        assert report.routes_the_request_did_not_name == []
-        assert report.why_not is not None
-        assert "no planning record for corr-1" in report.why_not
-
-
-class TestWhatCountsAsDeclaringACapability:
-    """The capability words are read in what the branch DECLARES.
-
-    They were measured on the prose of task documents, where "logging" is a
-    deliberate promise. Read in raw source they fire on ordinary code: driven
-    over one real 184-line commit, the word "permissions" inside a test
-    fixture put "It also added permissions, which the request did not ask
-    for." on the card Rich taps to say merge. A false sentence there buries
-    the true one beside it, so a test file, a note to a reader and a bare
-    import are all left out of the reading.
-    """
-
-    def test_a_word_in_a_test_file_is_not_something_this_build_added(
-        self, repo: Path
-    ) -> None:
-        _build_on(
-            repo,
-            {
-                "src/users/router.py": (
-                    "# the users router\n"
-                    "@router.get('/users/created-per-day')\n"
-                    "def counts():\n    return []\n"
-                ),
-                "src/users/crud.py": "# the users queries\ndef counts():\n    return []\n",
-                "tests/test_router.py": (
-                    "import logging\n"
-                    "\n"
-                    "FIXTURE = 'permissions: {filesystem: {allowlist: [/tmp]}}'\n"
-                    "\n"
-                    "def test_counts():\n    assert True\n"
-                ),
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert report.routes_read is True
-        assert report.capabilities_the_request_did_not_name == []
-        # and the fixture's own path is not a web address this build answers
-        # at either — the same blindness, in the other half of the sentence
-        assert report.routes_the_request_did_not_name == []
-        assert "/tmp" not in report.routes_the_branch_declares
-        assert "tests/test_router.py" in report.files_allowed_as_scaffolding
-
-        # and the card Rich taps says so: the whole way through, not just in
-        # the report
-        from forge.cli._serve_gate_activation import card_line_about_scope
-
+        assert report.read is True
+        assert sorted(report.files_the_plan_did_not_name) == [
+            "scripts/check.sh",
+            "src/users/router.ts",
+        ]
         line = card_line_about_scope(report)
-        assert "logging" not in line
+        assert "node_modules" not in line
+        assert "web address" not in line
         assert "permissions" not in line
-        assert line == (
-            "Every file this build changed was named in the plan, and it "
-            "added nothing the request did not ask for."
-        )
-
-    def test_an_import_and_a_logger_are_not_logging_the_build_added(
-        self, repo: Path
-    ) -> None:
-        _build_on(
-            repo,
-            {
-                "src/users/router.py": (
-                    "import logging\n"
-                    "\n"
-                    "logger = logging.getLogger(__name__)\n"
-                    "\n"
-                    "@router.get('/users/created-per-day')\n"
-                    "def counts():\n    return []\n"
-                ),
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert report.routes_read is True
-        assert "logging" not in report.capabilities_the_request_did_not_name
-
-    def test_a_note_to_a_reader_is_not_something_the_build_does(
-        self, repo: Path
-    ) -> None:
-        _build_on(
-            repo,
-            {
-                "src/users/crud.py": (
-                    '"""The daily counts.\n'
-                    "\n"
-                    "One day this could grow a service layer of its own.\n"
-                    '"""\n'
-                    "\n"
-                    "# error handling could come later\n"
-                    "def counts():\n    return []\n"
-                ),
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert report.routes_read is True
-        assert report.capabilities_the_request_did_not_name == []
-
-    def test_the_file_the_build_put_there_still_says_what_it_added(
-        self, repo: Path
-    ) -> None:
-        """The path is the declaration here: nothing in these lines says
-        migration, but a file under ``migrations/`` is one."""
-        _build_on(
-            repo,
-            {
-                "src/users/crud.py": "def counts():\n    return []\n",
-                "migrations/0001_add_created_at.py": (
-                    "revision = '0001'\n"
-                    "\n"
-                    "def upgrade():\n    pass\n"
-                    "\n"
-                    "def downgrade():\n    pass\n"
-                ),
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert "a database migration" in report.capabilities_the_request_did_not_name
-
-    def test_a_reading_that_never_said_which_file_is_not_counted(self) -> None:
-        """A count nobody could take is never published as a count of
-        nothing, so an answer with no files in it says so."""
-
-        class OnlyTheLines:
-            error = None
-            name_status = "M\x00src/users/crud.py\x00"
-            added_lines = "import logging\n"
-            added_lines_read_whole = True
-
-        report = scope_of_the_build(reading=OnlyTheLines(), request=REQUEST)
-
-        assert report.routes_read is False
-        assert report.capabilities_the_request_did_not_name == []
-        assert report.why_not is not None
-        assert "could not be read whole" in report.why_not
-
-    def test_a_script_s_files_on_disk_are_not_web_addresses(self) -> None:
-        """Found live on 15 October 2026: a setup script's ``/tmp`` file and
-        its ``/dev/null`` were read as web addresses. They are files; a route
-        the build added under ``/dev`` is still named."""
-
-        class ScriptAndRouter:
-            error = None
-            name_status = "A\x00scripts/setup.sh\x00M\x00cmd/server/routes.go\x00"
-            added_by_file = {
-                "scripts/setup.sh": (
-                    "kcadm.sh get realms > /tmp/x\n"
-                    "curl -s http://localhost:8080 > /dev/null\n"
-                ),
-                "cmd/server/routes.go": 'r.Post("/dev/seed", seedHandler)\n',
-            }
-            added_lines_read_whole = True
-
-        report = scope_of_the_build(reading=ScriptAndRouter(), request=REQUEST)
-
-        assert report.routes_read is True
-        for on_disk in ("/tmp/x", "/dev/null"):
-            assert on_disk not in report.routes_the_branch_declares
-            assert on_disk not in report.routes_the_request_did_not_name
-        assert "/dev/seed" in report.routes_the_branch_declares
-        assert "/dev/seed" in report.routes_the_request_did_not_name
-
-    def test_what_is_read_and_what_is_left_out(self) -> None:
-        declared = what_the_branch_declares(
-            {
-                "src/users/router.py": (
-                    "import logging\n"
-                    "logger = logging.getLogger(__name__)\n"
-                    "# permissions come later\n"
-                    '"""Pagination is out of scope.\n'
-                    'Still out of scope.\n"""\n'
-                    "def counts(user = Depends(require_authentication)):\n"
-                    "    return []\n"
-                ),
-                "tests/test_router.py": "CACHING = 'caching'\n",
-                "docs/api.md": "This endpoint uses rate limiting.\n",
-            }
-        )
-
-        assert "src/users/router.py" in declared
-        assert "require_authentication" in declared
-        assert "import logging" not in declared
-        assert "logging.getLogger" not in declared
-        assert "permissions" not in declared
-        assert "Pagination" not in declared
-        assert "Still out of scope" not in declared
-        assert "caching" not in declared
-        assert "rate limiting" not in declared
-
-    def test_it_never_raises_on_a_reading_with_nothing_in_it(self) -> None:
-        assert what_the_branch_declares({}) == ""
-        assert what_the_branch_declares({"": "x = 1\n"}) == ""
-
-
-#: The route declaration FEAT-3EF3 really committed to ``src/users/router.py``,
-#: copied out of that branch read-only on 2026-09-15. The last line of its
-#: description is the whole defect: the only mention of authentication anywhere
-#: in the code this build was asked for says the endpoint does NOT require any.
-FEAT_3EF3_ROUTER = '''"""Users API router."""
-
-
-@router.get(
-    "/users/created-per-day",
-    response_model=CreatedPerDayResponse,
-    tags=["users"],
-    summary="Get users created per day for the last 7 days",
-    description=(
-        "Returns exactly 7 entries (today and the previous 6 days) showing "
-        "the number of users created on each day, ordered from oldest to newest. "
-        "Days with zero creations are included with a count of 0. "
-        "This endpoint does not require authentication."
-    ),
-    responses={
-        503: {"description": "Database unavailable"},
-    },
-)
-async def get_users_created_per_day(db=Depends(get_db)):
-    return await crud.count_users_created_per_day(db)
-'''
-
-#: The same declaration from FEAT-7A25, which denies it the other way round:
-#: "publicly accessible without authentication".
-FEAT_7A25_ROUTER = '''"""Users API router."""
-
-
-@router.get(
-    "/users/created-per-day",
-    response_model=list[CreatedPerDayEntry],
-    tags=["users"],
-    summary="Get user creation counts per day for the last 7 days",
-    description=(
-        "Returns a JSON array of {day, count} objects showing the number of "
-        "users created on each of the last 7 days, ordered from oldest to "
-        "newest. Days with no user creations are included with a count of 0. "
-        "This endpoint is publicly accessible without authentication."
-    ),
-    responses={
-        503: {"description": "Database unavailable"},
-    },
-)
-async def get_users_created_per_day(db=Depends(get_db)):
-    return await crud.count_users_created_per_day(db)
-'''
-
-#: FEAT-BD8F really did add a login requirement nobody asked for, and its
-#: evidence is a line with no denial on it at all: the endpoint requires an
-#: ``X-Auth-Token`` header. This one must keep its sentence.
-FEAT_BD8F_ROUTER = '''"""Users API router."""
-
-
-@router.get(
-    "/users/created-per-day",
-    response_model=UserCreationStats,
-    tags=["users"],
-    summary="Get the number of users created on each of the last seven days",
-    description=(
-        "Returns the number of users created on each of the last seven calendar "
-        "days, oldest day first, with the total the days account for. The window "
-        "ends yesterday: today is still in progress and is not answered for. A "
-        "day with no creations carries a count of zero rather than going missing. "
-        "Soft-deleted users are not counted as creations. Requires the "
-        "``X-Auth-Token`` header."
-    ),
-    responses={
-        403: {"description": "Unauthorized: valid authentication token required"},
-        503: {"description": "Database unavailable"},
-    },
-)
-async def get_users_created_per_day(request, db=Depends(get_db)):
-    if request.headers.get("X-Auth-Token") != AUTH_TOKEN:
-        raise HTTPException(status_code=403, detail="Unauthorized")
-    return await crud.count_users_created_per_day(db)
-'''
-
-
-class TestALineThatDeniesACapability:
-    """A line saying the software does NOT do a thing is not evidence that
-    this build added it.
-
-    Driven read-only over all twenty-three real build branches in the api_test
-    repository on 2026-09-15, two of them carried the sentence "It also added
-    authentication, which the request did not ask for." on the card the owner
-    taps to say merge — and in both, the only mention of authentication in the
-    code the build was asked for was the route's own description saying the
-    endpoint needs none. The three route declarations above are those two
-    branches and the one that really did add it, copied out of the branches
-    themselves.
-    """
-
-    def test_feat_3ef3_loses_a_sentence_that_was_never_true(self, repo: Path) -> None:
-        _build_on(repo, {"src/users/router.py": FEAT_3EF3_ROUTER})
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert report.routes_read is True
-        assert report.capabilities_the_request_did_not_name == []
-
-        from forge.cli._serve_gate_activation import card_line_about_scope
-
-        assert "authentication" not in card_line_about_scope(report)
-
-    def test_feat_7a25_loses_it_too_where_the_denying_word_is_without(
-        self, repo: Path
-    ) -> None:
-        _build_on(repo, {"src/users/router.py": FEAT_7A25_ROUTER})
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert report.routes_read is True
-        assert report.capabilities_the_request_did_not_name == []
-
-        from forge.cli._serve_gate_activation import card_line_about_scope
-
-        assert "authentication" not in card_line_about_scope(report)
-
-    def test_feat_bd8f_keeps_the_sentence_that_is_true(self, repo: Path) -> None:
-        """This branch really did demand a header nobody asked for, and the
-        card must still say so. A denial reading that swallowed this one would
-        have cost the pass the only true sentence of the three."""
-        _build_on(repo, {"src/users/router.py": FEAT_BD8F_ROUTER})
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert report.routes_read is True
-        assert "authentication" in report.capabilities_the_request_did_not_name
-
-        from forge.cli._serve_gate_activation import card_line_about_scope
-
-        assert (
-            "It also added authentication, which the request did not ask for."
-            in card_line_about_scope(report)
-        )
-
-    def test_the_reading_is_per_line_so_a_true_mention_elsewhere_still_counts(
-        self, repo: Path
-    ) -> None:
-        """The denial only ever covers its own line. A build whose description
-        denies authentication on one line and whose code demands an
-        ``X-Auth-Token`` header on another has still added authentication, and
-        the card still says so."""
-        mixed = FEAT_3EF3_ROUTER.replace(
-            "async def get_users_created_per_day(db=Depends(get_db)):\n",
-            "async def get_users_created_per_day(request, db=Depends(get_db)):\n"
-            '    if request.headers.get("X-Auth-Token") != AUTH_TOKEN:\n'
-            '        raise HTTPException(status_code=403, detail="Unauthorized")\n',
-        )
-        assert "X-Auth-Token" in mixed
-        _build_on(repo, {"src/users/router.py": mixed})
-        reading = read_branch_scope(
-            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(reading=reading, request=REQUEST)
-
-        assert "authentication" in report.capabilities_the_request_did_not_name
-
-    def test_how_far_back_a_denial_reaches(self) -> None:
-        """A denial a few words in front of the capability word reaches it; one
-        far enough back to be a different clause does not, because a rule that
-        swallowed every later sentence would hide real additions."""
-        from forge.planning.assumption_review import _CAPABILITIES
-        from forge.pipeline.scope_report import promises_the_capability
-
-        auth = dict(_CAPABILITIES)["authentication"]
-
-        assert promises_the_capability("every request requires authentication", auth)
-        assert not promises_the_capability(
-            "This endpoint does not require authentication.", auth
-        )
-        assert not promises_the_capability(
-            "This endpoint is publicly accessible without authentication.", auth
-        )
-        assert not promises_the_capability(
-            "do not write a scenario about rejecting unauthenticated requests", auth
-        )
-        assert not promises_the_capability("the route doesn't need a login", auth)
-        # Out of reach: the denial is eight words back and belongs to another
-        # clause about something else entirely.
-        assert promises_the_capability(
-            "There is no cache here at all, and the endpoint now requires "
-            "authentication on every call.",
-            auth,
-        )
+        assert "did not ask for" not in line
+        # The diff itself is still read for the card's details.
+        assert reading.patch_read is True
+        assert "node_modules" in reading.patch
 
 
 class TestWhenNothingCouldBeRead:
@@ -846,63 +361,11 @@ class TestTheFeatureFileAndThePatch:
         assert plan_document_paths('  - file_path: "../../etc/passwd"\n') == ()
         assert plan_document_paths('  - file_path: "/etc/passwd"\n') == ()
 
-    def test_only_the_lines_a_branch_adds_are_read(self) -> None:
-        patch = (
-            "diff --git a/src/x.py b/src/x.py\n"
-            "--- a/src/x.py\n"
-            "+++ b/src/x.py\n"
-            "@@ -1 +1 @@\n"
-            "-the old line\n"
-            "+the new line\n"
-        )
-        assert added_lines_of(patch) == "the new line"
-
-    def test_the_file_each_added_line_came_from_is_kept(self) -> None:
-        patch = (
-            "diff --git a/src/x.py b/src/x.py\n"
-            "--- a/src/x.py\n"
-            "+++ b/src/x.py\n"
-            "@@ -0,0 +1,2 @@\n"
-            "+import logging\n"
-            "+def counts():\n"
-            "diff --git a/tests/test_x.py b/tests/test_x.py\n"
-            "--- /dev/null\n"
-            "+++ b/tests/test_x.py\n"
-            "@@ -0,0 +1 @@\n"
-            "+import logging\n"
-        )
-        assert added_lines_by_file(patch) == {
-            "src/x.py": "import logging\ndef counts():",
-            "tests/test_x.py": "import logging",
-        }
-
-    def test_the_answer_carries_which_file_each_line_came_from(self) -> None:
-        reading = BranchScopeReading(
-            name_status="M\x00src/x.py\x00",
-            added_by_file={"src/x.py": "def counts():"},
-            added_lines_read_whole=True,
-        )
-        answer = reading_to_answer(reading)
-        assert answer["added_by_file"] == {"src/x.py": "def counts():"}
-
-        came_back = reading_from_answer(answer)
-        assert came_back.added_by_file == reading.added_by_file
-        assert came_back.added_lines == "def counts():"
-        assert came_back.added_lines_read_whole is True
-
-    def test_an_answer_that_never_said_which_file_counts_as_unread(self) -> None:
-        came_back = reading_from_answer(
-            {"name_status": "M\x00src/x.py\x00", "added_lines_read_whole": True}
-        )
-        assert came_back.added_by_file == {}
-        assert came_back.added_lines_read_whole is False
-
-
 class TestTheReceipt:
     def test_it_lands_beside_the_build_s_own_evidence(self, tmp_path: Path) -> None:
         receipts = tmp_path / "receipts" / "build-X-1"
         receipts.mkdir(parents=True)
-        report = ScopeReport(read=True, plan_read=True, routes_read=True)
+        report = ScopeReport(read=True, plan_read=True)
         report.files_changed = 2
         written = write_scope_report("build-X-1", report, receipts_dir=receipts)
         assert written is not None
@@ -910,7 +373,7 @@ class TestTheReceipt:
         kept = json.loads(written.read_text(encoding="utf-8"))
         assert kept["read"] is True
         assert kept["files_changed"] == 2
-        assert "routes_read" in kept
+        assert "routes_read" not in kept
         assert "why_not" in kept
 
     def test_it_does_not_start_a_tree_of_receipts_of_its_own(
@@ -931,13 +394,19 @@ class TestTheReceipt:
             "files_the_plan_named",
             "files_the_plan_did_not_name",
             "files_allowed_as_scaffolding",
+            "plan_read",
+            "files_that_already_existed",
+        ):
+            assert field in kept, field
+        # Facts, not verdicts (step 2, 26 October 2026).
+        for gone in (
             "routes_in_the_request",
             "routes_the_branch_declares",
             "routes_the_request_did_not_name",
             "capabilities_the_request_did_not_name",
             "routes_read",
         ):
-            assert field in kept, field
+            assert gone not in kept, gone
 
 
 class TestTheFactorysOwnPaperworkOnTheBranch:
@@ -1054,7 +523,7 @@ class TestTheFactorysOwnPaperworkOnTheBranch:
         assert reading.error is None
         return scope_of_the_build(reading=reading, request=REQUEST)
 
-    def test_a_clean_build_says_nothing_beyond_the_plan_or_the_request(
+    def test_a_clean_build_says_nothing_beyond_the_plan(
         self, repo_the_way_the_factory_builds: Path
     ) -> None:
         """The whole point: a build that did exactly what was asked, with the
@@ -1067,13 +536,9 @@ class TestTheFactorysOwnPaperworkOnTheBranch:
 
         assert report.read is True
         assert report.plan_read is True
-        assert report.routes_read is True
         assert report.files_the_plan_did_not_name == []
-        assert report.routes_the_request_did_not_name == []
-        assert report.capabilities_the_request_did_not_name == []
         assert card_line_about_scope(report) == (
-            "Every file this build changed was named in the plan, and it "
-            "added nothing the request did not ask for."
+            "Every file this build changed was named in the plan."
         )
 
     def _code_and_commit(self, root: Path) -> dict[str, str]:
@@ -1120,80 +585,8 @@ class TestTheFactorysOwnPaperworkOnTheBranch:
         assert card_line_about_scope(report) == (
             "This build also changed 1 file the plan did not name: "
             "alembic/versions/0001_add_created_at.py — worth a look before "
-            "you merge. It also added a database migration, which the "
-            "request did not ask for."
+            "you merge."
         )
-
-    def test_the_shebang_the_placeholder_and_the_example_are_not_web_addresses(
-        self, repo_the_way_the_factory_builds: Path
-    ) -> None:
-        """The three that showed on every real card: /usr/bin/env from a
-        shebang, /REPLACE_ME from a placeholder, /stats from an example in a
-        docstring."""
-        root = repo_the_way_the_factory_builds
-        self._code_and_commit(root)
-        report = self._report(root)
-
-        for false_address in ("/usr/bin/env", "/REPLACE_ME", "/stats"):
-            assert false_address not in report.routes_the_branch_declares
-            assert false_address not in report.routes_the_request_did_not_name
-
-    def test_an_open_question_in_the_spec_input_is_not_a_capability(
-        self, repo_the_way_the_factory_builds: Path
-    ) -> None:
-        """The specification input asks, as an open question, whether this
-        endpoint needs authentication. A question the specification asked is
-        not a way of signing in that this build added."""
-        root = repo_the_way_the_factory_builds
-        self._code_and_commit(root)
-        report = self._report(root)
-
-        assert report.capabilities_the_request_did_not_name == []
-
-    def test_a_shebang_and_an_example_in_ordinary_code_are_still_not_addresses(
-        self, repo_the_way_the_factory_builds: Path
-    ) -> None:
-        """The same filter, in a file that is NOT paperwork: a script the
-        build really wrote still must not put its own shebang on the card."""
-        root = repo_the_way_the_factory_builds
-        files = self._code()
-        files["scripts/backfill_created_at.py"] = (
-            "#!/usr/bin/env python3\n"
-            '"""Backfill the column.\n\nCall /admin/backfill by hand.\n"""\n'
-            "# see /internal/notes for why\n"
-            "def run():\n    return None\n"
-        )
-        for rel, text in files.items():
-            _write(root, rel, text)
-        _git(root, "add", "-A")
-        _git(root, "commit", "-q", "-m", "what the build wrote")
-        report = self._report(root)
-
-        for false_address in ("/usr/bin/env", "/admin/backfill", "/internal/notes"):
-            assert false_address not in report.routes_the_branch_declares
-
-    def test_a_build_that_moved_the_address_is_still_named(
-        self, repo_the_way_the_factory_builds: Path
-    ) -> None:
-        """Nothing above is allowed to silence the thing this line exists for:
-        three of the twelve builds moved the endpoint, and that still shows."""
-        root = repo_the_way_the_factory_builds
-        files = self._code()
-        files["src/users/router.py"] = (
-            "# the users router\n"
-            'stats_router = APIRouter(prefix="/stats")\n'
-            '@stats_router.get("/users-created-per-day")\n'
-            "def counts():\n    return []\n"
-        )
-        for rel, text in files.items():
-            _write(root, rel, text)
-        _git(root, "add", "-A")
-        _git(root, "commit", "-q", "-m", "what the build wrote")
-        report = self._report(root)
-
-        assert "/stats" in report.routes_the_request_did_not_name
-        assert "/users-created-per-day" in report.routes_the_request_did_not_name
-
 
 class TestHowAPathIsRead:
     def test_a_dot_folder_keeps_its_dot(self) -> None:
@@ -1233,246 +626,3 @@ class TestHowAPathIsRead:
             "scripts/backfill.py",
         ):
             assert _is_scaffolding(real) is False, real
-
-    def test_an_address_written_in_pieces_is_not_a_new_address(self) -> None:
-        """A router declares its address in two lines. Each piece read alone
-        looked like somewhere nobody asked for."""
-        from forge.pipeline.scope_report import _pieces_of_a_web_address
-
-        pieces = _pieces_of_a_web_address("/users/created-per-day")
-        assert pieces == ("/users", "/users/created-per-day", "/created-per-day")
-        assert _pieces_of_a_web_address("/stats") == ("/stats",)
-        assert _pieces_of_a_web_address("") == ()
-
-
-class TestTheReasonsReadAsSentences:
-    def test_two_reasons_are_two_sentences(self, tmp_path: Path) -> None:
-        """Both halves can go uncounted at once, and the receipt then carried
-        '…to compare against. the build this repair belongs to…' — a full
-        stop followed by a lower-case word. Each reason now starts and ends
-        like a sentence."""
-        root = tmp_path / "api_test"
-        root.mkdir()
-        _git(root, "init", "-q", "-b", "main")
-        _write(root, "src/users/router.py", "# the users router\n")
-        _git(root, "add", "-A")
-        _git(root, "commit", "-q", "-m", "the repository as it stood")
-        _build_on(root, {"src/users/router.py": "# the users router\ndef counts():\n    return []\n"})
-        reading = read_branch_scope(
-            repo_root=root, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-        report = scope_of_the_build(
-            reading=reading,
-            request=None,
-            request_why_not="the build this repair belongs to is not in the record",
-        )
-
-        assert report.why_not is not None
-        sentences = [part.strip() for part in report.why_not.split(". ") if part.strip()]
-        assert len(sentences) == 2
-        for sentence in sentences:
-            assert sentence[0].isupper(), sentence
-        assert report.why_not.endswith(".")
-
-
-#: A dependency upgrade the way FEAT-3351 had it on 19 October 2026: one test
-#: package moved in a web app's manifest, and the lockfile beside it
-#: rewritten by the package manager. The package names and links below are
-#: written for this test.
-UPGRADE_REQUEST = "Upgrade the test runner in apps/web to the latest minor version."
-
-UPGRADE_MANIFEST_BEFORE = (
-    "{\n"
-    '  "name": "web",\n'
-    '  "devDependencies": {\n'
-    '    "testrunner": "4.0.15"\n'
-    "  }\n"
-    "}\n"
-)
-UPGRADE_MANIFEST_AFTER = UPGRADE_MANIFEST_BEFORE.replace("4.0.15", "4.1.11").replace(
-    '"testrunner": "4.1.11"\n',
-    '"testrunner": "4.1.11",\n    "local-helpers": "file:../local-helpers"\n',
-)
-UPGRADE_LOCKFILE_AFTER = (
-    "{\n"
-    '  "name": "web",\n'
-    '  "lockfileVersion": 3,\n'
-    '  "packages": {\n'
-    '    "node_modules/minimatch": {\n'
-    '      "version": "5.1.6",\n'
-    '      "resolved": "https://registry.example.invalid/minimatch/-/minimatch-5.1.6.tgz",\n'
-    '      "integrity": "sha512-AbC+/Defg/hIjk=="\n'
-    "    },\n"
-    '    "node_modules/balanced-match": {\n'
-    '      "version": "1.0.2",\n'
-    '      "resolved": "https://registry.example.invalid/balanced-match/-/balanced-match-1.0.2.tgz"\n'
-    "    },\n"
-    '    "node_modules/@scope/binding-android-arm-eabi": {\n'
-    '      "version": "1.2.3",\n'
-    '      "resolved": "https://registry.example.invalid/@scope/binding-android-arm-eabi/-/binding-android-arm-eabi-1.2.3.tgz"\n'
-    "    },\n"
-    '    "node_modules/passport-auth-helper": {\n'
-    '      "version": "0.1.0",\n'
-    '      "resolved": "https://registry.example.invalid/passport-auth-helper/-/passport-auth-helper-0.1.0.tgz"\n'
-    "    }\n"
-    "  }\n"
-    "}\n"
-)
-
-
-class TestADependencyUpgradeIsNotANewWebAddress:
-    """FEAT-3351, 19 October 2026: the merge card for a dependency upgrade
-    named a dozen package names as web addresses the request did not name,
-    every one read out of a lockfile's download links."""
-
-    @staticmethod
-    def _upgrade_repo(tmp_path: Path) -> Path:
-        root = tmp_path / "notes"
-        root.mkdir()
-        _git(root, "init", "-q", "-b", "main")
-        _write(root, "apps/web/package.json", UPGRADE_MANIFEST_BEFORE)
-        _write(root, "apps/web/package-lock.json", '{\n  "name": "web"\n}\n')
-        _write(root, "apps/web/src/routes.ts", "export const routes = [];\n")
-        _git(root, "add", "-A")
-        _git(root, "commit", "-q", "-m", "the repository as it stood")
-        return root
-
-    def test_an_upgrade_names_no_web_address(self, tmp_path: Path) -> None:
-        root = self._upgrade_repo(tmp_path)
-        _build_on(
-            root,
-            {
-                "apps/web/package.json": UPGRADE_MANIFEST_AFTER,
-                "apps/web/package-lock.json": UPGRADE_LOCKFILE_AFTER,
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=root, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-
-        report = scope_of_the_build(reading=reading, request=UPGRADE_REQUEST)
-
-        assert report.read is True
-        assert report.routes_read is True
-        assert report.routes_the_branch_declares == []
-        assert report.routes_the_request_did_not_name == []
-        assert report.capabilities_the_request_did_not_name == []
-
-        from forge.cli._serve_gate_activation import card_line_about_scope
-
-        line = card_line_about_scope(report)
-        assert "web address" not in line
-        assert "It also added" not in line
-
-    def test_a_real_route_beside_the_upgrade_is_still_named(
-        self, tmp_path: Path
-    ) -> None:
-        root = self._upgrade_repo(tmp_path)
-        _build_on(
-            root,
-            {
-                "apps/web/package.json": UPGRADE_MANIFEST_AFTER,
-                "apps/web/package-lock.json": UPGRADE_LOCKFILE_AFTER,
-                "apps/web/src/routes.ts": (
-                    "export const routes = [\n"
-                    "  { path: '/notes/archive', component: Archive },\n"
-                    "];\n"
-                ),
-            },
-        )
-        reading = read_branch_scope(
-            repo_root=root, base="main", head=BRANCH, feature_id=FEATURE_ID
-        )
-
-        report = scope_of_the_build(reading=reading, request=UPGRADE_REQUEST)
-
-        assert report.routes_the_request_did_not_name == ["/notes/archive"]
-        from forge.cli._serve_gate_activation import card_line_about_scope
-
-        assert (
-            "It also answers at a web address the request did not name: "
-            "/notes/archive." in card_line_about_scope(report)
-        )
-
-    def test_every_kind_of_lockfile_is_left_out_wherever_it_sits(self) -> None:
-        """The same rule for every stack: a lockfile is written by the
-        package manager, and its links are never web addresses."""
-        link = "https://registry.example.invalid/pkg/-/pkg-1.0.0.tgz\n"
-        for lockfile in (
-            "package-lock.json",
-            "web/yarn.lock",
-            "pnpm-lock.yaml",
-            "go.sum",
-            "crates/Cargo.lock",
-            "poetry.lock",
-            "uv.lock",
-            "Gemfile.lock",
-            "composer.lock",
-        ):
-
-            class OneLockfile:
-                error = None
-                name_status = f"M\x00{lockfile}\x00"
-                added_by_file = {lockfile: link}
-                added_lines_read_whole = True
-
-            report = scope_of_the_build(reading=OneLockfile(), request=UPGRADE_REQUEST)
-            assert report.routes_the_branch_declares == [], lockfile
-            assert report.capabilities_the_request_did_not_name == [], lockfile
-
-    def test_a_manifest_s_local_package_is_not_a_web_address(self) -> None:
-        """``file:../local-helpers`` in a manifest is a folder on disk."""
-
-        class OneManifest:
-            error = None
-            name_status = "M\x00apps/web/package.json\x00"
-            added_by_file = {
-                "apps/web/package.json": '    "local-helpers": "file:../local-helpers"\n',
-                "requirements-dev.txt": "-e ./tools/local-helper\n",
-            }
-            added_lines_read_whole = True
-
-        report = scope_of_the_build(reading=OneManifest(), request=UPGRADE_REQUEST)
-        assert report.routes_the_branch_declares == []
-
-    def test_a_package_the_build_chose_in_a_manifest_is_still_read(self) -> None:
-        """A lockfile is left out of the capability reading; a manifest is
-        not, because a package the build put there is its own choice."""
-        from forge.pipeline.scope_report import what_the_branch_declares
-
-        declared = what_the_branch_declares(
-            {
-                "apps/web/package.json": '    "rate-limiter": "1.0.0"\n',
-                "apps/web/package-lock.json": '    "node_modules/rate-limiter": {}\n',
-            }
-        )
-        assert "apps/web/package.json" in declared
-        assert "package-lock.json" not in declared
-
-    def test_a_manifest_adding_a_package_reports_its_capability(self) -> None:
-        """Through the whole pass, not just the text it reads: a rate-limiting
-        package the build put in a manifest is reported, and the same line in
-        a lockfile is not."""
-        line = '    "rate-limiter": "1.0.0"\n'
-
-        def _reading(path: str) -> object:
-            class OneFile:
-                error = None
-                name_status = f"M\x00{path}\x00"
-                added_by_file = {path: line}
-                added_lines_read_whole = True
-
-            return OneFile()
-
-        in_the_manifest = scope_of_the_build(
-            reading=_reading("apps/web/package.json"), request=UPGRADE_REQUEST
-        )
-        assert in_the_manifest.capabilities_the_request_did_not_name == [
-            "rate limiting"
-        ]
-
-        in_the_lockfile = scope_of_the_build(
-            reading=_reading("apps/web/package-lock.json"), request=UPGRADE_REQUEST
-        )
-        assert in_the_lockfile.routes_read is True
-        assert in_the_lockfile.capabilities_the_request_did_not_name == []

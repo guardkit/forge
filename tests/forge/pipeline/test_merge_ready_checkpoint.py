@@ -7,8 +7,8 @@ Coverage map:
 - **THE HARD PRECONDITION** (:class:`TestGatesGreenPrecondition`): a red
   gate NEVER publishes a card. It loops back into the fix cycle or
   terminates FAILED with a pack. An unknown / unwired / raising gate
-  reader is treated as red — the precondition is *proven green*, never
-  *not proven red*.
+  reader is advice since step 2 (26 October 2026): the card goes and says
+  the tests could not be run; the routing law's own UNKNOWN still stops it.
 - **NO-COMMIT TERMINALS STAY SILENT** (:class:`TestNoCommitSilence`).
 - **Never auto-merge** (:class:`TestAutoApproveRefusal`).
 - The delivery itself (:class:`TestCardDelivery`): the push step is
@@ -106,40 +106,58 @@ class TestGatesGreenPrecondition:
         assert decision.failure_pack == "/packs/fix-journey.json"
         assert "pytest" in packs[0]["reason"]
 
-    def test_no_gate_reader_is_treated_as_red(self) -> None:
-        """Proven green, never 'not proven red'."""
-        card = _RecordingPublisher()
-        publisher = MergeReadyCheckpointPublisher(publish_card=card)
-
-        decision = _submit(publisher)
-
-        assert decision.card_published is False
-        assert decision.gates is not None
-        assert decision.gates.status is GateStatus.UNKNOWN
-        assert card.calls == []
-
-    def test_a_raising_gate_reader_is_treated_as_red(self) -> None:
-        card = _RecordingPublisher()
+    @pytest.mark.parametrize(
+        ("reader", "said"),
+        [
+            pytest.param(None, "no reader", id="no-reader"),
+            pytest.param("boom", "RuntimeError", id="raising-reader"),
+            pytest.param(lambda **_: "probably fine", "str", id="nonsense-reader"),
+        ],
+    )
+    def test_tests_that_could_not_run_are_advice_and_the_card_goes(
+        self, reader: Any, said: str
+    ) -> None:
+        """Step 2 (26 October 2026, census FRG-138): tests that could not run
+        are not tests that ran and failed. The card is published and its
+        words say the tests could not be run; the merge press still runs the
+        project's own checks on the joined code."""
+        from forge.cli._serve_gate_activation import merge_card_words
 
         def boom(**_: Any) -> Any:
             raise RuntimeError("gate runner died")
 
+        card = _RecordingPublisher()
         publisher = MergeReadyCheckpointPublisher(
-            publish_card=card, gates_green_reader=boom
+            publish_card=card,
+            gates_green_reader=boom if reader == "boom" else reader,
         )
 
         decision = _submit(publisher)
 
-        assert decision.card_published is False
+        assert decision.outcome is MergeCardOutcome.CARD_PUBLISHED
         assert decision.gates is not None
         assert decision.gates.status is GateStatus.UNKNOWN
-        assert "RuntimeError" in decision.gates.detail
-        assert card.calls == []
+        assert said in decision.gates.detail
+        assert len(card.calls) == 1
+        words = merge_card_words(
+            feature_id="FEAT-X", branch="fix/TASK-X-0001", gates=decision.gates
+        )
+        assert "The tests could not be run here" in words
+        assert "What was checked" not in words
 
-    def test_a_nonsense_gate_reader_result_is_treated_as_red(self) -> None:
+    def test_an_unknown_naming_the_routing_laws_gates_still_stops_the_card(
+        self,
+    ) -> None:
+        """The routing law is kept as it was: an UNKNOWN that names failed
+        gates loops back like RED."""
         card = _RecordingPublisher()
         publisher = MergeReadyCheckpointPublisher(
-            publish_card=card, gates_green_reader=lambda **_: "probably fine"
+            publish_card=card,
+            gates_green_reader=lambda **_: GatesReport(
+                status=GateStatus.UNKNOWN,
+                failed_gates=("routing law: hurl (scenario 'x')",),
+                detail="no results envelope",
+            ),
         )
 
         decision = _submit(publisher)

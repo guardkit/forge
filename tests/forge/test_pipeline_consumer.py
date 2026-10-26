@@ -322,57 +322,39 @@ class TestPlanningHandoffRetirementGuard:
             "correlation_id": envelope_correlation
         }
 
+    @pytest.mark.parametrize(
+        "reader",
+        [
+            pytest.param("raises", id="history-cannot-be-read"),
+            pytest.param("none", id="validator-answers-nothing"),
+            pytest.param("unwired", id="validator-not-wired"),
+        ],
+    )
     @pytest.mark.asyncio
-    async def test_invalid_retirement_history_holds_without_any_effect(
-        self, deps_factory, allowlist_root: Path
+    async def test_an_unreadable_retirement_ledger_is_advice_and_the_build_goes_on(
+        self, deps_factory, allowlist_root: Path, reader: str
     ) -> None:
+        """Step 2 (26 October 2026, census FRG-001): the retirement ledger is
+        bookkeeping. One that cannot be read no longer holds every build; it
+        is read as nothing known retired and the build is dispatched."""
+
         def invalid_history():
             raise RuntimeError("malformed retirement receipt")
 
+        retired = {
+            "raises": invalid_history,
+            "none": lambda: None,
+            "unwired": None,
+        }[reader]
         msg = _make_msg(
             _envelope_bytes(_valid_payload_dict(allowlist_root / "feature.yaml"))
         )
-        deps, mocks = deps_factory(retired_planning_handoffs=invalid_history)
+        deps, mocks = deps_factory(retired_planning_handoffs=retired)
 
         await handle_message(msg, deps)
 
-        msg.ack.assert_not_called()
-        msg.nak.assert_not_called()
+        mocks["dispatch_build"].assert_awaited_once()
         mocks["publish_build_failed"].assert_not_called()
-        mocks["dispatch_build"].assert_not_called()
-        mocks["is_duplicate_terminal"].assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_invalid_validator_result_holds_without_ack(
-        self, deps_factory, allowlist_root: Path
-    ) -> None:
-        msg = _make_msg(
-            _envelope_bytes(_valid_payload_dict(allowlist_root / "feature.yaml"))
-        )
-        deps, mocks = deps_factory(retired_planning_handoffs=lambda: None)
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_not_called()
-        msg.nak.assert_not_called()
-        mocks["publish_build_failed"].assert_not_called()
-        mocks["dispatch_build"].assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_missing_retirement_validator_holds_without_ack(
-        self, deps_factory, allowlist_root: Path
-    ) -> None:
-        msg = _make_msg(
-            _envelope_bytes(_valid_payload_dict(allowlist_root / "feature.yaml"))
-        )
-        deps, mocks = deps_factory(retired_planning_handoffs=None)
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_not_called()
-        msg.nak.assert_not_called()
-        mocks["publish_build_failed"].assert_not_called()
-        mocks["dispatch_build"].assert_not_called()
 
     @pytest.mark.parametrize(
         ("payload_correlation", "envelope_correlation"),
@@ -484,7 +466,7 @@ class TestPlanningHandoffRetirementGuard:
         connection.close()
 
     @pytest.mark.asyncio
-    async def test_real_deep_malformed_receipt_holds_without_ack(
+    async def test_real_deep_malformed_receipt_is_advice_and_dispatches(
         self,
         tmp_path: Path,
         forge_config: ForgeConfig,
@@ -517,11 +499,9 @@ class TestPlanningHandoffRetirementGuard:
 
         await handle_message(msg, deps)
 
-        msg.ack.assert_not_called()
-        msg.nak.assert_not_called()
-        dispatch.assert_not_called()
+        # Step 2 (26 October 2026, census FRG-001): bookkeeping, not a hold.
+        dispatch.assert_awaited_once()
         publish_failed.assert_not_called()
-        deps.is_duplicate_terminal.assert_not_called()
         connection.close()
 
 

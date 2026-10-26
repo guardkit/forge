@@ -1,4 +1,4 @@
-"""Read a finished build's branch: what it changed, what it added, what its
+"""Read a finished build's branch: what it changed, its diff, and what its
 plan said it would touch.
 
 WHY THIS EXISTS (the planner fix, 2026-09-15). The merge card Rich taps on a
@@ -15,11 +15,10 @@ The three questions, all read-only, all fixed argument lists, no shell:
 * **what this branch changed** — ``diff --name-status -M -z <base>...<head>``,
   the three-dot form, so the answer is what THIS branch did and never what
   main has moved on to since;
-* **what this branch added** — ``diff -U0 <base>...<head>``, kept down to the
-  lines the branch adds and kept UNDER THE FILE each line was added to,
-  because a web address the request never named and a capability nobody asked
-  for are both things the branch WROTE, and the same words mean different
-  things in a test file and in the code that was asked for;
+* **the branch's diff** — ``diff -U0 <base>...<head>`` and its ``--stat``,
+  for the merge card's details (step 1, 24 October 2026). Step 2 (26 October
+  2026) deleted the reading of added lines for web addresses and capabilities
+  "the request did not name": the card shows facts, not verdicts;
 * **what the plan of record said** — the feature's own file
   (``.guardkit/features/<feature id>.yaml``) read at the branch's head, and
   every task document it names, so the files the plan declared can be
@@ -63,8 +62,6 @@ __all__ = [
     "BRANCH_SCOPE_LIMIT_BYTES",
     "BRANCH_SCOPE_TIMEOUT_SECONDS",
     "BranchScopeReading",
-    "added_lines_by_file",
-    "added_lines_of",
     "feature_file_path",
     "plan_document_paths",
     "read_branch_scope",
@@ -111,15 +108,6 @@ class BranchScopeReading:
 
     #: ``diff --name-status -M -z`` output, verbatim.
     name_status: str = ""
-    #: ``{repository-relative path: the lines this branch adds to that file}``,
-    #: each line without its leading ``+``. The file a line came from is kept
-    #: because it changes what the line means: ``import logging`` in a test
-    #: file is a test getting itself ready, not this build adding logging, and
-    #: reading the two the same way put false sentences on the merge card.
-    added_by_file: dict[str, str] = field(default_factory=dict)
-    #: False when the added lines were cut short, so nothing may be counted
-    #: from them.
-    added_lines_read_whole: bool = False
     #: The feature's own file at the branch's head, or the empty string.
     feature_file: str = ""
     #: ``{repository-relative path: the document's text}`` for every task
@@ -141,16 +129,6 @@ class BranchScopeReading:
     head_sha: str | None = None
     #: One plain sentence when the branch could not be read at all.
     error: str | None = None
-
-    @property
-    def added_lines(self) -> str:
-        """Every line this branch adds, whatever file it came from.
-
-        The web-address half of the scope pass reads this, because a web
-        address is judged by the string itself. Anything that has to know
-        which file a line is in reads :attr:`added_by_file` instead.
-        """
-        return "\n".join(text for text in self.added_by_file.values() if text)
 
 
 def feature_file_path(feature_id: str) -> str:
@@ -179,38 +157,6 @@ def plan_document_paths(feature_file: str) -> tuple[str, ...]:
         if len(found) >= MAX_PLAN_DOCUMENTS:
             break
     return tuple(found)
-
-
-def added_lines_by_file(patch: str) -> dict[str, str]:
-    """The lines a unified diff ADDS, kept under the file they were added to.
-
-    The header care lives in one place already —
-    :func:`forge.pipeline.merge_ready_checkpoint.iter_patch_lines` knows that
-    ``+++ b/file`` is a header and that a ``+`` inside a hunk is content — so
-    this reuses it rather than learning the same lesson a second time. It
-    already says which file each line belongs to, and this keeps that answer:
-    the same words mean different things in a test file and in the code the
-    build was asked for.
-    """
-    from forge.pipeline.merge_ready_checkpoint import iter_patch_lines
-
-    by_file: dict[str, list[str]] = {}
-    for path, added, line in iter_patch_lines(patch):
-        if added:
-            by_file.setdefault(str(path or ""), []).append(line)
-    return {path: "\n".join(lines) for path, lines in by_file.items()}
-
-
-def added_lines_of(patch: str) -> str:
-    """The lines a unified diff ADDS, one per line, without their ``+``.
-
-    The whole of what the branch wrote, for the one question that does not
-    care which file a line came from: whether the branch answers at a web
-    address the request never named.
-    """
-    return "\n".join(
-        text for text in added_lines_by_file(patch).values() if text
-    )
 
 
 def _git(repo_root: "Path | str", *args: str) -> "subprocess.CompletedProcess[str]":
@@ -263,12 +209,9 @@ def read_branch_scope(
             )
         )
 
-    # WHAT THE BRANCH ADDED. This one never stops anything: it feeds the
-    # comparison with the request, which is a report on a card, so a diff git
-    # could not answer or one too long to carry is said plainly and carries
+    # THE BRANCH'S DIFF. This one never stops anything: it is shown on the
+    # card, so a diff git could not answer is said plainly and carries
     # nothing.
-    added: dict[str, str] = {}
-    read_whole = False
     patch_text = ""
     patch_truncated = False
     patch_read = False
@@ -283,17 +226,6 @@ def read_branch_scope(
             stat_run = _git(repo_root, "diff", "--stat", "--no-color", f"{base}...{head}")
             if stat_run.returncode == 0:
                 stat = (stat_run.stdout or "")[:CHANGE_TEXT_LIMIT_CHARS]
-            if len(body.encode("utf-8")) <= BRANCH_SCOPE_LIMIT_BYTES:
-                added = added_lines_by_file(body)
-                read_whole = True
-            else:
-                logger.info(
-                    "the scope pass: what %s added against %s in %s is too "
-                    "long to read whole, so nothing is counted from it",
-                    head,
-                    base,
-                    repo_root,
-                )
         else:
             logger.info(
                 "the scope pass: git could not read what %s added against %s "
@@ -326,8 +258,6 @@ def read_branch_scope(
 
     return BranchScopeReading(
         name_status=name_status,
-        added_by_file=added,
-        added_lines_read_whole=read_whole,
         feature_file=feature_file,
         plan_documents=documents,
         patch=patch_text,
@@ -370,8 +300,6 @@ def reading_to_answer(reading: BranchScopeReading) -> dict[str, Any]:
     """The reading as the sidecar's JSON answer."""
     return {
         "name_status": reading.name_status,
-        "added_by_file": dict(reading.added_by_file),
-        "added_lines_read_whole": reading.added_lines_read_whole,
         "feature_file": reading.feature_file,
         "plan_documents": dict(reading.plan_documents),
         "patch": reading.patch,
@@ -400,20 +328,8 @@ def reading_from_answer(answer: Any) -> BranchScopeReading:
         if isinstance(documents_raw, dict)
         else {}
     )
-    added_raw = answer.get("added_by_file")
-    added = (
-        {str(k): str(v) for k, v in added_raw.items()}
-        if isinstance(added_raw, dict)
-        else {}
-    )
     return BranchScopeReading(
         name_status=str(answer.get("name_status") or ""),
-        added_by_file=added,
-        # An answer that never said which file its lines came from is an
-        # answer this side cannot judge, so it counts as not read at all
-        # rather than as a branch that added nothing.
-        added_lines_read_whole=bool(answer.get("added_lines_read_whole"))
-        and isinstance(added_raw, dict),
         feature_file=str(answer.get("feature_file") or ""),
         plan_documents=documents,
         patch=str(answer.get("patch") or "")[:CHANGE_TEXT_LIMIT_CHARS],

@@ -77,6 +77,7 @@ from forge.pipeline.merge_offer import (
     SKIP_NO_REGISTRY,
     SKIP_NO_TEMPLATE,
     SKIP_PLACEHOLDER_IN_ADDRESS,
+    SKIP_REGISTRATION_FAILED,
     SKIP_UNSUPPORTED_ADDRESS,
     SKIP_UNSUPPORTED_METHOD,
     placeholders_in,
@@ -186,10 +187,6 @@ from forge.planning.revision import (
     parse_dispositions,
 )
 from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
-from forge.planning.spec_digest import (
-    DIGEST_ERROR_PREFIX,
-    check_digest_consistency,
-)
 from forge.planning.states import PlanningState
 from forge.planning.target_repos import format_known_repos
 from forge.network_git import fetch_all_branches
@@ -1185,20 +1182,12 @@ def _possible_contradiction_text(
 # Until now the routing law first saw the examples at the plan stage, after
 # the owner's yes; a refusal there cost him a wait and, at worst, a stop.
 # Now, after the draft is committed and before the door opens, the spec leg
-# runs guardkit's rules-only check on the committed .feature; a refused
-# example goes back to the spec writer as the machine's own note — the same
-# round the plan stage runs, at most once — and the card the owner reads
-# says what happened. The plan stage's own stamping stays the consistency
-# check, and the model fallback's turn stays where rules 1a and 6b put it.
+# runs guardkit's rules-only check on the committed .feature, and the card
+# the owner reads names any refused example. Since step 2 (26 October 2026,
+# census FRG-043) that is advice: the spec is not sent back before the card.
+# The plan stage's own stamping stays the consistency check, and the model
+# fallback's turn stays where rules 1a and 6b put it.
 # ---------------------------------------------------------------------------
-
-#: The card's line when the machine rewrote refused examples before the card
-#: (rule 45, the spec's own words). ``{changes}`` is the what-changed
-#: sentence from :func:`_plain_card_changes`.
-_PROVABILITY_REWRITTEN_CARD_LINE = (
-    "The machine rewrote {n} of the worked examples after their provability "
-    "check. What changed: {changes}."
-)
 
 #: Where the plan leg's approved record carries that line for the build gate
 #: (:func:`forge.cli._serve_gate_activation.maybe_gate_build` reads it).
@@ -1210,9 +1199,10 @@ PLAN_REPOSITORY_UNAVAILABLE_KEY = "repository_unavailable"
 PLAN_SIZE_NOTE_KEY = "plan_size_note"
 PLAN_SIZE_KEY = "plan_size"
 
-#: Where the plan leg's approved record carries the build card's line when the
-#: plan's review record could not be read (24 October 2026), read beside the
-#: two lines above.
+#: Where the plan leg's approved record carries the build card's line about
+#: the plan's review: its request-traceability score (step 2, 26 October 2026)
+#: or that the record could not be read (24 October 2026), read beside the two
+#: lines above.
 PLAN_REVIEW_NOTE_KEY = "plan_review_note"
 
 #: The build card's line for an unreadable plan review record.
@@ -1221,15 +1211,38 @@ _PLAN_REVIEW_UNREADABLE_CARD_LINE = (
     "reviewer's verdict; this card decides."
 )
 
-#: The plan reviewer's own refusals: a readable verdict that did not approve.
-#: These still end the run. Every other problem with the review record is
-#: bookkeeping (24 October 2026).
+#: Every spec-digest error the spec writer's own check reports starts with
+#: this (its ``validation.json``); the spec leg shows those on the card. The
+#: spec writer's check is the one place the digest is checked (step 2, 26
+#: October 2026); Forge's mirror of it, ``planning/spec_digest.py``, went.
+DIGEST_ERROR_PREFIX = "spec digest: "
+
+#: The plan reviewer's own refusal: a readable decision that did not approve.
+#: It still ends the run (the planning seat owns that decision). The score and
+#: the Coach's verdict are advice (step 2, 26 October 2026); every other
+#: problem with the review record is bookkeeping (24 October 2026).
 _SEMANTIC_VERDICT_REFUSALS: frozenset[str] = frozenset(
-    {
-        "specialist semantic decision is not approved",
-        "request_traceability did not pass",
-        "Coach verdict is not accepting",
-    }
+    {"specialist semantic decision is not approved"}
+)
+
+#: Where the plan leg's approved record carries the planning seat's advice for
+#: the build card (step 2, 26 October 2026), read beside the lines above, and
+#: the line it is shown in. Display only: nothing waits or refuses on it.
+PLAN_ADVICE_NOTE_KEY = "plan_advice_note"
+_PLAN_ADVICE_CARD_LINE = "The planner's notes for you: {advice}"
+#: The seat's prefix for a prerequisite the repository does not have yet;
+#: such lines are shown first.
+_MISSING_PREREQUISITE = "Missing prerequisite:"
+
+#: What the review-record reader says when the plan came with none at all
+#: (the planning seat's unaccepted best draft, step 2, 26 October 2026).
+_SEMANTIC_REVIEW_MISSING = "semantic_review.json is missing"
+
+#: The build card's line with the plan reviewer's request-traceability score
+#: (step 2, 26 October 2026): advice for the person, never a refusal.
+_PLAN_REVIEW_SCORE_CARD_LINE = (
+    "The plan reviewer scored how closely the plan follows the request at "
+    "{score} out of 1 (its verdict: {verdict})."
 )
 
 #: What the exact-artifact re-review answers when the plan writer returned
@@ -1295,14 +1308,6 @@ _PROVABILITY_UNPROVABLE_CARD_LINE = (
     "send a note."
 )
 
-#: What fills the rewritten line's ``{changes}`` slot when the rewrite moved
-#: the examples' steps into a provable shape while every sentence on the
-#: list stayed word for word (the comparison sentence is then empty, and
-#: "What changed: ." would be a defect on a surface Rich reads).
-_PROVABILITY_CHANGES_WHEN_LIST_UNCHANGED = (
-    "nothing on this list (the examples' wording changed underneath it)"
-)
-
 #: The receipt's words when no check collaborator is wired (hermetic
 #: composition, or a serve that predates the seam).
 _PROVABILITY_NOT_WIRED_DETAIL = (
@@ -1345,30 +1350,6 @@ _MACHINE_REWRITE_NOTE = (
 #: The note's author on every receipt: the machine, never a person.
 _MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
 
-#: The author stamped on a rewrite the ASSUMPTION REVIEW asked for (2026-09-13,
-#: planning coach §4c) — a different reviewer from the stamp normalizer, and
-#: the record must say which.
-_ASSUMPTION_REVIEW_AUTHOR = "planning-driver (assumption review)"
-
-#: The author stamped on the shared rewrite when only the SPEC EXAMPLE CHECK
-#: (4 October 2026) asked for it: worked examples about something the request
-#: does not mention. When assumptions were flagged too, the assumption
-#: review's author is stamped and the row lists both.
-_EXAMPLE_REVIEW_AUTHOR = "planning-driver (spec example check)"
-
-#: The one closing instruction when the assumption review and the spec example
-#: check both send something back in the shared rewrite. Since 16 October 2026
-#: it never asks for the request's words copied exactly: the # Why: line names
-#: the part of the request in any words, and the example asks for no more.
-_SHARED_REVIEW_NOTE_CLOSING = (
-    "Remove these assumptions and every worked example that depends on them. "
-    "Remove each worked example listed above unless the request needs it; if you "
-    "keep one, say in its # Why: line which part of the request needs it, and "
-    "the example asks for nothing more than that part does. Remove any "
-    "assumption written only for an example you remove. Do not add other "
-    "assumptions or examples of the same kind. Change nothing else."
-)
-
 #: The spec card's line when the project's ``spec_examples:`` block is there
 #: and could not be read. Silence would hide the mistake: the person is told
 #: the examples were not checked, and why.
@@ -1386,13 +1367,6 @@ _EXAMPLE_READING_NO_VERDICT_CARD_LINE = (
 #: The file the spec writer puts beside the spec with its checker's reading
 #: of whether each example asks for more than the request does.
 _EXAMPLE_SUPPORT_FILE = "example_support.json"
-
-#: Rule-45-shaped line on the card when the writer removed what the reviewer
-#: flagged. Nobody is asked anything; the person is told what happened.
-_ASSUMPTION_REMOVED_CARD_LINE = (
-    "The machine's reviewer removed {count} assumption(s) the request did not "
-    "ask for ({what})."
-)
 
 #: The ONE un-mentioned line the owner reads when the rewrite stamped clean
 #: (rule 5). The spec card is not shown again; the three touches stand.
@@ -1537,6 +1511,10 @@ class _PlanAttempt:
     #: already committed tree (25 October 2026). ``None`` means the planning
     #: branch itself.
     branch: str | None = None
+    #: The planning seat's ``plan_advice`` lines (``Missing prerequisite:``
+    #: lines first), shown on the build card as information for the approver
+    #: (step 2, 26 October 2026). Display only: nothing reads them to decide.
+    plan_advice: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -2053,10 +2031,14 @@ class PlanningRunDriver:
         # recovered RUNNING/FEATURE_* path executes the same durable gate;
         # SUCCEEDED reuses its receipt and STARTED/UNKNOWN/FAILED refuses.
         if deps.feature_routing_required and deps.feature_routing_gate is None:
-            await self._settle_routing_failure(
-                correlation_id, "required feature routing gate is unavailable"
+            # Step 2 (26 October 2026, census FRG-022): a missing routing gate
+            # is bookkeeping. The dispatchers already carry on unrouted with a
+            # log line when they have no gate; this copy no longer ends the run.
+            logger.warning(
+                "planning driver: run %s has no feature routing gate — "
+                "ADVISORY; planning carries on unrouted",
+                correlation_id,
             )
-            return
         if deps.feature_routing_gate is not None and state is not PlanningState.PAUSED:
             try:
                 await deps.feature_routing_gate.ensure_seeded(
@@ -3809,9 +3791,7 @@ class PlanningRunDriver:
         terminal failure.
         """
         deps = self._deps
-        _factory_document, broken = ensure_factory_context(deps.store, correlation_id)
-        if broken is not None:
-            return await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
+        ensure_factory_context(deps.store, correlation_id)
         if self._has_leg_event(correlation_id, _FEATURE_SPEC_STAGE):
             return self._advance_after_spec(correlation_id)
 
@@ -3850,38 +3830,28 @@ class PlanningRunDriver:
                     return False  # the failure is already loud and terminal
                 # THE ASSUMPTIONS ARE REVIEWED BEFORE THE CARD (2026-09-13,
                 # planning coach §4c): an assumption that adds what the
-                # request did not ask for goes back to the writer once as
-                # the machine's note; the card says what happened.
+                # request did not ask for is shown on the card with the
+                # finding under it (advice since step 2, 26 October 2026).
                 drafted = await self._review_the_assumptions_before_the_card(
                     row,
                     correlation_id,
                     drafted,
-                    target_repo=target_repo,
                     repo_path=repo_path,
                     branch=branch,
-                    plan_run_id=plan_run_id,
                     notes=notes,
                 )
-                if drafted is None:
-                    return False  # the rewrite round's write or digest failed loudly
                 # THE EXAMPLES ARE CHECKED FOR PROVABILITY BEFORE THE CARD
                 # (Part K, 2026-09-07): the committed .feature is run through
-                # the routing law's rules-only check, a refused example goes
-                # back to the spec writer once as the machine's note, and
-                # the draft row is written HERE, with the receipt, so the
-                # card a restart replays is the card that was shown.
+                # the routing law's rules-only check, a refused example is
+                # named on the card (advice since step 2), and the draft row
+                # is written HERE, with the receipt, so the card a restart
+                # replays is the card that was shown.
                 draft = await self._prove_the_examples_before_the_card(
-                    row,
                     correlation_id,
                     drafted,
-                    target_repo=target_repo,
                     repo_path=repo_path,
                     branch=branch,
-                    plan_run_id=plan_run_id,
-                    notes=notes,
                 )
-                if draft is None:
-                    return False  # already loud (a write or digest failure)
 
             # THE ONE PAUSE. A run configured to skip the card on a thin
             # feature skips it here — mechanically decidable, no judgement.
@@ -4043,8 +4013,6 @@ class PlanningRunDriver:
         note_from_machine: bool = False,
         fail_on_refusal: bool = True,
         record: bool = True,
-        previous_card: Mapping[str, Any] | None = None,
-        machine_author: str = _MACHINE_NOTE_AUTHOR,
     ) -> dict[str, Any] | None:
         """Dispatch the spec-writer, commit the spec, record the DRAFT row.
 
@@ -4073,13 +4041,9 @@ class PlanningRunDriver:
 
         ``record`` (Part K, 2026-09-07): ``False`` returns the draft WITHOUT
         writing its ``drafted`` row, so the spec leg can check the committed
-        examples for provability — and run the machine's note round — before
-        the row that opens the card is written (:meth:`_record_spec_draft`
-        writes it). ``previous_card`` names the card the what-changed
-        comparison is made against when the caller knows it (the machine's
-        pre-card round compares with a draft that has no row yet); ``None``
-        reads it off the durable draft rows as before. Every existing caller
-        passes neither and is byte-identical.
+        examples for provability before the row that opens the card is
+        written (:meth:`_record_spec_draft`
+        writes it).
 
         Returns the draft record (the same dict the door and the approved row
         read), or ``None`` when the leg has already failed loudly.
@@ -4111,10 +4075,7 @@ class PlanningRunDriver:
             await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
             return None
         reference_files = reference.files if reference is not None else ()
-        factory_document, broken = ensure_factory_context(deps.store, correlation_id)
-        if broken is not None:
-            await self._fail_leg(correlation_id, _FEATURE_SPEC_STAGE, broken)
-            return None
+        factory_document = ensure_factory_context(deps.store, correlation_id)
         texts = context_texts(documents) + reference_context_texts(reference_files)
         # The project's decision records from memory, as the door recorded
         # them, before the factory reference. None recorded: nothing is added.
@@ -4399,18 +4360,13 @@ class PlanningRunDriver:
         # restart replays the same words.
         rewrite: dict[str, Any] | None = None
         if notes:
-            previous = (
-                previous_card
-                if previous_card is not None
-                else self._previous_digest_card(correlation_id)
-            )
+            previous = self._previous_digest_card(correlation_id)
             if previous is not None:
                 card, rewrite = self._compare_with_previous_card(
                     previous,
                     card,
                     note=str(notes[-1]),
                     note_from_machine=note_from_machine,
-                    machine_author=machine_author,
                 )
 
         draft: dict[str, Any] = {
@@ -4471,7 +4427,6 @@ class PlanningRunDriver:
         *,
         note: str,
         note_from_machine: bool,
-        machine_author: str = _MACHINE_NOTE_AUTHOR,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """What a note's rewrite changed on the list, and the card's words for
         it. Returns ``(card, rewrite)``: the rewrite record (``repeat``, the
@@ -4490,7 +4445,7 @@ class PlanningRunDriver:
             # The machine's own round (2026-09-06): the comparison is what
             # the caller reads to decide between carrying on and stopping,
             # and the receipt names the author.
-            rewrite["author"] = machine_author
+            rewrite["author"] = _MACHINE_NOTE_AUTHOR
             return dict(card), rewrite
         card = dict(card)
         if rewrite["repeat"]:
@@ -4866,37 +4821,28 @@ class PlanningRunDriver:
         correlation_id: str,
         draft: dict[str, Any],
         *,
-        target_repo: str,
         repo_path: str,
         branch: str,
-        plan_run_id: str,
         notes: list[str],
-    ) -> dict[str, Any] | None:
+    ) -> dict[str, Any]:
         """Hold the committed draft's assumptions against the request and the
-        repository; send the flagged ones back to the writer once; say on the
-        card what happened (planning coach, 2026-09-13, design §4c).
+        repository, and show on the card what was found (planning coach,
+        2026-09-13, design §4c).
 
         The deterministic half of the planning coach. An assumption that adds
-        a capability the request does not mention — the one that refused arm
-        B — goes back to the spec writer as the machine's own note, exactly
-        as the plan leg's note goes: same dispatch, same coach, same must-pass
-        criterion, at most one round. If the writer removed it, the card
-        carries one line saying so. If the writer kept it, the card shows it
-        with the finding under it, so the person's touch is a decision rather
-        than a proofread. Never a third try; never a new touch.
-
-        The spec example check (4 October 2026) shares this one round: worked
-        examples about something the request and the owner's notes do not
-        mention, by the words the project declares, go back in the same note,
-        and :meth:`_open_the_card_with` names what was removed and what kept.
+        a capability the request does not mention is shown on the card with
+        the finding under it, so the person's touch is a decision rather than
+        a proofread. The spec example check (4 October 2026) runs beside it:
+        worked examples about something the request and the owner's notes do
+        not mention are named on the card by :meth:`_open_the_card_with`.
+        Since step 2 (26 October 2026, census FRG-029 and FRG-048) neither
+        sends the spec back to the writer: advice, never a rewrite round.
 
         ``draft`` is a committed draft WITHOUT a row yet; this writes none —
         the provability step that follows writes the draft row. Returns the
         draft the rest of the leg continues with, its ``assumption_review``
-        receipt set, or ``None`` when the rewrite round's write or digest
-        failed the run loudly.
+        receipt set.
         """
-        deps = self._deps
         request_text = self._request_text_of(row)
         # THE SPEC EXAMPLE CHECK (4 October 2026) shares this step's one
         # rewrite: an example about something the request does not mention,
@@ -4964,123 +4910,29 @@ class PlanningRunDriver:
             draft["assumption_review"] = receipt
             return draft
 
-        # ONE note for both reviewers, so the writer is asked no more times
-        # than before the example check existed. Each alone is its own note,
-        # word for word; both together share one closing instruction.
-        if flagged and flagged_examples and review is not None and examples is not None:
-            note = self._shared_review_note(review, examples)
-        elif flagged and review is not None:
-            note = review.note()
-        else:
-            note = examples.note() if examples is not None else ""
-        author = _ASSUMPTION_REVIEW_AUTHOR if flagged else _EXAMPLE_REVIEW_AUTHOR
-        receipt.update({"round": 1, "author": author, "note": note, "flagged": flagged})
+        # STEP 2 (26 October 2026, census FRG-029 and FRG-048): advice. A
+        # flagged assumption is shown on the card with the finding under it,
+        # and a flagged worked example is named on the card as kept; neither
+        # sends the spec back to the writer for a rewrite round.
+        receipt["still_flagged"] = flagged
         if flagged_examples:
             receipt["flagged_examples"] = list(flagged_examples)
-        logger.info(
+        logger.warning(
             "planning driver: run %s — %d assumption(s) and %d worked example(s) "
-            "add what the request did not ask for; the machine sends them back "
-            "to the spec writer once (round 1) before the card: %s %s",
+            "add what the request did not ask for — ADVISORY; the card shows "
+            "them: %s %s",
             correlation_id,
             len(flagged),
             len(flagged_examples),
             flagged,
             flagged_examples,
         )
-        deps.store._record_event(
-            correlation_id=correlation_id,
-            stage_label=_SPEC_DRAFT_STAGE,
-            status="superseded",
-            actor_identity="planning-driver",
-            details_json=json.dumps(
-                {
-                    "spec_draft": {
-                        "slug": draft.get("slug"),
-                        "spec_files": list(draft.get("spec_files") or []),
-                        "sha": draft.get("sha"),
-                        "scenario_count": draft.get("scenario_count"),
-                        "superseded_by_note": note,
-                        "author": author,
-                        "flagged_assumptions": flagged,
-                        **({"flagged_examples": list(flagged_examples)} if flagged_examples else {}),
-                    }
-                }
-            ),
-        )
-        try:
-            rewritten = await self._draft_spec(
-                row,
-                correlation_id,
-                target_repo=target_repo,
-                repo_path=repo_path,
-                branch=branch,
-                plan_run_id=plan_run_id,
-                notes=[*notes, note],
-                note_from_machine=True,
-                fail_on_refusal=False,
-                record=False,
-                previous_card=draft.get("card") or {},
-                machine_author=author,
+        if flagged and review is not None:
+            draft["card"] = self._card_with_assumption_warnings(
+                draft.get("card") or {}, review, flagged
             )
-        except _MachineNoteRefused as refused_round:
-            receipt["refused_by_checker"] = True
-            receipt["checker_reason"] = str(refused_round.reason or "")
-            receipt["dispatch_reason"] = refused_round.dispatch_reason
-            receipt["still_flagged"] = flagged
-            logger.warning(
-                "planning driver: run %s — the checker refused the machine's "
-                "rewrite after the assumption review (round 1: %s); the card "
-                "opens on the draft as first written, with the finding under "
-                "each flagged assumption",
-                correlation_id,
-                refused_round.dispatch_reason,
-            )
-            if flagged and review is not None:
-                draft["card"] = self._card_with_assumption_warnings(draft.get("card") or {}, review, flagged)
-            draft["assumption_review"] = receipt
-            return draft
-        if rewritten is None:
-            return None  # the spec leg already failed the run loudly
-        second = (
-            None
-            if review_failed is not None
-            else await self._review_assumptions_on_branch(
-                rewritten, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
-            )
-        )
-        still = list(second.flagged_ids) if second is not None else []
-        removed = [assumption_id for assumption_id in flagged if assumption_id not in still]
-        final = dict(rewritten)
-        final.pop("rewrite", None)
-        final["cycle"] = draft.get("cycle")
-        receipt.update(
-            {
-                "rewritten": True,
-                "removed": removed,
-                "still_flagged": still,
-                "second": second.receipt() if second is not None else None,
-            }
-        )
-        card = dict(final.get("card") or {})
-        if removed:
-            what = ", ".join(
-                sorted({f.capability for f in review.findings if f.assumption_id in removed})
-            )
-            line = _ASSUMPTION_REMOVED_CARD_LINE.format(count=len(removed), what=what)
-            card["what_happened"] = f"{card.get('what_happened', '')} {line}".strip()
-            receipt["card_line"] = line
-        if still and second is not None:
-            card = self._card_with_assumption_warnings(card, second, still)
-        final["card"] = card
-        final["assumption_review"] = receipt
-        logger.info(
-            "planning driver: run %s — after the assumption review's round: "
-            "%d removed, %d still flagged",
-            correlation_id,
-            len(removed),
-            len(still),
-        )
-        return final
+        draft["assumption_review"] = receipt
+        return draft
 
     # ------------------------------------------------------------------ #
     # The worked examples are checked against the request before the card
@@ -5284,19 +5136,6 @@ class PlanningRunDriver:
         return lines, receipt
 
     @staticmethod
-    def _shared_review_note(review: Any, examples: ExampleReview) -> str:
-        """The one note when both the assumption review and the spec example
-        check flagged something: both lists, then ONE closing instruction,
-        so neither reviewer's ask contradicts the other's."""
-        lines = [
-            f"The reviewer found {len(review.flagged_ids)} assumption(s) that add "
-            "something the request did not ask for:"
-        ]
-        lines += [f"- {finding.assumption_id}: {finding.sentence}" for finding in review.findings]
-        lines += ["", *examples.listed(), "", _SHARED_REVIEW_NOTE_CLOSING]
-        return "\n".join(lines)
-
-    @staticmethod
     def _card_with_assumption_warnings(
         card: Mapping[str, Any], review: Any, flagged: Sequence[str]
     ) -> dict[str, Any]:
@@ -5329,37 +5168,26 @@ class PlanningRunDriver:
 
     async def _prove_the_examples_before_the_card(
         self,
-        row: Any,
         correlation_id: str,
         draft: dict[str, Any],
         *,
-        target_repo: str,
         repo_path: str,
         branch: str,
-        plan_run_id: str,
-        notes: list[str],
-    ) -> dict[str, Any] | None:
-        """Check the committed draft's examples by rule; rewrite once if any
-        is refused; write the draft row that opens the card (rules 44–46).
+    ) -> dict[str, Any]:
+        """Check the committed draft's examples by rule and write the draft
+        row that opens the card (rules 45–46).
 
         ``draft`` is a committed draft WITHOUT a row yet (``record=False``).
         The check is guardkit's rules-only dry run of the routing law on the
-        committed ``.feature``. When it refuses examples, the machine's note
-        round runs exactly as at the plan stage — the same note
-        (:meth:`_machine_rewrite_note`), the same revision path, the same
-        note-honoured criterion, at most one round — and the new draft is
-        checked again. The card then says which it was (rule 45): a rewrite
-        that landed, examples still unprovable after the round, or nothing
-        (the card byte-identical to today's). A checker-refused rewrite never
-        stops the run: the card opens on the draft as first written, with the
-        cannot-be-proven line. A check that could not run (unwired, an older
-        guardkit, a failure) is skipped and receipted; the card is unchanged.
+        committed ``.feature``. An example it refuses is named on the card
+        (the cannot-be-proven line); since step 2 (26 October 2026, census
+        FRG-043) the spec is no longer sent back for a rewrite round. A check
+        that could not run (unwired, an older guardkit, a failure) is skipped
+        and receipted; the card is unchanged.
 
         Returns the draft the card opens on — its row written, its
-        ``provability`` receipt set — or ``None`` when the rewrite round's
-        write or digest failed the run loudly.
+        ``provability`` receipt set.
         """
-        deps = self._deps
         check = await self._check_provability_by_rule(
             correlation_id, draft, repo_path=repo_path, branch=branch
         )
@@ -5389,149 +5217,25 @@ class PlanningRunDriver:
             )
             return self._open_the_card_with(correlation_id, draft, provability)
 
-        # THE MACHINE'S NOTE ROUND, BEFORE THE CARD (rule 44).
+        # STEP 2 (26 October 2026, census FRG-043): advice. An example no
+        # rule can prove is named on the card; the spec is no longer sent
+        # back to the writer for a rewrite round. The plan stage's stamping
+        # still decides it after the yes, where a project enforces the law.
         refused = list(check.refused_titles)
-        note = self._machine_rewrite_note(refused)
-        provability.update(
-            {
-                "round": 1,
-                "author": _MACHINE_NOTE_AUTHOR,
-                "note": note,
-                "refused_by_checker": False,
-                "still_refused": list(refused),
-            }
-        )
-        logger.info(
+        provability["still_refused"] = list(refused)
+        logger.warning(
             "planning driver: run %s — %d of the worked example(s) cannot be "
-            "proven by rule; the machine sends them back to the spec writer "
-            "once (round 1) before the card: %s",
+            "proven by rule (%s) — ADVISORY; the card names them",
             correlation_id,
             len(refused),
             refused,
         )
-        # The draft's own row, SUPERSEDED by the machine's note — the row an
-        # owner's note writes, so the revision channel finds the files to
-        # read back off the branch, a restart mid-round redoes the round, and
-        # the record says why this draft was never shown. No card on it: the
-        # spec text belongs on the row a card is opened from, and nowhere else.
-        deps.store._record_event(
-            correlation_id=correlation_id,
-            stage_label=_SPEC_DRAFT_STAGE,
-            status="superseded",
-            actor_identity="planning-driver",
-            details_json=json.dumps(
-                {
-                    "spec_draft": {
-                        "slug": draft.get("slug"),
-                        "spec_files": list(draft.get("spec_files") or []),
-                        "sha": draft.get("sha"),
-                        "scenario_count": draft.get("scenario_count"),
-                        "superseded_by_note": note,
-                        "author": _MACHINE_NOTE_AUTHOR,
-                        "refused_titles": refused,
-                    }
-                }
-            ),
-        )
-        try:
-            rewritten = await self._draft_spec(
-                row,
-                correlation_id,
-                target_repo=target_repo,
-                repo_path=repo_path,
-                branch=branch,
-                plan_run_id=plan_run_id,
-                notes=[*notes, note],
-                note_from_machine=True,
-                fail_on_refusal=False,
-                record=False,
-                previous_card=draft.get("card") or {},
-            )
-        except _MachineNoteRefused as refused_round:
-            # Rule 44: a checker-refused pre-card rewrite never stops the
-            # run. The card opens on the draft as first written and says
-            # which examples cannot be proven; the plan stage's stamping,
-            # with the model fallback allowed, decides them after the yes.
-            provability["refused_by_checker"] = True
-            provability["checker_reason"] = str(refused_round.reason or "")
-            provability["dispatch_reason"] = refused_round.dispatch_reason
-            logger.warning(
-                "planning driver: run %s — the checker refused the machine's "
-                "rewrite before the card (round 1: %s); the card opens on the "
-                "draft as first written and names the %d example(s) that "
-                "cannot be proven",
-                correlation_id,
-                refused_round.dispatch_reason,
-                len(refused),
-            )
-            return self._open_the_card_with(
-                correlation_id,
-                draft,
-                provability,
-                lines=[self._unprovable_card_line(refused)],
-            )
-        if rewritten is None:
-            return None  # the spec leg already failed the run loudly
-        compared = rewritten.get("rewrite") or {}
-        changes = str(compared.get("changes") or "")
-        provability["rewritten"] = True
-        provability["changes"] = changes or None
-        second = await self._check_provability_by_rule(
-            correlation_id, rewritten, repo_path=repo_path, branch=branch
-        )
-        provability["second_check"] = second.receipt()
-        still = list(second.refused_titles) if second.checked else []
-        provability["still_refused"] = still
-        if not second.checked:
-            logger.warning(
-                "planning driver: run %s — the rewritten examples could not be "
-                "checked again before the card (%s); the card reports the "
-                "rewrite, and the plan stage's stamping is the check",
-                correlation_id,
-                second.detail,
-            )
-        # The draft the card opens on is the REWRITE. Its comparison with the
-        # draft it replaced is the machine's (kept in the receipt); what the
-        # OWNER is told about his own note, when this round followed one, is
-        # measured against the card he actually read, not the draft he never
-        # saw. The machine's round is not one of the owner's rounds.
-        final = dict(rewritten)
-        final.pop("rewrite", None)
-        final["cycle"] = draft.get("cycle")
-        card = dict(final.get("card") or {})
-        if notes:
-            owner_read = self._previous_digest_card(correlation_id)
-            if owner_read is not None:
-                card, owner_rewrite = self._compare_with_previous_card(
-                    owner_read, card, note=str(notes[-1]), note_from_machine=False
-                )
-                final["rewrite"] = owner_rewrite
-        final["card"] = card
-        lines: list[str] = []
-        if changes or not still:
-            lines.append(
-                _PROVABILITY_REWRITTEN_CARD_LINE.format(
-                    n=len(refused),
-                    changes=changes or _PROVABILITY_CHANGES_WHEN_LIST_UNCHANGED,
-                )
-            )
-        if still:
-            lines.append(self._unprovable_card_line(still))
-        logger.info(
-            "planning driver: run %s — the machine's rewrite before the card "
-            "(round 1) landed (%s); %s",
+        return self._open_the_card_with(
             correlation_id,
-            changes or "nothing on the list changed",
-            (
-                f"the rules-only check still could not assign a verifier to "
-                f"{len(still)} example(s): {still}"
-                if still
-                else "every example can now be proven by rule"
-                if second.checked
-                else "the second check did not run"
-            ),
+            draft,
+            provability,
+            lines=[self._unprovable_card_line(refused)],
         )
-        return self._open_the_card_with(correlation_id, final, provability, lines=lines)
 
     @staticmethod
     def _unprovable_card_line(titles: Sequence[str]) -> str:
@@ -5707,35 +5411,12 @@ class PlanningRunDriver:
     @staticmethod
     def _how_the_spent_rewrite_went(spec_row: Mapping[str, Any]) -> str | None:
         """The plan-stop card's word for how the run's one rewrite went when
-        it was spent before this stamping — at the plan stage on an earlier
+        it was spent before this stamping, at the plan stage on an earlier
         drive (``rewritten_by_machine``: it landed, so titles refused now
-        "still could not be proven"), or before the card (Part K: landed →
-        the same; refused by the checker → rule 6's "was refused by the
-        checker: <reason>" variant). ``None`` when no rewrite was spent."""
+        "still could not be proven"). ``None`` when no rewrite was spent.
+        (The pre-card round went in step 2, 26 October 2026.)"""
         if spec_row.get("rewritten_by_machine"):
             return _REWRITE_STILL_UNPROVEN
-        pre_card = PlanningRunDriver._pre_card_round(spec_row)
-        if pre_card is None:
-            return None
-        if pre_card.get("rewritten"):
-            return _REWRITE_STILL_UNPROVEN
-        if pre_card.get("refused_by_checker"):
-            reason = " ".join(str(pre_card.get("checker_reason") or "").split()).rstrip(".")
-            return (
-                "was refused by the checker: "
-                + (reason or "the checker gave no reason")
-            )
-        return _REWRITE_STILL_UNPROVEN
-
-    @staticmethod
-    def _pre_card_round(spec_row: Mapping[str, Any]) -> Mapping[str, Any] | None:
-        """The approved spec row's record of a machine note round that ran
-        BEFORE the card (Part K), or ``None`` when none did. Present, it is
-        the run's one rewrite (rule 6: never a third try), so the plan
-        stage's stamping asks the model instead of sending the note again."""
-        block = spec_row.get("provability")
-        if isinstance(block, Mapping) and block.get("round"):
-            return block
         return None
 
     async def _prove_digest_against_branch(
@@ -5751,13 +5432,15 @@ class PlanningRunDriver:
         seed: Mapping[str, Any] | None = None,
         problems: Sequence[str] = (),
     ) -> tuple[dict[str, Any], dict[str, Any]]:
-        """Re-run the digest check against the COMMITTED spec, then build the card.
+        """Read the digest and the COMMITTED spec, then build the card.
 
-        Returns ``(digest, card)``. Since 24 October 2026 nothing here ends the
-        run: a missing or unreadable digest, or one that does not match the
-        committed spec, is shown as it is, and each problem is a line on the
-        card (``problems`` carries any the spec-writer's own check found). The
-        person reading the card decides; the worked examples ride along.
+        Returns ``(digest, card)``. Nothing here ends the run (24 October
+        2026): a missing or unreadable digest is shown as it is, and each
+        problem is a line on the card (``problems`` carries any the
+        spec-writer's own check found). Since step 2 (26 October 2026) Forge
+        no longer re-checks the digest against the spec itself: the spec
+        writer's own check, which lets the writer repair it, is the one place.
+        The person reading the card decides; the worked examples ride along.
         """
         found = [str(p) for p in problems]
         digest_obj: Any = {}
@@ -5771,40 +5454,13 @@ class PlanningRunDriver:
                 digest_obj = {}
 
         feature_rel = self._feature_file_rel(files)
-        assumptions_rel = next(
-            (rel for rel in files if rel.endswith(_SPEC_ASSUMPTIONS_SUFFIX)), None
-        )
         committed_feature: str | None = None
-        committed_assumptions: str | None = None
         if feature_rel:
             committed_feature = await self._deps.git_runner.read_file_from_branch(
                 repo_path=repo_path, branch=branch, file_path=feature_rel
             )
-        if assumptions_rel:
-            committed_assumptions = await self._deps.git_runner.read_file_from_branch(
-                repo_path=repo_path, branch=branch, file_path=assumptions_rel
-            )
-
-        manifest: dict[str, Any] = {}
-        if committed_assumptions:
-            try:
-                parsed = yaml.safe_load(committed_assumptions)
-            except yaml.YAMLError:
-                parsed = None
-            if isinstance(parsed, Mapping):
-                manifest = dict(parsed)
-
         if committed_feature is None:
-            found.append(
-                "the committed worked examples could not be read back, so the "
-                "summary was not checked against them"
-            )
-        elif isinstance(digest_obj, Mapping) and digest_obj:
-            found.extend(
-                check_digest_consistency(
-                    digest_obj, committed_feature, manifest, slug
-                )
-            )
+            found.append("the committed worked examples could not be read back")
         if not isinstance(digest_obj, Mapping):
             found.append("the summary is not a list of sentences")
             digest_obj = {}
@@ -6742,9 +6398,7 @@ class PlanningRunDriver:
         # An approved receipt survives a stop before the build is queued. It
         # still binds this run to its captured context on recovery; validate
         # before the idempotent shortcut can authorize downstream build work.
-        _factory_document, broken = ensure_factory_context(deps.store, correlation_id)
-        if broken is not None:
-            return await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
+        ensure_factory_context(deps.store, correlation_id)
         if self._has_leg_event(correlation_id, _FEATURE_PLAN_STAGE):
             logger.info(
                 "planning driver: run %s feature-plan already complete "
@@ -6778,26 +6432,6 @@ class PlanningRunDriver:
         # for the repo is the stamping step's own reading (an unenforced
         # repo stamps as before). The second stamping, after a rewrite, asks
         # the model about what is still refused.
-        pre_card = self._pre_card_round(
-            self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
-        )
-        if pre_card is not None:
-            # Part K (2026-09-07): the machine's one note round already ran
-            # before the card, so this stamping asks the model about anything
-            # still refused rather than sending the note again.
-            logger.info(
-                "planning driver: run %s — the machine's note round (round 1) "
-                "ran before the spec card (%s); the plan stage's stamping runs "
-                "with the model fallback allowed and never sends the note again",
-                correlation_id,
-                (
-                    "the checker refused the rewrite"
-                    if pre_card.get("refused_by_checker")
-                    else "the rewrite landed"
-                    if pre_card.get("rewritten")
-                    else "the rewrite did not land"
-                ),
-            )
         first = await self._plan_attempt(
             row,
             correlation_id,
@@ -6854,8 +6488,7 @@ class PlanningRunDriver:
                 return False
             if not self._machine_rewrite_allowed(correlation_id, stamps):
                 # Today's stop — or, on a re-drive after the one rewrite was
-                # already recorded (rule 7), or when the machine spent its one
-                # note BEFORE the card (Part K), the stop that says so.
+                # already recorded (rule 7), the stop that says so.
                 spec_row = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
                 return await self._stop_at_stamps(
                     correlation_id,
@@ -7148,10 +6781,7 @@ class PlanningRunDriver:
         if broken is not None:
             await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
             return None
-        factory_document, broken = ensure_factory_context(self._deps.store, correlation_id)
-        if broken is not None:
-            await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
-            return None
+        factory_document = ensure_factory_context(self._deps.store, correlation_id)
         texts = context_texts(documents) + reference_context_texts(
             reference.files if reference is not None else ()
         )
@@ -7259,11 +6889,11 @@ class PlanningRunDriver:
             )
             return None
 
-        # Semantic judgement belongs to the specialist Player/Coach. Forge's
-        # caller enforces that exact decision and the identity of the exact
-        # artifact tree it is about; it does not infer intent from phrases.
+        # Semantic judgement belongs to the specialist Player/Coach. Forge
+        # reads its record about this exact artifact tree and shows the score
+        # on the build card (step 2, 26 October 2026: advice, never a refusal).
         #
-        # A refusing verdict still ends the run. A record that cannot be read
+        # A refusing decision still ends the run. A record that cannot be read
         # as a verdict about this tree is bookkeeping (24 October 2026): the
         # existing exact-artifact re-review below is asked, and if its record
         # cannot be read either the build card says so and the card decides.
@@ -7324,10 +6954,23 @@ class PlanningRunDriver:
                 ),
             )
 
+        # NO REVIEW RECORD AT ALL (step 2, 26 October 2026): the planning seat
+        # hands on its best draft, unaccepted, with the reviewer's objections
+        # in ``plan_advice`` and no ``semantic_review.json``. That is
+        # bookkeeping: it is logged, the build card says so beside the
+        # objections, and the plan carries on with no re-review.
+        missing_record = semantic_error == _SEMANTIC_REVIEW_MISSING
+        if missing_record:
+            logger.warning(
+                "planning driver: run %s — the plan came with no review record "
+                "(the seat's best draft, unaccepted) — ADVISORY; the build card "
+                "says so and shows the reviewer's objections",
+                correlation_id,
+            )
         semantic_state: dict[str, Any] = {
             "role_output": role_output,
             "review": traceability,
-            "unreadable": None,
+            "unreadable": _SEMANTIC_REVIEW_MISSING if missing_record else None,
             # The plan writer's one ordinary-plan recovery, when the re-review
             # answers with it before anything is written (step 1).
             "recovered": None,
@@ -7337,7 +6980,7 @@ class PlanningRunDriver:
         async def _ensure_semantic_review(
             candidate_files: Mapping[str, str],
         ) -> str | None:
-            """``None`` to carry on, or the reason a REFUSING verdict ends the
+            """``None`` to carry on, or the reason a REFUSING decision ends the
             run. A record that cannot be read, after the one re-review, is
             kept as the card's line and never asked about again."""
             if semantic_state["unreadable"] is not None:
@@ -7488,7 +7131,19 @@ class PlanningRunDriver:
                     + semantic_error,
                 )
             outcome = await validate(worktree, feature_id)
-            return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
+            if not outcome.ok:
+                # Advice since step 2 (26 October 2026, census FRG-082): one
+                # rule in one place. GuardKit validates the feature itself
+                # when it loads it to build; this copy is logged, not refused.
+                logger.warning(
+                    "planning driver: run %s — guardkit feature validate "
+                    "complained about %s (%s) — ADVISORY; the plan is "
+                    "committed and GuardKit checks it when it builds",
+                    correlation_id,
+                    feature_id,
+                    outcome.detail,
+                )
+            return PreCommitResult(ok=True)
 
         # Sandbox first (2026-09-07, rule 70): a git runner that lives in the
         # repository's sandbox cannot run the closure above — nothing the
@@ -7709,6 +7364,12 @@ class PlanningRunDriver:
             traceability=semantic_state["review"],
             review_unreadable=semantic_state["unreadable"],
             branch=plan_branch if plan_branch != branch else None,
+            plan_advice=tuple(
+                sorted(
+                    (text for _rule, text in self._plan_advice_items(role_output)),
+                    key=lambda line: not line.startswith(_MISSING_PREREQUISITE),
+                )
+            ),
         )
 
     # -- the plan leg's pre-commit checks, declared (sandbox first, rule 70) --
@@ -7861,7 +7522,7 @@ class PlanningRunDriver:
         ``no_model`` exactly when the closure would pass ``rules_only``
         (rule 1a: the law enforced and the rewrite round still possible),
         blocking exactly when the closure's stop is armed (the law enforced);
-        then ``feature-validate``, always blocking. When forge's own check
+        then ``feature-validate``, never blocking (step 2). When forge's own check
         refuses the plan before the normalizer (a contradicting
         ``feature_files:``), the normalizer is not declared and the refusal is
         the stamping outcome, as the closure has it.
@@ -7934,8 +7595,12 @@ class PlanningRunDriver:
                     blocking=prelude.enforcement["enforcement"] == "enforced",
                 )
             )
+        # Advice since step 2 (26 October 2026, census FRG-082): GuardKit
+        # validates the feature when it loads it to build.
         checks.append(
-            PreCommitCheck(name="feature-validate", args={"feature_id": feature_id})
+            PreCommitCheck(
+                name="feature-validate", args={"feature_id": feature_id}, blocking=False
+            )
         )
         logger.info(
             "planning driver: the plan leg's pre-commit checks for %s are declared "
@@ -8025,11 +7690,6 @@ class PlanningRunDriver:
             return False
         spec_row = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
         if spec_row.get("rewritten_by_machine"):
-            return False
-        if self._pre_card_round(spec_row) is not None:
-            # Part K (2026-09-07): the machine's one note was sent BEFORE the
-            # card; the plan stage never sends it again — its stamping asks
-            # the model, as the card told the owner it would.
             return False
         return True
 
@@ -8734,9 +8394,7 @@ class PlanningRunDriver:
                     _FEATURE_PLAN_STAGE,
                     "requirement amendment refused: " + str(exc),
                 )
-        factory_document, broken = ensure_factory_context(deps.store, correlation_id)
-        if broken is not None:
-            return await self._fail_leg(correlation_id, _FEATURE_PLAN_STAGE, broken)
+        factory_document = ensure_factory_context(deps.store, correlation_id)
         if factory_document is not None:
             details["factory_context"] = factory_document.receipt()
         _memory_text, memory_receipt = self._recorded_memory_decisions(correlation_id)
@@ -8746,9 +8404,24 @@ class PlanningRunDriver:
             details["stamp_normalizer"] = stamp_receipt
         if semantic_review is not None:
             details["semantic_review"] = semantic_review
+            score = semantic_review.get("criterion_score")
+            details[PLAN_REVIEW_NOTE_KEY] = _PLAN_REVIEW_SCORE_CARD_LINE.format(
+                score=f"{float(score):.2f}"
+                if isinstance(score, (int, float)) and not isinstance(score, bool)
+                else "unknown",
+                verdict=semantic_review.get("coach_verdict") or "not given",
+            )
         if attempt.review_unreadable:
             details[PLAN_REVIEW_NOTE_KEY] = _PLAN_REVIEW_UNREADABLE_CARD_LINE.format(
                 reason=attempt.review_unreadable
+            )
+        if attempt.plan_advice:
+            # Information for the approver, never a gate (step 2).
+            details[PLAN_ADVICE_NOTE_KEY] = _PLAN_ADVICE_CARD_LINE.format(
+                advice=" ".join(
+                    line if line.rstrip().endswith((".", "!", "?")) else line.rstrip() + "."
+                    for line in attempt.plan_advice
+                )
             )
         documents, _broken = self._recorded_project_documents(correlation_id)
         if documents:
@@ -9540,31 +9213,27 @@ class PlanningRunDriver:
         # leg never ran this drive).
         spec_details = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
         raw_seed = spec_details.get("pass_bar_seed")
+        # STEP 2 (26 October 2026, census FRG-065): one rule in one place.
+        # GuardKit's own task-start precondition is where a missing pass bar
+        # is refused (when a project switches it on); Forge's copy here no
+        # longer ends the run. A seed that is missing or unreadable is logged
+        # and no pass bars are registered.
+        seed_problem: str | None = None
+        seed: Any = None
         if not raw_seed:
-            # (c) no seed shipped (older specialist). Fail LOUDLY at this cheaper
-            # layer — the WS2 B2 precondition would refuse the build anyway.
-            return await self._fail_leg(
-                correlation_id,
-                _QA_PASS_BARS_STAGE,
-                "the 007 reply shipped no pass-bar seed (pass-bar-seed-*.yaml); "
-                "cannot register the per-task QA pass bars the B2 precondition "
-                "demands — the specialist must emit the feature-grain seed",
+            seed_problem = (
+                "the 007 reply shipped no pass-bar seed (pass-bar-seed-*.yaml)"
             )
-
-        try:
-            seed = yaml.safe_load(raw_seed)
-        except yaml.YAMLError as exc:
-            return await self._fail_leg(
-                correlation_id,
-                _QA_PASS_BARS_STAGE,
-                f"the captured pass-bar seed is not parseable YAML: {exc}",
-            )
-        if not isinstance(seed, Mapping):
-            return await self._fail_leg(
-                correlation_id,
-                _QA_PASS_BARS_STAGE,
-                "the captured pass-bar seed is not a YAML mapping",
-            )
+        else:
+            try:
+                seed = yaml.safe_load(raw_seed)
+            except yaml.YAMLError as exc:
+                seed_problem = f"the captured pass-bar seed is not parseable YAML: {exc}"
+            else:
+                if not isinstance(seed, Mapping):
+                    seed_problem = "the captured pass-bar seed is not a YAML mapping"
+        if seed_problem is not None:
+            return self._skip_pass_bars(correlation_id, seed_problem)
 
         # AUTH DOOR (SPL-007 §A.2, Rich-ratified §5 call — CURED 2026-07-31 off
         # live run dff0cd00): an auth-surface-bearing seed no longer KILLS the
@@ -9782,28 +9451,33 @@ class PlanningRunDriver:
         validate = deps.validate_pass_bar
 
         async def _pre_commit(worktree: Path) -> PreCommitResult:
-            # Run guardkit's OWN ``qa validate pass-bar`` on every minted bar so a
-            # malformed forge-minted bar fails the leg before it lands (never a
-            # bar the B2 gate would later reject).
+            # Run guardkit's OWN ``qa validate pass-bar`` on every minted bar.
+            # Advice since step 2 (26 October 2026, census FRG-068): GuardKit's
+            # task-start precondition validates the same bar where it is
+            # enforced, so a complaint here is logged and the bars are written.
             for rel in sorted(bars):
                 outcome = await validate(worktree, rel)
                 if not outcome.ok:
-                    return PreCommitResult(
-                        ok=False, detail=f"{rel}: {outcome.detail}"
+                    logger.warning(
+                        "planning driver: run %s — %s: %s — ADVISORY; written "
+                        "anyway (GuardKit checks it at task start)",
+                        correlation_id,
+                        rel,
+                        outcome.detail,
                     )
             return PreCommitResult(ok=True)
 
         # Sandbox first (rule 87): for a runner that lives in the repository's
         # sandbox the same check is DECLARED once per minted bar, in the same
-        # order the loop above runs them; the first refusal stops the list and
-        # refuses the commit, exactly as the loop's early return does.
+        # order the loop above runs them, as advice (non-blocking), exactly as
+        # the loop above logs and carries on.
         git_runner = self._git_runner_for(_target_repo)
         pre_commit: Any = _pre_commit
         if self._runner_takes_declared_checks(git_runner):
             pre_commit = PreCommitChecks(
                 tuple(
                     PreCommitCheck(
-                        name="validate-pass-bar", args={"bar_file": rel}, blocking=True
+                        name="validate-pass-bar", args={"bar_file": rel}, blocking=False
                     )
                     for rel in sorted(bars)
                 )
@@ -10862,17 +10536,23 @@ class PlanningRunDriver:
         raw_slug = str(seed.get("feature_slug") or "").strip()
         slug = self._sanitise_slug(raw_slug) or feature_id.lower()
         slug_snake = re.sub(r"[^a-z0-9]+", "_", slug.lower()).strip("_")
+        # STEP 2 (26 October 2026, census FRG-069): registering this optional
+        # after-deploy check is the factory's own bookkeeping. Anything that
+        # stops it below is an honest skip with its reason, which both merge
+        # cards say; it never ends the run.
         if not slug_snake:
-            return await self._fail_leg(
+            return self._skip_feature_gate(
                 correlation_id,
-                _QA_FEATURE_GATE_STAGE,
                 f"could not derive a gate filename from feature_slug={raw_slug!r} "
-                f"/ feature_id={feature_id}",
+                f"/ feature_id={feature_id} — no gate registered",
+                reason_code=SKIP_REGISTRATION_FAILED,
+                feature_id=feature_id,
+                address=endpoint,
             )
         gate_rel = f"qa/gates/{slug_snake}_gate.py"
 
         # (c) Fill the template + append the registry entry. A drift in the
-        # template's fillable literals, or a malformed registry, is a LOUD fail.
+        # template's fillable literals, or a malformed registry, is a skip.
         try:
             filled_gate = self._fill_feature_gate(template, slug, endpoint)
             new_registry = self._append_gate_registry_entry(
@@ -10882,8 +10562,12 @@ class PlanningRunDriver:
                 pass_bar_ref=pass_bar_ref,
             )
         except _FeatureGateFillError as exc:
-            return await self._fail_leg(
-                correlation_id, _QA_FEATURE_GATE_STAGE, str(exc)
+            return self._skip_feature_gate(
+                correlation_id,
+                f"{exc} — no gate registered",
+                reason_code=SKIP_REGISTRATION_FAILED,
+                feature_id=feature_id,
+                address=endpoint,
             )
 
         validate = deps.validate_gate_registry
@@ -10946,17 +10630,22 @@ class PlanningRunDriver:
             if gitres.status != "failed":
                 amendment_qa = await finish_qa(amendment_qa, git_runner, repo_path, gitres.sha)
         except Exception as exc:  # noqa: BLE001 — write boundary
-            return await self._fail_leg(
+            return self._skip_feature_gate(
                 correlation_id,
-                _QA_FEATURE_GATE_STAGE,
-                f"feature-gate write raised {type(exc).__name__}: {exc}",
+                f"feature-gate write raised {type(exc).__name__}: {exc} — no "
+                "gate registered",
+                reason_code=SKIP_REGISTRATION_FAILED,
+                feature_id=feature_id,
+                address=endpoint,
             )
         if gitres.status == "failed":
-            return await self._fail_leg(
+            return self._skip_feature_gate(
                 correlation_id,
-                _QA_FEATURE_GATE_STAGE,
                 f"feature-gate write / qa validate gate-registry failed: "
-                f"{gitres.stderr}",
+                f"{gitres.stderr} — no gate registered",
+                reason_code=SKIP_REGISTRATION_FAILED,
+                feature_id=feature_id,
+                address=endpoint,
             )
 
         deps.store._record_event(
@@ -10994,6 +10683,46 @@ class PlanningRunDriver:
             endpoint["path"],
             feature_id,
             plan_sha,
+        )
+        return True
+
+    def _skip_pass_bars(self, correlation_id: str, reason: str) -> bool:
+        """Record a skipped ``qa-pass-bars`` leg and CONTINUE (step 2, 26
+        October 2026, census FRG-065): no pass bars are registered, the reason
+        is logged, and the run goes on to the feature-gate leg, which skips
+        its gate for want of a pass bar. GuardKit's own task-start
+        precondition is where a missing pass bar is refused, where enforced."""
+        logger.warning(
+            "planning driver: run %s — %s — ADVISORY; no per-task pass bars are "
+            "registered and the run carries on",
+            correlation_id,
+            reason,
+        )
+        from forge.planning.requirement_amendment_store import skipped_qa
+
+        plan_details = self._leg_event_details(correlation_id, _FEATURE_PLAN_STAGE)
+        branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
+        plan_sha = str(plan_details.get("sha") or "")
+        amendment_qa = skipped_qa(
+            self._deps.store._connection, correlation_id, branch, plan_sha
+        )
+        self._deps.store._record_event(
+            correlation_id=correlation_id,
+            stage_label=_QA_PASS_BARS_STAGE,
+            status="approved",
+            actor_identity="planning-driver",
+            details_json=json.dumps(
+                {
+                    "skipped": True,
+                    "reason_code": "no_usable_seed",
+                    "reason": reason,
+                    **({"requirement_amendment_qa": amendment_qa}
+                       if amendment_qa is not None else {}),
+                    "bar_files": [],
+                    "registered_at_sha": plan_sha,
+                    "branch": branch,
+                }
+            ),
         )
         return True
 
@@ -11635,8 +11364,9 @@ class PlanningRunDriver:
         """Read and verify the specialist's decisive semantic review receipt.
 
         Missing or malformed evidence is never approval. The receipt must name
-        the one semantic criterion, carry an accepting Coach verdict, and bind
-        byte-for-byte to the plan tree Forge is about to use.
+        the one semantic criterion and bind byte-for-byte to the plan tree
+        Forge is about to use. Its score and the Coach's verdict are advice
+        for the build card (step 2, 26 October 2026), never a refusal.
         """
         raw = role_output.get("semantic_review.json")
         if isinstance(raw, str):
@@ -11647,30 +11377,18 @@ class PlanningRunDriver:
         elif isinstance(raw, Mapping):
             parsed = dict(raw)
         else:
-            return None, "semantic_review.json is missing"
+            return None, _SEMANTIC_REVIEW_MISSING
         if not isinstance(parsed, Mapping):
             return None, "semantic_review.json is not an object"
 
-        # THE VERDICT FIRST (step 1, 25 October 2026): a refusal that can be
+        # THE DECISION FIRST (step 1, 25 October 2026): a refusal that can be
         # read is a refusal, whatever is wrong with the rest of the record.
-        # Only the record's shape is bookkeeping.
+        # STEP 2 (26 October 2026): the request-traceability score and the
+        # Coach's verdict are advice. The planning seat computes the score
+        # once; Forge shows it on the build card and never refuses a plan for
+        # it. Everything below is the record's shape (bookkeeping).
         if isinstance(parsed.get("decision"), str) and parsed["decision"] != "approved":
             return None, "specialist semantic decision is not approved"
-        read_score = parsed.get("criterion_score")
-        if (
-            isinstance(read_score, (int, float))
-            and not isinstance(read_score, bool)
-            and (
-                (isinstance(read_score, float) and not math.isfinite(read_score))
-                or read_score < 0.5
-            )
-        ):
-            return None, "request_traceability did not pass"
-        if isinstance(parsed.get("coach_verdict"), str) and parsed[
-            "coach_verdict"
-        ] not in {"ACCEPTABLE", "GOOD"}:
-            return None, "Coach verdict is not accepting"
-
         expected_keys = {
             "schema_version",
             "decision",
@@ -11696,12 +11414,12 @@ class PlanningRunDriver:
             isinstance(score, bool)
             or not isinstance(score, (int, float))
             or (isinstance(score, float) and not math.isfinite(score))
-            or score < 0.5
+            or score < 0.0
             or score > 1.0
         ):
-            return None, "request_traceability did not pass"
-        if parsed.get("coach_verdict") not in {"ACCEPTABLE", "GOOD"}:
-            return None, "Coach verdict is not accepting"
+            return None, "criterion_score is not a number from 0 to 1"
+        if not isinstance(parsed.get("coach_verdict"), str):
+            return None, "coach_verdict is not text"
         if type(parsed.get("reviewed_after_rewrite")) is not bool:
             return None, "reviewed_after_rewrite is not boolean"
 
@@ -11730,7 +11448,16 @@ class PlanningRunDriver:
 
     @staticmethod
     def _plan_advice(role_output: Mapping[str, Any]) -> list[str]:
-        """The specialist's ``plan_advice`` as ``rule: text`` lines, or ``[]``.
+        """The specialist's ``plan_advice`` as ``rule: text`` lines, or ``[]``
+        (for the log)."""
+        return [
+            f"{rule}: {text}" if rule else text
+            for rule, text in PlanningRunDriver._plan_advice_items(role_output)
+        ]
+
+    @staticmethod
+    def _plan_advice_items(role_output: Mapping[str, Any]) -> list[tuple[str, str]]:
+        """The specialist's ``plan_advice`` as ``(rule, text)`` pairs, or ``[]``.
 
         Read from the same ``validation.json`` as :meth:`_validation_failures`;
         anything unreadable is simply no advice.
@@ -11745,14 +11472,14 @@ class PlanningRunDriver:
         advice = data.get("plan_advice") if isinstance(data, Mapping) else None
         if not isinstance(advice, list):
             return []
-        lines: list[str] = []
+        items: list[tuple[str, str]] = []
         for item in advice:
             if isinstance(item, Mapping):
                 rule = str(item.get("rule") or "").strip()
                 text = str(item.get("text") or "").strip()
                 if text:
-                    lines.append(f"{rule}: {text}" if rule else text)
-        return lines
+                    items.append((rule, text))
+        return items
 
     @staticmethod
     def _validation_failures(role_output: Mapping[str, Any]) -> list[str]:

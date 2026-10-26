@@ -1,8 +1,15 @@
-"""Immutable factory interface evidence, retained in existing planning events."""
+"""Immutable factory interface evidence, retained in existing planning events.
+
+Bookkeeping (step 2, 26 October 2026, census FRG-049): a record of this
+evidence that is lost, corrupt or in conflict, or an installed reference that
+differs from its manifest, is logged as advice and the writers are given no
+factory reference for that run; it never ends a run.
+"""
 from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import re
 from dataclasses import dataclass
 from importlib.resources import files
@@ -18,6 +25,8 @@ CAPTURE_STAGE = "factory-deployment-context"
 DISPATCH_STAGE = "factory-deployment-context-dispatch"
 LEGACY_STAGE = "factory-deployment-context-legacy"
 RECEIPT_KEY = "factory_context"
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -82,20 +91,27 @@ def _record(store: Any, correlation_id: str, stage: str, record: dict[str, Any])
 def record_factory_dispatch(store: Any, correlation_id: str,
                             document: FactoryDeploymentDocument | None, *, stage: str) -> None:
     """Durable evidence before dispatch, including a crash before the draft receipt."""
-    recorded, why = ensure_factory_context(store, correlation_id)
-    if why is not None or recorded != document:
-        raise ValueError(why or "factory context changed before dispatch")
+    recorded = ensure_factory_context(store, correlation_id)
+    if recorded != document:
+        logger.warning(
+            "planning run %s: the factory reference changed before the %s "
+            "dispatch — ADVISORY; nothing is recorded for it",
+            correlation_id,
+            stage,
+        )
+        return
     if document is not None:
         _record(store, correlation_id, DISPATCH_STAGE,
                 {RECEIPT_KEY: document.receipt(), "writer": stage})
 
 
-def ensure_factory_context(store: Any, correlation_id: str) -> tuple[FactoryDeploymentDocument | None, str | None]:
+def ensure_factory_context(store: Any, correlation_id: str) -> FactoryDeploymentDocument | None:
     """Validate the whole history; capture only a new run or an exact pre-dispatch recovery.
 
     Equal duplicate records are harmless; conflicting records never pick a winner.
     Only an old spec draft without factory evidence establishes legacy behavior.
-    Neither a missing pair nor a corrupt receipt can establish that exception.
+    A history that cannot be supplied intact is bookkeeping (step 2): it is
+    logged and ``None`` comes back, so the writers get no factory reference.
     """
     try:
         expectations: list[dict[str, str]] = []
@@ -143,7 +159,7 @@ def ensure_factory_context(store: Any, correlation_id: str) -> tuple[FactoryDepl
                         "disposition": "legacy-spec-dispatch-without-factory-context",
                         "detail": "The existing run keeps its original planning context.",
                     })
-                return None, None
+                return None
             document = load_bundled_document()
             expected = document.receipt()
             _record(store, correlation_id, EXPECTATION_STAGE, {RECEIPT_KEY: expected})
@@ -157,6 +173,13 @@ def ensure_factory_context(store: Any, correlation_id: str) -> tuple[FactoryDepl
             _record(store, correlation_id, CAPTURE_STAGE, {RECEIPT_KEY: document.to_record()})
         if document.receipt() != expected or any(item != expected for item in receipts):
             raise ValueError("factory context capture or dispatch receipt conflicts with its expectation")
-        return document, None
+        return document
     except (ValueError, TypeError, AttributeError, KeyError, UnicodeError, OSError) as exc:
-        return None, f"The factory deployment context recorded for this run cannot be supplied intact: {exc}"
+        logger.warning(
+            "planning run %s: the factory deployment context recorded for this "
+            "run cannot be supplied intact (%s) — ADVISORY; the writers are "
+            "given no factory reference",
+            correlation_id,
+            exc,
+        )
+        return None

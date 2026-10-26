@@ -257,7 +257,8 @@ WILL_NOT_LAND_ON_ITS_OWN: frozenset[str] = frozenset(
 #: How long a build that finished clean may wait for its merge card to be
 #: offered before the queue asks "hold or go" about the row waiting on it.
 #: The offer normally follows within seconds; it writes nothing when it
-#: declines to offer (a build with failed tasks), so the only sign is time.
+#: declines to offer (the merge press switched off, say), so the only sign is
+#: time.
 #: Ten minutes is long enough never to ask the moment a build finishes.
 MERGE_CARD_GRACE_SECONDS: int = 10 * 60
 
@@ -739,8 +740,8 @@ def work_landing(
       which is the queue's behaviour from before.
     - ``NO_MERGE_CARD`` — the merge executor is on, the build finished
       COMPLETE, and no merge card has been offered for
-      :data:`MERGE_CARD_GRACE_SECONDS` since it finished (the offer refuses a
-      build with failed tasks and writes nothing durable when it does).
+      :data:`MERGE_CARD_GRACE_SECONDS` since it finished (an offer that is
+      not made writes nothing durable).
     - ``NOT_LANDED_YET`` — everything else: building, finished and waiting
       for its card, at its merge card (answered in time or not), approved and
       waiting for the repository's merge or running its checks, or sending.

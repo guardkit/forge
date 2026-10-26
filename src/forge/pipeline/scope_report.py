@@ -1,36 +1,33 @@
-"""The scope pass — hold the finished build against its plan AND against the
-sentence the person actually sent.
+"""The scope pass — hold the finished build against its plan.
 
 WHY (the planner fix, 2026-09-15). Twelve builds for one sentence: the
 specification was right twelve times out of twelve and the plan behind it was
 different every time. Something nobody asked for turned up in ten of the
-twelve — five modules here, a database migration there — and in three of them
-the web address moved, which is what got a run refused at the live gate an
-hour later. None of it reached the card Rich taps to say merge.
+twelve — five modules here, a database migration there. None of it reached the
+card Rich taps to say merge.
 
-So this asks TWO questions of a finished build, and they are deliberately not
-the same question:
+So this asks one question of a finished build: which files did this build
+change that no task document named? That is the blast radius, and "the plan
+did not name it" is the right test for it, because a sentence names no files
+at all. It also lists the files that already existed and that the branch
+changed.
 
-* **against the plan** — which files did this build change that no task
-  document named? That is the blast radius, and "the plan did not name it" is
-  the right test for it, because a sentence names no files at all.
-* **against the request** — does this build answer at a web address the
-  sentence never named, or add a capability the sentence never asked for?
-  That is read from what the branch WROTE, not from what the plan promised,
-  and it is the half that catches a plan that was followed faithfully into
-  the wrong place. It is read in what the branch DECLARES — the files it
-  changed and the lines that say what the software now does — and not in
-  every line of source it wrote, because a capability word inside a test
-  fixture, a comment or a bare import is not a capability this build added.
+FACTS, NOT VERDICTS (step 2, 26 October 2026). The second half of this pass
+read what the branch wrote for "web addresses the request did not name" and
+"capabilities the request did not name". It read an ``echo`` line as a route
+(first step 1 run, feature 2: the local merge judge declined good work over
+it), a file path as a route (feature 8) and CORS headers as permissions
+(re-run feature 7). It was deleted. The card keeps the changed files and the
+diff, which whoever answers the card reads for themselves.
 
-Both answers land in ``<receipts>/<build id>/scope_report.json`` at the moment
+The answer lands in ``<receipts>/<build id>/scope_report.json`` at the moment
 the merge card is offered, which is before anyone says merge, so one sentence
 of it can ride on the card.
 
 THE ONE RULE THIS MODULE WILL NOT BREAK: **a count nobody took is never
-published as a count of nothing.** Three separate things can go unread — the
-branch, the plan's own declaration of files, and the request — and the report
-says which, in ordinary words, rather than printing a zero.
+published as a count of nothing.** The branch and the plan's own declaration
+of files can go unread, and the report says which, in ordinary words, rather
+than printing a zero.
 
 Pure: no git, no network, no database. It is handed the reading and the
 request and it compares them. Never raises.
@@ -40,7 +37,6 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -53,12 +49,9 @@ __all__ = [
     "DeclaredFiles",
     "ScopeReport",
     "files_the_plan_named",
-    "promises_the_capability",
     "read_declared_files",
     "scope_of_the_build",
     "unread_scope",
-    "what_the_branch_declares",
-    "what_the_branch_wrote",
     "write_scope_report",
 ]
 
@@ -106,109 +99,6 @@ _FACTORY_PAPERWORK_FOLDERS: tuple[str, ...] = (
     "qa",
     "tasks",
 )
-
-#: A line that is a note to whoever reads the code next, rather than something
-#: the software now does. A comment saying "error handling" does not make the
-#: build handle errors. The capability words were measured on the prose of
-#: task documents, where such a word is a deliberate promise; in source text
-#: the same word turns up in the commentary of almost every honest build.
-_A_NOTE_TO_A_READER = re.compile(r"^\s*(#|//|/\*|\*/|\*\s)")
-
-#: The quotes that open and close a Python docstring — prose again, and not a
-#: thing the software does.
-_A_BLOCK_OF_PROSE = re.compile('"""' + "|'''")
-
-#: Lines that wire a module up rather than declare anything: an import, and a
-#: logger being made. ``import logging`` at the top of a file is the plainest
-#: false alarm there is, and it was putting "It also added logging, which the
-#: request did not ask for." on the card Rich taps to say merge.
-_ORDINARY_WIRING = re.compile(
-    r"^\s*(from\s+\S+\s+)?import\s"
-    r"|^\s*import\s+\S"
-    r"|\brequire\s*\("
-    r"|=\s*logging\.(getLogger|Logger)\b"
-    r"|^\s*logging\.(basicConfig|config)\b"
-)
-
-
-#: Words that turn a capability word on the same line into a DENIAL of that
-#: capability rather than a promise of it.
-#:
-#: WHY THIS EXISTS. Driven read-only over all twenty-three real build branches
-#: in the api_test repository on 2026-09-15, two of them put the sentence "It
-#: also added authentication, which the request did not ask for." on the card
-#: the owner taps to say merge — and both were wrong. The evidence in each was
-#: the route's own description string, which says the opposite of what the
-#: card said: "This endpoint does not require authentication." on one branch
-#: and "This endpoint is publicly accessible without authentication." on the
-#: other. A line that says the software does NOT do a thing is not evidence
-#: that the build added it.
-_A_DENIAL: frozenset[str] = frozenset({"not", "no", "never", "without"})
-
-#: How many words before the capability word a denial still reaches. Six is
-#: short on purpose: "does not require authentication" is three words, and a
-#: denial further back than that is usually a different clause saying a
-#: different thing.
-_HOW_FAR_A_DENIAL_REACHES = 6
-
-#: One word, hyphens and apostrophes kept, so that "X-Auth-Token",
-#: "non-authenticated" and "doesn't" are each read as the single word they are.
-_A_WORD = re.compile("[A-Za-z][A-Za-z'’-]*")
-
-
-def _a_denial_stands_before(line: str, at: int) -> bool:
-    """True when the capability word starting at ``at`` on this line is being
-    denied rather than promised.
-
-    Two ways a line denies a capability, and both are read here:
-
-    * the word itself is the capability's absence — "unauthenticated",
-      "non-authenticated" — which is a match that begins after an ``un`` or
-      ``non`` prefix inside one word;
-    * a denial stands a few words in front of it — "not", "no", "never",
-      "without", or anything ending in "n't".
-
-    Never raises.
-    """
-    words = [(match.group(0), match.start()) for match in _A_WORD.finditer(line)]
-    for word, start in words:
-        if start <= at < start + len(word):
-            lowered = word.lower()
-            inside = at - start
-            if lowered.startswith("un") and inside >= 2:
-                return True
-            if lowered.startswith("non") and inside >= 3:
-                return True
-            break
-    before = [word.lower() for word, start in words if start < at]
-    for word in before[-_HOW_FAR_A_DENIAL_REACHES:]:
-        if word in _A_DENIAL or word.endswith("n't") or word.endswith("n’t"):
-            return True
-    return False
-
-
-def promises_the_capability(text: str, pattern: re.Pattern[str]) -> bool:
-    """True when at least one LINE of ``text`` really says the software now
-    does the thing ``pattern`` names.
-
-    The question is asked one line at a time, and on each line a match that a
-    denial stands before does not count. Asking it of the whole text at once
-    was what put a false sentence on two of twenty-three real merge cards: the
-    only mention of authentication on either branch was a line saying the
-    endpoint does not require any. Reading line by line also keeps a true
-    mention elsewhere in the same file: a branch whose description string
-    denies authentication on one line and whose code requires an
-    ``X-Auth-Token`` header on another has still added authentication, and the
-    card still says so.
-
-    Never raises.
-    """
-    for line in str(text or "").splitlines():
-        for match in pattern.finditer(line):
-            if not _a_denial_stands_before(line, match.start()):
-                return True
-    return False
-
 
 @dataclass(frozen=True)
 class DeclaredFiles:
@@ -329,29 +219,6 @@ def _repo_path(path: str) -> str:
     return cleaned.lstrip("/")
 
 
-def _pieces_of_a_web_address(route: str) -> tuple[str, ...]:
-    """A web address and every run of whole parts inside it.
-
-    ``/users/created-per-day`` gives ``/users``, ``/created-per-day`` and
-    ``/users/created-per-day``. This exists because a router declares its
-    address in pieces — ``APIRouter(prefix="/users")`` on one line and
-    ``@router.get("/created-per-day")`` on another — and each piece read on
-    its own looked like an address the request never named. Driven over the
-    real build branches, that put two false sentences on almost every card,
-    while the address that really did move,
-    ``/stats/users-created-per-day``, is no run of parts of the request's
-    own address and is still named.
-    """
-    parts = [part for part in str(route or "").strip("/").split("/") if part]
-    pieces: list[str] = []
-    for start in range(len(parts)):
-        for end in range(start + 1, len(parts) + 1):
-            piece = "/" + "/".join(parts[start:end])
-            if piece not in pieces:
-                pieces.append(piece)
-    return tuple(pieces)
-
-
 def _is_scaffolding(path: str) -> bool:
     """True for a file that is not the code this build was asked for: a test
     file, a documentation page, or one of the factory's own planning papers.
@@ -372,163 +239,6 @@ def _is_scaffolding(path: str) -> bool:
         return True
     first = cleaned.split("/", 1)[0].lower()
     return first in _DOC_FOLDERS or first in _FACTORY_PAPERWORK_FOLDERS
-
-
-#: Dependency manifests: the files that list which packages a project uses.
-#: Read for capability words (a build that adds a rate-limiting package to
-#: one has said something), but never for web addresses: a manifest names
-#: packages, versions and local package folders, and none of those is an
-#: address the software answers at.
-_DEPENDENCY_MANIFEST_NAMES: frozenset[str] = frozenset(
-    {
-        "package.json",
-        "go.mod",
-        "go.work",
-        "cargo.toml",
-        "pyproject.toml",
-        "pipfile",
-        "gemfile",
-        "composer.json",
-        "pubspec.yaml",
-    }
-)
-
-
-def _file_name(path: str) -> str:
-    """The last part of a repository path, lower case."""
-    return _repo_path(path).rsplit("/", 1)[-1].lower()
-
-
-def _is_a_lockfile(path: str) -> bool:
-    """True for a dependency lockfile, by its name, wherever it sits.
-
-    WHY (19 October 2026). FEAT-3351 upgraded one test package in
-    ``apps/web/package.json`` and the lockfile beside it, and its merge card
-    said "It also answers at a web address the request did not name:" a dozen
-    times over: ``/minimatch-5``, ``/balanced-match-1``, ``/config-0`` and
-    more. Every one was read out of a lockfile line such as
-    ``"resolved": "https://registry.npmjs.org/minimatch/-/minimatch-5.1.6.tgz"``.
-    A lockfile is written by the package manager, not by the build, and it
-    lists every package the project pulls in, so nothing in it is a web
-    address or a capability this build added. The list of names is the one
-    the security sweep already keeps.
-    """
-    from forge.security_sweep.findings import LOCKFILE_NAMES
-
-    return _file_name(path) in LOCKFILE_NAMES
-
-
-def _is_a_dependency_manifest(path: str) -> bool:
-    """True for a file that lists a project's dependencies: one of the
-    manifests above, or a ``requirements*.txt`` file."""
-    name = _file_name(path)
-    if name in _DEPENDENCY_MANIFEST_NAMES:
-        return True
-    return name.startswith("requirements") and name.endswith(".txt")
-
-
-def _what_one_file_declares(text: str) -> list[str]:
-    """The lines one file added that say something about what the software
-    now does.
-
-    Three kinds of line are dropped, because a web address or a capability
-    word in one of them is not something this build does:
-
-    * a note to a reader — a comment, which includes the ``#!/usr/bin/env``
-      line at the top of a script;
-    * the prose inside a docstring, where an example address such as
-      ``/stats`` is an illustration and not a route the software answers at;
-    * ordinary wiring — an import, or a logger being made.
-
-    Never raises.
-    """
-    kept: list[str] = []
-    inside_prose = False
-    for line in str(text or "").splitlines():
-        quotes = len(_A_BLOCK_OF_PROSE.findall(line))
-        was_inside_prose = inside_prose
-        if quotes % 2:
-            inside_prose = not inside_prose
-        if was_inside_prose or inside_prose or quotes:
-            continue
-        if _A_NOTE_TO_A_READER.match(line) or _ORDINARY_WIRING.search(line):
-            continue
-        kept.append(line)
-    return kept
-
-
-def what_the_branch_wrote(added_by_file: Mapping[str, str]) -> str:
-    """Every line this branch added that says what the software now does, in
-    a file that is the code the build was asked for.
-
-    The web addresses are read here rather than in everything the branch
-    touched, and for the same two reasons the capability words are. A test
-    fixture holding ``permissions: {filesystem: {allowlist: [/tmp]}}`` was
-    otherwise read as this build answering at ``/tmp``; the shebang on a QA
-    gate script the factory itself wrote was read as ``/usr/bin/env``; and an
-    example address in that script's docstring was read as ``/stats``. All
-    three are false sentences on the card Rich taps to say merge. A web
-    address the build really answers at is declared in the code it was asked
-    for, so nothing true is lost by leaving the tests, the documentation, the
-    factory's own paperwork and the commentary out. Dependency lockfiles and
-    manifests are left out for the same reason: they name packages, and a
-    package's download link is not a web address. Never raises.
-    """
-    kept: list[str] = []
-    for path, text in dict(added_by_file or {}).items():
-        name = str(path or "").strip()
-        if not name or _is_scaffolding(name):
-            continue
-        # A lockfile or a dependency manifest declares packages, never a web
-        # address: read as code, a lockfile's download links put a dozen
-        # package names on FEAT-3351's card as addresses (19 October 2026).
-        if _is_a_lockfile(name) or _is_a_dependency_manifest(name):
-            continue
-        kept.extend(_what_one_file_declares(text))
-    return "\n".join(kept)
-
-
-def what_the_branch_declares(added_by_file: Mapping[str, str]) -> str:
-    """What this branch DECLARES, as one piece of text to read capability
-    words in: the names of the files it changed, and the lines it added to
-    them that say something about what the software now does.
-
-    Three kinds of line are left out, because a capability word in one of them
-    is not a capability the build added:
-
-    * everything in a test file or a documentation page — the same scaffolding
-      rule the file comparison uses. A fixture holding the word "permissions",
-      or ``import logging`` at the top of a test, says nothing about what was
-      built;
-    * a note to a reader — a comment, or the prose inside a docstring;
-    * ordinary wiring — an import, or a logger being made.
-
-    The file's own name IS kept, and deliberately: a build that adds
-    ``migrations/0001_add_users.py`` has declared a database migration by
-    putting the file there, whatever its lines say.
-
-    WHY THIS EXISTS. The first version of this pass read every added line of
-    the branch with no idea which file it came from, and the capability words,
-    which were measured on the prose of task documents, then fired on ordinary
-    code. Driven over one real 184-line commit it put a sentence about
-    permissions on the merge card because a test fixture contained the word.
-    A false sentence on the card Rich taps to say merge buries the true one
-    next to it, so the reading is narrowed to what the branch actually
-    declares. Never raises.
-    """
-    declared: list[str] = []
-    for path, text in dict(added_by_file or {}).items():
-        name = str(path or "").strip()
-        if not name or _is_scaffolding(name):
-            continue
-        # A lockfile lists every package the project pulls in, written by
-        # the package manager: a capability word in a package's name there
-        # is not something this build added (19 October 2026).
-        if _is_a_lockfile(name):
-            continue
-        declared.append(name)
-        declared.extend(_what_one_file_declares(text))
-    return "\n".join(declared)
 
 
 @dataclass
@@ -557,16 +267,6 @@ class ScopeReport:
     #: written before task documents carried the two sections, and the
     #: comparison is then not taken rather than reported as a sprawl.
     plan_read: bool = False
-    #: The web addresses the request itself names.
-    routes_in_the_request: list[str] = field(default_factory=list)
-    #: The web addresses this branch wrote.
-    routes_the_branch_declares: list[str] = field(default_factory=list)
-    #: Those of them the request never named.
-    routes_the_request_did_not_name: list[str] = field(default_factory=list)
-    #: Capabilities this branch added that the request never asked for.
-    capabilities_the_request_did_not_name: list[str] = field(default_factory=list)
-    #: The comparison with the sentence was taken at all.
-    routes_read: bool = False
     #: What the branch was held against: the commit the build started from,
     #: or the branch name used when the record named none.
     compared_against: str | None = None
@@ -607,15 +307,6 @@ class ScopeReport:
             "files_the_plan_did_not_name": list(self.files_the_plan_did_not_name),
             "files_allowed_as_scaffolding": list(self.files_allowed_as_scaffolding),
             "plan_read": self.plan_read,
-            "routes_in_the_request": list(self.routes_in_the_request),
-            "routes_the_branch_declares": list(self.routes_the_branch_declares),
-            "routes_the_request_did_not_name": list(
-                self.routes_the_request_did_not_name
-            ),
-            "capabilities_the_request_did_not_name": list(
-                self.capabilities_the_request_did_not_name
-            ),
-            "routes_read": self.routes_read,
             "compared_against": self.compared_against,
             "files_that_already_existed": [
                 item.to_dict() if hasattr(item, "to_dict") else dict(item)
@@ -630,22 +321,17 @@ def scope_of_the_build(
     reading: Any,
     request: str | None,
     request_source: str | None = None,
-    request_why_not: str | None = None,
-    test_roots: Sequence[str] | None = None,
     test_paths: Sequence[str] | None = None,
 ) -> ScopeReport:
-    """Compare a finished branch with its plan and with the request.
+    """Compare a finished branch with its plan.
 
     ``reading`` is a :class:`~forge.pipeline.branch_scope.BranchScopeReading`
     (or anything carrying the same attributes). ``request`` is the sentence
-    the person sent, or ``None`` when it could not be found — in which case
-    the comparison with the sentence is simply not taken, and the report says
-    so instead of reporting nothing wrong. ``request_why_not`` is the caller's
-    own sentence for why it could not be found, used in place of the plain
-    one below when the caller knows something more useful. ``test_paths``
-    are the path patterns this repository's tests live under, used only to
-    mark which of the files that already existed are tests; ``None`` means
-    the plain default.
+    the person sent, or ``None`` when it could not be found; it is carried on
+    the receipt as it was sent and compared with nothing. ``test_paths`` are
+    the path patterns this repository's tests live under, used only to mark
+    which of the files that already existed are tests; ``None`` means the
+    plain default.
 
     Never raises.
     """
@@ -653,11 +339,6 @@ def scope_of_the_build(
         DEFAULT_TEST_PATHS,
         files_that_already_existed,
         parse_changed_files,
-    )
-    from forge.pipeline.addresses_and_capabilities import (
-        _ALL_CAPABILITIES,
-        _is_a_place_on_disk,
-        _route_shaped,
     )
 
     report = ScopeReport(request=request or None, request_source=request_source)
@@ -682,7 +363,7 @@ def scope_of_the_build(
         )
     )
 
-    # (a) AGAINST THE PLAN — the blast radius.
+    # AGAINST THE PLAN — the blast radius.
     named, declared = files_the_plan_named(
         getattr(reading, "plan_documents", {}) or {}
     )
@@ -704,81 +385,7 @@ def scope_of_the_build(
             "so there was nothing to compare what this build changed against"
         )
 
-    # (b) AGAINST THE SENTENCE — the web addresses and the capability words in
-    # what the branch actually wrote. A different question from (a), asked of
-    # the finished build rather than of the plan.
-    added_by_file = getattr(reading, "added_by_file", None)
-    # A reading that never said which file its lines came from cannot be
-    # judged here, and a count nobody could take is never published as a count
-    # of nothing.
-    added_read_whole = bool(
-        getattr(reading, "added_lines_read_whole", False)
-    ) and isinstance(added_by_file, Mapping)
-    if not request:
-        reasons.append(
-            str(request_why_not).strip()
-            if request_why_not and str(request_why_not).strip()
-            else (
-                "the sentence this build was asked for could not be found, so "
-                "what it built was not compared against it"
-            )
-        )
-    elif not added_read_whole:
-        reasons.append(
-            "what this branch added could not be read whole, so what it "
-            "built was not compared against the request"
-        )
-    else:
-        report.routes_read = True
-        # The web addresses are read in the code this build was asked for.
-        # Read every file the branch touched instead and a path inside a test
-        # fixture is reported as an address the build answers at.
-        added = what_the_branch_wrote(added_by_file or {})
-        roots = tuple(test_roots) if test_roots else ()
-        in_request = [
-            route.rstrip("/") for route in _route_shaped(request)
-        ]
-        report.routes_in_the_request = list(dict.fromkeys(in_request))
-        # An address the request named, and every run of whole parts inside
-        # it, counts as named: a router writes its address in pieces.
-        known = {
-            piece.lower()
-            for route in report.routes_in_the_request
-            for piece in _pieces_of_a_web_address(route)
-        }
-        declares: list[str] = []
-        for route in _route_shaped(added, opening_a_string=True):
-            trimmed = route.rstrip("/")
-            if _is_a_place_on_disk(trimmed, roots or ("tests", "test", "spec", "specs")):
-                continue
-            if trimmed not in declares:
-                declares.append(trimmed)
-        report.routes_the_branch_declares = declares
-        report.routes_the_request_did_not_name = [
-            route for route in declares if route.lower() not in known
-        ]
-        # The capability words are read in what the branch DECLARES — the
-        # files it changed and the lines that say what the software now does —
-        # and not in every line of source it wrote. Read the raw diff instead
-        # and a test fixture or a bare import puts a sentence about a
-        # capability on the merge card that nothing in the build supports.
-        what_it_declares = what_the_branch_declares(added_by_file or {})
-        # Read one line at a time, and never count a capability word that the
-        # same line denies: two of twenty-three real build branches said "It
-        # also added authentication" on the merge card purely because their
-        # route description reads "This endpoint does not require
-        # authentication."
-        for capability, pattern in _ALL_CAPABILITIES:
-            if not promises_the_capability(what_it_declares, pattern):
-                continue
-            if pattern.search(request):
-                continue  # the person asked for it; a reading, not an addition
-            if capability not in report.capabilities_the_request_did_not_name:
-                report.capabilities_the_request_did_not_name.append(capability)
-
-    # Each reason is its own sentence, and both starts and ends like one:
-    # joined by a bare space they ran together into one unreadable line, and
-    # joined only by a full stop the second one still began in lower case.
+    # Each reason is its own sentence, and both starts and ends like one.
     def _as_a_sentence(reason: str) -> str:
         trimmed = str(reason).strip().rstrip(".")
         return trimmed[:1].upper() + trimmed[1:] if trimmed else ""

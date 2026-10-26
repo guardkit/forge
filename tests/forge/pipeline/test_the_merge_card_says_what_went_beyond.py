@@ -294,18 +294,15 @@ class TestTheScopePassOnARealBranch:
         assert report.request == REQUEST
         assert report.files_the_plan_named == ["src/users/router.py"]
         assert report.files_the_plan_did_not_name == ["src/analytics/service.py"]
-        assert report.routes_the_request_did_not_name == [
-            "/stats/users-created-per-day"
-        ]
+        # Facts, not verdicts (step 2, 26 October 2026): no route claims.
+        assert not hasattr(report, "routes_the_request_did_not_name")
 
         kept = json.loads(
             (receipts / BUILD_ID / SCOPE_REPORT_NAME).read_text(encoding="utf-8")
         )
         assert kept["request"] == REQUEST
         assert kept["files_changed"] == 2
-        assert kept["routes_the_request_did_not_name"] == [
-            "/stats/users-created-per-day"
-        ]
+        assert "routes_the_request_did_not_name" not in kept
 
     def test_a_repository_forge_cannot_locate_counts_nothing(
         self, pool: SqliteLifecyclePersistence
@@ -718,7 +715,7 @@ class TestAStuckTestSettingsReadNeverHoldsUpTheCard:
 
 
 class TestTheCardAndTheDurableRow:
-    def test_the_card_says_what_went_beyond_the_plan_and_the_request(
+    def test_the_card_says_what_went_beyond_the_plan(
         self,
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
@@ -740,10 +737,7 @@ class TestTheCardAndTheDurableRow:
             "This build also changed 1 file the plan did not name: "
             "src/analytics/service.py — worth a look before you merge." in words
         )
-        assert (
-            "It also answers at a web address the request did not name: "
-            "/stats/users-created-per-day." in words
-        )
+        assert "web address" not in words
         assert words.endswith(
             "Approve = merge into main, deploy to the sandbox and run the "
             "checks; the branch is kept either way. Reject = nothing changes."
@@ -931,7 +925,7 @@ class TestTheRepairJourneysCardCarriesTheSameLine:
     card that actually goes on the wire.
     """
 
-    def test_the_card_says_what_went_beyond_the_plan_and_the_request(
+    def test_the_card_says_what_went_beyond_the_plan(
         self,
         config: ForgeConfig,
         pool: SqliteLifecyclePersistence,
@@ -960,10 +954,7 @@ class TestTheRepairJourneysCardCarriesTheSameLine:
             "This build also changed 1 file the plan did not name: "
             "src/analytics/service.py — worth a look before you merge." in words
         )
-        assert (
-            "It also answers at a web address the request did not name: "
-            "/stats/users-created-per-day." in words
-        )
+        assert "web address" not in words
         # and the rest of the card is untouched: the scope line joins the
         # sentences that were already there, it does not replace one.
         assert words.startswith(f"{FEATURE_ID} is ready to merge on branch {BRANCH}.")

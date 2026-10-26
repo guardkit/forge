@@ -15,8 +15,9 @@ What these hold down:
   rewrites included, and to the plan writer as ``context``; both receipts
   record which files and which versions were sent;
 * a re-drive reuses what was recorded and reads nothing again;
-* a missing document, a symbolic-link document and documents over the budget
-  stop the run at the door with a plain sentence, with nothing dispatched;
+* a missing document and a symbolic-link document stop the run at the door
+  with a plain sentence, with nothing dispatched; documents over the budget
+  are given in full and the overrun is logged (step 2, 26 October 2026);
 * a project that declares nothing has no project documents read or sent;
   its writers still receive the separate factory interface reference;
 * the generic dispatcher keeps ``context`` on the wire.
@@ -453,19 +454,25 @@ async def test_a_symbolic_link_document_is_refused() -> None:
 
 
 @pytest.mark.asyncio
-async def test_over_the_budget_is_refused_naming_every_file_and_size() -> None:
+async def test_over_the_budget_is_given_in_full_and_logged_naming_every_file(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """The budget is a rough guide (step 2, 26 October 2026, census FRG-025):
+    documents over it are given in full and the overrun is logged."""
     at_limit = "x" * (PROJECT_DOCUMENTS_BUDGET_BYTES - len(AGENTS))
     tree = _Tree({"AGENTS.md": AGENTS, DECLARED[0]: at_limit})
     documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
     assert why is None and sum(d.bytes for d in documents) == PROJECT_DOCUMENTS_BUDGET_BYTES
 
     tree.files[DECLARED[0]] = at_limit + "x"
-    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
-    assert documents == ()
-    assert why is not None
-    assert str(PROJECT_DOCUMENTS_BUDGET_BYTES) in why
-    assert f"AGENTS.md ({len(AGENTS)} bytes)" in why
-    assert f"{DECLARED[0]} ({len(at_limit) + 1} bytes)" in why
+    with caplog.at_level("WARNING"):
+        documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
+    assert why is None
+    assert sum(d.bytes for d in documents) == PROJECT_DOCUMENTS_BUDGET_BYTES + 1
+    assert str(PROJECT_DOCUMENTS_BUDGET_BYTES) in caplog.text
+    assert f"AGENTS.md ({len(AGENTS)} bytes)" in caplog.text
+    assert f"{DECLARED[0]} ({len(at_limit) + 1} bytes)" in caplog.text
+    assert "ADVISORY" in caplog.text
 
 
 def test_each_context_text_starts_with_one_line_naming_its_path() -> None:
@@ -560,8 +567,9 @@ async def test_the_budget_counts_raw_bytes(tmp_path: Path) -> None:
     )
 
     assert len(text) < PROJECT_DOCUMENTS_BUDGET_BYTES
-    assert documents == ()
-    assert why is not None and f"({len(text.encode('utf-8'))} bytes)" in why
+    # Over the guide by raw bytes, and still given in full (step 2).
+    assert why is None
+    assert sum(d.bytes for d in documents) == len(text.encode("utf-8"))
 
 
 @pytest.mark.asyncio
@@ -769,7 +777,7 @@ async def test_a_document_missing_at_the_commit_fails_the_run_at_the_door(
 
 
 @pytest.mark.asyncio
-async def test_documents_over_the_budget_fail_the_run_at_the_door(
+async def test_documents_over_the_budget_do_not_stop_the_run_at_the_door(
     ledger: SqlitePlanningRunStore, tmp_path: Path
 ) -> None:
     big = "y" * PROJECT_DOCUMENTS_BUDGET_BYTES
@@ -777,11 +785,12 @@ async def test_documents_over_the_budget_fail_the_run_at_the_door(
     h = at_the_door._make_driver(ledger, repo_path=copy, worktrees_root=tmp_path / "wt")
     row = at_the_door._queue_running(ledger)
 
-    assert await h.driver._door(row, at_the_door.CID) is None
+    assert await h.driver._door(row, at_the_door.CID) is not None
 
-    assert ledger.get_run(at_the_door.CID)["state"] == PlanningState.FAILED.value
-    assert str(PROJECT_DOCUMENTS_BUDGET_BYTES) in h.errors[0]
-    assert f"{DECLARED[1]} ({len(big)} bytes)" in h.errors[0]
+    assert ledger.get_run(at_the_door.CID)["state"] != PlanningState.FAILED.value
+    recorded = _recorded(ledger, at_the_door.CID)
+    assert len(recorded) == 1
+    assert DECLARED[1] in [d["path"] for d in recorded[0]]
 
 
 # ---------------------------------------------------------------------------
@@ -1042,12 +1051,6 @@ async def test_a_project_that_declares_nothing_gets_only_factory_context(
         (lambda t: t.links.__setitem__(DECLARED[1], "../x.md") or t.files.pop(DECLARED[1]), "symbolic link"),
         (
             lambda t: t.files.__setitem__(
-                DECLARED[1], "z" * PROJECT_DOCUMENTS_BUDGET_BYTES
-            ),
-            str(PROJECT_DOCUMENTS_BUDGET_BYTES),
-        ),
-        (
-            lambda t: t.files.__setitem__(
                 ".guardkit/config.yaml",
                 DECLARES_DOCUMENTS + "    surprise: [x]\n",
             ),
@@ -1055,7 +1058,7 @@ async def test_a_project_that_declares_nothing_gets_only_factory_context(
         ),
         (lambda t: t.broken.__setitem__("AGENTS.md", "sidecar unreachable"), "sidecar unreachable"),
     ],
-    ids=["missing", "symbolic-link", "over-budget", "unknown-player-key", "unreadable-instruction"],
+    ids=["missing", "symbolic-link", "unknown-player-key", "unreadable-instruction"],
 )
 @pytest.mark.asyncio
 async def test_a_refusal_stops_the_run_before_any_model_is_asked(

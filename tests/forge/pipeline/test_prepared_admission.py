@@ -386,8 +386,6 @@ _MISSING_CASES = {
         "docs/constitution/mission.md",
         "autobuild.player.required_documents",
     ),
-    "pass bar": (f"qa/pass-bar-{TASKS[0]}.yaml", f"the pass bar for {TASKS[0]}"),
-    "QA seed": (f"qa/pass-bar-seed-{SPEC_NAME}.yaml", "the spec's QA seed"),
 }
 
 
@@ -411,19 +409,24 @@ async def test_each_missing_bundle_item_is_refused_by_name(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("item", ["pass bar", "QA seed"])
-async def test_the_qa_files_are_required_with_tier1_enforcement_off(
-    project: Project, runner: WorktreeGitRunner, item: str
+@pytest.mark.parametrize(
+    "path",
+    [f"qa/pass-bar-{TASKS[0]}.yaml", f"qa/pass-bar-seed-{SPEC_NAME}.yaml"],
+    ids=["pass bar", "QA seed"],
+)
+async def test_missing_qa_files_are_left_to_guardkits_own_precondition(
+    project: Project, runner: WorktreeGitRunner, path: str
 ) -> None:
-    path, _words = _MISSING_CASES[item]
+    """Step 2 (26 October 2026, census FRG-101): one rule in one place.
+    GuardKit's task-start precondition requires a pinned pass bar where a
+    project switches it on; admission no longer requires the QA files."""
     files = bundle(config=config_text(tier1_enforced=False))
     files.pop(path)
     project.commit_on(BRANCH, files)
 
     answer = await _admit(project, runner)
 
-    assert not answer.ok
-    assert path in (answer.refusal or "")
+    assert answer.ok, answer.refusal
 
 
 @pytest.mark.asyncio
@@ -547,9 +550,10 @@ async def test_a_binding_document_that_is_not_utf8_is_refused(
 
 
 @pytest.mark.asyncio
-async def test_documents_over_the_budget_are_refused(
+async def test_documents_over_the_budget_are_advice_not_a_refusal(
     project: Project, runner: WorktreeGitRunner
 ) -> None:
+    """Step 2 (26 October 2026, census FRG-025): the budget is a guide."""
     from forge.planning.project_documents import PROJECT_DOCUMENTS_BUDGET_BYTES
 
     files = bundle()
@@ -558,8 +562,7 @@ async def test_documents_over_the_budget_are_refused(
 
     answer = await _admit(project, runner)
 
-    assert not answer.ok
-    assert str(PROJECT_DOCUMENTS_BUDGET_BYTES) in (answer.refusal or "")
+    assert answer.ok, answer.refusal
 
 
 @pytest.mark.asyncio
@@ -741,10 +744,9 @@ def _replace_with_link(project: Project, path: str, target: str) -> None:
     [
         (f"{TASK_DIR}/IMPLEMENTATION-GUIDE.md", "../../../README.md"),
         (f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md", "../../../../outside.md"),
-        (f"qa/pass-bar-{TASKS[0]}.yaml", "nowhere.yaml"),
         (f"{SPEC_DIR}/{SPEC_NAME}_digest.yaml", f"{SPEC_NAME}_summary.md"),
     ],
-    ids=["linked-guide", "linked-task-escaping", "linked-qa-dangling", "linked-digest"],
+    ids=["linked-guide", "linked-task-escaping", "linked-digest"],
 )
 async def test_a_bundle_file_that_is_a_symbolic_link_is_refused_by_name(
     project: Project, runner: WorktreeGitRunner, path: str, target: str
@@ -763,21 +765,23 @@ async def test_a_bundle_file_that_is_a_symbolic_link_is_refused_by_name(
 async def test_a_bundle_file_reached_through_a_linked_folder_is_refused(
     project: Project, runner: WorktreeGitRunner
 ) -> None:
+    # The QA files are no longer read here (step 2), so the linked folder is
+    # the one the task files live in.
     files = bundle()
-    real = {k.replace("qa/", "real-qa/", 1): v for k, v in files.items() if k.startswith("qa/")}
-    files = {k: v for k, v in files.items() if not k.startswith("qa/")}
+    real = {k.replace("tasks/", "real-tasks/", 1): v for k, v in files.items() if k.startswith("tasks/")}
+    files = {k: v for k, v in files.items() if not k.startswith("tasks/")}
     project.commit_on(BRANCH, {**files, **real})
     _git(project.writer, "checkout", "-q", BRANCH)
-    (project.writer / "qa").symlink_to("real-qa")
+    (project.writer / "tasks").symlink_to("real-tasks")
     _git(project.writer, "add", "-A")
-    _git(project.writer, "commit", "-qm", "qa is a linked folder")
+    _git(project.writer, "commit", "-qm", "tasks is a linked folder")
     _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
     _git(project.writer, "checkout", "-q", "main")
 
     answer = await _admit(project, runner)
 
     assert not answer.ok
-    assert "reached through qa, a symbolic link" in (answer.refusal or "")
+    assert "reached through tasks, a symbolic link" in (answer.refusal or "")
 
 
 @pytest.mark.asyncio

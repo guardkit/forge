@@ -274,7 +274,8 @@ async def test_the_plan_legs_checks_run_in_the_sandbox_and_the_stamps_ride_the_c
         if "the plan leg's pre-commit checks" in r.getMessage()
     ]
     assert declared and "normalize-stamps(blocking, --no-model)" in declared[0]
-    assert "feature-validate(blocking)" in declared[0]
+    # Advice since step 2 (26 October 2026, census FRG-082).
+    assert "feature-validate(not blocking)" in declared[0]
 
     # (3) The stamps the sandbox wrote are on the planning branch.
     feature_id = _leg_details(store, "feature-plan")["feature_id"]
@@ -465,7 +466,7 @@ async def test_a_recovered_plan_from_the_final_review_after_the_commit_reaches_h
         cwd=repo, capture_output=True, text=True, check=True,
     ).stdout
     assert [t["branch"] for t in triggered] == [recovered_branch]
-    assert "plan_review_note" not in plan
+    assert plan["plan_review_note"].startswith("The plan reviewer scored")
     # The recovered plan's checks were declared from its own commit's
     # settings: the routing law enforced, as on the first plan.
     normalizes = normalize_calls(fake_guardkit)
@@ -591,30 +592,21 @@ async def test_where_the_law_is_not_enforced_the_refusal_never_blocks_the_commit
 
 
 @pytest.mark.asyncio
-async def test_a_red_feature_validate_in_the_sandbox_fails_the_leg_with_its_reason(
+async def test_a_red_feature_validate_in_the_sandbox_is_advice_and_the_plan_lands(
     store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path, monkeypatch
 ) -> None:
-    """The second declared check blocks the same way: a red ``feature
-    validate`` in the sandbox refuses the commit and the leg fails with what
-    guardkit said, not with a transport error."""
+    """Step 2 (26 October 2026, census FRG-082): the declared ``feature
+    validate`` does not block. A red answer in the sandbox is advice, the
+    plan commits, and GuardKit validates the feature when it builds."""
     repo, _, _ = sandbox_repo
     _queue(store)
     monkeypatch.setenv("FAKE_GUARDKIT_VALIDATE", "red")
     h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    await h.driver.drive(CID)
 
     assert len(validate_calls(fake_guardkit)) == 1
-    assert _plan_yaml_on_branch(repo, f"planning/{CID}") == []
-    # The leg failed with what guardkit said, not with a transport error.
-    failure = json.dumps(
-        [
-            json.loads(e["details_json"] or "{}")
-            for e in store.list_events(CID)
-            if e["stage_label"] == "feature-plan"
-        ]
-    )
-    assert "task file TASK-STAT-001.md missing" in failure
-    assert "could not be reached" not in failure
+    assert _plan_yaml_on_branch(repo, f"planning/{CID}") != []
+    assert store.get_run(CID)["state"] != PlanningState.FAILED.value
 
 
 # ---------------------------------------------------------------------------
@@ -861,23 +853,24 @@ async def test_the_pass_bar_leg_declares_one_check_per_bar_in_the_sandbox(
 
 
 @pytest.mark.asyncio
-async def test_a_malformed_bar_in_the_sandbox_fails_the_leg_and_no_bar_lands(
+async def test_a_malformed_bar_in_the_sandbox_is_advice_and_the_bar_lands(
     store: SqlitePlanningRunStore,
     sandbox_repo,
     fake_guardkit: Path,
     fake_normalizer_module: Path,
     monkeypatch,
 ) -> None:
+    """Step 2 (26 October 2026, census FRG-068): GuardKit's task-start
+    precondition validates the bar where it is enforced; the declared check
+    here does not block, so the bar is written."""
     repo, _, _ = sandbox_repo
     _queue(store)
     monkeypatch.setenv("FAKE_GUARDKIT_QA_VALIDATE", "red-pass-bar")
     h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
+    await h.driver.drive(CID)
 
-    assert _on_branch(repo, f"planning/{CID}", "qa/pass-bar-") == []
-    failure = _failure_text(store, "qa-pass-bars")
-    assert "pass-bar write / qa validate failed" in failure
-    assert "qa/pass-bar-TASK-STAT-001.yaml: guardkit qa validate pass-bar" in failure
+    assert _on_branch(repo, f"planning/{CID}", "qa/pass-bar-") != []
+    assert store.get_run(CID)["state"] != PlanningState.FAILED.value
 
 
 @pytest.mark.asyncio
@@ -965,17 +958,17 @@ async def test_the_provability_check_answers_from_the_sandbox_with_the_spec_comm
 
 
 @pytest.mark.asyncio
-async def test_a_refused_example_in_the_sandbox_fires_the_machines_round_before_the_card(
+async def test_a_refused_example_in_the_sandbox_is_named_on_the_card(
     store: SqlitePlanningRunStore,
     sandbox_repo,
     fake_guardkit: Path,
     fake_normalizer_module: Path,
     monkeypatch,
 ) -> None:
-    """The sandbox's own guardkit refuses two examples by rule, so the
-    machine's note round runs before the card exactly as it does when the
-    check runs in the container: two spec-writer calls, two checks, and the
-    card carries rule 45's words."""
+    """The sandbox's own guardkit refuses two examples by rule. Since step 2
+    (26 October 2026, census FRG-043) that is advice, exactly as when the
+    check runs in the container: one spec-writer call, one check, and the
+    card names the examples that cannot be proven."""
     _queue(store)
     monkeypatch.setenv("FAKE_GUARDKIT_CLASSIFY", "refused")
     h = _driver(
@@ -988,20 +981,16 @@ async def test_a_refused_example_in_the_sandbox_fires_the_machines_round_before_
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["spec"] == 2
-    assert len(classify_calls(fake_guardkit)) == 2
+    assert h.ctx["counters"]["spec"] == 1
+    assert len(classify_calls(fake_guardkit)) == 1
     receipt = _draft_provability(store)[-1]
-    assert receipt["round"] == 1
-    assert receipt["rewritten"] is True
+    assert "round" not in receipt
+    assert receipt["rewritten"] is False
     assert receipt["refused_titles"] == list(REFUSED_TITLES)
+    text = _digest_card_text(h)
+    assert "The rules-only check could not assign a verifier to 2 worked example(s)" in text
     for title in REFUSED_TITLES:
-        assert title in receipt["note"]
-    # The card line's words since 9 October 2026 (407734a4), the same as the
-    # container-side tests in test_driver_target_terminal.py.
-    assert (
-        "The machine rewrote 2 of the worked examples after their provability "
-        "check." in _digest_card_text(h)
-    )
+        assert title in text
 
 
 def _digest_card_text(h) -> str:

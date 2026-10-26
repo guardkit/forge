@@ -385,7 +385,10 @@ async def test_approval_exact_diff_admission_and_protection(
     assert backend.edit(str(work / DOC), "version 2", "version 1").error
     (work / DOC).write_text("shell tried changing the approved requirement\n")
     (work / "requirements/sibling.contract").unlink()
-    (work / "requirements/extra.txt").write_text("unauthorized sibling\n")
+    # A NEW file in the protected folder is not protected (GuardKit eaf5329d,
+    # step 2, 26 October 2026: only files that existed at the build's start
+    # are), so it stays; the existing files are restored.
+    (work / "requirements/extra.txt").write_text("a new sibling\n")
     git(work, "add", "-A")
     git(work, "commit", "-qm", "Unauthorized shell checkpoint fixture")
     assert restore_protected_paths(work, ref) is not None
@@ -395,7 +398,7 @@ async def test_approval_exact_diff_admission_and_protection(
     assert (work / "requirements/sibling.contract").read_text() == x.files[
         "requirements/sibling.contract"
     ]
-    assert not (work / "requirements/extra.txt").exists()
+    assert (work / "requirements/extra.txt").read_text() == "a new sibling\n"
     assert git(work, "diff", "--cached", "--name-only") == ""
     assert (
         git(x.repo, "show", a + ":research/history.txt")

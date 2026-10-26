@@ -1,4 +1,5 @@
-"""Factory-owned interface evidence survives restart and refuses record loss."""
+"""Factory-owned interface evidence survives restart; record loss is advice
+(step 2, 26 October 2026, census FRG-049)."""
 from __future__ import annotations
 
 import copy
@@ -37,8 +38,8 @@ def _remove(store, *stages):
 
 def _capture(store):
     docs.door._queue(store)
-    document, why = context.ensure_factory_context(store, docs.door.CID)
-    assert why is None and document is not None
+    document = context.ensure_factory_context(store, docs.door.CID)
+    assert document is not None
     return document
 
 
@@ -56,7 +57,7 @@ def test_restart_replays_captured_bytes_not_current_package(chain_store, monkeyp
     connection.row_factory = sqlite3.Row
     restarted = SqlitePlanningRunStore(connection, target_terminal_enabled=True)
     monkeypatch.setattr(context, "load_bundled_document", lambda: context.FactoryDeploymentDocument.of("new install", version="2"))
-    assert context.ensure_factory_context(restarted, docs.door.CID) == (document, None)
+    assert context.ensure_factory_context(restarted, docs.door.CID) == document
     assert len([e for e in restarted.list_events(docs.door.CID)
                 if e["stage_label"] == context.CAPTURE_STAGE]) == 1
     connection.close()
@@ -67,10 +68,10 @@ def test_interrupted_capture_recovers_only_matching_package(chain_store, monkeyp
     _remove(chain_store, context.CAPTURE_STAGE)
     changed = context.FactoryDeploymentDocument.of("different installed reference", version="2")
     monkeypatch.setattr(context, "load_bundled_document", lambda: changed)
-    assert "interrupted" in context.ensure_factory_context(chain_store, docs.door.CID)[1]
+    assert context.ensure_factory_context(chain_store, docs.door.CID) is None
     assert not any(e["stage_label"] == context.CAPTURE_STAGE for e in chain_store.list_events(docs.door.CID))
     monkeypatch.setattr(context, "load_bundled_document", lambda: document)
-    assert context.ensure_factory_context(chain_store, docs.door.CID) == (document, None)
+    assert context.ensure_factory_context(chain_store, docs.door.CID) == document
 
 
 @pytest.mark.parametrize("fault", [
@@ -79,7 +80,7 @@ def test_interrupted_capture_recovers_only_matching_package(chain_store, monkeyp
     "missing-capture", "double-loss", "dispatch-before-draft-loss", "conflicting-receipt",
 ])
 @pytest.mark.asyncio
-async def test_corruption_and_loss_refuse_before_writer_dispatch(chain_store, fault):
+async def test_corruption_and_loss_are_advice_and_the_run_carries_on(chain_store, fault):
     document = _capture(chain_store)
     if fault == "bad-json":
         chain_store._connection.execute("UPDATE planning_run_events SET details_json='{' WHERE stage_label=?", (context.CAPTURE_STAGE,))
@@ -111,18 +112,22 @@ async def test_corruption_and_loss_refuse_before_writer_dispatch(chain_store, fa
         _remove(chain_store, context.CAPTURE_STAGE)
     elif fault == "conflicting-receipt":
         _draft_receipt(chain_store, context.FactoryDeploymentDocument.of("other"))
-    h = docs._chain(chain_store, docs._declared_tree(), answers=[])
+    h = docs._chain(chain_store, docs._declared_tree(), answers=[docs.door._answer("approve")])
     await h.driver.drive(docs.door.CID)
-    assert chain_store.get_run(docs.door.CID)["state"] == PlanningState.FAILED.value
-    assert h.calls["spec"] == [] and h.calls["plan"] == []
-    assert any("factory deployment context" in message for _, message, _ in h.notifications)
+    # Bookkeeping never ends a run: nothing stops for the factory context.
+    # (The faults that plant a spec draft of their own then go on to read
+    # that planted draft, whose files are not on any branch.)
+    assert not any("factory deployment context" in message for _, message, _ in h.notifications)
+    if fault not in {"missing-capture", "double-loss", "conflicting-receipt"}:
+        assert chain_store.get_run(docs.door.CID)["state"] != PlanningState.FAILED.value
+        assert h.calls["spec"] != []
 
 
 def test_identical_duplicates_are_not_conflicts(chain_store):
     document = _capture(chain_store)
     _event(chain_store, context.EXPECTATION_STAGE, {"factory_context": document.receipt()})
     _event(chain_store, context.CAPTURE_STAGE, {"factory_context": document.to_record()})
-    assert context.ensure_factory_context(chain_store, docs.door.CID) == (document, None)
+    assert context.ensure_factory_context(chain_store, docs.door.CID) == document
 
 
 @pytest.mark.asyncio
@@ -142,8 +147,8 @@ async def test_legacy_dispatch_keeps_original_context_and_closed_card(chain_stor
                 data["spec_draft"].pop("factory_context", None)
             chain_store._connection.execute("UPDATE planning_run_events SET details_json=? WHERE id=?", (json.dumps(data), event["id"]))
     chain_store._connection.commit()
-    assert context.ensure_factory_context(chain_store, docs.door.CID) == (None, None)
-    assert context.ensure_factory_context(chain_store, docs.door.CID) == (None, None)
+    assert context.ensure_factory_context(chain_store, docs.door.CID) is None
+    assert context.ensure_factory_context(chain_store, docs.door.CID) is None
     legacy = [e for e in chain_store.list_events(docs.door.CID) if e["stage_label"] == context.LEGACY_STAGE]
     assert len(legacy) == 1
     assert json.loads(legacy[0]["details_json"])["disposition"] == "legacy-spec-dispatch-without-factory-context"
@@ -237,26 +242,15 @@ async def test_approved_plan_restart_validates_context_before_build(
         await replay.driver.drive(docs.door.CID)
         assert replay.calls == {"po": [], "spec": [], "plan": []}
         assert docs._drafted(restarted_store) == drafts_before
+        # Step 2: every fault is advice; the approved plan goes on to the build.
+        assert restarted_store.get_run(docs.door.CID)["state"] == PlanningState.BUILD_QUEUED.value
+        assert len(builds) == 1
         if fault in {"valid", "legacy"}:
-            assert restarted_store.get_run(docs.door.CID)["state"] == PlanningState.BUILD_QUEUED.value
-            assert len(builds) == 1
             if fault == "legacy":
                 dispositions = [e for e in restarted_store.list_events(docs.door.CID)
                                 if e["stage_label"] == context.LEGACY_STAGE]
                 assert len(dispositions) == 1
                 assert json.loads(dispositions[0]["details_json"])["disposition"] == "legacy-spec-dispatch-without-factory-context"
-        else:
-            assert restarted_store.get_run(docs.door.CID)["state"] == PlanningState.FAILED.value
-            assert builds == []
-            assert any("factory deployment context" in message
-                       for _, message, _ in replay.notifications)
-            # The approved plan receipt survives; its presence cannot bypass
-            # the missing/corrupt context check or be classified as legacy.
-            remaining = [e for e in restarted_store.list_events(docs.door.CID)
-                         if e["stage_label"] == "feature-plan" and e["status"] == "approved"]
-            assert json.loads(remaining[0]["details_json"])["factory_context"] == receipt
-            assert not any(e["stage_label"] == context.LEGACY_STAGE
-                           for e in restarted_store.list_events(docs.door.CID))
     finally:
         connection.close()
 

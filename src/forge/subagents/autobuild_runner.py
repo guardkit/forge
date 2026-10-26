@@ -2590,9 +2590,6 @@ _SOURCE_COMMIT_PATTERN = re.compile(r"^[0-9a-f]{7,64}$")
 #: What a build id must look like before it is part of a branch name.
 _SOURCE_BRANCH_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._\-]*$")
 
-#: How long GuardKit's own feature check may take before the build is stopped.
-FEATURE_VALIDATE_TIMEOUT_SECONDS: float = 300.0
-
 
 def _source_commit_for_build(payload: Mapping[str, Any]) -> str | None:
     """The exact commit a prepared feature was admitted at, or ``None``.
@@ -2666,64 +2663,6 @@ async def _delete_source_branch(repo_path: Path, branch: str | None) -> None:
             code,
             output,
         )
-
-
-async def _guardkit_feature_validate(
-    guardkit_path: Path,
-    feature_id: str,
-    *,
-    cwd: Path,
-    env: Mapping[str, str],
-) -> str | None:
-    """Run ``guardkit feature validate <id> --json`` in ``cwd``; ``None`` or why not.
-
-    GuardKit's own full check of the feature it is about to build (task files,
-    schema, the ledger lint), run in the worktree at the admitted commit before
-    ``guardkit autobuild feature``. A failure stops the build with GuardKit's
-    own words.
-    """
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            str(guardkit_path),
-            "feature",
-            "validate",
-            feature_id,
-            "--json",
-            cwd=str(cwd),
-            env=dict(env),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-    except (OSError, FileNotFoundError) as exc:
-        return f"guardkit feature validate could not be started: {exc!r}"
-    try:
-        out_bytes, _ = await asyncio.wait_for(
-            proc.communicate(), timeout=FEATURE_VALIDATE_TIMEOUT_SECONDS
-        )
-    except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
-        return (
-            f"guardkit feature validate {feature_id} did not finish within "
-            f"{FEATURE_VALIDATE_TIMEOUT_SECONDS:.0f} seconds"
-        )
-    if proc.returncode == 0:
-        return None
-    said = out_bytes.decode("utf-8", errors="replace").strip()
-    try:
-        decoded = json.loads(said)
-    except ValueError:
-        decoded = None
-    if isinstance(decoded, dict):
-        errors = [str(e) for e in decoded.get("errors") or [] if str(e).strip()]
-        message = str(decoded.get("error_message") or "").strip()
-        said = "; ".join([*([message] if message else []), *errors]) or said
-    return (
-        f"guardkit feature validate refused {feature_id} at the admitted commit "
-        f"(exit={proc.returncode}): {said[-2000:] or 'no output'}"
-    )
 
 
 def _feature_task_ids(repo_path: Path, feature_id: str) -> list[str] | None:
@@ -5652,22 +5591,11 @@ async def _run_one_build(state: AutobuildRunnerState) -> dict[str, Any]:
         ",".join(sorted(launch_env)),
     )
 
-    # GuardKit's own full check of a PREPARED feature, in the worktree at the
-    # admitted commit, before it is built (4 October 2026). In addition to
-    # admission's own checks, never instead of them. A failure stops the build
-    # with GuardKit's words; the worktree is kept for forensics.
-    if source_commit is not None and worktree_path is not None:
-        refused = await _guardkit_feature_validate(
-            guardkit_path, feature_id, cwd=worktree_path, env=launch_env
-        )
-        if refused is not None:
-            return _snapshot_update(
-                _build_failed_snapshot(
-                    payload,
-                    reason=_with_worktree_forensics(refused, worktree_path),
-                    worktree_path=worktree_path,
-                )
-            )
+    # A PREPARED feature is no longer checked here with ``guardkit feature
+    # validate`` before it is built (step 2, 26 October 2026, census FRG-109):
+    # one rule in one place. GuardKit loads and validates the feature itself
+    # when ``guardkit autobuild feature`` starts, and refuses it in its own
+    # words.
 
     # A build's clean-up under way in this runner (another build's cancel,
     # timeout or wedge): its place may already have been given to this one, so

@@ -302,7 +302,9 @@ def _bind_amendment_transport(publisher: Any, subscriber: Any, pool: Any) -> Non
 
 def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | None:
     """The plain lines the planning run left for the build gate's card, in
-    order: the repository line, the size line, then the plan review line.
+    order: the repository line, the size line, the plan review line, then the
+    planner's own notes for the approver (step 2, 26 October 2026: display
+    only).
     ``None`` when there are
     none. A ledger that cannot answer is no line: a card line must never stop
     the gate."""
@@ -311,6 +313,7 @@ def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | 
         "read_planning_repository_unavailable",
         "read_planning_plan_size_note",
         "read_planning_plan_review_note",
+        "read_planning_plan_advice_note",
     ):
         reader = getattr(sqlite_pool, name, None)
         try:
@@ -836,80 +839,48 @@ def card_line_about_files_that_already_existed(report: Any) -> str:
 
 
 def card_line_about_scope(report: Any) -> str:
-    """The ONE line about what this build did beyond what was asked for.
+    """The ONE line about the files this build changed beyond its plan.
 
-    The planner fix, 2026-09-15. Two comparisons, not one, and they answer
-    different questions:
+    The planner fix, 2026-09-15: files this build changed that no task
+    document named. That is the blast radius; a sentence names no files, so
+    "the plan did not name it" is the only test that says anything true.
 
-    * **against the plan** — files this build changed that no task document
-      named. That is the blast radius; a sentence names no files, so "the
-      plan did not name it" is the only test that says anything true.
-    * **against the request** — a web address the sentence never named, or a
-      capability the sentence never asked for, read from what the branch
-      itself wrote. This is the half that catches a plan followed faithfully
-      into the wrong place: three of twelve builds for one sentence answered
-      at an address nobody asked for, and one of them was refused at the live
-      gate an hour after the merge word.
+    Facts, not verdicts (step 2, 26 October 2026): the lines about web
+    addresses and capabilities "the request did not name" were deleted. They
+    read an ``echo`` line and a file path as routes and CORS headers as
+    permissions, and the card stated them as fact. The card's changed files
+    and diff are what the person or the local merge judge reads.
 
-    Five shapes. The first two may both appear; the last three each stand
-    alone:
+    Four shapes:
 
     * something outside the plan — what, how much, where, and "worth a look";
-    * something the request never named — one sentence per web address and
-      one per capability;
-    * nothing outside either — said in one short sentence;
+    * nothing outside the plan — said in one short sentence;
     * the branch could not be read here — said plainly;
     * ``""`` when nobody counted, which is byte for byte the card that
       shipped before this existed.
 
     A count nobody took is never published as a count of nothing: when the
-    plan named no files at all, or the sentence could not be found, that half
-    is simply left unsaid and the receipt carries the reason in ordinary
-    words.
+    plan named no files at all, that is simply left unsaid and the receipt
+    carries the reason in ordinary words.
     """
     if report is None:
         return ""
     read = bool(getattr(report, "read", False))
     plan_read = bool(getattr(report, "plan_read", False))
-    routes_read = bool(getattr(report, "routes_read", False))
     outside_the_plan = tuple(getattr(report, "files_the_plan_did_not_name", ()) or ())
-    unnamed_routes = tuple(getattr(report, "routes_the_request_did_not_name", ()) or ())
-    unnamed_capabilities = tuple(
-        getattr(report, "capabilities_the_request_did_not_name", ()) or ()
-    )
 
-    said: list[str] = []
     if read and plan_read and outside_the_plan:
         count = len(outside_the_plan)
-        said.append(
+        return (
             f"This build also changed {count} file"
             f"{'s' if count != 1 else ''} the plan did not name: "
             f"{_names_the_files(outside_the_plan)} — worth a look before you "
             "merge."
         )
-    if routes_read:
-        from forge.pipeline.merge_check_reading import shown_path
-
-        # Read out of the branch's own files: shown, never obeyed (review R7).
-        for route in unnamed_routes:
-            said.append(
-                "It also answers at a web address the request did not name: "
-                f"{shown_path(route)}."
-            )
-        for capability in unnamed_capabilities:
-            said.append(
-                f"It also added {shown_path(capability)}, which the request did "
-                "not ask for."
-            )
-    if said:
-        return " ".join(said)
     if not read:
         return "Which files this build changed could not be read here."
-    if plan_read and routes_read:
-        return (
-            "Every file this build changed was named in the plan, and it "
-            "added nothing the request did not ask for."
-        )
+    if plan_read:
+        return "Every file this build changed was named in the plan."
     return ""
 
 
@@ -1165,12 +1136,20 @@ def merge_card_words(
     deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
     named = feature_id or "this repair"
     checked = detail or "the checks this repository declares came back green"
+    could_not_run = getattr(getattr(gates, "status", None), "value", None) == "unknown"
     sentences = [f"{named} is ready to merge on branch {branch}."]
     if supplied_plan:
         sentences.append(supplied_plan)
     if prototype:
         sentences.append(prototype)
-    sentences.append(f"What was checked: {checked}.")
+    if could_not_run:
+        # Step 2 (26 October 2026, census FRG-138): advice, never red.
+        sentences.append(
+            f"The tests could not be run here ({detail or 'no reason was given'}); "
+            "the merge still runs the project's own checks on the joined code."
+        )
+    else:
+        sentences.append(f"What was checked: {checked}.")
     tests = card_line_about_tests(getattr(gates, "test_changes", None))
     if tests:
         sentences.append(tests)
