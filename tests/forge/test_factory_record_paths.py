@@ -4,7 +4,7 @@ Design: "Factory records never enter a project's commits" (14 October 2026).
 GuardKit writes records about a build inside the build's working folder. The
 list of where they live is written once in the design and copied literally
 into GuardKit and into Forge, because Forge does not import GuardKit. This
-file pins Forge's copy, and checks the small matcher the publisher uses
+file pins Forge's copy, and checks the small matcher the planning commit uses
 (``is_factory_record``) against git's own pathspec matching for a fixed set of
 paths, so the two can never disagree about what a record is.
 

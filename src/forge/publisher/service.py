@@ -168,12 +168,6 @@ THE_REMOTE_MOVED: str = "the-remote-moved"
 #: The refusal said when a route's key is not the file read at start.
 THE_ROUTE_KEY_CHANGED: str = "the-route-credential-changed"
 
-#: The refusals of the looks before a send (design "Factory records never
-#: enter a project's commits"). None is retried: the way forward is a fresh
-#: build.
-IT_HOLDS_FACTORY_RECORDS: str = "it-holds-factory-records"
-THE_COMMITS_COULD_NOT_BE_CHECKED: str = "the-commits-could-not-be-checked"
-
 #: The refusal when, with ``private_only`` on, a route's repository is not
 #: confirmed private (17 October 2026). Not retried.
 NOT_CONFIRMED_PRIVATE: str = "the-remote-is-not-confirmed-private"
@@ -830,13 +824,6 @@ class Publisher:
                 remote_now=remote_now,
             )
 
-        # -- what must not be published -----------------------------------
-        kept_back = self._what_must_not_be_published(
-            commits, remote_now=remote_now, j_commit=j_commit, target_branch=target_branch
-        )
-        if kept_back is not None:
-            return kept_back
-
         # -- the send ------------------------------------------------------
         # Looked at once more, immediately before the push, so the window in
         # which a route's key could be swapped is as short as it can be.
@@ -1188,57 +1175,6 @@ class Publisher:
                 branch,
             )
         return MissionBranchAnswer(created=True, remote_tip=commit, **said)
-
-    # -- what must not be published ---------------------------------------
-
-    def _what_must_not_be_published(
-        self,
-        commits: Any,
-        *,
-        remote_now: str,
-        j_commit: str,
-        target_branch: str,
-    ) -> Answer | None:
-        """``None`` when the commits the send adds may be published; a
-        refusal otherwise: looks a to c, the factory's own build records.
-        Nothing is ever removed or rewritten."""
-        findings = commits.what_must_not_be_published(remote_now, j_commit)
-        if findings is None:
-            return _refused(
-                THE_COMMITS_COULD_NOT_BE_CHECKED,
-                f"The commits {j_commit[:10]} would add to '{target_branch}' "
-                "could not be checked for the factory's own build records. "
-                "Nothing was sent.",
-                remote_now=remote_now,
-            )
-        records = list(findings)
-        if records:
-            paths = {path for f in records for path in f.paths}
-            count = len(paths) or sum(f.count for f in records)
-            logger.warning(
-                "publisher: %s holds %d of the factory's own records (looks %s); "
-                "nothing was sent",
-                j_commit[:10],
-                count,
-                ", ".join(f.look for f in records),
-            )
-            return _refused(
-                IT_HOLDS_FACTORY_RECORDS,
-                f"{j_commit[:10]} would publish {count} of the factory's own "
-                f"build records (for example {records[0].first}), added, "
-                "changed, moved or copied by commits that are not yet on "
-                f"'{target_branch}'. These are working files of the factory, "
-                "not part of the project, and they can hold private paths. "
-                "Nothing was sent. Build the feature again on a release that "
-                "keeps them out of commits.",
-                remote_now=remote_now,
-            )
-        logger.info(
-            "publisher: %s — the three looks found no factory record in the "
-            "commits it adds",
-            j_commit[:10],
-        )
-        return None
 
     # -- what the record refuses -------------------------------------------
 

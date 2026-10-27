@@ -19,14 +19,15 @@ records about a build inside the build's working folder: what the model said
 on each turn, what the judge decided, the test baseline, the query log, inner
 build folders. Nothing reads them back from git; they reach the receipts
 folder from disk. :data:`FACTORY_RECORD_PATHS` is where they live. Forge's
-planning commit leaves them out (:func:`forge.adapters.git.operations.prepare_index`)
-and the publisher refuses to send a commit that brings one in
-(:mod:`forge.publisher.git_work`). GuardKit holds a literal copy of the same
+planning commit leaves them out (:func:`forge.adapters.git.operations.prepare_index`).
+(The publisher's own refusal of a commit that brings one in went in the cull,
+27 October 2026: it only guarded what the commit side already does.) GuardKit
+holds a literal copy of the same
 list (``guardkit/orchestrator/worktree_checkpoints.py``), because Forge does
 not import GuardKit; a test in each repository pins its copy. A new GuardKit
 writer inside a working folder has to be added to both lists.
 
-This module stays standard-library only, so the publisher can import it.
+This module stays standard-library only.
 """
 
 from __future__ import annotations

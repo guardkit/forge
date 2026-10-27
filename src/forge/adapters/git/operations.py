@@ -395,8 +395,7 @@ RECORD_READ_BOUND_S: float = 5.0
 #: Records smaller than this are not compared with product files at commit
 #: time (coordinator decision, 14 October 2026). A tiny record such as ``[]``
 #: carries nothing worth protecting, and a product file holding the same few
-#: bytes must never be silently left out. Private text in any file is still
-#: refused by the publisher, whose own content look keeps no size exemption.
+#: bytes must never be silently left out.
 SMALLEST_COMPARED_RECORD: int = 64
 
 
