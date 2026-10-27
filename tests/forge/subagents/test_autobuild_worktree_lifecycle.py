@@ -6,7 +6,6 @@ import os
 import socket
 import subprocess
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -193,7 +192,6 @@ def test_unrelated_nested_registration_blocks_outer_cleanup(tmp_path: Path) -> N
     assert identity["ok"] is False
     assert str(unexpected) in identity["unexpected_registrations"]
     assert outer.is_dir() and inner.is_dir() and unexpected.is_dir()
-
 
 
 @pytest.mark.parametrize("location", ["outer", "inner"])

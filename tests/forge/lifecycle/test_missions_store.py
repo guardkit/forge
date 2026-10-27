@@ -18,7 +18,6 @@ import pytest
 
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations as lifecycle_migrations
-from forge.lifecycle.feature_routing import validate_feature_routing_id
 from forge.lifecycle.missions import (
     MissionFeature,
     MissionStore,
@@ -120,7 +119,6 @@ def test_approval_first_answer_wins_and_status_is_compare_and_swap(cx) -> None:
     closed = store.get(mission.id)
     assert closed.closed_at and closed.closed_reason == "x"
     assert store.list_active() == []
-
 
 
 def test_links_follow_keys_through_a_rebuild(cx) -> None:

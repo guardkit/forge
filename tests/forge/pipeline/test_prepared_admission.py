@@ -373,20 +373,6 @@ async def test_an_unreachable_remote_is_refused(
 # The supplied bundle: each missing item refused by name (R3)
 # ---------------------------------------------------------------------------
 
-_MISSING_CASES = {
-    "feature file": (f".guardkit/features/{FEATURE}.yaml", "its feature file"),
-    "task file": (f"{TASK_DIR}/{TASKS[1]}-do-the-thing.md", "the task file"),
-    "spec file": (f"{SPEC_DIR}/{SPEC_NAME}.feature", "the spec file"),
-    "assumptions": (f"{SPEC_DIR}/{SPEC_NAME}_assumptions.yaml", "assumptions file"),
-    "summary": (f"{SPEC_DIR}/{SPEC_NAME}_summary.md", "the spec's summary"),
-    "guide": (f"{TASK_DIR}/IMPLEMENTATION-GUIDE.md", "the plan's guide"),
-    "declared document": (
-        "docs/constitution/mission.md",
-        "autobuild.player.required_documents",
-    ),
-}
-
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -409,7 +395,6 @@ async def test_missing_qa_files_are_left_to_guardkits_own_precondition(
     assert answer.ok, answer.refusal
 
 
-
 @pytest.mark.asyncio
 async def test_back_quoted_paths_urls_and_anchors_are_not_checked(
     project: Project, runner: WorktreeGitRunner
@@ -428,7 +413,6 @@ async def test_back_quoted_paths_urls_and_anchors_are_not_checked(
     assert answer.ok, answer.refusal
 
 
-
 # ---------------------------------------------------------------------------
 # The one reading rule: admission refuses what planning and the Coach refuse
 # ---------------------------------------------------------------------------
@@ -443,7 +427,6 @@ def _commit_bytes_on(project: Project, branch: str, files: dict[str, bytes]) -> 
     _git(project.writer, "commit", "-qm", "bytes")
     _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{branch}")
     _git(project.writer, "checkout", "-q", "main")
-
 
 
 # ---------------------------------------------------------------------------
@@ -461,7 +444,6 @@ async def test_the_specialist_digest_is_optional(
     answer = await _admit(project, runner)
 
     assert answer.ok, answer.refusal
-
 
 
 @pytest.mark.asyncio
@@ -492,7 +474,6 @@ def _colon_guide(files: dict[str, str]) -> dict[str, str]:
     return files
 
 
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize("digest", [True, False], ids=["with-digest", "without-digest"])
 async def test_a_colon_heading_route_with_the_manifest_is_admitted(
@@ -512,31 +493,6 @@ async def test_a_colon_heading_route_with_the_manifest_is_admitted(
 # ---------------------------------------------------------------------------
 
 
-def _replace_with_link(project: Project, path: str, target: str) -> None:
-    _git(project.writer, "checkout", "-q", BRANCH)
-    full = project.writer / path
-    full.unlink()
-    full.symlink_to(target)
-    _git(project.writer, "add", "-A")
-    _git(project.writer, "commit", "-qm", f"{path} becomes a link")
-    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
-    _git(project.writer, "checkout", "-q", "main")
-
-
-
-def _commit_with_links(project: Project, files: dict[str, str], links: dict[str, str]) -> None:
-    project.commit_on(BRANCH, files)
-    _git(project.writer, "checkout", "-q", BRANCH)
-    for path, target in links.items():
-        (project.writer / path).parent.mkdir(parents=True, exist_ok=True)
-        (project.writer / path).symlink_to(target)
-    _git(project.writer, "add", "-A")
-    _git(project.writer, "commit", "-qm", "links")
-    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
-    _git(project.writer, "checkout", "-q", "main")
-
-
-
 @pytest.mark.asyncio
 async def test_a_markdown_reference_up_and_across_to_a_real_file_is_admitted(
     project: Project, runner: WorktreeGitRunner
@@ -550,7 +506,6 @@ async def test_a_markdown_reference_up_and_across_to_a_real_file_is_admitted(
     answer = await _admit(project, runner)
 
     assert answer.ok, answer.refusal
-
 
 
 _PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe\x00binary"
@@ -576,7 +531,6 @@ async def test_a_committed_picture_referenced_from_the_guide_is_admitted(
     assert answer.ok, answer.refusal
 
 
-
 @pytest.mark.asyncio
 async def test_the_same_paths_written_plainly_are_admitted(
     project: Project, runner: WorktreeGitRunner
@@ -584,12 +538,5 @@ async def test_the_same_paths_written_plainly_are_admitted(
     project.commit_on(BRANCH, bundle())
 
     assert (await _admit(project, runner)).ok
-
-
-
-# ---------------------------------------------------------------------------
-# The two text rules, directly
-# ---------------------------------------------------------------------------
-
 
 

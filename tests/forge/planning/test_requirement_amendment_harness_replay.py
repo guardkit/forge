@@ -134,7 +134,6 @@ async def approved_and_admitted(tmp_path: Path):
         feature_id=FEATURE,
     )
     from forge.planning.driver import (
-        PlanningRunDriver,
         _QA_FEATURE_GATE_STAGE,
         _QA_PASS_BARS_STAGE,
     )

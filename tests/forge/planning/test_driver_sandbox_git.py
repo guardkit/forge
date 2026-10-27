@@ -197,24 +197,6 @@ def sandbox_repo(
         shutdown()
 
 
-def _plan_yaml_on_branch(repo: Path, branch: str) -> list[str]:
-    """The plan YAML files that are on ``branch`` — empty when the plan commit
-    never landed (a blocking check refused it)."""
-    listed = subprocess.run(
-        ["git", "ls-tree", "-r", "--name-only", branch],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    if listed.returncode != 0:
-        return []
-    return [
-        line
-        for line in listed.stdout.splitlines()
-        if line.startswith(".guardkit/features/")
-    ]
-
-
 def _driver(store: SqlitePlanningRunStore, sandbox_repo, **kwargs: Any):
     repo, in_container, sandbox_runner = sandbox_repo
     return _make_driver(
@@ -224,12 +206,6 @@ def _driver(store: SqlitePlanningRunStore, sandbox_repo, **kwargs: Any):
         repo_path=str(repo),
         **kwargs,
     )
-
-
-# ---------------------------------------------------------------------------
-# The plan leg, end to end, with the checks declared
-# ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
@@ -260,12 +236,6 @@ async def test_a_caller_that_hands_over_a_closure_is_refused_out_loud(
 
 
 # ---------------------------------------------------------------------------
-# The routing law itself, read across the wire
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
 # The other three legs' checks, declared too (rule 87, 2026-09-07)
 # ---------------------------------------------------------------------------
 
@@ -292,18 +262,6 @@ def _failure_text(store: SqlitePlanningRunStore, stage: str) -> str:
             if e["stage_label"] == stage
         ]
     )
-
-
-def _draft_provability(store: SqlitePlanningRunStore) -> list[dict[str, Any]]:
-    """The ``provability`` receipt on every spec-draft row, in order."""
-    out: list[dict[str, Any]] = []
-    for event in store.list_events(CID):
-        if event["stage_label"] != "feature-spec-draft":
-            continue
-        draft = (json.loads(event["details_json"] or "{}") or {}).get("spec_draft") or {}
-        if "provability" in draft:
-            out.append(draft["provability"])
-    return out
 
 
 @pytest.mark.asyncio
@@ -366,7 +324,6 @@ async def test_a_red_normalizer_in_the_sandbox_fails_the_spec_leg_with_the_same_
     assert "could not be reached" not in failure
 
 
-
 @pytest.mark.asyncio
 async def test_the_feature_gate_legs_check_runs_in_the_sandbox(
     store: SqlitePlanningRunStore,
@@ -402,33 +359,6 @@ async def test_the_feature_gate_legs_check_runs_in_the_sandbox(
     assert git_show(repo, branch, "qa/gates/version_endpoint_gate.py") is not None
     registry = git_show(repo, branch, "qa/gates/registry.yaml") or ""
     assert "version-endpoint" in registry
-
-
-# ---------------------------------------------------------------------------
-# Part K's provability check, answered by the sandbox with the spec commit
-# ---------------------------------------------------------------------------
-
-
-def _never_classify_here():
-    async def _classify(repo_path: Path, feature_text: str):
-        raise AssertionError(
-            "the provability check must run in the repository's sandbox, "
-            "never in the forge container"
-        )
-
-    return _classify
-
-
-
-def _digest_card_text(h) -> str:
-    """The what-happened text on the one spec-digest card Rich reads."""
-    cards = [
-        env
-        for env in h.ctx["publisher"].envelopes
-        if env.payload["details"].get("checkpoint_type") == "product_docs_spec_digest"
-    ]
-    assert len(cards) == 1, cards
-    return str(cards[0].payload["details"]["summary"].get("what_happened") or "")
 
 
 # ---------------------------------------------------------------------------

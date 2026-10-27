@@ -330,26 +330,6 @@ def test_a_launch_with_no_branch_still_runs_when_nothing_else_is(
 
 
 # ---------------------------------------------------------------------------
-# Disk: free space is reserved, not just observed
-# ---------------------------------------------------------------------------
-
-
-GIB = 1024**3
-
-
-def _free_space(monkeypatch: pytest.MonkeyPatch, available: int) -> None:
-    """The worktree filesystem reports ``available`` free bytes."""
-    from forge.subagents import autobuild_worktree_lifecycle as lifecycle
-
-    monkeypatch.setattr(
-        lifecycle,
-        "_capacity",
-        lambda _path: {"available_bytes": available, "available_inodes": 10**6},
-    )
-
-
-
-# ---------------------------------------------------------------------------
 # Memory: each overlapping build carries its own project's memory
 # ---------------------------------------------------------------------------
 

@@ -71,16 +71,6 @@ EXPECTED_FEATURE_YAML_PATH = (
     ".guardkit/features/FEAT-1DF4.yaml"
 )
 
-#: The six human adapters — the originator allowlist BEFORE this fix. Used to
-#: prove the captured fixture is non-vacuous (the old gate refuses it).
-OLD_HUMAN_ONLY_ORIGINATORS = (
-    "terminal",
-    "voice-reachy",
-    "telegram",
-    "slack",
-    "dashboard",
-    "cli-wrapper",
-)
 
 FIXTURE_PATH = Path(__file__).parent / "fixtures" / "round14_build_queued_660d487e.json"
 

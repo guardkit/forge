@@ -47,22 +47,6 @@ from nats_core.events import PlanningCompletePayload
 
 GUIDE = "tasks/backlog/stats-endpoint/IMPLEMENTATION-GUIDE.md"
 
-DESCRIPTOR: dict[str, Any] = {
-    "repo": "example/service",
-    "test_roots": ["tests/stats"],
-    "where_the_specs_words_already_appear": [
-        {
-            "words": "stats",
-            "already_in": ["src/stats.py:6", "tests/stats/test_stats.py:2"],
-            "evidence": [
-                {"path": "src/stats.py", "first_line": 3, "last_line": 18, "score": 2, "text": "..."},
-                {"path": "tests/stats/test_stats.py", "first_line": 1, "last_line": 14, "score": 1, "text": "..."},
-            ],
-            "more_hits": 0,
-        }
-    ],
-}
-
 
 def _validation(**overrides: Any) -> str:
     body: dict[str, Any] = {
@@ -133,7 +117,6 @@ def test_a_malformed_answer_says_why(overrides: dict, files: Any, expected: str)
 # ---------------------------------------------------------------------------
 
 
-
 def test_the_planners_full_validation_shape_is_read() -> None:
     """Exactly what the plan writer sends (specialist-agent 820d701): the
     scenario-ownership note rides along and is not read."""
@@ -144,7 +127,6 @@ def test_the_planners_full_validation_shape_is_read() -> None:
     role_output["tasks/backlog/stats-endpoint/README.md"] = "# readme\n"
     claim, problem = ntb.read_claim(role_output, files)
     assert problem is None and claim is not None
-
 
 
 # ---------------------------------------------------------------------------

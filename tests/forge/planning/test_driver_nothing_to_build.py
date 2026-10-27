@@ -33,9 +33,7 @@ from tests.forge.planning.test_driver_target_terminal import (
     _make_driver,
     _plan_result_native,
     _queue,
-    _recorded_runner,
     _semantic_review_json,
-    _spec_result_native,
     store,  # noqa: F401 — the fixture, re-exported for these tests
 )
 
@@ -88,8 +86,6 @@ def _starting_at(repo: Path) -> RecordingGitRunner:
         ["git", "-C", str(repo), "rev-parse", "HEAD"], check=True, capture_output=True, text=True
     ).stdout.strip()
     return RecordingGitRunner(start_commit=head)
-
-
 
 
 def _nothing_reply(
@@ -186,8 +182,6 @@ def _switch_on(h: Any) -> None:
 def _messages_after_plan(h: Any, rec: _Recorder) -> list[tuple[str, str, str]]:
     assert rec.notifications_before_plan is not None, "the plan writer was never asked"
     return h.ctx["notifications"][rec.notifications_before_plan :]
-
-
 
 
 def _proof_from_windows(descriptor: Any) -> tuple[list[dict], list[dict]]:
@@ -359,7 +353,6 @@ def _reached_the_normal_handoff(store: SqlitePlanningRunStore, rec: _Recorder) -
     assert rec.complete == [] and rec.failed == []
 
 
-
 @pytest.mark.asyncio
 async def test_a_nothing_to_build_reply_that_also_plans_work_is_planned_as_usual(
     store: SqlitePlanningRunStore, tmp_path: Path
@@ -390,7 +383,6 @@ async def test_a_nothing_to_build_reply_that_also_plans_work_is_planned_as_usual
     assert len(rec.plan_calls) == 2
     assert "also sent a plan to build" in rec.plan_calls[1]["validate_feedback"]
     _reached_the_normal_handoff(store, rec)
-
 
 
 # ---------------------------------------------------------------------------
@@ -450,7 +442,6 @@ async def test_the_redrive_shortcut_rechecks_the_row_before_the_pass_bars(
 # ---------------------------------------------------------------------------
 
 
-
 @pytest.mark.asyncio
 async def test_switch_on_an_ordinary_plan_goes_on_as_today(
     store: SqlitePlanningRunStore,
@@ -466,7 +457,6 @@ async def test_switch_on_an_ordinary_plan_goes_on_as_today(
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     assert h.ctx["counters"]["build_trigger"] == 1
     assert h.ctx["counters"]["last_already_done_allowed"] is True
-
 
 
 def test_the_stage_label_is_never_the_plan_legs() -> None:

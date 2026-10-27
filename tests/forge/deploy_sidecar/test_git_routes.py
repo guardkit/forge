@@ -27,16 +27,8 @@ import pytest
 
 from forge.config.models import ForgeConfig
 from forge.deploy_sidecar.service import (
-    GIT_CHECK_BLOCKING_DEFAULTS,
-    GIT_CHECK_NAMES,
-    GIT_CHECK_TIMEOUT_DEFAULTS,
-    GIT_READ_FILE_ROUTE,
-    GIT_REV_PARSE_ROUTE,
     GIT_WRITE_TREE_ROUTE,
     GUARDKIT_PATH_ENV,
-    MERGE_TIMEOUT_EXIT_CODE,
-    TIMEOUT_MAX,
-    GIT_CHECK_PATH_ARGS,
     build_server,
     process_git_read_file_request,
     process_git_list_files_on_branch_request,
@@ -45,27 +37,15 @@ from forge.deploy_sidecar.service import (
     resolve_check_command,
     resolve_normalizer_command_for_checks,
 )
-from forge.planning.handoff import PRE_COMMIT_CHECK_NAMES
 
 from tests.forge.deploy_sidecar._fake_guardkit import (
     NORMALIZED_MARKER,
-    REFUSED_TITLES,
-    classify_calls,
     fake_normalizer,
     git_rev_parse,
     git_show,
-    normalize_calls,
     normalizer_calls,
-    qa_validate_calls,
     scratch_repo,
-    validate_calls,
-    validate_saw,
     write_fake_guardkit,
-)
-from tests.forge.planning._live_guardkit import (
-    live_cli_importable,
-    live_guardkit_checkout,
-    live_guardkit_python,
 )
 
 REPO_KEY = "guardkit/api_test"
@@ -134,26 +114,13 @@ def fake_normalizer_module(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
 
 FEATURE_REL = "features/stats/stats.feature"
 FEATURE_TEXT = "Feature: stats\n  Scenario: ok\n    Given a thing\n"
-BAR_REL = "qa/pass-bar-TASK-STAT-001.yaml"
-REGISTRY_REL = "qa/gates/registry.yaml"
 SPEC_FILES = {
     FEATURE_REL: FEATURE_TEXT,
     "features/stats/stats_summary.md": "# summary\n",
 }
-BAR_FILES = {BAR_REL: "task_id: TASK-STAT-001\ncriteria: []\n"}
-GATE_FILES = {REGISTRY_REL: "gates:\n  - id: stats\n"}
-
 
 def _normalize_feature_check(rel: str = FEATURE_REL) -> dict[str, Any]:
     return {"name": "normalize-feature", "args": {"feature_file": rel}}
-
-
-def _pass_bar_check(rel: str = BAR_REL) -> dict[str, Any]:
-    return {"name": "validate-pass-bar", "args": {"bar_file": rel}}
-
-
-def _gate_registry_check(rel: str = REGISTRY_REL) -> dict[str, Any]:
-    return {"name": "validate-gate-registry", "args": {"registry_file": rel}}
 
 
 def _write(
@@ -209,14 +176,6 @@ STAND_IN_SETTINGS: tuple[str, ...] = (
 )
 
 
-def _normalize_check(**args: Any) -> dict[str, Any]:
-    return {"name": "normalize-stamps", "args": {"feature_id": FEATURE, **args}}
-
-
-def _validate_check() -> dict[str, Any]:
-    return {"name": "feature-validate", "args": {"feature_id": FEATURE}}
-
-
 def _by_name(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {c["name"]: c for c in body["checks"]}
 
@@ -227,12 +186,6 @@ def _no_commit_landed(repo: Path, branch: str = BRANCH) -> bool:
     -b`` creates it there before the checks run, and a refused commit leaves
     it there (zero branch mutation)."""
     return git_rev_parse(repo, branch) in (None, git_rev_parse(repo, "HEAD"))
-
-
-# ---------------------------------------------------------------------------
-# The closed list of checks is the protocol's own
-# ---------------------------------------------------------------------------
-
 
 
 # ---------------------------------------------------------------------------
@@ -302,13 +255,11 @@ def test_the_message_is_required(cfg: ForgeConfig, tmp_path: Path) -> None:
     assert status == 400 and "'message' is required" in body["error"]
 
 
-
 def test_checks_must_be_a_list_of_objects(cfg: ForgeConfig, tmp_path: Path) -> None:
     status, body = _write(cfg, tmp_path, checks={"name": "feature-validate"})
     assert status == 400 and "'checks' must be a list" in body["error"]
     status, body = _write(cfg, tmp_path, checks=["feature-validate"])
     assert status == 400 and "checks[0] must be an object" in body["error"]
-
 
 
 # ---------------------------------------------------------------------------
@@ -357,7 +308,6 @@ def test_the_working_copy_is_never_touched(
 # ---------------------------------------------------------------------------
 # Declared checks — run with the guardkit beside the sidecar, in the worktree
 # ---------------------------------------------------------------------------
-
 
 
 def test_an_escaping_file_path_never_reaches_the_worktree(
@@ -485,7 +435,6 @@ def test_the_normalizer_command_is_resolved_the_way_the_spec_leg_resolves_it(
     assert command is not None
     assert command[1] == "-m"
     assert command[2].endswith("feature_spec_normalize")
-
 
 
 # ---------------------------------------------------------------------------
@@ -674,14 +623,12 @@ def server(cfg: ForgeConfig, tmp_path: Path):
         srv.server_close()
 
 
-
 def test_end_to_end_refusal_is_http_400_with_one_sentence(server: str) -> None:
     status, body = _post(
         server + GIT_WRITE_TREE_ROUTE,
         {"repo": REPO_KEY, "branch": "-x", "files": PLAN_FILES, "message": MESSAGE},
     )
     assert status == 400 and "'branch'" in body["error"]
-
 
 
 def test_the_other_operations_still_work_beside_the_git_routes(server: str) -> None:
@@ -694,27 +641,6 @@ def test_the_other_operations_still_work_beside_the_git_routes(server: str) -> N
 # ---------------------------------------------------------------------------
 # guardkit's real verbs, when a checkout that carries them is reachable
 # ---------------------------------------------------------------------------
-
-
-def _live_guardkit_wrapper(tmp_path: Path) -> Path | None:
-    """A runnable ``guardkit`` that starts the live checkout's CLI, or None."""
-    checkout = live_guardkit_checkout(Path(__file__))
-    if checkout is None:
-        return None
-    python = live_guardkit_python(checkout, Path(__file__))
-    ok, _ = live_cli_importable(checkout, python)
-    if not ok:
-        return None
-    wrapper = tmp_path / "live-bin" / "guardkit"
-    wrapper.parent.mkdir(parents=True, exist_ok=True)
-    wrapper.write_text(
-        "#!/bin/sh\n"
-        f'PYTHONPATH="{checkout}" exec "{python}" -m guardkit.cli.main "$@"\n',
-        encoding="utf-8",
-    )
-    wrapper.chmod(0o755)
-    return wrapper
-
 
 
 def test_list_files_on_branch_reads_that_branch_not_the_checked_out_tree(
@@ -750,39 +676,5 @@ def test_list_files_on_branch_reads_that_branch_not_the_checked_out_tree(
         assert ask(bad_branch)[0] == 400
     for bad_under in ("/etc", "../x", "", None):
         assert ask("autobuild/FEAT-X", bad_under)[0] == 400
-
-
-# ---------------------------------------------------------------------------
-# FEAT-FFEC (3 October 2026): the plan check refuses a task that names
-# another task with no order between them
-# ---------------------------------------------------------------------------
-
-_FFEC_FIXTURE = (
-    Path(__file__).resolve().parents[1] / "planning" / "fixtures" / "ffec_c9c3714c"
-)
-_FFEC_YAML = ".guardkit/features/FEAT-FFEC.yaml"
-
-
-def _ffec_files(*, ordered: bool) -> dict[str, str]:
-    """The FEAT-FFEC plan files exactly as the writer committed them
-    (c9c3714c), or with TASK-FFEC-002's need for TASK-FFEC-003 declared and
-    the waves reordered."""
-    import yaml
-
-    files = {
-        str(p.relative_to(_FFEC_FIXTURE)): p.read_text(encoding="utf-8")
-        for p in sorted(_FFEC_FIXTURE.rglob("*"))
-        if p.is_file() and p.name != "README.md"
-    }
-    if ordered:
-        data = yaml.safe_load(files[_FFEC_YAML])
-        for task in data["tasks"]:
-            if task["id"] == "TASK-FFEC-002":
-                task["dependencies"] = ["TASK-FFEC-001", "TASK-FFEC-003"]
-        data["orchestration"]["parallel_groups"] = [
-            ["TASK-FFEC-001"], ["TASK-FFEC-003"], ["TASK-FFEC-002"], ["TASK-FFEC-004"]
-        ]
-        files[_FFEC_YAML] = yaml.safe_dump(data, sort_keys=False)
-    return files
 
 

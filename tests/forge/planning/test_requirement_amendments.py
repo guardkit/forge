@@ -197,7 +197,6 @@ async def planned(tmp_path, request):
             plan=p,
             feature_id=feature,
         )
-    from forge.planning.driver import PlanningRunDriver
 
     review = {
         "schema_version": 1,

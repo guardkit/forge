@@ -1262,7 +1262,6 @@ async def test_forge_no_longer_rechecks_the_digest_against_the_committed_spec(
     assert "summary_problems" not in summary
 
 
-
 @pytest.mark.asyncio
 async def test_an_ordinary_self_check_failure_still_only_warns(
     store: SqlitePlanningRunStore,
@@ -1282,7 +1281,6 @@ async def test_an_ordinary_self_check_failure_still_only_warns(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-
 
 
 @pytest.mark.asyncio
@@ -2650,133 +2648,8 @@ async def test_a_refusal_with_no_reason_still_says_what_to_do(
 
 
 # ---------------------------------------------------------------------------
-# THE WORKED EXAMPLES ARE CHECKED FOR PROVABILITY BEFORE THE CARD (Part K of
-# the rewrite-on-refusal lane, 2026-09-07, on Rich's decision).
-#
-# Until now the routing law first saw the examples at the plan stage, after
-# Rich's yes; a refusal there cost him a wait and, at worst, a stop. Now the
-# committed draft is run through guardkit's rules-only check before the door
-# opens; a refused example goes back to the spec writer once as the machine's
-# own note — the same round the plan stage runs — and the card says what
-# happened, in the spec's words. No new buttons, no new touch.
-# ---------------------------------------------------------------------------
-
-
-_REFUSED_TITLE = "Version endpoint rejects an unknown format"
-_HOMED_TITLE = "Version endpoint returns the running build"
-
-#: Rule 45's cannot-be-proven line, the spec's own words.
-_UNPROVABLE_LINE = (
-    f"The rules-only check could not assign a verifier to 1 worked example(s): "
-    f"“{_REFUSED_TITLE}”. This is not a semantic impossibility. "
-    "If you approve, the plan stage will ask the model fallback to place them; "
-    "or send a note."
-)
-
-
-
-
-
-def _classify_payload(refused: list[str]) -> str:
-    rows = []
-    for title in (_HOMED_TITLE, _REFUSED_TITLE):
-        is_refused = title in refused
-        rows.append(
-            {
-                "title": title,
-                "home": None if is_refused else "hurl",
-                "rule": None if is_refused else "R9",
-                "refused": is_refused,
-            }
-        )
-    return json.dumps(
-        {
-            "feature_file": "/tmp/draft.feature",
-            "repo_has_http_surface": True,
-            "http_surface_evidence": "declared test fixture",
-            "scenarios": rows,
-            "refused_titles": refused,
-        },
-        indent=2,
-    )
-
-
-class _ClassifierSeamRun:
-    """Frozen guardkit-run seam answers; no process, network or broker."""
-
-    def __init__(self, states: list[str]) -> None:
-        self.states = states
-        self.calls: list[dict[str, Any]] = []
-
-    async def __call__(self, **kwargs: Any) -> Any:
-        self.calls.append(kwargs)
-        state = self.states[min(len(self.calls) - 1, len(self.states) - 1)]
-        if state == "clean":
-            return SimpleNamespace(
-                status="success",
-                exit_code=0,
-                stdout_tail=_classify_payload([]),
-                stderr="",
-            )
-        if state == "refused":
-            return SimpleNamespace(
-                status="success",
-                exit_code=0,
-                stdout_tail=_classify_payload([_REFUSED_TITLE]),
-                stderr="",
-            )
-        if state == "clipped":
-            payload = _classify_payload([_REFUSED_TITLE])
-            return SimpleNamespace(
-                status="success",
-                exit_code=0,
-                stdout_tail=payload[payload.index('"refused_titles"') :],
-                stderr="",
-            )
-        if state == "unavailable":
-            return SimpleNamespace(
-                status="failed",
-                exit_code=2,
-                stdout_tail="",
-                stderr="Error: No such command 'classify-scenarios'.\n",
-            )
-        assert state == "failed"
-        return SimpleNamespace(
-            status="failed",
-            exit_code=1,
-            stdout_tail="",
-            stderr="fixture classifier failure\n",
-        )
-
-
-def _draft_rows(store: SqlitePlanningRunStore) -> list[tuple[str, dict]]:
-    return [(status, d.get("spec_draft") or {}) for status, d in _events(store, _DRAFT_STAGE)]
-
-
-def _card_summary(h: _Harness, index: int = 0) -> dict[str, Any]:
-    return _digest_cards(h)[index].payload["details"]["summary"]
-
-
-
-# ---------------------------------------------------------------------------
 # The assumptions are reviewed before the card (planning coach, 2026-09-13)
 # ---------------------------------------------------------------------------
-
-_INVENTING_ASSUMPTIONS = (
-    "assumptions:\n"
-    "- id: ASSUM-001\n"
-    "  assumption: The version string comes from the build metadata.\n"
-    "  basis: common practice; the input did not say\n"
-    "- id: ASSUM-002\n"
-    "  assumption: The endpoint requires authentication\n"
-    "  basis: Not stated in input; common security practice for analytics endpoints\n"
-)
-_INVENTING_DIGEST = DIGEST_YAML + (
-    "- id: ASSUM-002\n"
-    "  text: The endpoint requires authentication\n"
-    "  basis: Not stated in input; common security practice for analytics endpoints\n"
-)
-
 
 
 @pytest.mark.asyncio
@@ -2789,7 +2662,6 @@ async def test_a_clean_manifest_leaves_the_leg_byte_for_byte(
     await h.driver.drive(CID)
     assert len(h.ctx["dispatches"]) == 1
     assert "reviewer" not in json.dumps(_digest_cards(h)[0].payload)
-
 
 
 # ---------------------------------------------------------------------------
@@ -3061,11 +2933,6 @@ _SPEC_EXAMPLES_CONFIG = (
     '      request_words: ["POST", "other methods"]\n'
 )
 
-_KEPT_LINE = (
-    f'Not asked for, but kept: "{_PADDED_TITLE}" (another request method). If you '
-    "approve, it will be built; to drop it, send a note."
-)
-
 
 class _DeclaringRepository(_EmptyRepository):
     """A readable repository whose only file the planner reads is the
@@ -3086,7 +2953,6 @@ def _declaring_git(config: str = _SPEC_EXAMPLES_CONFIG) -> RecordingGitRunner:
 
 def _padded() -> Any:
     return _spec_reply(feature=_PADDED_FEATURE, digest=_PADDED_DIGEST)
-
 
 
 @pytest.mark.asyncio
@@ -3113,7 +2979,6 @@ async def test_an_example_the_owner_asked_for_in_a_note_is_never_sent_back(
     second = cards[1].payload["details"]["summary"]
     assert second["worked_examples"] == _PADDED_FEATURE
     assert "not asked for" not in second["what_happened"].lower()
-
 
 
 # ---------------------------------------------------------------------------
@@ -3452,10 +3317,6 @@ def _supported(reply: Any, support: dict | None) -> Any:
     return reply
 
 
-def _quoted_reply(support: dict | None = _CLEAN_SUPPORT) -> Any:
-    return _supported(_spec_reply(feature=_QUOTED_FEATURE_TEXT), support)
-
-
 def _reply_with_example(title: str, why: str, *, support: dict | None = _CLEAN_SUPPORT) -> Any:
     """_QUOTED_FEATURE_TEXT and DIGEST_YAML with one more worked example."""
     feature = _QUOTED_FEATURE_TEXT + (
@@ -3476,16 +3337,6 @@ def _reply_with_example(title: str, why: str, *, support: dict | None = _CLEAN_S
         "assumptions:\n",
     )
     return _supported(_spec_reply(feature=feature, digest=digest), support)
-
-
-def _last_receipt(store: SqlitePlanningRunStore) -> dict:
-    drafted = [d["spec_draft"] for status, d in _events(store, _DRAFT_STAGE) if status == "drafted"]
-    return drafted[-1]["example_review"]
-
-
-
-_FAITHFUL_TITLE = "The version answers with the build it was made from"
-
 
 
 @pytest.mark.asyncio
@@ -3524,14 +3375,6 @@ async def test_an_example_that_quotes_a_project_document_is_not_flagged(
     assert len(h.ctx["dispatches"]) == 1
     card = _digest_cards(h)[0].payload["details"]["summary"]
     assert card["what_happened"] == _ROUND_ONE_TEXT
-
-
-_BEYOND = {
-    "status": "checked",
-    "checked_request": True,
-    "goes_beyond": [{"title": _UNQUOTED_TITLE, "why": "nothing in the request asks about restarts"}],
-}
-
 
 
 @pytest.mark.asyncio

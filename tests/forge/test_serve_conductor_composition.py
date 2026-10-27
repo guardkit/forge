@@ -1780,35 +1780,6 @@ def _git(cwd: Path, *args: str, when: str | None = None) -> str:
     ).stdout
 
 
-def _write_f4_envelope(
-    worktree: Path, run_id: str, *, started: str, verdict: str = "pass", hurl_exit: int = 0
-) -> Path:
-    import json
-
-    history = worktree / "qa" / "gates" / "history"
-    history.mkdir(parents=True, exist_ok=True)
-    out = history / f"{run_id}.json"
-    out.write_text(
-        json.dumps(
-            {
-                "format_version": "1.0",
-                "run_id": run_id,
-                "feature_id": "FEAT-G",
-                "target_env": "local",
-                "started": started,
-                "finished": started,
-                "preflight": {"checks": [], "instrument_ok": True},
-                "gates": [
-                    {"gate_id": "health", "exit_code": 0, "assertions": []},
-                    {"gate_id": "hurl-twins", "exit_code": hurl_exit, "assertions": []},
-                ],
-                "verdict": verdict,
-            }
-        )
-    )
-    return out
-
-
 @pytest.fixture
 def stamped_repo(tmp_path: Path) -> "dict[str, Any]":
     """A fixture repo pair: a CANONICAL checkout carrying the stamped feature
@@ -1855,6 +1826,5 @@ def stamped_repo(tmp_path: Path) -> "dict[str, Any]":
         "canonical": canonical,
         "worktree": worktree,
     }
-
 
 

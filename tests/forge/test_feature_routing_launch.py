@@ -1,17 +1,12 @@
 from __future__ import annotations
 
 import asyncio
-import json
-from unittest.mock import AsyncMock
 
 import pytest
 
 from forge.launch_environment import build_launch_env
-from forge.lifecycle.feature_routing import FeatureRoutingBlocked, FeatureRoutingReceipt
+from forge.lifecycle.feature_routing import FeatureRoutingReceipt
 from forge.pipeline.dispatchers.autobuild_async import dispatch_autobuild_async
-from forge.subagents.autobuild_runner import _validated_feature_routing
-from forge.subagents import autobuild_runner
-from forge.deploy_sidecar.service import process_guardkit_merge_request
 
 
 def test_launch_environment_routing_is_protected_from_parent_and_project():
@@ -107,6 +102,5 @@ def test_a_missing_routing_gate_is_logged_and_the_build_dispatches_unrouted(capl
     assert "feature_routing_required" not in starter.context
     assert "feature_routing_receipt" not in starter.context
     assert "dispatching unrouted" in caplog.text
-
 
 

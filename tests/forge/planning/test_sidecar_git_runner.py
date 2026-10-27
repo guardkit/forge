@@ -37,10 +37,8 @@ from forge.planning.sidecar_git_runner import (
 )
 
 from tests.forge.deploy_sidecar._fake_guardkit import (
-    REFUSED_TITLES,
     git_rev_parse,
     git_show,
-    normalize_calls,
     scratch_repo,
     write_fake_guardkit,
 )
@@ -186,7 +184,6 @@ async def test_tree_write_carries_the_exact_committed_routing_receipt() -> None:
     assert sent[0]["feature_routing_receipt"] == receipt
 
 
-
 # ---------------------------------------------------------------------------
 # Against the real sidecar
 # ---------------------------------------------------------------------------
@@ -224,7 +221,6 @@ def a_coordinator_that_recorded_the_run(
     commit = git_rev_parse(repo, "HEAD")
     with a_coordinator_that_recorded({THE_RUN: str(commit)}, monkeypatch):
         yield commit
-
 
 
 @pytest.mark.asyncio

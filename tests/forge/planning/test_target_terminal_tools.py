@@ -9,7 +9,6 @@ guardkit binary).
 from __future__ import annotations
 
 import os
-import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -342,33 +341,8 @@ async def test_normalize_missing_file_is_noop_repair(tmp_path: Path) -> None:
 
 
 # ---------------------------------------------------------------------------
-# feature validate
-# ---------------------------------------------------------------------------
-
-
-def _fake_run(status: str, exit_code: int, stderr: str = "", tail: str = ""):
-    captured: dict[str, Any] = {}
-
-    async def _run(**kwargs):
-        captured.update(kwargs)
-        return SimpleNamespace(
-            status=status, exit_code=exit_code, stderr=stderr, stdout_tail=tail
-        )
-
-    return _run, captured
-
-
-
-# ---------------------------------------------------------------------------
-# qa validate pass-bar (B4 round-19)
-# ---------------------------------------------------------------------------
-
-
-
-# ---------------------------------------------------------------------------
 # qa validate gate-registry (F2)
 # ---------------------------------------------------------------------------
-
 
 
 def test_tool_outcome_is_frozen() -> None:
@@ -794,122 +768,18 @@ def test_discovery_against_the_REAL_api_test_checkout() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _task_doc(feature_id: str, task_id: str = "TASK-A001") -> str:
-    """A minimal task doc with a YAML frontmatter block carrying ``feature_id``."""
-    return (
-        "---\n"
-        f"id: {task_id}\n"
-        'title: "A task"\n'
-        "status: backlog\n"
-        f"feature_id: {feature_id}\n"
-        "wave: 1\n"
-        "---\n"
-        "\n"
-        "# A task\n"
-        "\n"
-        "Body prose that mentions the feature id in passing.\n"
-    )
-
-
 # --- pure repair function --------------------------------------------------
-
 
 
 # --- tree-level scan (repair_plan_task_frontmatter) ------------------------
 
 
-def _write_task_tree(root: Path, docs: dict[str, str]) -> None:
-    for rel, content in docs.items():
-        target = root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-
-
-
 # --- wired _validate end-to-end (fake oracle checks per-doc parity) --------
-
-
-def _parity_validate_seam(canonical: str):
-    """A fake guardkit ``feature validate`` that exits 0 iff EVERY task doc's
-    frontmatter feature_id equals ``canonical`` — the accept/refuse the real
-    oracle encodes for per-doc parity, with no shell-out. Returns the offending
-    doc's line on stdout_tail when it refuses (so P-5 can be exercised too)."""
-    calls: list[dict[str, Any]] = []
-
-    async def _run(**kwargs):
-        calls.append(dict(kwargs))
-        repo = Path(kwargs["repo_path"])
-        tasks = repo / "tasks"
-        bad: list[str] = []
-        if tasks.is_dir():
-            for doc in sorted(tasks.rglob("*.md")):
-                text = doc.read_text(encoding="utf-8")
-                # Parity check: the frontmatter must carry the canonical id line.
-                if f"feature_id: {canonical}\n" not in text:
-                    bad.append(str(doc.relative_to(repo)))
-        if bad:
-            return SimpleNamespace(
-                status="failed",
-                exit_code=1,
-                stderr="",
-                stdout_tail="FRONTMATTER PARITY FAILED: " + ", ".join(bad),
-            )
-        return SimpleNamespace(status="success", exit_code=0, stderr="", stdout_tail="")
-
-    return _run, calls
-
-
-
-# ---------------------------------------------------------------------------
-# P-8's three fences (2026-09-12) — the repair mends only what THIS run wrote,
-# never renames a real feature, and only ever admits the shape of the defect it
-# was written for. Real files in real temporary directories, and a real git
-# repository where the fence reads the run's own writing from git.
-#
-# THE INCIDENT: planning run 1318e2d5 (feature FEAT-DBB5) rewrote twelve of
-# api_test's own PostgreSQL task documents — feature FEAT-DB, a real separate
-# feature, none of them written by that run — onto FEAT-DBB5, because "FEAT-DB"
-# is a prefix of "FEAT-DBB5".
-# ---------------------------------------------------------------------------
-
-_DB_DOCS = (
-    "tasks/backlog/TASK-DB-005-create-initial-migration.md",
-    "tasks/backlog/postgresql-database/TASK-DB-002-setup-alembic-migrations.md",
-    "tasks/backlog/postgresql-database/TASK-DB-004-setup-test-infrastructure.md",
-)
-
-
-def _git(repo: Path, *args: str) -> str:
-    """Run one git command in ``repo`` and return its stdout (raises on red)."""
-    result = subprocess.run(
-        ["git", *args], cwd=str(repo), capture_output=True, text=True, check=True
-    )
-    return result.stdout
-
-
-def _git_repo_with_committed_db_docs(
-    root: Path, rels: tuple[str, ...] = _DB_DOCS
-) -> Path:
-    """A real repository whose FEAT-DB documents are already on the branch —
-    the shape api_test had when the incident happened."""
-    root.mkdir(parents=True, exist_ok=True)
-    _git(root, "init", "-q", "-b", "main")
-    _git(root, "config", "user.email", "tests@example.invalid")
-    _git(root, "config", "user.name", "P-8 tests")
-    for rel in rels:
-        target = root / rel
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(_task_doc("FEAT-DB", Path(rel).stem), encoding="utf-8")
-    _git(root, "add", "-A")
-    _git(root, "commit", "-q", "-m", "the PostgreSQL feature, FEAT-DB")
-    return root
-
 
 
 # ---------------------------------------------------------------------------
 # P-5 — persist the FULL validate stdout+stderr (observability rider)
 # ---------------------------------------------------------------------------
-
 
 
 def test_python_only_dunder_tests_dir_is_not_a_root(tmp_path):
@@ -930,61 +800,16 @@ def test_ts_dunder_tests_dir_is_a_root(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# THE STAMP NORMALIZER seam (Rich's condition 1, 2026-08-16; coordinator
-# condition 5 the same day — statuses written / nothing-to-do / partial /
-# refused / failed / unavailable / not-wired; the STOP is the driver's call on
-# enforcement, so the classifier only says ``is_failure``)
-#
-# ``guardkit qa normalize-stamps --feature <id> --repo <worktree>`` through the
-# frozen guardkit run seam; the classifier is exercised on the CLI's REAL
-# captured stdout shapes (tests/forge/planning/fixtures/stamp_normalizer/), the
-# clipped-tail and console-echo fallbacks, click's "No such command" (older
-# image), the exit-3 PARTIAL law, and the feature_files fill.
+# The feature_files fill: a plan that declares no feature_files is given the
+# committed spec's .feature. (The stamp normalizer these tests sat beside went
+# in the cull, 27 October 2026.)
 # ---------------------------------------------------------------------------
 
-import dataclasses  # noqa: E402
-import shutil  # noqa: E402
 
 from forge.planning.target_terminal_tools import (  # noqa: E402
     FeatureFilesFill,
     declare_feature_files_if_absent,
 )
-
-_STAMP_FIXTURES = Path(__file__).parent / "fixtures" / "stamp_normalizer"
-_CLICK_NO_SUCH_COMMAND = (
-    "Usage: guardkit qa [OPTIONS] COMMAND [ARGS]...\n"
-    "Try 'guardkit qa --help' for help.\n\n"
-    "Error: No such command 'normalize-stamps'.\n"
-)
-_MOON = (
-    "The moon is made of a very particular kind of cheese that no rule family "
-    "in the design has ever heard about at all"
-)
-
-
-def _fixture(name: str) -> str:
-    return (_STAMP_FIXTURES / name).read_text(encoding="utf-8")
-
-
-def _tail(text: str, n: int = 4096) -> str:
-    """The frozen seam's 4 KB stdout tail (parser._tail_bytes shape)."""
-    b = text.encode("utf-8")
-    return b[-n:].decode("utf-8", errors="ignore") if len(b) > n else text
-
-
-# -- classify: the real shapes -------------------------------------------------
-
-
-
-# -- classify: the exit-3 PARTIAL law (guardkit a8e5bfa3) ----------------------
-
-
-
-# -- parse: whole JSON, clipped tail, console echo -----------------------------
-
-
-
-# -- the feature_files fill -----------------------------------------------------
 
 
 def _write_plan_yaml(root: Path, feature_id: str, body: str) -> Path:
@@ -1047,48 +872,6 @@ def test_fill_does_not_match_a_nested_or_commented_feature_files(tmp_path: Path)
     assert fill.fired
 
 
-# -- make_normalize_stamps: the seam call ---------------------------------------
-
-
-
-# -- LIVE: the real guardkit CLI through the real parser ------------------------
-#
-# Skips unless a guardkit checkout carrying the normalizer is reachable (see
-# tests/forge/planning/_live_guardkit.py: FORGE_GUARDKIT_NORMALIZER_CHECKOUT /
-# _PYTHON, else the sibling checkout once the lane merges). Drives
-# ``python -m guardkit.cli.main qa normalize-stamps`` as a subprocess exactly as
-# the frozen seam would (stdout NOT a tty), folds it through
-# ``parse_guardkit_output`` (the 4 KB tail and all), and proves written /
-# nothing-to-do / refused / not-found end to end on the api_test 5bc6fd1 fixture.
-
-from tests.forge.planning._live_guardkit import live_guardkit_or_skip, live_run_fn  # noqa: E402
-
-
-
-
-# ---------------------------------------------------------------------------
-# HOW the declared-list check DECIDES (defect found by adversarial review,
-# 2026-08-22; the 08-16 ruling itself is untouched — a present list that omits
-# forge's committed spec still refuses LOUD).
-#
-# The check used to read the ``feature_files:`` block up to the next BLANK LINE
-# and then ask whether the committed path was a SUBSTRING of that window. Both
-# halves were wrong, and wrong in opposite directions:
-#
-#   * over-sensitive — an EMPTY list followed by any other YAML list before the
-#     next blank line swallowed that list, so the block looked non-empty and a
-#     correct plan was refused (measured on unmodified forge);
-#   * under-sensitive — the committed path appearing ANYWHERE in that window
-#     (a comment, a neighbouring key's value, or inside a longer and different
-#     path) satisfied the substring test, so a plan naming the wrong file was
-#     accepted (measured on unmodified forge).
-#
-# It now reads the block to the next TOP-LEVEL KEY and compares PARSED entries,
-# path against path.
-# ---------------------------------------------------------------------------
-
-
-
 def test_fill_still_fires_on_a_malformed_plan_with_no_feature_files_key(
     tmp_path: Path,
 ) -> None:
@@ -1102,149 +885,3 @@ def test_fill_still_fires_on_a_malformed_plan_with_no_feature_files_key(
     )
     assert fill.fired is True
     assert fill.feature_files == ("features/user-search/user-search.feature",)
-
-
-
-# ---------------------------------------------------------------------------
-# ADVISORY DISAGREEMENTS (Rich's ruling 08-18, drive-19 datum): the normalizer's
-# `disagreements` list rides through the classifier into the receipt, on ANY
-# status; malformed entries are dropped, never guessed.
-# ---------------------------------------------------------------------------
-
-
-
-# -- the model fallback reports its own outcome (rule 16, 2026-09-06) ----------
-
-import json  # noqa: E402
-
-
-_MODEL_ASKED_AND_FAILED = {
-    "status": "asked_and_failed",
-    "detail": "HTTPStatusError: 502 Bad Gateway from localhost:4000",
-    "endpoint": "localhost:4000",
-    "model": "workhorse",
-}
-
-
-def _exit3_json(model_outcome: Any = "absent") -> str:
-    """The exit-3 JSON as guardkit prints it (indent=2), with or without the
-    ``model_outcome`` key, followed by the rich echo that always trails it."""
-    payload: dict[str, Any] = {
-        "feature": "FEAT-TIME",
-        "stamped": {"Reading the current server time": "hurl"},
-        "rules": {"Reading the current server time": "R9"},
-        "already_stamped": [],
-        "refused": [_MOON, "Another undecidable one"],
-        "written": True,
-    }
-    if model_outcome != "absent":
-        payload["model_outcome"] = model_outcome
-    return json.dumps(payload, indent=2) + "\n! normalize-stamps PARTIAL: 2 scenario(s) undecidable by rule\n"
-
-
-def _with_model_line_where_guardkit_prints_it(line: str) -> str:
-    """The fixture's stderr with the fallback's line where guardkit prints it:
-    among the logger lines, BEFORE the rich ``! normalize-stamps PARTIAL:``
-    block that closes the stream (the fallback runs during normalization; the
-    echo prints at the end)."""
-    text = _fixture("partial-stderr.txt")
-    marker = "! normalize-stamps PARTIAL:"
-    idx = text.index(marker)
-    return text[:idx] + line + "\n" + text[idx:]
-
-
-
-# -- the rewrite comes before the model fallback (rule 1a, 2026-09-07) ---------
-#
-# The production collaborator takes ``rules_only``: true adds ``--no-model``
-# to the argv, so the normalizer decides by rule alone on the driver's first
-# stamping. An older guardkit that has the subcommand but not the option is
-# run again the old way, once, and the receipt says so. The model outcome
-# gains ``switched_off`` — read from the JSON and from the one plain stderr
-# line, and never mistaken for "no endpoint is configured".
-
-
-_CLICK_NO_SUCH_OPTION = (
-    "Usage: python -m guardkit.cli.main qa normalize-stamps [OPTIONS]\n"
-    "Try 'python -m guardkit.cli.main qa normalize-stamps --help' for help.\n\n"
-    "Error: No such option: --no-model\n"
-)
-
-_SWITCHED_OFF_LINE = (
-    "INFO:guardkit.orchestrator.stamp_model_fallback:STAMP NORMALIZER: "
-    "feature FEAT-TIME — the model fallback was not asked about 2 title(s) no "
-    "rule could decide: switched off for this stamping by the caller "
-    "(--no-model). The titles stay refused and nothing was stamped."
-)
-
-
-def _sequenced_run(answers: list[tuple[str, int, str, str]]):
-    """A fake seam that answers per call from ``(status, exit, stderr, tail)``
-    rows (the last repeats) and records every call's kwargs."""
-    calls: list[dict[str, Any]] = []
-
-    async def _run(**kwargs):
-        calls.append(dict(kwargs))
-        status, exit_code, stderr, tail = answers[min(len(calls) - 1, len(answers) - 1)]
-        return SimpleNamespace(status=status, exit_code=exit_code, stderr=stderr, stdout_tail=tail)
-
-    return _run, calls
-
-
-
-# ---------------------------------------------------------------------------
-# THE PROVABILITY CHECK BEFORE THE CARD (Part K, 2026-09-07) — the seam.
-#
-# ``guardkit qa classify-scenarios --feature-file <tmp> --repo <checkout>
-# --json`` is the routing law's rules-only dry run on a spec that has no plan
-# yet. The seam writes the committed .feature CONTENT to a temporary file,
-# runs the verb in the target checkout, and reads back exactly one JSON
-# object; it never writes under the checkout, and an older guardkit without
-# the verb is "unavailable", never a failure of the run.
-# ---------------------------------------------------------------------------
-
-
-_CLASSIFY_FEATURE = (
-    "Feature: users\n"
-    "  Scenario: Creating a user answers 201\n"
-    "    When the caller sends POST /users\n"
-    "    Then the reply is 201\n"
-    "  Scenario: A new user can be created on a freshly created database\n"
-    "    Given a fresh database\n"
-    "    When a user is created\n"
-    "    Then the row exists\n"
-)
-
-_CLASSIFY_JSON = (
-    "{\n"
-    '  "feature_file": "/tmp/forge-provability-x/draft.feature",\n'
-    '  "repo_has_http_surface": true,\n'
-    '  "http_surface_evidence": "fastapi is an exact dependency in pyproject.toml",\n'
-    '  "scenarios": [\n'
-    "    {\n"
-    '      "title": "Creating a user answers 201",\n'
-    '      "home": "hurl",\n'
-    '      "rule": "R9",\n'
-    '      "refused": false\n'
-    "    },\n"
-    "    {\n"
-    '      "title": "A new user can be created on a freshly created database",\n'
-    '      "home": null,\n'
-    '      "rule": null,\n'
-    '      "refused": true\n'
-    "    }\n"
-    "  ],\n"
-    '  "refused_titles": [\n'
-    '    "A new user can be created on a freshly created database"\n'
-    "  ]\n"
-    "}\n"
-)
-
-_CLICK_NO_SUCH_CLASSIFY = (
-    "Usage: guardkit qa [OPTIONS] COMMAND [ARGS]...\n"
-    "Try 'guardkit qa --help' for help.\n\n"
-    "Error: No such command 'classify-scenarios'.\n"
-)
-
-
-

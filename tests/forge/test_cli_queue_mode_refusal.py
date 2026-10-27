@@ -23,7 +23,6 @@ attempt must not reach it anyway.
 
 from __future__ import annotations
 
-import sqlite3
 from pathlib import Path
 from typing import Any
 from unittest.mock import Mock
@@ -35,7 +34,6 @@ from click.testing import CliRunner
 from forge.cli import queue as cli_queue
 from forge.config.conductor import CONDUCTOR_FLAG_PATH
 from forge.lifecycle.modes import BuildMode
-from forge.lifecycle.migrations import apply_at_boot
 
 
 # ---------------------------------------------------------------------------
@@ -203,36 +201,6 @@ def _assert_nothing_written(
     assert persistence.rows == [], "a refused queue attempt wrote a build row"
     assert persistence.calls == [], "a refused queue attempt touched persistence"
     assert published == [], "a refused queue attempt published to the bus"
-
-
-def _make_v16_ledger(path: Path, *, malformed: bool = False) -> None:
-    connection = sqlite3.connect(path)
-    apply_at_boot(connection)
-    connection.execute("DROP TABLE feature_routing_seeds")
-    connection.execute("DELETE FROM schema_version WHERE version > 16")
-    connection.execute("ALTER TABLE builds DROP COLUMN source_commit")
-    if malformed:
-        connection.execute("ALTER TABLE planning_runs DROP COLUMN launch_settings")
-    connection.commit()
-    connection.close()
-
-
-def _record_queue_writer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> list[sqlite3.Connection]:
-    from forge.adapters.sqlite import connect as sqlite_connect
-
-    opened: list[sqlite3.Connection] = []
-    original = sqlite_connect.connect_writer
-
-    def recording_connect(path: Path) -> sqlite3.Connection:
-        connection = original(path)
-        opened.append(connection)
-        return connection
-
-    monkeypatch.setattr(sqlite_connect, "connect_writer", recording_connect)
-    return opened
-
 
 
 # ---------------------------------------------------------------------------

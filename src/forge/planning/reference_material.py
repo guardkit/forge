@@ -81,7 +81,6 @@ PROTOTYPE_NOT_READ_LINE: str = (
 logger = logging.getLogger(__name__)
 
 _ORDINARY_MODES = frozenset({"100644", "100755"})
-_LINK_MODE = "120000"
 _FULL_COMMIT = re.compile(r"^[0-9a-f]{40}$")
 #: What may follow a reference folder's name in a request: anything but space,
 #: quotes, back-quotes and brackets (so a Markdown link or a back-quoted path
@@ -131,7 +130,6 @@ def named_reference_files(request_text: str, paths: Sequence[str]) -> list[str]:
             if name not in found:
                 found.append(name)
     return found
-
 
 
 def _inside(name: str, paths: Sequence[str]) -> bool:

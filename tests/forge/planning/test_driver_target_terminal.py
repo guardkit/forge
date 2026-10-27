@@ -1392,7 +1392,6 @@ def _plan_result_native_smoke(smoke_path: str, slug: str = "stats-endpoint"):
     return _factory
 
 
-
 @pytest.mark.asyncio
 async def test_replay_real_tests_health_passes_to_build_queued(
     store: SqlitePlanningRunStore, tmp_path: Path
@@ -1507,7 +1506,6 @@ async def test_normalizer_red_fails_and_does_not_commit(
     assert feature_show.returncode != 0  # path not present on the branch
 
 
-
 @pytest.mark.asyncio
 async def test_plan_invalid_artifacts_fails(store: SqlitePlanningRunStore) -> None:
     _queue(store)
@@ -1518,7 +1516,6 @@ async def test_plan_invalid_artifacts_fails(store: SqlitePlanningRunStore) -> No
         ),
     )
     assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-
 
 
 @pytest.mark.asyncio
@@ -1646,7 +1643,6 @@ async def test_the_planners_missing_prerequisite_line_is_shown_on_the_card(
         assert "The planner's notes" not in line
 
 
-
 @pytest.mark.asyncio
 async def test_a_low_traceability_score_is_advice_on_the_build_card(
     store: SqlitePlanningRunStore,
@@ -1687,7 +1683,6 @@ async def test_a_low_traceability_score_is_advice_on_the_build_card(
     line = _planning_card_lines(SqliteLifecyclePersistence(connection=store._connection), CID)
     assert line is not None
     assert "0.40 out of 1" in line and "REVISE" in line
-
 
 
 @pytest.mark.asyncio
@@ -2811,7 +2806,6 @@ async def test_round19_no_seed_is_advice_and_the_build_is_queued(
     assert not any(level == "error" for _, _, level in h.ctx["notifications"])
 
 
-
 # ---------------------------------------------------------------------------
 # F2 — the per-feature live-gate REGISTRATION leg (sibling of the pass-bar leg).
 # At plan-commit the machine flow registered pass BARS but no live GATE; this
@@ -3448,7 +3442,6 @@ async def test_f2_missing_registry_skip_names_its_reason(
     assert ev["reason_code"] == "no_registry"
     assert ev["address"] == {"method": "GET", "path": "/version"}
     assert ev["feature_id"] == _leg_details(store, "feature-plan")["feature_id"]
-
 
 
 @pytest.mark.asyncio
@@ -4105,7 +4098,6 @@ def test_the_real_api_test_rules_file_shape_reads(tmp_path: Path) -> None:
     assert [r["id"] for r in block["rules"]] == ["R-OV-1", "R-ADR001-1"]
 
 
-
 # ---------------------------------------------------------------------------
 # WHAT THE REPOSITORY ALREADY CONTAINS, IN THE DESCRIPTOR (2026-09-11)
 #
@@ -4536,20 +4528,8 @@ def test_the_inventory_rides_beside_the_architecture_rules(tmp_path: Path) -> No
 # ---------------------------------------------------------------------------
 
 
-_STAMP_SPEC_REL = "features/stats-endpoint/stats-endpoint.feature"
-_MOON_TITLE = (
-    "The moon is made of a very particular kind of cheese that no rule family "
-    "in the design has ever heard about at all"
-)
-_UNDECIDABLE_TITLES = (_MOON_TITLE, "Another undecidable one")
-
-
 def _plan_yaml_rel(feature_id: str) -> str:
     return f".guardkit/features/{feature_id}.yaml"
-
-
-
-
 
 
 def _commit_repo_routing_law(repo: Path, value: str) -> None:
@@ -4578,110 +4558,10 @@ def _commit_repo_routing_law(repo: Path, value: str) -> None:
     _publish_to_origin(repo)
 
 
-def _plan_result_with_feature_flag(value: str):
-    """A plan-writer YAML that carries its own ``routing_law:`` (the
-    feature-level escape hatch guardkit honours over the repo flag)."""
-
-    def _factory(feature_id: str) -> Any:
-        r = _plan_result_native(feature_id)
-        r.role_output[_plan_yaml_rel(feature_id)] = (
-            f"id: {feature_id}\nrouting_law: {value}\ntasks:\n- id: TASK-STAT-001\n"
-        )
-        return r
-
-    return _factory
-
-
-_UNENFORCED_LINE = (
-    "2 of 4 examples could not be given a verification home by rule —\n"
-    f"  - {_MOON_TITLE}\n"
-    "  - Another undecidable one\n"
-    "— the plan proceeds; this repo does not enforce the routing law yet"
-)
-
-
-def _share_order(sink: dict[str, Any], h: _Harness) -> None:
-    """One call-order list across the fake normalizer and the harness's
-    validate, so a test can assert normalizer-then-validate."""
-    sink["order"] = h.ctx["counters"].setdefault("order", [])
-
-
 def _show(repo: Path, branch: str, path: str) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "show", f"{branch}:{path}"], cwd=repo, capture_output=True, text=True
     )
-
-
-
-
-# -- LIVE: the whole plan leg with the REAL guardkit normalizer ------------------
-#
-# Skips unless a guardkit checkout carrying the normalizer is reachable (see
-# tests/forge/planning/_live_guardkit.py). Real git (WorktreeGitRunner), the
-# real ``guardkit qa normalize-stamps`` CLI through the real parser, forge's
-# real ``feature_files:`` fill on a plan YAML shaped like the live 008 output
-# (no feature_files, no scenarios — api_test FEAT-F924) — and the plan commit
-# on the planning branch carries the rule-minted stamps. Rich's condition 1,
-# end to end.
-
-from tests.forge.planning._live_guardkit import live_guardkit_or_skip, live_run_fn  # noqa: E402
-
-_LIVE_TITLE = "The endpoint is unaffected by database unavailability"
-_LIVE_FEATURE = (
-    "Feature: stats\n"
-    f"  Scenario: {_LIVE_TITLE}\n"
-    "    Given the database is unavailable\n"
-    "    When I request the statistics\n"
-    "    Then the response is served from memory\n"
-)
-
-
-def _live_spec_result(slug: str = "stats-endpoint") -> Any:
-    return SimpleNamespace(
-        outcome=SimpleNamespace(value="completed"),
-        role_output={
-            f"{slug}.feature": _LIVE_FEATURE,
-            f"{slug}_assumptions.yaml": "assumptions: []\n",
-            f"{slug}_summary.md": "# summary\n",
-            f"{slug}_digest.yaml": (
-                f"feature: {slug}\n"
-                "generated: '2026-08-16T10:00:00Z'\n"
-                "scenarios:\n"
-                f"- title: {_LIVE_TITLE}\n"
-                "  tags: []\n"
-                "  sentence: The endpoint keeps answering when the database is down.\n"
-                "assumptions: []\n"
-            ),
-            f"pass-bar-seed-{slug}.yaml": _AUTHLESS_SEED_YAML,
-            "validation.json": json.dumps(
-                {"accepted": True, "errors": [], "gates_run": ["gherkin_backstop"]}
-            ),
-        },
-        reason=None,
-    )
-
-
-
-# ---------------------------------------------------------------------------
-# ADVISORY DISAGREEMENTS reach the owner as ONE plain line — WHATEVER the
-# status and whether or not the repo enforces the law (a legal-but-wrong
-# stamp PASSES the law; the stamp is never changed, so the line IS the
-# mechanism). Rich's ruling 08-18, drive-19 datum.
-# ---------------------------------------------------------------------------
-
-_DISAGREEMENTS = (
-    {"title": "The endpoint returns the count", "stamped": "toolchain", "rule_home": "hurl", "rule": "R9", "evidence": "the endpoint returns"},
-    {"title": "Unauthenticated requests are rejected", "stamped": "toolchain", "rule_home": "hurl", "rule": "R9", "evidence": "requests are rejected"},
-)
-_DISAGREEMENTS_LINE = (
-    "2 example(s) carry a verification home the rules would not have chosen —\n"
-    "  - The endpoint returns the count — stamped toolchain, the rules say hurl\n"
-    "  - Unauthenticated requests are rejected — stamped toolchain, the rules say hurl\n"
-    "— the stamps stand as written (nothing was changed); worth a look before this feature graduates"
-)
-
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -4967,328 +4847,8 @@ async def test_documentation_task_bar_lands_narrowed_on_the_branch(
     ]
 
 
-# ---------------------------------------------------------------------------
-# THE MACHINE REWRITES ON A REFUSAL BEFORE IT ASKS (2026-09-06)
-#
-# Two of Rich's sentences that weekend stopped at the plan leg because the
-# spec writer wrote worked examples the routing law could not prove. The law
-# was right to refuse; the machine was wrong to ask a person to fix what it
-# could have fixed itself. The plan leg now sends the refused examples back to
-# the spec writer ONCE, as its own note, and stamps again; only a second
-# refusal stops the run. Three touches, as before.
-# ---------------------------------------------------------------------------
-
-from forge.planning.driver import PlanningRunDriver as _Driver  # noqa: E402
-
-_MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
-
-#: Rule 2, the spec's own words, with the two fixture titles verbatim.
-_MACHINE_NOTE_FOR_TITLES = (
-    "The rules-only check could not assign a verifier to these worked examples; "
-    "this is not a semantic impossibility:\n"
-    f"- {_MOON_TITLE}\n"
-    "- Another undecidable one\n"
-    "\n"
-    "Revise only these examples using facts in the supplied request and context. "
-    "Keep the behaviour each example specifies unchanged, including its "
-    "concurrency, timing, and other multi-interaction behaviour; never turn that "
-    "behaviour into sequential or single-interaction behaviour. Describe only "
-    "what a caller or user can observe through the interface the request or "
-    "context actually supplies (for example, an HTTP, command, screen, or message "
-    "interface). Do not invent an interface, status, field, implementation detail, "
-    "test name, or verifier. If the supplied facts cannot support a faithful "
-    "provable revision, leave that example unchanged; do not add an assumption or "
-    "ask a question. Keep every other worked example exactly as it is."
-)
-
-#: Rule 5: the ONE un-mentioned line when the rewrite stamped clean.
-_MACHINE_REWRITE_LINE_EXPECTED = (
-    "2 of the worked examples could not be proven as written, so the machine "
-    "asked the spec writer to express their behaviour through the supplied "
-    "interface. What changed: 1 example changed. The plan carries on."
-)
-
-#: Rule 6: the sentence at the top of the plan-stop card after the rewrite
-#: landed and the second stamping still refused titles. (A rewrite that
-#: changed nothing no longer reaches the card: since rule 6b the model gets
-#: its turn first — see the tests below.)
-_STOP_STILL_UNPROVEN = (
-    "The machine already asked the spec writer once to express these as observable "
-    "behaviour through the supplied interface; the rewrite still could not be "
-    "proven."
-)
-
-
-
-class _Crash(BaseException):
-    """A process death mid-leg: not an Exception, so nothing on the drive path
-    catches it — the durable rows are whatever was written before it."""
-
-
-
-
-def _rewritten_spec_result(base: Any | None = None, slug: str = "stats-endpoint") -> Any:
-    """Round two of the spec: the same one example, said as what the endpoint
-    does on the digest — so the comparison reads "1 example changed"."""
-    result = base if base is not None else _spec_result_native(slug)
-    result.role_output[f"{slug}_digest.yaml"] = _digest_yaml(slug).replace(
-        "The service answers the request in the ordinary way.",
-        "GET /stats answers 200 with the statistics in the body.",
-    )
-    return result
-
-
-def _spec_by_round(first: Any, second: Any):
-    """The spec-writer's reply per round: the plain first round, then the reply
-    to whatever note came back (the harness passes ``validate_feedback``)."""
-
-    def _factory(validate_feedback: str | None) -> Any:
-        return first if validate_feedback is None else second
-
-    return _factory
-
-
-def _enforced_repo(tmp_path: Path) -> tuple[Path, WorktreeGitRunner]:
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _commit_repo_routing_law(repo, "enforced")
-    return repo, _recorded_runner(tmp_path / "wt", repo)
-
-
-def _approved_spec_rows(store: SqlitePlanningRunStore) -> list[dict[str, Any]]:
-    return [
-        json.loads(e["details_json"] or "{}")
-        for e in store.list_events(CID)
-        if e["stage_label"] == "feature-spec" and e["status"] == "approved"
-    ]
-
-
 def _error_cards(h: _Harness) -> list[str]:
     return [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
-
-
-
-
-# ---------------------------------------------------------------------------
-# WHEN THE REWRITE IS REFUSED, THE MODEL GETS ITS TURN BEFORE THE RUN STOPS
-# (rule 6b, 2026-09-07, after run 696a3e38)
-#
-# The live run: one title refused by rule, the machine's note sent, the
-# specialist answered "could not carry out what this round required, after 2
-# attempts. 'feedback_resolved' must be met…", and the run stopped with
-# nothing built — the model fallback, which the second stamping exists to
-# ask, was never asked. Now a rewrite the checker refused, or one that
-# changed nothing, does not stop the run: the second stamping runs on the
-# spec of record with the model allowed; if everything stamps the owner reads
-# one line naming what the model decided and the plan carries on; if titles
-# are still refused the run stops with the note-refused sentence and the
-# model's own sentence after it. Never a third try.
-# ---------------------------------------------------------------------------
-
-
-
-
-
-
-
-
-_MODEL_ASKED_AND_FAILED = {
-    "status": "asked_and_failed",
-    "detail": "HTTPStatusError: 502 Bad Gateway from localhost:4000",
-    "endpoint": "localhost:4000",
-    "model": "workhorse",
-}
-
-#: Rule 6b's line in the spec's own shape for one example, with the
-#: fixture's real title and the real word the model decided.
-_MODEL_LINE_AFTER_REFUSED_REWRITE = (
-    "1 of the worked examples could not be proven as written; the spec writer "
-    "could not express it as observable behaviour through the supplied interface "
-    "(the checker refused the rewrite twice), so the model fallback decided its "
-    "verifier: "
-    f"{_MOON_TITLE} → probe:process. The plan carries on."
-)
-
-#: The same shape for two examples after a rewrite that changed nothing.
-_MODEL_LINE_AFTER_CHANGED_NOTHING = (
-    "2 of the worked examples could not be proven as written; the spec writer "
-    "could not express them as observable behaviour through the supplied interface "
-    "(the rewrite changed nothing), so the model fallback decided their verifiers: "
-    f"{_MOON_TITLE} → probe:process; Another undecidable one → hurl. "
-    "The plan carries on."
-)
-
-#: Rule 23's machine-variant sentence, verbatim: the first sentence of the
-#: rule 6b stop after the checker refused the rewrite and the model could
-#: not settle the titles.
-_REFUSED_TWICE_SENTENCE = (
-    f"Planning run {CID} stopped at writing the task plan: 2 of the worked "
-    "examples could not be proven as written, and when the machine asked the "
-    "spec writer to express their behaviour through the supplied interface, the "
-    "checker refused the rewrite twice (the rewrite moved two examples the note "
-    "did not name). Nothing was built. To try again, state the intended interface "
-    "and its observable behaviour explicitly in the sentence or supplied context, "
-    "without unsupported details."
-)
-
-#: Rule 6's sentence at the top of the plan-stop card when the rewrite
-#: changed nothing — the spec's own words for that outcome, which is also
-#: how a changed-nothing rewrite stops after the model's turn (rule 6b):
-#: the note-refused sentence would blame the checker for a refusal that
-#: never was, and the spec quotes no other sentence for it.
-_STOP_CHANGED_NOTHING = (
-    "The machine already asked the spec writer once to express these as observable "
-    "behaviour through the supplied interface; the rewrite changed nothing."
-)
-
-#: The same worked example with its steps said as observable interface behaviour and
-#: the title untouched: a rewrite that moves the .feature but not one digest
-#: sentence, so the cards say the same thing while the bytes differ.
-_FIXTURE_FEATURE_ENDPOINT_STEPS = (
-    "Feature: stats\n  Scenario: ok\n    When the caller sends GET /stats\n"
-    "    Then the reply is 200\n"
-)
-_SPEC_FEATURE_REL = "features/stats-endpoint/stats-endpoint.feature"
-
-
-def _steps_moved_spec_result(slug: str = "stats-endpoint") -> Any:
-    """Round two of the spec: the .feature's steps rewritten into the
-    endpoint shape, every digest sentence byte-identical to round one."""
-    result = _spec_result_native(slug)
-    result.role_output[f"{slug}.feature"] = _FIXTURE_FEATURE_ENDPOINT_STEPS
-    return result
-
-
-def _branch_subjects(repo: Path, branch: str) -> list[str]:
-    """The commit subjects on ``branch``, newest first."""
-    res = subprocess.run(
-        ["git", "log", "--format=%s", branch], cwd=repo, capture_output=True, text=True
-    )
-    return [ln for ln in res.stdout.splitlines() if ln]
-
-
-def _rev_parse(repo: Path, rev: str) -> str:
-    res = subprocess.run(["git", "rev-parse", rev], cwd=repo, capture_output=True, text=True)
-    assert res.returncode == 0, res.stderr
-    return res.stdout.strip()
-
-
-
-
-class _ForgetfulGitRunner(WorktreeGitRunner):
-    """A real runner that cannot read a file at a COMMIT id (only at a branch
-    name) — the one thing the put-back needs from it."""
-
-    async def read_file_from_branch(
-        self, *, repo_path: str, branch: str, file_path: str
-    ) -> str | None:
-        if re.fullmatch(r"[0-9a-f]{40}", branch):
-            return None
-        return await super().read_file_from_branch(
-            repo_path=repo_path, branch=branch, file_path=file_path
-        )
-
-
-
-
-# ---------------------------------------------------------------------------
-# The model fallback reports its own outcome and the card prints it (rule 16)
-# ---------------------------------------------------------------------------
-
-
-
-
-
-#: Every outcome the stamp check's model fallback can report, with details in
-#: the build system's own words (settings, error classes, codes), and the plain
-#: sentence the owner's card must say instead (5 October 2026, Codex round 1).
-_EVERY_MODEL_OUTCOME = [
-    (
-        {"status": "asked_and_failed", "detail": (
-            "ValueError: the reply from 10.0.0.1:4000 was empty — the model was "
-            "still thinking when it ran out of room (raise "
-            "GUARDKIT_STAMP_MODEL_MAX_TOKENS above 8192)"
-        )},
-        "the model ran out of room before it answered",
-    ),
-    (
-        {"status": "asked_and_failed", "detail": "TimeoutError from localhost:4000 (timed out)"},
-        "no answer came back in time",
-    ),
-    (
-        {"status": "asked_and_failed", "detail": "URLError from localhost:4000 (Connection refused)"},
-        "could not reach its model",
-    ),
-    (
-        {"status": "asked_and_failed", "detail": "HTTPError 500 from 127.0.0.1:4000 (upstream command exited prematurely)"},
-        "the model did not give a usable answer",
-    ),
-    (
-        {"status": "asked_and_failed", "detail": ""},
-        "the model did not give a usable answer",
-    ),
-    (
-        {"status": "answer_rejected", "detail": "ModelAnswerRejected: 'maybe' is not one of the allowed words"},
-        "its answer was not one the check accepts",
-    ),
-    (
-        {"status": "not_configured", "detail": (
-            "no model endpoint is configured (set GUARDKIT_STAMP_MODEL_URL, or "
-            "OPENAI_BASE_URL, to something like http://localhost:4000/v1)"
-        )},
-        "The model fallback was not asked: no endpoint is configured.",
-    ),
-    (
-        {"status": "not_configured", "detail": "stamp model not configured (GUARDKIT_STAMP_MODEL unset); no model call made"},
-        "has no model named, so it did not ask a model",
-    ),
-    (
-        {"status": "decided", "detail": "decided all 1 of them: 'x' -> hurl", "count": 1},
-        "The model fallback decided 1 of them",
-    ),
-    (
-        {"status": "switched_off", "detail": "switched off for this stamping by the caller (GUARDKIT rules only)"},
-        "was not asked (it was switched off for this stamping)",
-    ),
-]
-
-
-
-# ---------------------------------------------------------------------------
-# THE REWRITE COMES BEFORE THE MODEL FALLBACK (rule 1a, 2026-09-07)
-#
-# The first live run of the rewrite round never fired: the model fallback
-# (reachable through LiteLLM since that morning) answered for the schema
-# examples and "proved" them with a check that never touches the schema, so
-# there was no refusal for the round to hear. Now the FIRST stamping of a run
-# goes by rule only — the collaborator is called with rules_only=True and the
-# argv carries --no-model — exactly when the round could fire: the switch is
-# on, the law is enforced for the repo, and this run has not had its one
-# rewrite. The second stamping, after the rewrite, asks the model about what
-# is still refused. Switch off, law not enforced, or rewrite already spent:
-# the model is asked on the first stamping as before.
-# ---------------------------------------------------------------------------
-
-_RULES_FIRST_LOG = "first stamping by rule only (the rewrite round is on)"
-
-_SWITCHED_OFF_MODEL_OUTCOME = {
-    "status": "switched_off",
-    "detail": (
-        "the model fallback was not asked about 2 title(s) no rule could decide: "
-        "switched off for this stamping by the caller (--no-model). The titles "
-        "stay refused and nothing was stamped."
-    ),
-}
-
-
-
-
-
-
-def _driver_log_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
-    return [r.getMessage() for r in caplog.records if r.name == "forge.planning.driver"]
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -5595,7 +5155,6 @@ async def test_unchanged_approved_plan_does_not_request_semantic_rereview(
     assert h.ctx["counters"].get("semantic_rereview", 0) == 0
 
 
-
 # ---------------------------------------------------------------------------
 # the 1 October planner fix, follow-up: the plan leg reads the repository where
 # every other planning call for it goes, and when it cannot, the plan-writer,
@@ -5714,36 +5273,6 @@ async def test_an_unreadable_repository_reaches_the_plan_writer_and_the_build_ga
 # the build-gate card when a plan is half as big again as the median of the
 # project's own earlier plans, with at least five to compare. Never a refusal.
 # ---------------------------------------------------------------------------
-
-
-def _plan_yaml(feature_id: str, tasks: int, minutes: int) -> str:
-    lines = [f"id: {feature_id}", "tasks:"]
-    for n in range(1, tasks + 1):
-        lines += [f"  - id: TASK-{feature_id[-4:]}-{n:03d}", f"    estimated_minutes: {minutes}"]
-    lines += ["orchestration:", "  parallel_groups:"]
-    lines += [f"    - [TASK-{feature_id[-4:]}-{n:03d}]" for n in range(1, tasks + 1)]
-    return "\n".join(lines) + "\n"
-
-
-def _earlier(count: int, tasks: int = 5, minutes: int = 50) -> dict[str, str]:
-    return {
-        f".guardkit/features/FEAT-E{n:03d}.yaml": _plan_yaml(f"FEAT-E{n:03d}", tasks, minutes)
-        for n in range(count)
-    }
-
-
-class _PlansReader:
-    where = "a stand-in"
-
-    def __init__(self, files: dict[str, str]) -> None:
-        self.files = files
-
-    def list_files(self) -> list[str]:
-        return sorted(self.files)
-
-    def read_text(self, path: str) -> str | None:
-        return self.files.get(path)
-
 
 
 @pytest.mark.asyncio
@@ -5867,11 +5396,6 @@ def _approved_plan_events(store: SqlitePlanningRunStore) -> list[dict[str, Any]]
     ]
 
 
-#: A review record whose shape is wrong: bookkeeping that is asked about once
-#: in the exact re-review (a record missing altogether is not, since step 2).
-_MALFORMED_REVIEW = json.dumps({"decision": "approved"})
-
-
 def _a_reply(files: dict[str, str], review: str | None = None) -> Any:
     role_output: dict[str, Any] = {"files": dict(files)}
     if review is not None:
@@ -5879,7 +5403,6 @@ def _a_reply(files: dict[str, str], review: str | None = None) -> Any:
     return SimpleNamespace(
         outcome=SimpleNamespace(value="completed"), role_output=role_output, reason=None
     )
-
 
 
 @pytest.mark.asyncio
@@ -5898,6 +5421,5 @@ async def test_a_readable_rejection_with_missing_fields_is_advice(
     await h.driver.drive(CID)
     plan = _approved_plan_events(store)
     assert plan and "did not approve this plan" in plan[-1]["plan_review_note"]
-
 
 

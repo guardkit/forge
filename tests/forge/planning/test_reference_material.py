@@ -38,7 +38,6 @@ import pytest
 
 from forge.planning.factory_deployment_context import load_bundled_document
 
-from forge.planning import nothing_to_build
 from forge.planning.code_evidence import MAX_REFERENCE_WINDOWS
 from forge.planning.declared_memory import (
     DeclaredReference,
@@ -157,7 +156,6 @@ def test_slack_links_dot_slash_and_fragments_are_read_as_typed() -> None:
     ]
 
 
-
 # ---------------------------------------------------------------------------
 # Read at the start commit: the record and the named files
 # ---------------------------------------------------------------------------
@@ -245,7 +243,6 @@ async def test_what_stops_the_run_and_why(
     material, why = await _gather(_Tree({RECORD: GOOD_RECORD, **files}), request_text)
     assert material is None
     assert why is not None and said in why
-
 
 
 # ---------------------------------------------------------------------------
@@ -389,7 +386,6 @@ def test_the_facts_sheet_skips_reference_folders(tmp_path: Path) -> None:
         LocalCheckoutReader(str(repo)), request, reference_paths=("reference/",)
     ).text
     assert "reference/" not in (skipped or "")
-
 
 
 # ---------------------------------------------------------------------------
