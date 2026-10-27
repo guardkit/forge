@@ -1569,14 +1569,14 @@ def _ffec_files(*, ordered: bool) -> dict[str, str]:
     return files
 
 
-def test_live_guardkit_feature_validate_refuses_an_unordered_task_reference(
+def test_live_guardkit_feature_validate_advises_on_an_unordered_task_reference(
     cfg: ForgeConfig, tmp_path: Path, repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The plan leg's ``feature-validate`` check, run by the sidecar with
-    guardkit's real ``feature validate``: the FEAT-FFEC plan as committed is
-    refused, nothing lands on the branch, and guardkit's sentence reaches the
-    check's detail (which the driver puts on the failed leg). The same plan
-    with the need declared and the waves reordered commits."""
+    guardkit's real ``feature validate``. Since step 2 (GuardKit GKT-049) an
+    unordered task reference is advice: the FEAT-FFEC plan as committed passes
+    and commits. The same plan with the need declared and the waves reordered
+    also commits."""
     checkout = live_guardkit_checkout(Path(__file__))
     if checkout is None:
         pytest.skip("no live guardkit checkout is reachable")
@@ -1592,14 +1592,9 @@ def test_live_guardkit_feature_validate_refuses_an_unordered_task_reference(
     status, body = _write(cfg, tmp_path, files=_ffec_files(ordered=False), checks=[check])
 
     assert status == 200, body
-    assert body["status"] == "failed" and body["sha"] is None
     validate = _by_name(body)["feature-validate"]
-    assert validate["ran"] and not validate["passed"]
-    assert (
-        "TASK-FFEC-002's task file refers to TASK-FFEC-003, but neither depends "
-        "on the other, so they can run together or in either order."
-    ) in validate["detail"]
-    assert _no_commit_landed(repo)
+    assert validate["ran"] and validate["passed"], body
+    assert body["status"] == "success"
 
     status, body = _write(
         cfg,
