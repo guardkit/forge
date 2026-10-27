@@ -192,7 +192,12 @@ class TestTheStopEndsTheWorkInside:
         """Its own hold, and only its own — by a name nothing else uses."""
         service = _start(root)
         try:
-            assert _wait_for(lambda: len(_calls(root)) >= 2)
+            # Wait for the START, as the test above does: the stop before the
+            # first start already makes two calls, and a stop signal sent
+            # then is answered by exiting before any hold was taken.
+            assert _wait_for(
+                lambda: any(c.endswith("the/projects/own/bootstrap") for c in _calls(root))
+            )
             service.send_signal(signal.SIGTERM)
             service.communicate(timeout=60)
         finally:
