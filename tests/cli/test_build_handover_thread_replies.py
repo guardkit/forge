@@ -501,14 +501,14 @@ async def test_an_invalid_bundle_is_answered_once(
     persistence: SqliteLifecyclePersistence,
 ) -> None:
     files = bundle()
-    files.pop("qa/pass-bar-seed-count-things.yaml")
+    files.pop("tasks/backlog/count-things/TASK-AB12-001-do-the-thing.md")  # a missing task file is still refused; pass bars are GuardKit's (step 2)
     project.commit_on(BRANCH, files)
 
     msg = await _hand_over(planning_deps, build_deps, bus)
 
     (reply,) = bus.replies()
     assert reply.message.startswith(f"{FEATURE} was not started: ")
-    assert "qa/pass-bar-seed-count-things.yaml" in reply.message
+    assert "tasks/backlog/count-things/TASK-AB12-001-do-the-thing.md" in reply.message
     assert reply.parent_request_id == THREAD and reply.level == "warning"
     assert _rows(persistence) == [] and starter.replies_at_launch == []
     assert msg.acks == 1

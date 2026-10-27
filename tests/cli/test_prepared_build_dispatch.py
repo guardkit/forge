@@ -256,7 +256,7 @@ async def test_a_refused_prepared_feature_writes_no_row_and_says_why(
     persistence: SqliteLifecyclePersistence,
 ) -> None:
     files = bundle()
-    files.pop(f"qa/pass-bar-seed-count-things.yaml")
+    files.pop("tasks/backlog/count-things/TASK-AB12-001-do-the-thing.md")  # a missing task file is still refused; pass bars are GuardKit's (step 2)
     project.commit_on(BRANCH, files)
     client, starter, rejections = _StubNatsClient(), _RecordingStarter(), []
     deps = _deps(
@@ -273,9 +273,9 @@ async def test_a_refused_prepared_feature_writes_no_row_and_says_why(
     assert starter.calls == []
     assert acks == ["ack"]
     ((cid, reason),) = rejections
-    assert cid == CID and "qa/pass-bar-seed-count-things.yaml" in reason
+    assert cid == CID and "tasks/backlog/count-things/TASK-AB12-001-do-the-thing.md" in reason
     failed = [body for subject, body in client.published if "build-failed" in subject]
-    assert failed and b"qa/pass-bar-seed-count-things.yaml" in failed[0]
+    assert failed and b"tasks/backlog/count-things/TASK-AB12-001-do-the-thing.md" in failed[0]
 
 
 @pytest.mark.asyncio
