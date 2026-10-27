@@ -3637,10 +3637,6 @@ DYNAMIC_IMPORT_ALLOWED: dict[tuple[str, str], str] = {
         "that starts no process) behind a test seam, because the reviewed "
         "compatibility fix replaces one function on that module"
     ),
-    ("planning/target_terminal_tools.py", "discover_target_test_roots"): (
-        "takes importlib.import_module as the default of an injected importer "
-        "that tests replace, to reach the build system's test-root discovery"
-    ),
 }
 
 

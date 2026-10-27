@@ -1161,9 +1161,6 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
     assert bool(bound["qa_receipts"][1]["receipt"].get("skipped")) == (
         registrations == "bars-only"
     )
-    assert h.ctx["counters"]["pass_bar_validate"] > 0 and (
-        registrations == "bars-only" or h.ctx["counters"]["gate_registry_validate"] > 0
-    )
     # The persisted same-run proof must still reject stale/missing/changed
     # registration evidence; none of these failures may create a build.
     from forge.planning.requirement_amendment_store import freeze_final_plan

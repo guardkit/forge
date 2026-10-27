@@ -41,7 +41,6 @@ import time
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
 
 
 from forge.launch_environment import build_launch_env
@@ -52,17 +51,14 @@ __all__ = [
     "discover_test_roots_from_listing",
     "folders_holding_tests",
     "NORMALIZER_MODULE_CANDIDATES",
-    "TEST_ROOT_DISCOVERY_MODULE_CANDIDATES",
     "NormalizeFeatureSpecFn",
     "NormalizerModuleUnresolved",
     "FeatureFilesFill",
     "declare_feature_files_if_absent",
-    "TargetTestRootsUnresolved",
     "ToolOutcome",
     "DividerRepairResult",
     "comment_box_drawing_dividers",
     "TS_TEST_FILE_SUFFIXES",
-    "discover_target_test_roots",
     "discover_ts_shape_test_roots",
     "shallow_discover_test_roots",
     "make_normalize_feature_spec",
@@ -167,45 +163,10 @@ def resolve_normalizer_command(
 
 
 # ---------------------------------------------------------------------------
-# Descriptor test-root discovery — REUSE guardkit's OWN function (B4 run
-# 36629c5a, round 10)
-#
-# The 008 ``target_repo_descriptor.test_roots`` must be the EXACT set the
-# downstream ``guardkit feature validate`` pre-commit oracle enforces, never a
-# shallow re-guess. guardkit builds both the smoke-gate ``available_roots`` and
-# the "Available test roots: …" validate error from a single function —
-# ``installer/core/commands/lib/smoke_gates_nudge.py:42`` ``discover_test_roots``
-# (called at ``guardkit/orchestrator/feature_loader.py:931`` and :1139). We
-# import and call THAT function so forge tells 008 the truth the oracle holds it
-# to.
-#
-# LIVE INCIDENT this fixes: forge's old shallow builder discovered checkout-root
-# ``tests/`` dirs only -> ``['tests']``; the 008 model then invented
-# ``tests/smoke`` (a PREFIX of ``tests``), which the specialist's in-session
-# ``smoke_gate_containment`` gate PASSED (keyed on ``descriptor.test_roots``,
-# ``path.startswith(root + '/')`` — feature_plan_oracle.py:915) — but the real
-# ``feature validate`` knows the repo's roots are ``tests/health, tests/users``
-# (no ``tests/smoke``) and refused the plan at the pre-commit oracle. Handing the
-# EXACT roots makes prefix-containment == membership for these shapes, so the
-# in-session gate catches the invention where the revision loop can correct it.
+# Descriptor test-root discovery: Forge's own. (It used to import GuardKit's
+# discovery from its smoke-gate module, which went in GuardKit's cull,
+# 27 October 2026.)
 # ---------------------------------------------------------------------------
-
-#: The two module paths guardkit's ``discover_test_roots`` is importable at, in
-#: resolution priority order — the SAME dual-candidate shape as
-#: :data:`NORMALIZER_MODULE_CANDIDATES`:
-#:
-#: * ``guardkit._installer_core.commands.lib.smoke_gates_nudge`` — the wheel/pip
-#:   form (DF-011 wheel, hatch ``force-include`` of ``installer/core`` under the
-#:   guardkit namespace). This is what the forge production image installs, so it
-#:   is tried FIRST.
-#: * ``installer.core.commands.lib.smoke_gates_nudge`` — the source/editable
-#:   checkout form (a repo root carrying an importable top-level ``installer``
-#:   package). The dev-host form.
-TEST_ROOT_DISCOVERY_MODULE_CANDIDATES: tuple[str, ...] = (
-    "guardkit._installer_core.commands.lib.smoke_gates_nudge",
-    "installer.core.commands.lib.smoke_gates_nudge",
-)
-
 
 #: Filename suffixes that mark a file as a TypeScript/JavaScript test. These are
 #: the vitest/jest/mocha conventions, not a guess: ``*.test.ts`` / ``*.spec.ts``
@@ -424,14 +385,10 @@ def discover_ts_shape_test_roots(repo_path: Path | str) -> list[str]:
 
 
 def shallow_discover_test_roots(repo_path: Path | str) -> list[str]:
-    """Degraded, guardkit-free test-root discovery (both shapes).
-
-    Used ONLY when guardkit's own ``discover_test_roots`` cannot be imported —
-    an interpreter where the real ``feature validate`` oracle cannot run either.
-    Reproduces guardkit's Python shape (immediate subdirectories of ``tests/``)
-    instead of the historical bare ``["tests"]`` guess, and adds the TypeScript
-    shapes from :func:`discover_ts_shape_test_roots`, so the degraded answer has
-    the same geometry as the healthy one.
+    """The repository's test roots: each immediate subdirectory of
+    ``tests/`` (never a bare ``["tests"]``, which is a prefix of every
+    ``tests/<x>`` path), and the TypeScript shapes from
+    :func:`discover_ts_shape_test_roots`.
     """
     root = Path(repo_path)
     roots: list[str] = []
@@ -451,8 +408,7 @@ def discover_test_roots_from_listing(paths: Sequence[str]) -> list[str]:
     the discovery's rules over strings, this lays the listing out as an empty
     skeleton (each tracked file as an empty file, so every directory that
     holds a tracked file exists) in a temporary folder and runs the SAME
-    discovery on it: guardkit's own :func:`discover_target_test_roots`, or
-    the shallow fallback when guardkit is not importable. Both decide by
+    discovery on it (:func:`shallow_discover_test_roots`), which decides by
     which directories and file names exist, which the skeleton reproduces.
 
     A path that is absolute or climbs out with ``..`` is skipped. Never
@@ -471,10 +427,7 @@ def discover_test_roots_from_listing(paths: Sequence[str]) -> list[str]:
                 target.touch()
             except OSError:
                 continue
-        try:
-            return discover_target_test_roots(root)
-        except TargetTestRootsUnresolved:
-            return shallow_discover_test_roots(root)
+        return shallow_discover_test_roots(root)
 
 
 def folders_holding_tests(test_roots: Sequence[str]) -> tuple[str, ...]:
@@ -493,85 +446,6 @@ def folders_holding_tests(test_roots: Sequence[str]) -> tuple[str, ...]:
         if len(parts) == 2 and parts[1] != "__tests__":
             prefixes.append(parts[0] + "/")
     return tuple(dict.fromkeys(prefixes))
-
-
-class TargetTestRootsUnresolved(RuntimeError):
-    """guardkit's ``discover_test_roots`` is not importable in this interpreter.
-
-    Raised by :func:`discover_target_test_roots` when the guardkit distribution
-    is absent from the image entirely (the same failure mode
-    :class:`NormalizerModuleUnresolved` names for the normalizer). The message
-    names BOTH candidates and the build fix; the descriptor builder catches it
-    and degrades to a shallow discovery so a guardkit-less env — where the real
-    ``feature validate`` oracle cannot run either — still builds a descriptor
-    rather than crashing the drive.
-    """
-
-
-def discover_target_test_roots(
-    repo_path: Path | str,
-    *,
-    module_candidates: Sequence[str] = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES,
-    import_module: Callable[[str], Any] = importlib.import_module,
-) -> list[str]:
-    """Return the target checkout's ``tests/<name>`` roots via guardkit's OWN discovery.
-
-    Imports guardkit's ``discover_test_roots`` — dual-candidate, wheel form
-    (``guardkit._installer_core.*``) first, source-checkout form
-    (``installer.core.*``) second — and calls it in-process against
-    ``repo_path``. The result is the byte-identical ``tests/<name>`` set
-    ``guardkit feature validate`` reports as its "Available test roots"
-    (``installer/core/commands/lib/smoke_gates_nudge.py:42``), so the 008
-    descriptor carries exactly what the pre-commit oracle will enforce.
-
-    THE TYPESCRIPT SHAPES RIDE ON TOP (design §D.3(ii)). guardkit's function
-    answers the Python shape only. Its answer is kept verbatim and UNIONed with
-    :func:`discover_ts_shape_test_roots`, which is purely additive and gated on
-    TypeScript evidence — so a Python checkout's roots are byte-unchanged, and a
-    TypeScript checkout stops answering ``[]``.
-
-    This does NOT put forge out of step with the downstream oracle. guardkit's
-    ``feature validate`` decides a smoke-gate path by EXISTENCE
-    (``feature_loader.py:927`` / ``:1135`` — ``not (repo_root / p).exists()``);
-    ``discover_test_roots`` only renders the "Available test roots" line of the
-    resulting error message. A root this function adds is a directory that
-    exists, so a plan built on it passes the oracle. The guardkit-side twin —
-    teaching the same shapes to ``discover_test_roots`` so the ERROR MESSAGE
-    lists them too — is a guardkit-venue change and is reported, not made here.
-
-    Raises :class:`TargetTestRootsUnresolved` — naming BOTH candidates — when
-    neither module imports (a guardkit-less interpreter).
-    """
-    last_exc: Exception | None = None
-    for candidate in module_candidates:
-        try:
-            module = import_module(candidate)
-        except (ImportError, ModuleNotFoundError, ValueError) as exc:
-            # ``import_module`` raises rather than returns None when a parent
-            # package is missing (e.g. no top-level ``installer`` at all).
-            # Treat that as "not importable" and try the next candidate.
-            last_exc = exc
-            continue
-        # guardkit's discover_test_roots(repo_root) -> sorted list[str] of
-        # ``tests/<name>`` paths; [] when there is no tests/ tree.
-        python_roots = list(module.discover_test_roots(Path(repo_path)))
-        ts_roots = [
-            root
-            for root in discover_ts_shape_test_roots(repo_path)
-            if root not in python_roots
-        ]
-        if not ts_roots:
-            # Python-shape repo: byte-identical to what guardkit returned.
-            return python_roots
-        return sorted(python_roots + ts_roots)
-    raise TargetTestRootsUnresolved(
-        "target-terminal test-root discovery could not import guardkit's "
-        "discover_test_roots: none of the candidates import in this "
-        f"interpreter — {list(module_candidates)}. The forge image must "
-        "install guardkit (pip install the DF-011 wheel, which exposes "
-        "guardkit._installer_core.*) or provide a source checkout with an "
-        "importable top-level installer package. See scripts/build-image.sh."
-    ) from last_exc
 
 
 @dataclass(frozen=True)

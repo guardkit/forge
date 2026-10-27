@@ -479,17 +479,16 @@ _PASS_BAR_FORMAT_VERSION = "2.0"
 _DOCS_TASK_TYPES = frozenset({"documentation", "research"})
 
 #: Evidence kind forge writes on a criterion it derives from a task's own
-#: "## Acceptance Criteria" section. Mirrors guardkit's own machine minter
-#: (``guardkit/orchestrator/pass_bar_mint.py`` ``_DERIVED_EVIDENCE_KIND``): a
-#: checker loop produces a log, and the two LIVE kinds (``screenshot``,
-#: ``operator_signoff``) would arm the feature-complete runtime-surface gate off
-#: a documentation task — a fabricated gate.
+#: "## Acceptance Criteria" section: a checker loop produces a log, and the two
+#: LIVE kinds (``screenshot``, ``operator_signoff``) would arm the
+#: feature-complete runtime-surface gate off a documentation task — a
+#: fabricated gate.
 _DERIVED_EVIDENCE_KIND = "log"
 
 #: The marker every narrowed documentation bar carries in its leading comment
 #: block. ``PassBar`` is ``extra="forbid"``, so a note has nowhere to live as a
-#: field; guardkit's own minter uses the same leading-comment form, which the
-#: schema ignores and a reader cannot miss.
+#: field; a leading comment is what the schema ignores and a reader cannot
+#: miss.
 _DOCS_BAR_NOTE_MARKER = "DOCUMENTATION TASK — NOT A COPY OF THE FEATURE CHECKLIST"
 
 #: One "## Acceptance Criteria" bullet in a task file. Both the plain-bullet
@@ -498,8 +497,8 @@ _DOCS_BAR_NOTE_MARKER = "DOCUMENTATION TASK — NOT A COPY OF THE FEATURE CHECKL
 #: checkbox form is the same bug that blocked a feature close on 2026-08-14.
 _TASK_CRITERION_RE = re.compile(r"^\s*[-*]\s*(?:\[[ xX]?\]\s*)?(?P<text>\S.*?)\s*$")
 
-#: A criterion that names its own id (``AC-1: ...``) keeps it, exactly as
-#: guardkit's minter does; anything else is numbered in order.
+#: A criterion that names its own id (``AC-1: ...``) keeps it; anything else
+#: is numbered in order.
 _TASK_CRITERION_ID_RE = re.compile(
     r"^(?P<id>[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)*)\s*:\s*(?P<text>\S.*)$"
 )
@@ -1299,14 +1298,11 @@ def task_type_from_front_matter(task_text: str) -> str | None:
 def task_acceptance_criteria(task_text: str) -> list[dict[str, str]]:
     """The criteria written ON a task, as pass-bar criterion mappings.
 
-    Reads the task file's ``## Acceptance Criteria`` section — the same section
-    guardkit's own machine minter reads
-    (``guardkit/orchestrator/pass_bar_mint.py`` ``read_acceptance_criteria``)
-    and the same list the Coach holds the task to. Returns ``[]`` when the
-    section is absent or empty.
+    Reads the task file's ``## Acceptance Criteria`` section — the same list
+    the Coach holds the task to. Returns ``[]`` when the section is absent or
+    empty.
 
-    Class and evidence kind mirror that minter's judgements, for its reasons:
-    ``machine`` because there is no operator runbook to route an operator
+    Class and evidence kind: ``machine`` because there is no operator runbook to route an operator
     criterion to (a criterion with nowhere to route is a silently dropped one),
     and ``log`` because the two live evidence kinds would arm the
     feature-complete runtime-surface gate off a documentation task.
@@ -8007,7 +8003,7 @@ class PlanningRunDriver:
 
         1. The criteria written ON the task itself ("## Acceptance Criteria" in
            its task file) — the list the Coach actually checks that task
-           against, and the same source guardkit's own machine minter uses.
+           against.
         2. Failing that, the seed's non-machine criteria only.
         3. Failing that, the seed unchanged — because ``PassBar.criteria``
            requires at least one entry, and a bar that will not validate stops
@@ -8016,7 +8012,7 @@ class PlanningRunDriver:
 
         Returns ``(criteria, note_lines)``; the note is written into the file as
         a leading comment block (``PassBar`` forbids extra fields, so a comment
-        is the only place a note can live — guardkit's minter does the same).
+        is the only place a note can live).
         """
         own = task_acceptance_criteria(task_text or "")
         if own:
@@ -8996,18 +8992,12 @@ class PlanningRunDriver:
         both sides deliberately, so either image can be redeployed first and a
         descriptor without it plans byte for byte as it does today.
 
-        ``test_roots`` is the EXACT ``tests/<name>`` set the downstream
-        ``guardkit feature validate`` pre-commit oracle enforces, discovered by
-        REUSING guardkit's OWN ``discover_test_roots``
-        (:func:`forge.planning.target_terminal_tools.discover_target_test_roots`)
-        — never a shallow re-guess. For api_test this is
-        ``["tests/health", "tests/users"]`` (EMPTY ⇒ the plan may emit no smoke
-        gate, ASSUM-010). B4 run 36629c5a round 10: the old shallow
-        checkout-root discovery returned ``["tests"]``, so 008 invented
-        ``tests/smoke`` — a prefix of ``tests`` that the in-session containment
-        gate passed but the real validate rejected (repo has ``tests/health``,
-        ``tests/users``, no ``tests/smoke``). Handing the exact roots makes
-        prefix-containment == membership so the invention is caught in-session.
+        ``test_roots`` are the repository's test folders, found by Forge's own
+        discovery (:func:`forge.planning.target_terminal_tools.shallow_discover_test_roots`):
+        each immediate subfolder of ``tests/`` and the TypeScript shapes. For
+        api_test this is ``["tests/health", "tests/users"]``. (Forge used to
+        import GuardKit's own discovery from its smoke-gate module; that module
+        went in GuardKit's cull, 27 October 2026.)
 
         ``reference_paths`` (17 October 2026, prototype-to-factory design 2.2)
         are the project's declared reference folders, read from the run's
@@ -9022,11 +9012,9 @@ class PlanningRunDriver:
         Left out, it is :data:`~forge.planning.code_evidence.MAX_EVIDENCE_CHARS`
         as before.
         """
-        # Local import: keep the guardkit-boundary reuse out of the module
-        # import graph (target_terminal_tools imports the guardkit run seam).
+        # Local import: keep target_terminal_tools out of the module import
+        # graph (it imports the guardkit run seam).
         from forge.planning.target_terminal_tools import (
-            TargetTestRootsUnresolved,
-            discover_target_test_roots,
             discover_test_roots_from_listing,
             shallow_discover_test_roots,
         )
@@ -9059,32 +9047,7 @@ class PlanningRunDriver:
                 reasons.append(str(exc))
                 test_roots = []
         else:
-            try:
-                test_roots = discover_target_test_roots(repo_path)
-            except TargetTestRootsUnresolved as exc:
-                # Degraded path: guardkit absent from the interpreter. Production
-                # images always ship guardkit (the Dockerfile asserts the import),
-                # so this only fires in a guardkit-less env where the real
-                # ``feature validate`` oracle cannot run either. Fall back to
-                # forge's own discovery so the descriptor is still built and the
-                # run reaches the oracle (the last line of defense) rather than
-                # crashing — log LOUDLY.
-                #
-                # The old fallback returned bare ``["tests"]`` / ``["test"]``,
-                # which is the ROUND-10 DEFECT SHAPE: a bare ``tests`` root is a
-                # prefix of every ``tests/<x>`` path, so the in-session
-                # containment gate waves through an invented subdirectory. The
-                # replacement reproduces guardkit's per-suite Python shape AND
-                # the TypeScript shapes, so the degraded answer has the same
-                # geometry as the healthy one.
-                logger.warning(
-                    "target_repo_descriptor: guardkit test-root discovery "
-                    "unavailable (%s); falling back to forge's own shallow "
-                    "discovery — the roots are shape-correct but are not the "
-                    "oracle's own answer",
-                    exc,
-                )
-                test_roots = shallow_discover_test_roots(repo_path)
+            test_roots = shallow_discover_test_roots(repo_path)
         if reference_paths:
             # A test folder inside reference material is not the product's.
             test_roots = [

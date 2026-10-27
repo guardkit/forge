@@ -40,12 +40,6 @@ import stat
 from collections.abc import Iterator, Sequence
 from pathlib import Path
 
-#: The two titles the fake refuses — the driver test's own fixture titles.
-REFUSED_TITLES = (
-    "The moon is made of a very particular kind of cheese that no rule family "
-    "in the design has ever heard about at all",
-    "Another undecidable one",
-)
 
 FAKE_GUARDKIT_SOURCE = r'''#!/usr/bin/env python3
 """The stand-in guardkit (see tests/forge/deploy_sidecar/_fake_guardkit.py)."""
@@ -341,28 +335,6 @@ def read_log(path: Path) -> list[dict]:
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line]
 
 
-def normalize_calls(path: Path) -> list[list[str]]:
-    """The argv of every ``qa normalize-stamps`` call, in order."""
-    return [
-        entry["argv"]
-        for entry in read_log(path)
-        if entry["argv"][:2] == ["qa", "normalize-stamps"]
-    ]
-
-
-def validate_calls(path: Path) -> list[list[str]]:
-    return [
-        entry["argv"] for entry in read_log(path) if entry["argv"][:2] == ["feature", "validate"]
-    ]
-
-
-def classify_calls(path: Path) -> list[list[str]]:
-    return [
-        entry["argv"]
-        for entry in read_log(path)
-        if entry["argv"][:2] == ["qa", "classify-scenarios"]
-    ]
-
 
 def normalizer_calls(path: Path) -> list[list[str]]:
     """The argv of every stand-in NORMALIZER call, in order (the module run
@@ -373,23 +345,6 @@ def normalizer_calls(path: Path) -> list[list[str]]:
         if entry["argv"][:1] == ["<normalize-feature>"]
     ]
 
-
-def qa_validate_calls(path: Path, kind: str) -> list[list[str]]:
-    """The argv of every ``qa validate <kind> …`` call, in order."""
-    return [
-        entry["argv"]
-        for entry in read_log(path)
-        if entry["argv"][:3] == ["qa", "validate", kind]
-    ]
-
-
-def validate_saw(path: Path) -> list[tuple[bool, bool]]:
-    """Per validate call: (saw stamps, saw feature_files)."""
-    return [
-        (bool(entry["argv"][1]), bool(entry["argv"][2]))
-        for entry in read_log(path)
-        if entry["argv"][:1] == ["<validate saw stamps>"]
-    ]
 
 
 def scratch_repo(path: Path, *, declares: Sequence[str] | None = None) -> Path:

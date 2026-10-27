@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,13 +17,10 @@ import pytest
 from forge.planning import target_terminal_tools as ttt
 from forge.planning.target_terminal_tools import (
     NORMALIZER_MODULE_CANDIDATES,
-    TEST_ROOT_DISCOVERY_MODULE_CANDIDATES,
     DividerRepairResult,
     comment_box_drawing_dividers,
     NormalizerModuleUnresolved,
-    TargetTestRootsUnresolved,
     ToolOutcome,
-    discover_target_test_roots,
     discover_ts_shape_test_roots,
     shallow_discover_test_roots,
     make_normalize_feature_spec,
@@ -461,106 +457,26 @@ async def test_normalize_none_prefix_red_when_unresolved(
 
 
 # ---------------------------------------------------------------------------
-# Descriptor test-root discovery — REUSE of guardkit's discover_test_roots
-# (B4 run 36629c5a, round 10). These pin that forge asks GUARDKIT for the roots
-# (dual-candidate import), never re-guesses them, so the 008 descriptor carries
-# the EXACT ``tests/<name>`` set the pre-commit ``feature validate`` oracle
-# enforces (tests/health, tests/users for api_test — never a shallow "tests").
+# Descriptor test-root discovery (B4 run 36629c5a, round 10): the per-suite
+# ``tests/<name>`` roots (tests/health, tests/users for api_test — never a bare
+# "tests"). Forge's own discovery; it used to import GuardKit's from its
+# smoke-gate module, which went in GuardKit's cull (27 October 2026).
 # ---------------------------------------------------------------------------
 
 
-def _fake_import_for(modules: dict[str, Any]):
-    """A fake ``importlib.import_module`` that only "imports" the given names.
-
-    Names outside the mapping raise ``ModuleNotFoundError`` — the parent-missing
-    shape real ``import_module`` produces when e.g. no top-level ``installer``
-    package exists (a wheel install with no source checkout).
-    """
-
-    def _fake(name: str):
-        if name in modules:
-            return modules[name]
-        raise ModuleNotFoundError(f"No module named {name!r}")
-
-    return _fake
-
-
-def test_discovery_candidates_mirror_the_wheel_then_source_shape() -> None:
-    wheel, source = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES
-    assert wheel == "guardkit._installer_core.commands.lib.smoke_gates_nudge"
-    assert source == "installer.core.commands.lib.smoke_gates_nudge"
-
-
-def test_discovery_prefers_the_wheel_candidate() -> None:
-    wheel, source = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES
-    wheel_mod = SimpleNamespace(
-        discover_test_roots=lambda root: ["tests/from_wheel"]
-    )
-    source_mod = SimpleNamespace(
-        discover_test_roots=lambda root: ["tests/from_source"]
-    )
-    roots = discover_target_test_roots(
-        "/repo",
-        import_module=_fake_import_for({wheel: wheel_mod, source: source_mod}),
-    )
-    # Both importable -> the wheel/pip path wins (production container form).
-    assert roots == ["tests/from_wheel"]
-
-
-def test_discovery_falls_back_to_the_source_candidate() -> None:
-    _wheel, source = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES
-    source_mod = SimpleNamespace(
-        discover_test_roots=lambda root: ["tests/from_source"]
-    )
-    # Only the source-checkout path importable (dev-host / editable form).
-    roots = discover_target_test_roots(
-        "/repo", import_module=_fake_import_for({source: source_mod})
-    )
-    assert roots == ["tests/from_source"]
-
-
-def test_discovery_raises_naming_both_when_neither_resolves() -> None:
-    with pytest.raises(TargetTestRootsUnresolved) as excinfo:
-        discover_target_test_roots(
-            "/repo", import_module=_fake_import_for({})
-        )
-    message = str(excinfo.value)
-    for candidate in TEST_ROOT_DISCOVERY_MODULE_CANDIDATES:
-        assert candidate in message
-    assert "guardkit" in message
-
-
-def test_discovery_passes_the_repo_path_through_to_guardkit() -> None:
-    wheel, _source = TEST_ROOT_DISCOVERY_MODULE_CANDIDATES
-    seen: list[Path] = []
-
-    def _discover(root: Path) -> list[str]:
-        seen.append(root)
-        return ["tests/x"]
-
-    discover_target_test_roots(
-        "/srv/repos/api_test",
-        import_module=_fake_import_for(
-            {wheel: SimpleNamespace(discover_test_roots=_discover)}
-        ),
-    )
-    # guardkit is handed a Path built from the repo_path string.
-    assert seen == [Path("/srv/repos/api_test")]
-
 
 def test_discovery_against_an_api_test_shaped_fixture(tmp_path: Path) -> None:
-    """The real guardkit function (via the conftest source-checkout path) over an
-    api_test-shaped tree returns the EXACT per-suite roots — not a bare 'tests'."""
+    """An api_test-shaped tree gives the EXACT per-suite roots — not a bare 'tests'."""
     (tmp_path / "tests" / "health").mkdir(parents=True)
     (tmp_path / "tests" / "users").mkdir(parents=True)
     (tmp_path / "tests" / "__pycache__").mkdir()  # skipped by guardkit
-    roots = discover_target_test_roots(tmp_path)
+    roots = shallow_discover_test_roots(tmp_path)
     assert roots == ["tests/health", "tests/users"]
 
 
 def test_discovery_empty_when_no_tests_tree(tmp_path: Path) -> None:
     # ASSUM-010: no tests/ tree -> empty roots (the plan may emit no smoke gate).
-    assert discover_target_test_roots(tmp_path) == []
+    assert shallow_discover_test_roots(tmp_path) == []
 
 
 # ---------------------------------------------------------------------------
@@ -597,7 +513,7 @@ def test_flat_ts_shape_discovers_tests_itself(tmp_path: Path) -> None:
     """
     _ts_api_test_original_shape(tmp_path)
     assert discover_ts_shape_test_roots(tmp_path) == ["tests"]
-    assert discover_target_test_roots(tmp_path) == ["tests"]
+    assert shallow_discover_test_roots(tmp_path) == ["tests"]
 
 
 def test_the_stage_b_shape_bend_still_works_unchanged(tmp_path: Path) -> None:
@@ -605,18 +521,18 @@ def test_the_stage_b_shape_bend_still_works_unchanged(tmp_path: Path) -> None:
 
     Reversibility cuts both ways: the repo may move back to flat, and it may
     also stay bent. The bent tree is a plain Python-shaped subdirectory, so
-    guardkit's own discovery answers it and the TS pass adds nothing.
+    the per-suite discovery answers it and the TS pass adds nothing.
     """
     (tmp_path / "tests" / "health").mkdir(parents=True)
     (tmp_path / "tests" / "health" / "health.test.ts").write_text("", encoding="utf-8")
     assert discover_ts_shape_test_roots(tmp_path) == []
-    assert discover_target_test_roots(tmp_path) == ["tests/health"]
+    assert shallow_discover_test_roots(tmp_path) == ["tests/health"]
 
 
 def test_singular_test_dir_flat(tmp_path: Path) -> None:
     (tmp_path / "test").mkdir()
     (tmp_path / "test" / "app.spec.ts").write_text("", encoding="utf-8")
-    assert discover_target_test_roots(tmp_path) == ["test"]
+    assert shallow_discover_test_roots(tmp_path) == ["test"]
 
 
 def test_singular_test_dir_with_subdirectories(tmp_path: Path) -> None:
@@ -624,7 +540,7 @@ def test_singular_test_dir_with_subdirectories(tmp_path: Path) -> None:
     (tmp_path / "test" / "health" / "health.test.ts").write_text("", encoding="utf-8")
     (tmp_path / "test" / "users").mkdir(parents=True)
     (tmp_path / "test" / "users" / "users.test.ts").write_text("", encoding="utf-8")
-    assert discover_target_test_roots(tmp_path) == ["test/health", "test/users"]
+    assert shallow_discover_test_roots(tmp_path) == ["test/health", "test/users"]
 
 
 def test_colocated_dunder_tests_under_src(tmp_path: Path) -> None:
@@ -636,7 +552,7 @@ def test_colocated_dunder_tests_under_src(tmp_path: Path) -> None:
     (tmp_path / "src" / "users" / "__tests__" / "svc.spec.tsx").write_text(
         "", encoding="utf-8"
     )
-    assert discover_target_test_roots(tmp_path) == [
+    assert shallow_discover_test_roots(tmp_path) == [
         "src/health/__tests__",
         "src/users/__tests__",
     ]
@@ -672,7 +588,7 @@ def test_python_shape_gains_nothing_from_the_ts_pass(tmp_path: Path) -> None:
     (tmp_path / "src" / "app.py").write_text("", encoding="utf-8")
 
     assert discover_ts_shape_test_roots(tmp_path) == []
-    assert discover_target_test_roots(tmp_path) == ["tests/health", "tests/users"]
+    assert shallow_discover_test_roots(tmp_path) == ["tests/health", "tests/users"]
 
 
 def test_a_python_repo_with_a_singular_test_dir_is_unchanged(tmp_path: Path) -> None:
@@ -681,25 +597,24 @@ def test_a_python_repo_with_a_singular_test_dir_is_unchanged(tmp_path: Path) -> 
     (tmp_path / "test" / "pkg").mkdir(parents=True)
     (tmp_path / "test" / "pkg" / "test_thing.py").write_text("", encoding="utf-8")
     assert discover_ts_shape_test_roots(tmp_path) == []
-    assert discover_target_test_roots(tmp_path) == []
+    assert shallow_discover_test_roots(tmp_path) == []
 
 
 def test_ts_discovery_never_raises_on_a_missing_tree(tmp_path: Path) -> None:
     assert discover_ts_shape_test_roots(tmp_path / "nope") == []
 
 
-# --- The guardkit-less degraded fallback ------------------------------------
+# --- The per-suite shape, never a bare "tests" --------------------------------
 
 
 def test_shallow_fallback_reproduces_the_per_suite_python_shape(
     tmp_path: Path,
 ) -> None:
-    """The degraded path no longer answers the round-10 defect shape.
+    """Discovery never answers the round-10 defect shape.
 
-    It used to return a bare ``["tests"]`` — a PREFIX of every ``tests/<x>``
-    path, which is exactly what let 008 invent ``tests/smoke`` and pass the
-    in-session containment gate. It now returns the same per-suite roots
-    guardkit would.
+    A bare ``["tests"]`` is a PREFIX of every ``tests/<x>`` path, which is
+    exactly what let 008 invent ``tests/smoke`` and pass the in-session
+    containment gate. It returns the per-suite roots instead.
     """
     (tmp_path / "tests" / "health").mkdir(parents=True)
     (tmp_path / "tests" / "users").mkdir(parents=True)
@@ -746,7 +661,7 @@ def test_discovery_against_the_REAL_api_test_checkout() -> None:
     fixture under ``tests/``, built with ``tmp_path`` — see the shape tests
     above, which do exactly that.
     """
-    roots = discover_target_test_roots(_REAL_API_TEST)
+    roots = shallow_discover_test_roots(_REAL_API_TEST)
 
     # Non-empty: a real Python checkout with a tests/ tree has roots.
     assert roots, "real api_test checkout yielded no test roots"
@@ -763,40 +678,17 @@ def test_discovery_against_the_REAL_api_test_checkout() -> None:
         assert (_REAL_API_TEST / root).is_dir(), f"{root} is not a directory"
 
 
-# ---------------------------------------------------------------------------
-# P-8 — task-doc frontmatter feature_id truncation repair
-# ---------------------------------------------------------------------------
-
-
-# --- pure repair function --------------------------------------------------
-
-
-# --- tree-level scan (repair_plan_task_frontmatter) ------------------------
-
-
-# --- wired _validate end-to-end (fake oracle checks per-doc parity) --------
-
-
-# ---------------------------------------------------------------------------
-# P-5 — persist the FULL validate stdout+stderr (observability rider)
-# ---------------------------------------------------------------------------
-
-
 def test_python_only_dunder_tests_dir_is_not_a_root(tmp_path):
     """The src/**/__tests__ shape is TS-gated: a Python repo's answer stays []."""
     (tmp_path / "src" / "pkg" / "__tests__").mkdir(parents=True)
     (tmp_path / "src" / "pkg" / "__tests__" / "test_x.py").write_text("def test_x(): pass\n")
-    from forge.planning.target_terminal_tools import discover_target_test_roots
-
-    assert discover_target_test_roots(tmp_path) == []
+    assert shallow_discover_test_roots(tmp_path) == []
 
 
 def test_ts_dunder_tests_dir_is_a_root(tmp_path):
     (tmp_path / "src" / "pkg" / "__tests__").mkdir(parents=True)
     (tmp_path / "src" / "pkg" / "__tests__" / "x.test.ts").write_text("test\n")
-    from forge.planning.target_terminal_tools import discover_target_test_roots
-
-    assert "src/pkg/__tests__" in discover_target_test_roots(tmp_path)
+    assert "src/pkg/__tests__" in shallow_discover_test_roots(tmp_path)
 
 
 # ---------------------------------------------------------------------------

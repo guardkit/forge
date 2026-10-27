@@ -550,12 +550,6 @@ def _make_driver(
     spec_dispatch: Any | None = None,
     plan_dispatch: Any | None = None,
     normalize: Any | None = None,
-    validate: Any | None = None,
-    validate_fn: Any | None = None,
-    pass_bar_validate: Any | None = None,
-    pass_bar_validate_fn: Any | None = None,
-    gate_registry_validate: Any | None = None,
-    gate_registry_validate_fn: Any | None = None,
     normalize_stamps_fn: Any | None = None,
     wire_legs: bool = True,
     build_trigger_result: Any | None = None,
@@ -578,13 +572,8 @@ def _make_driver(
         "spec": 0,
         "plan": 0,
         "normalize": 0,
-        "validate": 0,
-        "pass_bar_validate": 0,
-        "gate_registry_validate": 0,
         "build_trigger": 0,
     }
-    validated_bars: list[str] = []
-    validated_registries: list[str] = []
 
     def _default_subscriber_factory(
         expected_approver: Any, armed: Any
@@ -735,36 +724,6 @@ def _make_driver(
         assert (worktree / feature_rel).is_file()
         return normalize if normalize is not None else ToolOutcome(ok=True)
 
-    async def _validate(worktree: Path, feature_id: str) -> ToolOutcome:
-        counters["validate"] += 1
-        counters.setdefault("order", []).append("validate")
-        # A dynamic oracle (e.g. the real guardkit smoke-gate path check that
-        # inspects the worktree) takes precedence over a static ToolOutcome.
-        if validate_fn is not None:
-            return await validate_fn(worktree, feature_id)
-        return validate if validate is not None else ToolOutcome(ok=True)
-
-    async def _validate_pass_bar(worktree: Path, bar_rel: str) -> ToolOutcome:
-        counters["pass_bar_validate"] += 1
-        validated_bars.append(bar_rel)
-        # A dynamic oracle (the schema-faithful pass-bar check) takes precedence.
-        if pass_bar_validate_fn is not None:
-            return await pass_bar_validate_fn(worktree, bar_rel)
-        return pass_bar_validate if pass_bar_validate is not None else ToolOutcome(ok=True)
-
-    async def _validate_gate_registry(worktree: Path, registry_rel: str) -> ToolOutcome:
-        counters["gate_registry_validate"] += 1
-        validated_registries.append(registry_rel)
-        # A dynamic oracle (the schema-faithful gate-registry check) takes
-        # precedence over a static ToolOutcome.
-        if gate_registry_validate_fn is not None:
-            return await gate_registry_validate_fn(worktree, registry_rel)
-        return (
-            gate_registry_validate
-            if gate_registry_validate is not None
-            else ToolOutcome(ok=True)
-        )
-
     build_triggers: list[dict[str, Any]] = []
 
     async def _dispatch_build_trigger(
@@ -850,8 +809,6 @@ def _make_driver(
             "counters": counters,
             "git": deps.git_runner,
             "build_triggers": build_triggers,
-            "validated_bars": validated_bars,
-            "validated_registries": validated_registries,
             "publisher": publisher,
         },
     )
@@ -1183,10 +1140,8 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     """The 008 leg gets the committed spec CONTENTS + an honestly-built descriptor.
 
     ``test_roots`` is the EXACT ``tests/<name>`` set discovered from the target
-    checkout by REUSING guardkit's own ``discover_test_roots`` (the same
-    function the pre-commit ``feature validate`` oracle reports as its
-    "Available test roots") — api_test-shaped: ``tests/health`` + ``tests/users``
-    (no ``tests/smoke``). ``spec_feature``/``spec_summary`` are the contents read
+    checkout — api_test-shaped: ``tests/health`` + ``tests/users`` (no
+    ``tests/smoke``). ``spec_feature``/``spec_summary`` are the contents read
     back off the branch.
     """
     repo = tmp_path / "api_test"
@@ -1290,11 +1245,10 @@ async def test_the_location_sent_to_the_writer_is_the_one_forge_checks_against(
 
 
 # ---------------------------------------------------------------------------
-# REPLAY PROOF (B4 run 36629c5a, round 10) — the fixed descriptor threads the
-# EXACT roots, and the pre-commit validate (the REAL guardkit smoke-gate path
-# check, byte-faithful to `guardkit feature validate`) is STILL the last line of
-# defense: an invented ``tests/smoke`` fails loudly; a real ``tests/health``
-# passes to BUILD_QUEUED.
+# REPLAY PROOF (B4 run 36629c5a, round 10) — the descriptor threads the exact
+# per-suite roots, and a plan whose smoke gate names the real ``tests/health``
+# drives to BUILD_QUEUED. (GuardKit checks the smoke gate's paths when it
+# builds; Forge's copy of that check at planning went in the cull.)
 # ---------------------------------------------------------------------------
 
 
@@ -1322,44 +1276,6 @@ def _init_api_test_shaped_repo(path: Path) -> None:
     subprocess.run(["git", "commit", "-qm", "init"], cwd=path, check=True, env=env)
     _give_repo_a_remote(path, env)
 
-
-async def _guardkit_smoke_gate_validate(
-    worktree: Path, feature_id: str
-) -> ToolOutcome:
-    """A validate oracle built from guardkit's OWN smoke-gate path primitives.
-
-    Byte-faithful to guardkit's ``feature validate`` smoke-gate check
-    (``guardkit/orchestrator/feature_loader.py:1131-1142``
-    ``_validate_smoke_gate_paths_for_validate``): it reuses the SAME three
-    functions — ``parse_positional_paths`` + a filesystem existence check +
-    ``discover_test_roots`` + ``format_smoke_gate_path_error`` — the real
-    validate binary composes. Used in-process here because the full guardkit
-    ``FeatureLoader`` pulls heavy deps (frontmatter) absent from the forge venv,
-    which is exactly why production shells the guardkit BINARY via
-    ``forge.adapters.guardkit.run``; the identical binary run against the
-    preserved round-10 worktree is the separate live-repro check.
-    """
-    import yaml
-    from guardkit.lib.pytest_argv import (
-        format_smoke_gate_path_error,
-        parse_positional_paths,
-    )
-    from installer.core.commands.lib.smoke_gates_nudge import discover_test_roots
-
-    feature_file = worktree / ".guardkit" / "features" / f"{feature_id}.yaml"
-    data = yaml.safe_load(feature_file.read_text(encoding="utf-8"))
-    smoke_gates = (data or {}).get("smoke_gates")
-    if not smoke_gates or not smoke_gates.get("command"):
-        return ToolOutcome(ok=True)
-    paths = parse_positional_paths(smoke_gates["command"])
-    missing = [p for p in paths if not (worktree / p).exists()]
-    if not missing:
-        return ToolOutcome(ok=True)
-    roots = discover_test_roots(worktree)
-    return ToolOutcome(
-        ok=False,
-        detail=format_smoke_gate_path_error(missing, worktree, roots),
-    )
 
 
 def _plan_result_native_smoke(smoke_path: str, slug: str = "stats-endpoint"):
@@ -1409,7 +1325,6 @@ async def test_replay_real_tests_health_passes_to_build_queued(
         git_runner=git,
         repo_path=str(repo),
         plan_result_factory=_plan_result_native_smoke("tests/health"),
-        validate_fn=_guardkit_smoke_gate_validate,
     )
 
     await h.driver.drive(CID)
@@ -1685,33 +1600,6 @@ async def test_a_low_traceability_score_is_advice_on_the_build_card(
     assert "0.40 out of 1" in line and "REVISE" in line
 
 
-@pytest.mark.asyncio
-async def test_validate_red_is_advice_and_the_plan_is_committed(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Step 2 (26 October 2026, census FRG-082): GuardKit validates the
-    feature when it builds; Forge's copy at planning is advice."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        validate=ToolOutcome(ok=False, detail="schema errors"),
-    )
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    branch = f"planning/{CID}"
-    plan_show = subprocess.run(
-        ["git", "show", f"{branch}:features/stats-endpoint"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    assert "FEAT-" in plan_show.stdout
-
 
 @pytest.mark.asyncio
 async def test_unwired_legs_fail_loudly(store: SqlitePlanningRunStore) -> None:
@@ -1922,18 +1810,6 @@ def _assert_pass_bar_schema(bar: dict[str, Any]) -> None:
     assert required <= set(bar["negative_paths"])
 
 
-async def _schema_pass_bar_oracle(worktree: Path, bar_rel: str) -> ToolOutcome:
-    """A pass-bar validate oracle that runs the schema-faithful check against the
-    on-disk minted bar (stands in for the vendored guardkit binary in-test)."""
-    import yaml as _yaml
-
-    try:
-        data = _yaml.safe_load((worktree / bar_rel).read_text(encoding="utf-8"))
-        _assert_pass_bar_schema(data)
-    except AssertionError as exc:
-        return ToolOutcome(ok=False, detail=f"{bar_rel}: schema invalid — {exc}")
-    return ToolOutcome(ok=True)
-
 
 def _spec_result_with_seed(seed_yaml: str | None, slug: str = "version-endpoint") -> Any:
     """The DEPLOYED 007 native reply for ``slug`` carrying ``seed_yaml`` as its
@@ -2096,7 +1972,6 @@ async def _auth_flagged_harness(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
         subscriber_factory=SharedScriptSubscriberFactory(script),
         originator_wait_seconds=originator_wait_seconds,
         publisher=publisher,
@@ -2451,7 +2326,6 @@ async def test_auth_door_confirmation_is_never_re_asked_on_a_re_drive(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
         subscriber_factory=factory,
     )
     await _carry_in_flight_spec(store, git, repo, seed_yaml=_ROUND19_SEED_AUTH)
@@ -2537,7 +2411,6 @@ async def test_auth_door_survives_a_restart_and_re_emits_the_same_card(
             repo_path=str(repo),
             spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
             plan_result_factory=_plan_result_native_versions,
-            pass_bar_validate_fn=_schema_pass_bar_oracle,
             subscriber_factory=SharedScriptSubscriberFactory(script),
             publisher=publisher,
         )
@@ -2606,7 +2479,6 @@ async def test_auth_door_never_published_says_undeliverable_not_silence(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTH),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
         subscriber_factory=NeverArmingFactory(),
         originator_wait_seconds=1,
     )
@@ -2696,7 +2568,6 @@ async def test_round19_authless_seed_mints_three_validated_bars(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,  # the schema-faithful oracle
     )
 
     await h.driver.drive(CID)
@@ -2877,26 +2748,6 @@ def _seed_gate_surface(
     _publish_to_origin(repo)
 
 
-async def _schema_gate_registry_oracle(
-    worktree: Path, registry_rel: str
-) -> ToolOutcome:
-    """A gate-registry validate oracle running a schema-faithful check against
-    the on-disk appended registry (stands in for the vendored guardkit binary):
-    every entry carries id/path/target.base_url_env/pass_bar_ref."""
-    import yaml as _yaml
-
-    try:
-        data = _yaml.safe_load((worktree / registry_rel).read_text(encoding="utf-8"))
-        assert isinstance(data, dict) and isinstance(data.get("gates"), list)
-        assert data["gates"], "gates must be non-empty"
-        for gate in data["gates"]:
-            assert gate.get("id") and gate.get("path")
-            assert gate.get("target", {}).get("base_url_env")
-            assert gate.get("pass_bar_ref")
-    except AssertionError as exc:
-        return ToolOutcome(ok=False, detail=f"gate-registry schema invalid — {exc}")
-    return ToolOutcome(ok=True)
-
 
 #: An AUTHLESS seed whose ONLY machine criterion yields NO endpoint (a legitimate
 #: non-endpoint feature) — the honest-skip path.
@@ -2943,8 +2794,6 @@ async def test_f2_derivable_seed_registers_gate_as_one_commit_before_build(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
     )
 
     await h.driver.drive(CID)
@@ -3116,8 +2965,6 @@ async def test_f2_digest_endpoint_gates_what_the_prose_cannot_derive(
             "/users/active-count",
         ),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
     )
 
     await h.driver.drive(CID)
@@ -3162,8 +3009,6 @@ async def test_f2_digest_address_with_a_placeholder_is_skipped_with_its_reason(
             "/users/{user_id}",
         ),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
     )
 
     await h.driver.drive(CID)
@@ -3198,8 +3043,6 @@ async def test_f2_digest_endpoint_absent_leaves_the_prose_path_exactly_as_it_was
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
     )
 
     await h.driver.drive(CID)
@@ -3324,8 +3167,6 @@ async def test_f2_prose_address_is_read_whole_and_skipped_with_its_reason(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_seed_with_criterion(criterion)),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
     )
 
     await h.driver.drive(CID)
@@ -3367,8 +3208,6 @@ async def test_f2_prose_plain_get_address_registers_the_whole_address(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_seed_with_criterion(criterion)),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        gate_registry_validate_fn=_schema_gate_registry_oracle,
     )
 
     await h.driver.drive(CID)
@@ -3775,7 +3614,6 @@ async def test_leftover_dcl_config_is_ignored_end_to_end(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
         plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
     )
     # The collaborator itself is gone from the deps surface.
     assert not hasattr(h.driver._deps, "dcl_author")
@@ -3885,27 +3723,6 @@ def test_descriptor_for_a_python_repo_is_unchanged(tmp_path: Path) -> None:
         "test_roots": ["tests/health", "tests/users"],
     }
 
-
-def test_descriptor_degrades_shape_correctly_without_guardkit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """With guardkit unimportable, the fallback is shape-correct, not a bare
-    ``["tests"]`` — the round-10 defect shape that let 008 invent a prefix."""
-    from forge.planning import target_terminal_tools as ttt
-
-    repo = tmp_path / "api_test"
-    (repo / "tests" / "health").mkdir(parents=True)
-    (repo / "tests" / "users").mkdir(parents=True)
-
-    def _boom(*_args: Any, **_kwargs: Any) -> list[str]:
-        raise ttt.TargetTestRootsUnresolved("no guardkit in this interpreter")
-
-    monkeypatch.setattr(ttt, "discover_target_test_roots", _boom)
-
-    descriptor = PlanningRunDriver._build_target_repo_descriptor(
-        "appmilla/api_test", str(repo)
-    )
-    assert descriptor["test_roots"] == ["tests/health", "tests/users"]
 
 
 # ---------------------------------------------------------------------------
@@ -4803,7 +4620,6 @@ async def test_documentation_task_bar_lands_narrowed_on_the_branch(
         repo_path=str(repo),
         spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
         plan_result_factory=_plan_result_docs_task,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
     )
 
     await h.driver.drive(CID)
