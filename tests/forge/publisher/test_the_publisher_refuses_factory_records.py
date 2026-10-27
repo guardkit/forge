@@ -1,21 +1,23 @@
-"""The publisher refuses to send the factory's own records or private paths.
+"""The publisher refuses to send the factory's own records.
 
 Design: "Factory records never enter a project's commits" (14 October 2026),
 tests 15 to 36. Before it sends, the publisher looks at the commits the send
 would add (those reachable from the join and not from the published branch)
-four ways:
+three ways:
 
 a. a record path added or changed, at any depth, even one later deleted;
 b. a record moved or copied to another path, judged on the final state;
-c. a record's exact content saved under any other path;
-d. any new file version holding one of the factory's private folder names.
+c. a record's exact content saved under any other path.
+
+(The fourth look, for the factory's private folder names, went in the cull,
+27 October 2026.)
 
 When any look finds something, nothing is sent, and the answer is one plain
 sentence. When a look itself fails, nothing is sent either.
 
 NOTHING HERE CONTACTS ANYTHING REAL. The "remote" is a bare repository in the
-test's own temporary folder. The private folder name is made up
-(``/home/example``). Nothing names a language: the product is text files.
+test's own temporary folder. Nothing names a language: the product is text
+files.
 """
 
 from __future__ import annotations
@@ -30,10 +32,8 @@ import pytest
 from forge.network_git import NetworkResult
 from forge.publisher import git_work
 from forge.publisher.service import Publisher
-from forge.publisher.settings import SettingsRefused, load_settings
 from tests.forge.publisher.a_project_and_a_ledger import (
     FEATURE,
-    MADE_UP_PRIVATE_FOLDER,
     a_request,
     every_push_the_remote_saw,
     git,
@@ -42,7 +42,6 @@ from tests.forge.publisher.a_project_and_a_ledger import (
     what_the_remote_has,
 )
 
-PRIVATE = MADE_UP_PRIVATE_FOLDER
 
 #: Twenty lines of ordinary JSON, with no private folder name in it.
 OLD_RECORD = (
@@ -53,7 +52,6 @@ OLD_RECORD = (
 EDITED = OLD_RECORD + '{"one more": "line"}\n'
 
 RECORDS_KIND = "it-holds-factory-records"
-PRIVATE_KIND = "it-holds-private-paths"
 UNCHECKED_KIND = "the-commits-could-not-be-checked"
 
 
@@ -420,76 +418,6 @@ class TestRecordContentElsewhere:
 # ---------------------------------------------------------------------------
 
 
-class TestPrivateFolderNames:
-    def test_23_a_private_line_added_then_removed_is_refused(self, world: World) -> None:
-        line = f'labels: "com.example.workdir={PRIVATE}/projects/shop"\n'
-        world.commit({"deploy/compose.yml": "services: {}\n" + line})
-        world.commit({"deploy/compose.yml": "services: {}\n"})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), PRIVATE_KIND)
-
-        assert "deploy/compose.yml" in sentence
-        assert PRIVATE not in sentence
-        assert "com.example.workdir" not in sentence
-
-    def test_33_a_document_quoting_a_diff_header_is_refused(self, world: World) -> None:
-        world.commit({"docs/notes.md": f"An example:\n\n+++ {PRIVATE}/result.json\n"})
-        world.commit({"docs/notes.md": None, "src/app.txt": "two\n"})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), PRIVATE_KIND)
-
-        assert "docs/notes.md" in sentence
-
-    def test_34_a_file_turned_into_a_link_to_a_private_folder_is_refused(
-        self, world: World
-    ) -> None:
-        world.commit({"src/where": "nowhere special\n"})
-        world.make_this_the_target()
-        (world.copy / "src" / "where").unlink()
-        (world.copy / "src" / "where").symlink_to(f"{PRIVATE}/forge-state/receipts")
-        world.commit(message="a link now")
-        world.commit({"src/where": None, "src/app.txt": "two\n"})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), PRIVATE_KIND)
-
-        assert "src/where" in sentence
-
-    def test_35_removing_one_of_two_private_lines_is_refused(self, tmp_path: Path) -> None:
-        world = tracking(
-            tmp_path,
-            {"deploy/notes.txt": f"first {PRIVATE}/a\nsecond {PRIVATE}/b\nplain\n"},
-        )
-        world.commit({"deploy/notes.txt": f"second {PRIVATE}/b\nplain\n"})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), PRIVATE_KIND)
-
-        assert "deploy/notes.txt" in sentence
-
-    def test_36_a_contaminated_file_copied_then_deleted_is_refused(
-        self, tmp_path: Path
-    ) -> None:
-        world = tracking(tmp_path, {"deploy/old.txt": f"path {PRIVATE}/x\n"})
-        world.commit({"deploy/copy.txt": f"path {PRIVATE}/x\n"})
-        world.commit({"deploy/copy.txt": None, "src/app.txt": "two\n"})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), PRIVATE_KIND)
-
-        assert "deploy/copy.txt" in sentence
-
-    def test_36_control_an_untouched_contaminated_file_still_publishes(
-        self, tmp_path: Path
-    ) -> None:
-        world = tracking(tmp_path, {"deploy/old.txt": f"path {PRIVATE}/x\n"})
-        world.commit({"src/app.txt": "two\n"})
-        project = world.join()
-
-        published(world, world.publish(project), project)
-
 
 # ---------------------------------------------------------------------------
 # Ordinary work is never refused (tests 24, 30, 31)
@@ -529,12 +457,6 @@ class TestNoFalseRefusal:
 
         published(world, world.publish(project), project)
 
-    def test_24_removing_the_only_private_line_is_published(self, tmp_path: Path) -> None:
-        world = tracking(tmp_path, {"deploy/notes.txt": f"where {PRIVATE}/a\nplain\n"})
-        world.commit({"deploy/notes.txt": "plain\n"})
-        project = world.join()
-
-        published(world, world.publish(project), project)
 
     def test_30_the_targets_record_and_product_copy_inherited_into_the_join(
         self, world: World
@@ -641,13 +563,7 @@ class TestALookThatFailsRefuses:
         commits = publisher._its_own_copy(route)  # noqa: SLF001 - the seam under test
         assert commits.bring_the_joined_commit_out(project["j"]).ok
 
-        assert commits.what_must_not_be_published("f" * 40, project["j"], private_prefixes=(PRIVATE,)) is None
-
-    def test_25_no_private_prefixes_means_nothing_is_sent(self, world: World) -> None:
-        world.commit({"src/app.txt": "two\n"})
-        project = world.join()
-
-        refused(world, world.publish(project, private_path_prefixes=()), UNCHECKED_KIND)
+        assert commits.what_must_not_be_published("f" * 40, project["j"]) is None
 
 
 def _settings_file(tmp_path: Path, **extra: Any) -> Path:
@@ -656,43 +572,6 @@ def _settings_file(tmp_path: Path, **extra: Any) -> Path:
     where.write_text(json.dumps(body), encoding="utf-8")
     return where
 
-
-class TestTheSettingIsRequired:
-    @pytest.mark.parametrize(
-        "extra",
-        [
-            {},
-            {"private_path_prefixes": []},
-            {"private_path_prefixes": ["/home/"]},
-            {"private_path_prefixes": ["/var/"]},
-            {"private_path_prefixes": ["/home"]},
-            {"private_path_prefixes": ["/"]},
-            {"private_path_prefixes": ["relative/folder"]},
-            {"private_path_prefixes": "/home/example"},
-            {"private_path_prefixes": [PRIVATE, "/var"]},
-            {"private_path_prefixes": [PRIVATE, 7]},
-        ],
-        ids=[
-            "missing", "empty", "home", "var", "home without slash", "root",
-            "relative", "not a list", "one generic among good", "not text",
-        ],
-    )
-    def test_26_a_missing_empty_or_generic_setting_is_refused(
-        self, tmp_path: Path, extra: dict[str, Any]
-    ) -> None:
-        with pytest.raises(SettingsRefused) as caught:
-            load_settings(_settings_file(tmp_path, **extra))
-        assert "private_path_prefixes" in str(caught.value)
-
-    def test_26_a_real_looking_setting_is_read(self, tmp_path: Path) -> None:
-        loaded = load_settings(
-            _settings_file(
-                tmp_path, private_path_prefixes=[PRIVATE, "/srv/sandboxes/storage/"]
-            )
-        )
-        assert loaded.private_path_prefixes == (PRIVATE, "/srv/sandboxes/storage")
-        assert "private_path_prefixes" not in json.dumps(loaded.without_secrets())
-        assert loaded.without_secrets()["private_path_prefix_count"] == 2
 
 
 # ---------------------------------------------------------------------------
@@ -710,128 +589,5 @@ class TestCoachFixPass1:
 
         refused(world, world.publish(project), RECORDS_KIND)
 
-    def test_f4_a_longer_folder_name_that_starts_the_same_is_published(
-        self, world: World
-    ) -> None:
-        world.commit({"deploy/Dockerfile": f"WORKDIR {PRIVATE}s-shop/app\n"})
-        project = world.join()
-
-        published(world, world.publish(project), project)
-
-    @pytest.mark.parametrize(
-        "text",
-        [f'{{"cwd": "{PRIVATE}"}}\n', f"cd {PRIVATE}\n", f"{PRIVATE}"],
-        ids=["quoted", "end of a line", "end of the file"],
-    )
-    def test_f4_the_folder_itself_is_still_found(self, world: World, text: str) -> None:
-        world.commit({"deploy/notes.txt": text})
-        project = world.join()
-
-        refused(world, world.publish(project), PRIVATE_KIND)
-
-    def test_a_commit_message_naming_a_private_folder_is_refused(
-        self, world: World
-    ) -> None:
-        world.write({"src/app.txt": "two\n"})
-        world.run("add", "-A")
-        world.run("commit", "-q", "-m", f"work done in {PRIVATE}/projects/shop")
-        named = world.run("rev-parse", "HEAD")
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), PRIVATE_KIND)
-
-        assert PRIVATE not in sentence
-        assert f"the message of commit {named[:10]}" in sentence
-
-    @pytest.mark.parametrize(
-        "path",
-        [
-            f"mirror{PRIVATE}/forge-state/x.txt",
-            f"{PRIVATE.lstrip('/')}/notes.txt",
-            f"mirror{PRIVATE}/café à la carte.txt",
-        ],
-        ids=["inside a folder", "at the top", "a name git would quote"],
-    )
-    def test_a_file_path_holding_a_private_folder_is_refused(
-        self, world: World, path: str
-    ) -> None:
-        world.commit({path: "ordinary text\n"})
-        world.commit({path: None, "src/app.txt": "two\n"})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), PRIVATE_KIND)
-
-        assert PRIVATE not in sentence
-        assert PRIVATE.lstrip("/") not in sentence
 
 
-class TestTheSettingRefusesGenericFolders:
-    @pytest.mark.parametrize(
-        "value",
-        ["/home/node", "/home/runner", "/usr/local/bin", "/usr/share", "/opt/app",
-         "/var/lib", "/tmp/build", "/srv/app", "/root/app", "/app/src"],
-    )
-    def test_a_generic_folder_is_refused(self, tmp_path: Path, value: str) -> None:
-        with pytest.raises(SettingsRefused):
-            load_settings(_settings_file(tmp_path, private_path_prefixes=[value]))
-
-    @pytest.mark.parametrize(
-        "value", [PRIVATE, "/Users/example", "/srv/sandboxes/storage", "/opt/factory/receipts"]
-    )
-    def test_a_machine_s_own_folder_is_read(self, tmp_path: Path, value: str) -> None:
-        loaded = load_settings(_settings_file(tmp_path, private_path_prefixes=[value]))
-        assert loaded.private_path_prefixes == (value,)
-
-
-class TestCoachFixPass3:
-    def test_g1_a_private_folder_at_the_end_of_a_sentence_is_refused(
-        self, world: World
-    ) -> None:
-        world.commit({"docs/notes.md": f"The receipts live in {PRIVATE}.\n"})
-        project = world.join()
-
-        refused(world, world.publish(project), PRIVATE_KIND)
-
-    @pytest.mark.parametrize("longer", [f"{PRIVATE}.org/x", f"{PRIVATE}s-shop/app"])
-    def test_g1_a_longer_name_that_starts_the_same_is_published(
-        self, world: World, longer: str
-    ) -> None:
-        world.commit({"docs/notes.md": f"See {longer} for more.\n"})
-        project = world.join()
-
-        published(world, world.publish(project), project)
-
-
-class TestCodexRound1Redaction:
-    """Codex implementation round 1, R2: a file name holding a private
-    folder at the top of the repository (no leading ``/``) is never written
-    into a refusal, whichever look found the problem."""
-
-    TOP = PRIVATE.lstrip("/")
-
-    def test_a_record_under_a_root_relative_private_folder(self, world: World) -> None:
-        world.commit({f"{self.TOP}/.guardkit/autobuild/x.json": '{"turn": 1}\n'})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), RECORDS_KIND)
-
-        assert self.TOP not in sentence
-
-    def test_a_record_moved_to_a_root_relative_private_folder(self, tmp_path: Path) -> None:
-        world = tracking(tmp_path, {".guardkit/autobuild/old.json": OLD_RECORD})
-        (world.copy / self.TOP).mkdir(parents=True)
-        world.run("mv", ".guardkit/autobuild/old.json", f"{self.TOP}/old.json")
-        world.commit({f"{self.TOP}/old.json": EDITED})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), RECORDS_KIND)
-
-        assert self.TOP not in sentence
-
-    def test_private_content_in_a_root_relative_private_file(self, world: World) -> None:
-        world.commit({f"{self.TOP}/notes.txt": f"see {PRIVATE}/x\n"})
-        project = world.join()
-
-        sentence = refused(world, world.publish(project), PRIVATE_KIND)
-
-        assert self.TOP not in sentence

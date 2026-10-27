@@ -41,10 +41,10 @@ nothing can be built or run out of it.
 
 WHAT MUST NOT BE PUBLISHED (14 October 2026, design "Factory records never
 enter a project's commits"). Before a send, :meth:`TheProjectsCommits.what_must_not_be_published`
-looks at exactly the commits the send would add, four ways: a record path
-added or changed (a), a record moved or copied out, on the final state (b), a
-record's exact content under another path (c), and any new file version
-holding one of the factory's private folder names (d). It only reads the
+looks at exactly the commits the send would add, three ways: a record path
+added or changed (a), a record moved or copied out, on the final state (b),
+and a record's exact content under another path (c). (The look for private
+folder names went in the cull, 27 October 2026.) It only reads the
 publisher's own copy; it never removes or rewrites anything.
 
 AGNOSTIC. Two git addresses and a branch name. Nothing here knows what a
@@ -182,23 +182,16 @@ class TheRemotesList:
 class Finding:
     """One look's answer: what it found, how many, and the first one.
 
-    ``look`` is ``"a"``, ``"b"``, ``"c"`` or ``"d"``. ``first`` names a file
-    (and, for looks b and c, the record it came from); it never quotes a
-    file's content or a private folder name.
+    ``look`` is ``"a"``, ``"b"`` or ``"c"``. ``first`` names a file (and, for
+    looks b and c, the record it came from); it never quotes a file's content.
     """
 
     look: str
     count: int
     first: str
-    #: The files found, for looks a to c (so one file found by two looks is
-    #: counted once); for look d, the files whose new version matched. Used
-    #: for counting only and never written into a sentence: only ``first``
-    #: is, after every file name in it has been checked for a private folder.
+    #: The files found (so one file found by two looks is counted once).
+    #: Used for counting only.
     paths: tuple[str, ...] = ()
-
-    @property
-    def private_paths(self) -> bool:
-        return self.look == "d"
 
 
 #: An object id of all zeros: no object (a deletion, or nothing before).
@@ -233,9 +226,6 @@ _HISTORY = (
     "-z",
     "--format=",
 )
-
-#: How many blobs one ``cat-file --batch`` reads at a time.
-_BLOBS_PER_READ = 256
 
 
 @dataclass(frozen=True)
@@ -298,88 +288,6 @@ def _raw_moves(text: str) -> list[tuple[str, str, str]]:
         else:
             index += 1
     return moves
-
-
-#: What may follow a private folder name for it to count: anything but a
-#: character that would continue the folder's own name. A ``.`` continues it
-#: only when a name character follows (coach review 2, G1). So
-#: ``/home/example`` is found in ``/home/example/x``, ``"/home/example"``, at
-#: the end of a file and at the end of a sentence (``in /home/example.``), and
-#: not in ``/home/examples-shop`` or ``/home/example.org`` (coach review 1, F4).
-_NAME_GOES_ON = rb"(?![A-Za-z0-9_\-]|\.[A-Za-z0-9_\-])"
-
-
-def _private_folder_pattern(prefixes: list[str]) -> "re.Pattern[bytes]":
-    """One pattern matching any of ``prefixes`` on a folder-name boundary."""
-    alternatives = b"|".join(re.escape(p.encode("utf-8")) for p in prefixes)
-    return re.compile(b"(?:" + alternatives + b")" + _NAME_GOES_ON)
-
-
-def _blobs_holding(
-    data: bytes, wanted: list[str], private: "re.Pattern[bytes]"
-) -> set[str] | None:
-    """The blob ids among ``wanted`` whose bytes hold a private folder name,
-    from ``git cat-file --batch`` output. ``None`` when the output is not
-    what was asked for (a missing object, a short read)."""
-    found: set[str] = set()
-    at = 0
-    for object_id in wanted:
-        end = data.find(b"\n", at)
-        if end < 0:
-            return None
-        header = data[at:end].split()
-        if len(header) != 3 or header[0].decode("ascii", "replace") != object_id:
-            return None
-        if header[1] != b"blob":
-            return None
-        try:
-            size = int(header[2])
-        except ValueError:
-            return None
-        start = end + 1
-        content = data[start : start + size]
-        if len(content) != size:
-            return None
-        if private.search(content):
-            found.add(object_id)
-        at = start + size + 1  # the newline after the content
-    return found
-
-
-#: What a finding says in place of a file name that holds a private folder.
-NAME_NOT_WRITTEN = "a file whose name is not written here"
-
-
-def _names_a_private_folder(
-    name: str, private: "re.Pattern[bytes]", prefixes: list[str]
-) -> bool:
-    """Whether a file name holds a private folder name, checked the way
-    detection checks it (with a leading ``/``, so a folder at the top of the
-    repository counts) and, more bluntly, for the folder name without its
-    leading ``/`` anywhere in the text (Codex implementation round 1, R2)."""
-    text = str(name or "")
-    if private.search(("/" + text).encode("utf-8", "surrogateescape")):
-        return True
-    return any(p.strip("/") and p.strip("/") in text for p in prefixes)
-
-
-def _unquoted(finding: Finding, prefixes: list[str]) -> Finding:
-    """The same finding, with any text holding a private folder name
-    replaced: a refusal sentence never quotes one. A last check over the
-    finished text; each file name is also checked before it is formatted."""
-    def clean(text: str) -> str:
-        return (
-            NAME_NOT_WRITTEN
-            if any(p.strip("/") and p.strip("/") in text for p in prefixes)
-            else text
-        )
-
-    return Finding(
-        finding.look,
-        finding.count,
-        clean(finding.first),
-        finding.paths,
-    )
 
 
 def without_the_addresses(said: str, addresses: "Iterable[str]" = ()) -> str:
@@ -716,8 +624,6 @@ class TheProjectsCommits:
         self,
         since: str,
         commit: str,
-        *,
-        private_prefixes: "Iterable[str]",
     ) -> list[Finding] | None:
         """What the commits a send would add hold that must not be published.
 
@@ -744,28 +650,12 @@ class TheProjectsCommits:
            record path in the range's boundary commits, or that look a saw a
            new commit put at one; then any added, changed or retyped file
            outside the record paths whose new blob is one of them.
-        d. **Private folder names**: every blob the range adds, changes or
-           retypes, at any path, merges included, is read whole and its raw
-           bytes searched for each private prefix. A gitlink is never read.
-           A blob seen twice is read once. The names of the files the range
-           adds, changes or retypes (as ``-z`` prints them, never quoted, and
-           with a leading ``/`` so a folder at the top counts) and every
-           commit message in the range are searched too (coach review 1). A
-           prefix counts only where the folder's name ends: followed by
-           ``/``, the end, or any character that cannot continue a name.
-
-        No look parses a patch, and nothing is removed or rewritten. No
-        finding's sentence quotes a private folder name: a name holding one
-        is not written down.
+        No look parses a patch, and nothing is removed or rewritten. (The
+        look for private folder names went in the cull, 27 October 2026.)
         """
-        prefixes = [str(p) for p in private_prefixes if str(p or "")]
-        if not prefixes:
-            return None
-        private = _private_folder_pattern(prefixes)
 
         def shown(name: str) -> str:
-            """A file name as a refusal may write it."""
-            return NAME_NOT_WRITTEN if _names_a_private_folder(name, private, prefixes) else name
+            return name
 
         if a_plain_commit_name(since) is None or a_plain_commit_name(commit) is None:
             return None
@@ -869,65 +759,7 @@ class TheProjectsCommits:
                 )
             )
 
-        # -- d. private folder names in any new file version ---------------
-        wanted = list(dict.fromkeys(entry.object_id for entry in new_blobs))
-        holding: set[str] = set()
-        for start in range(0, len(wanted), _BLOBS_PER_READ):
-            chunk = wanted[start : start + _BLOBS_PER_READ]
-            done = run_network_git(
-                ["cat-file", "--batch"],
-                transport="none",
-                git_dir=self._where,
-                timeout=self._timeout,
-                binary=True,
-                input_bytes="".join(f"{o}\n" for o in chunk).encode("ascii"),
-            )
-            if not done.ok:
-                return None
-            found = _blobs_holding(done.data, chunk, private)
-            if found is None:
-                return None
-            holding |= found
-        matched = tuple(
-            dict.fromkeys(e.path for e in new_blobs if e.object_id in holding)
-        )
-        named_in_path = list(
-            dict.fromkeys(
-                e.path
-                for e in added_entries
-                if private.search(("/" + e.path).encode("utf-8", "surrogateescape"))
-            )
-        )
-        messages = run_network_git(
-            ["log", "-z", "--format=%H%n%B", span],
-            transport="none",
-            git_dir=self._where,
-            timeout=self._timeout,
-            binary=True,
-        )
-        if not messages.ok:
-            return None
-        named_in_message = [
-            record.split(b"\n", 1)[0].decode("ascii", "replace").strip()
-            for record in messages.data.split(b"\0")
-            if record.strip() and private.search(record.split(b"\n", 1)[-1])
-        ]
-        if holding or named_in_path or named_in_message:
-            if matched:
-                first = shown(matched[0])
-            elif named_in_path:
-                first = "a file name in those commits"
-            else:
-                first = f"the message of commit {named_in_message[0][:10]}"
-            findings.append(
-                Finding(
-                    "d",
-                    len(holding) + len(named_in_path) + len(named_in_message),
-                    first,
-                    matched,
-                )
-            )
-        return [_unquoted(f, prefixes) for f in findings]
+        return findings
 
     def send(self, commit: str, branch: str) -> GitSaid:
         """An ordinary, non-forcing push of one commit to one branch."""

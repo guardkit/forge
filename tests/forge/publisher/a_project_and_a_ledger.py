@@ -32,11 +32,6 @@ from forge.publisher.settings import ProjectRoute, PublisherSettings
 #: run produced and prove it is in none of them.
 THE_MADE_UP_CREDENTIAL = "not-a-real-credential-TESTONLY-8f31c2"
 
-#: A made-up private folder name for the publisher's required
-#: ``private_path_prefixes`` setting. No test project contains it unless a
-#: test puts it there on purpose.
-MADE_UP_PRIVATE_FOLDER = "/home/example"
-
 BUILD = "build-FEAT-PUB1-1"
 FEATURE = "FEAT-PUB1"
 PROJECT = "bench/widget-shop"
@@ -293,7 +288,6 @@ def settings_for(
     ledger: Path,
     credential_file: Path | None = None,
     projects: dict[str, ProjectRoute] | None = None,
-    private_path_prefixes: tuple[str, ...] = (MADE_UP_PRIVATE_FOLDER,),
 ) -> PublisherSettings:
     return PublisherSettings(
         credential_file=str(
@@ -315,7 +309,6 @@ def settings_for(
         },
         port=0,
         git_timeout_seconds=60.0,
-        private_path_prefixes=tuple(private_path_prefixes),
     )
 
 

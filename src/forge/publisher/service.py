@@ -25,9 +25,9 @@ WHAT IT DOES. Given ``{project, build_id, turn, j_commit, target_branch}``:
    build tip, and that G is part of the remote's target branch as it is NOW,
    so that sending moves the branch forwards and never sideways;
 3a. it looks at the commits the send would add, and refuses when they bring
-   in one of the factory's own build records, move or copy one elsewhere, or
-   add a file version naming one of the factory's private folders (14
-   October 2026, design "Factory records never enter a project's commits").
+   in one of the factory's own build records, or move or copy one elsewhere
+   (14 October 2026, design "Factory records never enter a project's
+   commits").
    A look that cannot be made refuses too. It never removes anything;
 4. it sends the joined commit to the remote's recorded target branch with an
    ordinary, NON-FORCING push, using the one credential it holds;
@@ -170,9 +170,8 @@ THE_ROUTE_KEY_CHANGED: str = "the-route-credential-changed"
 
 #: The refusals of the looks before a send (design "Factory records never
 #: enter a project's commits"). None is retried: the way forward is a fresh
-#: build, or a product file with the private folder name taken out.
+#: build.
 IT_HOLDS_FACTORY_RECORDS: str = "it-holds-factory-records"
-IT_HOLDS_PRIVATE_PATHS: str = "it-holds-private-paths"
 THE_COMMITS_COULD_NOT_BE_CHECKED: str = "the-commits-could-not-be-checked"
 
 #: The refusal when, with ``private_only`` on, a route's repository is not
@@ -1201,23 +1200,18 @@ class Publisher:
         target_branch: str,
     ) -> Answer | None:
         """``None`` when the commits the send adds may be published; a
-        refusal otherwise. Looks a to c (records) are said before look d
-        (private folder names). Nothing is ever removed or rewritten."""
-        findings = commits.what_must_not_be_published(
-            remote_now,
-            j_commit,
-            private_prefixes=self._settings.private_path_prefixes,
-        )
+        refusal otherwise: looks a to c, the factory's own build records.
+        Nothing is ever removed or rewritten."""
+        findings = commits.what_must_not_be_published(remote_now, j_commit)
         if findings is None:
             return _refused(
                 THE_COMMITS_COULD_NOT_BE_CHECKED,
                 f"The commits {j_commit[:10]} would add to '{target_branch}' "
-                "could not be checked for the factory's own build records and "
-                "private folder names. Nothing was sent.",
+                "could not be checked for the factory's own build records. "
+                "Nothing was sent.",
                 remote_now=remote_now,
             )
-        records = [f for f in findings if not f.private_paths]
-        private = [f for f in findings if f.private_paths]
+        records = list(findings)
         if records:
             paths = {path for f in records for path in f.paths}
             count = len(paths) or sum(f.count for f in records)
@@ -1239,25 +1233,9 @@ class Publisher:
                 "keeps them out of commits.",
                 remote_now=remote_now,
             )
-        if private:
-            logger.warning(
-                "publisher: %s holds %d file version(s), file name(s) or commit "
-                "message(s) naming a private folder; nothing was sent",
-                j_commit[:10],
-                private[0].count,
-            )
-            return _refused(
-                IT_HOLDS_PRIVATE_PATHS,
-                f"{j_commit[:10]} would publish {private[0].count} new file "
-                "version(s), file name(s) or commit message(s) naming a folder "
-                "that exists only on the factory's own machines (first: "
-                f"{private[0].first}). Nothing was sent. Build the feature "
-                "again on a release that keeps such paths out of commits.",
-                remote_now=remote_now,
-            )
         logger.info(
-            "publisher: %s — the four looks found no factory record and no "
-            "private folder name in the commits it adds",
+            "publisher: %s — the three looks found no factory record in the "
+            "commits it adds",
             j_commit[:10],
         )
         return None
