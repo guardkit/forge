@@ -402,12 +402,25 @@ SANDBOX_REPO = "appmilla/api_test_sandboxed"
 
 @pytest.fixture
 def sandbox_clone(tmp_path: Path) -> Path:
-    """The factory's own clone, as it is inside the repository's sandbox."""
+    """The factory's own clone, as it is inside the repository's sandbox.
+
+    Its main already carries the project's committed deployment profile, as a
+    sandboxed project that has been deployed before does: the real check in
+    the sandbox runs from that profile. Without one, the press reads this
+    build as the project's first deployment, which needs the owner's recorded
+    approval of the offer (5a73b043, 21 October 2026); the sandbox merge press
+    tests were given the same declaration in 395676c6.
+    """
     root = tmp_path / "sandbox" / "api_test"
     root.mkdir(parents=True)
     _git(root, "init", "-b", "main", "-q")
     (root / "README.md").write_text("first\n", encoding="utf-8")
-    _git(root, "add", "README.md")
+    (root / "deploy").mkdir()
+    (root / "deploy" / "profile.yaml").write_text(
+        "env_id: example\ncompose:\n  file: compose.yaml\n  script: deploy/run\n",
+        encoding="utf-8",
+    )
+    _git(root, "add", "README.md", "deploy/profile.yaml")
     _git(root, "commit", "-q", "-m", "first")
     _git(root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
     (root / "feature.txt").write_text("the feature\n", encoding="utf-8")
@@ -466,8 +479,10 @@ def test_the_attended_command_presses_a_sandboxed_repository_in_its_sandbox(
             "approval": {"expected_approver": "rich"},
         }
     )
+    # The build started from the sandbox clone's main, profile and all.
     pool.connection.execute(
-        "UPDATE builds SET repo = ? WHERE build_id = ?", (SANDBOX_REPO, BUILD_ID)
+        "UPDATE builds SET repo = ?, start_commit = ? WHERE build_id = ?",
+        (SANDBOX_REPO, _git(sandbox_clone, "rev-parse", "main"), BUILD_ID),
     )
     pool.connection.commit()
     wired = _wire(monkeypatch, pool, sandbox_clone)
