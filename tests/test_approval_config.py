@@ -393,6 +393,14 @@ class TestApprovalYamlRoundTrip:
                 }
             },
         }
+        # The sandbox starter block (one sandbox per project, stage S2): the
+        # unfiltered dump always includes it.
+        original["planning"]["sandbox_starter"] = {
+            "url": None,
+            "idle_minutes": 30,
+            "ready_timeout_seconds": 600,
+            "poll_seconds": 60,
+        }
 
         yaml_path = tmp_path / "forge.yaml"
         yaml_path.write_text(yaml.safe_dump(original))

@@ -191,7 +191,7 @@ def test_the_stop_columns_are_added_to_an_older_missions_table(tmp_path: Path) -
     ensure_tables(connection)
     names = {row[1] for row in connection.execute("PRAGMA table_info(missions)")}
     assert {"stop_requested_at", "stop_requested_by"} <= names
-    assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 19
+    assert connection.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 21
     connection.close()
 
 

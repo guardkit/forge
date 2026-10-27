@@ -486,25 +486,17 @@ def test_the_shipped_manifest_plans_every_image_of_the_release(tmp_path):
     result = _plan(copy)
 
     assert result.returncode == 0, result.stderr
-    assert "would build 5 image(s)" in result.stdout
+    # Since 25 October 2026 the shipped manifest builds the two Forge images
+    # only; the memory and Jarvis images are added back for a release that
+    # changes them (the manifest says so beside its images list).
+    assert "would build 2 image(s)" in result.stdout
     assert "forge [coordinator] from forge/Dockerfile" in result.stdout
     assert (
         "forge-publisher [publisher] from forge/src/forge/publisher/Dockerfile"
         in result.stdout
     )
-    assert (
-        "fleet-memory-mcp [memory] from fleet-memory/deploy/mcp/Dockerfile"
-        in result.stdout
-    )
-    assert (
-        "fleet-memory-relay [memory-relay] from fleet-memory/deploy/relay/Dockerfile"
-        in result.stdout
-    )
-    assert "jarvis [front-door] from jarvis/deploy/Dockerfile" in result.stdout
     assert "proved by : forge/scripts/verify-forge-oracles.sh" in result.stdout
     assert "proved by : forge/scripts/verify-publisher-image.sh" in result.stdout
-    assert "proved by : forge/scripts/verify-fleet-memory-image.sh" in result.stdout
-    assert "proved by : forge/scripts/verify-jarvis-image.sh" in result.stdout
 
 
 @needs_docker
@@ -521,6 +513,30 @@ def test_an_image_is_tagged_by_the_commit_of_the_repository_it_came_from(tmp_pat
     elsewhere.mkdir()
     copy = elsewhere / "manifest.yaml"
     text = SHIPPED_MANIFEST.read_text(encoding="utf-8")
+    # The memory and Jarvis images, added back as a release that changes them
+    # does (the shipped manifest builds the two Forge images only since
+    # 25 October 2026).
+    others = (
+        "  - name: fleet-memory-mcp\n"
+        "    context: fleet-memory\n"
+        "    dockerfile: deploy/mcp/Dockerfile\n"
+        "    role: memory\n"
+        "    proof: scripts/verify-fleet-memory-image.sh\n"
+        "  - name: fleet-memory-relay\n"
+        "    context: fleet-memory\n"
+        "    dockerfile: deploy/relay/Dockerfile\n"
+        "    role: memory-relay\n"
+        "    proof: scripts/verify-fleet-memory-image.sh\n"
+        "  - name: jarvis\n"
+        "    context: jarvis\n"
+        "    dockerfile: deploy/Dockerfile\n"
+        "    role: front-door\n"
+        "    proof: scripts/verify-jarvis-image.sh\n"
+    )
+    marker = "\nrepositories:\n"
+    assert marker in text
+    head, tail = text.split(marker, 1)
+    text = head.rstrip("\n") + "\n" + others + marker + tail
     copy.write_text(text, encoding="utf-8")
 
     pins = _pins_of(text)

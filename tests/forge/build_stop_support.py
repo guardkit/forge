@@ -21,6 +21,8 @@ Every process and container a check starts is removed by the check.
 
 from __future__ import annotations
 
+import pytest
+
 import json
 import os
 import signal
@@ -306,6 +308,10 @@ def real_runner(
     port = free_port()
     log = home / "runner.log"
     langgraph = Path(sys.executable).parent / "langgraph"
+    if not langgraph.exists():
+        # The development server comes with the ``sidecar`` extra, which the
+        # GitHub workflow's ``uv sync --extra dev`` does not install.
+        pytest.skip(f"the development server is not installed at {langgraph}")
     env = {
         **os.environ,
         **estate.env(),

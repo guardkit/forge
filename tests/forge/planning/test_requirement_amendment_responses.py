@@ -249,7 +249,7 @@ async def test_real_no_task_legs_freeze_absence_and_launch_ordinary_source(plann
         _make_driver,
         _AUTHLESS_SEED_YAML,
     )
-    import one_sentence as operator
+    operator = pytest.importorskip("one_sentence", reason="a sibling repository this test reads (one_sentence) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
 
     x = planned
     # The old fixture's synthetic no-write receipts are explicitly removed.

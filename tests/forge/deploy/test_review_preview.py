@@ -155,6 +155,10 @@ class FakeVenue:
         # and any more of its compose project's containers that do not.
         self.labelled = True
         self.unlabelled_members: list[str] = []
+        # Which lease a compose project belongs to. Two concurrent
+        # preparations interleave in no fixed order, so "the lease laid out
+        # last" can be the other preparation's.
+        self.lease_for_project: Any = None
 
     async def lay_out(self, lease_id: str, *, onto: str, candidate: str) -> PreviewTree:
         self.calls.append(("lay_out", (lease_id, onto, candidate)))
@@ -190,7 +194,10 @@ class FakeVenue:
         self, compose_project: str
     ) -> tuple[set[str], list[tuple[str, str]]] | None:
         self.calls.append(("preview_containers", compose_project))
-        lease = self.named("lay_out")[-1][0]
+        if self.lease_for_project is not None:
+            lease = self.lease_for_project(compose_project)
+        else:
+            lease = self.named("lay_out")[-1][0]
         label = lease if self.labelled else ""
         members = [(f"{compose_project}-app-1", label)]
         members += [(name, "") for name in self.unlabelled_members]
@@ -272,6 +279,9 @@ class World:
         self.dispatch = FakeDispatch()
         self.profile = _profile()
         self.store = PreviewLeaseStore(connection)
+        self.venue.lease_for_project = lambda project: next(
+            lease.lease_id for lease in self.store.live() if lease.compose_project == project
+        )
         self.root = tmp_path / "evidence"
         self.leases = iter(f"pv{n:012x}" for n in range(1, 100))
         self.runs = iter(f"pvrun-{n:012x}" for n in range(1, 100))

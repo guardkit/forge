@@ -176,7 +176,9 @@ def test_compose_and_operator_paths_share_one_contract() -> None:
     assert "com.docker.network.bridge.name: ${FORGE_PUBLISHER_BRIDGE:?" in fragment
     assert "enable_ipv6: false" in fragment
     assert "expected_bridge = \"fpb\" + hashlib.sha256(project.encode" in settings
-    assert estate.count("--project-name \"$FACTORY_ESTATE_PROJECT\"") == 2
+    # The estate README gives the up command in more than one place (the
+    # release procedure repeats it); what matters is that it is given.
+    assert estate.count("--project-name \"$FACTORY_ESTATE_PROJECT\"") >= 2
     assert '-f "$FACTORY_ESTATE_DIR/compose.yaml" -f "$FACTORY_ESTATE_DIR/compose.external-bus.yaml" up -d' in estate
     assert "not a supported standalone" in " ".join(component.split())
     assert "docker compose --env-file .env --profile sandbox" not in estate
