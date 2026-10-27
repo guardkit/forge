@@ -308,14 +308,15 @@ async def test_the_plan_legs_checks_run_in_the_sandbox_and_the_stamps_ride_the_c
 
 
 @pytest.mark.asyncio
-async def test_sidecar_normalizer_review_refusal_fails_after_commit_before_build(
+async def test_sidecar_normalizer_review_refusal_is_advice_and_the_plan_goes_on(
     store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path
 ) -> None:
     """A mutating declared check cannot inherit the pre-normalization receipt.
 
     The sidecar has already made the immutable plan commit when Forge can ask
-    the async specialist to judge its exact bytes. A refused review therefore
-    leaves that audit commit in place but stops before the build trigger.
+    the async specialist to judge its exact bytes. A refused review is advice
+    (step 2, 27 October 2026): the committed plan carries on, and the build
+    card says the reviewer did not approve it, with its objection.
     """
     repo, _, _ = sandbox_repo
     _queue(store)
@@ -343,15 +344,12 @@ async def test_sidecar_normalizer_review_refusal_fails_after_commit_before_build
 
     h = _driver(store, sandbox_repo, plan_dispatch=reviewer)
 
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert h.ctx["counters"]["build_trigger"] == 0
+    assert await _drive_to_failure(h, store) != PlanningState.FAILED.value
     assert len(normalize_calls(fake_guardkit)) == 1
     assert _plan_yaml_on_branch(repo, f"planning/{CID}")
-    assert any(
-        "committed plan semantic re-review failed" in message
-        and "Coach refused normalized tree" in message
-        for _, message, _ in h.ctx["notifications"]
-    )
+    note = _leg_details(store, "feature-plan")["plan_review_note"]
+    assert "did not approve this plan" in note
+    assert "Coach refused normalized tree" in note
 
 
 @pytest.mark.asyncio
@@ -593,20 +591,35 @@ async def test_where_the_law_is_not_enforced_the_refusal_never_blocks_the_commit
 
 @pytest.mark.asyncio
 async def test_a_red_feature_validate_in_the_sandbox_is_advice_and_the_plan_lands(
-    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path, monkeypatch
+    store: SqlitePlanningRunStore,
+    sandbox_repo,
+    fake_guardkit: Path,
+    monkeypatch,
+    caplog,
 ) -> None:
     """Step 2 (26 October 2026, census FRG-082): the declared ``feature
     validate`` does not block. A red answer in the sandbox is advice, the
-    plan commits, and GuardKit validates the feature when it builds."""
+    plan commits, and GuardKit validates the feature when it builds. The
+    sandbox's answer is logged as the same ADVISORY warning the in-container
+    closure gives, so it is not lost (27 October 2026)."""
     repo, _, _ = sandbox_repo
     _queue(store)
     monkeypatch.setenv("FAKE_GUARDKIT_VALIDATE", "red")
     h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    await h.driver.drive(CID)
+    with caplog.at_level(logging.WARNING, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
 
     assert len(validate_calls(fake_guardkit)) == 1
     assert _plan_yaml_on_branch(repo, f"planning/{CID}") != []
     assert store.get_run(CID)["state"] != PlanningState.FAILED.value
+    advice = [
+        r.getMessage()
+        for r in caplog.records
+        if "feature-validate complained in the sandbox" in r.getMessage()
+    ]
+    assert len(advice) == 1
+    assert "ADVISORY" in advice[0]
+    assert "task file TASK-STAT-001.md missing" in advice[0]
 
 
 # ---------------------------------------------------------------------------
@@ -859,18 +872,30 @@ async def test_a_malformed_bar_in_the_sandbox_is_advice_and_the_bar_lands(
     fake_guardkit: Path,
     fake_normalizer_module: Path,
     monkeypatch,
+    caplog,
 ) -> None:
     """Step 2 (26 October 2026, census FRG-068): GuardKit's task-start
     precondition validates the bar where it is enforced; the declared check
-    here does not block, so the bar is written."""
+    here does not block, so the bar is written. The sandbox's complaint is
+    logged as the same ADVISORY warning the in-container loop gives (27
+    October 2026)."""
     repo, _, _ = sandbox_repo
     _queue(store)
     monkeypatch.setenv("FAKE_GUARDKIT_QA_VALIDATE", "red-pass-bar")
     h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    await h.driver.drive(CID)
+    with caplog.at_level(logging.WARNING, logger="forge.planning.driver"):
+        await h.driver.drive(CID)
 
     assert _on_branch(repo, f"planning/{CID}", "qa/pass-bar-") != []
     assert store.get_run(CID)["state"] != PlanningState.FAILED.value
+    advice = [
+        r.getMessage()
+        for r in caplog.records
+        if "validate-pass-bar complained in the sandbox" in r.getMessage()
+    ]
+    assert advice and all("ADVISORY" in line for line in advice)
+    assert "'criteria' is a required property" in advice[0]
+    assert "qa/pass-bar-" in advice[0]
 
 
 @pytest.mark.asyncio

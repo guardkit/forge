@@ -1654,29 +1654,38 @@ async def test_plan_missing_semantic_review_passes_and_the_build_card_says_so(
 
 
 @pytest.mark.asyncio
-async def test_a_refusing_plan_review_verdict_still_fails_before_write(
+async def test_a_refusing_plan_review_verdict_is_advice_and_the_plan_carries_on(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """A readable verdict that did not approve is never turned into a yes."""
+    """Step 2 (27 October 2026): a readable verdict that did not approve is
+    never turned into a yes, and never ends the run either. The plan is
+    written, no re-review is asked, and the build card says the reviewer did
+    not approve it beside the planner's notes (its objections)."""
     _queue(store)
     files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
     review = json.loads(_semantic_review_json(files))
     review["decision"] = "rejected"
-    h = _make_driver(
-        store,
-        plan_result=SimpleNamespace(
-            outcome=SimpleNamespace(value="completed"),
-            role_output={"files": files, "semantic_review.json": json.dumps(review)},
-            reason=None,
-        ),
-    )
+    calls: list[dict[str, Any]] = []
 
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert any(
-        "semantic review refused" in message.lower()
-        or "semantic review" in message.lower()
-        for _, message, _ in h.ctx["notifications"]
-    )
+    async def _the_specialist(**kwargs: Any) -> Any:
+        calls.append(kwargs)
+        reply = _a_reply(files, json.dumps(review))
+        reply.role_output["validation.json"] = json.dumps(
+            {"plan_advice": [{"rule": "A6", "text": "The plan leaves a part unbuilt."}]}
+        )
+        return reply
+
+    h = _make_driver(store, plan_dispatch=_the_specialist)
+    await h.driver.drive(CID)
+
+    assert [c.get("revision_of") is not None for c in calls] == [False]
+    plan = _approved_plan_events(store)
+    assert plan, "the plan was recorded, not refused"
+    assert "semantic_review" not in plan[-1]
+    assert "did not approve this plan" in plan[-1]["plan_review_note"]
+    card = _card_lines_of(store)
+    assert "The plan reviewer did not approve this plan" in card
+    assert "The plan leaves a part unbuilt." in card
 
 
 @pytest.mark.asyncio
@@ -8872,17 +8881,20 @@ async def test_a_recovered_plan_is_never_recovered_twice(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dropped", ["artifact_identity", "reviewed_after_rewrite"])
-async def test_a_readable_rejection_with_missing_fields_still_fails(
+async def test_a_readable_rejection_with_missing_fields_is_advice(
     store: SqlitePlanningRunStore, dropped: str
 ) -> None:
+    """The decision is read first, whatever else is wrong with the record:
+    the card says the reviewer did not approve, and the plan carries on."""
     _queue(store)
     files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
     review = json.loads(_semantic_review_json(files))
     review["decision"] = "rejected"
     review.pop(dropped)
     h = _make_driver(store, plan_result=_a_reply(files, json.dumps(review)))
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert _approved_plan_events(store) == []
+    await h.driver.drive(CID)
+    plan = _approved_plan_events(store)
+    assert plan and "did not approve this plan" in plan[-1]["plan_review_note"]
 
 
 @pytest.mark.asyncio
@@ -8912,10 +8924,12 @@ async def test_an_accepting_review_with_missing_fields_is_re_reviewed_not_refuse
 
 
 @pytest.mark.asyncio
-async def test_a_retained_objection_returned_by_the_re_review_fails(
+async def test_a_retained_objection_returned_by_the_re_review_is_advice(
     store: SqlitePlanningRunStore,
 ) -> None:
-    """The plan writer answered the re-review and refused: that is its verdict."""
+    """The plan writer answered the re-review and refused: that is its
+    verdict, shown on the build card with its objection (step 2, 27 October
+    2026); the plan that came back carries on."""
     _queue(store)
     files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
 
@@ -8933,11 +8947,13 @@ async def test_a_retained_objection_returned_by_the_re_review_fails(
         )
 
     h = _make_driver(store, plan_dispatch=_the_specialist)
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert any(
-        "re-review refused" in message for _, message, _ in h.ctx["notifications"]
-    )
-    assert _approved_plan_events(store) == []
+    await h.driver.drive(CID)
+    plan = _approved_plan_events(store)
+    assert plan, "the plan that came back was recorded, not refused"
+    note = plan[-1]["plan_review_note"]
+    assert "did not approve this plan" in note
+    assert "A6 the plan leaves a part unbuilt" in note
+    assert "The plan reviewer did not approve this plan" in _card_lines_of(store)
 
 
 @pytest.mark.asyncio

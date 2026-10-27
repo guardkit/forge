@@ -1217,12 +1217,18 @@ _PLAN_REVIEW_UNREADABLE_CARD_LINE = (
 #: October 2026); Forge's mirror of it, ``planning/spec_digest.py``, went.
 DIGEST_ERROR_PREFIX = "spec digest: "
 
-#: The plan reviewer's own refusal: a readable decision that did not approve.
-#: It still ends the run (the planning seat owns that decision). The score and
-#: the Coach's verdict are advice (step 2, 26 October 2026); every other
-#: problem with the review record is bookkeeping (24 October 2026).
-_SEMANTIC_VERDICT_REFUSALS: frozenset[str] = frozenset(
-    {"specialist semantic decision is not approved"}
+#: What the review-record reader says when the plan reviewer's readable
+#: decision did not approve the plan. Advice since step 2 (27 October 2026):
+#: the plan carries on and the build card says the reviewer did not approve
+#: it; the card decides. Every other problem with the record is bookkeeping.
+_SEMANTIC_NOT_APPROVED = "specialist semantic decision is not approved"
+
+#: The build card's line when the plan reviewer did not approve the plan
+#: (step 2, 27 October 2026): advice for the person, never a refusal.
+_PLAN_REVIEW_REFUSED_CARD_LINE = (
+    "The plan reviewer did not approve this plan ({reason}). The plan was kept "
+    "for you to judge; the planner's notes give its objections where it stated "
+    "them. This card decides."
 )
 
 #: Where the plan leg's approved record carries the planning seat's advice for
@@ -1245,9 +1251,9 @@ _PLAN_REVIEW_SCORE_CARD_LINE = (
     "{score} out of 1 (its verdict: {verdict})."
 )
 
-#: What the exact-artifact re-review answers when the plan writer returned
-#: its one ordinary-plan recovery instead of a review (step 1, 25 October
-#: 2026): the plan attempt takes that plan and starts its checks again.
+#: Why the commit stops when the exact-artifact re-review answered with the
+#: plan writer's one ordinary-plan recovery instead of a review (step 1, 25
+#: October 2026): the plan attempt takes that plan and starts its checks again.
 _PLAN_RECOVERED = "the re-review answered with the plan writer's recovered plan"
 
 def _names_a_reviewer_refusal(reason: str) -> bool:
@@ -1255,10 +1261,10 @@ def _names_a_reviewer_refusal(reason: str) -> bool:
 
     The specialist reports a reviewer's refusal in one form, ``<mode> ...
     refused: <reasons>`` (its retained objections, a refused exact review),
-    inside the failed command's message. An error with no such verdict (an
-    unavailable reply, a closed connection, a timeout) names no refusal and
-    is the unreadable-record advice instead (25 October 2026). The generic
-    error category alone is never a verdict.
+    inside the failed command's message. Either way the plan carries on
+    (step 2, 27 October 2026); this only picks the build card's line: the
+    reviewer did not approve, or (no such verdict: an unavailable reply, a
+    closed connection, a timeout) the record could not be read.
     """
     return " refused: " in f" {reason}".lower()
 
@@ -1502,6 +1508,9 @@ class _PlanAttempt:
     #: Why the plan's review record could not be read, after the one
     #: re-review (24 October 2026): the build card says so and decides.
     review_unreadable: str | None = None
+    #: Why the plan reviewer did not approve the plan (step 2, 27 October
+    #: 2026): the build card says so and decides; nothing refuses on it.
+    review_refused: str | None = None
     #: Set when the plan writer answered "already done, nothing to build"
     #: (7 October 2026): nothing was written, and the caller ends the run
     #: through :meth:`PlanningRunDriver._finish_nothing_to_build`.
@@ -6893,19 +6902,22 @@ class PlanningRunDriver:
         # reads its record about this exact artifact tree and shows the score
         # on the build card (step 2, 26 October 2026: advice, never a refusal).
         #
-        # A refusing decision still ends the run. A record that cannot be read
-        # as a verdict about this tree is bookkeeping (24 October 2026): the
-        # existing exact-artifact re-review below is asked, and if its record
-        # cannot be read either the build card says so and the card decides.
+        # A decision that did not approve the plan is advice (step 2, 27
+        # October 2026): the plan carries on with no re-review, and the build
+        # card says the reviewer did not approve it. A record that cannot be
+        # read as a verdict about this tree is bookkeeping (24 October 2026):
+        # the existing exact-artifact re-review below is asked, and if its
+        # record cannot be read either the build card says so and decides.
         traceability, semantic_error = self._semantic_review_of(role_output, files)
-        if semantic_error in _SEMANTIC_VERDICT_REFUSALS:
-            await self._fail_leg(
+        review_refused: str | None = None
+        if semantic_error == _SEMANTIC_NOT_APPROVED:
+            review_refused = "its review record says not approved"
+            logger.warning(
+                "planning driver: run %s — the plan reviewer did not approve the "
+                "plan — ADVISORY; the plan carries on and the build card says so",
                 correlation_id,
-                _FEATURE_PLAN_STAGE,
-                "008 semantic review refused: " + semantic_error,
             )
-            return None
-        if semantic_error is not None:
+        elif semantic_error is not None:
             logger.warning(
                 "planning driver: run %s plan review record unreadable (%s) — "
                 "ADVISORY; asking the existing re-review",
@@ -6934,7 +6946,11 @@ class PlanningRunDriver:
         if claim is not None and semantic_error is not None:
             # Never an approval invented: an already-done answer whose review
             # cannot be read is not taken, and an ordinary plan is asked for.
-            claim, claim_problem = None, "its review record could not be read"
+            claim, claim_problem = None, (
+                "its reviewer did not approve it"
+                if review_refused is not None
+                else "its review record could not be read"
+            )
         if claim is not None or claim_problem is not None:
             return _PlanAttempt(
                 committed=False,
@@ -6971,6 +6987,9 @@ class PlanningRunDriver:
             "role_output": role_output,
             "review": traceability,
             "unreadable": _SEMANTIC_REVIEW_MISSING if missing_record else None,
+            # Why the plan reviewer did not approve the plan: the build card's
+            # line (step 2, 27 October 2026), never a refusal.
+            "refused": review_refused,
             # The plan writer's one ordinary-plan recovery, when the re-review
             # answers with it before anything is written (step 1).
             "recovered": None,
@@ -6979,19 +6998,25 @@ class PlanningRunDriver:
 
         async def _ensure_semantic_review(
             candidate_files: Mapping[str, str],
-        ) -> str | None:
-            """``None`` to carry on, or the reason a REFUSING decision ends the
-            run. A record that cannot be read, after the one re-review, is
-            kept as the card's line and never asked about again."""
-            if semantic_state["unreadable"] is not None:
-                return None
+        ) -> None:
+            """Read the review of ``candidate_files``, asking the one exact
+            re-review when it does not bind to them. Never refuses: a record
+            that cannot be read, or a reviewer that did not approve, is kept
+            as the card's line and never asked about again. A recovered plan
+            the re-review answers with is left in ``semantic_state``."""
+            if (
+                semantic_state["unreadable"] is not None
+                or semantic_state["refused"] is not None
+            ):
+                return
             current, current_error = self._semantic_review_of(
                 semantic_state["role_output"], candidate_files
             )
             if current_error is None:
                 semantic_state["review"] = current
-                return None
+                return
             unreadable: str | None = None
+            refused: str | None = None
             try:
                 reviewed_result = await _ask_the_plan_writer(
                     note=FINAL_PLAN_REVIEW_FEEDBACK,
@@ -7004,15 +7029,16 @@ class PlanningRunDriver:
                 )
             if unreadable is None:
                 reviewed_ok, reviewed_reason = self._dispatch_ok(reviewed_result)
-            if unreadable is None and not reviewed_ok:
-                if _names_a_reviewer_refusal(reviewed_reason):
-                    # The plan writer's reviewer answered and refused (its
-                    # retained objection): a refusal, as on the first call.
-                    return "exact-artifact re-review refused: " + reviewed_reason
-                # An error with no verdict in it (the reply was unavailable,
-                # the connection closed, the call timed out) is bookkeeping.
-                unreadable = "exact-artifact re-review " + reviewed_reason
-            if unreadable is None:
+                if not reviewed_ok and _names_a_reviewer_refusal(reviewed_reason):
+                    # The plan writer's reviewer answered and did not approve
+                    # (its retained objection): advice, as on the first call.
+                    refused = "the re-review: " + reviewed_reason
+                elif not reviewed_ok:
+                    # An error with no verdict in it (the reply was
+                    # unavailable, the connection closed, the call timed out)
+                    # is bookkeeping.
+                    unreadable = "exact-artifact re-review " + reviewed_reason
+            if unreadable is None and refused is None:
                 reviewed_output = self._role_output_of(reviewed_result)
                 reviewed_files = self._plan_tree_files(reviewed_output)
                 review, review_error = self._semantic_review_of(
@@ -7028,13 +7054,13 @@ class PlanningRunDriver:
                     # (specialist-agent's recovery after a retained objection).
                     # It replaces this attempt's plan; nothing has been written.
                     semantic_state["recovered"] = reviewed_result
-                    return _PLAN_RECOVERED
+                    return
                 elif dict(reviewed_files) != dict(candidate_files):
                     unreadable = (
                         "exact-artifact re-review rewrote the supplied plan tree"
                     )
-                elif review_error in _SEMANTIC_VERDICT_REFUSALS:
-                    return "exact-artifact re-review refused: " + review_error
+                elif review_error == _SEMANTIC_NOT_APPROVED:
+                    refused = "its re-review record says not approved"
                 elif review_error is not None:
                     unreadable = "exact-artifact re-review: " + review_error
                 elif review is None or review.get("reviewed_after_rewrite") is not True:
@@ -7044,16 +7070,25 @@ class PlanningRunDriver:
                 else:
                     semantic_state["role_output"] = reviewed_output
                     semantic_state["review"] = review
-                    return None
+                    return
+            semantic_state["review"] = None
+            if refused is not None:
+                logger.warning(
+                    "planning driver: run %s — the plan reviewer did not approve "
+                    "the plan at the re-review (%s) — ADVISORY; the plan carries "
+                    "on and the build card says so",
+                    correlation_id,
+                    refused,
+                )
+                semantic_state["refused"] = refused
+                return
             logger.warning(
                 "planning driver: run %s plan review record unreadable after the "
                 "re-review (%s) — ADVISORY; the build card says so and decides",
                 correlation_id,
                 unreadable,
             )
-            semantic_state["review"] = None
             semantic_state["unreadable"] = unreadable
-            return None
 
         # VALIDATION CHANNEL (C5): advisory self-check data, not an oracle —
         # same posture as the 007 leg above. The REAL oracle for the plan tree
@@ -7123,13 +7158,10 @@ class PlanningRunDriver:
                         ok=False,
                         detail=f"semantic review artifact {rel} became unreadable",
                     )
-            semantic_error = await _ensure_semantic_review(post_normalizer)
-            if semantic_error is not None:
-                return PreCommitResult(
-                    ok=False,
-                    detail="semantic re-review after normalization failed: "
-                    + semantic_error,
-                )
+            await _ensure_semantic_review(post_normalizer)
+            if semantic_state["recovered"] is not None:
+                # Stops this commit so the recovered plan is written instead.
+                return PreCommitResult(ok=False, detail=_PLAN_RECOVERED)
             outcome = await validate(worktree, feature_id)
             if not outcome.ok:
                 # Advice since step 2 (26 October 2026, census FRG-082): one
@@ -7247,16 +7279,9 @@ class PlanningRunDriver:
                 carried_files=carried,
             )
 
-        semantic_error = await _ensure_semantic_review(files)
+        await _ensure_semantic_review(files)
         if semantic_state["recovered"] is not None:
             return await _take_the_recovered_plan()
-        if semantic_error is not None:
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_PLAN_STAGE,
-                "plan tree changed after semantic approval: " + semantic_error,
-            )
-            return None
 
         try:
             (
@@ -7298,6 +7323,12 @@ class PlanningRunDriver:
             stamps_read = self._stamps_from_declared_checks(gitres, declared, feature_id)
             if stamps_read is not None:
                 stamp_state["outcome"] = stamps_read
+            self._log_declared_advice(
+                correlation_id,
+                gitres,
+                "feature-validate",
+                "the plan is committed and GuardKit checks it when it builds",
+            )
         if gitres.status == "failed" and semantic_state["recovered"] is not None:
             # The re-review after normalization answered with the recovered
             # plan, which stopped the commit before anything was written.
@@ -7340,21 +7371,14 @@ class PlanningRunDriver:
         # ``_pre_commit`` above; a sidecar cannot call the async specialist from
         # inside its pre-commit transaction. Read the committed bytes back and
         # use the same Coach-only exact-artifact review here. The helper is
-        # idempotent when the approved bytes are unchanged and fails closed for
-        # every missing, rejected, malformed, or tree-rewriting response.
+        # idempotent when the approved bytes are unchanged; a missing,
+        # rejected, malformed or tree-rewriting response is the card's line.
         # The tree is committed. A first recovery the final review answers with
         # still goes through the usual checks and plan write, on a branch of
         # its own; the committed plan stays as the record of what was asked.
-        semantic_error = await _ensure_semantic_review(committed_files)
+        await _ensure_semantic_review(committed_files)
         if semantic_state["recovered"] is not None:
             return await _take_the_recovered_plan(after_commit=gitres.sha)
-        if semantic_error is not None:
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_PLAN_STAGE,
-                "committed plan semantic re-review failed: " + semantic_error,
-            )
-            return None
         return _PlanAttempt(
             committed=True,
             stamps=stamp_state.get("outcome"),
@@ -7363,6 +7387,7 @@ class PlanningRunDriver:
             sha=gitres.sha,
             traceability=semantic_state["review"],
             review_unreadable=semantic_state["unreadable"],
+            review_refused=semantic_state["refused"],
             branch=plan_branch if plan_branch != branch else None,
             plan_advice=tuple(
                 sorted(
@@ -7619,6 +7644,27 @@ class PlanningRunDriver:
             prelude=prelude,
             stamps=stamps,
         )
+
+    @staticmethod
+    def _log_declared_advice(
+        correlation_id: str, gitres: Any, name: str, carried_on: str
+    ) -> None:
+        """Log what a not-blocking declared check said when it did not pass
+        (step 2, 27 October 2026). The sandbox returns each check's outcome
+        in the write's ``checks``; this is the same ADVISORY warning the
+        in-container closure logs, so the complaint is not lost. Nothing
+        refuses on it."""
+        for check in getattr(gitres, "checks", None) or []:
+            if check.name != name or not check.ran or check.passed:
+                continue
+            logger.warning(
+                "planning driver: run %s — %s complained in the sandbox (%s) — "
+                "ADVISORY; %s",
+                correlation_id,
+                name,
+                check.detail or check.stderr_tail.strip() or f"exit {check.exit_code}",
+                carried_on,
+            )
 
     def _stamps_from_declared_checks(
         self, gitres: Any, declared: "_DeclaredPlanChecks", feature_id: str
@@ -8414,6 +8460,10 @@ class PlanningRunDriver:
         if attempt.review_unreadable:
             details[PLAN_REVIEW_NOTE_KEY] = _PLAN_REVIEW_UNREADABLE_CARD_LINE.format(
                 reason=attempt.review_unreadable
+            )
+        if attempt.review_refused:
+            details[PLAN_REVIEW_NOTE_KEY] = _PLAN_REVIEW_REFUSED_CARD_LINE.format(
+                reason=attempt.review_refused
             )
         if attempt.plan_advice:
             # Information for the approver, never a gate (step 2).
@@ -9514,6 +9564,12 @@ class PlanningRunDriver:
                 feature_routing_id=correlation_id,
                 feature_routing_required=self._deps.feature_routing_required,
                 feature_routing_receipt=self._feature_routing_receipt(correlation_id),
+            )
+            self._log_declared_advice(
+                correlation_id,
+                gitres,
+                "validate-pass-bar",
+                "written anyway (GuardKit checks it at task start)",
             )
             if gitres.status != "failed":
                 amendment_qa = await finish_qa(amendment_qa, git_runner, repo_path, gitres.sha)
@@ -11388,7 +11444,7 @@ class PlanningRunDriver:
         # once; Forge shows it on the build card and never refuses a plan for
         # it. Everything below is the record's shape (bookkeeping).
         if isinstance(parsed.get("decision"), str) and parsed["decision"] != "approved":
-            return None, "specialist semantic decision is not approved"
+            return None, _SEMANTIC_NOT_APPROVED
         expected_keys = {
             "schema_version",
             "decision",
@@ -11406,7 +11462,7 @@ class PlanningRunDriver:
         ):
             return None, "semantic review schema_version is not 1"
         if parsed.get("decision") != "approved":
-            return None, "specialist semantic decision is not approved"
+            return None, _SEMANTIC_NOT_APPROVED
         if parsed.get("criterion") != "request_traceability":
             return None, "semantic review names the wrong criterion"
         score = parsed.get("criterion_score")
