@@ -49,7 +49,6 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Awaitable, Callable, Protocol
 
-from forge.lifecycle_bridge.version_check import check_langgraph_runner_version
 from forge.persistence.repositories.bridge_registry import (
     BridgeRegistry,
     BridgeRegistryEntry,
@@ -221,16 +220,9 @@ class LifecycleBridge:
             tests can substitute a real or fake repository against an
             in-memory SQLite database.
         sidecar_url: Optional base URL of the ``langgraph-runner``
-            sidecar. When supplied, the constructor invokes
-            :func:`forge.lifecycle_bridge.version_check.check_langgraph_runner_version`
-            **before** any registry interaction (and therefore before
-            :meth:`recover_in_flight`) so a version-mismatched sidecar
-            fails the daemon at boot with a clear diagnostic rather
-            than emitting malformed envelopes at runtime
-            (TASK-FRR-PEB-010, AC-2/AC-3). When ``None`` (the
-            default), the check is skipped — useful for unit tests
-            and for the T2 skeleton callers that do not yet wire a
-            sidecar URL.
+            sidecar. Kept for the callers' signature; the boot-time
+            version check that read it went in the cull (27 October
+            2026).
 
     The constructor accepts no SSE client — that arrives in T3/T4.
     """
@@ -249,14 +241,7 @@ class LifecycleBridge:
                 "LifecycleBridge: registry must be a BridgeRegistry; got "
                 f"{type(registry).__name__}"
             )
-        # AC-2/AC-3 (TASK-FRR-PEB-010): version-skew diagnostic. Runs
-        # *before* the registry handle is stored so a mismatched sidecar
-        # cannot leave the bridge in a half-initialised state. The check
-        # itself is silent on transport errors (slow / unreachable
-        # sidecar) — only a confirmed out-of-range version raises and
-        # propagates out of this constructor to fail daemon boot.
-        if sidecar_url is not None:
-            check_langgraph_runner_version(sidecar_url)
+        del sidecar_url
         self._registry = registry
         # Internal book-keeping for the SSE-attached features. T3 will
         # populate this map with live SSE clients keyed by feature_id.

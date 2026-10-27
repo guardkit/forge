@@ -160,7 +160,6 @@ from forge.pipeline.merge_offer import (
     MERGE_OFFER_TARGET_IDENTIFIER,
     branch_to_merge,
 )
-from forge.pipeline.digest_conformance import run_digest_conformance
 from forge.pipeline.merge_check_reading import names_for_record, names_from_record
 from forge.pipeline.merge_card import REBUILD_NOTE, decide_previewed_offer, describable
 from forge.pipeline.merge_join import (
@@ -1154,7 +1153,6 @@ def stored_outcome(
     correlation_id: str,
     started: datetime,
     receipts_dir: Path,
-    digest_warning: str | None,
     join_as: str,
 ) -> dict[str, Any]:
     """The press's ending as it is written down before it is reported.
@@ -1168,7 +1166,6 @@ def stored_outcome(
         "correlation_id": correlation_id,
         "started_at": started.isoformat(),
         "receipts_dir": str(receipts_dir),
-        "digest_warning": digest_warning,
         "join_as": join_as,
     }
 
@@ -1295,7 +1292,6 @@ def the_stopped_presss_ending(
             started=datetime.fromisoformat(str(said.get("started_at"))),
             receipts_dir=Path(str(said.get("receipts_dir"))),
             attempt_id=written.attempt_id,
-            digest_warning=said.get("digest_warning"),
         )
     if getattr(record, "result", None) == RESULT_PUBLISHED_TO_MISSION_BRANCH:
         # THE ONE RECORD RESULT WITH ONLY ONE ENDING: a mission feature's
@@ -1323,7 +1319,6 @@ def the_stopped_presss_ending(
             started=deps.clock(),
             receipts_dir=_receipts_root_of(deps, row.repo) / f"merge-{row.build_id}",
             attempt_id=written.attempt_id,
-            digest_warning=None,
             mint_repair=False,
         )
     detail = ENDING_NOT_RECORDED_SENTENCE
@@ -1344,7 +1339,6 @@ def the_stopped_presss_ending(
         started=deps.clock(),
         receipts_dir=_receipts_root_of(deps, row.repo) / f"merge-{row.build_id}",
         attempt_id=written.attempt_id,
-        digest_warning=None,
         mint_repair=False,
     )
 
@@ -1435,7 +1429,6 @@ class PressEnding:
     started: datetime
     receipts_dir: Path
     attempt_id: str | None
-    digest_warning: str | None
     #: False only for the ending-not-recorded fallback: not a finding about
     #: the code, so no repair row.
     mint_repair: bool = True
@@ -1474,7 +1467,6 @@ def _the_report_payload(
         checks_total=outcome.checks_total,
         verify_status=outcome.verify_status,
         detail=outcome.detail,
-        digest_conformance_warning=ending.digest_warning,
         dry_run=dry_run,
         # Additive (Part M, rule 55): the branch this press merged, or
         # would have — truthful for a repair, the feature's own otherwise.
@@ -2535,7 +2527,6 @@ async def execute_merge_deploy(
     # Advisory digest-conformance state — filled in after a landed merge,
     # read by the report step. It can add a warning line; it can never
     # block anything.
-    digest_conformance: dict[str, Any] = {}
     # What the candidate check found — on every report once the check began.
     # ``ran`` says the deploy stage really drove the check (a repair row is
     # only worth filing then); ``refusal`` is the middle clause of the
@@ -2818,9 +2809,6 @@ async def execute_merge_deploy(
         so it is not applied twice), and to a copy for the ending written
         down before the clean-up.
         """
-        conformance_warning = digest_conformance.get("warning")
-        if conformance_warning:
-            outcome.detail = f"{outcome.detail}\nWARNING: {conformance_warning}"
         # A CANDIDATE THIS PRESS COULD NOT NAME IS SAID IN THE REPORT, not only
         # in a log: something is still standing and a person has to remove it.
         # The cleanup runs before this, in the caller's ``finally``, so by here
@@ -2874,7 +2862,6 @@ async def execute_merge_deploy(
                 correlation_id=correlation_id,
                 started=started,
                 receipts_dir=receipts_dir,
-                digest_warning=digest_conformance.get("warning"),
                 join_as=join_as,
             )
             said["cleanup_done"] = cleanup_done
@@ -2970,7 +2957,6 @@ async def execute_merge_deploy(
             started=started,
             receipts_dir=receipts_dir,
             attempt_id=merge_execution_attempt_id,
-            digest_warning=digest_conformance.get("warning"),
         )
         if dry_run:
             return report_a_dry_run(deps, ending)
@@ -6350,26 +6336,6 @@ async def execute_merge_deploy(
                     (report or {}).get("judge_files_not_on_target"),
                 )
 
-                # Advisory: does the joined tree keep the promises in the feature's
-                # spec digest? Deterministic and never blocking.
-                try:
-                    conformance = run_digest_conformance(
-                        repo_root=repo_root, feature_id=feature_id
-                    )
-                except Exception as exc:  # noqa: BLE001 — advisory must never stop a join
-                    conformance = {
-                        "advisory": True,
-                        "feature_id": feature_id,
-                        "conformant": None,
-                        "checks": [],
-                        "warning": None,
-                        "skipped": (
-                            "the digest conformance check itself failed "
-                            f"({exc}) — nothing was checked"
-                        ),
-                    }
-                digest_conformance.update(conformance)
-                _write_receipt("digest_conformance.json", conformance)
 
                 if (
                     merged_in_report

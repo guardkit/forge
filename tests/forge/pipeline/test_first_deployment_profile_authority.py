@@ -390,7 +390,6 @@ def _publisher(
             ledger=str(db),
             state_dir=str(tmp_path / f"publisher-{db.stem}"),
             projects={REPO: route},
-            private_path_prefixes=(str(tmp_path / "unpublished"),),
         ),
         commits_for=lambda _route: checked,
     )

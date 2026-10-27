@@ -32,7 +32,6 @@ attempt of every key it needs has LANDED, so a rebuild's dependants follow it.
 
 from __future__ import annotations
 
-import re
 import secrets
 import sqlite3
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -48,7 +47,6 @@ __all__ = [
     "STOPPED_BEFORE_IT_STARTED",
     "STOPPED_REASON",
     "StopAnswer",
-    "MISSION_KEY_PATTERN",
     "MISSION_ROLE_FEATURE",
     "MISSION_ROLE_MERGE",
     "MISSION_STATUSES",
@@ -92,9 +90,6 @@ ATTEMPT_STATUSES: tuple[str, ...] = ("WAITING", "ADMITTED", "LANDED", "FAILED", 
 #: ``builds.mission_role`` for a feature build, and for the mission's own merge.
 MISSION_ROLE_FEATURE: str = "feature"
 MISSION_ROLE_MERGE: str = "mission-merge"
-
-#: A key, after upper-casing: 1-12 letters or digits, no hyphen.
-MISSION_KEY_PATTERN: str = r"^[A-Z0-9]{1,12}$"
 
 #: The reason an attempt-1 closes with when its merge into the mission branch
 #: stopped on a conflict. Any first failure files attempt 2 (step 1, 24

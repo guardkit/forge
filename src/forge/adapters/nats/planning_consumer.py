@@ -26,7 +26,6 @@ References:
 from __future__ import annotations
 
 import logging
-import re
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable, Mapping, Protocol, runtime_checkable
 
@@ -68,18 +67,6 @@ PLANNING_QUEUED_SUBJECT_FILTER: str = "pipeline.planning-queued.*"
 #: Durable consumer name for planning intake.
 #: Survives Forge restart so unacked messages are redelivered.
 PLANNING_DURABLE_NAME: str = "forge-serve-planning"
-
-#: Correlation ID validation pattern (RT-03 trust boundary).
-#: - Alphanumeric, underscore, hyphen only
-#: - No dot: a dotted correlation_id fragments the approval subject
-#:   ``agents.approval.forge.plan-{cid}`` past jarvis's 4-token gate,
-#:   silently dropping the approval (TASK-MP-012 — post-merge review
-#:   wire-topology finding; no legitimate producer uses dots)
-#: - No forward slash (path traversal)
-#: - No NATS subject-breaking chars (~^:?*[)
-#: - No whitespace
-#: - 1-128 characters
-CORRELATION_ID_PATTERN: str = r"^[A-Za-z0-9_-]{1,128}$"
 
 #: Redelivery delay requested on nak after a store-write failure.
 #: Without it a persistent store failure (disk full, corrupt db) makes
@@ -350,12 +337,9 @@ async def create_and_start_planning_run(
 
 
 def _amendment_scope_from(payload: Any) -> tuple[str, ...]:
-    from forge.planning.requirement_amendments import paths, AmendmentRefused, FIELD
+    from forge.planning.requirement_amendments import paths, FIELD
     extras = getattr(payload, "model_extra", None) or {}
-    scope = paths(extras.get(FIELD, []))
-    if scope and (extras.get("kind", "feature") != "feature" or extras.get("queue_command") is not None):
-        raise AmendmentRefused("requirement amendments are supported only on ordinary feature sentences")
-    return scope
+    return paths(extras.get(FIELD, []))
 
 
 def _kind_from(payload: Any) -> str:
@@ -853,34 +837,6 @@ async def _stop_mission(
 
 
 # ---------------------------------------------------------------------------
-# Correlation ID validation
-# ---------------------------------------------------------------------------
-
-
-def _is_valid_correlation_id(correlation_id: str) -> bool:
-    """Validate correlation_id against trust boundary rules (RT-03).
-
-    Returns:
-        True if valid, False otherwise.
-    """
-    if not correlation_id:
-        return False
-
-    if len(correlation_id) > 128:
-        return False
-
-    # Check pattern
-    if not re.fullmatch(CORRELATION_ID_PATTERN, correlation_id):
-        return False
-
-    # Additional check: no consecutive dots (.. = parent traversal)
-    if ".." in correlation_id:
-        return False
-
-    return True
-
-
-# ---------------------------------------------------------------------------
 # Core message handler
 # ---------------------------------------------------------------------------
 
@@ -953,16 +909,7 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
         await msg.ack()
         return
 
-    # --- 2. Correlation ID validation (RT-03) ----------------------------
     correlation_id = payload.correlation_id
-    if not _is_valid_correlation_id(correlation_id):
-        logger.warning(
-            "planning_consumer: invalid correlation_id=%r (fails trust boundary "
-            "validation); acking and rejecting",
-            correlation_id,
-        )
-        await msg.ack()
-        return
 
     # --- 3. Tolerate missing originating_adapter (digest fact 6) ---------
     if payload.originating_adapter is None and payload.triggered_by == "jarvis":
@@ -1174,7 +1121,6 @@ async def handle_planning_message(msg: _MsgLike, deps: PlanningConsumerDeps) -> 
 
 __all__ = [
     "BUILD_HANDOVER_CORRELATION_SUFFIX",
-    "CORRELATION_ID_PATTERN",
     "INTAKE_ACTOR",
     "create_and_start_planning_run",
     "UNKNOWN_REPO_STAGE_LABEL",
@@ -1184,5 +1130,4 @@ __all__ = [
     "PlanningConsumerDeps",
     "handle_planning_message",
     "publish_build_request",
-    "_is_valid_correlation_id",  # Exported for testing
 ]

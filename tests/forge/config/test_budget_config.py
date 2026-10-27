@@ -74,18 +74,6 @@ class TestResolve:
 class TestValidation:
     """AC: the attended profile cannot be armed; default must exist."""
 
-    def test_armed_attended_profile_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            BudgetConfig(
-                profiles={ATTENDED_PROFILE_NAME: BudgetGuards(max_review_cycles=1)}
-            )
-
-    def test_missing_default_profile_rejected(self) -> None:
-        with pytest.raises(ValidationError):
-            BudgetConfig(
-                default_profile="ghost",
-                profiles={ATTENDED_PROFILE_NAME: BudgetGuards()},
-            )
 
     def test_non_positive_cap_rejected(self) -> None:
         with pytest.raises(ValidationError):
@@ -117,13 +105,6 @@ class TestForgeConfigIntegration:
         cfg = load_config(_minimal_forge_yaml(tmp_path, budget_block=budget))
         assert cfg.budget.default_profile == "unattended"
         assert cfg.budget.resolve("unattended").max_review_cycles == 3
-
-    def test_armed_attended_in_yaml_is_rejected(self, tmp_path: Path) -> None:
-        budget = (
-            "budget:\n" "  profiles:\n" "    attended:\n" "      max_review_cycles: 2\n"
-        )
-        with pytest.raises(ValidationError):
-            load_config(_minimal_forge_yaml(tmp_path, budget_block=budget))
 
 
 class TestLegBudgets:

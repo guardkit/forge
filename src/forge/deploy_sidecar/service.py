@@ -46,8 +46,6 @@ The narrow contract:
     POST /git/candidate-tree {repo, feature_id, sha}
               -> {path, tree, exclude_written}
     POST /git/candidate-tree-remove {repo, feature_id} -> {removed, path}
-    POST /routing-stamps/evidence {repo, feature_id, worktree, branch}
-              -> {feature_yaml, envelope, code_commit_time, history_dir}
     POST /git/worktree-changed-files {repo, path, base}
               -> {name_status, approval_patch, truncated, head|null,
                   test_patch, test_patch_truncated}
@@ -175,11 +173,10 @@ THE DENY-BY-DEFAULT LAWS (each one a test in tests/forge/deploy_sidecar):
    is refused in one plain sentence before a process starts. The declared
    test command's working directory must be one of this repository's own
    journey worktrees (LAW 10), and the live-gate driver's may be a candidate
-   tree exactly as LAW 8 allows. Both, and ``/routing-stamps/evidence``
-   beside them, are answered ONLY by a sidecar running inside a repository's
-   sandbox (the bootstrap sets ``FORGE_SIDECAR_IN_SANDBOX``): they exist so a
-   repository's own code and its own records are run and read where the
-   repository lives, and a host sidecar refuses all three in one plain
+   tree exactly as LAW 8 allows. Both are answered ONLY by a sidecar running
+   inside a repository's sandbox (the bootstrap sets
+   ``FORGE_SIDECAR_IN_SANDBOX``): they exist so a repository's own code is run
+   where the repository lives, and a host sidecar refuses both in one plain
    sentence saying where the request belongs.
 
 Each request-processing core (:func:`process_run_request` and
@@ -3683,8 +3680,7 @@ def process_guardkit_merge_request(
 # Rich's rule: nothing the factory runs on a repository runs on the host. The
 # planning chain's commits (the spec, the plan) used to be made by forge's
 # own git runner in a worktree of the operator's checkout, with the plan
-# stage's pre-commit checks (the stamp normalizer, feature validate) run as a
-# Python closure beside it. In the sandbox, the sidecar makes those commits
+# stage's pre-commit checks run as a Python closure beside it. In the sandbox, the sidecar makes those commits
 # on the factory's clone instead: the caller declares the checks BY NAME with
 # their arguments, the sidecar materialises the worktree exactly as the
 # in-container runner does (the same class, imported), writes the files, runs
@@ -3694,9 +3690,8 @@ def process_guardkit_merge_request(
 #
 # LAW 9 (the git routes' own): the repository is the same key as everywhere
 # else; a branch, a ref and every file path are shape-checked before git sees
-# them; a check must be one of the six names below (nothing else runs, and
-# ``classify-scenarios`` may never be declared blocking); a check is one
-# fixed argument list through the same no-shell runner the merge uses.
+# them; a check must be the one name below (nothing else runs); a check is
+# one fixed argument list through the same no-shell runner the merge uses.
 # ---------------------------------------------------------------------------
 
 #: The three routes.
@@ -3736,39 +3731,21 @@ GIT_LIST_FILES_ON_BRANCH_ROUTE: str = "/git/list-files-on-branch"
 #: The checks the sidecar knows how to run — the closed list.
 GIT_CHECK_NAMES: tuple[str, ...] = PRE_COMMIT_CHECK_NAMES
 
-#: Each check's own time limit when the caller names none: the stamp
-#: normalizer and the provability check are rules over a handful of files
-#: (seconds); a feature validate reads a whole plan tree, and the gherkin
-#: normalizer and the two schema checks are the planning oracles' usual ten
-#: minutes — the same budget the driver's own closures give them.
+#: Each check's own time limit when the caller names none: the gherkin
+#: normalizer's usual ten minutes, the budget the driver's own closure gives it.
 GIT_CHECK_TIMEOUT_DEFAULTS: dict[str, float] = {
-    "normalize-stamps": 120.0,
-    "feature-validate": 600.0,
-    "classify-scenarios": 120.0,
     "normalize-feature": 600.0,
-    "validate-pass-bar": 600.0,
-    "validate-gate-registry": 600.0,
 }
 
-#: Whether a check blocks the commit when the caller does not say: every
-#: check the driver's own hook stops on, and never the provability check.
+#: Whether a check blocks the commit when the caller does not say.
 GIT_CHECK_BLOCKING_DEFAULTS: dict[str, bool] = {
-    "normalize-stamps": True,
-    "feature-validate": True,
-    "classify-scenarios": False,
     "normalize-feature": True,
-    "validate-pass-bar": True,
-    "validate-gate-registry": True,
 }
 
 #: The one argument each path-shaped check takes, by name. Every value is a
-#: repository-relative path, shape-checked before the worktree is joined to
-#: it, exactly as ``classify-scenarios``'s always was.
+#: repository-relative path, shape-checked before the worktree is joined to it.
 GIT_CHECK_PATH_ARGS: dict[str, str] = {
-    "classify-scenarios": "feature_file",
     "normalize-feature": "feature_file",
-    "validate-pass-bar": "bar_file",
-    "validate-gate-registry": "registry_file",
 }
 
 #: Ceiling on the whole pre-commit step (every check together) — the same
@@ -3906,11 +3883,6 @@ def _parse_checks(raw: Any) -> tuple[list[_DeclaredCheck] | None, str | None]:
             blocking = blocking_raw
         else:
             return None, f"checks[{index}] ({name}): 'blocking' must be true or false"
-        if name == "classify-scenarios" and blocking:
-            return None, (
-                "classify-scenarios never blocks a commit — declare it without "
-                "'blocking'"
-            )
         timeout_raw = item.get("timeout_seconds")
         timeout = GIT_CHECK_TIMEOUT_DEFAULTS[name]
         if timeout_raw is not None:
@@ -3925,34 +3897,14 @@ def _parse_checks(raw: Any) -> tuple[list[_DeclaredCheck] | None, str | None]:
                     f"positive number no larger than {TIMEOUT_MAX:g}"
                 )
             timeout = float(timeout_raw)
-        clean: dict[str, Any]
-        if name in ("normalize-stamps", "feature-validate"):
-            feature_id = args.get("feature_id")
-            if not isinstance(feature_id, str) or not FEATURE_ID_PATTERN.match(feature_id):
-                return None, (
-                    f"checks[{index}] ({name}): args.feature_id must look like "
-                    f"FEAT-ABC1; got {feature_id!r}"
-                )
-            clean = {"feature_id": feature_id}
-            allowed = {"feature_id"}
-            if name == "normalize-stamps":
-                no_model = args.get("no_model", False)
-                if not isinstance(no_model, bool):
-                    return None, (
-                        f"checks[{index}] (normalize-stamps): args.no_model must "
-                        "be true or false"
-                    )
-                clean["no_model"] = no_model
-                allowed.add("no_model")
-        else:
-            key = GIT_CHECK_PATH_ARGS[name]
-            error = _relative_path_error(
-                args.get(key), what=f"checks[{index}] args.{key}"
-            )
-            if error:
-                return None, error
-            clean = {key: str(args[key])}
-            allowed = {key}
+        key = GIT_CHECK_PATH_ARGS[name]
+        error = _relative_path_error(
+            args.get(key), what=f"checks[{index}] args.{key}"
+        )
+        if error:
+            return None, error
+        clean: dict[str, Any] = {key: str(args[key])}
+        allowed = {key}
         extra = sorted(set(args) - allowed)
         if extra:
             return None, (
@@ -4065,40 +4017,15 @@ def run_declared_check(
     """Run one declared check in ``worktree`` and judge it the way the
     driver's closure judged it.
 
-    * ``normalize-stamps`` — the argv :func:`make_normalize_stamps` builds;
-      when ``--no-model`` was asked for and the installed guardkit has no such
-      option, it is run again without it and the outcome's ``note`` says so
-      (the same second run, the same sentence). Passed means the outcome is
-      not a failure — written, nothing to do, or unavailable — read with
-      :func:`classify_normalizer_check`, the parser the driver reads it with.
-    * ``feature-validate`` — the task documents' front matter is repaired
-      first (the closure's own pre-oracle repair; the receipt rides ``note``),
-      then ``guardkit feature validate <id> --json``; passed means exit 0.
-    * ``classify-scenarios`` — ``guardkit qa classify-scenarios``; its verdict
-      is exit 0, and it never blocks.
-    * ``normalize-feature`` — the spec leg's gherkin normalizer over the
-      committed ``.feature``: the box-drawing divider repair first (the
-      closure's own, in place, its receipt riding ``note``), then
-      ``python -m <the normalizer module> <the file>``; passed means exit 0,
-      and the sentence a failure carries is the closure's word for word.
-    * ``validate-pass-bar`` / ``validate-gate-registry`` — ``guardkit qa
-      validate pass-bar <path>`` and ``guardkit qa validate gate-registry
-      <path>``; passed means exit 0, and the details are the two legs' own
-      sentences (a bar's names the bar first, as the pass-bar leg's loop
-      does).
+    ``normalize-feature`` — the spec leg's gherkin normalizer over the
+    committed ``.feature``: the box-drawing divider repair first (the
+    closure's own, in place, its receipt riding ``note``), then ``python -m
+    <the normalizer module> <the file>``; passed means exit 0, and the
+    sentence a failure carries is the closure's word for word.
 
     Never raises: a runner that blows up is a failed check with the reason.
     """
-    from forge.planning.target_terminal_tools import (
-        NO_MODEL_OPTION_UNKNOWN_NOTE,
-        _NORMALIZER_NO_MODEL_UNKNOWN_RE,
-        _check_status_word,
-        _repair_box_drawing_dividers,
-        classify_normalizer_check,
-        classify_scenarios_check,
-        repair_plan_task_frontmatter,
-        validate_feature_plan_check,
-    )
+    from forge.planning.target_terminal_tools import _repair_box_drawing_dividers
 
     def _run(argv: list[str]) -> tuple[int, str, str]:
         # Every check is launched with the factory's own named list, the
@@ -4119,189 +4046,63 @@ def run_declared_check(
         return check_runner(**kwargs)
 
     try:
-        if check.name == "normalize-stamps":
-            feature_id = str(check.args["feature_id"])
-            no_model = bool(check.args.get("no_model"))
-            argv = [
-                *command,
-                "qa",
-                "normalize-stamps",
-                "--feature",
-                feature_id,
-                "--repo",
-                str(worktree),
-            ]
-            note = ""
-            exit_code, stdout, stderr = _run(argv + (["--no-model"] if no_model else []))
-            if (
-                no_model
-                and exit_code != 0
-                and _NORMALIZER_NO_MODEL_UNKNOWN_RE.search(stderr or "")
-            ):
-                note = NO_MODEL_OPTION_UNKNOWN_NOTE
-                logger.warning(
-                    "forge-deploy-sidecar: normalize-stamps for %s — %s", feature_id, note
-                )
-                exit_code, stdout, stderr = _run(argv)
-            outcome = classify_normalizer_check(
-                feature_id,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
-                timed_out=exit_code == MERGE_TIMEOUT_EXIT_CODE,
+        feature_rel = str(check.args["feature_file"])
+        target = (worktree / feature_rel).resolve()
+        # The closure's own pre-parse repair, in place, before the parse:
+        # a top-level box-drawing divider becomes a comment so the run
+        # gets a parseable spec instead of dying with no revision loop.
+        repair_note = _repair_box_drawing_dividers(target, feature_rel) or ""
+        if repair_note:
+            logger.warning(
+                "forge-deploy-sidecar: normalize-feature — %s", repair_note
             )
+        if not normalizer_command:
             return _check_outcome(
                 check,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
-                passed=not outcome.is_failure,
-                detail=f"stamp normalizer {outcome.status}: {outcome.detail}",
-                note=note,
+                exit_code=1,
+                stdout="",
+                stderr="",
+                passed=False,
+                detail=(
+                    "the gherkin normalizer module could not be resolved "
+                    "in this sidecar's interpreter"
+                ),
             )
-        if check.name == "feature-validate":
-            feature_id = str(check.args["feature_id"])
-            repair = repair_plan_task_frontmatter(worktree, feature_id)
-            note = repair.receipt(feature_id) if repair.fired else ""
-            if note:
-                logger.warning("forge-deploy-sidecar: feature-validate: %s", note)
-            exit_code, stdout, stderr = _run(
-                [*command, "feature", "validate", feature_id, "--json"]
-            )
-            outcome = validate_feature_plan_check(
-                feature_id,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
-                timed_out=exit_code == MERGE_TIMEOUT_EXIT_CODE,
-                note=note,
-            )
-            return _check_outcome(
-                check,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
-                passed=outcome.ok,
-                detail=outcome.detail,
-                note=note,
-            )
-        if check.name == "normalize-feature":
-            feature_rel = str(check.args["feature_file"])
-            target = (worktree / feature_rel).resolve()
-            # The closure's own pre-parse repair, in place, before the parse:
-            # a top-level box-drawing divider becomes a comment so the run
-            # gets a parseable spec instead of dying with no revision loop.
-            repair_note = _repair_box_drawing_dividers(target, feature_rel) or ""
-            if repair_note:
-                logger.warning(
-                    "forge-deploy-sidecar: normalize-feature — %s", repair_note
-                )
-            if not normalizer_command:
-                return _check_outcome(
-                    check,
-                    exit_code=1,
-                    stdout="",
-                    stderr="",
-                    passed=False,
-                    detail=(
-                        "the gherkin normalizer module could not be resolved "
-                        "in this sidecar's interpreter"
-                    ),
-                )
-            exit_code, stdout, stderr = _run([*normalizer_command, str(target)])
-            if exit_code == MERGE_TIMEOUT_EXIT_CODE:
-                return _check_outcome(
-                    check,
-                    exit_code=exit_code,
-                    stdout=stdout,
-                    stderr=stderr,
-                    passed=False,
-                    detail=(
-                        f"normalizer timed out after {check.timeout:g}s "
-                        f"({feature_rel})"
-                    ),
-                    note=repair_note,
-                )
-            if exit_code != 0:
-                return _check_outcome(
-                    check,
-                    exit_code=exit_code,
-                    stdout=stdout,
-                    stderr=stderr,
-                    passed=False,
-                    detail=(
-                        f"normalizer exit {exit_code} for {feature_rel}: "
-                        f"{(stderr or stdout).strip()[:500]}"
-                    ),
-                    note=repair_note,
-                )
-            return _check_outcome(
-                check,
-                exit_code=exit_code,
-                stdout=stdout,
-                stderr=stderr,
-                passed=True,
-                detail=repair_note,
-                note=repair_note,
-            )
-        if check.name in ("validate-pass-bar", "validate-gate-registry"):
-            verb = (
-                "pass-bar" if check.name == "validate-pass-bar" else "gate-registry"
-            )
-            rel = str(check.args[GIT_CHECK_PATH_ARGS[check.name]])
-            exit_code, stdout, stderr = _run([*command, "qa", "validate", verb, rel])
-            status = _check_status_word(exit_code, exit_code == MERGE_TIMEOUT_EXIT_CODE)
-            if status == "success" and exit_code == 0:
-                return _check_outcome(
-                    check,
-                    exit_code=exit_code,
-                    stdout=stdout,
-                    stderr=stderr,
-                    passed=True,
-                    detail="",
-                )
-            detail = (
-                f"guardkit qa validate {verb} {status} (exit {exit_code}) for "
-                f"{rel}: {(stderr or stdout).strip()[:500]}"
-            )
-            if check.name == "validate-pass-bar":
-                # The pass-bar leg's loop names the bar before the oracle's
-                # own sentence; the same words reach the leg from here.
-                detail = f"{rel}: {detail}"
+        exit_code, stdout, stderr = _run([*normalizer_command, str(target)])
+        if exit_code == MERGE_TIMEOUT_EXIT_CODE:
             return _check_outcome(
                 check,
                 exit_code=exit_code,
                 stdout=stdout,
                 stderr=stderr,
                 passed=False,
-                detail=detail,
+                detail=(
+                    f"normalizer timed out after {check.timeout:g}s "
+                    f"({feature_rel})"
+                ),
+                note=repair_note,
             )
-        feature_file = worktree / str(check.args["feature_file"])
-        exit_code, stdout, stderr = _run(
-            [
-                *command,
-                "qa",
-                "classify-scenarios",
-                "--feature-file",
-                str(feature_file),
-                "--repo",
-                str(worktree),
-                "--json",
-            ]
-        )
-        outcome = classify_scenarios_check(
-            exit_code=exit_code,
-            stdout=stdout,
-            stderr=stderr,
-            timed_out=exit_code == MERGE_TIMEOUT_EXIT_CODE,
-        )
+        if exit_code != 0:
+            return _check_outcome(
+                check,
+                exit_code=exit_code,
+                stdout=stdout,
+                stderr=stderr,
+                passed=False,
+                detail=(
+                    f"normalizer exit {exit_code} for {feature_rel}: "
+                    f"{(stderr or stdout).strip()[:500]}"
+                ),
+                note=repair_note,
+            )
         return _check_outcome(
             check,
             exit_code=exit_code,
             stdout=stdout,
             stderr=stderr,
-            passed=exit_code == 0 and outcome.status == "checked",
-            detail=outcome.detail,
+            passed=True,
+            detail=repair_note,
+            note=repair_note,
         )
     except Exception as exc:  # noqa: BLE001 — never raise past the check
         logger.exception("forge-deploy-sidecar: check %s raised", check.name)
@@ -5890,163 +5691,6 @@ def process_receipts_export_request(
         + [f"{dest}/{name}" for name in sorted(extra_files or {})],
     }
 
-
-# ---------------------------------------------------------------------------
-# The routing law's own evidence, read where the repository lives (rule 88)
-# ---------------------------------------------------------------------------
-#
-# Found by L3b's coach, 2026-09-08. The merge-ready gates reader has five
-# steps, and the last one is the routing law's stamped-verifier check: it
-# reads the feature's per-scenario ``verifier:`` stamps from the canonical
-# repository and then asks, home by home, whether the promised verifier
-# really ran green for this branch — from the newest results envelope under
-# the journey worktree, and the branch's last code commit time, which says
-# whether that envelope is fresh enough to count.
-#
-# All three of those live inside the sandbox for a repository that has one.
-# Left reading the host, the check found no feature file, answered "this
-# feature carries no scenario stamps", had no effect, and a GREEN merge card
-# went out with the routing law silently not applied. That is the one
-# direction this reader is written never to fail in. So the three reads
-# happen here, and the DECISION still happens on the forge side, out of the
-# same pure function it always used: this route reads, it never judges.
-
-#: The route.
-STAMPS_EVIDENCE_ROUTE: str = "/routing-stamps/evidence"
-
-
-def process_stamps_evidence_request(
-    payload: Any,
-    *,
-    config: ForgeConfig,
-    worktrees_root: Path | None = None,
-    inside_sandbox: bool | None = None,
-) -> tuple[int, dict[str, Any]]:
-    """``{repo, feature_id, worktree, branch}`` → the routing law's evidence.
-
-    The answer carries three things and no opinion about them:
-
-    * ``feature_yaml`` — the feature's plan of record, read from the CANONICAL
-      branch of the factory's clone (``main``, never the worktree the journey
-      has been editing, for the same reason the declared toolchain is), with
-      the path it has in here so every sentence a person reads names the real
-      file. ``present`` is false when the file is not on that branch, which
-      upstream reads exactly as an absent file on the host does.
-    * ``envelope`` — the newest results envelope under the journey worktree's
-      ``qa/gates/history/``, or ``null``.
-    * ``code_commit_time`` — the branch's last code commit, ISO-8601, or
-      ``null`` when git could not say.
-
-    The worktree must be one of this repository's own journey worktrees (LAW
-    10). Never raises.
-
-    REFUSED ON THE HOST, like the two ``/run`` shapes beside it (L3e, the
-    third coach's second must-fix). This route exists so that the routing
-    law's evidence is read where a sandboxed repository's clone, its journey
-    worktrees and its gate receipts actually are; a host sidecar answering it
-    would be reading the operator's own checkout, which is the wall Rich's
-    rule of 2026-09-07 puts up. ``inside_sandbox`` is read from the
-    bootstrap's environment value unless a caller (a test) says otherwise.
-    """
-    if not isinstance(payload, dict):
-        return 400, {"error": "request body must be a JSON object"}
-    in_sandbox = (
-        sidecar_is_inside_sandbox() if inside_sandbox is None else bool(inside_sandbox)
-    )
-    if not in_sandbox:
-        return 400, {
-            "error": _not_inside_a_sandbox("routing-law evidence", verb="read")
-        }
-    repo_path, error = _resolve_repo_key(payload, config)
-    if error or repo_path is None:
-        return 400, {"error": error}
-    feature_id = payload.get("feature_id")
-    if not isinstance(feature_id, str) or not SAFE_NAME_PATTERN.match(feature_id):
-        return 400, {
-            "error": (
-                "'feature_id' is required and must be a plain feature id "
-                f"(letters, digits, dots, dashes and underscores); got "
-                f"{feature_id!r}"
-            )
-        }
-    error = _worktree_path_error(repo_path, payload.get("worktree"), what="worktree")
-    if error:
-        return 400, {"error": error}
-    worktree = os.path.normpath(os.path.abspath(str(payload["worktree"])))
-    branch = payload.get("branch")
-    if branch is not None:
-        error = _ref_error(branch, what="branch")
-        if error:
-            return 400, {"error": error}
-    from forge.cli._conductor_worktree import JOURNEY_BASE_REF
-
-    canonical = payload.get("canonical_branch") or JOURNEY_BASE_REF
-    error = _ref_error(canonical, what="canonical_branch")
-    if error:
-        return 400, {"error": error}
-
-    from forge.pipeline.routing_stamps import (
-        HISTORY_RELATIVE_PATH,
-        feature_yaml_relative_path,
-        read_last_code_commit_time,
-        read_newest_envelope,
-    )
-
-    runner = _git_runner(worktrees_root)
-    found_path = feature_yaml_relative_path(feature_id)
-    content: str | None = None
-    try:
-        for suffix in ("yaml", "yml"):
-            relative = feature_yaml_relative_path(feature_id, suffix=suffix)
-            answer = _run_coroutine(
-                runner.read_file_from_branch(
-                    repo_path=str(repo_path),
-                    branch=str(canonical),
-                    file_path=relative,
-                )
-            )
-            if isinstance(answer, str):
-                content, found_path = answer, relative
-                break
-    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
-        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
-
-    history_dir = os.path.join(worktree, str(HISTORY_RELATIVE_PATH))
-    try:
-        envelope = read_newest_envelope(history_dir)
-    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
-        return 500, {"error": f"sidecar receipts error: {type(exc).__name__}: {exc}"}
-    try:
-        commit_time = read_last_code_commit_time(
-            worktree, str(branch) if branch else None
-        )
-    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
-        return 500, {"error": f"sidecar git error: {type(exc).__name__}: {exc}"}
-
-    return 200, {
-        "feature_yaml": {
-            "path": str(Path(repo_path) / found_path),
-            "branch": str(canonical),
-            "present": content is not None,
-            "text": content,
-        },
-        "envelope": None
-        if envelope is None
-        else {
-            "path": str(envelope.path),
-            "run_id": envelope.run_id,
-            "verdict": envelope.verdict,
-            "started": None
-            if envelope.started is None
-            else envelope.started.isoformat(),
-            "gates": dict(envelope.gates),
-            "feature_id": envelope.feature_id,
-        },
-        "code_commit_time": None
-        if commit_time is None
-        else commit_time.isoformat(),
-        "history_dir": history_dir,
-    }
 
 
 def _is_inside(candidate: str, root: str) -> bool:
@@ -8955,7 +8599,6 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 GIT_WORKTREE_CHANGED_FILES_ROUTE,
                 GIT_BRANCH_SCOPE_ROUTE,
                 RECEIPTS_EXPORT_ROUTE,
-                STAMPS_EVIDENCE_ROUTE,
                 GUARDKIT_LEG_ROUTE,
                 GUARDKIT_LEG_CANCEL_ROUTE,
                 CODE_LIST_FILES_ROUTE,
@@ -9064,12 +8707,6 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
         elif route == GIT_WORKTREE_ADD_ROUTE:
             status, body = process_git_worktree_add_request(
                 payload, config=config
-            )
-        elif route == STAMPS_EVIDENCE_ROUTE:
-            status, body = process_stamps_evidence_request(
-                payload,
-                config=config,
-                worktrees_root=self.server.worktrees_root,  # type: ignore[attr-defined]
             )
         elif route == GIT_WORKTREE_REMOVE_ROUTE:
             status, body = process_git_worktree_remove_request(
@@ -9337,8 +8974,6 @@ __all__ = [
     "GIT_WORKTREE_CHANGED_FILES_ROUTE",
     "GIT_BRANCH_SCOPE_ROUTE",
     "RECEIPTS_EXPORT_ROUTE",
-    "STAMPS_EVIDENCE_ROUTE",
-    "process_stamps_evidence_request",
     "SAFE_NAME_PATTERN",
     "process_git_worktree_add_request",
     "process_git_worktree_remove_request",

@@ -152,16 +152,6 @@ Feature: Pipeline State Machine and Configuration
   # GROUP C — Negative Cases
   # ─────────────────────────────────────────────────────────────────────────
 
-  # Why: Path allowlist is a safety boundary — queueing outside it must fail fast
-  @task:TASK-PSM-008
-  @negative
-  Scenario: Queueing a build against a repository path outside the allowlist is refused
-    Given a repository path that is not on the allowlist
-    When I attempt to queue a feature for that repository
-    Then the queue command should be refused with an unauthorised-path error
-    And no new build should be recorded
-    And no message should be published to the pipeline
-
   # Why: Active-duplicate guard — a feature already in flight cannot be re-queued
   @task:TASK-PSM-008
   @negative

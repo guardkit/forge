@@ -1392,24 +1392,6 @@ class TestModeCBudgetEnforcement:
         supervisor.budget_pause = _pause
         return supervisor, doubles, recorder
 
-    def test_coach_score_below_floor_pauses(self) -> None:
-        # AC-05: a real last_coach_score strictly below the floor breaches the
-        # min_coach_score cap → PAUSED_BUDGET, risk=high, budget_guard_breach.
-        supervisor, doubles, recorder = self._coach_floor(
-            min_coach_score=0.8, reader=lambda _bid: 0.5
-        )
-        doubles["mode_reader"].modes["build-LOWSCORE"] = BuildMode.MODE_C
-        doubles["mode_c_history"].histories["build-LOWSCORE"] = _review_entries(1)
-
-        report = _run(supervisor.next_turn("build-LOWSCORE"))
-
-        assert report.outcome is TurnOutcome.PAUSED_BUDGET
-        assert doubles["subprocess"].calls == []
-        assert len(recorder) == 1
-        payload = recorder[0]["payload"]
-        assert payload.risk_level == "high"
-        assert payload.details["reason"] == "budget_guard_breach"
-        assert payload.details["breached_cap"] == "min_coach_score"
 
     def test_coach_score_at_floor_proceeds(self) -> None:
         # AC-05: a score exactly at the floor is NOT a breach (strict `<`);

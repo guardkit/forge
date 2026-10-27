@@ -9,6 +9,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
+from tests.forge.planning._plan_identity import plan_artifact_identity
 import pytest
 import pytest_asyncio
 from click.testing import CliRunner
@@ -204,7 +205,7 @@ async def planned(tmp_path, request):
         "criterion": "request_traceability",
         "criterion_score": 1.0,
         "coach_verdict": "GOOD",
-        "artifact_identity": PlanningRunDriver._plan_artifact_identity(plan_files),
+        "artifact_identity": plan_artifact_identity(plan_files),
         "reviewed_after_rewrite": False,
     }
     record_plan(cx, "amendment-request", checked, review)
@@ -361,6 +362,7 @@ async def test_approval_exact_diff_admission_and_protection(
     import types
 
     package = types.ModuleType("guardkit.orchestrator")
+    pytest.importorskip("jarvis", reason="a sibling repository this test reads (jarvis) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     package.__path__ = [
         str(Path(importlib.util.find_spec("guardkit").origin).parent / "orchestrator")
     ]
@@ -371,6 +373,7 @@ async def test_approval_exact_diff_admission_and_protection(
         hold_protected_index,
     )
     from guardkit.orchestrator.harness.selector import load_project_documents_at_commit
+    pytest.importorskip("guardkitfactory", reason="a sibling repository this test reads (guardkitfactory) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     from guardkitfactory.harness.backend_config import PathConfinedBackend
 
     work = tmp_path / "player"
@@ -607,6 +610,7 @@ async def test_normal_producer_serialization_and_pinned_jarvis_consumer(
     import types
 
     package = types.ModuleType("jarvis.infrastructure")
+    pytest.importorskip("jarvis", reason="a sibling repository this test reads (jarvis) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     package.__path__ = [
         str(Path(importlib.util.find_spec("jarvis").origin).parent / "infrastructure")
     ]
@@ -1038,6 +1042,7 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
         _seed_gate_surface,
     )
     from tests.forge.recorded_fetch_address import allow_local_remotes
+    pytest.importorskip("specialist_agent", reason="a sibling repository this test reads (specialist_agent) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     from specialist_agent.roles.architect.modes.feature_plan import (
         add_semantic_review_receipt,
     )
@@ -1072,6 +1077,7 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
         requirement_amendment_paths=(DOC,),
     )
     runner = _recorded_runner(tmp_path / "normal-wt", repo)
+    pytest.importorskip("specialist_agent", reason="a sibling repository this test reads (specialist_agent) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     import specialist_agent
 
     specialist_tests = Path(specialist_agent.__file__).resolve().parents[2] / "tests"
@@ -1080,9 +1086,11 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
         _plan as specialist_plan,
     )
     from roles.architect.test_feature_plan_dispatch import _FID as specialist_feature
+    pytest.importorskip("specialist_agent", reason="a sibling repository this test reads (specialist_agent) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     from specialist_agent.roles.architect.modes.feature_plan import (
         postprocess_feature_plan,
     )
+    pytest.importorskip("specialist_agent", reason="a sibling repository this test reads (specialist_agent) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     from specialist_agent.modes.types import ModeRuntimeContext
 
     async def planner(**kwargs):
@@ -1312,7 +1320,7 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
     card = project_approval(cx, card)
     # Consume this exact serialized producer card with the actual full-policy
     # harness (paired tools directory is required on PYTHONPATH).
-    import one_sentence as operator
+    operator = pytest.importorskip("one_sentence", reason="a sibling repository this test reads (one_sentence) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
 
     run = operator.Run(
         arm="fixture",
@@ -1459,6 +1467,7 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
     import types
 
     package = types.ModuleType("guardkit.orchestrator")
+    pytest.importorskip("jarvis", reason="a sibling repository this test reads (jarvis) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     package.__path__ = [
         str(Path(importlib.util.find_spec("guardkit").origin).parent / "orchestrator")
     ]
@@ -1469,6 +1478,7 @@ async def test_normal_driver_registers_qa_then_freezes_final_source(
         hold_protected_index,
     )
     from guardkit.orchestrator.harness.selector import load_project_documents_at_commit
+    pytest.importorskip("guardkitfactory", reason="a sibling repository this test reads (guardkitfactory) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     from guardkitfactory.harness.backend_config import PathConfinedBackend
 
     class Calls(list):

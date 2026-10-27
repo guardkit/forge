@@ -129,42 +129,6 @@ class TestTotalityAndPurity:
 # ---------------------------------------------------------------------------
 
 
-class TestBoundaryViolation:
-    """AC-003: History containing PLANNING_FORBIDDEN_STAGES -> BoundaryViolation."""
-
-    def test_history_with_autobuild_returns_boundary_violation(self) -> None:
-        from forge.planning.planner import plan_next_step
-
-        history = [
-            FakePlanningEvent(stage=StageClass.AUTOBUILD, status="approved"),
-        ]
-
-        decision = plan_next_step(history=history)
-
-        assert decision.__class__.__name__ == "BoundaryViolation"
-
-    def test_history_with_pull_request_review_returns_boundary_violation(self) -> None:
-        from forge.planning.planner import plan_next_step
-
-        history = [
-            FakePlanningEvent(stage=StageClass.PULL_REQUEST_REVIEW, status="approved"),
-        ]
-
-        decision = plan_next_step(history=history)
-
-        assert decision.__class__.__name__ == "BoundaryViolation"
-
-    def test_history_with_feature_spec_returns_boundary_violation(self) -> None:
-        from forge.planning.planner import plan_next_step
-
-        history = [
-            FakePlanningEvent(stage=StageClass.FEATURE_SPEC, status="approved"),
-        ]
-
-        decision = plan_next_step(history=history)
-
-        assert decision.__class__.__name__ == "BoundaryViolation"
-
 
 # ---------------------------------------------------------------------------
 # AC-004 — mode_chains_data.py unchanged + PRODUCT_OWNER in planning chain
@@ -292,19 +256,6 @@ class TestPlanningChainDecisions:
 
         assert decision.__class__.__name__ == "ExecuteHandoff"
 
-    def test_forbidden_stage_in_history_never_advances(self) -> None:
-        """Scenario: Planning run never advances into build stages."""
-        from forge.planning.planner import plan_next_step
-
-        # Simulate somehow a forbidden stage got into history
-        history = [
-            FakePlanningEvent(stage=StageClass.FEATURE_PLAN, status="approved"),
-        ]
-
-        decision = plan_next_step(history=history)
-
-        assert decision.__class__.__name__ == "BoundaryViolation"
-
 
 # ---------------------------------------------------------------------------
 # Chain data constants
@@ -322,23 +273,6 @@ class TestChainDataConstants:
         assert isinstance(PLANNING_CHAIN, (tuple, frozenset))
         assert StageClass.PRODUCT_OWNER in PLANNING_CHAIN
 
-    def test_planning_forbidden_stages_contains_all_build_stages(self) -> None:
-        from forge.planning.planner import PLANNING_FORBIDDEN_STAGES
-
-        # Must contain all build stages: everything in MODE_A_CHAIN except
-        # PRODUCT_OWNER, plus AUTOBUILD and PULL_REQUEST_REVIEW explicitly
-        expected_forbidden = {
-            StageClass.ARCHITECT,
-            StageClass.SYSTEM_ARCH,
-            StageClass.SYSTEM_DESIGN,
-            StageClass.FEATURE_SPEC,
-            StageClass.FEATURE_PLAN,
-            StageClass.AUTOBUILD,
-            StageClass.PULL_REQUEST_REVIEW,
-        }
-
-        assert isinstance(PLANNING_FORBIDDEN_STAGES, frozenset)
-        assert expected_forbidden.issubset(PLANNING_FORBIDDEN_STAGES)
 
     def test_product_docs_stage_label_constant(self) -> None:
         from forge.planning.planner import PRODUCT_DOCS_STAGE_LABEL

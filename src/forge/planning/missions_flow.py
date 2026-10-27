@@ -29,24 +29,20 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import re
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from datetime import datetime, timezone
 from typing import Any
 
 from forge.lifecycle.missions import (
-    MISSION_KEY_PATTERN,
     Mission,
     MissionFeature,
     MissionStore,
     StopAnswer,
-    attempt_correlation_id,
 )
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "MAX_MISSION_FEATURES",
     "MISSION_PLAN_STAGE_LABEL",
     "MISSIONS_SWITCHED_OFF",
     "MissionFlow",
@@ -60,9 +56,6 @@ __all__ = [
 
 #: The card's stage label; Jarvis gives it its own headline.
 MISSION_PLAN_STAGE_LABEL: str = "the mission plan"
-
-#: The most features one mission may carry.
-MAX_MISSION_FEATURES: int = 20
 
 #: What the thread is told when the switch is off.
 MISSIONS_SWITCHED_OFF: str = "missions are switched off"
@@ -79,9 +72,6 @@ _RESEND_SECONDS: float = 60.0
 
 #: How long to wait for the card's response subscription to arm.
 _ARM_TIMEOUT_SECONDS: float = 30.0
-
-_KEY = re.compile(MISSION_KEY_PATTERN)
-
 
 def stop_mission(
     missions: MissionStore,
@@ -130,39 +120,25 @@ def mission_build_id(mission_id: str) -> str:
 def validate_mission(
     command: Mapping[str, Any], *, mission_correlation_id: str
 ) -> tuple[str, list[MissionFeature]] | str:
-    """``(title, features)``, or the one sentence that says what is wrong.
+    """``(title, features)``, or the one sentence that says why nothing can start.
 
-    The checks of design section 1, except the repository and the switch,
-    which the caller makes: 1–20 features; keys of 1–12 letters or digits,
-    upper-cased, unique; every ``needs`` names a key in the mission; no cycle;
-    no blank sentence; and the longest attempt correlation id
-    (``<mission correlation id>-<KEY>-a2``) no longer than 128 characters and
-    accepted by the routing check and the intake contract.
+    Only what leaves nothing to start is refused: no features, a feature
+    with no sentence, two features with one key (they cannot both be
+    filed), and needs that go round in a circle. The size, key-form, title
+    and reference-length checks were removed in the cull (27 October 2026);
+    a need naming a key outside the mission is not waited for.
     """
-    from forge.adapters.nats.planning_consumer import _is_valid_correlation_id
-    from forge.lifecycle.feature_routing import validate_feature_routing_id
-
     title = str(command.get("title") or "").strip()
-    if not title:
-        return "The mission has no title, so nothing was started."
     raw = command.get("features")
     if not isinstance(raw, Sequence) or isinstance(raw, (str, bytes)):
         raw = []
-    if not 1 <= len(raw) <= MAX_MISSION_FEATURES:
-        return (
-            f"A mission has between 1 and {MAX_MISSION_FEATURES} features, and "
-            f"this one has {len(raw)}, so nothing was started."
-        )
+    if not raw:
+        return "The mission has no features, so nothing was started."
     features: list[MissionFeature] = []
     seen: set[str] = set()
     for item in raw:
         item = item if isinstance(item, Mapping) else {}
         key = str(item.get("key") or "").strip().upper()
-        if not _KEY.fullmatch(key):
-            return (
-                f"{key or 'A feature'} is not a usable key: a key is 1 to 12 "
-                "letters or digits. Nothing was started."
-            )
         if key in seen:
             return f"The key {key} is used twice, so nothing was started."
         seen.add(key)
@@ -181,29 +157,10 @@ def validate_mission(
                 no_sign_in=item.get("no_sign_in") is True,
             )
         )
-    for feature in features:
-        for needed in feature.needs:
-            if needed not in seen:
-                return (
-                    f"{feature.key} needs {needed}, which is not in this mission, "
-                    "so nothing was started."
-                )
     if waves(features) is None:
         return (
             "The features' needs go round in a circle, so no feature could ever "
             "start. Nothing was started."
-        )
-    longest = max(features, key=lambda f: len(f.key)).key
-    attempt_id = attempt_correlation_id(mission_correlation_id, longest, 2)
-    try:
-        validate_feature_routing_id(attempt_id)
-        acceptable = len(attempt_id) <= 128 and _is_valid_correlation_id(attempt_id)
-    except ValueError:
-        acceptable = False
-    if not acceptable:
-        return (
-            "This mission's message reference is too long to name its features' "
-            "builds, so nothing was started. Use shorter keys."
         )
     return title, features
 

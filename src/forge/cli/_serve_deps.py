@@ -14,9 +14,7 @@ What this module wires
 ----------------------
 
 * ``forge_config`` — passed straight through; the consumer reads
-  ``forge_config.pipeline.approved_originators`` and
-  ``forge_config.permissions.filesystem.allowlist`` for its rejection
-  rules (FEAT-FORGE-002 §2 + §3).
+  ``planning.target_repo_paths`` to resolve a relative feature path.
 * ``is_duplicate_terminal`` — bound to a SQLite ``SELECT status`` against
   the unique ``(feature_id, correlation_id)`` index on the ``builds``
   table (per ASSUM-014). Returns ``True`` only when the row's
@@ -279,22 +277,6 @@ def _build_is_duplicate_terminal(
         return result
 
     return is_duplicate_terminal
-
-
-def _build_retired_planning_handoffs_reader(
-    sqlite_pool: SqliteLifecyclePersistence,
-) -> Callable[[], frozenset[str]]:
-    """Bind the canonical reader to the daemon's read-only SQLite handle."""
-
-    def read_retired_planning_handoffs() -> frozenset[str]:
-        from forge.lifecycle.planning_handoff_retirement import (
-            retired_planning_handoff_correlations,
-        )
-
-        with sqlite_pool._reader() as connection:
-            return retired_planning_handoff_correlations(connection)
-
-    return read_retired_planning_handoffs
 
 
 def _utc_now() -> datetime:
@@ -2622,8 +2604,7 @@ def build_pipeline_consumer_deps(
         client: The pre-opened NATS client owned by ``_run_serve``
             (ASSUM-011: exactly one connection per daemon).
         forge_config: Validated :class:`ForgeConfig`. Used by the
-            consumer for ``approved_originators`` /
-            ``permissions.filesystem.allowlist`` and by the
+            consumer to resolve feature paths and by the
             forward-context builder for the worktree allowlist.
         sqlite_pool: The shared
             :class:`SqliteLifecyclePersistence` facade. Provides:
@@ -2747,9 +2728,6 @@ def build_pipeline_consumer_deps(
     if reply_in_thread is None:
         reply_in_thread = make_build_thread_reply(client)
     is_duplicate_terminal = _build_is_duplicate_terminal(sqlite_pool)
-    retired_planning_handoffs = _build_retired_planning_handoffs_reader(
-        sqlite_pool
-    )
     dispatch_build = _build_dispatch_build(
         sqlite_pool=sqlite_pool,
         forward_context_builder=forward_context_builder,
@@ -2778,7 +2756,6 @@ def build_pipeline_consumer_deps(
         is_duplicate_terminal=is_duplicate_terminal,
         dispatch_build=dispatch_build,
         publish_build_failed=publish_build_failed,
-        retired_planning_handoffs=retired_planning_handoffs,
         register_ack_handle=register_ack_handle,
         record_build_rejection=record_build_rejection,
         reply_in_thread=reply_in_thread,

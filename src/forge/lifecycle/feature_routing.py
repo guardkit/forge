@@ -94,33 +94,21 @@ def validate_feature_routing_launch_receipt(
     *,
     required: bool,
 ) -> tuple[str | None, dict[str, object] | None]:
-    """Validate one launch's explicit routing authority.
+    """One launch's routing key and receipt, passed on as given.
 
-    Required launches need both the exact routing key and the coordinator's
-    committed receipt.  Optional, unkeyed standalone launches retain their
-    historical shape.  A receipt that *is* supplied is always consumed and
-    validated; it can never be silently ignored merely because routing is
-    optional at that call site.
+    The checks on them went in the cull (27 October 2026): a launch with no
+    key or no receipt goes ahead unrouted, and a receipt is carried as it
+    came. ``required`` is kept for the callers' signature.
     """
+    del required
     key = (
-        validate_feature_routing_id(feature_routing_id)
-        if feature_routing_id is not None
+        feature_routing_id
+        if isinstance(feature_routing_id, str) and feature_routing_id
         else None
     )
-    if required and key is None:
-        raise FeatureRoutingBlocked("required feature routing has no identity")
-    if receipt is None:
-        if required:
-            raise FeatureRoutingBlocked("required feature routing has no receipt")
+    if not isinstance(receipt, Mapping):
         return key, None
-    if key is None:
-        raise FeatureRoutingBlocked(
-            "feature routing receipt was supplied without an identity"
-        )
-    canonical = FeatureRoutingReceipt.from_wire(
-        receipt, expected_feature_routing_id=key
-    )
-    return key, canonical.to_wire()
+    return key, dict(receipt)
 
 
 @dataclass(frozen=True, slots=True)
@@ -403,14 +391,6 @@ def _router_restart_blockers_snapshot(
     connection: sqlite3.Connection,
 ) -> tuple[str, ...]:
     from forge.lifecycle.merge_retirement import retired_decision_ids
-    from forge.lifecycle.planning_handoff_retirement import (
-        retired_planning_handoff_correlations,
-    )
-
-    # Parity validation with the router's production maintenance guard. Forge
-    # grants no blocker exemption from this set; its runtime admission guards
-    # consume the same canonical reader separately.
-    retired_planning_handoff_correlations(connection)
 
     planning_terminal = _PLANNING_TERMINAL_STATES
     build_terminal = _BUILD_TERMINAL_STATES

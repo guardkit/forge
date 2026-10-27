@@ -200,30 +200,6 @@ def test_sidecar_code_route_error_has_no_git_text(tmp_path: Path) -> None:
     assert "fatal" not in said.lower()
 
 
-def test_repository_facts_and_lay_out_commit_fetch_the_recorded_address(
-    netlab: NetLab, tmp_path: Path
-) -> None:
-    """Today a missing start commit is fetched from the checkout's origin
-    (here an ``ext::`` marker program)."""
-    from forge.planning import driver
-    from forge.planning.repository_facts import LocalCheckoutReader
-
-    clone = netlab.clone()
-    _ext_origin(netlab, clone)
-    netlab.lab.fired()
-    reader = _call(LocalCheckoutReader, str(clone), commit=netlab.good_commit,
-                   fetch_address=netlab.recorded, repo="org/good")
-    files = reader.list_files()
-    assert netlab.lab.fired() == []
-    assert "good.md" in files
-    second = netlab.clone("second")
-    _ext_origin(netlab, second)
-    netlab.lab.fired()
-    why = _call(driver._lay_out_commit, str(second), netlab.good_commit, tmp_path / "laid",
-                fetch_address=netlab.recorded, repo="org/good")
-    assert netlab.lab.fired() == []
-    assert why is None, why
-
 
 # ---------------------------------------------------------------------------
 # Local commands

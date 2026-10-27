@@ -381,23 +381,6 @@ def test_a_configured_path_that_is_not_a_git_repository_is_refused(
     assert "is not a git repo" in _messages(caplog)
 
 
-def test_a_configured_path_outside_the_allowlist_is_refused(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The allowlist gate applies to a configured path as it does to a guess."""
-    outside = _make_git_repo(tmp_path / "outside" / "api_test")
-    monkeypatch.setenv(FORGE_REPO_BASE_ENV, str(tmp_path / "base"))
-    _write_config(
-        Path("forge.yaml"),
-        allowlist=[str(tmp_path / "base")],
-        repo_paths={REPO_KEY: str(outside)},
-    )
-
-    with caplog.at_level(logging.WARNING, logger=LOGGER_NAME):
-        assert _resolve_repo_path({"repo": REPO_KEY}) is None
-
-    assert "outside the" in _messages(caplog)
-
 
 # ---------------------------------------------------------------------------
 # Reading the configuration can never kill a build

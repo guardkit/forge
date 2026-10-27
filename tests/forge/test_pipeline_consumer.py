@@ -35,8 +35,6 @@ from forge.adapters.nats.pipeline_consumer import (
     IN_FLIGHT_BUILD_STATES,
     PAUSED_BUILD_STATE,
     REASON_MALFORMED_PAYLOAD,
-    REASON_ORIGINATOR_NOT_RECOGNISED,
-    REASON_PATH_OUTSIDE_ALLOWLIST,
     RESTART_FROM_PREPARING_STATES,
     STREAM_NAME,
     TERMINAL_BUILD_STATES,
@@ -48,25 +46,11 @@ from forge.adapters.nats.pipeline_consumer import (
     handle_message,
     reconcile_on_boot,
 )
-from forge.cli._serve_deps import (
-    _build_publish_build_failed,
-    _build_retired_planning_handoffs_reader,
-)
 from forge.config.models import (
     FilesystemPermissions,
     ForgeConfig,
     PermissionsConfig,
     PipelineConfig,
-)
-from forge.lifecycle.persistence import SqliteLifecyclePersistence
-from forge.lifecycle_bridge.coexistence import (
-    TerminalPublishLedger,
-    apply_migration as apply_terminal_publish_migration,
-)
-from tests.forge.lifecycle.planning_handoff_fixture import (
-    CORRELATION as RETIRED_CORRELATION,
-    add_planning_retirement,
-    make_planning_ledger,
 )
 
 
@@ -108,7 +92,6 @@ def deps_factory(forge_config: ForgeConfig):
     def _make(
         *,
         is_duplicate_terminal: bool = False,
-        retired_planning_handoffs=lambda: frozenset(),
     ) -> tuple[PipelineConsumerDeps, dict[str, AsyncMock]]:
         is_dup = AsyncMock(return_value=is_duplicate_terminal)
         dispatch = AsyncMock()
@@ -118,7 +101,6 @@ def deps_factory(forge_config: ForgeConfig):
             is_duplicate_terminal=is_dup,
             dispatch_build=dispatch,
             publish_build_failed=publish_failed,
-            retired_planning_handoffs=retired_planning_handoffs,
         )
         return deps, {
             "is_duplicate_terminal": is_dup,
@@ -282,228 +264,6 @@ class TestValidPayloadDispatch:
         mocks["publish_build_failed"].assert_not_called()
 
 
-class TestPlanningHandoffRetirementGuard:
-    """Permanent retirement is checked before any intake side effect."""
-
-    @pytest.mark.parametrize(
-        ("payload_correlation", "envelope_correlation"),
-        (("retired-correlation", "other-correlation"),
-         ("other-correlation", "retired-correlation")),
-    )
-    @pytest.mark.asyncio
-    async def test_either_retired_identity_acks_and_publishes_named_failure(
-        self,
-        deps_factory,
-        allowlist_root: Path,
-        payload_correlation: str,
-        envelope_correlation: str,
-    ) -> None:
-        payload = _valid_payload_dict(allowlist_root / "feature.yaml")
-        payload["correlation_id"] = payload_correlation
-        msg = _make_msg(
-            _envelope_bytes(payload, correlation_id=envelope_correlation)
-        )
-        deps, mocks = deps_factory(
-            retired_planning_handoffs=lambda: frozenset({"retired-correlation"})
-        )
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        mocks["dispatch_build"].assert_not_called()
-        mocks["is_duplicate_terminal"].assert_not_called()
-        mocks["publish_build_failed"].assert_awaited_once()
-        failure, feature_id = mocks["publish_build_failed"].await_args.args
-        assert feature_id == "FEAT-A1B2"
-        assert failure.failure_reason == (
-            "planning handoff was permanently retired before routing"
-        )
-        assert mocks["publish_build_failed"].await_args.kwargs == {
-            "correlation_id": envelope_correlation
-        }
-
-    @pytest.mark.parametrize(
-        "reader",
-        [
-            pytest.param("raises", id="history-cannot-be-read"),
-            pytest.param("none", id="validator-answers-nothing"),
-            pytest.param("unwired", id="validator-not-wired"),
-        ],
-    )
-    @pytest.mark.asyncio
-    async def test_an_unreadable_retirement_ledger_is_advice_and_the_build_goes_on(
-        self, deps_factory, allowlist_root: Path, reader: str
-    ) -> None:
-        """Step 2 (26 October 2026, census FRG-001): the retirement ledger is
-        bookkeeping. One that cannot be read no longer holds every build; it
-        is read as nothing known retired and the build is dispatched."""
-
-        def invalid_history():
-            raise RuntimeError("malformed retirement receipt")
-
-        retired = {
-            "raises": invalid_history,
-            "none": lambda: None,
-            "unwired": None,
-        }[reader]
-        msg = _make_msg(
-            _envelope_bytes(_valid_payload_dict(allowlist_root / "feature.yaml"))
-        )
-        deps, mocks = deps_factory(retired_planning_handoffs=retired)
-
-        await handle_message(msg, deps)
-
-        mocks["dispatch_build"].assert_awaited_once()
-        mocks["publish_build_failed"].assert_not_called()
-
-    @pytest.mark.parametrize(
-        ("payload_correlation", "envelope_correlation"),
-        (
-            (RETIRED_CORRELATION, "ordinary-envelope"),
-            ("ordinary-payload", RETIRED_CORRELATION),
-        ),
-    )
-    @pytest.mark.asyncio
-    async def test_real_ledger_mismatches_only_write_terminal_dedup_telemetry(
-        self,
-        tmp_path: Path,
-        forge_config: ForgeConfig,
-        allowlist_root: Path,
-        payload_correlation: str,
-        envelope_correlation: str,
-    ) -> None:
-        db_path = tmp_path / "forge.db"
-        connection, event_ids = make_planning_ledger(db_path, version=18)
-        add_planning_retirement(connection, event_ids)
-        connection.commit()
-        apply_terminal_publish_migration(connection)
-
-        protected_tables = (
-            "planning_runs",
-            "planning_run_events",
-            "builds",
-            "work_queue",
-            "feature_routing_seeds",
-        )
-        before = {
-            table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-            for table in protected_tables
-        }
-        publisher = AsyncMock()
-        deps = PipelineConsumerDeps(
-            forge_config=forge_config,
-            is_duplicate_terminal=AsyncMock(return_value=False),
-            dispatch_build=AsyncMock(),
-            publish_build_failed=_build_publish_build_failed(
-                publisher,
-                terminal_publish_ledger=TerminalPublishLedger(connection=connection),
-            ),
-            retired_planning_handoffs=_build_retired_planning_handoffs_reader(
-                SqliteLifecyclePersistence(connection=connection, db_path=db_path)
-            ),
-        )
-        payload = _valid_payload_dict(allowlist_root / "feature.yaml")
-        payload["feature_id"] = "FEAT-FIXTURE"
-        payload["correlation_id"] = payload_correlation
-        msg = _make_msg(
-            _envelope_bytes(payload, correlation_id=envelope_correlation)
-        )
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        deps.dispatch_build.assert_not_called()
-        deps.is_duplicate_terminal.assert_not_called()
-        publisher.publish_build_failed.assert_awaited_once()
-        after = {
-            table: connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-            for table in protected_tables
-        }
-        assert after == before
-        claim = connection.execute(
-            "SELECT feature_id, correlation_id, claimed_by "
-            "FROM lifecycle_bridge_terminal_publishes"
-        ).fetchall()
-        assert len(claim) == 1
-        assert tuple(claim[0]) == (
-            "FEAT-FIXTURE",
-            envelope_correlation,
-            "f010f-safety-net",
-        )
-        connection.close()
-
-    @pytest.mark.asyncio
-    async def test_real_ledger_allows_an_ordinary_correlation(
-        self,
-        tmp_path: Path,
-        forge_config: ForgeConfig,
-        allowlist_root: Path,
-    ) -> None:
-        db_path = tmp_path / "forge.db"
-        connection, event_ids = make_planning_ledger(db_path, version=18)
-        add_planning_retirement(connection, event_ids)
-        connection.commit()
-        pool = SqliteLifecyclePersistence(connection=connection, db_path=db_path)
-        dispatch = AsyncMock()
-        deps = PipelineConsumerDeps(
-            forge_config=forge_config,
-            is_duplicate_terminal=AsyncMock(return_value=False),
-            dispatch_build=dispatch,
-            publish_build_failed=AsyncMock(),
-            retired_planning_handoffs=_build_retired_planning_handoffs_reader(pool),
-        )
-        payload = _valid_payload_dict(allowlist_root / "feature.yaml")
-        payload["correlation_id"] = "ordinary-correlation"
-        msg = _make_msg(
-            _envelope_bytes(payload, correlation_id="ordinary-correlation")
-        )
-
-        await handle_message(msg, deps)
-
-        dispatch.assert_awaited_once()
-        msg.ack.assert_not_called()
-        deps.publish_build_failed.assert_not_called()
-        connection.close()
-
-    @pytest.mark.asyncio
-    async def test_real_deep_malformed_receipt_is_advice_and_dispatches(
-        self,
-        tmp_path: Path,
-        forge_config: ForgeConfig,
-        allowlist_root: Path,
-    ) -> None:
-        db_path = tmp_path / "forge.db"
-        connection, event_ids = make_planning_ledger(db_path, version=18)
-        deep = (
-            '{"planning_handoff_retirement":'
-            + "[" * 16000
-            + "0"
-            + "]" * 16000
-            + "}"
-        )
-        add_planning_retirement(connection, event_ids, details=deep)
-        connection.commit()
-        pool = SqliteLifecyclePersistence(connection=connection, db_path=db_path)
-        dispatch = AsyncMock()
-        publish_failed = AsyncMock()
-        deps = PipelineConsumerDeps(
-            forge_config=forge_config,
-            is_duplicate_terminal=AsyncMock(return_value=False),
-            dispatch_build=dispatch,
-            publish_build_failed=publish_failed,
-            retired_planning_handoffs=_build_retired_planning_handoffs_reader(pool),
-        )
-        msg = _make_msg(
-            _envelope_bytes(_valid_payload_dict(allowlist_root / "feature.yaml"))
-        )
-
-        await handle_message(msg, deps)
-
-        # Step 2 (26 October 2026, census FRG-001): bookkeeping, not a hold.
-        dispatch.assert_awaited_once()
-        publish_failed.assert_not_called()
-        connection.close()
-
 
 # ---------------------------------------------------------------------------
 # AC-008: ack is called exactly once
@@ -534,11 +294,12 @@ class TestAckCalledExactlyOnce:
     async def test_rejection_acks_once_no_dispatch(
         self, deps_factory, tmp_path: Path
     ) -> None:
-        # A payload outside the allowlist should ack exactly once (here,
-        # immediately) and never invoke the dispatcher.
-        outside = tmp_path / "outside" / "feature.yaml"
-        outside.parent.mkdir()
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(outside)))
+        # A relative feature path for a repository with no registered
+        # checkout should ack exactly once (here, immediately) and never
+        # invoke the dispatcher.
+        payload = _valid_payload_dict(tmp_path / "feature.yaml")
+        payload["feature_yaml_path"] = ".guardkit/features/FEAT-A.yaml"
+        msg = _make_msg(_envelope_bytes(payload))
         deps, mocks = deps_factory()
 
         await handle_message(msg, deps)
@@ -608,139 +369,11 @@ class TestMalformedPayload:
 # ---------------------------------------------------------------------------
 
 
-class TestPathAllowlist:
-    """AC-004: path outside allowlist → ack + ``build-failed``.
-
-    AC-010: ``Path.resolve() + is_relative_to`` rejects ``..`` traversal.
-    """
-
-    @pytest.mark.asyncio
-    async def test_path_outside_allowlist_is_rejected(
-        self, deps_factory, tmp_path: Path
-    ) -> None:
-        outside = tmp_path / "elsewhere" / "feature.yaml"
-        outside.parent.mkdir()
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(outside)))
-        deps, mocks = deps_factory()
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        mocks["publish_build_failed"].assert_awaited_once()
-        sent, _feature_id = mocks["publish_build_failed"].await_args.args
-        assert sent.failure_reason == REASON_PATH_OUTSIDE_ALLOWLIST
-        mocks["dispatch_build"].assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_dotdot_traversal_escape_is_rejected(
-        self, deps_factory, allowlist_root: Path, tmp_path: Path
-    ) -> None:
-        # Construct a path that *literally* sits inside the allowlist root
-        # but uses ``..`` to escape — Path.resolve() must collapse the
-        # traversal so is_relative_to returns False.
-        traversal = (
-            allowlist_root
-            / ".."
-            / ".."
-            / tmp_path.name  # back into tmp_path itself, outside the root
-            / "outside"
-            / "feature.yaml"
-        )
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(traversal)))
-        deps, mocks = deps_factory()
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        mocks["publish_build_failed"].assert_awaited_once()
-        sent, _feature_id = mocks["publish_build_failed"].await_args.args
-        assert sent.failure_reason == REASON_PATH_OUTSIDE_ALLOWLIST
-        mocks["dispatch_build"].assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_path_inside_allowlist_via_dotdot_is_accepted(
-        self, deps_factory, allowlist_root: Path
-    ) -> None:
-        # Lexical ``..`` that *resolves back into* the allowlist root must
-        # be accepted — only escapes are rejected.
-        nested = allowlist_root / "subdir" / ".." / "feature.yaml"
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(nested)))
-        deps, mocks = deps_factory()
-
-        await handle_message(msg, deps)
-
-        mocks["dispatch_build"].assert_awaited_once()
-        mocks["publish_build_failed"].assert_not_called()
-
 
 # ---------------------------------------------------------------------------
 # AC-005: unrecognised originating_adapter → ack + build-failed
 # ---------------------------------------------------------------------------
 
-
-class TestOriginatorAllowlist:
-    """AC-005: ``originating_adapter`` not in approved list → rejected."""
-
-    @pytest.mark.asyncio
-    async def test_none_originator_is_rejected(
-        self, deps_factory, allowlist_root: Path
-    ) -> None:
-        yaml_path = allowlist_root / "feature.yaml"
-        payload = _valid_payload_dict(yaml_path)
-        # Bypass the Pydantic Literal so the consumer is the layer that
-        # rejects it — emulates a producer publishing without populating
-        # the field.
-        envelope = MessageEnvelope(
-            message_id="m1",
-            timestamp=datetime.now(timezone.utc),
-            version="1.0",
-            source_id="cli-wrapper",
-            event_type=EventType.BUILD_QUEUED,
-            payload={**payload, "originating_adapter": None},
-        )
-        msg = _make_msg(envelope.model_dump_json().encode("utf-8"))
-        deps, mocks = deps_factory()
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        mocks["publish_build_failed"].assert_awaited_once()
-        sent, _feature_id = mocks["publish_build_failed"].await_args.args
-        assert sent.failure_reason == REASON_ORIGINATOR_NOT_RECOGNISED
-        mocks["dispatch_build"].assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_unapproved_originator_is_rejected(
-        self,
-        forge_config: ForgeConfig,
-        allowlist_root: Path,
-    ) -> None:
-        # Tighten the approved list so ``cli-wrapper`` becomes invalid
-        # without having to monkey-patch the Pydantic Literal.
-        narrow_config = ForgeConfig(
-            pipeline=PipelineConfig(approved_originators=["terminal"]),
-            permissions=forge_config.permissions,
-        )
-        is_dup = AsyncMock(return_value=False)
-        dispatch = AsyncMock()
-        publish_failed = AsyncMock()
-        deps = PipelineConsumerDeps(
-            forge_config=narrow_config,
-            is_duplicate_terminal=is_dup,
-            dispatch_build=dispatch,
-            publish_build_failed=publish_failed,
-            retired_planning_handoffs=lambda: frozenset(),
-        )
-
-        yaml_path = allowlist_root / "feature.yaml"
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(yaml_path)))
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        publish_failed.assert_awaited_once()
-        sent, _feature_id = publish_failed.await_args.args
-        assert sent.failure_reason == REASON_ORIGINATOR_NOT_RECOGNISED
-        dispatch.assert_not_called()
 
 
 # ---------------------------------------------------------------------------

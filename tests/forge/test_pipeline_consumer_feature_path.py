@@ -3,10 +3,11 @@
 Jarvis sends ``feature_yaml_path`` relative to the repository. The consumer
 used to resolve it against its own working folder and check only the string;
 the runner then read ``.guardkit/features/<feature_id>.yaml`` regardless. Now a
-relative path is resolved against the repository's REGISTERED checkout and must
-be exactly that file; the allowlist then checks the resolved path. An absolute
-path (the factory's own planning trigger, ``forge queue``, the fix journey) is
-checked exactly as before.
+relative path is resolved against the repository's REGISTERED checkout; a
+repository with no registered checkout leaves nothing to build from. An
+absolute path (the factory's own planning trigger, ``forge queue``, the fix
+journey) is used as it is. The name and folder checks were removed in the cull
+(27 October 2026).
 
 Collaborators are mocks; nothing here touches a bus, a ledger or a checkout.
 """
@@ -22,7 +23,6 @@ import pytest
 from nats_core.envelope import EventType, MessageEnvelope
 
 from forge.adapters.nats.pipeline_consumer import (
-    REASON_PATH_OUTSIDE_ALLOWLIST,
     PipelineConsumerDeps,
     handle_message,
 )
@@ -52,7 +52,6 @@ def _deps(config: ForgeConfig) -> tuple[PipelineConsumerDeps, dict[str, Any]]:
         is_duplicate_terminal=AsyncMock(return_value=False),
         dispatch_build=dispatch,
         publish_build_failed=publish,
-        retired_planning_handoffs=lambda: frozenset(),
         record_build_rejection=lambda cid, reason: rejections.append((cid, reason)),
     )
     return deps, {"dispatch": dispatch, "publish": publish, "rejections": rejections}
@@ -101,51 +100,6 @@ async def test_a_relative_path_is_resolved_against_the_registered_checkout(
     mocks["publish"].assert_not_awaited()
 
 
-@pytest.mark.asyncio
-async def test_the_allowlist_checks_the_resolved_path_not_the_string(
-    tmp_path: Path, checkout: Path
-) -> None:
-    """The checkout is registered but outside the allowlist: refused, though
-    the relative string alone would have resolved against this process's own
-    working folder."""
-    other = tmp_path / "elsewhere"
-    other.mkdir()
-    deps, mocks = _deps(_config([other], {REPO: checkout}))
-    msg = _msg(f".guardkit/features/{FEATURE}.yaml")
-
-    await handle_message(msg, deps)
-
-    mocks["dispatch"].assert_not_called()
-    (failure, _fid), _kw = mocks["publish"].await_args
-    assert failure.failure_reason == REASON_PATH_OUTSIDE_ALLOWLIST
-    assert str(checkout / ".guardkit" / "features") in mocks["rejections"][0][1]
-    msg.ack.assert_awaited_once()
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "path",
-    [
-        "features/count-things/plan.yaml",
-        ".guardkit/features/FEAT-0THER.yaml",
-        ".guardkit/features/../features/FEAT-AB12.yaml.bak",
-        "../outside/.guardkit/features/FEAT-AB12.yaml",
-    ],
-)
-async def test_any_other_relative_path_is_refused_in_plain_words(
-    tmp_path: Path, checkout: Path, path: str
-) -> None:
-    deps, mocks = _deps(_config([tmp_path / "repos"], {REPO: checkout}))
-    msg = _msg(path)
-
-    await handle_message(msg, deps)
-
-    mocks["dispatch"].assert_not_called()
-    (failure, _fid), _kw = mocks["publish"].await_args
-    assert f".guardkit/features/{FEATURE}.yaml" in failure.failure_reason
-    assert "the one file a build of" in mocks["rejections"][0][1]
-    msg.ack.assert_awaited_once()
-
 
 @pytest.mark.asyncio
 async def test_a_normalised_spelling_of_the_right_file_is_accepted(
@@ -173,13 +127,12 @@ async def test_a_relative_path_for_an_unregistered_repository_is_refused(
 
 
 @pytest.mark.asyncio
-async def test_an_absolute_path_is_checked_exactly_as_before(
+async def test_an_absolute_path_is_used_as_it_is(
     tmp_path: Path, checkout: Path
 ) -> None:
     deps, mocks = _deps(_config([tmp_path / "repos"], {REPO: checkout}))
 
-    # Any absolute path inside the allowlist passes, whatever its name — the
-    # factory's own planning trigger sends its plan tree's file this way.
+    # The factory's own planning trigger sends its plan tree's file this way.
     await handle_message(_msg(str(checkout / "features" / "plan.yaml")), deps)
 
     mocks["dispatch"].assert_awaited_once()

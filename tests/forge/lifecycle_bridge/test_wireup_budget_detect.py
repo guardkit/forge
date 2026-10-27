@@ -357,50 +357,6 @@ class TestWallClockBreach:
 # ---------------------------------------------------------------------------
 
 
-class TestCoachFloorBreach:
-    @pytest.mark.asyncio
-    async def test_low_envelope_score_breaches_floor(
-        self,
-        registry: BridgeRegistry,
-        translator: StreamEventTranslator,
-        fake_publisher: MagicMock,
-        persistence: SqliteLifecyclePersistence,
-    ) -> None:
-        build_id = _queued_build(persistence)
-        publish = AsyncMock(name="publish_approval_request")
-        observer = _make_observer(
-            persistence,
-            guards=BudgetGuards(min_coach_score=0.5),
-            profile_name="unattended",
-            elapsed_seconds=0.0,  # wall-clock inert
-            publish=publish,
-        )
-        # First stage-complete carries a score of 0.0, below the 0.5 floor.
-        parts = _lifecycle_parts(_FEATURE_ID, build_id, stage_scores=[0.0])
-
-        bridge = LifecycleBridge(registry=registry)
-        wireup = _build_wireup(
-            bridge=bridge,
-            translator=translator,
-            fake_publisher=fake_publisher,
-            persistence=persistence,
-            build_id=build_id,
-            parts=parts,
-            budget_observer=observer,
-        )
-        handle = _make_handle()
-        await wireup.register_ack_handle(_FEATURE_ID, _CORRELATION_ID, handle)
-        await _drain(wireup, _FEATURE_ID)
-
-        detail = persistence.read_budget_breach(build_id)
-        assert detail is not None
-        assert "min_coach_score" in detail
-        publish.assert_awaited_once()
-        # No status change; the run completed normally.
-        assert _row_status(persistence, build_id) == BuildState.COMPLETE.value
-
-        await wireup.shutdown()
-
 
 # ---------------------------------------------------------------------------
 # First-breach-wins — a second breach never escalates twice
@@ -631,62 +587,6 @@ class TestReviewCycleCounterPerObserver:
 # Production factory — build_budget_breach_observer composes the serve reuse
 # ---------------------------------------------------------------------------
 
-
-class TestProductionFactoryComposition:
-    @pytest.mark.asyncio
-    async def test_factory_wired_observer_detects_a_breach(
-        self,
-        registry: BridgeRegistry,
-        translator: StreamEventTranslator,
-        fake_publisher: MagicMock,
-        persistence: SqliteLifecyclePersistence,
-    ) -> None:
-        from types import SimpleNamespace
-
-        from forge.lifecycle_bridge.budget_observer import (
-            build_budget_breach_observer,
-        )
-
-        build_id = _queued_build(persistence)
-        publish = AsyncMock(name="publish_approval_request")
-        # Minimal ForgeConfig-shaped stub: budget.resolve returns a coach floor.
-        fake_config = SimpleNamespace(
-            budget=SimpleNamespace(
-                resolve=lambda _name: BudgetGuards(min_coach_score=0.5),
-                default_profile="unattended",
-            )
-        )
-        observer = build_budget_breach_observer(
-            pool=persistence,
-            config=fake_config,
-            publish_approval_request=publish,
-        )
-        # First stage-complete carries 0.0, below the 0.5 floor.
-        parts = _lifecycle_parts(_FEATURE_ID, build_id, stage_scores=[0.0])
-
-        bridge = LifecycleBridge(registry=registry)
-        wireup = _build_wireup(
-            bridge=bridge,
-            translator=translator,
-            fake_publisher=fake_publisher,
-            persistence=persistence,
-            build_id=build_id,
-            parts=parts,
-            budget_observer=observer,
-        )
-        handle = _make_handle()
-        await wireup.register_ack_handle(_FEATURE_ID, _CORRELATION_ID, handle)
-        await _drain(wireup, _FEATURE_ID)
-
-        detail = persistence.read_budget_breach(build_id)
-        assert detail is not None and "min_coach_score" in detail
-        publish.assert_awaited_once()
-        _payload, subject = publish.await_args.args
-        # The factory composed the canonical approval subject for the build.
-        assert subject.endswith(build_id)
-        assert _row_status(persistence, build_id) == BuildState.COMPLETE.value
-
-        await wireup.shutdown()
 
 
 # ---------------------------------------------------------------------------

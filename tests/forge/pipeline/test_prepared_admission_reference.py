@@ -78,44 +78,6 @@ async def test_a_good_record_is_admitted(project: Project, runner: WorktreeGitRu
     assert answer.admitted.reference_signed_off == RECORD_PATH
 
 
-@pytest.mark.parametrize(
-    ("record", "said"),
-    [
-        (None, "does not exist"),
-        ("repository: x\ncommit: 1234567\n", "full 40-character commit"),
-        (f"commit: {'7' * 40}\n", "names no repository"),
-    ],
-)
-@pytest.mark.asyncio
-async def test_a_broken_record_is_refused(
-    project: Project, runner: WorktreeGitRunner, record: str | None, said: str
-) -> None:
-    files = _with_reference(bundle(), DECLARES_RECORD)
-    if record is not None:
-        files[RECORD_PATH] = record
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    refusal = answer.refusal or ""
-    assert refusal.startswith("the prepared feature cannot be built: ")
-    assert said in refusal and RECORD_PATH in refusal
-
-
-@pytest.mark.asyncio
-async def test_a_malformed_reference_block_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    project.commit_on(
-        BRANCH, _with_reference(bundle(), 'reference:\n  paths: ["/reference/"]\n')
-    )
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "reference.paths[0]" in (answer.refusal or "")
-
 
 @pytest.mark.asyncio
 async def test_without_a_record_setting_nothing_is_checked(
@@ -162,33 +124,4 @@ async def test_a_link_from_the_repository_top_is_admitted(
     assert answer.ok, answer.refusal
 
 
-@pytest.mark.parametrize("where", sorted(SOURCES))
-@pytest.mark.asyncio
-async def test_a_link_from_the_top_to_a_missing_reference_file_is_refused(
-    project: Project, runner: WorktreeGitRunner, where: str
-) -> None:
-    files = _with_reference(bundle(), 'reference:\n  paths: ["reference/"]\n')
-    missing = "/reference/prototype/src/screens/Missing.view"
-    project.commit_on(BRANCH, _link_from(files, SOURCES[where], missing))
 
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "reference/prototype/src/screens" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_relative_reference_link_from_a_nested_task_file_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    """Without the leading ``/`` the link resolves under the task's own folder,
-    where there is no such file: the convention needs the ``/``."""
-    files = _with_reference(bundle(), 'reference:\n  paths: ["reference/"]\n')
-    task = SOURCES["task file"]
-    project.commit_on(BRANCH, _link_from(files, task, SCREEN))
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    refusal = answer.refusal or ""
-    assert task in refusal and f"{TASK_DIR}/reference" in refusal

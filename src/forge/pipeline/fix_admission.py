@@ -1074,9 +1074,7 @@ async def admit_fix_build(
        allows.
     3. **The parent feature** comes from the fix-task YAML's
        ``parent_feature`` and is validated as a feature identifier.
-    4. **The repository** must be one ``queue.repo_allowlist`` allows (an
-       empty allowlist, the default, allows everything).
-    5. **The row is written first, then published** — the write-then-publish
+    4. **The row is written first, then published** — the write-then-publish
        discipline the whole pipeline keeps. A publish that fails raises
        :class:`FixPublishFailed` and the row deliberately stays.
 
@@ -1167,13 +1165,6 @@ async def admit_fix_build(
 
     # 4. The repository.
     repo = Path(repo_path)
-    if not _repo_allowed(repo, config):
-        raise FixAdmissionRefused(
-            f"Repository {str(repo)!r} is not in queue.repo_allowlist; "
-            "refusing to enqueue (Group C path-allowlist refused).",
-            reason="repo-not-allowed",
-            permanent=True,
-        )
 
     # 4b. The branch the build rides. The repair's own, with the task file
     #     the review leg will look for committed on it (Part L, rule 48) —
@@ -2374,40 +2365,6 @@ def repo_slug(repo: Path | str) -> str:
     return f"{org or 'local'}/{name}"
 
 
-def path_in_allowlist(repo: Path | str, allowlist: Iterable[Path | str]) -> bool:
-    """Whether ``repo`` is a checkout the allowlist allows.
-
-    Compared against the RESOLVED absolute path, and a nested checkout under
-    an allowed root passes. An empty allowlist — the schema default — means
-    no restriction, so everything passes.
-    """
-    entries = list(allowlist)
-    if not entries:
-        return True
-    repo_resolved = Path(repo).expanduser().resolve()
-    for entry in entries:
-        try:
-            entry_resolved = Path(entry).expanduser().resolve()
-        except (OSError, RuntimeError):
-            # Defensive — a pathological symlink loop in forge.yaml should
-            # not crash an admission. Skip the bad entry.
-            logger.warning("repo_allowlist entry %r could not be resolved", entry)
-            continue
-        if repo_resolved == entry_resolved:
-            return True
-        try:
-            repo_resolved.relative_to(entry_resolved)
-        except ValueError:
-            continue
-        return True
-    return False
-
-
-def _repo_allowed(repo: Path, config: Any) -> bool:
-    """Whether ``queue.repo_allowlist`` allows this checkout (empty = all)."""
-    allowlist = list(getattr(getattr(config, "queue", None), "repo_allowlist", []) or [])
-    return path_in_allowlist(repo, allowlist)
-
 
 def _one_line(text: str) -> str:
     return " ".join(str(text).split())
@@ -2446,7 +2403,6 @@ __all__ = [
     "gather_repair_facts",
     "materialise_repair_task",
     "mint_fix_task_id",
-    "path_in_allowlist",
     "read_fix_task_name",
     "read_parent_feature",
     "render_repair_task_file",

@@ -38,7 +38,7 @@ Two-fixture cluster from the F10 plan
   ``forge_runner`` is a :class:`CliRunner` with the queue command's
   side-effect seams patched onto the persistence fixture.
 
-The 34 scenarios resolve to 34 test items via ``scenarios(...)`` —
+The 33 scenarios resolve to 33 test items via ``scenarios(...)`` —
 pytest-bdd auto-generates one ``test_*`` per scenario and per
 ``Examples`` row in the four Scenario Outlines (turn-budget bounds × 2
 examples, turn-budget rejected × 2 examples, history-limit × 3
@@ -832,39 +832,6 @@ def then_at_most_five_stages(world: dict[str, Any]) -> None:
 # Group C — Negative Cases
 # ---------------------------------------------------------------------------
 
-
-@given("a repository path that is not on the allowlist")
-def given_repo_not_allowlisted(
-    world: dict[str, Any], tmp_path: Path, forge_config: Any
-) -> None:
-    bad_repo = tmp_path / "outside_allowlist"
-    bad_repo.mkdir(exist_ok=True)
-    # Point the allowlist somewhere else that does NOT include bad_repo.
-    only_path = tmp_path / "only_allowlisted"
-    only_path.mkdir(exist_ok=True)
-    forge_config.queue.repo_allowlist.clear()
-    forge_config.queue.repo_allowlist.append(only_path)
-    world["repo"] = bad_repo
-    world["feature_yaml"] = _make_feature_yaml(tmp_path)
-    world["feature_id"] = "FEAT-NOPATH"
-
-
-@when("I attempt to queue a feature for that repository")
-def when_attempt_queue_bad_repo(
-    world: dict[str, Any], forge_runner: CliRunner, forge_config: Any
-) -> None:
-    world["result"] = _invoke_queue(
-        forge_runner,
-        forge_config,
-        feature_id=world["feature_id"],
-        repo=world["repo"],
-        feature_yaml=world["feature_yaml"],
-    )
-
-
-@then("the queue command should be refused with an unauthorised-path error")
-def then_refused_unauthorised_path(world: dict[str, Any]) -> None:
-    assert world["result"].exit_code == queue_module.EXIT_PATH_REFUSED
 
 
 @then("no message should be published to the pipeline")

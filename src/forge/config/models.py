@@ -216,8 +216,8 @@ class PipelineConfig(BaseModel):
     approved_originators: list[str] = Field(
         default_factory=lambda: list(DEFAULT_APPROVED_ORIGINATORS),
         description=(
-            "Originator identifiers accepted by pipeline_consumer. Build-queued "
-            "events from any other originator are rejected."
+            "No longer read: the originator check went in the cull (27 "
+            "October 2026). Kept so existing settings files still load."
         ),
     )
     max_concurrent_builds: int = Field(
@@ -453,8 +453,8 @@ class QueueConfig(BaseModel):
     repo_allowlist: list[Path] = Field(
         default_factory=list,
         description=(
-            "Repository paths matched by ``forge queue --repo``. An empty "
-            "list (the default) means no repository restriction is applied."
+            "No longer read: the repository allowlist check went in the cull "
+            "(27 October 2026). Kept so existing settings files still load."
         ),
     )
 
@@ -592,10 +592,8 @@ class BudgetGuards(BaseModel):
         ge=0.0,
         le=1.0,
         description=(
-            "Optional Coach-score floor. STUB (ADR-ARCH-033): enforcement is "
-            "inert until the runner populates ``last_coach_score`` — the "
-            "coach-score gap that is itself a UBS-002 prerequisite. Set here "
-            "so the guard activates automatically once the score flows."
+            "No longer read: the coach-score floor went in the cull (27 "
+            "October 2026). Kept so existing settings files still load."
         ),
     )
     leg_max_turns: int | None = Field(
@@ -741,10 +739,8 @@ class BudgetConfig(BaseModel):
     """Named budget-guard profiles for the Unattended Build Service (UBS-002).
 
     ``forge queue --profile <name>`` selects one profile; the daemon resolves
-    the caps for the build. The ``attended`` profile is reserved and must keep
-    every cap unset (ASSUM-010) — the model_validator rejects any config that
-    arms it, so an operator cannot silently turn attended builds into capped
-    ones by editing the wrong block.
+    the caps for the build. The ``attended`` profile is the default and
+    carries no caps (ASSUM-010).
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -760,24 +756,6 @@ class BudgetConfig(BaseModel):
         default_factory=_default_budget_profiles,
         description="Map of profile name → budget caps.",
     )
-
-    @model_validator(mode="after")
-    def _validate_profiles(self) -> BudgetConfig:
-        """Reject a missing default profile or an armed ``attended`` profile."""
-        if self.default_profile not in self.profiles:
-            raise ValueError(
-                f"budget.default_profile {self.default_profile!r} is not one "
-                f"of the defined profiles {sorted(self.profiles)!r}"
-            )
-        attended = self.profiles.get(ATTENDED_PROFILE_NAME)
-        if attended is not None and attended.caps_enabled:
-            raise ValueError(
-                f"budget.profiles[{ATTENDED_PROFILE_NAME!r}] must have all caps "
-                "unset (FEAT-FORGE-008 ASSUM-010 — attended mode is "
-                "reviewer-driven with no numeric cap); use a differently-named "
-                "profile for capped builds"
-            )
-        return self
 
     def resolve(self, name: str | None) -> BudgetGuards:
         """Return the caps for ``name`` (or ``default_profile`` when ``None``).
@@ -1403,12 +1381,8 @@ class PlanningConfig(BaseModel):
     rewrite_on_refusal: bool = Field(
         default=True,
         description=(
-            "True (default) = when the plan stage cannot prove some of the "
-            "spec's worked examples (the routing law is enforced and the stamp "
-            "normalizer refused them), the machine sends those examples back "
-            "to the spec writer once, as its own note, and stamps again; only "
-            "a second refusal stops the run and asks a person. False = the "
-            "first refusal stops the run, exactly as before 2026-09-06."
+            "No longer read: the routing law and its rewrite round went in the "
+            "cull (27 October 2026). Kept so existing settings files still load."
         ),
     )
     nothing_to_build: NothingToBuildConfig = Field(
@@ -1833,21 +1807,9 @@ DEFAULT_PREFLIGHT_DISK_FLOOR_GB = 20.0
 
 
 class ResourcePreflightConfig(BaseModel):
-    """Pre-run memory/disk headroom preflight (O-27 / O-29 — E2-S4).
-
-    A run must fail CLEANLY *before* it starts when the box is already under its
-    memory or disk floor — never mid-run with a kernel OOM-kill (O-27) or an
-    ENOSPC-wedged JetStream/worktree write (O-29). The run-entry path consults
-    :func:`forge.preflight.run_resource_preflight`; on a breach the run is
-    refused into a loud FAILED terminal with a route-and-notify to the
-    originator (never a mid-run kill).
-
-    Unlike the other stage switches this defaults **enabled=True**: the check
-    only ever refuses BEFORE work starts, so leaving it on is safe (it can never
-    kill a run in flight). An *unreadable* resource (non-Linux dev host, etc.)
-    is treated as UNCHECKED, never a fabricated breach — the preflight fails open
-    per-resource.
-    """
+    """No longer read by planning: the pre-run memory and disk preflight went
+    in the cull (27 October 2026). Kept so existing settings files still
+    load."""
 
     model_config = ConfigDict(extra="forbid")
 

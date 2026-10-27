@@ -59,7 +59,6 @@ from forge.planning.declared_memory import (
 from forge.planning.driver import PlanningDriverDeps, PlanningRunDriver
 from forge.planning.gate_adapters import build_planning_gate_adapters
 from forge.planning.project_documents import (
-    PROJECT_DOCUMENTS_BUDGET_BYTES,
     ProjectDocument,
     context_texts,
     read_project_documents_at_commit,
@@ -453,27 +452,6 @@ async def test_a_symbolic_link_document_is_refused() -> None:
     assert DECLARED[0] in why and "symbolic link" in why
 
 
-@pytest.mark.asyncio
-async def test_over_the_budget_is_given_in_full_and_logged_naming_every_file(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """The budget is a rough guide (step 2, 26 October 2026, census FRG-025):
-    documents over it are given in full and the overrun is logged."""
-    at_limit = "x" * (PROJECT_DOCUMENTS_BUDGET_BYTES - len(AGENTS))
-    tree = _Tree({"AGENTS.md": AGENTS, DECLARED[0]: at_limit})
-    documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
-    assert why is None and sum(d.bytes for d in documents) == PROJECT_DOCUMENTS_BUDGET_BYTES
-
-    tree.files[DECLARED[0]] = at_limit + "x"
-    with caplog.at_level("WARNING"):
-        documents, why = await _read(tree, _declared(documents=(DECLARED[0],)))
-    assert why is None
-    assert sum(d.bytes for d in documents) == PROJECT_DOCUMENTS_BUDGET_BYTES + 1
-    assert str(PROJECT_DOCUMENTS_BUDGET_BYTES) in caplog.text
-    assert f"AGENTS.md ({len(AGENTS)} bytes)" in caplog.text
-    assert f"{DECLARED[0]} ({len(at_limit) + 1} bytes)" in caplog.text
-    assert "ADVISORY" in caplog.text
-
 
 def test_each_context_text_starts_with_one_line_naming_its_path() -> None:
     documents = (
@@ -553,23 +531,6 @@ async def test_invalid_utf8_is_refused(tmp_path: Path) -> None:
     assert documents == ()
     assert why is not None and DECLARED[0] in why and "not UTF-8 text" in why
 
-
-@pytest.mark.asyncio
-async def test_the_budget_counts_raw_bytes(tmp_path: Path) -> None:
-    """Multi-byte characters count by their bytes: 43,691 three-byte
-    characters are 131,073 bytes, over the 131,072-byte budget."""
-    text = "—" * (PROJECT_DOCUMENTS_BUDGET_BYTES // 3 + 1)
-    repo, sha = _commit_bytes(tmp_path, {DECLARED[0]: text.encode("utf-8")})
-    runner = WorktreeGitRunner(worktrees_root=tmp_path / "wt")
-
-    documents, why = await read_project_documents_at_commit(
-        runner, repo_path=str(repo), commit=sha, declared=_declared(documents=(DECLARED[0],))
-    )
-
-    assert len(text) < PROJECT_DOCUMENTS_BUDGET_BYTES
-    # Over the guide by raw bytes, and still given in full (step 2).
-    assert why is None
-    assert sum(d.bytes for d in documents) == len(text.encode("utf-8"))
 
 
 @pytest.mark.asyncio
@@ -776,22 +737,6 @@ async def test_a_document_missing_at_the_commit_fails_the_run_at_the_door(
     assert DECLARED[1] in h.errors[0] and "no such file" in h.errors[0]
 
 
-@pytest.mark.asyncio
-async def test_documents_over_the_budget_do_not_stop_the_run_at_the_door(
-    ledger: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    big = "y" * PROJECT_DOCUMENTS_BUDGET_BYTES
-    _remote, copy = _seed_project(tmp_path, extra={DECLARED[1]: big})
-    h = at_the_door._make_driver(ledger, repo_path=copy, worktrees_root=tmp_path / "wt")
-    row = at_the_door._queue_running(ledger)
-
-    assert await h.driver._door(row, at_the_door.CID) is not None
-
-    assert ledger.get_run(at_the_door.CID)["state"] != PlanningState.FAILED.value
-    recorded = _recorded(ledger, at_the_door.CID)
-    assert len(recorded) == 1
-    assert DECLARED[1] in [d["path"] for d in recorded[0]]
-
 
 # ---------------------------------------------------------------------------
 # The whole chain: what the spec writer and the plan writer are sent
@@ -894,9 +839,6 @@ def _chain(
             dispatch_feature_spec=dispatch_spec,
             dispatch_feature_plan=dispatch_plan,
             normalize_feature_spec=ok,
-            validate_feature_plan=ok,
-            validate_pass_bar=ok,
-            validate_gate_registry=ok,
             dispatch_build_trigger=dispatch_build_trigger,
         )
     )
@@ -1165,11 +1107,3 @@ async def test_a_run_past_the_door_before_documents_were_read_says_so_once(
     assert len(said) == 1
 
 
-def test_budget_is_128_kib_the_same_value_guardkit_uses_for_the_coach() -> None:
-    """Forge's planning budget and GuardKit's Coach budget are kept in step.
-
-    GuardKit's ``PROJECT_DOCUMENTS_BUDGET_BYTES`` (in
-    ``guardkit/orchestrator/harness/selector.py``) has its own test pinning
-    the same number; change both together.
-    """
-    assert PROJECT_DOCUMENTS_BUDGET_BYTES == 131_072

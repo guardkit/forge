@@ -43,7 +43,6 @@ import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
-from functools import partial
 from datetime import datetime, timezone
 from pathlib import Path
 from collections.abc import Mapping, Sequence
@@ -74,7 +73,6 @@ from forge.planning.work_queue_loop import (
 )
 from forge.planning.work_queue_store import WorkQueueStore
 from forge.planning.states import PlanningState
-from forge.preflight import run_resource_preflight
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.config.models import ForgeConfig, PlanningConfig
@@ -803,11 +801,8 @@ def _resolve_feature_yaml_path(
 ) -> str:
     """Resolve the repo-relative plan YAML to an ABSOLUTE ``feature_yaml_path``.
 
-    B4 round-14 second-fault fix. The Mode B build intake's path allowlist
-    (:func:`forge.adapters.nats.pipeline_consumer._path_inside_allowlist`)
-    calls :meth:`pathlib.Path.resolve` on the candidate; a repo-relative
-    value would resolve against the daemon process CWD — semantically wrong
-    and pass/fail by accident.
+    B4 round-14 second-fault fix: a repo-relative value would resolve
+    against the daemon process CWD, which is semantically wrong.
 
     The dispatch side does NOT consume ``feature_yaml_path`` to locate the
     spec — the autobuild executor
@@ -911,10 +906,9 @@ def compose_planning_git_runner(
     for repo, entry in planning.sandboxes.items():
         logger.info(
             "planning git for %s goes to the sidecar in sandbox %s at %s — "
-            "every planning leg's checks run there (the spec's gherkin "
-            "normalizer and provability check, the plan's stamping and "
-            "feature validate, the pass bars, the feature gate). Other "
-            "repositories stay in the forge container",
+            "every planning leg's commits are made there (the spec's gherkin "
+            "normalizer runs there). Other repositories stay in the forge "
+            "container",
             repo,
             entry.name,
             entry.sidecar_url,
@@ -1014,11 +1008,6 @@ async def compose_planning_consumer_and_dispatch(
         from forge.planning.frontier import FrontierSecondOpinion
         from forge.planning.target_terminal_tools import (
             make_normalize_feature_spec,
-            make_classify_scenarios,
-            make_normalize_stamps,
-            make_validate_feature_plan,
-            make_validate_gate_registry,
-            make_validate_pass_bar,
         )
 
         clock_fn = clock if clock is not None else lambda: datetime.now(timezone.utc)
@@ -1379,25 +1368,6 @@ async def compose_planning_consumer_and_dispatch(
         # (``guardkit._installer_core.*``) or a source checkout
         # (``installer.core.*``) — the B4 run 4b3b0893 in-container gap.
         normalize_feature_spec = make_normalize_feature_spec(command_prefix=None)
-        validate_feature_plan = make_validate_feature_plan()
-        # THE STAMP NORMALIZER (Rich's condition 1, 2026-08-16): ``guardkit qa
-        # normalize-stamps`` runs against the planning worktree immediately
-        # BEFORE the plan-commit validate, so the rule-minted verifier stamps
-        # are WRITTEN on the planning branch and ride the plan commit. Same
-        # frozen guardkit seam; an older guardkit without the subcommand
-        # continues (receipted) until the rebake.
-        normalize_stamps = make_normalize_stamps()
-        # The worked examples are checked for provability before the spec card
-        # (2026-09-07): a refused one is rewritten once by the machine before Rich
-        # is asked anything. Unwired, the card is exactly as before.
-        classify_scenarios = make_classify_scenarios()
-        # B4 round-19: the per-task pass bars forge mints from the 007 seed are
-        # validated by guardkit's OWN ``qa validate pass-bar`` before they land.
-        validate_pass_bar = make_validate_pass_bar()
-        # F2: the per-feature live gate forge fills + its appended registry entry
-        # are validated by guardkit's OWN ``qa validate gate-registry`` before
-        # they land.
-        validate_gate_registry = make_validate_gate_registry()
 
         # -- approval side -------------------------------------------------
         approval_publisher = ApprovalPublisher(nats_client=nats_client)
@@ -1557,26 +1527,11 @@ async def compose_planning_consumer_and_dispatch(
                 publish_notification=publish_planning_notification,
                 publish_planning_failed=publish_planning_failed,
                 publish_planning_complete=publish_planning_complete,
-                # O-27/O-29 (E2-S4) — pre-run memory/disk headroom preflight,
-                # bound to a zero-arg callable so the driver stays ignorant of
-                # /proc + shutil. Defaults enabled=True (refuses only BEFORE a
-                # run starts, never a mid-run kill).
-                resource_preflight=partial(
-                    run_resource_preflight, config.resource_preflight
-                ),
                 # Lane B / Phase E1 (B2) — target-terminal legs (no-op unless
                 # planning.target_terminal.enabled is on).
                 dispatch_feature_spec=dispatch_feature_spec,
                 dispatch_feature_plan=dispatch_feature_plan,
                 normalize_feature_spec=normalize_feature_spec,
-                validate_feature_plan=validate_feature_plan,
-                normalize_stamps=normalize_stamps,
-                classify_scenarios=classify_scenarios,
-                validate_pass_bar=validate_pass_bar,
-                # Lane B / Phase E1 (F2) — the per-feature live-gate registration
-                # leg (sibling of the pass-bar leg; no-op unless the endpoint is
-                # derivable AND the repo carries the qa/gates/ surface).
-                validate_gate_registry=validate_gate_registry,
                 # Lane B / Phase E1 (B3) — the Mode B build trigger.
                 dispatch_build_trigger=dispatch_build_trigger,
                 feature_routing_gate=feature_routing_gate,

@@ -105,7 +105,7 @@ def test_the_boot_log_no_longer_says_some_legs_are_not_declared(caplog) -> None:
         compose_planning_git_runner(planning)
     said = " ".join(r.getMessage() for r in caplog.records)
     assert "api-test" in said and "http://127.0.0.1:8225" in said
-    assert "every planning leg's checks run there" in said
+    assert "every planning leg's commits are made there" in said
     for stale in (
         "Only the plan leg's checks are declared",
         "hand a Python function",

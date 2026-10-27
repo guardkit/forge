@@ -96,7 +96,6 @@ def deps_factory(forge_config: ForgeConfig):
             is_duplicate_terminal=is_dup,
             dispatch_build=dispatch,
             publish_build_failed=publish_failed,
-            retired_planning_handoffs=lambda: frozenset(),
         )
         return deps, {
             "is_duplicate_terminal": is_dup,
@@ -154,26 +153,26 @@ def _make_msg(data: bytes) -> AsyncMock:
 
 
 # ---------------------------------------------------------------------------
-# AC-2: path-allowlist rejection threads inbound correlation_id
+# AC-2: a refused build (no registered checkout) threads inbound correlation_id
 # ---------------------------------------------------------------------------
 
 
 class TestPathRejectionThreadsCorrelationId:
     """AC-2 — the empirical case from 2026-05-04 (correlation_id 21df1258-…).
 
-    The inbound envelope carries ``correlation_id`` 21df1258-…; the path
-    is outside the allowlist so the consumer rejects on the path-validation
-    path. The outbound ``build-failed`` MUST carry the inbound
+    The inbound envelope carries ``correlation_id`` 21df1258-…; the
+    relative feature path names a repository with no registered checkout, so
+    the consumer refuses it. The outbound ``build-failed`` MUST carry the inbound
     ``correlation_id`` (DDR-029); prior to this task it carried ``None``.
     """
 
     @pytest.mark.asyncio
-    async def test_path_outside_allowlist_threads_inbound_correlation_id(
+    async def test_a_refused_build_threads_inbound_correlation_id(
         self, deps_factory, tmp_path: Path
     ) -> None:
-        outside = tmp_path / "outside" / "feature.yaml"
-        outside.parent.mkdir()
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(outside)))
+        payload = _valid_payload_dict(tmp_path / "feature.yaml")
+        payload["feature_yaml_path"] = ".guardkit/features/FEAT-43DE.yaml"
+        msg = _make_msg(_envelope_bytes(payload))
         deps, mocks = deps_factory()
 
         await handle_message(msg, deps)
@@ -277,8 +276,7 @@ class TestAllRejectionPathsThreadCorrelationId:
     """AC-4 — the contract MUST NOT be lost again.
 
     The parametrised test exercises every rejection path in
-    :func:`handle_message` (originator-not-recognised and path-outside-
-    allowlist — both have a parsed envelope, so both threading paths are
+    :func:`handle_message` (a refused build has a parsed envelope, so its threading path is
     proven by one assertion shape). The malformed-envelope path is
     covered by the dedicated ``test_malformed_envelope_passes_none`` case
     because it is the only path where ``correlation_id=None`` is the
@@ -290,21 +288,6 @@ class TestAllRejectionPathsThreadCorrelationId:
     the field will fail this test.
     """
 
-    @pytest.mark.asyncio
-    async def test_originator_rejection_threads_correlation_id(
-        self, deps_factory, allowlist_root: Path
-    ) -> None:
-        yaml_path = allowlist_root / "feature.yaml"
-        bad = _valid_payload_dict(yaml_path)
-        bad["originating_adapter"] = "not-on-the-allowlist"
-        msg = _make_msg(_envelope_bytes(bad))
-        deps, mocks = deps_factory()
-
-        await handle_message(msg, deps)
-
-        mocks["publish_build_failed"].assert_awaited_once()
-        kwargs = mocks["publish_build_failed"].await_args.kwargs
-        assert kwargs.get("correlation_id") == INBOUND_CORRELATION_ID
 
     @pytest.mark.asyncio
     async def test_malformed_payload_with_parseable_envelope_threads_correlation_id(

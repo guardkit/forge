@@ -39,18 +39,14 @@ References: TASK-MP-012, FEAT-SPL-002, DF-009, RT-04, RT-08, DDR-007.
 from __future__ import annotations
 
 import asyncio
-import functools
-import dataclasses
 import difflib
 import hashlib
 import inspect
 import json
 import logging
-import math
 import os
 import re
 import sqlite3
-import subprocess
 import tempfile
 import time
 from dataclasses import dataclass, field
@@ -67,9 +63,6 @@ from forge.gating.identity import (
 )
 from forge.lifecycle.identifiers import validate_feature_id
 from forge.lifecycle.missions import mission_membership
-from forge.pipeline.dispatchers.specialist import (
-    FINAL_PLAN_REVIEW_FEEDBACK,
-)
 from forge.pipeline.merge_offer import (
     AFTER_DEPLOY_CHECK_STAGE,
     SKIP_NO_ENDPOINT_NAMED,
@@ -96,10 +89,7 @@ from forge.planning.declared_memory import (
     read_declared_project_documents,
     read_declared_reference,
 )
-from forge.planning.factory_deployment_context import (
-    ensure_factory_context,
-    record_factory_dispatch,
-)
+from forge.planning.factory_deployment_context import ensure_factory_context
 from forge.planning import memory_decisions
 from forge.planning.project_documents import (
     ProjectDocument,
@@ -133,15 +123,12 @@ from forge.planning.handoff import (
     build_feature_spec_input_content,
 )
 from forge.planning.planner import (
-    BoundaryViolation,
     DispatchProductOwner,
     ExecuteHandoff,
     Fail,
     PauseAtCheckpoint,
     plan_next_step,
 )
-from forge.planning.assumption_review import review_assumptions
-from forge.planning.plan_size import read_plan_size_note
 from forge.planning.code_evidence import (
     LISTED_ALL_MEANS,
     MAX_EVIDENCE_CHARS,
@@ -160,15 +147,6 @@ from forge.planning.code_evidence import (
     scenario_words,
     set_candidates,
     trim_to_budget,
-)
-from forge.planning.example_review import (
-    ExampleReview,
-    ExampleWords,
-    merge_reviews,
-    read_example_words,
-    reading_of,
-    review_examples,
-    worked_examples_in,
 )
 from forge.planning.repository_facts import (
     LocalCheckoutReader,
@@ -189,24 +167,13 @@ from forge.planning.revision import (
 from forge.planning.run_store import SqlitePlanningRunStore, TransitionRefused
 from forge.planning.states import PlanningState
 from forge.planning.target_repos import format_known_repos
-from forge.network_git import fetch_all_branches
-from forge.project_git import run_git
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from forge.config.models import PlanningConfig
     from forge.gating.wrappers import GateRepository, StateMachine
-    from forge.preflight import ResourcePreflightResult
     from forge.planning.checkpoint import SecondOpinionProvider
     from forge.planning.target_terminal_tools import (
-        ClassifyScenariosFn,
-        FeatureFilesFill,
         NormalizeFeatureSpecFn,
-        NormalizeStampsFn,
-        ScenarioProvabilityOutcome,
-        StampNormalizerOutcome,
-        ValidateFeaturePlanFn,
-        ValidateGateRegistryFn,
-        ValidatePassBarFn,
     )
 
 logger = logging.getLogger(__name__)
@@ -647,111 +614,6 @@ def _one_form(word: str) -> str:
     return lowered
 
 
-#: The repository files GuardKit's ``qa classify-scenarios`` reads to detect
-#: an HTTP surface (``detect_repo_http_surface`` at GuardKit ``7e8844ec``: the
-#: gate registry, the project's own declaration, and the two manifests). The
-#: verb is given the feature as a file of its own, so these are all it reads.
-CLASSIFIER_READS: tuple[str, ...] = (
-    "qa/gates/registry.yaml",
-    ".guardkit/config.yaml",
-    "pyproject.toml",
-    "package.json",
-)
-#: The largest of those files copied out of a commit; one bigger is refused.
-_CLASSIFIER_FILE_MAX_BYTES = 256 * 1024
-#: How long the one fetch of a start commit this checkout lacks may take.
-_START_COMMIT_FETCH_TIMEOUT_SECONDS = 60
-
-
-def _lay_out_commit(
-    repo_path: str,
-    commit: str,
-    into: Path,
-    *,
-    fetch_address: str | None = None,
-    repo: str | None = None,
-) -> str | None:
-    """Write the files the scenario check reads (:data:`CLASSIFIER_READS`),
-    as ``commit`` has them, into the new folder ``into``; ``None`` on
-    success, else one plain reason.
-
-    Each is read out of git's objects on its own (``git ls-tree`` for its
-    mode and size, then ``git cat-file blob``), so the cost is bounded by
-    those few files: nothing else of the commit is copied, a file the commit
-    does not hold is simply absent, a link or anything but an ordinary file
-    is not followed, and a file over :data:`_CLASSIFIER_FILE_MAX_BYTES` is
-    refused before it is read. Nothing in the checkout is touched, and
-    nothing of its working tree is copied (Codex review round 2, 7 October
-    2026: the earlier whole-commit archive was buffered with no limit).
-
-    Every git command goes through :func:`forge.project_git.run_git`, and a
-    missing start commit is fetched from the project's RECORDED address
-    (``fetch_address``), never the checkout's own origin (Forge git
-    hardening, 14 October 2026); git's own words are never repeated."""
-    if not re.fullmatch(r"[0-9a-f]{7,40}", commit or ""):
-        return f"{commit!r} is not a commit id"
-
-    def git(*args: str, timeout: float = _REPO_INVENTORY_GIT_TIMEOUT_SECONDS) -> "subprocess.CompletedProcess[bytes]":
-        return run_git(
-            ["-c", "safe.directory=*", "-C", str(repo_path), *args],
-            text=False,
-            timeout=timeout,
-        )
-
-    def present() -> bool:
-        return git("rev-parse", "--verify", "--quiet", f"{commit}^{{commit}}").returncode == 0
-
-    try:
-        # The start commit is fetched by the starting rule where the run's
-        # work happens, which need not be this checkout: a commit missing
-        # here is fetched from its remote once, time-limited (coach check 2).
-        if not present():
-            fetched = fetch_all_branches(
-                Path(repo_path),
-                fetch_address,
-                repo=repo,
-                timeout=_START_COMMIT_FETCH_TIMEOUT_SECONDS,
-            )
-            if not present():
-                why = (
-                    "it is not there even after fetching the project's recorded address"
-                    if fetched.refusal is None
-                    else f"fetching the project's recorded address failed ({fetched.refusal})"
-                )
-                return f"the checkout at {repo_path} does not have it: {why}"
-        listed = git("ls-tree", "-z", "-l", f"{commit}^{{commit}}", "--", *CLASSIFIER_READS)
-        if listed.returncode != 0:
-            said = listed.stderr.decode("utf-8", errors="replace").strip()
-            return f"git could not read the commit in the checkout at {repo_path} ({said or 'no reason given'})"
-        into.mkdir(parents=True)
-        for record in listed.stdout.split(b"\0"):
-            head, _, name = record.partition(b"\t")
-            parts = head.decode("ascii", errors="replace").split()
-            rel = name.decode("utf-8", errors="replace")
-            if len(parts) != 4 or rel not in CLASSIFIER_READS:
-                continue
-            mode, kind, oid, size = parts
-            if kind != "blob" or mode not in ("100644", "100755"):
-                # Not an ordinary file: as good as absent. A manifest stored
-                # as a symbolic link is not followed (GuardKit, reading a
-                # real checkout, would follow it); then no web framework is
-                # found through it, which is the safe side.
-                continue
-            if not size.isdigit() or int(size) > _CLASSIFIER_FILE_MAX_BYTES:
-                return (
-                    f"{rel} is {size} bytes at that commit, over the "
-                    f"{_CLASSIFIER_FILE_MAX_BYTES}-byte limit for a file the check reads"
-                )
-            blob = git("cat-file", "blob", oid)
-            if blob.returncode != 0:
-                return f"git could not read {rel} out of the commit"
-            target = into / rel
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(blob.stdout[: _CLASSIFIER_FILE_MAX_BYTES])
-    except (OSError, subprocess.TimeoutExpired) as exc:
-        return f"git could not be run ({type(exc).__name__})"
-    return None
-
 
 #: The longest ranked code search query sent to the sandbox helper (12 October
 #: 2026): the request's distinctive words, cut here.
@@ -847,13 +709,6 @@ terminal's derived projection, ``pipeline.planning-complete``. ``extra`` holds
 the fields the event carries beyond its typed ones (``outcome``, ``proof``,
 ``summary``). Published only for the "already done, nothing to build" outcome
 (7 October 2026), and only after its PLANNED_HANDOFF transition committed."""
-
-ResourcePreflightFn = Callable[[], "ResourcePreflightResult"]
-"""``() -> ResourcePreflightResult`` — a zero-arg pre-run resource check.
-
-Bound (e.g. ``functools.partial(run_resource_preflight, config.resource_preflight)``)
-so the driver stays ignorant of ``/proc`` and ``shutil``. Consulted once at the
-QUEUED→RUNNING run-start boundary (O-27/O-29); ``None`` = no preflight wired."""
 
 SubscriberFactory = Callable[[str | None, "asyncio.Event | None"], Any]
 """``(expected_approver, armed_event) -> subscriber`` — the returned object
@@ -1175,29 +1030,10 @@ def _possible_contradiction_text(
     return text[:_POSSIBLE_CONTRADICTION_MAX_CHARS]
 
 
-# ---------------------------------------------------------------------------
-# The worked examples are checked for provability BEFORE the spec card
-# (Part K of the rewrite-on-refusal lane, 2026-09-07, on Rich's decision).
-#
-# Until now the routing law first saw the examples at the plan stage, after
-# the owner's yes; a refusal there cost him a wait and, at worst, a stop.
-# Now, after the draft is committed and before the door opens, the spec leg
-# runs guardkit's rules-only check on the committed .feature, and the card
-# the owner reads names any refused example. Since step 2 (26 October 2026,
-# census FRG-043) that is advice: the spec is not sent back before the card.
-# The plan stage's own stamping stays the consistency check, and the model
-# fallback's turn stays where rules 1a and 6b put it.
-# ---------------------------------------------------------------------------
-
 #: Where the plan leg's approved record carries that line for the build gate
 #: (:func:`forge.cli._serve_gate_activation.maybe_gate_build` reads it).
 PLAN_REPOSITORY_UNAVAILABLE_KEY = "repository_unavailable"
 
-#: Where the plan leg's approved record carries the one size warning for the
-#: build gate (6 October 2026, planning improvements item 6), read beside the
-#: line above; and what was compared, for the record.
-PLAN_SIZE_NOTE_KEY = "plan_size_note"
-PLAN_SIZE_KEY = "plan_size"
 
 #: Where the plan leg's approved record carries the build card's line about
 #: the plan's review: its request-traceability score (step 2, 26 October 2026)
@@ -1205,23 +1041,6 @@ PLAN_SIZE_KEY = "plan_size"
 #: lines above.
 PLAN_REVIEW_NOTE_KEY = "plan_review_note"
 
-#: The build card's line for an unreadable plan review record.
-_PLAN_REVIEW_UNREADABLE_CARD_LINE = (
-    "Plan review record unreadable ({reason}), so nothing confirmed the plan "
-    "reviewer's verdict; this card decides."
-)
-
-#: Every spec-digest error the spec writer's own check reports starts with
-#: this (its ``validation.json``); the spec leg shows those on the card. The
-#: spec writer's check is the one place the digest is checked (step 2, 26
-#: October 2026); Forge's mirror of it, ``planning/spec_digest.py``, went.
-DIGEST_ERROR_PREFIX = "spec digest: "
-
-#: What the review-record reader says when the plan reviewer's readable
-#: decision did not approve the plan. Advice since step 2 (27 October 2026):
-#: the plan carries on and the build card says the reviewer did not approve
-#: it; the card decides. Every other problem with the record is bookkeeping.
-_SEMANTIC_NOT_APPROVED = "specialist semantic decision is not approved"
 
 #: The build card's line when the plan reviewer did not approve the plan
 #: (step 2, 27 October 2026): advice for the person, never a refusal.
@@ -1240,9 +1059,6 @@ _PLAN_ADVICE_CARD_LINE = "The planner's notes for you: {advice}"
 #: such lines are shown first.
 _MISSING_PREREQUISITE = "Missing prerequisite:"
 
-#: What the review-record reader says when the plan came with none at all
-#: (the planning seat's unaccepted best draft, step 2, 26 October 2026).
-_SEMANTIC_REVIEW_MISSING = "semantic_review.json is missing"
 
 #: The build card's line with the plan reviewer's request-traceability score
 #: (step 2, 26 October 2026): advice for the person, never a refusal.
@@ -1251,33 +1067,6 @@ _PLAN_REVIEW_SCORE_CARD_LINE = (
     "{score} out of 1 (its verdict: {verdict})."
 )
 
-#: Why the commit stops when the exact-artifact re-review answered with the
-#: plan writer's one ordinary-plan recovery instead of a review (step 1, 25
-#: October 2026): the plan attempt takes that plan and starts its checks again.
-_PLAN_RECOVERED = "the re-review answered with the plan writer's recovered plan"
-
-def _names_a_reviewer_refusal(reason: str) -> bool:
-    """Does a returned dispatch error carry the plan writer's own refusal?
-
-    The specialist reports a reviewer's refusal in one form, ``<mode> ...
-    refused: <reasons>`` (its retained objections, a refused exact review),
-    inside the failed command's message. Either way the plan carries on
-    (step 2, 27 October 2026); this only picks the build card's line: the
-    reviewer did not approve, or (no such verdict: an unavailable reply, a
-    closed connection, a timeout) the record could not be read.
-    """
-    return " refused: " in f" {reason}".lower()
-
-
-#: The suffix of the branch a recovered plan is written on when the planning
-#: branch already carries the first plan's commit (25 October 2026).
-_RECOVERED_BRANCH_SUFFIX = "-recovered"
-
-#: The note on the recovered plan's later calls: an ordinary plan, so the
-#: already-done answer is not offered again.
-_RECOVERED_PLAN_NOTE = (
-    "An earlier answer was objected to; this is the ordinary plan with its tasks."
-)
 
 #: The spec card's line when the planner could not read the repository
 #: (the 1 October planner fix, 1 October 2026). Plain words; the reason is the
@@ -1303,24 +1092,6 @@ def _partial_card_line(reason: str) -> str:
     return _REPOSITORY_FACTS_PARTIAL_CARD_LINE.format(reason=text)
 
 
-#: The card's line when examples are still unprovable after the round — or
-#: when the checker refused the machine's rewrite, so the card opens on the
-#: draft as first written (rule 45, the spec's own words). The titles are
-#: verbatim, quoted, separated by semicolons.
-_PROVABILITY_UNPROVABLE_CARD_LINE = (
-    "The rules-only check could not assign a verifier to {n} worked example(s): "
-    "{titles}. This is not a semantic impossibility. If you "
-    "approve, the plan stage will ask the model fallback to place them; or "
-    "send a note."
-)
-
-#: The receipt's words when no check collaborator is wired (hermetic
-#: composition, or a serve that predates the seam).
-_PROVABILITY_NOT_WIRED_DETAIL = (
-    "no provability check is wired (classify_scenarios), so the worked "
-    "examples were not checked by rule before the card; the plan stage's "
-    "stamping still checks them"
-)
 
 # ---------------------------------------------------------------------------
 # The machine rewrites on a refusal before it asks (2026-09-06).
@@ -1334,105 +1105,6 @@ _PROVABILITY_NOT_WIRED_DETAIL = (
 # read. Only a second refusal asks.
 # ---------------------------------------------------------------------------
 
-#: The machine's note to the spec writer — the refused titles verbatim, one
-#: per line, and one ask. Rule 2 of the lane's spec; the words are the spec's.
-_MACHINE_REWRITE_NOTE = (
-    "The rules-only check could not assign a verifier to these worked examples; "
-    "this is not a semantic impossibility:\n"
-    "{titles}\n"
-    "\n"
-    "Revise only these examples using facts in the supplied request and context. "
-    "Keep the behaviour each example specifies unchanged, including its "
-    "concurrency, timing, and other multi-interaction behaviour; never turn that "
-    "behaviour into sequential or single-interaction behaviour. Describe only "
-    "what a caller or user can observe through the interface the request or "
-    "context actually supplies (for example, an HTTP, command, screen, or message "
-    "interface). Do not invent an interface, status, field, implementation detail, "
-    "test name, or verifier. If the supplied facts cannot support a faithful "
-    "provable revision, leave that example unchanged; do not add an assumption or "
-    "ask a question. Keep every other worked example exactly as it is."
-)
-
-#: The note's author on every receipt: the machine, never a person.
-_MACHINE_NOTE_AUTHOR = "planning-driver (stamp normalizer refusal)"
-
-#: The spec card's line when the project's ``spec_examples:`` block is there
-#: and could not be read. Silence would hide the mistake: the person is told
-#: the examples were not checked, and why.
-_EXAMPLE_WORDS_UNREADABLE_CARD_LINE = (
-    "The project's list of examples it does not want unless asked for could "
-    "not be read ({reason}), so the worked examples were not checked against it."
-)
-
-#: The spec card's line when the spec writer's checker was asked whether each
-#: example follows from the request and gave no answer (6 October 2026).
-_EXAMPLE_READING_NO_VERDICT_CARD_LINE = (
-    "The check of whether each example follows from the request gave no answer."
-)
-
-#: The file the spec writer puts beside the spec with its checker's reading
-#: of whether each example asks for more than the request does.
-_EXAMPLE_SUPPORT_FILE = "example_support.json"
-
-#: The ONE un-mentioned line the owner reads when the rewrite stamped clean
-#: (rule 5). The spec card is not shown again; the three touches stand.
-_MACHINE_REWRITE_LINE = (
-    "{n} of the worked examples could not be proven as written, so the machine "
-    "asked the spec writer to express their behaviour through the supplied "
-    "interface. What changed: {changes}. The plan carries on."
-)
-
-#: The one sentence at the top of the plan-stop card when the rewrite did not
-#: get there (rule 6). ``{why}`` is one of the spec's two outcomes that reach
-#: this card: "still could not be proven" (the rewrite landed and the second
-#: stamping refused titles) or "changed nothing" (the rewrite came back
-#: saying the same thing, the model fallback had its turn on the spec of
-#: record — rule 6b, 2026-09-07 — and titles are still refused). A rewrite
-#: the checker refused stops, after the model's turn, with the note-refused
-#: sentence below and the model's own sentence after it (rule 6b).
-_MACHINE_REWRITE_STOP_SENTENCE = (
-    "The machine already asked the spec writer once to express these as "
-    "observable behaviour through the supplied interface; the rewrite {why}."
-)
-_REWRITE_STILL_UNPROVEN = "still could not be proven"
-_REWRITE_CHANGED_NOTHING = "changed nothing"
-
-#: The machine record's words for the model's turn after a rewrite that did
-#: not land (rule 6b) — never the owner's.
-_MODEL_TURN_NOTE = (
-    "the model fallback had its turn on the second stamping, on the spec of record"
-)
-_STILL_REFUSED_NOTE = (
-    "titles still refused after the model's turn, so the run stops (never a third try)"
-)
-
-#: The normalizer's provenance marks: an R-number is a RULE's decision, and
-#: ``model`` is the model fallback's own mark (guardkit's MODEL_RULE). The
-#: rule 6b line names what the MODEL decided, so a title a rule decided is
-#: never put in its mouth.
-_RULE_NUMBER_RE = re.compile(r"^r\d+[a-z]?$")
-_MODEL_RULE_MARK = "model"
-
-#: Why the spec writer could not rewrite the refused examples — the words in
-#: the parenthesis of the rule 6b line — the two outcomes the plan leg can
-#: see for itself.
-_REWRITE_REFUSED_BY_CHECKER_WHY = "the checker refused the rewrite twice"
-_REWRITE_CHANGED_NOTHING_WHY = "the rewrite changed nothing"
-
-#: Rule 6b (2026-09-07): the ONE un-mentioned line the owner reads when the
-#: spec writer could not rewrite the refused examples (the checker refused
-#: the rewrite twice, or it changed nothing) and the model fallback, given
-#: its turn on the second stamping, decided their verifiers. The spec's
-#: shape, verbatim for one example; ``{it}`` and ``{its_verifier}`` bend for
-#: more than one ("them", "their verifiers"). ``{decided}`` is
-#: "<title> → <word>" per example, joined with "; " — the real title and
-#: the real word from the second stamping's stamped map.
-_MACHINE_REWRITE_MODEL_LINE = (
-    "{n} of the worked examples could not be proven as written; the spec "
-    "writer could not express {it} as observable behaviour through the supplied "
-    "interface ({why}), so the model fallback decided {its_verifier}: {decided}. "
-    "The plan carries on."
-)
 
 #: What the owner reads when the spec writer's revision round is refused by
 #: the checker after a note (rule 23) — theirs or the machine's. It says what
@@ -1445,69 +1117,21 @@ _NOTE_REFUSED_MESSAGE = (
     "with the note folded into it."
 )
 
-#: The same event when the note was the MACHINE's (Part A, rule 6): the note
-#: is a list of titles and an instruction, so quoting it back would be noise.
-#: The owner reads how many examples could not be proven, that the machine
-#: tried once, why the checker refused, and the shape of sentence that works.
-_MACHINE_NOTE_REFUSED_MESSAGE = (
-    "Planning run {correlation_id} stopped at {stage}: {count} of the worked "
-    "examples could not be proven as written, and when the machine asked the "
-    "spec writer to express their behaviour through the supplied interface, the "
-    "checker refused the rewrite twice ({reason}). Nothing was built. To try "
-    "again, state the intended interface and its observable behaviour explicitly "
-    "in the sentence or supplied context, without unsupported details."
-)
-
-#: The commit that puts the approved spec back on the planning branch when the
-#: machine's rewrite moved the branch without changing anything the owner
-#: reads (rule 6b: the model's turn is "on the spec of record", and that has
-#: to be true of the branch, not only of the row — coach finding 2026-09-07).
-_SPEC_OF_RECORD_PUT_BACK_MESSAGE = (
-    "planning: the approved spec put back for {correlation_id} (the machine's "
-    "rewrite changed nothing the owner reads; its commit {rewrite_sha} is set aside)"
-)
-
-
-class _MachineNoteRefused(Exception):
-    """The checker refused the spec writer's revision round after the
-    MACHINE's note (rule 6b, 2026-09-07). Raised by :meth:`_draft_spec` when
-    the plan leg asked to hear about the refusal (``fail_on_refusal=False``)
-    instead of having the run failed there, so the model fallback can have
-    its turn on the second stamping before anyone is told to start again.
-    Carries the checker's reason as the dispatch reported it, and the
-    dispatch's own ``outcome: reason`` words for the machine record. Never
-    raised for an owner's note: that path is unchanged."""
-
-    def __init__(self, *, reason: Any, dispatch_reason: str) -> None:
-        super().__init__(dispatch_reason)
-        self.reason = reason
-        self.dispatch_reason = dispatch_reason
-
 
 @dataclass(frozen=True)
 class _PlanAttempt:
-    """One pass of the plan leg's work: read the spec, write the plan, stamp.
+    """One pass of the plan leg's work: read the spec, write the plan.
 
-    ``committed`` — the plan tree is on the branch (validate green, stamps
-    written) and the caller finishes the leg. Otherwise the stamp normalizer
-    stopped the commit where the routing law is enforced: ``stamps`` says how,
-    and the caller decides between the machine's one rewrite and the card. A
-    pass that failed the run loudly for any other reason is not an attempt
-    record at all — the helper returns ``None`` after ``_fail_leg``.
+    A pass that failed the run loudly is not an attempt record at all — the
+    helper returns ``None`` after ``_fail_leg``.
     """
 
-    committed: bool
-    stamps: "StampNormalizerOutcome | None"
     files: Mapping[str, str]
     slug: str
     sha: str | None = None
-    #: The specialist's decisive semantic review and exact artifact identity.
-    #: ``None`` only where the attempt never got as far as a reviewed tree.
-    #: The legacy field name is retained to avoid widening this private record.
+    #: The plan reviewer's record as the planning seat wrote it, shown on the
+    #: build card. The legacy field name is retained.
     traceability: Mapping[str, Any] | None = None
-    #: Why the plan's review record could not be read, after the one
-    #: re-review (24 October 2026): the build card says so and decides.
-    review_unreadable: str | None = None
     #: Why the plan reviewer did not approve the plan (step 2, 27 October
     #: 2026): the build card says so and decides; nothing refuses on it.
     review_refused: str | None = None
@@ -1515,11 +1139,6 @@ class _PlanAttempt:
     #: (7 October 2026): nothing was written, and the caller ends the run
     #: through :meth:`PlanningRunDriver._finish_nothing_to_build`.
     nothing_to_build: "_NothingToBuildAnswer | None" = None
-    #: The branch the plan was committed on when it is not the planning
-    #: branch: the plan writer's recovered plan after the final review of an
-    #: already committed tree (25 October 2026). ``None`` means the planning
-    #: branch itself.
-    branch: str | None = None
     #: The planning seat's ``plan_advice`` lines (``Missing prerequisite:``
     #: lines first), shown on the build card as information for the approver
     #: (step 2, 26 October 2026). Display only: nothing reads them to decide.
@@ -1528,42 +1147,12 @@ class _PlanAttempt:
 
 @dataclass(frozen=True)
 class _NothingToBuildAnswer:
-    """The plan writer's "nothing to build" answer, and what it is checked
-    against: the code windows Forge sent it. ``claim`` is ``None`` and
+    """The plan writer's "nothing to build" answer. ``claim`` is ``None`` and
     ``problem`` says why when the answer could not be read as one."""
 
     claim: "nothing_to_build.Claim | None"
     problem: str | None
-    windows: tuple["nothing_to_build.Window", ...]
 
-
-@dataclass(frozen=True)
-class _StampPrelude:
-    """What the stamping step settled BEFORE the normalizer ran (sandbox
-    first, 2026-09-07): the routing law's enforcement for the repo/feature,
-    whether this stamping runs by rule only (and the note when it was asked
-    to and could not), and the ``feature_files:`` fill's receipt. Shared by
-    the closure and the declared form of the plan leg's pre-commit."""
-
-    enforcement: dict[str, str]
-    by_rule_only: bool
-    rules_only_note: str
-    fill: "FeatureFilesFill"
-
-
-@dataclass(frozen=True)
-class _DeclaredPlanChecks:
-    """The plan leg's pre-commit, declared for a sandbox git runner (rule
-    70): the checks by name, the files to commit (the plan YAML with the
-    committed spec path(s) written in when the plan-writer left the key
-    out), the prelude the outcomes are finished with, and — when forge's own
-    check refused the plan before the normalizer — that refusal as the
-    stamping outcome (the normalizer is then not declared)."""
-
-    checks: PreCommitChecks
-    files: dict[str, str]
-    prelude: _StampPrelude
-    stamps: "StampNormalizerOutcome | None" = None
 
 
 @dataclass(frozen=True)
@@ -1791,12 +1380,6 @@ class PlanningDriverDeps:
     # its pre-commit checks declared (``supports_declared_checks``) rather
     # than as a closure run here.
     git_runner_for_repo: Callable[[str], Any] | None = None
-    # O-27/O-29 (E2-S4) — pre-run resource-headroom preflight. Optional / default
-    # None: unwired = no preflight (byte-for-byte no-op). Wired, it is consulted
-    # exactly ONCE at the fresh QUEUED→RUNNING run-start boundary; a breach fails
-    # the run LOUDLY before any seat-holding dispatch (never a mid-run kill, and
-    # never re-run on a crash re-drive of an already-RUNNING run).
-    resource_preflight: ResourcePreflightFn | None = None
     # Lane B / Phase E1 (B2) — the target-terminal spec/plan legs. All optional
     # and default None: with the target-terminal flag OFF they are never
     # consulted (byte-for-byte no-op). With the flag ON they are required; a
@@ -1804,38 +1387,6 @@ class PlanningDriverDeps:
     dispatch_feature_spec: DispatchFeatureSpecFn | None = None
     dispatch_feature_plan: DispatchFeaturePlanFn | None = None
     normalize_feature_spec: "NormalizeFeatureSpecFn | None" = None
-    validate_feature_plan: "ValidateFeaturePlanFn | None" = None
-    # THE STAMP NORMALIZER (Rich's condition 1, 2026-08-16) — ``guardkit qa
-    # normalize-stamps`` run against the planning worktree immediately BEFORE
-    # the plan-commit ``feature validate``, so the rule-minted ``verifier:``
-    # stamps are WRITTEN on the planning branch and ride the plan commit.
-    # Optional / default None: unwired = the plan leg proceeds exactly as
-    # before and the plan receipts say ``not-wired`` (never silent). Wired, a
-    # refusal (undecidable titles) or a failure STOPS the run with a card
-    # naming the titles verbatim; an older guardkit without the subcommand
-    # continues (backward compatible until the rebake) and is receipted.
-    normalize_stamps: "NormalizeStampsFn | None" = None
-    # THE PROVABILITY CHECK BEFORE THE CARD (Part K, 2026-09-07) — ``guardkit
-    # qa classify-scenarios`` run, rules only, on the committed spec .feature
-    # BEFORE the digest card opens, so a worked example no rule can prove goes
-    # back to the spec writer as the machine's note before the owner is asked
-    # anything. Optional / default None: unwired = the card opens exactly as
-    # before and the draft row's receipt says the check did not run (never
-    # silent). A guardkit without the verb is likewise skipped and receipted.
-    classify_scenarios: "ClassifyScenariosFn | None" = None
-    # Lane B / Phase E1 (B4 round-19, Rich-ratified) — the guardkit ``qa validate
-    # pass-bar`` oracle. Optional / default None: with the flag OFF it is never
-    # consulted. With the flag ON the per-task QA pass-bar registration leg
-    # requires it; a missing collaborator fails the run LOUDLY (never a silent
-    # skip — the same posture as the other target-terminal oracles).
-    validate_pass_bar: "ValidatePassBarFn | None" = None
-    # Lane B / Phase E1 (F2 — the per-feature live-gate REGISTRATION leg, sibling
-    # of the pass-bar leg) — the guardkit ``qa validate gate-registry`` oracle.
-    # Optional / default None: with the flag OFF it is never consulted. With the
-    # flag ON the per-feature gate-registration leg requires it; a missing
-    # collaborator fails the run LOUDLY (never a silent skip — the same posture
-    # as the other target-terminal oracles).
-    validate_gate_registry: "ValidateGateRegistryFn | None" = None
     # Lane B / Phase E1 (B3) — the build trigger. Optional / default None: with
     # the target-terminal flag OFF it is never consulted; with the flag ON it is
     # required and a missing collaborator fails the run LOUDLY (never silent).
@@ -1860,56 +1411,6 @@ class _HistoryEvent:
     status: str
     details: Mapping[str, Any]
 
-
-#: What the plan-stop card says about the stamp check's model (5 October
-#: 2026). Plain words for the owner, one sentence per outcome; the build
-#: system's own detail, which names settings and error classes, stays in the
-#: receipt's model_outcome and the coordinator log.
-_NO_STAMP_MODEL_SENTENCE = (
-    "The plan's stamp check has no model named, so it did not ask a model; "
-    "the factory's settings need the stamp model set."
-)
-_MODEL_RAN_OUT_OF_ROOM_SENTENCE = (
-    "The plan's stamp check asked its model, but the model ran out of room "
-    "before it answered, so these scenarios could not be labelled; the "
-    "model needs a larger answer allowance."
-)
-_MODEL_TIMED_OUT_SENTENCE = (
-    "The plan's stamp check asked its model, but no answer came back in "
-    "time, so these scenarios could not be labelled."
-)
-_MODEL_UNREACHABLE_SENTENCE = (
-    "The plan's stamp check could not reach its model, so these scenarios "
-    "could not be labelled; check that the model service is running."
-)
-_MODEL_FAILED_SENTENCE = (
-    "The plan's stamp check asked its model, but the model did not give a "
-    "usable answer, so these scenarios could not be labelled."
-)
-_MODEL_ANSWER_REJECTED_SENTENCE = (
-    "The plan's stamp check asked its model, but its answer was not one the "
-    "check accepts, so these scenarios could not be labelled."
-)
-
-
-def _model_failed_sentence(detail: str) -> str:
-    """The plain sentence for a stamp-check model call that failed, chosen
-    from the build system's own detail: it ran out of room, it timed out, it
-    could not be reached, or anything else. Never echoes the detail."""
-    lowered = detail.lower()
-    if "ran out of room" in lowered or "max_tokens" in lowered or "was empty" in lowered:
-        return _MODEL_RAN_OUT_OF_ROOM_SENTENCE
-    if "timed out" in lowered or "timeout" in lowered:
-        return _MODEL_TIMED_OUT_SENTENCE
-    if (
-        "connection refused" in lowered
-        or "connecterror" in lowered
-        or "urlerror" in lowered
-        or "name or service not known" in lowered
-        or "unreachable" in lowered
-    ):
-        return _MODEL_UNREACHABLE_SENTENCE
-    return _MODEL_FAILED_SENTENCE
 
 
 class PlanningRunDriver:
@@ -2015,39 +1516,9 @@ class PlanningRunDriver:
                 )
                 return
 
-            # O-27/O-29 — resource-headroom preflight at the fresh run-start
-            # boundary. We are now RUNNING (FAILED is a legal edge) and nothing
-            # has dispatched yet, so a starved box refuses CLEANLY here rather
-            # than risk a mid-run kernel OOM-kill / ENOSPC. Only on this fresh
-            # QUEUED→RUNNING path: a crash re-drive of an already-RUNNING run
-            # never re-preflights (we never kill work in flight).
-            if deps.resource_preflight is not None:
-                preflight = deps.resource_preflight()
-                if not preflight.ok:
-                    logger.error(
-                        "planning driver: %s refused at run start — %s",
-                        correlation_id,
-                        preflight.summary,
-                    )
-                    await self._fail_leg(
-                        correlation_id,
-                        stage_label="resource-preflight",
-                        reason=preflight.summary,
-                    )
-                    return
-
         # The QUEUED→RUNNING commit above precedes the sole HTTP seed.  A
         # recovered RUNNING/FEATURE_* path executes the same durable gate;
         # SUCCEEDED reuses its receipt and STARTED/UNKNOWN/FAILED refuses.
-        if deps.feature_routing_required and deps.feature_routing_gate is None:
-            # Step 2 (26 October 2026, census FRG-022): a missing routing gate
-            # is bookkeeping. The dispatchers already carry on unrouted with a
-            # log line when they have no gate; this copy no longer ends the run.
-            logger.warning(
-                "planning driver: run %s has no feature routing gate — "
-                "ADVISORY; planning carries on unrouted",
-                correlation_id,
-            )
         if deps.feature_routing_gate is not None and state is not PlanningState.PAUSED:
             try:
                 await deps.feature_routing_gate.ensure_seeded(
@@ -2159,14 +1630,6 @@ class PlanningRunDriver:
             # state is RUNNING — consult the pure planner over durable history
             history = self._load_history(correlation_id)
             decision = plan_next_step(history)
-
-            if isinstance(decision, BoundaryViolation):
-                await self._fail(
-                    correlation_id,
-                    stage_label="planning-boundary",
-                    reason=decision.rationale,
-                )
-                return
 
             if isinstance(decision, Fail):
                 await self._fail(
@@ -2844,68 +2307,32 @@ class PlanningRunDriver:
         or say what to tell the plan writer when it must plan as usual.
 
         Returns ``None`` when the run has ended here, and otherwise the note
-        for the one ordinary plan the caller then asks for (step 1
-        simplification, 24 October 2026: an incomplete proof is advice, not
-        the end of the run). Three steps:
+        for the one ordinary plan the caller then asks for: an answer that
+        could not be read, or one given while the switch is off, means "plan
+        as usual". (The check of its citations against Forge's own code
+        windows went in the cull, 27 October 2026.) Otherwise:
 
-        1. **Check the proof against Forge's own windows.** Every citation must
-           lie inside a code window Forge sent the plan writer. A miss or a
-           malformed answer means "plan as usual": the parts that were proven
-           go back to the plan writer as its note. Only the switch being off
-           still ends the run FAILED through :meth:`_fail_leg`.
-        2. **End the run in the existing success state.** FEATURE_PLAN →
+        1. **End the run in the existing success state.** FEATURE_PLAN →
            PLANNED_HANDOFF, labelled :data:`nothing_to_build.STAGE_LABEL`,
            with the marker, the proof and the owner's sentence in the
            transition's ``details_json``. No ``feature-plan`` event is
            written, so the plan leg's re-drive shortcut can never fire.
-        3. **Tell people once, and only if the transition committed.** One
+        2. **Tell people once, and only if the transition committed.** One
            ``pipeline.planning-complete`` carrying the marker and the proof,
            then one owner message. A refused transition means another writer
            already ended the run: nothing is sent, and the refusal is logged.
         """
-        request = " ".join(self._request_text_of(row).split())
-        quoted = f'"{request}"' if request else "the request"
-
-        async def refuse(reason: str, sentence: str) -> None:
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_PLAN_STAGE,
-                "nothing to build refused: " + reason,
-                owner_message=sentence + " Nothing was built.",
-            )
-
         if not self._nothing_to_build_enabled():
-            await refuse(
-                "the planning.nothing_to_build switch is off",
-                f"The planner answered that {quoted} is already done, but this "
-                "factory does not take that answer yet, so the run stopped.",
+            return self._plan_as_usual(
+                correlation_id,
+                "this factory does not take that answer (the "
+                "planning.nothing_to_build switch is off)",
+                proven=(),
             )
-            return None
         claim = answer.claim
         if claim is None:
             problem = answer.problem or "it could not be read"
             return self._plan_as_usual(correlation_id, problem, proven=())
-        outside = nothing_to_build.citations_outside(claim, answer.windows)
-        if outside:
-            proven = nothing_to_build.Claim(
-                parts=tuple(
-                    (quote, cited)
-                    for quote, cited in claim.parts
-                    if not set(cited) & set(outside)
-                ),
-                scenarios=tuple(
-                    (title, cited)
-                    for title, cited in claim.scenarios
-                    if not set(cited) & set(outside)
-                ),
-            )
-            return self._plan_as_usual(
-                correlation_id,
-                "it pointed at lines outside the code it was shown ("
-                + ", ".join(outside)
-                + ")",
-                proven=nothing_to_build.proof_lines(proven),
-            )
 
         message = nothing_to_build.owner_message(
             self._request_text_of(row), target_repo, claim
@@ -3800,7 +3227,6 @@ class PlanningRunDriver:
         terminal failure.
         """
         deps = self._deps
-        ensure_factory_context(deps.store, correlation_id)
         if self._has_leg_event(correlation_id, _FEATURE_SPEC_STAGE):
             return self._advance_after_spec(correlation_id)
 
@@ -3833,34 +3259,12 @@ class PlanningRunDriver:
                     branch=branch,
                     plan_run_id=plan_run_id,
                     notes=notes,
-                    record=False,
                 )
                 if drafted is None:
                     return False  # the failure is already loud and terminal
-                # THE ASSUMPTIONS ARE REVIEWED BEFORE THE CARD (2026-09-13,
-                # planning coach §4c): an assumption that adds what the
-                # request did not ask for is shown on the card with the
-                # finding under it (advice since step 2, 26 October 2026).
-                drafted = await self._review_the_assumptions_before_the_card(
-                    row,
-                    correlation_id,
-                    drafted,
-                    repo_path=repo_path,
-                    branch=branch,
-                    notes=notes,
-                )
-                # THE EXAMPLES ARE CHECKED FOR PROVABILITY BEFORE THE CARD
-                # (Part K, 2026-09-07): the committed .feature is run through
-                # the routing law's rules-only check, a refused example is
-                # named on the card (advice since step 2), and the draft row
-                # is written HERE, with the receipt, so the card a restart
-                # replays is the card that was shown.
-                draft = await self._prove_the_examples_before_the_card(
-                    correlation_id,
-                    drafted,
-                    repo_path=repo_path,
-                    branch=branch,
-                )
+                # The draft row is written HERE, with the card, so the card a
+                # restart replays is the card that was shown.
+                draft = self._open_the_card(correlation_id, drafted)
 
             # THE ONE PAUSE. A run configured to skip the card on a thin
             # feature skips it here — mechanically decidable, no judgement.
@@ -4019,11 +3423,8 @@ class PlanningRunDriver:
         branch: str,
         plan_run_id: str,
         notes: list[str],
-        note_from_machine: bool = False,
-        fail_on_refusal: bool = True,
-        record: bool = True,
     ) -> dict[str, Any] | None:
-        """Dispatch the spec-writer, commit the spec, record the DRAFT row.
+        """Dispatch the spec-writer, commit the spec, return the draft.
 
         ``notes`` carries the owner's plain-English notes from earlier rounds;
         the newest is threaded back as ``validate_feedback`` VERBATIM together
@@ -4031,28 +3432,7 @@ class PlanningRunDriver:
         channel that has been vocabulary since it was designed. A first-round
         dispatch passes neither and is byte-identical to the call that shipped.
 
-        ``note_from_machine`` (2026-09-06): the newest note is the machine's
-        own — the plan leg sending refused worked examples back for one
-        rewrite — not a person's. The round runs exactly as an owner's note
-        round does (same dispatch, same coach, same must-pass criterion); what
-        differs is the words: the owner's message when the checker refuses the
-        rewrite names "the machine's note", and the card is not annotated,
-        because nobody is shown it again.
-
-        ``fail_on_refusal`` (rule 6b, 2026-09-07): ``False`` — honoured only
-        with ``note_from_machine`` — asks that a checker refusal of the
-        machine's round be RETURNED to the plan leg, as
-        :class:`_MachineNoteRefused`, rather than failing the run here, so
-        the model fallback can have its turn before anyone is told to start
-        again. An owner's note never passes it and keeps today's path exactly.
-        Every other failure of the round (the dispatch raising, the write, the
-        digest) still fails the run here, loudly, as before.
-
-        ``record`` (Part K, 2026-09-07): ``False`` returns the draft WITHOUT
-        writing its ``drafted`` row, so the spec leg can check the committed
-        examples for provability before the row that opens the card is
-        written (:meth:`_record_spec_draft`
-        writes it).
+        The draft row is written by :meth:`_open_the_card`.
 
         Returns the draft record (the same dict the door and the approved row
         read), or ``None`` when the leg has already failed loudly.
@@ -4105,7 +3485,6 @@ class PlanningRunDriver:
             project_context["code_evidence"] = code_evidence
 
         try:
-            record_factory_dispatch(deps.store, correlation_id, factory_document, stage="spec")
             result = await deps.dispatch_feature_spec(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
@@ -4131,23 +3510,6 @@ class PlanningRunDriver:
             return None
         ok, reason = self._dispatch_ok(result)
         if not ok:
-            if notes and note_from_machine and not fail_on_refusal:
-                # Rule 6b (2026-09-07): the checker refused the MACHINE's
-                # rewrite and the plan leg asked to decide for itself what
-                # happens next (the model fallback's turn, then the words).
-                # Nothing is failed here; nobody is told yet.
-                logger.warning(
-                    "planning driver: run %s — the checker refused the spec "
-                    "writer's rewrite after the machine's note (%s); handed "
-                    "back to the plan leg, which gives the model fallback its "
-                    "turn before the run stops",
-                    correlation_id,
-                    reason,
-                )
-                raise _MachineNoteRefused(
-                    reason=getattr(result, "reason", None),
-                    dispatch_reason=f"007 dispatch {reason}",
-                )
             # After a note, a not-ok dispatch is the checker refusing the
             # rewrite (the must-pass "what the note asks must change, and
             # nothing else may move without reason"). The owner is told what
@@ -4157,7 +3519,6 @@ class PlanningRunDriver:
                 self._note_refused_message(
                     correlation_id,
                     note=str(notes[-1]),
-                    note_from_machine=note_from_machine,
                     reason=getattr(result, "reason", None),
                 )
                 if notes
@@ -4168,8 +3529,7 @@ class PlanningRunDriver:
                 _FEATURE_SPEC_STAGE,
                 f"007 dispatch {reason}"
                 + (
-                    " (the checker refused the revision round after "
-                    f"{'the machine' if note_from_machine else 'the owner'}'s note)"
+                    " (the checker refused the revision round after the owner's note)"
                     if notes
                     else ""
                 ),
@@ -4210,41 +3570,6 @@ class PlanningRunDriver:
             )
             return None
 
-        # VALIDATION CHANNEL (C5): the 007 native map ships a validation.json
-        # self-check alongside the artifacts. TWO POSTURES, each honest about
-        # what it is.
-        #
-        # Every gate but one is ADVISORY: the B2 spec of record's REAL oracles
-        # run next (the normalizer + ``guardkit feature validate``), and a
-        # self-flagged spec that passes them is good enough by the estate's own
-        # bar (the gold hermetic run shipped accepted:false on a minor count
-        # note while the coach scored 0.985). So those are surfaced LOUDLY,
-        # verbatim, and the oracles decide.
-        #
-        # The DIGEST gate was the exception until 24 October 2026: its failure
-        # stopped the run. It is advice now, like the rest: a digest the
-        # spec-writer's own check doubted is still shown, and the card says
-        # what the check found, so the person reading it decides.
-        spec_val_errors = self._validation_failures(role_output)
-        digest_errors = [e for e in spec_val_errors if e.startswith(DIGEST_ERROR_PREFIX)]
-        other_errors = [
-            e for e in spec_val_errors if not e.startswith(DIGEST_ERROR_PREFIX)
-        ]
-        if other_errors:
-            logger.warning(
-                "007 validation.json self-check reported failures for %s "
-                "(ADVISORY — proceeding to the normalizer/validate oracles): %s",
-                correlation_id,
-                "; ".join(other_errors),
-            )
-        if digest_errors:
-            logger.warning(
-                "007 validation.json digest self-check reported failures for %s "
-                "(ADVISORY — the card says so): %s",
-                correlation_id,
-                "; ".join(digest_errors),
-            )
-
         feature_rel = self._feature_file_rel(files)
         normalize = deps.normalize_feature_spec
 
@@ -4258,14 +3583,10 @@ class PlanningRunDriver:
 
         # Sandbox first (2026-09-07, rule 87): a git runner that lives in the
         # repository's sandbox cannot run the closure above. For such a runner
-        # the SAME normalizer is DECLARED by name against the same file, and
-        # Part K's provability check rides the same commit — it is the check
-        # the routing law would run, on the very bytes that land on the
-        # branch, so what a red normalizer means and what the card says are
-        # unchanged. The in-container runner keeps the closure.
+        # the SAME normalizer is DECLARED by name against the same file. The
+        # in-container runner keeps the closure.
         git_runner = self._git_runner_for(target_repo)
         pre_commit: Any = _pre_commit
-        declared_spec_checks = False
         if self._runner_takes_declared_checks(git_runner):
             if feature_rel is None:
                 await self._fail_leg(
@@ -4276,7 +3597,6 @@ class PlanningRunDriver:
                 )
                 return None
             pre_commit = self._declare_spec_checks(correlation_id, feature_rel)
-            declared_spec_checks = True
 
         try:
             (
@@ -4313,10 +3633,6 @@ class PlanningRunDriver:
                 f"spec write / normalizer failed: {gitres.stderr}",
             )
             return None
-        if declared_spec_checks and not record:
-            # Only the pre-card path asks for Part K's answer (``record`` is
-            # false exactly there), so only that path keeps it.
-            self._keep_declared_provability(gitres)
 
         # THE DIGEST IS RE-PROVEN AGAINST THE COMMITTED SPEC. The spec-writer
         # checked its digest against its own text; the normalizer then rewrote
@@ -4346,18 +3662,15 @@ class PlanningRunDriver:
                 seed = dict(parsed_seed)
 
         digest_text = self._capture_digest(role_output, files)
-        proof = await self._prove_digest_against_branch(
+        digest_obj, card = await self._spec_card(
             correlation_id,
             target_repo=target_repo,
             repo_path=repo_path,
             branch=branch,
             files=files,
             digest_text=digest_text,
-            slug=slug,
             seed=seed,
-            problems=digest_errors,
         )
-        digest_obj, card = proof
 
         # DID THE NOTE ACTUALLY CHANGE ANYTHING? On a rewrite round the owner
         # has already read one of these lists and said what was wrong with it.
@@ -4375,7 +3688,6 @@ class PlanningRunDriver:
                     previous,
                     card,
                     note=str(notes[-1]),
-                    note_from_machine=note_from_machine,
                 )
 
         draft: dict[str, Any] = {
@@ -4417,16 +3729,6 @@ class PlanningRunDriver:
         )
         if coherence_warning is not None:
             draft["coherence_warning"] = coherence_warning
-        # WHETHER EACH EXAMPLE ASKS FOR MORE THAN THE REQUEST (6 October 2026):
-        # the spec writer's checker's reading, from THIS reply, beside the
-        # contradiction; the example check reads it from the draft.
-        example_support = self._capture_example_support(role_output, correlation_id)
-        if example_support is not None:
-            draft["example_support"] = example_support
-        if record:
-            self._record_spec_draft(
-                correlation_id, draft, note_from_machine=note_from_machine
-            )
         return draft
 
     @staticmethod
@@ -4435,27 +3737,17 @@ class PlanningRunDriver:
         card: Mapping[str, Any],
         *,
         note: str,
-        note_from_machine: bool,
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """What a note's rewrite changed on the list, and the card's words for
         it. Returns ``(card, rewrite)``: the rewrite record (``repeat``, the
-        note, the what-changed sentence, and the author when the note was the
-        machine's) and the card — annotated for an OWNER's note (the same-list
-        text, or the changed-list line appended), untouched for the machine's
-        (nobody is shown that card again, and "Your note was" would be a lie
-        on a row a person may read later)."""
+        note, the what-changed sentence) and the card, annotated with the
+        same-list text or the changed-list line."""
         rewrite: dict[str, Any]
         if _cards_say_the_same_thing(previous, card):
             rewrite = {"repeat": True, "note": note, "changes": ""}
         else:
             changes = _plain_card_changes(previous, card)
             rewrite = {"repeat": False, "note": note, "changes": changes}
-        if note_from_machine:
-            # The machine's own round (2026-09-06): the comparison is what
-            # the caller reads to decide between carrying on and stopping,
-            # and the receipt names the author.
-            rewrite["author"] = _MACHINE_NOTE_AUTHOR
-            return dict(card), rewrite
         card = dict(card)
         if rewrite["repeat"]:
             card["what_happened"] = _SAME_LIST_CARD_TEXT.format(note=note)
@@ -4470,8 +3762,6 @@ class PlanningRunDriver:
         self,
         correlation_id: str,
         draft: Mapping[str, Any],
-        *,
-        note_from_machine: bool,
     ) -> None:
         """Write the durable ``drafted`` row for a committed draft.
 
@@ -4487,23 +3777,13 @@ class PlanningRunDriver:
         )
         logger.info(
             "planning driver: run %s feature-spec drafted (slug=%s, %d files, "
-            "%d worked example(s), pass-bar seed %s) — %s",
+            "%d worked example(s), pass-bar seed %s) — showing the digest",
             correlation_id,
             draft.get("slug"),
             len(draft.get("spec_files") or []),
             int(draft.get("scenario_count") or 0),
             "captured" if draft.get("pass_bar_seed") is not None else "ABSENT",
-            (
-                "the machine's rewrite round (round 1); the digest is not shown again"
-                if note_from_machine
-                else "showing the digest"
-            ),
         )
-
-    # ------------------------------------------------------------------ #
-    # The worked examples are checked for provability before the card
-    # (Part K, 2026-09-07)
-    # ------------------------------------------------------------------ #
 
     @staticmethod
     def _request_text_of(row: Any) -> str:
@@ -4793,496 +4073,20 @@ class PlanningRunDriver:
             return _partial_card_line(facts.partial)
         return None
 
-    async def _review_assumptions_on_branch(
-        self,
-        draft: Mapping[str, Any],
-        *,
-        repo_path: str,
-        branch: str,
-        request_text: str,
-        repository_facts: str | None,
-    ) -> Any | None:
-        """The assumption review of the COMMITTED manifest, read back off the
-        planning branch — the same read the provability check makes for the
-        ``.feature``. ``None`` when there is no manifest to read."""
-        manifest_rel = next(
-            (
-                str(rel)
-                for rel in (draft.get("spec_files") or [])
-                if str(rel).endswith(_SPEC_ASSUMPTIONS_SUFFIX)
-            ),
-            None,
-        )
-        if manifest_rel is None:
-            return None
-        text = await self._deps.git_runner.read_file_from_branch(
-            repo_path=repo_path, branch=branch, file_path=manifest_rel
-        )
-        if text is None:
-            return None
-        return review_assumptions(
-            text, request_text=request_text, repository_facts=repository_facts
-        )
-
-    async def _review_the_assumptions_before_the_card(
-        self,
-        row: Any,
-        correlation_id: str,
-        draft: dict[str, Any],
-        *,
-        repo_path: str,
-        branch: str,
-        notes: list[str],
-    ) -> dict[str, Any]:
-        """Hold the committed draft's assumptions against the request and the
-        repository, and show on the card what was found (planning coach,
-        2026-09-13, design §4c).
-
-        The deterministic half of the planning coach. An assumption that adds
-        a capability the request does not mention is shown on the card with
-        the finding under it, so the person's touch is a decision rather than
-        a proofread. The spec example check (4 October 2026) runs beside it:
-        worked examples about something the request and the owner's notes do
-        not mention are named on the card by :meth:`_open_the_card_with`.
-        Since step 2 (26 October 2026, census FRG-029 and FRG-048) neither
-        sends the spec back to the writer: advice, never a rewrite round.
-
-        ``draft`` is a committed draft WITHOUT a row yet; this writes none —
-        the provability step that follows writes the draft row. Returns the
-        draft the rest of the leg continues with, its ``assumption_review``
-        receipt set.
-        """
-        request_text = self._request_text_of(row)
-        # THE SPEC EXAMPLE CHECK (4 October 2026) shares this step's one
-        # rewrite: an example about something the request does not mention,
-        # by the project's own declared words, goes back with the flagged
-        # assumptions in the same note. Since 6 October 2026 one more check
-        # shares it for every project, list or none, once the spec writer's
-        # checker sends its example_support.json: an example the checker reads
-        # as asking for more than the request does. Without that file, nothing
-        # changes. (The # Why: exact-quote check went on 16 October 2026.)
-        examples = await self._check_the_examples_first(
-            correlation_id, draft, repo_path=repo_path, request_text=request_text, notes=notes
-        )
-        review_failed: str | None = None
-        try:
-            facts = await self._repository_facts_for(correlation_id, repo_path, row)
-            review = await self._review_assumptions_on_branch(
-                draft, repo_path=repo_path, branch=branch, request_text=request_text, repository_facts=facts
-            )
-        except Exception as exc:  # noqa: BLE001 — a reviewer must never stop a run
-            # Same posture as the provability check beside it: a reviewer that
-            # cannot read is a reviewer that says so, not a failed planning run.
-            # The card opens exactly as it would have without this step —
-            # unless worked examples were flagged: they still go through the
-            # one rewrite, so the card never names as "kept" an example the
-            # writer was never asked about.
-            logger.warning(
-                "planning driver: run %s — the assumption review could not run "
-                "(%s: %s); %s",
-                correlation_id,
-                type(exc).__name__,
-                str(exc)[:160],
-                "the flagged worked examples still go back once"
-                if examples is not None and examples.findings
-                else "the card opens as written",
-            )
-            review_failed = f"the review could not run ({type(exc).__name__})"
-            if examples is None or not examples.findings:
-                draft["assumption_review"] = {
-                    "checked": False,
-                    "round": 0,
-                    "rewritten": False,
-                    "removed": [],
-                    "still_flagged": [],
-                    "not_checked": review_failed,
-                }
-                return draft
-            facts, review = None, None
-        receipt: dict[str, Any] = {
-            "checked": review is not None,
-            "round": 0,
-            "rewritten": False,
-            "removed": [],
-            "still_flagged": [],
-            "repository_facts": facts,
-        }
-        if review_failed is not None:
-            receipt["not_checked"] = review_failed
-        elif review is None:
-            receipt["not_checked"] = "the committed spec has no assumptions manifest to read"
-        else:
-            receipt["first"] = review.receipt()
-        flagged = list(review.flagged_ids) if review is not None else []
-        flagged_examples = examples.flagged_titles if examples is not None else []
-        if not flagged and not flagged_examples:
-            draft["assumption_review"] = receipt
-            return draft
-
-        # STEP 2 (26 October 2026, census FRG-029 and FRG-048): advice. A
-        # flagged assumption is shown on the card with the finding under it,
-        # and a flagged worked example is named on the card as kept; neither
-        # sends the spec back to the writer for a rewrite round.
-        receipt["still_flagged"] = flagged
-        if flagged_examples:
-            receipt["flagged_examples"] = list(flagged_examples)
-        logger.warning(
-            "planning driver: run %s — %d assumption(s) and %d worked example(s) "
-            "add what the request did not ask for — ADVISORY; the card shows "
-            "them: %s %s",
-            correlation_id,
-            len(flagged),
-            len(flagged_examples),
-            flagged,
-            flagged_examples,
-        )
-        if flagged and review is not None:
-            draft["card"] = self._card_with_assumption_warnings(
-                draft.get("card") or {}, review, flagged
-            )
-        draft["assumption_review"] = receipt
-        return draft
 
     # ------------------------------------------------------------------ #
     # The worked examples are checked against the request before the card
     # (4 October 2026), by the words the project itself declares
     # ------------------------------------------------------------------ #
 
-    async def _example_words_for(self, correlation_id: str, repo_path: str) -> ExampleWords:
-        """The project's ``spec_examples:`` list, read once per run.
 
-        Read the way the fact sheet reads the same file: through
-        :meth:`_repository_reader_for`, so a sandboxed repository is read on
-        the factory's own clone through the helper's read-only route. Off the
-        event loop, and never raises: a list that cannot be read is no check.
-        """
-        cache: dict[str, ExampleWords] = self.__dict__.setdefault("_example_words_cache", {})
-        if correlation_id not in cache:
-            try:
-                reader = self._repository_reader_for(repo_path, correlation_id)
-                words = await asyncio.to_thread(read_example_words, reader)
-            except Exception as exc:  # noqa: BLE001 — a reviewer must never stop a run
-                words = ExampleWords(
-                    None, not_checked=f"the project's list could not be read ({type(exc).__name__})"
-                )
-            if words.kinds is None:
-                logger.info(
-                    "planning driver: run %s — the worked examples are not checked "
-                    "against a project list (%s)",
-                    correlation_id,
-                    words.not_checked,
-                )
-            cache[correlation_id] = words
-        return cache[correlation_id]
-
-    async def _check_the_examples_first(
-        self,
-        correlation_id: str,
-        draft: Mapping[str, Any],
-        *,
-        repo_path: str,
-        request_text: str,
-        notes: Sequence[str],
-    ) -> ExampleReview | None:
-        """The first draft's examples held against the request and the
-        owner's notes so far.
-
-        Two checks, merged into one review (6 October 2026): the words the
-        project declares, when it declares some; and the spec writer's
-        checker's reading of whether each example asks for more than the
-        request does. The second runs for every project, but ONLY for a draft
-        that carries the checker's ``example_support.json``: the spec writer
-        writes it only once its own switch is on. Without it this is the
-        4 October check exactly: ``None`` when the project declares no list,
-        and the same note, card and receipt. (A third check, that each
-        ``# Why:`` line quoted the request exactly, was removed on 16 October
-        2026.)
-
-        What the card is later measured against is kept for the run, so
-        :meth:`_open_the_card_with` can name what the rewrite removed and
-        what it kept, whichever draft the card finally opens on.
-        """
-        words = await self._example_words_for(correlation_id, repo_path)
-        if draft.get("example_support") is None:
-            first = None
-            if words.kinds is not None:
-                feature_text = str((draft.get("card") or {}).get("worked_examples") or "")
-                first = review_examples(
-                    feature_text, request_text=request_text, notes=notes, kinds=words.kinds
-                )
-            self.__dict__.setdefault("_example_review_runs", {})[correlation_id] = {
-                "words": words,
-                "request_text": request_text,
-                "notes": [str(note) for note in notes],
-                "first": first,
-                "new_checks": False,
-            }
-            return first
-        state: dict[str, Any] = {
-            "words": words,
-            "request_text": request_text,
-            "notes": [str(note) for note in notes],
-        }
-        first, reading = self._examples_reviewed(state, draft)
-        state.update(
-            {
-                "new_checks": True,
-                "first": first,
-                "first_reading": reading,
-                "reading_ran": reading["status"] == "checked",
-            }
-        )
-        self.__dict__.setdefault("_example_review_runs", {})[correlation_id] = state
-        return first
-
-    @staticmethod
-    def _project_words_lines(
-        state: Mapping[str, Any], card: Mapping[str, Any]
-    ) -> tuple[list[str], dict[str, Any] | None]:
-        """The 4 October card lines and receipt: the project's words only."""
-        words: ExampleWords = state["words"]
-        receipt: dict[str, Any] = {"checked": words.kinds is not None, **words.receipt()}
-        if words.unreadable:
-            line = _EXAMPLE_WORDS_UNREADABLE_CARD_LINE.format(reason=words.unreadable)
-            receipt["card_lines"] = [line]
-            return [line], receipt
-        if words.kinds is None:
-            return [], receipt
-        first: ExampleReview | None = state["first"]
-        final = review_examples(
-            str(card.get("worked_examples") or ""),
-            request_text=state["request_text"],
-            notes=state["notes"],
-            kinds=words.kinds,
-        )
-        lines = final.card_lines(first)
-        receipt.update(
-            {
-                "first": first.receipt() if first is not None else None,
-                "final": final.receipt(),
-                "card_lines": lines,
-            }
-        )
-        return lines, receipt
-
-    @staticmethod
-    def _examples_reviewed(
-        state: Mapping[str, Any], draft: Mapping[str, Any]
-    ) -> tuple[ExampleReview, dict[str, Any]]:
-        """One draft's merged review and the checker's reading, from the
-        inputs kept for the run."""
-        feature_text = str((draft.get("card") or {}).get("worked_examples") or "")
-        words: ExampleWords = state["words"]
-        titles = [title for title, _ in worked_examples_in(feature_text)]
-        project = (
-            review_examples(
-                feature_text,
-                request_text=state["request_text"],
-                notes=state["notes"],
-                kinds=words.kinds,
-            )
-            if words.kinds is not None
-            else None
-        )
-        support = draft.get("example_support")
-        status, goes_beyond = reading_of(support, titles)
-        reading = {
-            "status": status or "not_asked",
-            "goes_beyond": [
-                dict(entry)
-                for entry in (support or {}).get("goes_beyond") or []
-                if isinstance(entry, Mapping) and entry.get("title") in goes_beyond
-            ]
-            if isinstance(support, Mapping)
-            else [],
-        }
-        merged = merge_reviews(titles, project, goes_beyond=goes_beyond)
-        return merged, reading
-
-    def _example_review_lines(
-        self, correlation_id: str, final_draft: Mapping[str, Any]
-    ) -> tuple[list[str], dict[str, Any] | None]:
-        """The card's lines about the examples, and the run's receipt.
-
-        The final draft is checked again by both checks: an example flagged
-        at first and gone now was removed; one flagged now was kept. A
-        project list that is there and could not be read is said in one line,
-        and the checker's reading is still used (6 October 2026).
-
-        The checker's reading is used only when a draft carried its
-        ``example_support.json``; otherwise this is the 4 October card and
-        receipt, word for word."""
-        state = (self.__dict__.get("_example_review_runs") or {}).get(correlation_id)
-        if state is None:
-            return [], None
-        words: ExampleWords = state["words"]
-        if not state.get("new_checks") and final_draft.get("example_support") is None:
-            return self._project_words_lines(state, final_draft.get("card") or {})
-        lines: list[str] = []
-        if words.unreadable:
-            lines.append(_EXAMPLE_WORDS_UNREADABLE_CARD_LINE.format(reason=words.unreadable))
-        first: ExampleReview | None = state["first"]
-        final, reading = self._examples_reviewed(state, final_draft)
-        lines += final.card_lines(first)
-        if reading["status"] == "no_verdict":
-            lines.append(_EXAMPLE_READING_NO_VERDICT_CARD_LINE)
-        receipt: dict[str, Any] = {
-            "checked": bool(
-                words.kinds is not None
-                or state.get("reading_ran")
-                or reading["status"] == "checked"
-            ),
-            "project_words": words.receipt(),
-            "reading": {
-                "status": reading["status"],
-                "first": state.get("first_reading"),
-                "final": reading,
-            },
-            "first": first.receipt() if first is not None else None,
-            "final": final.receipt(),
-            "card_lines": lines,
-        }
-        return lines, receipt
-
-    @staticmethod
-    def _card_with_assumption_warnings(
-        card: Mapping[str, Any], review: Any, flagged: Sequence[str]
+    def _open_the_card(
+        self, correlation_id: str, draft: Mapping[str, Any]
     ) -> dict[str, Any]:
-        """The card with the reviewer's finding under each assumption the
-        writer kept. The card's entries carry the assumption's words, not its
-        id, so the match is on the words the manifest gave them."""
-        warnings: dict[str, str] = {}
-        for entry in review.assumptions:
-            assumption_id = str(entry.get("id") or entry.get("assumption_id") or "")
-            if assumption_id in flagged:
-                text = str(entry.get("assumption") or entry.get("text") or "").strip()
-                warning = review.card_warning(assumption_id)
-                if text and warning:
-                    warnings[text] = warning
-        if not warnings:
-            return dict(card)
-        out = dict(card)
-        assumed = []
-        for item in out.get("what_the_machine_assumed") or []:
-            if not isinstance(item, Mapping):
-                assumed.append(item)
-                continue
-            entry = dict(item)
-            warning = warnings.get(str(entry.get("assumption") or "").strip())
-            if warning:
-                entry["why"] = f"{entry.get('why', '')} {warning}".strip()
-            assumed.append(entry)
-        out["what_the_machine_assumed"] = assumed
-        return out
-
-    async def _prove_the_examples_before_the_card(
-        self,
-        correlation_id: str,
-        draft: dict[str, Any],
-        *,
-        repo_path: str,
-        branch: str,
-    ) -> dict[str, Any]:
-        """Check the committed draft's examples by rule and write the draft
-        row that opens the card (rules 45–46).
-
-        ``draft`` is a committed draft WITHOUT a row yet (``record=False``).
-        The check is guardkit's rules-only dry run of the routing law on the
-        committed ``.feature``. An example it refuses is named on the card
-        (the cannot-be-proven line); since step 2 (26 October 2026, census
-        FRG-043) the spec is no longer sent back for a rewrite round. A check
-        that could not run (unwired, an older guardkit, a failure) is skipped
-        and receipted; the card is unchanged.
-
-        Returns the draft the card opens on — its row written, its
-        ``provability`` receipt set.
-        """
-        check = await self._check_provability_by_rule(
-            correlation_id, draft, repo_path=repo_path, branch=branch
-        )
-        provability: dict[str, Any] = {
-            "checked_by_rule": check.checked,
-            "refused_titles": list(check.refused_titles),
-            "rewritten": False,
-            "changes": None,
-            "check": check.receipt(),
-        }
-        if not check.checked:
-            provability["not_checked"] = check.detail
-            logger.warning(
-                "planning driver: run %s — the worked examples were not checked "
-                "for provability before the card (%s); the card opens as "
-                "written, and the plan stage's stamping is the check",
-                correlation_id,
-                check.detail,
-            )
-            return self._open_the_card_with(correlation_id, draft, provability)
-        if not check.refused_titles:
-            logger.info(
-                "planning driver: run %s — %s before the card; the card opens "
-                "as written",
-                correlation_id,
-                check.detail,
-            )
-            return self._open_the_card_with(correlation_id, draft, provability)
-
-        # STEP 2 (26 October 2026, census FRG-043): advice. An example no
-        # rule can prove is named on the card; the spec is no longer sent
-        # back to the writer for a rewrite round. The plan stage's stamping
-        # still decides it after the yes, where a project enforces the law.
-        refused = list(check.refused_titles)
-        provability["still_refused"] = list(refused)
-        logger.warning(
-            "planning driver: run %s — %d of the worked example(s) cannot be "
-            "proven by rule (%s) — ADVISORY; the card names them",
-            correlation_id,
-            len(refused),
-            refused,
-        )
-        return self._open_the_card_with(
-            correlation_id,
-            draft,
-            provability,
-            lines=[self._unprovable_card_line(refused)],
-        )
-
-    @staticmethod
-    def _unprovable_card_line(titles: Sequence[str]) -> str:
-        """Rule 45's cannot-be-proven line: the count and every title verbatim."""
-        return _PROVABILITY_UNPROVABLE_CARD_LINE.format(
-            n=len(titles),
-            titles="; ".join(f"“{title}”" for title in titles),
-        )
-
-    def _open_the_card_with(
-        self,
-        correlation_id: str,
-        draft: Mapping[str, Any],
-        provability: dict[str, Any],
-        *,
-        lines: Sequence[str] = (),
-    ) -> dict[str, Any]:
-        """Append rule 45's line(s) to the card's what-happened text, set the
-        ``provability`` receipt (rule 46) on the draft, write its ``drafted``
-        row, and return the draft the door opens on. No lines = the card
-        byte-identical to today's."""
+        """Put the spec writer's possible contradiction and the repository
+        line on the card, write the draft's ``drafted`` row, and return the
+        draft the door opens on."""
         final = dict(draft)
-        if lines:
-            card = dict(final.get("card") or {})
-            added = " ".join(lines)
-            card["what_happened"] = f"{card.get('what_happened', '')} {added}".strip()
-            final["card"] = card
-            provability["card_line"] = added
-        # THE SPEC EXAMPLE CHECK's lines (4 October 2026): what the rewrite
-        # removed and what it kept, named, so a possible loss shows as well.
-        example_lines, example_receipt = self._example_review_lines(correlation_id, final)
-        if example_lines:
-            card = dict(final.get("card") or {})
-            added = " ".join(example_lines)
-            card["what_happened"] = f"{card.get('what_happened', '')} {added}".strip()
-            final["card"] = card
-        if example_receipt is not None:
-            final["example_review"] = example_receipt
         # The possible contradiction gets a field of its own, never a line in
         # what_happened (4 October 2026). No warning: the card is unchanged.
         warning = final.get("coherence_warning")
@@ -5305,130 +4109,11 @@ class PlanningRunDriver:
             )
             final["card"] = card
             final["repository_facts_unavailable"] = unavailable_line
-        final["provability"] = provability
-        self._record_spec_draft(correlation_id, final, note_from_machine=False)
+        self._record_spec_draft(correlation_id, final)
         return final
 
-    async def _check_provability_by_rule(
-        self,
-        correlation_id: str,
-        draft: Mapping[str, Any],
-        *,
-        repo_path: str,
-        branch: str,
-    ) -> "ScenarioProvabilityOutcome":
-        """Run guardkit's rules-only check on the draft's COMMITTED ``.feature``.
 
-        The bytes are read back off the planning branch — the same call the
-        plan leg uses to read the spec of record — because the committed
-        file is what the plan stage will stamp, and the driver never learns
-        the worktree's path. Never raises: an unwired collaborator, a
-        missing file, or a raise comes back as an outcome that says so.
-        """
-        from forge.planning.target_terminal_tools import ScenarioProvabilityOutcome
-
-        kept = self._provability_from_the_sandbox.pop(
-            str(draft.get("sha") or ""), None
-        )
-        if kept is not None:
-            # The repository has a sandbox, so the check already ran there,
-            # beside the normalizer, on the committed bytes (rule 87).
-            logger.info(
-                "planning driver: run %s — the worked examples were checked "
-                "for provability in the repository's sandbox with the spec "
-                "commit: %s",
-                correlation_id,
-                kept.detail,
-            )
-            return kept
-
-        classify = self._deps.classify_scenarios
-        if classify is None:
-            return ScenarioProvabilityOutcome(
-                status="not-wired", detail=_PROVABILITY_NOT_WIRED_DETAIL
-            )
-        feature_rel = next(
-            (
-                str(rel)
-                for rel in (draft.get("spec_files") or [])
-                if str(rel).endswith(".feature")
-            ),
-            None,
-        )
-        if feature_rel is None:
-            return ScenarioProvabilityOutcome(
-                status="failed",
-                detail="the committed spec has no .feature file to check",
-            )
-        text = await self._deps.git_runner.read_file_from_branch(
-            repo_path=repo_path, branch=branch, file_path=feature_rel
-        )
-        if text is None:
-            return ScenarioProvabilityOutcome(
-                status="failed",
-                detail=(
-                    f"{feature_rel} could not be read back off the planning "
-                    "branch to be checked"
-                ),
-            )
-        # AT THE RUN'S STARTING COMMIT (7 October 2026). The verb reads the
-        # repository's own files to detect its HTTP surface. Where this
-        # coordinator holds a checkout, it is handed a copy of just those
-        # files as the commit the run starts from has them, never that
-        # checkout's working tree, which can lag the commit or carry local
-        # edits. A run with no
-        # recorded start (older than the starting rule), or no checkout here
-        # at all (nothing stale to read), is called as before.
-        start, failed = self._recorded_start(correlation_id)
-        if failed is not None:
-            return ScenarioProvabilityOutcome(status="unavailable", detail=failed)
-        try:
-            if start is None or not (Path(repo_path) / ".git").exists():
-                return await classify(Path(repo_path), text)
-            with tempfile.TemporaryDirectory(prefix="forge-start-commit-") as scratch:
-                # Only the files the check reads, as the start commit has
-                # them (CLASSIFIER_READS).
-                tree = Path(scratch) / "tree"
-                repo_key, address = self._fetch_address_for(repo_path)
-                why = await asyncio.to_thread(
-                    functools.partial(
-                        _lay_out_commit, repo_path, start, tree,
-                        fetch_address=address, repo=repo_key,
-                    )
-                )
-                if why is not None:
-                    return ScenarioProvabilityOutcome(
-                        status="unavailable",
-                        detail=(
-                            f"could not read the starting commit {start[:12]} to check "
-                            f"the worked examples against: {why}"
-                        ),
-                    )
-                return await classify(tree, text)
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:  # noqa: BLE001 — collaborator boundary
-            logger.exception(
-                "planning driver: run %s — the provability check raised",
-                correlation_id,
-            )
-            return ScenarioProvabilityOutcome(
-                status="failed",
-                detail=f"the provability check raised {type(exc).__name__}: {exc}",
-            )
-
-    @staticmethod
-    def _how_the_spent_rewrite_went(spec_row: Mapping[str, Any]) -> str | None:
-        """The plan-stop card's word for how the run's one rewrite went when
-        it was spent before this stamping, at the plan stage on an earlier
-        drive (``rewritten_by_machine``: it landed, so titles refused now
-        "still could not be proven"). ``None`` when no rewrite was spent.
-        (The pre-card round went in step 2, 26 October 2026.)"""
-        if spec_row.get("rewritten_by_machine"):
-            return _REWRITE_STILL_UNPROVEN
-        return None
-
-    async def _prove_digest_against_branch(
+    async def _spec_card(
         self,
         correlation_id: str,
         *,
@@ -5437,50 +4122,28 @@ class PlanningRunDriver:
         branch: str,
         files: Mapping[str, str],
         digest_text: str | None,
-        slug: str,
         seed: Mapping[str, Any] | None = None,
-        problems: Sequence[str] = (),
     ) -> tuple[dict[str, Any], dict[str, Any]]:
         """Read the digest and the COMMITTED spec, then build the card.
 
-        Returns ``(digest, card)``. Nothing here ends the run (24 October
-        2026): a missing or unreadable digest is shown as it is, and each
-        problem is a line on the card (``problems`` carries any the
-        spec-writer's own check found). Since step 2 (26 October 2026) Forge
-        no longer re-checks the digest against the spec itself: the spec
-        writer's own check, which lets the writer repair it, is the one place.
-        The person reading the card decides; the worked examples ride along.
+        Returns ``(digest, card)``. A digest that is missing or cannot be read
+        gives an empty summary; the worked examples ride along and the person
+        reading the card decides (the cull, 27 October 2026).
         """
-        found = [str(p) for p in problems]
         digest_obj: Any = {}
-        if not digest_text or not str(digest_text).strip():
-            found.append("the spec-writer sent no plain-language summary")
-        else:
+        if digest_text and str(digest_text).strip():
             try:
                 digest_obj = yaml.safe_load(str(digest_text))
-            except yaml.YAMLError as exc:
-                found.append(f"the summary could not be read ({exc})")
+            except yaml.YAMLError:
                 digest_obj = {}
-
+        if not isinstance(digest_obj, Mapping):
+            digest_obj = {}
         feature_rel = self._feature_file_rel(files)
         committed_feature: str | None = None
         if feature_rel:
             committed_feature = await self._deps.git_runner.read_file_from_branch(
                 repo_path=repo_path, branch=branch, file_path=feature_rel
             )
-        if committed_feature is None:
-            found.append("the committed worked examples could not be read back")
-        if not isinstance(digest_obj, Mapping):
-            found.append("the summary is not a list of sentences")
-            digest_obj = {}
-        if found:
-            logger.warning(
-                "planning driver: run %s spec summary problems (ADVISORY — shown "
-                "on the card): %s",
-                correlation_id,
-                "; ".join(found),
-            )
-
         card = self._digest_review_card(
             correlation_id,
             digest_obj=digest_obj,
@@ -5488,15 +4151,6 @@ class PlanningRunDriver:
             seed=seed,
             target_repo=target_repo,
         )
-        if found:
-            card["what_happened"] = (
-                "The spec-writer has written the worked examples this build "
-                "will be checked against. Below is the plain-language summary "
-                "it wrote, but ordinary code could not confirm it matches the "
-                "examples: " + "; ".join(found) + ". Read the worked examples "
-                "before saying yes."
-            )
-            card["summary_problems"] = list(found)
         return dict(digest_obj), card
 
     def _record_spec_approved(
@@ -5533,11 +4187,6 @@ class PlanningRunDriver:
             # and the gate leg falls back to the prose regex exactly as before.
             "digest": draft.get("digest"),
         }
-        if isinstance(draft.get("provability"), Mapping):
-            # Part K (2026-09-07): the pre-card provability receipt rides the
-            # approved row so the plan stage can read, from the durable row,
-            # whether the machine's one note round already ran.
-            record["provability"] = dict(draft["provability"])
         if answer is not None:
             # The one tap answered the sign-in question too, when the card
             # carried it — the pass-bars leg reads this instead of opening a
@@ -5577,84 +4226,12 @@ class PlanningRunDriver:
         )
         return self._advance_after_spec(correlation_id)
 
-    def _record_spec_approved_after_machine_rewrite(
-        self,
-        correlation_id: str,
-        draft: Mapping[str, Any],
-        *,
-        branch: str,
-        note: str,
-        refused_titles: Sequence[str],
-        changes: str,
-    ) -> dict[str, Any]:
-        """Record the spec's ``approved`` row AGAIN after the machine's rewrite.
-
-        Rule 4 of the rewrite-on-refusal lane (2026-09-06): the owner's decision
-        is carried, not lost. The latest approved row is copied forward whole —
-        ``spec_review`` (who said yes, the sign-in answer) unchanged, which the
-        pass-bars leg reads from this row and must still find — with the file
-        list, sha, seed and digest replaced by the rewritten spec's, plus
-        ``rewritten_by_machine``: the round, the note, the refused titles and
-        the what-changed sentence. Its presence is ALSO how a re-drive knows
-        the one rewrite has happened (rule 7): read from this row, never from
-        memory. Returns the block it wrote, for the plan receipt.
-
-        No transition: the run is already at FEATURE_PLAN.
-        """
-        record = dict(self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE))
-        record.update(
-            {
-                "slug": draft.get("slug"),
-                "spec_files": list(draft.get("spec_files") or []),
-                "target_repo": draft.get("target_repo"),
-                "repo_path": draft.get("repo_path"),
-                "branch": draft.get("branch") or branch,
-                "sha": draft.get("sha"),
-                "pass_bar_seed": draft.get("pass_bar_seed"),
-                "digest": draft.get("digest"),
-            }
-        )
-        block: dict[str, Any] = {
-            "round": 1,
-            "author": _MACHINE_NOTE_AUTHOR,
-            "note": note,
-            "refused_titles": list(refused_titles),
-            "changes": changes,
-        }
-        record["rewritten_by_machine"] = block
-        self._deps.store._record_event(
-            correlation_id=correlation_id,
-            stage_label=_FEATURE_SPEC_STAGE,
-            status="approved",
-            actor_identity="planning-driver",
-            details_json=json.dumps(record),
-        )
-        logger.info(
-            "planning driver: run %s feature-spec approved row re-recorded after "
-            "the machine's rewrite (round 1; slug=%s, %d files; the owner's "
-            "decision carried forward %s)",
-            correlation_id,
-            record.get("slug"),
-            len(record["spec_files"]),
-            "with the sign-in answer"
-            if (record.get("spec_review") or {}).get("sign_in_answer")
-            else "unchanged",
-        )
-        return block
-
-    @staticmethod
-    def _machine_rewrite_note(refused_titles: Sequence[str]) -> str:
-        """The machine's note to the spec writer: every refused title verbatim,
-        one per line, and the one ask (rule 2, the spec's own words)."""
-        titles = "\n".join(f"- {title}" for title in refused_titles)
-        return _MACHINE_REWRITE_NOTE.format(titles=titles)
 
     @staticmethod
     def _note_refused_message(
         correlation_id: str,
         *,
         note: str,
-        note_from_machine: bool,
         reason: Any,
     ) -> str:
         """The owner's sentence when the checker refused a revision round
@@ -5662,17 +4239,6 @@ class PlanningRunDriver:
         one sentence, that nothing was built, and what to do next."""
         one_sentence = " ".join(str(reason or "").split()).rstrip(".").strip()
         reason_words = one_sentence or "the checker gave no reason"
-        if note_from_machine:
-            # The machine's note lists the refused titles one per "- " line
-            # (:meth:`_machine_rewrite_note`); count them rather than quote them.
-            titles = [ln for ln in note.splitlines() if ln.strip().startswith("- ")]
-            count = str(len(titles)) if titles else "some"
-            return _MACHINE_NOTE_REFUSED_MESSAGE.format(
-                correlation_id=correlation_id,
-                stage=plain_stage_name(_FEATURE_PLAN_STAGE),
-                count=count,
-                reason=reason_words,
-            )
         return _NOTE_REFUSED_MESSAGE.format(
             correlation_id=correlation_id,
             note=note,
@@ -6370,44 +4936,16 @@ class PlanningRunDriver:
         return None
 
     async def _feature_plan_leg(self, row: Any, correlation_id: str) -> bool:
-        """FEATURE_PLAN leg: mint the FEAT id, dispatch 008, write + validate.
+        """FEATURE_PLAN leg: mint the FEAT id, dispatch 008, write the plan.
 
-        Returns True once the plan tree is validated + committed (the caller
-        proceeds to the B3 build trigger), False when the run has ended
-        (failed, or nothing to build). A
-        durable ``feature-plan`` approved event short-circuits a re-drive
-        (no re-dispatch — returns True so the build trigger still runs, which is
-        what makes a crash between the plan commit and BUILD_QUEUED recover).
-
-        THE MACHINE'S ONE REWRITE (2026-09-06). The work — read the approved
-        spec back, dispatch the plan-writer, stamp in the pre-commit step — is
-        :meth:`_plan_attempt`, and it runs up to twice. When the routing law is
-        enforced and the stamp normalizer refuses worked examples on the first
-        pass, the driver sends those examples back to the spec writer as its
-        own note (exactly as an owner's note goes: same dispatch, same coach,
-        same must-pass criterion), re-records the approved spec row with the
-        owner's decision carried forward, and runs the attempt again from the
-        top. A clean second stamping tells the owner in ONE un-mentioned line
-        and carries on; a landed rewrite whose second stamping still refuses
-        titles stops with the plan-stop card plus one sentence saying the
-        machine already tried. When the spec writer could NOT rewrite them —
-        the checker refused the rewrite twice, or it changed nothing — the
-        run does not stop yet (rule 6b, 2026-09-07, after run 696a3e38): the
-        second stamping runs anyway, on the spec of record (nothing was
-        re-recorded), with the model fallback allowed; if everything stamps
-        the owner reads one line naming what the model decided and the plan
-        carries on; if titles are still refused the run stops with the
-        note-refused sentence and the model's own sentence after it. Never a
-        third try; whether the one rewrite has happened is read from the
-        durable row, so a re-drive after a crash does the right thing either
-        side of it. Off by ``planning.rewrite_on_refusal: false``, which is
-        the 2026-09-05 path.
+        Returns True once the plan tree is committed (the caller proceeds to
+        the B3 build trigger), False when the run has ended (failed, or
+        nothing to build). A durable ``feature-plan`` approved event
+        short-circuits a re-drive (no re-dispatch — returns True so the build
+        trigger still runs, which is what makes a crash between the plan
+        commit and BUILD_QUEUED recover).
         """
         deps = self._deps
-        # An approved receipt survives a stop before the build is queued. It
-        # still binds this run to its captured context on recovery; validate
-        # before the idempotent shortcut can authorize downstream build work.
-        ensure_factory_context(deps.store, correlation_id)
         if self._has_leg_event(correlation_id, _FEATURE_PLAN_STAGE):
             logger.info(
                 "planning driver: run %s feature-plan already complete "
@@ -6416,12 +4954,12 @@ class PlanningRunDriver:
             )
             return True
 
-        if deps.dispatch_feature_plan is None or deps.validate_feature_plan is None:
+        if deps.dispatch_feature_plan is None:
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
-                "target terminal ON but the plan leg collaborators "
-                "(dispatch_feature_plan / validate_feature_plan) are not wired",
+                "target terminal ON but the plan leg collaborator "
+                "(dispatch_feature_plan) is not wired",
             )
             return False
         resolved = await self._resolve_repo(row, correlation_id, stage_label=_FEATURE_PLAN_STAGE)
@@ -6430,18 +4968,10 @@ class PlanningRunDriver:
         target_repo, repo_path = resolved
         branch = f"planning/{correlation_id}"
         plan_run_id = f"plan-{correlation_id}"
-        # The feature id is minted ONCE per run (rule 3): the machine's rewrite
-        # redoes the plan work on the same id and the same branch.
+        # The feature id is minted ONCE per run (rule 3).
         feature_id = self._mint_feature_id(correlation_id)
 
-        # Rule 1a (2026-09-07): when the rewrite round could still fire — the
-        # switch is on and this run has not had its one rewrite — the FIRST
-        # stamping runs by rule only (no model fallback), because a refusal
-        # is the signal the round listens for. Whether the law is enforced
-        # for the repo is the stamping step's own reading (an unenforced
-        # repo stamps as before). The second stamping, after a rewrite, asks
-        # the model about what is still refused.
-        first = await self._plan_attempt(
+        attempt = await self._plan_attempt(
             row,
             correlation_id,
             target_repo=target_repo,
@@ -6450,25 +4980,23 @@ class PlanningRunDriver:
             plan_run_id=plan_run_id,
             feature_id=feature_id,
             round_label="first",
-            rules_only=self._rewrite_round_could_fire(correlation_id),
         )
-        if first is None:
+        if attempt is None:
             return False  # already loud and terminal
-        # "Already done, nothing to build" (7 October 2026): a proven answer
-        # ends the run; one whose proof could not be used is followed by one
-        # ordinary plan (24 October 2026), which carries on below as usual.
-        plan_note: str | None = None
-        if first.nothing_to_build is not None:
+        # "Already done, nothing to build" (7 October 2026): the answer ends
+        # the run; one that could not be read is followed by one ordinary plan
+        # (24 October 2026), which carries on below as usual.
+        if attempt.nothing_to_build is not None:
             plan_note = await self._finish_nothing_to_build(
                 row,
                 correlation_id,
-                first.nothing_to_build,
+                attempt.nothing_to_build,
                 target_repo=target_repo,
                 feature_id=feature_id,
             )
             if plan_note is None:
                 return False
-            first = await self._plan_attempt(
+            attempt = await self._plan_attempt(
                 row,
                 correlation_id,
                 target_repo=target_repo,
@@ -6477,169 +5005,23 @@ class PlanningRunDriver:
                 plan_run_id=plan_run_id,
                 feature_id=feature_id,
                 round_label="first (an ordinary plan after an already-done answer)",
-                rules_only=self._rewrite_round_could_fire(correlation_id),
                 plan_note=plan_note,
             )
-            if first is None:
+            if attempt is None:
                 return False
-            if first.nothing_to_build is not None:
+            if attempt.nothing_to_build is not None:
                 return await self._fail_leg(
                     correlation_id,
                     _FEATURE_PLAN_STAGE,
                     "the planner answered already done again when asked for an "
                     "ordinary plan",
                 )
-        attempt = first
-        rewrite: dict[str, Any] | None = None
-        if not first.committed:
-            stamps = first.stamps
-            if stamps is None:  # pragma: no cover — not committed ⇒ stamps stopped it
-                return False
-            if not self._machine_rewrite_allowed(correlation_id, stamps):
-                # Today's stop — or, on a re-drive after the one rewrite was
-                # already recorded (rule 7), the stop that says so.
-                spec_row = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
-                return await self._stop_at_stamps(
-                    correlation_id,
-                    feature_id,
-                    stamps,
-                    after_rewrite=(
-                        self._how_the_spent_rewrite_went(spec_row)
-                        if stamps.refused_titles
-                        else None
-                    ),
-                )
-            rewrite = await self._machine_rewrite_after_refusal(
-                row,
-                correlation_id,
-                target_repo=target_repo,
-                repo_path=repo_path,
-                branch=branch,
-                plan_run_id=plan_run_id,
-                stamps=stamps,
-            )
-            if rewrite is None:
-                return False  # the spec leg said why — already loud
-            rewrite_did_not_land = bool(
-                rewrite.get("refused_by_checker") or rewrite.get("changed_nothing")
-            )
-            # The second stamping runs either way, with the model fallback
-            # allowed: on the REWRITTEN spec when the rewrite landed (the
-            # attempt reads the latest approved row, which the rewrite
-            # re-recorded), or — rule 6b — on the spec of record when it did
-            # not land (nothing was re-recorded), so the model gets its turn
-            # before anyone is told to start again.
-            second = await self._plan_attempt(
-                row,
-                correlation_id,
-                target_repo=target_repo,
-                repo_path=repo_path,
-                branch=branch,
-                plan_run_id=plan_run_id,
-                feature_id=feature_id,
-                round_label=(
-                    "second (the machine's rewrite, round 1, did not land: the "
-                    "model fallback's turn on the spec of record)"
-                    if rewrite_did_not_land
-                    else "second (after the machine's rewrite, round 1)"
-                ),
-                rules_only=False,
-                plan_note=plan_note,
-            )
-            if second is None:
-                return False
-            if second.nothing_to_build is not None:
-                if plan_note is not None:
-                    return await self._fail_leg(
-                        correlation_id,
-                        _FEATURE_PLAN_STAGE,
-                        "the planner answered already done again when asked "
-                        "for an ordinary plan",
-                    )
-                plan_note = await self._finish_nothing_to_build(
-                    row,
-                    correlation_id,
-                    second.nothing_to_build,
-                    target_repo=target_repo,
-                    feature_id=feature_id,
-                )
-                if plan_note is None:
-                    return False
-                second = await self._plan_attempt(
-                    row,
-                    correlation_id,
-                    target_repo=target_repo,
-                    repo_path=repo_path,
-                    branch=branch,
-                    plan_run_id=plan_run_id,
-                    feature_id=feature_id,
-                    round_label=(
-                        "second (an ordinary plan after an already-done answer)"
-                    ),
-                    rules_only=False,
-                    plan_note=plan_note,
-                )
-                if second is None:
-                    return False
-                if second.nothing_to_build is not None:
-                    return await self._fail_leg(
-                        correlation_id,
-                        _FEATURE_PLAN_STAGE,
-                        "the planner answered already done again when asked "
-                        "for an ordinary plan",
-                    )
-            attempt = second
-            if not second.committed:
-                stamps2 = second.stamps
-                if stamps2 is None:  # pragma: no cover
-                    return False
-                # Rule 6: never a third try. A normalizer that could not RUN
-                # the second time is a different thing and keeps today's
-                # cannot-run card, whichever way the rewrite went.
-                if not stamps2.refused_titles:
-                    return await self._stop_at_stamps(
-                        correlation_id,
-                        feature_id,
-                        stamps2,
-                        round_note=(
-                            self._rewrite_round_note(rewrite)
-                            if rewrite_did_not_land
-                            else None
-                        ),
-                    )
-                if rewrite.get("refused_by_checker"):
-                    # Rule 6b: the model had its turn and titles are still
-                    # refused — the note-refused sentence, then the model's own.
-                    return await self._stop_after_refused_rewrite(
-                        correlation_id, feature_id, stamps2, rewrite
-                    )
-                if rewrite_did_not_land:
-                    # The rewrite changed nothing and the model, given its
-                    # turn on the spec of record, still could not settle the
-                    # titles: rule 6's card with its "changed nothing"
-                    # sentence at the top — the spec's own words for this
-                    # outcome (the note-refused sentence would blame the
-                    # checker for a refusal that never was).
-                    return await self._stop_at_stamps(
-                        correlation_id,
-                        feature_id,
-                        stamps2,
-                        after_rewrite=_REWRITE_CHANGED_NOTHING,
-                        round_note=self._rewrite_round_note(rewrite, still_refused=True),
-                    )
-                return await self._stop_at_stamps(
-                    correlation_id,
-                    feature_id,
-                    stamps2,
-                    after_rewrite=_REWRITE_STILL_UNPROVEN,
-                )
         return await self._finish_feature_plan(
             correlation_id,
             attempt,
             feature_id=feature_id,
             target_repo=target_repo,
-            branch=attempt.branch or branch,
-            rewrite=rewrite,
+            branch=branch,
             repo_path=repo_path,
         )
 
@@ -6654,62 +5036,28 @@ class PlanningRunDriver:
         plan_run_id: str,
         feature_id: str,
         round_label: str,
-        rules_only: bool = False,
         plan_note: str | None = None,
-        recovered_result: Any | None = None,
-        write_branch: str | None = None,
-        write_start_commit: str | None = None,
-        carried_files: Mapping[str, str] | None = None,
     ) -> "_PlanAttempt | None":
-        """One pass of the plan leg's work, from the top: read the approved spec
-        back off the branch, dispatch the plan-writer, write the tree with the
-        stamp normalizer + validate in the pre-commit step.
-
-        Runs once today; twice when the machine's one rewrite is in play
-        (2026-09-06) — the second pass reads the REWRITTEN spec, because it
-        reads the latest approved spec row, which the rewrite re-recorded.
+        """One pass of the plan leg's work: read the approved spec back off the
+        branch, dispatch the plan-writer, write the plan tree.
 
         ``row`` is the run row, handed down from :meth:`_feature_plan_leg`,
-        which already holds it (2026-09-15). It is here for one reason: the
-        sentence the person actually sent lives on it, and the plan-writer's
-        own reviewer was never shown it. The leg reads it rather than the
-        attempt going back to the store for a row the caller already has.
-
-        ``rules_only`` (rule 1a, 2026-09-07): ask the stamping step to run by
-        rule only — no model fallback — which it does where the routing law
-        is enforced for the repo/feature. True on the first attempt exactly
-        when the rewrite round could fire; False on the second.
+        which already holds it (2026-09-15): the sentence the person actually
+        sent lives on it.
 
         ``plan_note`` (step 1 simplification, 24 October 2026): set for the one
         ordinary plan asked for after an already-done answer that could not be
         used. It goes to the plan writer as its note, and the already-done
         answer is not offered on that call.
 
-        ``recovered_result`` (step 1, 25 October 2026): the plan writer's one
-        ordinary-plan recovery, returned by the exact-artifact re-review
-        instead of a review of the tree it was sent. It is taken as this
-        attempt's reply, with no new dispatch, and goes through the ordinary
-        normalization, validation and handoff. It is never recovered again.
-
-        ``write_branch`` / ``write_start_commit``: where that recovered plan is
-        written when the final review answered after the planning branch
-        already carried a committed plan (the audit commit stays where it is).
-        The branch is cut from ``write_start_commit`` and its settings are read
-        from that same commit. The spec is still read off ``branch``.
-        ``carried_files`` are written beside the plan and are not part of it:
-        the approved spec's files, when the branch is cut from the run's start
-        commit because the spec's own commit is not on record.
-
-        Returns the attempt record, or ``None`` after failing the run loudly
-        for any reason other than the normalizer's stop (which the caller
-        decides on).
+        Returns the attempt record, or ``None`` after failing the run loudly.
+        The plan reviewer's record is read for the build card only (the cull,
+        27 October 2026): nothing here refuses on what a model wrote about the
+        plan.
         """
         deps = self._deps
         spec_details = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
         slug = str(spec_details.get("slug") or self._slug_of({}, correlation_id))
-        # Where this attempt writes its plan: the planning branch, or the
-        # recovered plan's own branch (25 October 2026).
-        plan_branch = write_branch or branch
 
         # The 008 contract needs the CONTENTS of the committed spec triple, not
         # paths. Read them back off the planning branch (they are no longer in
@@ -6720,15 +5068,17 @@ class PlanningRunDriver:
         spec_feature, spec_summary, spec_assumptions = await self._read_spec_triple(
             repo_path, branch, spec_files
         )
-        if not spec_feature or not spec_summary:
+        if not spec_feature:
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
-                "could not read the committed spec triple contents "
-                f"(.feature / _summary.md) off branch {branch} "
-                f"(spec_files={sorted(spec_files)})",
+                "could not read the committed spec's .feature off branch "
+                f"{branch} (spec_files={sorted(spec_files)})",
             )
             return None
+        # The summary and assumptions files are optional (the cull, 27
+        # October 2026): one that did not come is sent as nothing.
+        spec_summary = spec_summary or ""
         descriptor_unavailable: list[str] = []
         descriptor_partial: list[str] = []
         target_repo_descriptor = await asyncio.to_thread(
@@ -6810,33 +5160,18 @@ class PlanningRunDriver:
             target_repo_descriptor["requirement_amendment_base_commit"] = run_record["start_commit"]
             target_repo_descriptor["requirement_amendment_before_sha256"] = {doc.path: doc.sha256 for doc in documents if doc.path in amendment_scope}
 
-        async def _ask_the_plan_writer(
-            *, note: str | None = None, prior: Mapping[str, str] | None = None
-        ) -> Any:
-            """One call to the plan writer.
-
-            ``note`` and ``prior`` are sent ONLY by the exact-artifact
-            re-review below (``_ensure_semantic_review``): the fixed
-            re-review note and the exact plan tree to judge again. The first
-            call sends neither and is byte for byte the call that shipped.
-            """
+        async def _ask_the_plan_writer() -> Any:
+            """One call to the plan writer."""
             extra: dict[str, Any] = {}
-            if note is not None:
-                extra["validate_feedback"] = note
-            elif plan_note is not None:
+            if plan_note is not None:
                 extra["validate_feedback"] = plan_note
-            if prior is not None:
-                extra["revision_of"] = dict(prior)
             if texts:
                 extra["context"] = texts
             # "Already done, nothing to build" (7 October 2026): asked for only
-            # with the switch on, on every plan call of the run (the exact
-            # re-review must judge the same shape). Off, the call is today's.
-            # Not on the ordinary plan asked for after an already-done answer
-            # that could not be used (24 October 2026).
+            # with the switch on. Not on the ordinary plan asked for after an
+            # already-done answer that could not be used (24 October 2026).
             if self._nothing_to_build_enabled() and plan_note is None:
                 extra[nothing_to_build.REQUEST_FIELD] = True
-            record_factory_dispatch(deps.store, correlation_id, factory_document, stage="plan")
             return await deps.dispatch_feature_plan(
                 plan_run_id=plan_run_id,
                 correlation_id=correlation_id,
@@ -6848,8 +5183,7 @@ class PlanningRunDriver:
                 spec_feature_paths=spec_feature_paths,
                 # The coach's ground truth, the same two the spec leg sends
                 # (2026-09-15): the sentence, word for word, and what the
-                # repository already does for the words it uses. Absent, the
-                # wire is byte for byte what it was.
+                # repository already does for the words it uses.
                 request_text=self._request_text_of(row),
                 repository_facts=await self._plan_repository_facts(
                     correlation_id, repo_path, row
@@ -6858,11 +5192,7 @@ class PlanningRunDriver:
             )
 
         try:
-            result = (
-                recovered_result
-                if recovered_result is not None
-                else await _ask_the_plan_writer()
-            )
+            result = await _ask_the_plan_writer()
         except Exception as exc:  # noqa: BLE001 — dispatch boundary
             await self._fail_leg(
                 correlation_id,
@@ -6878,17 +5208,6 @@ class PlanningRunDriver:
             return None
 
         role_output = self._role_output_of(result)
-        # RV-1: assert the SUPPLIED feature id, not filename self-consistency.
-        declared = role_output.get("feature_id")
-        if declared is not None and str(declared) != feature_id:
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_PLAN_STAGE,
-                f"feature id mismatch (RV-1): forge supplied {feature_id}, "
-                f"the plan declares {declared}",
-            )
-            return None
-
         files = self._plan_tree_files(role_output)
         if not files:
             await self._fail_leg(
@@ -6898,391 +5217,32 @@ class PlanningRunDriver:
             )
             return None
 
-        # Semantic judgement belongs to the specialist Player/Coach. Forge
-        # reads its record about this exact artifact tree and shows the score
-        # on the build card (step 2, 26 October 2026: advice, never a refusal).
-        #
-        # A decision that did not approve the plan is advice (step 2, 27
-        # October 2026): the plan carries on with no re-review, and the build
-        # card says the reviewer did not approve it. A record that cannot be
-        # read as a verdict about this tree is bookkeeping (24 October 2026):
-        # the existing exact-artifact re-review below is asked, and if its
-        # record cannot be read either the build card says so and decides.
-        traceability, semantic_error = self._semantic_review_of(role_output, files)
+        # The plan reviewer's record, for the build card only.
+        review = self._plan_review_record(role_output)
         review_refused: str | None = None
-        if semantic_error == _SEMANTIC_NOT_APPROVED:
+        if review is not None and review.get("decision") not in (None, "approved"):
             review_refused = "its review record says not approved"
-            logger.warning(
-                "planning driver: run %s — the plan reviewer did not approve the "
-                "plan — ADVISORY; the plan carries on and the build card says so",
-                correlation_id,
-            )
-        elif semantic_error is not None:
-            logger.warning(
-                "planning driver: run %s plan review record unreadable (%s) — "
-                "ADVISORY; asking the existing re-review",
-                correlation_id,
-                semantic_error,
-            )
 
         # "ALREADY DONE, NOTHING TO BUILD" (7 October 2026). The plan writer
         # may answer that every part of the request is already in the
-        # repository, with its proof, and its reviewer accepted that exact
-        # answer (the receipt above binds to it). Nothing is written: the
-        # caller checks the proof against the code windows Forge sent, and
-        # ends the run. A reply without the marker goes on exactly as today.
+        # repository, with its proof. Nothing is written: the caller ends the
+        # run. A reply without the marker goes on exactly as today.
         claim, claim_problem = nothing_to_build.read_claim(role_output, files)
-        if recovered_result is not None and (
-            claim is not None or claim_problem is not None
-        ):
-            # The one recovery was for an ordinary plan; there is no third ask.
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_PLAN_STAGE,
-                "the planner answered already done again when asked for an "
-                "ordinary plan",
-            )
-            return None
-        if claim is not None and semantic_error is not None:
-            # Never an approval invented: an already-done answer whose review
-            # cannot be read is not taken, and an ordinary plan is asked for.
-            claim, claim_problem = None, (
-                "its reviewer did not approve it"
-                if review_refused is not None
-                else "its review record could not be read"
-            )
         if claim is not None or claim_problem is not None:
             return _PlanAttempt(
-                committed=False,
-                stamps=None,
                 files=files,
                 slug=slug,
-                traceability=traceability,
+                traceability=review,
                 nothing_to_build=_NothingToBuildAnswer(
-                    claim=claim,
-                    problem=claim_problem,
-                    windows=tuple(
-                        nothing_to_build.windows_sent(
-                            target_repo_descriptor,
-                            reference_paths=self._reference_paths_of(correlation_id),
-                        )
-                    ),
+                    claim=claim, problem=claim_problem
                 ),
             )
 
-        # NO REVIEW RECORD AT ALL (step 2, 26 October 2026): the planning seat
-        # hands on its best draft, unaccepted, with the reviewer's objections
-        # in ``plan_advice`` and no ``semantic_review.json``. That is
-        # bookkeeping: it is logged, the build card says so beside the
-        # objections, and the plan carries on with no re-review.
-        missing_record = semantic_error == _SEMANTIC_REVIEW_MISSING
-        if missing_record:
-            logger.warning(
-                "planning driver: run %s — the plan came with no review record "
-                "(the seat's best draft, unaccepted) — ADVISORY; the build card "
-                "says so and shows the reviewer's objections",
-                correlation_id,
-            )
-        semantic_state: dict[str, Any] = {
-            "role_output": role_output,
-            "review": traceability,
-            "unreadable": _SEMANTIC_REVIEW_MISSING if missing_record else None,
-            # Why the plan reviewer did not approve the plan: the build card's
-            # line (step 2, 27 October 2026), never a refusal.
-            "refused": review_refused,
-            # The plan writer's one ordinary-plan recovery, when the re-review
-            # answers with it before anything is written (step 1).
-            "recovered": None,
-            "may_recover": recovered_result is None,
-        }
-
-        async def _ensure_semantic_review(
-            candidate_files: Mapping[str, str],
-        ) -> None:
-            """Read the review of ``candidate_files``, asking the one exact
-            re-review when it does not bind to them. Never refuses: a record
-            that cannot be read, or a reviewer that did not approve, is kept
-            as the card's line and never asked about again. A recovered plan
-            the re-review answers with is left in ``semantic_state``."""
-            if (
-                semantic_state["unreadable"] is not None
-                or semantic_state["refused"] is not None
-            ):
-                return
-            current, current_error = self._semantic_review_of(
-                semantic_state["role_output"], candidate_files
-            )
-            if current_error is None:
-                semantic_state["review"] = current
-                return
-            unreadable: str | None = None
-            refused: str | None = None
-            try:
-                reviewed_result = await _ask_the_plan_writer(
-                    note=FINAL_PLAN_REVIEW_FEEDBACK,
-                    prior=candidate_files,
-                )
-            except Exception as exc:  # noqa: BLE001 - dispatch boundary
-                reviewed_result = None
-                unreadable = (
-                    f"exact-artifact re-review raised {type(exc).__name__}: {exc}"
-                )
-            if unreadable is None:
-                reviewed_ok, reviewed_reason = self._dispatch_ok(reviewed_result)
-                if not reviewed_ok and _names_a_reviewer_refusal(reviewed_reason):
-                    # The plan writer's reviewer answered and did not approve
-                    # (its retained objection): advice, as on the first call.
-                    refused = "the re-review: " + reviewed_reason
-                elif not reviewed_ok:
-                    # An error with no verdict in it (the reply was
-                    # unavailable, the connection closed, the call timed out)
-                    # is bookkeeping.
-                    unreadable = "exact-artifact re-review " + reviewed_reason
-            if unreadable is None and refused is None:
-                reviewed_output = self._role_output_of(reviewed_result)
-                reviewed_files = self._plan_tree_files(reviewed_output)
-                review, review_error = self._semantic_review_of(
-                    reviewed_output, candidate_files
-                )
-                if reviewed_files is None:
-                    unreadable = "exact-artifact re-review returned no plan tree"
-                elif (
-                    dict(reviewed_files) != dict(candidate_files)
-                    and semantic_state["may_recover"]
-                ):
-                    # The plan writer answered with its one ordinary plan
-                    # (specialist-agent's recovery after a retained objection).
-                    # It replaces this attempt's plan; nothing has been written.
-                    semantic_state["recovered"] = reviewed_result
-                    return
-                elif dict(reviewed_files) != dict(candidate_files):
-                    unreadable = (
-                        "exact-artifact re-review rewrote the supplied plan tree"
-                    )
-                elif review_error == _SEMANTIC_NOT_APPROVED:
-                    refused = "its re-review record says not approved"
-                elif review_error is not None:
-                    unreadable = "exact-artifact re-review: " + review_error
-                elif review is None or review.get("reviewed_after_rewrite") is not True:
-                    unreadable = (
-                        "exact-artifact re-review did not mark the rewritten tree"
-                    )
-                else:
-                    semantic_state["role_output"] = reviewed_output
-                    semantic_state["review"] = review
-                    return
-            semantic_state["review"] = None
-            if refused is not None:
-                logger.warning(
-                    "planning driver: run %s — the plan reviewer did not approve "
-                    "the plan at the re-review (%s) — ADVISORY; the plan carries "
-                    "on and the build card says so",
-                    correlation_id,
-                    refused,
-                )
-                semantic_state["refused"] = refused
-                return
-            logger.warning(
-                "planning driver: run %s plan review record unreadable after the "
-                "re-review (%s) — ADVISORY; the build card says so and decides",
-                correlation_id,
-                unreadable,
-            )
-            semantic_state["unreadable"] = unreadable
-
-        # VALIDATION CHANNEL (C5): advisory self-check data, not an oracle —
-        # same posture as the 007 leg above. The REAL oracle for the plan tree
-        # is ``guardkit feature validate`` in the pre-commit step right below:
-        # a self-flagged plan that validates green is good enough by the
-        # estate's own bar. Surface the self-reported errors LOUDLY, verbatim,
-        # then let the oracle decide. TODO(C5 follow-on): the bounded
-        # revision_of re-invoke consumes this channel properly.
-        plan_val_errors = self._validation_failures(role_output)
-        if plan_val_errors:
-            logger.warning(
-                "008 validation.json self-check reported failures for %s "
-                "(ADVISORY — proceeding to the guardkit validate oracle): %s",
-                correlation_id,
-                "; ".join(plan_val_errors),
-            )
-        # The specialist's plan advice (24 October 2026): findings that used to
-        # send the plan back are shown, never refused. ``plan_advice`` is
-        # ``[{"rule", "text"}]``; absent means none.
-        plan_advice = self._plan_advice(role_output)
-        if plan_advice:
-            logger.warning(
-                "008 validation.json plan_advice for %s (ADVISORY — proceeding "
-                "to the guardkit validate oracle): %s",
-                correlation_id,
-                "; ".join(plan_advice),
-            )
-
-        validate = deps.validate_feature_plan
-        # THE STAMP NORMALIZER (Rich's condition 1): the committed spec
-        # ``.feature`` path(s) are the scenario universe forge can name when
-        # the plan-writer omitted ``feature_files:``. ``spec_feature_paths`` is
-        # computed above the dispatch since 2026-08-22 — the SAME list is now
-        # also sent to the plan-writer, so what forge checks here and what the
-        # writer was told cannot drift apart.
-        stamp_state: dict[str, Any] = {}
-
-        async def _pre_commit(worktree: Path) -> PreCommitResult:
-            # Rich's condition 1 (2026-08-16): the verifier stamps are WRITTEN
-            # on the planning branch BEFORE validate — the normalizer runs
-            # here, against the materialised worktree, so what it writes
-            # rides the plan commit and validate reads the stamped YAML.
-            # Coordinator condition 5 (same day): the STOP is gated on the
-            # routing law's ENFORCEMENT for this repo/feature (feature-level
-            # flag → repo config → off). Not enforced, a partial / refused /
-            # failed normalizer never kills the plan — the decided stamps it
-            # wrote ride the commit, and everything is receipted below.
-            stamps = await self._stamp_normalizer_step(
-                worktree,
-                feature_id,
-                spec_feature_paths,
-                rules_only=rules_only,
-                feature_routing_id=correlation_id,
-            )
-            stamp_state["outcome"] = stamps
-            if stamps.stops_the_run:
-                return PreCommitResult(
-                    ok=False, detail=f"stamp normalizer {stamps.status}: {stamps.detail}"
-                )
-            post_normalizer: dict[str, str] = {}
-            for rel in files:
-                path = worktree / rel
-                try:
-                    post_normalizer[str(rel)] = path.read_text(encoding="utf-8")
-                except (OSError, UnicodeError):
-                    return PreCommitResult(
-                        ok=False,
-                        detail=f"semantic review artifact {rel} became unreadable",
-                    )
-            await _ensure_semantic_review(post_normalizer)
-            if semantic_state["recovered"] is not None:
-                # Stops this commit so the recovered plan is written instead.
-                return PreCommitResult(ok=False, detail=_PLAN_RECOVERED)
-            outcome = await validate(worktree, feature_id)
-            if not outcome.ok:
-                # Advice since step 2 (26 October 2026, census FRG-082): one
-                # rule in one place. GuardKit validates the feature itself
-                # when it loads it to build; this copy is logged, not refused.
-                logger.warning(
-                    "planning driver: run %s — guardkit feature validate "
-                    "complained about %s (%s) — ADVISORY; the plan is "
-                    "committed and GuardKit checks it when it builds",
-                    correlation_id,
-                    feature_id,
-                    outcome.detail,
-                )
-            return PreCommitResult(ok=True)
-
-        # Sandbox first (2026-09-07, rule 70): a git runner that lives in the
-        # repository's sandbox cannot run the closure above — nothing the
-        # factory runs on a repository runs on the host. For such a runner
-        # the SAME two checks are DECLARED by name (the normalizer with its
-        # feature id and --no-model, then feature validate), the sidecar
-        # runs them in the worktree it materialised, and their outcomes are
-        # read back below through the parsers the closure's collaborators
-        # use — so a refusal, rule 1a's rule-only stamping, rule 6b's second
-        # stamping and every receipt mean exactly what they mean here. The
-        # in-container runner keeps the closure.
+        # The plan YAML names the committed spec .feature when the plan-writer
+        # left ``feature_files:`` out: Forge committed that file one leg
+        # earlier and is the party that knows it.
+        files = self._with_feature_files(files, feature_id, spec_feature_paths)
         git_runner = self._git_runner_for(target_repo)
-        declared: _DeclaredPlanChecks | None = None
-        pre_commit: Any = _pre_commit
-        if self._runner_takes_declared_checks(git_runner):
-            declared = await self._declare_plan_checks(
-                git_runner,
-                files,
-                feature_id,
-                spec_feature_paths,
-                rules_only=rules_only,
-                repo_path=repo_path,
-                # The settings of the commit the plan is written on: the
-                # recovered branch's start commit, before that branch exists.
-                branch=write_start_commit or plan_branch,
-            )
-            files = declared.files
-            if declared.stamps is not None:
-                # forge's own refusal before the normalizer (a plan whose
-                # feature_files: contradicts the committed spec): the check
-                # is not declared, and where the law is enforced the commit
-                # never starts — as the closure returns before the write.
-                stamp_state["outcome"] = declared.stamps
-                if declared.stamps.stops_the_run:
-                    return _PlanAttempt(
-                        committed=False,
-                        stamps=declared.stamps,
-                        files=files,
-                        slug=slug,
-                        traceability=traceability,
-                    )
-            pre_commit = declared.checks
-
-        async def _take_the_recovered_plan(
-            *, after_commit: str | None = None
-        ) -> "_PlanAttempt | None":
-            """The recovered plan, through the usual checks and plan write.
-
-            ``after_commit`` is the plan commit already on the planning branch
-            when the final review answered: that audit commit stays, and the
-            recovered plan is written on a branch of its own, cut from the
-            approved spec's commit, so none of the first plan's files ride
-            along. The recovered plan is never recovered again.
-            """
-            logger.warning(
-                "planning driver: run %s — the plan writer answered the "
-                "re-review with its one ordinary-plan recovery; that plan "
-                "replaces this attempt's and goes through the usual checks%s",
-                correlation_id,
-                f" (the committed plan {after_commit} is kept)" if after_commit else "",
-            )
-            # ONE COMMIT FOR THE CUT AND THE SETTINGS (25 October 2026): the
-            # approved spec's commit when it is on record, else the commit this
-            # run started from. A spec record without its commit is a
-            # bookkeeping gap: said as advice, and the recovered plan is kept.
-            start = str(spec_details.get("sha") or "").strip() or None
-            carried: dict[str, str] | None = None
-            if after_commit and start is None:
-                start, _target = self._deps.store.get_start_point(correlation_id)
-                logger.warning(
-                    "planning driver: run %s — ADVISORY: the approved spec's "
-                    "record names no commit; the recovered plan's branch is cut "
-                    "from the run's start commit %s and carries the approved "
-                    "spec's files",
-                    correlation_id,
-                    start,
-                )
-                carried = {}
-                for rel in spec_details.get("spec_files") or []:
-                    text = await git_runner.read_file_from_branch(
-                        repo_path=repo_path, branch=branch, file_path=str(rel)
-                    )
-                    if text is not None:
-                        carried[str(rel)] = text
-            return await self._plan_attempt(
-                row,
-                correlation_id,
-                target_repo=target_repo,
-                repo_path=repo_path,
-                branch=branch,
-                plan_run_id=plan_run_id,
-                feature_id=feature_id,
-                round_label=f"{round_label} (the plan writer's recovered plan)",
-                rules_only=rules_only,
-                plan_note=plan_note or _RECOVERED_PLAN_NOTE,
-                recovered_result=semantic_state["recovered"],
-                write_branch=(
-                    f"{branch}{_RECOVERED_BRANCH_SUFFIX}" if after_commit else None
-                ),
-                write_start_commit=start if after_commit else None,
-                carried_files=carried,
-            )
-
-        await _ensure_semantic_review(files)
-        if semantic_state["recovered"] is not None:
-            return await _take_the_recovered_plan()
-
         try:
             (
                 recorded_memory,
@@ -7292,17 +5252,11 @@ class PlanningRunDriver:
             ) = self._recorded_launch(correlation_id)
             gitres = await git_runner.prepare_branch_and_write_tree(
                 repo_path=repo_path,
-                branch=plan_branch,
-                files={**dict(carried_files or {}), **files},
+                branch=branch,
+                files=files,
                 message=(
                     f"planning: feature plan {feature_id} for {correlation_id} "
                     "(Lane B 008)"
-                ),
-                pre_commit=pre_commit,
-                **(
-                    {"start_commit": write_start_commit}
-                    if write_start_commit
-                    else {}
                 ),
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
@@ -7319,76 +5273,19 @@ class PlanningRunDriver:
                 f"plan write raised {type(exc).__name__}: {exc}",
             )
             return None
-        if declared is not None:
-            stamps_read = self._stamps_from_declared_checks(gitres, declared, feature_id)
-            if stamps_read is not None:
-                stamp_state["outcome"] = stamps_read
-            self._log_declared_advice(
-                correlation_id,
-                gitres,
-                "feature-validate",
-                "the plan is committed and GuardKit checks it when it builds",
-            )
-        if gitres.status == "failed" and semantic_state["recovered"] is not None:
-            # The re-review after normalization answered with the recovered
-            # plan, which stopped the commit before anything was written.
-            return await _take_the_recovered_plan()
         if gitres.status == "failed":
-            stamps = stamp_state.get("outcome")
-            if stamps is not None and stamps.stops_the_run:
-                # The normalizer stopped the commit — the caller decides
-                # between the machine's one rewrite and the card.
-                return _PlanAttempt(
-                    committed=False,
-                    stamps=stamps,
-                    files=files,
-                    slug=slug,
-                    traceability=semantic_state["review"],
-                )
             await self._fail_leg(
                 correlation_id,
                 _FEATURE_PLAN_STAGE,
-                f"plan write / feature validate failed: {gitres.stderr}",
+                f"plan write failed: {gitres.stderr}",
             )
             return None
-
-        committed_files: dict[str, str] = {}
-        for rel in files:
-            content = await git_runner.read_file_from_branch(
-                repo_path=repo_path, branch=plan_branch, file_path=str(rel)
-            )
-            if content is None:
-                await self._fail_leg(
-                    correlation_id,
-                    _FEATURE_PLAN_STAGE,
-                    f"committed semantic-review artifact is unreadable: {rel}",
-                )
-                return None
-            committed_files[str(rel)] = content
-        # A declared sandbox check can mutate the plan tree immediately before
-        # commit (notably ``normalize-stamps`` adding verifier stamps). The
-        # in-process pre-commit path reviews that exact post-normalizer tree in
-        # ``_pre_commit`` above; a sidecar cannot call the async specialist from
-        # inside its pre-commit transaction. Read the committed bytes back and
-        # use the same Coach-only exact-artifact review here. The helper is
-        # idempotent when the approved bytes are unchanged; a missing,
-        # rejected, malformed or tree-rewriting response is the card's line.
-        # The tree is committed. A first recovery the final review answers with
-        # still goes through the usual checks and plan write, on a branch of
-        # its own; the committed plan stays as the record of what was asked.
-        await _ensure_semantic_review(committed_files)
-        if semantic_state["recovered"] is not None:
-            return await _take_the_recovered_plan(after_commit=gitres.sha)
         return _PlanAttempt(
-            committed=True,
-            stamps=stamp_state.get("outcome"),
-            files=committed_files,
+            files=files,
             slug=slug,
             sha=gitres.sha,
-            traceability=semantic_state["review"],
-            review_unreadable=semantic_state["unreadable"],
-            review_refused=semantic_state["refused"],
-            branch=plan_branch if plan_branch != branch else None,
+            traceability=review,
+            review_refused=review_refused,
             plan_advice=tuple(
                 sorted(
                     (text for _rule, text in self._plan_advice_items(role_output)),
@@ -7396,6 +5293,31 @@ class PlanningRunDriver:
                 )
             ),
         )
+
+    @staticmethod
+    def _with_feature_files(
+        files: Mapping[str, str], feature_id: str, spec_feature_paths: Sequence[str]
+    ) -> dict[str, str]:
+        """The plan files, with the committed spec path(s) written into a plan
+        YAML that declares no ``feature_files:``. Done on a temporary copy of
+        the plan's own files; nothing of the repository is read or run."""
+        from forge.planning.target_terminal_tools import declare_feature_files_if_absent
+
+        files_out: dict[str, str] = {str(k): str(v) for k, v in files.items()}
+        with tempfile.TemporaryDirectory(prefix="forge-plan-files-") as td:
+            shadow = Path(td).resolve()
+            for rel, content in files_out.items():
+                target = (shadow / rel).resolve()
+                if not str(target).startswith(str(shadow) + os.sep):
+                    continue  # the runner refuses an escaping path itself
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+            fill = declare_feature_files_if_absent(shadow, feature_id, spec_feature_paths)
+            if fill.fired:
+                files_out[fill.yaml_rel] = (shadow / fill.yaml_rel).read_text(
+                    encoding="utf-8"
+                )
+        return files_out
 
     # -- the plan leg's pre-commit checks, declared (sandbox first, rule 70) --
 
@@ -7425,37 +5347,12 @@ class PlanningRunDriver:
         except Exception:  # noqa: BLE001 — a runner that cannot answer takes closures
             return False
 
-    @property
-    def _provability_from_the_sandbox(self) -> dict[str, Any]:
-        """Part K's answers that came back with a spec commit made in a
-        repository's sandbox, by the commit's sha (rule 87, 2026-09-07).
-
-        When the spec leg declares its checks, the provability check runs
-        beside the normalizer in the sandbox's own worktree, on the bytes
-        that land on the branch — so its answer is already in hand by the
-        time the card's round asks for it, and asking again would run the
-        repository's guardkit a second time (and, for a sandboxed
-        repository, in the wrong place: the forge container). The answer is
-        kept here until that round reads it.
-        """
-        kept = getattr(self, "_provability_kept", None)
-        if kept is None:
-            kept = {}
-            self._provability_kept = kept
-        return kept
 
     def _declare_spec_checks(
         self, correlation_id: str, feature_rel: str
     ) -> PreCommitChecks:
         """The spec leg's pre-commit, declared: the gherkin normalizer over
-        the committed ``.feature`` (blocking, as the closure is), then Part
-        K's provability check over the same file (never blocking — it decides
-        nothing about the commit, only what the card says).
-
-        The provability check is declared exactly when it is wired at all
-        (``classify_scenarios``), so a composition that does not wire it
-        reads "no provability check is wired" here as it does anywhere else.
-        """
+        the committed ``.feature`` (blocking, as the closure is)."""
         checks = [
             PreCommitCheck(
                 name="normalize-feature",
@@ -7463,14 +5360,6 @@ class PlanningRunDriver:
                 blocking=True,
             )
         ]
-        if self._deps.classify_scenarios is not None:
-            checks.append(
-                PreCommitCheck(
-                    name="classify-scenarios",
-                    args={"feature_file": feature_rel},
-                    blocking=False,
-                )
-            )
         logger.info(
             "planning driver: run %s — the spec leg's pre-commit checks on %s "
             "are declared to the sandbox git runner rather than run here: %s",
@@ -7483,699 +5372,7 @@ class PlanningRunDriver:
         )
         return PreCommitChecks(tuple(checks))
 
-    def _keep_declared_provability(self, gitres: Any) -> None:
-        """Read Part K's answer off a declared spec write and keep it against
-        the commit's sha for :meth:`_check_provability_by_rule`. A check that
-        never ran (an older guardkit in the sandbox, or no answer at all)
-        keeps nothing, and the card's round then reports it as not checked in
-        the words it always used.
 
-        Only the spec leg's pre-card write calls this, and the round that
-        follows it always reads what it kept — so nothing accumulates in the
-        ordinary course. The cap below is for a leg that failed in between.
-        """
-        from forge.planning.target_terminal_tools import classify_scenarios_check
-
-        sha = str(getattr(gitres, "sha", "") or "")
-        check = next(
-            (
-                c
-                for c in (getattr(gitres, "checks", None) or [])
-                if c.name == "classify-scenarios"
-            ),
-            None,
-        )
-        if not sha or check is None or not check.ran:
-            return
-        kept = self._provability_from_the_sandbox
-        if len(kept) > 32:
-            # A leg that failed after its write leaves its answer behind;
-            # the newest thirty-two are all any run can still ask for.
-            kept.clear()
-        kept[sha] = classify_scenarios_check(
-            exit_code=check.exit_code,
-            stdout=check.stdout,
-            stderr=check.stderr_tail,
-            timed_out=check.timed_out,
-        )
-
-    async def _declare_plan_checks(
-        self,
-        git_runner: Any,
-        files: Mapping[str, str],
-        feature_id: str,
-        spec_feature_paths: list[str],
-        *,
-        rules_only: bool,
-        repo_path: str,
-        branch: str,
-    ) -> "_DeclaredPlanChecks":
-        """Turn the plan leg's pre-commit closure into a declaration.
-
-        What the closure does BEFORE the normalizer runs — read the routing
-        law's enforcement for this repo/feature, and write the committed spec
-        ``.feature`` path(s) into a plan YAML that declares no
-        ``feature_files:`` — reads and edits the plan's own YAML and the
-        repository's ``.guardkit/config.yaml``. Those are files forge itself
-        is about to commit, plus one flag file read off the branch; no
-        repository code is run. So they are laid out in a temporary directory
-        of forge's own (the plan files from memory, the config from the
-        branch through the runner's read) and the SAME two helpers run on it,
-        unchanged — then the filled YAML goes back into the files to commit.
-
-        The declaration: ``normalize-stamps`` with the feature id and
-        ``no_model`` exactly when the closure would pass ``rules_only``
-        (rule 1a: the law enforced and the rewrite round still possible),
-        blocking exactly when the closure's stop is armed (the law enforced);
-        then ``feature-validate``, never blocking (step 2). When forge's own check
-        refuses the plan before the normalizer (a contradicting
-        ``feature_files:``), the normalizer is not declared and the refusal is
-        the stamping outcome, as the closure has it.
-        """
-        from forge.planning.target_terminal_tools import StampNormalizerOutcome
-
-        files_out: dict[str, str] = {str(k): str(v) for k, v in files.items()}
-        with tempfile.TemporaryDirectory(prefix="forge-plan-checks-") as td:
-            shadow = Path(td).resolve()
-            for rel, content in files_out.items():
-                target = (shadow / rel).resolve()
-                if not str(target).startswith(str(shadow) + os.sep):
-                    continue  # the runner refuses an escaping path itself
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(content, encoding="utf-8")
-            config_rel = ".guardkit/config.yaml"
-            if config_rel not in files_out:
-                # The routing law's own file, off the planning branch — and,
-                # when the branch does not carry it yet (the plan leg is the
-                # first commit on it), off the repository's current tip, which
-                # is what the branch will be cut from. Read it we must: it is
-                # what says whether a refusal stops the run, and a file we
-                # could not read would read as "the law is off".
-                config_text = await git_runner.read_file_from_branch(
-                    repo_path=repo_path, branch=branch, file_path=config_rel
-                )
-                if config_text is None:
-                    config_text = await git_runner.read_file_from_branch(
-                        repo_path=repo_path, branch="HEAD", file_path=config_rel
-                    )
-                if config_text is not None:
-                    config_path = shadow / config_rel
-                    config_path.parent.mkdir(parents=True, exist_ok=True)
-                    config_path.write_text(config_text, encoding="utf-8")
-                else:
-                    logger.warning(
-                        "planning driver: %s — the repository's %s could not be "
-                        "read from %s or from its current tip, so the routing "
-                        "law reads as off for this stamping and a refusal will "
-                        "not stop the run",
-                        feature_id,
-                        config_rel,
-                        branch,
-                    )
-            prelude = self._stamp_normalizer_prelude(
-                shadow,
-                feature_id,
-                spec_feature_paths,
-                rules_only=rules_only,
-                accepts_rules_only=True,
-            )
-            if prelude.fill.fired:
-                files_out[prelude.fill.yaml_rel] = (shadow / prelude.fill.yaml_rel).read_text(
-                    encoding="utf-8"
-                )
-        checks: list[PreCommitCheck] = []
-        stamps: StampNormalizerOutcome | None = None
-        if prelude.fill.inconsistent:
-            logger.error("stamp normalizer hook: %s", prelude.fill.reason)
-            stamps = self._stamp_normalizer_finish(
-                StampNormalizerOutcome(status="refused", detail=prelude.fill.reason),
-                prelude,
-                feature_id,
-            )
-        else:
-            checks.append(
-                PreCommitCheck(
-                    name="normalize-stamps",
-                    args={"feature_id": feature_id, "no_model": prelude.by_rule_only},
-                    blocking=prelude.enforcement["enforcement"] == "enforced",
-                )
-            )
-        # Advice since step 2 (26 October 2026, census FRG-082): GuardKit
-        # validates the feature when it loads it to build.
-        checks.append(
-            PreCommitCheck(
-                name="feature-validate", args={"feature_id": feature_id}, blocking=False
-            )
-        )
-        logger.info(
-            "planning driver: the plan leg's pre-commit checks for %s are declared "
-            "to the sandbox git runner rather than run here: %s",
-            feature_id,
-            ", ".join(
-                f"{c.name}({'blocking' if c.blocking else 'not blocking'}"
-                + (", --no-model" if c.args.get("no_model") else "")
-                + ")"
-                for c in checks
-            ),
-        )
-        return _DeclaredPlanChecks(
-            checks=PreCommitChecks(tuple(checks)),
-            files=files_out,
-            prelude=prelude,
-            stamps=stamps,
-        )
-
-    @staticmethod
-    def _log_declared_advice(
-        correlation_id: str, gitres: Any, name: str, carried_on: str
-    ) -> None:
-        """Log what a not-blocking declared check said when it did not pass
-        (step 2, 27 October 2026). The sandbox returns each check's outcome
-        in the write's ``checks``; this is the same ADVISORY warning the
-        in-container closure logs, so the complaint is not lost. Nothing
-        refuses on it."""
-        for check in getattr(gitres, "checks", None) or []:
-            if check.name != name or not check.ran or check.passed:
-                continue
-            logger.warning(
-                "planning driver: run %s — %s complained in the sandbox (%s) — "
-                "ADVISORY; %s",
-                correlation_id,
-                name,
-                check.detail or check.stderr_tail.strip() or f"exit {check.exit_code}",
-                carried_on,
-            )
-
-    def _stamps_from_declared_checks(
-        self, gitres: Any, declared: "_DeclaredPlanChecks", feature_id: str
-    ) -> "StampNormalizerOutcome | None":
-        """Read the stamping outcome off a declared write's result: the
-        ``normalize-stamps`` check's streams through the normalizer's own
-        parser, then the closure's after-the-fact steps (rule-only receipt,
-        the fill, the enforcement) — so the outcome is the one the closure
-        would have produced. ``None`` when the check never ran (the write
-        was refused before the checks, or forge's own refusal stood in for
-        it — that outcome is already recorded)."""
-        from forge.planning.target_terminal_tools import classify_normalizer_check
-
-        if declared.stamps is not None:
-            return declared.stamps
-        outcomes = getattr(gitres, "checks", None) or []
-        check = next((c for c in outcomes if c.name == "normalize-stamps"), None)
-        if check is None or not check.ran:
-            return None
-        outcome = classify_normalizer_check(
-            feature_id,
-            exit_code=check.exit_code,
-            stdout=check.stdout,
-            stderr=check.stderr_tail,
-            timed_out=check.timed_out,
-        )
-        if check.note:
-            # The sidecar ran it again without --no-model (the installed
-            # guardkit has no such option): the same receipt the closure's
-            # collaborator writes for that case.
-            outcome = dataclasses.replace(
-                outcome, rules_only=False, rules_only_note=check.note
-            )
-        return self._stamp_normalizer_finish(outcome, declared.prelude, feature_id)
-
-    def _machine_rewrite_allowed(
-        self, correlation_id: str, stamps: "StampNormalizerOutcome"
-    ) -> bool:
-        """Rule 1: does the machine get its one rewrite here?
-
-        Yes only when ALL of: the switch is on (``planning.rewrite_on_refusal``,
-        on by default); the routing law is enforced for this repo/feature; the
-        normalizer came back ``refused`` or ``partial`` WITH refused titles (a
-        ``failed`` or cannot-run normalizer is not a refusal of examples, and
-        titles that could not be read back cannot be sent back); and the
-        latest approved spec row does not already carry ``rewritten_by_machine``
-        — the fence is read from the durable row, never from memory (rule 7).
-        """
-        if not self._rewrite_round_could_fire(correlation_id):
-            return False
-        if stamps.status not in ("refused", "partial") or not stamps.refused_titles:
-            return False
-        if not stamps.enforced:
-            return False
-        return True
-
-    def _rewrite_round_could_fire(self, correlation_id: str) -> bool:
-        """The outcome-free half of rule 1: the switch is on
-        (``planning.rewrite_on_refusal``) and the latest approved spec row does
-        not already carry ``rewritten_by_machine`` (rule 7, read from the
-        durable row). This is what decides, BEFORE the first stamping, whether
-        it runs by rule only (rule 1a, 2026-09-07): with the round still
-        possible, a refusal is the signal it needs and the model is not asked
-        until the second stamping; with the switch off, or the one rewrite
-        already spent, the stamping asks the model as before.
-        """
-        cfg = self._deps.planning_config
-        if not bool(getattr(cfg, "rewrite_on_refusal", True)):
-            return False
-        spec_row = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
-        if spec_row.get("rewritten_by_machine"):
-            return False
-        return True
-
-    async def _machine_rewrite_after_refusal(
-        self,
-        row: Any,
-        correlation_id: str,
-        *,
-        target_repo: str,
-        repo_path: str,
-        branch: str,
-        plan_run_id: str,
-        stamps: "StampNormalizerOutcome",
-    ) -> dict[str, Any] | None:
-        """The machine's one rewrite: compose the note, run the spec writer's
-        revision round with it, and — when the rewrite landed — re-record the
-        approved row (rules 2, 3, 4).
-
-        Returns the rewrite record (round, author, note, refused titles, the
-        what-changed sentence, ``refused_by_checker`` and ``changed_nothing``
-        — with the checker's reason when it refused — and the first
-        stamping's receipt), or ``None`` when the spec leg already failed the
-        run loudly (a write or digest failure speaks its own sentence there).
-        A rewrite that did NOT land — the checker refused it (rule 6b: the
-        refusal comes back here as :class:`_MachineNoteRefused` instead of
-        failing the run) or it changed nothing — is returned WITHOUT
-        re-recording the approved row: the spec of record stays the one the
-        owner approved, and the caller gives the model fallback its turn on
-        it before deciding anything.
-        """
-        refused_titles = list(stamps.refused_titles)
-        note = self._machine_rewrite_note(refused_titles)
-        logger.info(
-            "planning driver: run %s — %d worked example(s) refused by rule "
-            "where the law is enforced; the machine sends them back to the "
-            "spec writer once (round 1): %s",
-            correlation_id,
-            len(refused_titles),
-            refused_titles,
-        )
-        record: dict[str, Any] = {
-            "round": 1,
-            "author": _MACHINE_NOTE_AUTHOR,
-            "note": note,
-            "refused_titles": refused_titles,
-            "changes": "",
-            "refused_by_checker": False,
-            "changed_nothing": False,
-            # Rule 1a: the receipt says whether the stamping that set off the
-            # rewrite ran by rule only, and what the model fallback said of
-            # itself on that call (switched off, when it was).
-            "first_stamping": self._first_stamping_block(stamps),
-        }
-        try:
-            draft = await self._draft_spec(
-                row,
-                correlation_id,
-                target_repo=target_repo,
-                repo_path=repo_path,
-                branch=branch,
-                plan_run_id=plan_run_id,
-                notes=[*self._spec_review_notes(correlation_id), note],
-                note_from_machine=True,
-                fail_on_refusal=False,
-            )
-        except _MachineNoteRefused as refused:
-            # Rule 6b (2026-09-07): the checker refused the machine's rewrite.
-            # The run does not stop here: the spec of record stands, and the
-            # model fallback gets its turn on the second stamping.
-            record["refused_by_checker"] = True
-            record["checker_reason"] = str(refused.reason or "")
-            record["dispatch_reason"] = refused.dispatch_reason
-            logger.warning(
-                "planning driver: run %s — the checker refused the machine's "
-                "rewrite (round 1): %s; the spec of record stands, and the "
-                "model fallback gets its turn on the second stamping before "
-                "the run can stop",
-                correlation_id,
-                refused.dispatch_reason,
-            )
-            return record
-        if draft is None:
-            return None
-        compared = draft.get("rewrite")
-        if not isinstance(compared, Mapping):
-            # Unreachable in practice: the plan leg only runs after an approved
-            # draft, so there is always a card to compare against. Said aloud
-            # rather than guessed at.
-            logger.warning(
-                "planning driver: run %s — the machine's rewrite could not be "
-                "compared with the approved list (no prior card on record); "
-                "carrying on with the rewrite as written",
-                correlation_id,
-            )
-            compared = {"repeat": False, "changes": "not recorded"}
-        changes = str(compared.get("changes") or "")
-        record["changes"] = changes
-        if bool(compared.get("repeat")) or not changes:
-            # Rule 6b: a rewrite that changed nothing the owner reads is never
-            # re-recorded; the spec of record stands, and the model fallback
-            # gets its turn ON IT. "Stands" has to be true of the BRANCH as
-            # well as of the row (coach finding, 2026-09-07): the spec leg
-            # committed the rewrite's files before the comparison, and a
-            # rewrite can move the steps of an example while every digest
-            # sentence stays word for word — the branch tip is then the
-            # rewrite, not the approved spec, and the second stamping would
-            # run on bytes no approved row records. So the approved sha is
-            # compared with the draft's: unmoved (the runner's idempotent
-            # no-commit path) and there is nothing to do; moved, and the
-            # approved spec is put back on the branch first.
-            record["changed_nothing"] = True
-            spec_of_record = await self._put_the_spec_of_record_back(
-                correlation_id, draft, repo_path=repo_path, branch=branch
-            )
-            if spec_of_record is None:
-                return None  # already loud: nothing must be stamped on those bytes
-            record["spec_of_record"] = spec_of_record
-            logger.warning(
-                "planning driver: run %s — the machine's rewrite (round 1) "
-                "changed nothing on the list; %s; the model fallback gets "
-                "its turn on the second stamping, on the spec of record, "
-                "before the run can stop",
-                correlation_id,
-                self._spec_of_record_words(spec_of_record),
-            )
-            return record
-        self._record_spec_approved_after_machine_rewrite(
-            correlation_id,
-            draft,
-            branch=branch,
-            note=note,
-            refused_titles=refused_titles,
-            changes=changes,
-        )
-        logger.info(
-            "planning driver: run %s — the machine's rewrite (round 1) landed "
-            "(%s); stamping again from the top of the plan leg%s",
-            correlation_id,
-            changes,
-            (
-                ", this time with the model fallback allowed"
-                if stamps.rules_only
-                else ""
-            ),
-        )
-        return record
-
-    @staticmethod
-    def _first_stamping_block(stamps: "StampNormalizerOutcome") -> dict[str, Any]:
-        """The receipt of the stamping that set off the machine's rewrite
-        (rule 1a, 2026-09-07): its status, whether it ran by rule only, the
-        note when rule-only was asked for and could not be had, and what the
-        model fallback said about itself when it said anything."""
-        block: dict[str, Any] = {
-            "status": stamps.status,
-            "rules_only": stamps.rules_only,
-        }
-        if stamps.rules_only_note:
-            block["rules_only_note"] = stamps.rules_only_note
-        if stamps.model_outcome is not None:
-            block["model_outcome"] = dict(stamps.model_outcome)
-        return block
-
-    async def _put_the_spec_of_record_back(
-        self,
-        correlation_id: str,
-        draft: Mapping[str, Any],
-        *,
-        repo_path: str,
-        branch: str,
-    ) -> dict[str, Any] | None:
-        """Make the planning branch carry the APPROVED spec again after a
-        machine rewrite that changed nothing the owner reads (rule 6b, coach
-        finding 2026-09-07).
-
-        The spec leg commits a rewrite's files before it compares the digest
-        cards, so a rewrite that moved an example's steps while the digest
-        sentences stayed word for word leaves the branch tip at the rewrite —
-        and the second stamping, which reads the approved row's files OFF THE
-        BRANCH, would stamp bytes no approved row records. Here the approved
-        row's sha is compared with the draft's: the same sha is the runner's
-        idempotent no-commit path (the rewrite was byte-identical) and nothing
-        is done; a different sha means the branch moved, and every file the
-        approved row lists is read off the approved commit and written back
-        on the branch as one commit, so the second stamping and the plan sit
-        on the spec of record. The rewrite's commit stays in the branch's
-        history, set aside, named in the receipt.
-
-        Returns the receipt block (the approved sha, whether the branch had
-        moved, and when it had the rewrite's sha and the put-back commit's),
-        or ``None`` after failing the run loudly — an approved row without a
-        sha, a file unreadable at the approved commit, or a write that failed
-        all mean the spec of record could not be put back, and nothing may be
-        stamped on bytes nobody approved.
-        """
-        approved = self._leg_event_details(correlation_id, _FEATURE_SPEC_STAGE)
-        approved_sha = str(approved.get("sha") or "")
-        rewrite_sha = str(draft.get("sha") or "")
-        if not approved_sha:
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_PLAN_STAGE,
-                "the machine's rewrite changed nothing on the list, but the "
-                "approved spec row records no commit, so the approved spec "
-                "could not be put back on the branch before stamping again; "
-                "nothing was built",
-            )
-            return None
-        block: dict[str, Any] = {
-            "sha": approved_sha,
-            "branch_moved_by_rewrite": False,
-        }
-        if rewrite_sha == approved_sha:
-            return block
-        block["branch_moved_by_rewrite"] = True
-        block["rewrite_sha"] = rewrite_sha
-        files: dict[str, str] = {}
-        for rel in approved.get("spec_files") or []:
-            content = await self._deps.git_runner.read_file_from_branch(
-                repo_path=repo_path, branch=approved_sha, file_path=str(rel)
-            )
-            if content is None:
-                await self._fail_leg(
-                    correlation_id,
-                    _FEATURE_PLAN_STAGE,
-                    "the machine's rewrite changed nothing on the list, but "
-                    f"{rel} could not be read at the approved spec's commit "
-                    f"{approved_sha}, so the approved spec could not be put back "
-                    "on the branch before stamping again; nothing was built",
-                )
-                return None
-            files[str(rel)] = content
-        try:
-            (
-                recorded_memory,
-                recorded_settings,
-                whose_work,
-                declared_at,
-            ) = self._recorded_launch(correlation_id)
-            gitres = await self._deps.git_runner.prepare_branch_and_write_tree(
-                repo_path=repo_path,
-                branch=branch,
-                files=files,
-                message=_SPEC_OF_RECORD_PUT_BACK_MESSAGE.format(
-                    correlation_id=correlation_id, rewrite_sha=rewrite_sha
-                ),
-                memory_project=recorded_memory,
-                launch_settings=recorded_settings,
-                build=whose_work,
-                declared_at=declared_at,
-                feature_routing_id=correlation_id,
-                feature_routing_required=self._deps.feature_routing_required,
-                feature_routing_receipt=self._feature_routing_receipt(correlation_id),
-            )
-        except Exception as exc:  # noqa: BLE001 — write boundary
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_PLAN_STAGE,
-                "putting the approved spec back on the branch, after the "
-                "machine's rewrite changed nothing on the list, raised "
-                f"{type(exc).__name__}: {exc}; nothing was built",
-            )
-            return None
-        if gitres.status == "failed":
-            await self._fail_leg(
-                correlation_id,
-                _FEATURE_PLAN_STAGE,
-                "putting the approved spec back on the branch, after the "
-                "machine's rewrite changed nothing on the list, failed: "
-                f"{gitres.stderr}; nothing was built",
-            )
-            return None
-        block["restored_sha"] = str(gitres.sha or "")
-        extra = sorted(
-            set(str(f) for f in draft.get("spec_files") or []) - set(files)
-        )
-        if extra:
-            # The runner writes files and never removes them: a rewrite that
-            # used another file name leaves that file on the branch. Nothing
-            # reads it (every later leg reads the approved row's list), and
-            # the receipt names it rather than pretending it is not there.
-            block["files_left_by_rewrite"] = extra
-        logger.info(
-            "planning driver: run %s — the machine's rewrite (round 1) had moved "
-            "the planning branch to %s without changing anything the owner "
-            "reads; the approved spec (%s) is put back as %s, %d file(s)%s",
-            correlation_id,
-            rewrite_sha,
-            approved_sha,
-            block["restored_sha"],
-            len(files),
-            (
-                "; the rewrite's own file(s) stay on the branch unread: "
-                + ", ".join(extra)
-                if extra
-                else ""
-            ),
-        )
-        return block
-
-    @staticmethod
-    def _spec_of_record_words(spec_of_record: Mapping[str, Any] | None) -> str:
-        """The machine record's words for where the spec of record stood
-        after a changed-nothing rewrite: the branch never moved, or the
-        rewrite's commit was set aside and the approved spec put back."""
-        if not spec_of_record:
-            return "the spec of record stands"
-        if not spec_of_record.get("branch_moved_by_rewrite"):
-            return "the branch never moved, so the spec of record stands"
-        return (
-            f"the rewrite's commit {spec_of_record.get('rewrite_sha')} was set "
-            f"aside and the approved spec {spec_of_record.get('sha')} put back on "
-            f"the branch as {spec_of_record.get('restored_sha')}"
-        )
-
-    async def _stop_at_stamps(
-        self,
-        correlation_id: str,
-        feature_id: str,
-        stamps: "StampNormalizerOutcome",
-        *,
-        after_rewrite: str | None = None,
-        round_note: str | None = None,
-    ) -> bool:
-        """The normalizer stopped the run — the card names the refused titles
-        VERBATIM (or the reason it could not run); the machine record keeps
-        the internal reason and, after the machine's rewrite, names the round
-        and how it went (rule 6, rule 9). ``after_rewrite`` is the card's
-        word for how the rewrite went; ``round_note``, when given, is the
-        machine record's whole account of the round (it goes on the record
-        only — the cannot-run card after a rewrite that did not land, rule
-        6b, says nothing about the round, as it never has) and otherwise the
-        record's account is built from ``after_rewrite``."""
-        reason = self._stamps_reason(feature_id, stamps)
-        if round_note:
-            reason = f"{reason}; {round_note}"
-        elif after_rewrite:
-            reason = (
-                f"{reason}; after the machine's rewrite (round 1): the rewrite "
-                f"{after_rewrite}"
-            )
-        return await self._fail_leg(
-            correlation_id,
-            _FEATURE_PLAN_STAGE,
-            reason,
-            owner_message=self._stamp_normalizer_card(
-                correlation_id, feature_id, stamps, after_rewrite=after_rewrite
-            ),
-        )
-
-    @staticmethod
-    def _stamps_reason(feature_id: str, stamps: "StampNormalizerOutcome") -> str:
-        """The machine record's reason for a normalizer stop. When the model
-        fallback was in fact asked, the record must not say "no fallback
-        home" (rule 16) — the outcome's own detail already says what the
-        model said, and a detail built elsewhere is corrected here."""
-        detail = stamps.detail
-        if stamps.model_was_asked and "no fallback home" in detail:
-            detail = detail.replace(
-                "no fallback home", "the model fallback was asked and could not settle them"
-            )
-        return (
-            f"stamp normalizer {stamps.status} for {feature_id}: {detail}"
-            + (
-                f"; refused titles: {list(stamps.refused_titles)!r}"
-                if stamps.refused_titles
-                else ""
-            )
-        )
-
-    @staticmethod
-    def _how_the_rewrite_went(rewrite: Mapping[str, Any]) -> str:
-        """The machine record's words for a rewrite that did not land: refused
-        by the checker, with the dispatch's own words, or changed nothing —
-        and, for the latter, where the spec of record then stood."""
-        if rewrite.get("refused_by_checker"):
-            return (
-                "the rewrite was refused by the checker "
-                f"({rewrite.get('dispatch_reason') or 'no reason supplied'})"
-            )
-        return (
-            "the rewrite changed nothing ("
-            + PlanningRunDriver._spec_of_record_words(rewrite.get("spec_of_record"))
-            + ")"
-        )
-
-    @staticmethod
-    def _rewrite_round_note(
-        rewrite: Mapping[str, Any], *, still_refused: bool = False
-    ) -> str:
-        """The machine record's words for a rewrite that did not land (rule
-        6b): how it went, that the model fallback had its turn on the second
-        stamping, on the spec of record, and — when it is so — that titles
-        are still refused and the run stops."""
-        note = (
-            "after the machine's rewrite (round 1): "
-            f"{PlanningRunDriver._how_the_rewrite_went(rewrite)}; {_MODEL_TURN_NOTE}"
-        )
-        return f"{note}; {_STILL_REFUSED_NOTE}" if still_refused else note
-
-    async def _stop_after_refused_rewrite(
-        self,
-        correlation_id: str,
-        feature_id: str,
-        stamps: "StampNormalizerOutcome",
-        rewrite: Mapping[str, Any],
-    ) -> bool:
-        """Rule 6b's stop after a rewrite the CHECKER refused: the model
-        fallback had its turn on the second stamping and titles are still
-        refused. The owner reads ONE message, not a card — rule 23's
-        machine-variant sentence, then the model fallback's own sentence
-        about itself (rule 16) when the normalizer said anything — and no
-        other words (every sentence here is quoted in the spec). The machine
-        record keeps the round, how it went, and the second stamping's
-        outcome. A rewrite that changed nothing stops elsewhere, with rule
-        6's card and its "changed nothing" sentence."""
-        first = self._note_refused_message(
-            correlation_id,
-            note=str(rewrite.get("note") or ""),
-            note_from_machine=True,
-            reason=rewrite.get("checker_reason"),
-        )
-        model_sentence = self._model_fallback_sentence(stamps)
-        message = f"{first} {model_sentence}" if model_sentence else first
-        reason = (
-            f"{self._stamps_reason(feature_id, stamps)}; "
-            f"{self._rewrite_round_note(rewrite, still_refused=True)}"
-        )
-        logger.error(
-            "planning driver: run %s — the model fallback had its turn after "
-            "the checker refused the machine's rewrite (round 1), and %d "
-            "title(s) are still refused; the run stops with the note-refused "
-            "sentence and the model's own (%s)",
-            correlation_id,
-            len(stamps.refused_titles),
-            str((stamps.model_outcome or {}).get("status") or "the normalizer said nothing about the model"),
-        )
-        return await self._fail_leg(
-            correlation_id, _FEATURE_PLAN_STAGE, reason, owner_message=message
-        )
 
     async def _finish_feature_plan(
         self,
@@ -8185,198 +5382,13 @@ class PlanningRunDriver:
         feature_id: str,
         target_repo: str,
         branch: str,
-        rewrite: Mapping[str, Any] | None,
         repo_path: str | None = None,
     ) -> bool:
-        """The plan is on the branch: receipts, the one line about the machine's
-        rewrite when there was one (rule 5), the approved row, and on to the
-        build trigger."""
+        """The plan is on the branch: the approved row, and on to the build
+        trigger."""
         deps = self._deps
-        stamps = attempt.stamps
         files = attempt.files
-        # The plan receipts carry the normalizer's outcome whichever way it
-        # went — written / nothing-to-do / partial / refused / failed /
-        # unavailable / not-wired — so a plan committed WITHOUT (all its)
-        # stamps is never silent about it. (An idempotent RT-08 short-circuit
-        # that never ran the hook leaves the key absent, honestly.)
-        stamp_receipt = stamps.receipt() if stamps is not None else None
-        if stamps is not None and stamps.disagreements:
-            # ADVISORY disagreements (Rich's ruling 08-18): named to the owner
-            # on their own plain line WHATEVER the status / enforcement — the
-            # stamps are never changed, so visibility is the whole mechanism.
-            stamp_receipt = dict(stamp_receipt or {})
-            dline = self._stamp_disagreements_line(stamps)
-            stamp_receipt["disagreements_line"] = dline
-            dsent = await self._notify(correlation_id, dline, level="info", mention=False)
-            stamp_receipt["disagreements_line_sent"] = (
-                "sent" if dsent == "sent" else "line not sent (no notifier)"
-            )
-        if stamps is not None and stamps.is_failure and not stamps.enforced:
-            # Coordinator condition 5: NOT ENFORCED → the plan PROCEEDED past
-            # a partial / refused / failed normalizer. The owner gets ONE
-            # plain, un-@mentioned line in the same thread naming every
-            # example that has no verification home (when there are titles
-            # to name); the receipt says whether it went out.
-            stamp_receipt = dict(stamp_receipt or {})
-            stamp_receipt["proceeded_unenforced"] = True
-            line = self._stamp_normalizer_unenforced_line(stamps)
-            if line is None:
-                stamp_receipt["owner_line"] = (
-                    "no owner line: no refused titles to name "
-                    f"(status {stamps.status}; see detail)"
-                )
-            else:
-                stamp_receipt["owner_line"] = line
-                sent = await self._notify(
-                    correlation_id, line, level="info", mention=False
-                )
-                stamp_receipt["owner_line_sent"] = (
-                    "sent"
-                    if sent == "sent"
-                    else "line not sent (no notifier)"
-                    if sent == "no-notifier"
-                    else "line not sent (publish failed)"
-                )
-        # THE MACHINE'S REWRITE (2026-09-06, rules 5 and 9). Read from the
-        # approved spec row when this drive did not do it itself — a re-drive
-        # after the row was written still receipts it and still tells the
-        # owner, because nobody has yet.
-        if rewrite is None:
-            recorded = self._leg_event_details(
-                correlation_id, _FEATURE_SPEC_STAGE
-            ).get("rewritten_by_machine")
-            rewrite = dict(recorded) if isinstance(recorded, Mapping) else None
-        if rewrite is not None:
-            refused_titles = list(rewrite.get("refused_titles") or [])
-            did_not_land = bool(
-                rewrite.get("refused_by_checker") or rewrite.get("changed_nothing")
-            )
-            decided: list[tuple[str, str]] = []
-            line: str | None
-            if did_not_land:
-                # Rule 6b: the rewrite did not land and the model fallback,
-                # given its turn on the second stamping, decided the rest.
-                # The line names the real titles and the real words — and
-                # only what the MODEL decided. When the normalizer marked
-                # nothing as the model's (the rules of this stamping settled
-                # every refused title themselves, which the same bytes should
-                # never produce), the line would not be true and no line is
-                # sent: the receipt and the log say so instead.
-                decided = (
-                    self._model_decided_pairs(stamps, refused_titles)
-                    if stamps is not None
-                    else [
-                        (t, "a verifier the normalizer did not name")
-                        for t in refused_titles
-                    ]
-                )
-                line = (
-                    self._machine_rewrite_model_line(
-                        len(refused_titles),
-                        why=(
-                            _REWRITE_REFUSED_BY_CHECKER_WHY
-                            if rewrite.get("refused_by_checker")
-                            else _REWRITE_CHANGED_NOTHING_WHY
-                        ),
-                        decided=decided,
-                    )
-                    if decided
-                    else None
-                )
-            else:
-                line = _MACHINE_REWRITE_LINE.format(
-                    n=len(refused_titles),
-                    changes=str(rewrite.get("changes") or "not recorded"),
-                )
-            if line is None:
-                sent = "no-line"
-                logger.warning(
-                    "planning driver: run %s — the machine's rewrite (round 1) "
-                    "did not land and the second stamping settled the refused "
-                    "titles without the model fallback (no title carries the "
-                    "model's mark: %s); the plan carries on and no line about "
-                    "the model is sent, because it would not be true",
-                    correlation_id,
-                    dict(stamps.rules) if stamps is not None else {},
-                )
-            else:
-                sent = await self._notify(correlation_id, line, level="info", mention=False)
-            receipt_block = {
-                "round": rewrite.get("round", 1),
-                "author": rewrite.get("author", _MACHINE_NOTE_AUTHOR),
-                "note": rewrite.get("note"),
-                "refused_titles": refused_titles,
-                "changes": rewrite.get("changes"),
-                "owner_line": (
-                    line
-                    if line is not None
-                    else "no owner line: the model fallback decided none of the "
-                    "refused titles on the second stamping (this stamping's own "
-                    "rules or existing stamps settled them), so a line about "
-                    "what the model decided would not be true"
-                ),
-                "owner_line_sent": (
-                    "sent"
-                    if sent == "sent"
-                    else "no line to send"
-                    if sent == "no-line"
-                    else "line not sent (no notifier)"
-                    if sent == "no-notifier"
-                    else "line not sent (publish failed)"
-                ),
-            }
-            if rewrite.get("refused_by_checker"):
-                receipt_block["refused_by_checker"] = True
-                receipt_block["checker_reason"] = str(rewrite.get("checker_reason") or "")
-            if rewrite.get("changed_nothing"):
-                receipt_block["changed_nothing"] = True
-                spec_of_record = rewrite.get("spec_of_record")
-                if isinstance(spec_of_record, Mapping):
-                    # Where the spec of record stood for the model's turn:
-                    # the approved sha, whether the rewrite had moved the
-                    # branch, and when it had, the commit set aside and the
-                    # one that put the approved spec back.
-                    receipt_block["spec_of_record"] = dict(spec_of_record)
-            if did_not_land:
-                # Rule 6b's receipt: the second stamping — the one that ran
-                # with the model allowed, on the spec of record — and what
-                # the model decided, title by title.
-                second_stamping: dict[str, Any] = {
-                    "status": stamps.status if stamps is not None else "not run",
-                    "rules_only": bool(stamps.rules_only) if stamps is not None else False,
-                    "model_decided": dict(decided),
-                }
-                if stamps is not None and stamps.model_outcome is not None:
-                    second_stamping["model_outcome"] = dict(stamps.model_outcome)
-                receipt_block["second_stamping"] = second_stamping
-            first_stamping = rewrite.get("first_stamping")
-            if isinstance(first_stamping, Mapping):
-                # Rule 1a: the stamping that set off the rewrite, and whether
-                # it ran by rule only; the block's own ``rules_only`` is the
-                # SECOND stamping's (the one committed with the plan). Known
-                # only to the drive that did the stamping — a re-drive after
-                # the row was written reads the rewrite from the durable row,
-                # which keeps rule 4's fields and no more.
-                receipt_block["first_stamping"] = dict(first_stamping)
-            stamp_receipt = dict(stamp_receipt or {})
-            stamp_receipt["rewrite"] = receipt_block
-            logger.info(
-                "planning driver: run %s — %s; the owner's line %s",
-                correlation_id,
-                (
-                    "the model fallback settled, on the second stamping, what "
-                    "the machine's rewrite (round 1) could not: "
-                    + "; ".join(f"{t} -> {w}" for t, w in decided)
-                    if did_not_land and decided
-                    else "the second stamping settled, without the model "
-                    "fallback, what the machine's rewrite (round 1) could not"
-                    if did_not_land
-                    else "the machine's rewrite (round 1) stamped clean"
-                ),
-                receipt_block["owner_line_sent"],
-            )
-        # Keep the exact specialist decision and reviewed artifact identity on
-        # the durable approved row.
+        # Keep the plan reviewer's record on the durable approved row.
         semantic_review = (
             dict(attempt.traceability) if attempt.traceability is not None else None
         )
@@ -8446,8 +5458,6 @@ class PlanningRunDriver:
         _memory_text, memory_receipt = self._recorded_memory_decisions(correlation_id)
         if memory_receipt is not None:
             details[memory_decisions.RECEIPT_KEY] = memory_receipt
-        if stamp_receipt is not None:
-            details["stamp_normalizer"] = stamp_receipt
         if semantic_review is not None:
             details["semantic_review"] = semantic_review
             score = semantic_review.get("criterion_score")
@@ -8456,10 +5466,6 @@ class PlanningRunDriver:
                 if isinstance(score, (int, float)) and not isinstance(score, bool)
                 else "unknown",
                 verdict=semantic_review.get("coach_verdict") or "not given",
-            )
-        if attempt.review_unreadable:
-            details[PLAN_REVIEW_NOTE_KEY] = _PLAN_REVIEW_UNREADABLE_CARD_LINE.format(
-                reason=attempt.review_unreadable
             )
         if attempt.review_refused:
             details[PLAN_REVIEW_NOTE_KEY] = _PLAN_REVIEW_REFUSED_CARD_LINE.format(
@@ -8488,17 +5494,6 @@ class PlanningRunDriver:
             # taps to start the build says the plan was written without the
             # repository, in the same words as the spec card.
             details[PLAN_REPOSITORY_UNAVAILABLE_KEY] = unavailable_line
-        # One plain warning when this plan is half as big again as the
-        # project's own usual (6 October 2026). It never refuses anything.
-        if repo_path is not None:
-            size_note, size_receipt = await asyncio.to_thread(
-                read_plan_size_note,
-                self._repository_reader_for(repo_path, correlation_id),
-                files,
-            )
-            details[PLAN_SIZE_KEY] = size_receipt
-            if size_note is not None:
-                details[PLAN_SIZE_NOTE_KEY] = size_note
         deps.store._record_event(
             correlation_id=correlation_id,
             stage_label=_FEATURE_PLAN_STAGE,
@@ -8508,565 +5503,18 @@ class PlanningRunDriver:
         )
         await self._notify(
             correlation_id,
-            f"Planning run {correlation_id}: machine spec + plan complete and "
-            f"validated (feature {feature_id}, branch {branch})"
-            f"{self._stamp_normalizer_clause(stamps)}; queueing the build.",
+            f"Planning run {correlation_id}: machine spec + plan complete "
+            f"(feature {feature_id}, branch {branch}); queueing the build.",
             level="info",
         )
         logger.info(
-            "planning driver: run %s feature-plan validated (feature_id=%s); "
+            "planning driver: run %s feature-plan committed (feature_id=%s); "
             "proceeding to the B3 build trigger",
             correlation_id,
             feature_id,
         )
         return True
 
-    async def _stamp_normalizer_step(
-        self,
-        worktree: Path,
-        feature_id: str,
-        spec_feature_paths: list[str],
-        *,
-        rules_only: bool = False,
-        feature_routing_id: str | None = None,
-    ) -> "StampNormalizerOutcome":
-        """Run THE STAMP NORMALIZER against the planning worktree (pre-validate).
-
-        Rich's condition 1 (2026-08-16): the ``verifier:`` stamps are WRITTEN
-        on the planning branch before validate. Two things happen here, in
-        order, both loud:
-
-        1. if the plan YAML declares no ``feature_files:`` at all, forge writes
-           the committed spec ``.feature`` path(s) into it — the universe the
-           normalizer reads is explicit, and forge is the party that knows it
-           (it committed that file one leg earlier; live 008 plans omit the
-           key — api_test FEAT-F924);
-        2. ``guardkit qa normalize-stamps --feature <id> --repo <worktree>``
-           via the frozen guardkit seam. Written / nothing-to-do → proceed to
-           validate; unavailable (older guardkit, no such subcommand) → log
-           ``normalizer unavailable`` and proceed, receipted; not wired →
-           proceed, receipted. Partial / refused / failed → the routing
-           law's ENFORCEMENT for this repo/feature decides (coordinator
-           condition 5): ENFORCED → the leg stops with a card naming the
-           titles verbatim; NOT ENFORCED → the plan proceeds (the decided
-           stamps already written ride the commit), a WARNING (partial /
-           refused) or ERROR (failed) is logged here, and the caller
-           receipts every title and tells the owner in one plain line.
-
-        The enforcement is resolved from the worktree BEFORE the normalizer
-        runs (since 2026-09-07; it was read afterwards before, from the same
-        files, and nothing the normalizer writes touches the flag): the
-        feature YAML's own ``routing_law:`` wins, then the repo's
-        ``.guardkit/config.yaml``, else off — the same two places and the
-        same precedence guardkit's plan-load half reads. Forge only READS
-        the flag; it never writes ``routing_law`` (pinned by test).
-
-        ``rules_only`` (rule 1a of the rewrite-on-refusal lane, 2026-09-07):
-        the caller asks for this stamping to run by rule only — the model
-        fallback not asked — because the machine's rewrite round is still
-        possible and a refusal is what it listens for. Honoured ONLY where
-        the law is enforced for this repo/feature (an unenforced repo stamps
-        exactly as before: the round never fires there) and only by a
-        collaborator that takes the keyword; an older one is called the old
-        way and the receipt says so (``rules_only_note``).
-
-        Never raises.
-        """
-        from forge.planning.target_terminal_tools import (
-            StampNormalizerOutcome,
-            normalizer_accepts_rules_only,
-        )
-
-        normalize = self._deps.normalize_stamps
-        if normalize is None:
-            logger.info(
-                "stamp normalizer hook: not wired for %s — the plan is "
-                "committed as the plan-writer wrote it (receipted)",
-                feature_id,
-            )
-            return StampNormalizerOutcome(
-                status="not-wired",
-                detail=(
-                    "no normalize_stamps collaborator wired; verifier stamps were "
-                    "NOT minted by forge for this plan"
-                ),
-            )
-        prelude = self._stamp_normalizer_prelude(
-            worktree,
-            feature_id,
-            spec_feature_paths,
-            rules_only=rules_only,
-            accepts_rules_only=normalizer_accepts_rules_only(normalize),
-        )
-        by_rule_only = prelude.by_rule_only
-        fill = prelude.fill
-        if fill.inconsistent:
-            # Coordinator condition 4: refuse LOUD, do not run the normalizer on
-            # a plan whose feature_files: contradicts forge's own spec commit.
-            logger.error("stamp normalizer hook: %s", fill.reason)
-            outcome = StampNormalizerOutcome(status="refused", detail=fill.reason)
-        else:
-            try:
-                routing_kwargs: dict[str, Any] = {}
-                if _accepts_keyword(normalize, "feature_routing_id"):
-                    routing_kwargs["feature_routing_id"] = feature_routing_id
-                if _accepts_keyword(normalize, "feature_routing_required"):
-                    routing_kwargs["feature_routing_required"] = (
-                        self._deps.feature_routing_required
-                    )
-                if _accepts_keyword(normalize, "feature_routing_receipt"):
-                    routing_kwargs["feature_routing_receipt"] = (
-                        self._feature_routing_receipt(feature_routing_id)
-                        if feature_routing_id is not None
-                        else None
-                    )
-                if by_rule_only:
-                    logger.info(
-                        "stamp normalizer hook: %s — first stamping by rule only "
-                        "(the rewrite round is on); the model fallback is not "
-                        "asked on this call",
-                        feature_id,
-                    )
-                    outcome = await normalize(
-                        worktree, feature_id, rules_only=True, **routing_kwargs
-                    )
-                else:
-                    outcome = await normalize(worktree, feature_id, **routing_kwargs)
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — collaborator boundary
-                logger.exception("stamp normalizer hook raised for %s", feature_id)
-                outcome = StampNormalizerOutcome(
-                    status="failed",
-                    detail=f"normalize_stamps raised {type(exc).__name__}: {exc}",
-                )
-        return self._stamp_normalizer_finish(outcome, prelude, feature_id)
-
-    def _stamp_normalizer_prelude(
-        self,
-        worktree: Path,
-        feature_id: str,
-        spec_feature_paths: list[str],
-        *,
-        rules_only: bool,
-        accepts_rules_only: bool,
-    ) -> "_StampPrelude":
-        """Everything the stamping step does BEFORE the normalizer runs, on
-        the worktree: read the routing law's enforcement (the mode and the
-        stop both hang on it), settle whether this stamping runs by rule
-        only, and write the committed spec path(s) into a plan YAML that
-        declares no ``feature_files:``. Shared by the closure (the
-        in-container runner) and the declared form (a sandbox runner, on a
-        temporary copy of the same files), so the two cannot drift.
-
-        ``accepts_rules_only`` is whether the party that will run the
-        normalizer takes ``--no-model``: the closure's collaborator says so
-        by its signature; a sandbox sidecar always does (and says so itself
-        when the guardkit beside it turns out not to).
-        """
-        from forge.pipeline.routing_stamps import resolve_routing_law
-        from forge.planning.target_terminal_tools import declare_feature_files_if_absent
-
-        # Coordinator condition 5: the STOP is gated on enforcement — and
-        # since rule 1a the MODE of the stamping is too, so the law is read
-        # first. A resolver defect is "off", said aloud (the law is opt-in).
-        enforcement: dict[str, str]
-        try:
-            law = resolve_routing_law(worktree, feature_id)
-        except Exception as exc:  # noqa: BLE001 — a resolver defect is "off", said aloud
-            logger.warning(
-                "stamp normalizer hook: routing-law resolver raised %s: %s for %s "
-                "— enforcement read as off (the law is opt-in)",
-                type(exc).__name__,
-                exc,
-                feature_id,
-            )
-            enforcement = {
-                "enforcement": "off",
-                "enforcement_source": "default",
-                "enforcement_detail": f"resolver raised {type(exc).__name__}: {exc}",
-            }
-        else:
-            enforcement = {
-                "enforcement": law.enforcement,
-                "enforcement_source": law.source,
-                "enforcement_detail": law.detail,
-            }
-        by_rule_only = bool(rules_only) and enforcement["enforcement"] == "enforced"
-        rules_only_note = ""
-        if by_rule_only and not accepts_rules_only:
-            by_rule_only = False
-            rules_only_note = (
-                "the first stamping was asked to run by rule only (the rewrite "
-                "round is on) but the wired normalize_stamps collaborator does "
-                "not take the rules_only keyword, so it was called as before "
-                "and the model fallback may have been asked"
-            )
-            logger.warning("stamp normalizer hook: %s for %s", rules_only_note, feature_id)
-        elif rules_only and not by_rule_only:
-            logger.info(
-                "stamp normalizer hook: rule-only stamping was asked for %s but the "
-                "routing law is not enforced here (%s) — stamping as before, the "
-                "rewrite round does not fire in an unenforced repo",
-                feature_id,
-                enforcement["enforcement_detail"],
-            )
-        fill = declare_feature_files_if_absent(worktree, feature_id, spec_feature_paths)
-        return _StampPrelude(
-            enforcement=enforcement,
-            by_rule_only=by_rule_only,
-            rules_only_note=rules_only_note,
-            fill=fill,
-        )
-
-    def _stamp_normalizer_finish(
-        self,
-        outcome: "StampNormalizerOutcome",
-        prelude: "_StampPrelude",
-        feature_id: str,
-    ) -> "StampNormalizerOutcome":
-        """Everything the stamping step does AFTER the normalizer answered:
-        the rule-only receipt, the fill's receipt, the enforcement, and the
-        log line that says how it went. Shared by both forms."""
-        by_rule_only = prelude.by_rule_only
-        rules_only_note = prelude.rules_only_note
-        fill = prelude.fill
-        enforcement = prelude.enforcement
-        if rules_only_note:
-            # The driver's own reason: the collaborator does not take the keyword.
-            outcome = dataclasses.replace(
-                outcome, rules_only=False, rules_only_note=rules_only_note
-            )
-        elif by_rule_only and not outcome.rules_only_note:
-            # The keyword was passed and the collaborator did not say it could
-            # not honour it (the production one says so — and keeps
-            # ``rules_only`` false — when the installed guardkit has no
-            # ``--no-model`` option); the driver's word is the receipt's.
-            outcome = dataclasses.replace(outcome, rules_only=True)
-        if fill.fired:
-            outcome = dataclasses.replace(
-                outcome, feature_files_filled=tuple(fill.feature_files)
-            )
-        outcome = dataclasses.replace(outcome, **enforcement)
-        if outcome.status == "unavailable":
-            logger.warning(
-                "stamp normalizer hook: normalizer unavailable for %s — %s",
-                feature_id,
-                outcome.detail,
-            )
-        elif outcome.is_failure and not outcome.enforced:
-            if outcome.status == "failed":
-                logger.error(
-                    "stamp normalizer hook: %s FAILED for %s — %s; the routing law "
-                    "is NOT enforced here (%s), so the plan PROCEEDS unstamped "
-                    "(a broken normalizer must not kill an un-enforced chain)",
-                    outcome.status,
-                    feature_id,
-                    outcome.detail,
-                    outcome.enforcement_detail,
-                )
-            else:
-                logger.warning(
-                    "stamp normalizer hook: %s for %s — %s; refused titles: %s; the "
-                    "routing law is NOT enforced here (%s), so the plan PROCEEDS "
-                    "with the decided stamps written",
-                    outcome.status,
-                    feature_id,
-                    outcome.detail,
-                    list(outcome.refused_titles),
-                    outcome.enforcement_detail,
-                )
-        elif outcome.is_failure:
-            logger.error(
-                "stamp normalizer hook: %s for %s — %s; the routing law IS "
-                "enforced here (%s): the plan leg STOPS",
-                outcome.status,
-                feature_id,
-                outcome.detail,
-                outcome.enforcement_detail,
-            )
-        return outcome
-
-    @staticmethod
-    def _stamp_normalizer_unenforced_line(
-        stamps: "StampNormalizerOutcome",
-    ) -> str | None:
-        """The ONE plain line the owner gets when the plan proceeded past a
-        partial / refused normalizer in a repo that does not enforce the
-        routing law — the refused titles named verbatim, one per line, no
-        rule ids, no @mention. ``None`` when there are no titles to name (a
-        cannot-run failure, or forge's own condition-4 refusal): those are
-        logged + receipted, and the plan-complete line carries the clause.
-        """
-        if not stamps.refused_titles:
-            return None
-        n = len(stamps.refused_titles)
-        m = stamps.total_scenarios
-        titles = "\n".join(f"  - {t}" for t in stamps.refused_titles)
-        return (
-            f"{n} of {m} examples could not be given a verification home by rule —\n"
-            f"{titles}\n"
-            "— the plan proceeds; this repo does not enforce the routing law yet"
-        )
-
-    @staticmethod
-    def _stamp_disagreements_line(stamps: "StampNormalizerOutcome") -> str | None:
-        """The ONE plain line the owner gets when the rules DISAGREE with a
-        stamp already on the plan (Rich's ruling 08-18, drive-19 datum): the
-        stamp is left exactly as written — this is visibility at zero
-        authority — so it goes out WHATEVER the status and whether or not the
-        repo enforces the law (a legal-but-wrong stamp passes the law). Plain
-        words, no rule ids, no @mention."""
-        if not stamps.disagreements:
-            return None
-        n = len(stamps.disagreements)
-        rows = "\n".join(
-            f"  - {d.get('title', '?')} — stamped {d.get('stamped', '?')}, "
-            f"the rules say {d.get('rule_home', '?')}"
-            for d in stamps.disagreements
-        )
-        return (
-            f"{n} example(s) carry a verification home the rules would not have chosen —\n"
-            f"{rows}\n"
-            "— the stamps stand as written (nothing was changed); worth a look before this feature graduates"
-        )
-
-    @staticmethod
-    def _stamp_normalizer_clause(stamps: "StampNormalizerOutcome | None") -> str:
-        """The owner-facing clause on the plan-complete line — plain words."""
-        if stamps is None:
-            return ""
-        if stamps.status == "written":
-            n = len(stamps.stamped) or (stamps.stamps_on_branch or 0)
-            return f"; {n} verifier stamp(s) minted by rule and committed with the plan"
-        if stamps.status == "nothing-to-do":
-            return "; every scenario already carried its verifier stamp"
-        if stamps.status == "unavailable":
-            return (
-                "; verifier stamps NOT minted — this guardkit predates the stamp "
-                "normalizer (rebake pending), so the plan is unstamped"
-            )
-        if stamps.is_failure and not stamps.enforced:
-            k = len(stamps.refused_titles)
-            n = len(stamps.stamped) or (stamps.stamps_on_branch or 0)
-            if stamps.status == "partial" and k:
-                return (
-                    f"; {n} verifier stamp(s) minted by rule and committed with the "
-                    f"plan, {k} example(s) left without one (named above)"
-                )
-            if stamps.status == "partial":
-                return (
-                    f"; {n} verifier stamp(s) minted by rule and committed with the "
-                    "plan, some example(s) left without one (the normalizer's list "
-                    "could not be read back)"
-                )
-            if stamps.status == "refused" and k:
-                return (
-                    f"; verifier stamps NOT minted — {k} example(s) had no rule to "
-                    "decide a verifier (named above)"
-                )
-            return (
-                "; verifier stamps NOT minted — the stamp normalizer "
-                f"{'refused' if stamps.status == 'refused' else 'could not run'} "
-                "and this repo does not enforce the routing law yet"
-            )
-        return ""
-
-    @staticmethod
-    def _model_fallback_sentence(stamps: "StampNormalizerOutcome") -> str | None:
-        """The one sentence after the titles about the MODEL FALLBACK (rule 16,
-        2026-09-06): what it reported about itself, in plain words for the
-        owner (5 October 2026) — asked and could not answer (ran out of room,
-        timed out, unreachable, or otherwise), answer rejected, not asked
-        (no model named, or no endpoint configured), or decided some. Never
-        the build system's own detail. ``None`` when the normalizer said
-        nothing about it (an older guardkit) — nothing is invented."""
-        outcome = stamps.model_outcome
-        if not outcome:
-            return None
-        status = str(outcome.get("status") or "")
-        detail = " ".join(str(outcome.get("detail") or "").split()).rstrip(".")
-        # The card is read by the owner (5 October 2026, Codex round 1): every
-        # sentence here is plain words, never the build system's own detail,
-        # which names settings and error classes. That detail stays in the
-        # receipt's model_outcome and in this one log line.
-        if status in ("asked_and_failed", "answer_rejected", "not_configured"):
-            logger.info(
-                "planning driver: the stamp check's model fallback ended %s; "
-                "the build system said: %s",
-                status,
-                detail or "nothing more",
-            )
-        if status == "asked_and_failed":
-            return _model_failed_sentence(detail)
-        if status == "answer_rejected":
-            return _MODEL_ANSWER_REJECTED_SENTENCE
-        if status == "not_configured":
-            # Two reasons share this status: no endpoint is set, or (current
-            # guardkit) no stamp model is named. The endpoint sentence is
-            # unchanged word for word.
-            lowered = detail.lower()
-            if "endpoint" not in lowered and (
-                "stamp model" in lowered or "guardkit_stamp_model" in lowered
-            ):
-                return _NO_STAMP_MODEL_SENTENCE
-            return "The model fallback was not asked: no endpoint is configured."
-        if status == "switched_off":
-            # Rule 1a (2026-09-07): the machine itself ran this stamping by
-            # rule only so its rewrite round could fire. That is the machine's
-            # own doing, not something the owner can act on, and it is NEVER
-            # "no endpoint is configured". The card's fallback clause (in
-            # :meth:`_stamp_normalizer_card`) already says the model was not
-            # asked and why, so no second sentence repeats it. After a
-            # rewrite the card reports the SECOND stamping, which could ask
-            # the model.
-            return None
-        if status == "decided":
-            count: Any = outcome.get("count")
-            if not isinstance(count, int) or isinstance(count, bool):
-                m = re.search(r"\b(\d+)\b", detail)
-                count = int(m.group(1)) if m else "some"
-            return f"The model fallback decided {count} of them; these could not be decided."
-        return None
-
-    @staticmethod
-    def _model_decided_pairs(
-        stamps: "StampNormalizerOutcome", refused_titles: Sequence[str]
-    ) -> list[tuple[str, str]]:
-        """The (title, verifier word) pairs the MODEL decided on a stamping
-        (rule 6b): the titles the normalizer marks with rule ``model`` — its
-        own provenance mark for a model-decided stamp, never an R-number.
-        When it marked none (an older guardkit, or a stamped map the seam's
-        clipped tail lost), the titles the first stamping refused, each with
-        what this stamping wrote for it — or a plain "not named", never a
-        guessed word. A title this stamping's RULES decided (an R-number in
-        the rules map) or found already stamped is never put in the model's
-        mouth (coach finding, 2026-09-07): it is left out, and the caller
-        says nothing about the model when nothing is left."""
-        stamped = {str(k): str(v) for k, v in stamps.stamped.items()}
-        rules = {str(k): str(v).strip().lower() for k, v in stamps.rules.items()}
-        pairs = [(t, w) for t, w in stamped.items() if rules.get(t) == _MODEL_RULE_MARK]
-        if pairs:
-            return pairs
-        out: list[tuple[str, str]] = []
-        for title in refused_titles:
-            if _RULE_NUMBER_RE.match(rules.get(title, "")):
-                continue  # a rule decided it on this stamping, not the model
-            if title in stamps.already_stamped:
-                continue  # it carried a stamp already; nobody decided it here
-            word = stamped.get(title)
-            if word is None:
-                word = "a verifier the normalizer did not name"
-            out.append((title, word))
-        return out
-
-    @staticmethod
-    def _machine_rewrite_model_line(
-        n: int, *, why: str, decided: Sequence[tuple[str, str]]
-    ) -> str:
-        """Rule 6b's one line, in the spec's shape: the count, why the spec
-        writer could not rewrite the examples, and what the model decided —
-        the real title and the real word, one pair per example."""
-        one = n == 1
-        return _MACHINE_REWRITE_MODEL_LINE.format(
-            n=n,
-            it="it" if one else "them",
-            why=why,
-            its_verifier="its verifier" if one else "their verifiers",
-            decided="; ".join(f"{title} → {word}" for title, word in decided),
-        )
-
-    @staticmethod
-    def _stamp_normalizer_card(
-        correlation_id: str,
-        feature_id: str,
-        stamps: "StampNormalizerOutcome",
-        *,
-        after_rewrite: str | None = None,
-    ) -> str:
-        """The owner's card when THE STAMP NORMALIZER stops the run — which
-        it does ONLY where the routing law is enforced for the repo/feature
-        (coordinator condition 5).
-
-        Names every refused title VERBATIM (the rule could not decide which
-        verifier proves it; partial and refused alike — no rule ids on the
-        face), says what the model fallback said about itself when it said
-        anything (rule 16, 2026-09-06 — "no fallback home" is said only when
-        the model was NOT asked, and never when the machine itself switched
-        it off for this stamping, rule 1a of 2026-09-07: that clause says the
-        model was not asked and why), says nothing was stamped on the branch
-        and nothing was built, says the repo enforces the law, and says what a
-        person does next — in plain words, the vocabulary named once. A
-        cannot-run failure names the reason instead.
-
-        ``after_rewrite`` (rule 6, 2026-09-06): the machine already spent its
-        one rewrite; the card opens with the sentence that says so and how the
-        rewrite went — "still could not be proven" (the rewrite landed and
-        was refused again) or "changed nothing" (the rewrite came back saying
-        the same thing and the model fallback, given its turn on the spec of
-        record — rule 6b, 2026-09-07 — could not settle the titles either).
-        A rewrite the checker refused never reaches this card: after the
-        model's turn it stops, if it must, with the note-refused sentence.
-        """
-        from forge.pipeline.routing_stamps import VERIFIER_HOMES
-
-        head = (
-            f"Planning run {correlation_id} stopped at "
-            f"{plain_stage_name(_FEATURE_PLAN_STAGE)}"
-        )
-        lead = (
-            f"{head}. "
-            + _MACHINE_REWRITE_STOP_SENTENCE.format(why=after_rewrite)
-            + " The"
-            if after_rewrite
-            else f"{head}: the"
-        )
-        if stamps.status in ("refused", "partial") and stamps.refused_titles:
-            titles = "\n".join(f"  - {t}" for t in stamps.refused_titles)
-            n = len(stamps.refused_titles)
-            recovered = (
-                " (titles read back from the normalizer's wrapped console echo; "
-                "compare against the spec)"
-                if stamps.titles_recovered_from_console_echo
-                else ""
-            )
-            model_status = str((stamps.model_outcome or {}).get("status") or "")
-            if stamps.model_was_asked:
-                fallback_clause = "the model fallback could not settle them"
-            elif model_status == "switched_off":
-                # Rule 1a (2026-09-07): the machine itself switched the model
-                # off for this stamping so its rewrite round could go first.
-                # The card says THAT. It never says "there is no fallback
-                # home" — a model endpoint may well be configured; it was
-                # not asked on this stamping. (After a rewrite the card is
-                # about the SECOND stamping, which asks the model — rule 6b —
-                # so this clause is the first stamping's alone.)
-                fallback_clause = (
-                    "the model fallback was not asked (it was switched off "
-                    "for this stamping)"
-                )
-            else:
-                fallback_clause = "there is no fallback home"
-            model_sentence = PlanningRunDriver._model_fallback_sentence(stamps)
-            return (
-                f"{lead} verifier stamps could not all be minted by rule for "
-                f"feature {feature_id}. {n} scenario(s) had no rule to decide "
-                f"which verifier proves them, and {fallback_clause}, so "
-                f"nothing was stamped and nothing was built{recovered}:\n"
-                f"{titles}\n"
-                + (f"{model_sentence}\n" if model_sentence else "")
-                + f"This repo enforces the routing law: every scenario needs a "
-                f"verifier before its plan can be committed. "
-                f"What to do: give each of these scenarios a verifier by hand in "
-                f".guardkit/features/{feature_id}.yaml under scenarios: — one of "
-                f"{', '.join(VERIFIER_HOMES)} (operator only for attended human "
-                f"work, never as a default) — then re-run the request."
-            )
-        return (
-            f"{lead} verifier-stamp normalizer could not run for feature "
-            f"{feature_id}, so the plan was not stamped and nothing was built "
-            f"(this repo enforces the routing law). Reason: {stamps.detail}"
-        )
 
     async def _build_trigger_leg(self, row: Any, correlation_id: str) -> bool:
         """B3 build trigger: queue the validated feature, advance to BUILD_QUEUED.
@@ -9250,14 +5698,6 @@ class PlanningRunDriver:
             )
             return True
 
-        if deps.validate_pass_bar is None:
-            return await self._fail_leg(
-                correlation_id,
-                _QA_PASS_BARS_STAGE,
-                "target terminal ON but the pass-bar validate collaborator "
-                "(validate_pass_bar) is not wired",
-            )
-
         # The seed was captured at the spec commit and persisted on the durable
         # feature-spec event (it survives an idempotent re-drive where the spec
         # leg never ran this drive).
@@ -9379,16 +5819,7 @@ class PlanningRunDriver:
         plan_sha = str(plan_details.get("sha") or "")
         branch = str(plan_details.get("branch") or f"planning/{correlation_id}")
         plan_files = [str(f) for f in (plan_details.get("plan_files") or [])]
-        if not plan_sha:
-            plan_tasks = []
-            logger.warning(
-                "planning driver: run %s feature-plan record names no plan "
-                "commit — ADVISORY; no per-task pass bars are registered and "
-                "the run carries on",
-                correlation_id,
-            )
-        else:
-            plan_tasks = None
+        plan_tasks: list[Any] | None = [] if not plan_sha else None
         resolved = await self._resolve_repo(
             row, correlation_id, stage_label=_QA_PASS_BARS_STAGE
         )
@@ -9498,47 +5929,7 @@ class PlanningRunDriver:
                 ", ".join(sorted(docs_bars)),
             )
 
-        validate = deps.validate_pass_bar
-
-        async def _pre_commit(worktree: Path) -> PreCommitResult:
-            # Run guardkit's OWN ``qa validate pass-bar`` on every minted bar.
-            # Advice since step 2 (26 October 2026, census FRG-068): GuardKit's
-            # task-start precondition validates the same bar where it is
-            # enforced, so a complaint here is logged and the bars are written.
-            for rel in sorted(bars):
-                outcome = await validate(worktree, rel)
-                if not outcome.ok:
-                    logger.warning(
-                        "planning driver: run %s — %s: %s — ADVISORY; written "
-                        "anyway (GuardKit checks it at task start)",
-                        correlation_id,
-                        rel,
-                        outcome.detail,
-                    )
-            return PreCommitResult(ok=True)
-
-        # Sandbox first (rule 87): for a runner that lives in the repository's
-        # sandbox the same check is DECLARED once per minted bar, in the same
-        # order the loop above runs them, as advice (non-blocking), exactly as
-        # the loop above logs and carries on.
         git_runner = self._git_runner_for(_target_repo)
-        pre_commit: Any = _pre_commit
-        if self._runner_takes_declared_checks(git_runner):
-            pre_commit = PreCommitChecks(
-                tuple(
-                    PreCommitCheck(
-                        name="validate-pass-bar", args={"bar_file": rel}, blocking=False
-                    )
-                    for rel in sorted(bars)
-                )
-            )
-            logger.info(
-                "planning driver: run %s — the pass-bar leg's %d check(s) are "
-                "declared to the sandbox git runner rather than run here",
-                correlation_id,
-                len(bars),
-            )
-
         try:
             from forge.planning.requirement_amendment_store import begin_qa, finish_qa
             amendment_qa = await begin_qa(deps.store._connection, correlation_id, git_runner, repo_path, branch, bars)
@@ -9556,7 +5947,6 @@ class PlanningRunDriver:
                     f"planning: register {len(bars)} per-task QA pass bar(s) for "
                     f"{correlation_id} ({feature_id}, Lane B seed fan-out)"
                 ),
-                pre_commit=pre_commit,
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
                 build=whose_work,
@@ -9564,12 +5954,6 @@ class PlanningRunDriver:
                 feature_routing_id=correlation_id,
                 feature_routing_required=self._deps.feature_routing_required,
                 feature_routing_receipt=self._feature_routing_receipt(correlation_id),
-            )
-            self._log_declared_advice(
-                correlation_id,
-                gitres,
-                "validate-pass-bar",
-                "written anyway (GuardKit checks it at task start)",
             )
             if gitres.status != "failed":
                 amendment_qa = await finish_qa(amendment_qa, git_runner, repo_path, gitres.sha)
@@ -9583,7 +5967,7 @@ class PlanningRunDriver:
             return await self._fail_leg(
                 correlation_id,
                 _QA_PASS_BARS_STAGE,
-                f"pass-bar write / qa validate failed: {gitres.stderr}",
+                f"pass-bar write failed: {gitres.stderr}",
             )
 
         deps.store._record_event(
@@ -10443,14 +6827,6 @@ class PlanningRunDriver:
             )
             return True
 
-        if deps.validate_gate_registry is None:
-            return await self._fail_leg(
-                correlation_id,
-                _QA_FEATURE_GATE_STAGE,
-                "target terminal ON but the gate-registry validate collaborator "
-                "(validate_gate_registry) is not wired",
-            )
-
         # The seed the bars leg consumed (persisted on the durable feature-spec
         # event). It is authless here — either by construction or by the owner's
         # confirmation at the bars leg's auth door, which runs BEFORE this leg
@@ -10626,35 +7002,7 @@ class PlanningRunDriver:
                 address=endpoint,
             )
 
-        validate = deps.validate_gate_registry
-
-        async def _pre_commit(worktree: Path) -> PreCommitResult:
-            # Run guardkit's OWN ``qa validate gate-registry`` on the appended
-            # registry so a malformed forge-appended entry fails the leg BEFORE
-            # it lands (never an entry the post-deploy live-gate would reject).
-            outcome = await validate(worktree, _GATE_REGISTRY_REL)
-            return PreCommitResult(ok=outcome.ok, detail=outcome.detail)
-
-        # Sandbox first (rule 87): declared by name for a runner in the
-        # repository's sandbox, the same check against the same file.
         git_runner = self._git_runner_for(_target_repo)
-        pre_commit: Any = _pre_commit
-        if self._runner_takes_declared_checks(git_runner):
-            pre_commit = PreCommitChecks(
-                (
-                    PreCommitCheck(
-                        name="validate-gate-registry",
-                        args={"registry_file": _GATE_REGISTRY_REL},
-                        blocking=True,
-                    ),
-                )
-            )
-            logger.info(
-                "planning driver: run %s — the feature-gate leg's check is "
-                "declared to the sandbox git runner rather than run here",
-                correlation_id,
-            )
-
         files = {gate_rel: filled_gate, _GATE_REGISTRY_REL: new_registry}
         try:
             from forge.planning.requirement_amendment_store import begin_qa, finish_qa
@@ -10674,7 +7022,6 @@ class PlanningRunDriver:
                     f"{correlation_id} ({feature_id}, GET {endpoint['path']} — "
                     "F2 seed derivation)"
                 ),
-                pre_commit=pre_commit,
                 memory_project=recorded_memory,
                 launch_settings=recorded_settings,
                 build=whose_work,
@@ -10697,8 +7044,7 @@ class PlanningRunDriver:
         if gitres.status == "failed":
             return self._skip_feature_gate(
                 correlation_id,
-                f"feature-gate write / qa validate gate-registry failed: "
-                f"{gitres.stderr} — no gate registered",
+                f"feature-gate write failed: {gitres.stderr} — no gate registered",
                 reason_code=SKIP_REGISTRATION_FAILED,
                 feature_id=feature_id,
                 address=endpoint,
@@ -11295,10 +7641,11 @@ class PlanningRunDriver:
         ``_assumptions.yaml`` / ``_summary.md``, plus ``_digest.yaml``) PLUS
         extras (a
         ``pass-bar-seed-*.yaml`` and the ``validation.json`` data channel).
-        Requires EXACTLY one file per suffix; extras are tolerated but never
-        committed. The committed paths are the canonical ``features/<slug>/``
-        triple (``slug`` already resolved via ``_slug_of``). ``None`` when the
-        map does not carry exactly one of each suffix.
+        Only the ``.feature`` is needed (without it there is no spec); the
+        assumptions and summary files are committed when they came, the first
+        of each when several did (the cull, 27 October 2026). The committed
+        paths are the canonical ``features/<slug>/`` files (``slug`` already
+        resolved via ``_slug_of``). ``None`` when no ``.feature`` came.
 
         THE SPEC DIGEST IS COMMITTED TOO, and additively: when the reply carries
         exactly one ``<slug>_digest.yaml`` it lands beside the triple, so the
@@ -11327,22 +7674,14 @@ class PlanningRunDriver:
                 if key.endswith(suffix):
                     by_suffix[suffix].append(str(content))
                     break
-        required = (
-            _SPEC_FEATURE_SUFFIX,
-            _SPEC_ASSUMPTIONS_SUFFIX,
-            _SPEC_SUMMARY_SUFFIX,
-        )
-        if any(len(by_suffix[suffix]) != 1 for suffix in required):
+        if not by_suffix[_SPEC_FEATURE_SUFFIX]:
             return None
         base = f"features/{slug}"
-        files = {
-            f"{base}/{slug}{suffix}": by_suffix[suffix][0] for suffix in required
+        return {
+            f"{base}/{slug}{suffix}": found[0]
+            for suffix, found in by_suffix.items()
+            if found
         }
-        if len(by_suffix[_SPEC_DIGEST_SUFFIX]) == 1:
-            files[f"{base}/{slug}{_SPEC_DIGEST_SUFFIX}"] = by_suffix[
-                _SPEC_DIGEST_SUFFIX
-            ][0]
-        return files
 
     @staticmethod
     def _spec_triple_files(
@@ -11353,11 +7692,13 @@ class PlanningRunDriver:
         Shape resolution (belt-and-braces):
           1. An explicit ``files`` mapping (specialist-authored repo-relative
              paths — the legacy/alternate shape), committed verbatim.
-          2. The DEPLOYED native suffix-keyed artifact map (one ``*.feature`` /
-             ``*_assumptions.yaml`` / ``*_summary.md`` plus tolerated extras),
-             projected onto the canonical ``features/<slug>/`` triple.
-          3. Field-based ``feature`` / ``assumptions`` / ``summary`` fallback.
-        ``None`` when no shape yields a triple (the invalid-artifacts fail path).
+          2. The DEPLOYED native suffix-keyed artifact map (a ``*.feature``,
+             with ``*_assumptions.yaml`` / ``*_summary.md`` when they came, plus
+             tolerated extras), projected onto ``features/<slug>/``.
+          3. Field-based ``feature`` (and optional ``assumptions`` /
+             ``summary``) fallback.
+        ``None`` when no shape yields a ``.feature`` (the invalid-artifacts
+        fail path: there is no spec).
         """
         files = role_output.get("files")
         if isinstance(files, Mapping) and files:
@@ -11366,16 +7707,15 @@ class PlanningRunDriver:
         if native is not None:
             return native
         feature = role_output.get("feature")
-        assumptions = role_output.get("assumptions")
-        summary = role_output.get("summary")
-        if feature and assumptions and summary:
-            base = f"features/{slug}"
-            return {
-                f"{base}/{slug}.feature": str(feature),
-                f"{base}/{slug}_assumptions.yaml": str(assumptions),
-                f"{base}/{slug}_summary.md": str(summary),
-            }
-        return None
+        if not feature:
+            return None
+        base = f"features/{slug}"
+        files = {f"{base}/{slug}.feature": str(feature)}
+        if role_output.get("assumptions"):
+            files[f"{base}/{slug}_assumptions.yaml"] = str(role_output["assumptions"])
+        if role_output.get("summary"):
+            files[f"{base}/{slug}_summary.md"] = str(role_output["summary"])
+        return files
 
     @staticmethod
     def _plan_tree_files(role_output: Mapping[str, Any]) -> dict[str, str] | None:
@@ -11399,124 +7739,30 @@ class PlanningRunDriver:
         }
         return tree or None
 
-    @staticmethod
-    def _plan_artifact_identity(files: Mapping[str, str]) -> dict[str, Any]:
-        """Reproduce the specialist's canonical identity for a plan tree."""
-        tree = {str(path): str(content) for path, content in files.items()}
-        canonical = json.dumps(
-            tree, sort_keys=True, separators=(",", ":"), ensure_ascii=False
-        ).encode("utf-8")
-        return {
-            "algorithm": "sha256",
-            "digest": hashlib.sha256(canonical).hexdigest(),
-            "paths": sorted(tree),
-        }
 
     @staticmethod
-    def _semantic_review_of(
-        role_output: Mapping[str, Any],
-        files: Mapping[str, str],
-    ) -> tuple[dict[str, Any] | None, str | None]:
-        """Read and verify the specialist's decisive semantic review receipt.
-
-        Missing or malformed evidence is never approval. The receipt must name
-        the one semantic criterion and bind byte-for-byte to the plan tree
-        Forge is about to use. Its score and the Coach's verdict are advice
-        for the build card (step 2, 26 October 2026), never a refusal.
-        """
+    def _plan_review_record(role_output: Mapping[str, Any]) -> dict[str, Any] | None:
+        """The plan reviewer's ``semantic_review.json`` as the planning seat
+        wrote it, for the build card; ``None`` when there is none or it is
+        not a JSON object. Nothing is checked or refused on it (the cull,
+        27 October 2026)."""
         raw = role_output.get("semantic_review.json")
         if isinstance(raw, str):
             try:
                 parsed: Any = json.loads(raw)
             except (json.JSONDecodeError, ValueError):
-                return None, "semantic_review.json is not parseable JSON"
-        elif isinstance(raw, Mapping):
-            parsed = dict(raw)
+                return None
         else:
-            return None, _SEMANTIC_REVIEW_MISSING
-        if not isinstance(parsed, Mapping):
-            return None, "semantic_review.json is not an object"
+            parsed = raw
+        return dict(parsed) if isinstance(parsed, Mapping) else None
 
-        # THE DECISION FIRST (step 1, 25 October 2026): a refusal that can be
-        # read is a refusal, whatever is wrong with the rest of the record.
-        # STEP 2 (26 October 2026): the request-traceability score and the
-        # Coach's verdict are advice. The planning seat computes the score
-        # once; Forge shows it on the build card and never refuses a plan for
-        # it. Everything below is the record's shape (bookkeeping).
-        if isinstance(parsed.get("decision"), str) and parsed["decision"] != "approved":
-            return None, _SEMANTIC_NOT_APPROVED
-        expected_keys = {
-            "schema_version",
-            "decision",
-            "criterion",
-            "criterion_score",
-            "coach_verdict",
-            "artifact_identity",
-            "reviewed_after_rewrite",
-        }
-        if set(parsed) != expected_keys:
-            return None, "semantic_review.json has the wrong fields"
-        if (
-            type(parsed.get("schema_version")) is not int
-            or parsed.get("schema_version") != 1
-        ):
-            return None, "semantic review schema_version is not 1"
-        if parsed.get("decision") != "approved":
-            return None, _SEMANTIC_NOT_APPROVED
-        if parsed.get("criterion") != "request_traceability":
-            return None, "semantic review names the wrong criterion"
-        score = parsed.get("criterion_score")
-        if (
-            isinstance(score, bool)
-            or not isinstance(score, (int, float))
-            or (isinstance(score, float) and not math.isfinite(score))
-            or score < 0.0
-            or score > 1.0
-        ):
-            return None, "criterion_score is not a number from 0 to 1"
-        if not isinstance(parsed.get("coach_verdict"), str):
-            return None, "coach_verdict is not text"
-        if type(parsed.get("reviewed_after_rewrite")) is not bool:
-            return None, "reviewed_after_rewrite is not boolean"
-
-        identity = parsed.get("artifact_identity")
-        if not isinstance(identity, Mapping):
-            return None, "artifact_identity is missing or malformed"
-        if set(identity) != {"algorithm", "digest", "paths"}:
-            return None, "artifact_identity has the wrong fields"
-        if identity.get("algorithm") != "sha256":
-            return None, "artifact_identity uses an unsupported algorithm"
-        paths = identity.get("paths")
-        if (
-            not isinstance(paths, list)
-            or any(not isinstance(path, str) for path in paths)
-            or paths != sorted(set(paths))
-        ):
-            return None, "artifact_identity paths are malformed"
-
-        actual = PlanningRunDriver._plan_artifact_identity(files)
-        if paths != actual["paths"]:
-            return None, "semantic review artifact paths do not match the plan tree"
-        digest = identity.get("digest")
-        if not isinstance(digest, str) or digest != actual["digest"]:
-            return None, "semantic review artifact digest does not match the plan tree"
-        return dict(parsed), None
-
-    @staticmethod
-    def _plan_advice(role_output: Mapping[str, Any]) -> list[str]:
-        """The specialist's ``plan_advice`` as ``rule: text`` lines, or ``[]``
-        (for the log)."""
-        return [
-            f"{rule}: {text}" if rule else text
-            for rule, text in PlanningRunDriver._plan_advice_items(role_output)
-        ]
 
     @staticmethod
     def _plan_advice_items(role_output: Mapping[str, Any]) -> list[tuple[str, str]]:
         """The specialist's ``plan_advice`` as ``(rule, text)`` pairs, or ``[]``.
 
-        Read from the same ``validation.json`` as :meth:`_validation_failures`;
-        anything unreadable is simply no advice.
+        Read from the reply's ``validation.json``; anything unreadable is
+        simply no advice.
         """
         raw = role_output.get("validation.json")
         data: Any = raw
@@ -11537,48 +7783,6 @@ class PlanningRunDriver:
                     items.append((rule, text))
         return items
 
-    @staticmethod
-    def _validation_failures(role_output: Mapping[str, Any]) -> list[str]:
-        """Return the specialist's decidable-gate failures (C5), or ``[]``.
-
-        The 007/008 modes ship the artifacts PLUS a machine-readable
-        ``validation.json`` (a JSON STRING in the native map) carrying
-        ``{accepted, errors, gates_run}`` — the validation-as-data channel: a
-        decidable gate FAILURE returns the artifacts AND the error list so the
-        leg holds both. VALIDATION HONESTY: a reply that reports gate failures
-        (``accepted: false`` / a non-empty ``errors`` list) must NOT proceed
-        silently — the caller fails the leg loudly naming these errors. A clean
-        (``accepted: true``) or absent channel returns ``[]`` (proceed).
-        """
-        raw = role_output.get("validation.json")
-        data: Any = None
-        if isinstance(raw, str) and raw.strip():
-            try:
-                data = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
-                return [
-                    "the specialist's validation.json is present but not "
-                    "parseable JSON"
-                ]
-        elif isinstance(raw, Mapping):
-            data = raw
-        else:
-            alt = role_output.get("validation")
-            if isinstance(alt, Mapping):
-                data = alt
-        if not isinstance(data, Mapping):
-            return []
-        accepted = data.get("accepted")
-        errors = data.get("errors")
-        error_list = [str(e) for e in errors] if isinstance(errors, list) else []
-        if accepted is True:
-            return []
-        if accepted is False or error_list:
-            return error_list or [
-                "the specialist reported the artifact set as not accepted "
-                "(no error detail supplied)"
-            ]
-        return []
 
     @staticmethod
     def _feature_file_rel(files: Mapping[str, str]) -> str | None:
@@ -11683,57 +7887,6 @@ class PlanningRunDriver:
             "possible_contradiction": _possible_contradiction_text(pairs, pair_count),
         }
 
-    @staticmethod
-    def _capture_example_support(
-        role_output: Mapping[str, Any], correlation_id: str
-    ) -> dict[str, Any] | None:
-        """The spec writer's checker's reading of each worked example, or
-        ``None`` (6 October 2026, planning improvements item 4).
-
-        Reads ``example_support.json`` from the reply (a tolerated extra,
-        never committed), exactly as :meth:`_capture_coherence_warning` reads
-        its file: ``{"status", "checked_request", "goes_beyond": [{"title",
-        "why"}]}``. ``None`` when there is no file (an older spec writer) or
-        it cannot be read: a bad file is logged and never fails the leg.
-        """
-        raw: Any = None
-        for name, content in role_output.items():
-            if str(name).rsplit("/", 1)[-1] == _EXAMPLE_SUPPORT_FILE:
-                raw = content
-                break
-        if raw is None:
-            return None
-        try:
-            record = json.loads(raw) if isinstance(raw, (str, bytes)) else raw
-            if not isinstance(record, Mapping):
-                raise ValueError("not a JSON object")
-            status = str(record.get("status") or "")
-            if status not in ("checked", "no_verdict", "not_asked"):
-                raise ValueError(f"unknown status {status!r}")
-            entries = record.get("goes_beyond") or []
-            if not isinstance(entries, list):
-                raise ValueError("'goes_beyond' is not a list")
-            goes_beyond = [
-                {
-                    "title": str(entry.get("title") or "").strip(),
-                    "why": str(entry.get("why") or "").strip(),
-                }
-                for entry in entries
-                if isinstance(entry, Mapping) and str(entry.get("title") or "").strip()
-            ]
-        except (ValueError, TypeError) as exc:
-            logger.warning(
-                "planning driver: run %s — the spec writer's %s could not be "
-                "read (%s); the examples are checked without it",
-                correlation_id,
-                _EXAMPLE_SUPPORT_FILE,
-                exc,
-            )
-            return None
-        support: dict[str, Any] = {"status": status, "goes_beyond": goes_beyond}
-        if "checked_request" in record:
-            support["checked_request"] = record.get("checked_request")
-        return support
 
     @staticmethod
     def _capture_pass_bar_seed(role_output: Mapping[str, Any]) -> str | None:

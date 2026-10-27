@@ -14,7 +14,6 @@ wrong-shaped config.
 
 from __future__ import annotations
 
-from pathlib import Path
 
 import pytest
 import yaml
@@ -326,57 +325,6 @@ class TestTheSeatIsRequired:
         with pytest.raises(ValidationError):
             load_config(path)
 
-
-class TestTheDeployOrderLawsSecondSurface:
-    """The sidecar reads the SAME yaml — and degrades PERMISSIVE on failure.
-
-    Conductor-activation design pass §5: the langgraph sidecar lazily
-    re-reads ``$FORGE_CONFIG_PATH`` per invocation, and on ANY load failure
-    falls back to a base-dir-only filesystem check. So a ``conductor:`` key
-    written into the deployed yaml before the sidecar is running the schema
-    that defines it does not merely refuse the daemon — it silently WEAKENS
-    the routine path's worktree-confinement gate. That is why activation is
-    TWO acts (daemon recreate AND sidecar stop-wait-start) BEFORE the yaml
-    act, and this pins the mechanism rather than trusting the runbook's
-    prose.
-    """
-
-    def _allowlist(self, tmp_path, body: str, monkeypatch):
-        from forge.subagents.autobuild_runner import _load_filesystem_allowlist
-
-        path = tmp_path / "forge.yaml"
-        path.write_text(body)
-        monkeypatch.setenv("FORGE_CONFIG_PATH", str(path))
-        monkeypatch.chdir(tmp_path)
-        return _load_filesystem_allowlist()
-
-    def test_a_config_the_running_schema_understands_yields_the_allowlist(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """The healthy case — the confinement gate has real roots to check."""
-        assert self._allowlist(tmp_path, _MINIMAL + _ON, monkeypatch) == [
-            Path("/tmp")
-        ]
-
-    def test_a_conductor_key_the_schema_does_not_know_degrades_permissive(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """The hazard itself, driven.
-
-        An unknown key under ``conductor:`` is exactly what ``seat:`` was to
-        yesterday's image: ``extra='forbid'`` refuses the WHOLE config, the
-        lazy loader swallows it, and the answer is ``None`` — the permissive
-        base-dir-only fallback. Loud on the daemon, SILENT here.
-        """
-        body = _MINIMAL + "\nconductor:\n  enabled: false\n  seat_from_a_newer_image: x\n"
-        assert self._allowlist(tmp_path, body, monkeypatch) is None
-
-    def test_an_enabled_but_seatless_config_also_degrades_permissive(
-        self, tmp_path, monkeypatch
-    ) -> None:
-        """The new validator is a load failure like any other, sidecar-side."""
-        body = _MINIMAL + "\nconductor:\n  enabled: true\n"
-        assert self._allowlist(tmp_path, body, monkeypatch) is None
 
 
 # ---------------------------------------------------------------------------

@@ -66,14 +66,6 @@ def _git_isolation(monkeypatch: pytest.MonkeyPatch) -> None:
 def persistence(monkeypatch: pytest.MonkeyPatch) -> _RecordingPersistence:
     fake = _RecordingPersistence()
     monkeypatch.setattr(cli_queue, "make_persistence", lambda config: fake)
-    monkeypatch.setattr(
-        cli_queue, "_planning_handoff_retirement_preflight", lambda path: frozenset()
-    )
-    monkeypatch.setattr(
-        cli_queue,
-        "_planning_handoff_retirement_after_migration",
-        lambda persistence: frozenset(),
-    )
     return fake
 
 

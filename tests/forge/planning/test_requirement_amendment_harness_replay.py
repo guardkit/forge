@@ -21,6 +21,7 @@ import json
 from datetime import datetime, timezone
 from pathlib import Path
 
+from tests.forge.planning._plan_identity import plan_artifact_identity
 import pytest
 import pytest_asyncio
 from nats_core.envelope import EventType, MessageEnvelope
@@ -144,7 +145,7 @@ async def approved_and_admitted(tmp_path: Path):
         "criterion": "request_traceability",
         "criterion_score": 1.0,
         "coach_verdict": "GOOD",
-        "artifact_identity": PlanningRunDriver._plan_artifact_identity(plan_files),
+        "artifact_identity": plan_artifact_identity(plan_files),
         "reviewed_after_rewrite": False,
     }
     record_plan(cx, CORRELATION, checked, review)

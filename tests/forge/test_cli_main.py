@@ -128,14 +128,6 @@ class _FakePersistence:
 def fake_persistence(monkeypatch: pytest.MonkeyPatch) -> _FakePersistence:
     fake = _FakePersistence()
     monkeypatch.setattr(cli_queue, "make_persistence", lambda config: fake)
-    monkeypatch.setattr(
-        cli_queue, "_planning_handoff_retirement_preflight", lambda path: frozenset()
-    )
-    monkeypatch.setattr(
-        cli_queue,
-        "_planning_handoff_retirement_after_migration",
-        lambda persistence: frozenset(),
-    )
     return fake
 
 
@@ -270,35 +262,6 @@ class TestFeatureIdValidationBeforeSideEffects:
 
 class TestRepoAllowlistRejection:
     """AC-004: ``--repo`` outside ``repo_allowlist`` exits 2 (Group C)."""
-
-    def test_unauthorised_repo_exits_2_with_no_persistence_or_publish(
-        self,
-        restricted_config_path: Path,
-        repo_dir: Path,
-        feature_yaml: Path,
-        captured_publish: list[tuple[str, bytes]],
-        fake_persistence: _FakePersistence,
-    ) -> None:
-        from forge.cli.main import main
-
-        runner = CliRunner()
-        result = runner.invoke(
-            main,
-            [
-                "--config",
-                str(restricted_config_path),
-                "queue",
-                "FEAT-PATH",
-                "--repo",
-                str(repo_dir),
-                "--feature-yaml",
-                str(feature_yaml),
-            ],
-        )
-        assert result.exit_code == 2, result.output
-        assert "allowlist" in result.output.lower() or "repo" in result.output.lower()
-        assert fake_persistence.calls == []
-        assert captured_publish == []
 
 
 # ---------------------------------------------------------------------------

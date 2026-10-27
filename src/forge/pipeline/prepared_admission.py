@@ -21,10 +21,12 @@ otherwise):
 2. the project's ``.guardkit/config.yaml`` is read AT THAT COMMIT with the
    planning door's own reader, for the memory name and the launch-setting
    names, refused in the planning door's own words;
-3. the supplied bundle — the feature file, its tasks, its spec files, the
-   plan's guide, the project's binding documents, the files they link to and
-   the QA files both producers write — must be present at that commit. The
-   first missing item is named. No model is called.
+3. the feature file must be at that commit and read as a plan with tasks,
+   and each task's file must be there: without them there is nothing to
+   build. (The checks on the rest of the supplied bundle — spec files,
+   companion files, the plan's guide, binding documents, links, ids written
+   with spaces, the leak-sweep manifest — went in the cull, 27 October
+   2026.) No model is called.
 
 Nothing here calls a planning capability, writes anything, or changes a
 checked-out branch. Every answer is either the admitted facts or one plain
@@ -33,21 +35,15 @@ sentence; nothing raises.
 
 from __future__ import annotations
 
-import posixpath
-import re
 from dataclasses import dataclass
 from typing import Any
-from urllib.parse import unquote
 
 import yaml
 
 from forge.planning.declared_memory import (
     read_declarations_at_commit,
-    read_declared_project_documents,
     read_declared_reference,
 )
-from forge.planning.project_documents import read_project_documents_at_commit
-from forge.planning.reference_material import read_signed_off_record
 
 __all__ = [
     "AdmittedBuild",
@@ -56,18 +52,10 @@ __all__ = [
     "admit_prepared_build",
     "check_supplied_bundle",
     "feature_yaml_relpath",
-    "guide_claims_routes",
-    "relative_markdown_links",
 ]
 
 #: Where GuardKit (and so the build runner) reads a feature's plan file.
 FEATURE_YAML_DIR: str = ".guardkit/features"
-
-#: The plan's guide, written beside the task files by ``/feature-plan``.
-GUIDE_NAME: str = "IMPLEMENTATION-GUIDE.md"
-
-#: The leak-sweep manifest both producers write when the guide claims routes.
-LEAK_SWEEP_PATH: str = "qa/leak-sweep.yaml"
 
 
 def feature_yaml_relpath(feature_id: str) -> str:
@@ -196,7 +184,6 @@ async def admit_prepared_build(
 # ---------------------------------------------------------------------------
 
 
-_LINK_MODE = "120000"
 _ORDINARY_MODES = frozenset({"100644", "100755"})
 _BUILT_PREFIX = "the prepared feature cannot be built: "
 
@@ -238,43 +225,14 @@ async def _read(
     commit: str,
     path: str,
 ) -> tuple[str | None, str | None]:
-    """``(text, None)`` for an ordinary committed file, ``(None, None)`` when
-    absent, ``(None, why)`` otherwise.
-
-    Every file of a prepared bundle must be the file itself (Codex review
-    round 1, R2): the raw read reports the tree entry's mode, and a symbolic
-    link — dangling, escaping or otherwise — is refused naming the file, as
-    is a path reached through a linked folder. A folder at the path is not a
-    file: absent.
-    """
+    """``(text, None)`` for a committed file, ``(None, None)`` when absent,
+    ``(None, why)`` when the reader could not answer."""
     answer, why = await _raw(runner, repo_path, commit, path)
     if why:
         return None, why
-    mode = getattr(answer, "mode", None)
-    if getattr(answer, "found", False) and mode == _LINK_MODE:
-        return None, (
-            f"{_BUILT_PREFIX}{path} is a symbolic link at {_short(commit)}; every "
-            f"file of a prepared feature must be the file itself"
-        )
-    if getattr(answer, "found", False) and mode in _ORDINARY_MODES:
+    if getattr(answer, "found", False) and getattr(answer, "mode", None) in _ORDINARY_MODES:
         content = getattr(answer, "content", None)
         return (content if isinstance(content, str) else ""), None
-    if mode is None and "/" in path:
-        # Not there: say so plainly, unless a folder on the way is a link.
-        parts = path.split("/")
-        for index in range(1, len(parts)):
-            prefix = "/".join(parts[:index])
-            step, why = await _raw(runner, repo_path, commit, prefix)
-            if why:
-                return None, why
-            if getattr(step, "found", False) and getattr(step, "mode", None) == _LINK_MODE:
-                return None, (
-                    f"{_BUILT_PREFIX}{path} is reached through {prefix}, a "
-                    f"symbolic link at {_short(commit)}; every file of a "
-                    f"prepared feature must be the file itself"
-                )
-            if getattr(step, "mode", None) is None:
-                break
     return None, None
 
 
@@ -297,245 +255,18 @@ def _short(commit: str) -> str:
     return commit[:12]
 
 
-_FENCE_RE = re.compile(r"^(```|~~~).*?^\1[^\n]*$", re.MULTILINE | re.DOTALL)
-_INLINE_CODE_RE = re.compile(r"`[^`\n]*`")
-_LINK_RE = re.compile(r"!?\[[^\]\n]*\]\(\s*<?([^)\s>]+)>?(?:\s+[\"'(][^)]*)?\)")
-_SCHEME_RE = re.compile(r"^[A-Za-z][A-Za-z0-9+.\-]*:")
-
-
-def relative_markdown_links(text: str) -> list[str]:
-    """The relative link targets in Markdown ``text``, in order, once each.
-
-    ``[text](path)`` and ``![alt](path)`` count; a URL (anything with a
-    scheme, ``//host`` included), a bare ``#anchor`` and anything inside a code
-    fence or back-quotes do not — task files back-quote paths of files still to
-    be written. A ``#fragment`` or ``?query`` is dropped from the path.
-    """
-    stripped = _INLINE_CODE_RE.sub("", _FENCE_RE.sub("", text))
-    found: list[str] = []
-    for match in _LINK_RE.finditer(stripped):
-        target = match.group(1).strip()
-        if not target or target.startswith("#") or target.startswith("//"):
-            continue
-        if _SCHEME_RE.match(target):
-            continue
-        target = target.split("#", 1)[0].split("?", 1)[0]
-        if not target:
-            continue
-        target = unquote(target)
-        if target not in found:
-            found.append(target)
-    return found
-
-
-def _padded(path: str) -> bool:
-    """Does ``path`` begin or end with whitespace (Codex review round 3, R8)?
-
-    Such a path is never trimmed into another: GuardKit reads it exactly as
-    written, and `` ./x`` is a folder named `` .`` (which a committed link
-    could redirect), not ``./x``. So it is refused, naming it."""
-    return bool(path) and (path[0].isspace() or path[-1].isspace())
-
 
 def _yaml_path(raw: str) -> str | None:
-    """A path the feature YAML names (a task's ``file_path``, a spec file), or
-    ``None`` when it is absolute or has a ``..`` component (Codex review
-    rounds 1-2, R3 and R6). Nothing is normalised before the check: a ``..``
-    is refused outright, never collapsed, since in the commit it could mean a
-    linked folder's parent. Only ``.`` and empty components are dropped."""
+    """A path the feature YAML names (a task's ``file_path``) as a path in the
+    commit, or ``None`` when it is absolute or has a ``..`` component (no
+    such path can be read out of a commit). Only ``.`` and empty components
+    are dropped."""
     if raw.startswith("/") or raw.startswith("\\"):
         return None
     parts = [part for part in raw.split("/") if part not in ("", ".")]
     if not parts or ".." in parts:
         return None
     return "/".join(parts)
-
-
-async def _walk_reference(
-    runner: Any,
-    repo_path: str,
-    commit: str,
-    source: str,
-    target: str,
-    seen: dict[str, Any],
-) -> tuple[str | None, str | None]:
-    """Resolve a Markdown reference from ``source`` inside the commit.
-
-    ``(path, None)`` for an ordinary committed file, else ``(None, why)``
-    (Codex review round 2, R6). Walked component by component against the
-    commit tree, in order — as GuardKit's committed resolver walks — and
-    never collapsed first: ``.`` and empty components are skipped, ``..``
-    takes the parent of the folder reached so far (refused at the top), and
-    every component is looked at in the commit. A link at any component is
-    refused, as is a component that is not there or a file used as a folder.
-    A leading ``/`` starts at the repository's top.
-    """
-    at = _short(commit)
-    if _padded(target):
-        # CommonMark has already trimmed the destination; what is left (after
-        # %-decoding) still begins or ends with a space, so it names a
-        # different file from the one it appears to (R8).
-        return None, (
-            f"{_BUILT_PREFIX}{source} links to {target!r}, whose path begins or "
-            f"ends with a space; write the link without one and queue the "
-            f"build again."
-        )
-    current: list[str] = [] if target.startswith("/") else (
-        [p for p in source.split("/")[:-1] if p]
-    )
-    parts = target.split("/")
-
-    def refused(reason: str) -> tuple[None, str]:
-        return None, (
-            f"{_BUILT_PREFIX}{source} links to {target}, {reason}. Commit "
-            f"it on the branch, or correct the link, and queue the build "
-            f"again."
-        )
-
-    for index, part in enumerate(parts):
-        if part in ("", "."):
-            continue
-        if part == "..":
-            if not current:
-                return refused("which is outside the repository")
-            current.pop()
-            continue
-        candidate = "/".join([*current, part])
-        if candidate not in seen:
-            # Existence and kind only: a reference target is never parsed or
-            # delivered as text, so a picture is a fine target (R7).
-            answer, why = await _raw(
-                runner, repo_path, commit, candidate, mode_only=True
-            )
-            if why:
-                return None, why
-            seen[candidate] = answer
-        answer = seen[candidate]
-        mode = getattr(answer, "mode", None)
-        found = bool(getattr(answer, "found", False))
-        last = all(rest in ("", ".") for rest in parts[index + 1 :])
-        if found and mode == _LINK_MODE:
-            return refused(
-                f"and {candidate} is a symbolic link at {at}; every file of a "
-                f"prepared feature, and every folder on the way to one, must "
-                f"be the thing itself"
-            )
-        if mode == "040000" and not last:
-            current.append(part)
-            continue
-        if last and found and mode in _ORDINARY_MODES:
-            return candidate, None
-        if mode is None:
-            what = "in the commit"
-        elif last:
-            what = "an ordinary file in the commit"
-        else:
-            what = "a folder in the commit"
-        return refused(f"and {candidate} is not {what} {at} it was supplied at")
-    return refused("which names no file")
-
-
-#: The guide's Integration Contracts sections, read the way the specialist
-#: planner's own emitter reads them (specialist-agent
-#: ``src/specialist_agent/qa/leak_sweep_emit.py``: ``_HEADING_RE`` and
-#: ``_FENCE_RE``, here ``_GUIDE_HEADING_RE`` and ``_GUIDE_FENCE_RE``, and
-#: ``_heading_anchor``, ``_is_integration_heading``,
-#: ``_extract_integration_sections`` and ``_fenced_line_starts``, as fixed on
-#: 7 October 2026), ported here small. Admission must never require a
-#: ``qa/leak-sweep.yaml`` the emitter correctly does not write, so it asks
-#: exactly the emitter's question of the guide:
-#:
-#: * a heading is up to three spaces, then two or more hashes, or one hash
-#:   followed by a space (``# Appendix`` is a level-one heading and ends a
-#:   section); a heading-like line inside a fenced ``` or ~~~ block is not a
-#:   heading, and neither opens nor ends a section;
-#: * a heading opens an Integration Contracts section when, numbering,
-#:   ``§``, a colon, bracketed qualifiers, case and spacing taken away, it
-#:   reads "integration contract(s)", or it is a bare ``§4`` / ``4``;
-#: * every such section counts, and each runs to the next heading of the
-#:   same or a higher level.
-#:
-#: Until 7 October 2026 this read only the emitter's old, case-sensitive
-#: first section, plus GuardKit's colon form, and ran a section to the next
-#: ``##`` only, so a ``# Appendix`` after an empty section, or a heading in a
-#: fenced example, made admission ask for a manifest no emitter would write.
-_GUIDE_HEADING_RE = re.compile(r"^ {0,3}(#{2,}|#(?=[ \t]|$))[ \t]*(.*?)[ \t#]*$", re.MULTILINE)
-_GUIDE_FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
-_BARE_SECTION_FOUR_RE = re.compile(r"(?:§\s*)?4\s*:?")
-#: The emitter's own route pattern (``_ROUTE_RE``, case-insensitive), with a
-#: route that is only spaces not counted, as the emitter skips it.
-_ROUTE_LINE_RE = re.compile(r"(?i)^\s*[-]?\s*route:\s*\S", re.MULTILINE)
-
-
-def _heading_anchor(text: str) -> str:
-    """The heading text with its numbering, qualifiers and punctuation taken
-    away: "§4: Integration Contracts [MANDATORY]" -> "integration contracts"."""
-    t = text.lower()
-    t = re.sub(r"\([^)]*\)", " ", t)
-    t = re.sub(r"\[[^\]]*\]", " ", t)
-    t = re.sub(r"§\s*\d+\s*:?", " ", t)
-    t = re.sub(r"^\s*\d+\s*[.):]?\s*", "", t)
-    t = re.sub(r"[^a-z0-9]+", " ", t)
-    return re.sub(r"\s+", " ", t).strip()
-
-
-def _is_integration_heading(text: str) -> bool:
-    if _BARE_SECTION_FOUR_RE.fullmatch(text.strip()):
-        return True
-    return _heading_anchor(text) in ("integration contract", "integration contracts")
-
-
-def _fenced_line_starts(text: str) -> set[int]:
-    """The offsets of the lines inside fenced code blocks, fences included;
-    a block closes on a line of the same character at least as long, with
-    nothing after it, and an unclosed block runs to the end."""
-    fenced: set[int] = set()
-    open_char = ""
-    open_len = 0
-    offset = 0
-    for line in text.splitlines(keepends=True):
-        match = _GUIDE_FENCE_RE.match(line)
-        if open_char:
-            fenced.add(offset)
-            if match and match.group(1)[0] == open_char and len(match.group(1)) >= open_len:
-                if not line[match.end() :].strip():
-                    open_char = ""
-        elif match:
-            fenced.add(offset)
-            open_char = match.group(1)[0]
-            open_len = len(match.group(1))
-        offset += len(line)
-    return fenced
-
-
-def _integration_sections(guide_text: str) -> list[str]:
-    fenced = _fenced_line_starts(guide_text)
-    headings = [
-        (m.start(), m.end(), len(m.group(1)), m.group(2))
-        for m in _GUIDE_HEADING_RE.finditer(guide_text)
-        if m.start() not in fenced
-    ]
-    sections: list[str] = []
-    for index, (_start, body_start, level, text) in enumerate(headings):
-        if not _is_integration_heading(text):
-            continue
-        body_end = len(guide_text)
-        for next_start, _end, next_level, _text in headings[index + 1 :]:
-            if next_level <= level:
-                body_end = next_start
-                break
-        sections.append(guide_text[body_start:body_end])
-    return sections
-
-
-def guide_claims_routes(guide_text: str) -> bool:
-    """Does an Integration Contracts section of the guide declare a ``route:``?
-
-    The emitter's own question (see :data:`_GUIDE_HEADING_RE` above): a ``route:``
-    line in any of the guide's Integration Contracts sections is the
-    producer's signal that ``qa/leak-sweep.yaml`` belongs with it.
-    """
-    return any(_ROUTE_LINE_RE.search(body) for body in _integration_sections(guide_text))
 
 
 async def check_supplied_bundle(
@@ -546,21 +277,15 @@ async def check_supplied_bundle(
     feature_id: str,
     config_text: str | None,
 ) -> str | None:
-    """``None`` when the supplied bundle is all at ``commit``; else the first gap.
+    """``None`` when there is something to build at ``commit``; else why not.
 
-    In order: the feature file and its ``id``; each task's file; at least one
-    spec file, each present (whatever ``routing_law`` says); the two companion
-    files beside each spec file; the guide in each folder holding task files;
-    the project's binding documents, as ordinary files; the project's
-    signed-off reference record, when it declares one; every relative
-    Markdown link in the supplied summaries, guides and task files; a pass bar
-    per task and a QA seed per spec file (whatever the tier-1 enforcement
-    setting); and the leak-sweep manifest when the guide claims a route. The
-    specialist-only ``<name>_digest.yaml`` is never required.
+    The feature file must be there and read as a plan with tasks, and each
+    task's file must be there. ``config_text`` is kept for the callers'
+    signature.
     """
+    del config_text
     at = _short(commit)
 
-    # 1. The feature file, the one the runner builds.
     yaml_path = feature_yaml_relpath(feature_id)
     text, why = await _read(runner, repo_path, commit, yaml_path)
     if why:
@@ -574,210 +299,18 @@ async def check_supplied_bundle(
         return f"the prepared feature cannot be built: {yaml_path} could not be read: {first}"
     if not isinstance(plan, dict):
         return f"the prepared feature cannot be built: {yaml_path} is not a feature plan"
-    declared_id = plan.get("id")
-    if isinstance(declared_id, str) and _padded(declared_id):
-        # Read exactly as written, as GuardKit reads it (R8, same class).
-        return (
-            f"the prepared feature cannot be built: {yaml_path} at {at} names "
-            f"the feature {declared_id!r}, which begins or ends with a space; "
-            f"write it as {feature_id}"
-        )
-    if str(declared_id or "") != feature_id:
-        return (
-            f"the prepared feature cannot be built: {yaml_path} at {at} names "
-            f"the feature {declared_id!r}, not {feature_id}"
-        )
 
-    # 2. Every task's file.
     tasks = plan.get("tasks")
     if not isinstance(tasks, list) or not tasks:
         return f"the prepared feature cannot be built: {yaml_path} names no tasks"
-    task_files: list[str] = []
-    task_ids: list[str] = []
     for index, task in enumerate(tasks):
-        if not isinstance(task, dict):
-            return f"the prepared feature cannot be built: task {index + 1} in {yaml_path} is not a task"
-        task_id = str(task.get("id") or "")
-        file_path = task.get("file_path")
-        if not task_id.strip():
-            return f"the prepared feature cannot be built: task {index + 1} in {yaml_path} has no id"
-        if _padded(task_id):
-            # GuardKit keeps the id as written and reads qa/pass-bar-<id>.yaml
-            # with it, so a trimmed id would check a different bar (R8 class).
-            return (
-                f"the prepared feature cannot be built: task {index + 1} in "
-                f"{yaml_path} has the id {task_id!r}, which begins or ends with "
-                f"a space; write it without one"
-            )
-        if not isinstance(file_path, str) or not file_path.strip():
-            return f"the prepared feature cannot be built: task {task_id} in {yaml_path} names no task file"
-        if _padded(file_path):
-            return (
-                f"the prepared feature cannot be built: task {task_id}'s file "
-                f"{file_path!r} begins or ends with a space; the path is read "
-                f"exactly as written, so write it without one"
-            )
-        normal = _yaml_path(file_path)
+        file_path = task.get("file_path") if isinstance(task, dict) else None
+        normal = _yaml_path(file_path) if isinstance(file_path, str) else None
         if normal is None:
-            return (
-                f"the prepared feature cannot be built: task {task_id}'s file "
-                f"{file_path} is not a path inside the repository (an absolute "
-                f"path, or one that leaves it)"
-            )
-        task_ids.append(task_id)
-        task_files.append(normal)
-    texts: dict[str, str] = {}
-    for path in task_files:
-        content, why = await _read(runner, repo_path, commit, path)
-        if why:
-            return _cannot(why)
-        if content is None:
-            return _missing("the task file", path, at)
-        texts[path] = content
-
-    # 3. At least one spec file, each present — even with routing_law: off,
-    #    because a prepared feature comes from /feature-spec, which always
-    #    writes one.
-    feature_files = plan.get("feature_files")
-    if not isinstance(feature_files, list) or not [
-        f for f in feature_files if isinstance(f, str) and f.strip()
-    ]:
-        return (
-            f"the prepared feature cannot be built: {yaml_path} lists no spec "
-            f"file (feature_files); a feature planned elsewhere is built "
-            f"against the .feature its spec wrote"
-        )
-    specs: list[str] = []
-    for raw in feature_files:
-        if not isinstance(raw, str) or not raw.strip():
             continue
-        if _padded(raw):
-            return (
-                f"the prepared feature cannot be built: the spec file {raw!r} "
-                f"begins or ends with a space; the path is read exactly as "
-                f"written, so write it without one"
-            )
-        normal = _yaml_path(raw)
-        if normal is None:
-            return (
-                f"the prepared feature cannot be built: the spec file {raw} is "
-                f"not a path inside the repository (an absolute path, or one "
-                f"that leaves it)"
-            )
         content, why = await _read(runner, repo_path, commit, normal)
         if why:
             return _cannot(why)
         if content is None:
-            return _missing("the spec file", normal, at)
-        specs.append(normal)
-
-    # 4. The two companion files both producers write beside each spec file,
-    #    and the specialist-only digest when it is there (never required, but
-    #    an ordinary file when present).
-    summaries: list[str] = []
-    for spec in specs:
-        folder = posixpath.dirname(spec)
-        name = posixpath.basename(spec)
-        if name.endswith(".feature"):
-            name = name[: -len(".feature")]
-        for suffix, what in (
-            ("_assumptions.yaml", "the spec's assumptions file"),
-            ("_summary.md", "the spec's summary"),
-        ):
-            companion = posixpath.join(folder, f"{name}{suffix}")
-            content, why = await _read(runner, repo_path, commit, companion)
-            if why:
-                return _cannot(why)
-            if content is None:
-                return _missing(what, companion, at)
-            if suffix == "_summary.md":
-                texts[companion] = content
-                summaries.append(companion)
-        digest = posixpath.join(folder, f"{name}_digest.yaml")
-        content, why = await _read(runner, repo_path, commit, digest)
-        if why:
-            return _cannot(why)
-
-    # 5. The plan's guide, in each folder that holds task files.
-    guides: list[str] = []
-    for folder in dict.fromkeys(posixpath.dirname(p) for p in task_files):
-        guide = posixpath.join(folder, GUIDE_NAME) if folder else GUIDE_NAME
-        content, why = await _read(runner, repo_path, commit, guide)
-        if why:
-            return _cannot(why)
-        if content is None:
-            return _missing("the plan's guide", guide, at)
-        texts[guide] = content
-        guides.append(guide)
-
-    # 6. The project's own documents, by the ONE reading rule the planning
-    #    door and GuardKit's Coach use (4 October 2026): the same reader, so
-    #    admission refuses exactly what planning and the Coach would refuse —
-    #    declared instruction files present and resolvable, binding documents
-    #    ordinary files of strict UTF-8 at their exact committed bytes, and the
-    #    128 KiB budget. Opt-in: nothing is judged unless binding documents are
-    #    declared.
-    declared, why = read_declared_project_documents(config_text)
-    if why:
-        return f"the prepared feature cannot be built: {why}"
-    if declared.documents:
-        _documents, why = await read_project_documents_at_commit(
-            runner, repo_path=repo_path, commit=commit, declared=declared
-        )
-        if why:
-            return f"the prepared feature cannot be built: {why}"
-
-    # 6b. The project's reference material (17 October 2026, prototype-to-
-    #     factory design 2.2, Codex R4): a malformed ``reference:`` block is
-    #     refused, and a declared signed-off record must exist at this commit,
-    #     parse, and name a repository and a full commit — the same check the
-    #     planning door makes. Opt-in: nothing is judged without the block.
-    reference, why = read_declared_reference(config_text)
-    if why:
-        return f"the prepared feature cannot be built: {why}"
-    if reference.declared and reference.signed_off:
-        _record, why = await read_signed_off_record(
-            runner, repo_path=repo_path, commit=commit, path=reference.signed_off
-        )
-        if why:
-            return f"the prepared feature cannot be built: {why}"
-
-    # 7. Referenced context: every relative Markdown link in the supplied
-    #    summaries, guides and task files names an ordinary file at this
-    #    commit, walked component by component (R6).
-    checked: set[tuple[str, str]] = set()
-    seen: dict[str, Any] = {}
-    for source in [*summaries, *guides, *task_files]:
-        for target in relative_markdown_links(texts.get(source, "")):
-            key = ("" if target.startswith("/") else posixpath.dirname(source), target)
-            if key in checked:
-                continue
-            _resolved, why = await _walk_reference(
-                runner, repo_path, commit, source, target, seen
-            )
-            if why:
-                return _cannot(why)
-            checked.add(key)
-
-    # 8. (Step 2, 26 October 2026, census FRG-101.) The pass bars and spec
-    #    seeds are no longer required here: GuardKit's own task-start
-    #    precondition requires a pinned pass bar where a project switches it
-    #    on, so this copy went (one rule in one place).
-
-    # 9. The leak-sweep manifest, exactly when one of a guide's Integration
-    #    Contracts sections, read as the specialist emitter reads them,
-    #    declares a route.
-    if any(guide_claims_routes(texts.get(guide, "")) for guide in guides):
-        content, why = await _read(runner, repo_path, commit, LEAK_SWEEP_PATH)
-        if why:
-            return _cannot(why)
-        if content is None:
-            return (
-                f"the prepared feature cannot be built: the plan's guide "
-                f"declares a route under Integration Contracts, so "
-                f"{LEAK_SWEEP_PATH} must be supplied too, and it is not in the "
-                f"commit {at}. Commit it on the branch and queue the build "
-                f"again."
-            )
-
+            return _missing("the task file", normal, at)
     return None

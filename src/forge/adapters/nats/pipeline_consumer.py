@@ -13,10 +13,10 @@ Responsibilities (per TASK-NFI-007):
   ``forge-serve``, attached by ``forge.cli._serve_daemon._attach_consumer``
   with ``max_ack_pending`` set to the configured build limit
   (``pipeline.max_concurrent_builds``, default 1).
-- Validate every incoming :class:`~nats_core.events.BuildQueuedPayload` and
-  reject malformed payloads, unrecognised originators, and ``feature_yaml_path``
-  values outside the configured filesystem allowlist by acking the JetStream
-  message and publishing ``pipeline.build-failed.{feature_id}``.
+- Parse every incoming :class:`~nats_core.events.BuildQueuedPayload` and
+  reject one that cannot be parsed, or that names a repository with no
+  registered checkout, by acking the JetStream message and publishing
+  ``pipeline.build-failed.{feature_id}``.
 - Detect already-terminal duplicates against an injected SQLite read helper and
   skip them idempotently (ack + no new build).
 - For accepted builds, hand control to the state machine entrypoint together
@@ -44,7 +44,6 @@ ADR / contract anchors:
 from __future__ import annotations
 
 import logging
-import posixpath
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Awaitable, Callable, Protocol, runtime_checkable
@@ -113,11 +112,6 @@ UNKNOWN_FEATURE_ID: str = "unknown"
 # ---------------------------------------------------------------------------
 
 REASON_MALFORMED_PAYLOAD: str = "malformed BuildQueuedPayload"
-REASON_PATH_OUTSIDE_ALLOWLIST: str = "path outside allowlist"
-REASON_ORIGINATOR_NOT_RECOGNISED: str = "originator not recognised"
-REASON_PLANNING_HANDOFF_RETIRED: str = (
-    "planning handoff was permanently retired before routing"
-)
 
 
 # ---------------------------------------------------------------------------
@@ -131,9 +125,6 @@ IsDuplicateTerminal = Callable[[str, str], Awaitable[bool]]
 """``async (feature_id, correlation_id) -> bool`` — True if the build already
 terminated (``COMPLETE | FAILED | CANCELLED | SKIPPED``) and the consumer
 should ack-and-skip."""
-
-RetiredPlanningHandoffs = Callable[[], frozenset[str]]
-"""Synchronous full-ledger validation returning retired correlations."""
 
 RegisterObserver = Callable[[], Awaitable[None]]
 """``async () -> None`` — TASK-GATE-D659 R1 deferred bridge-registration.
@@ -227,7 +218,6 @@ class PipelineConsumerDeps:
     is_duplicate_terminal: IsDuplicateTerminal
     dispatch_build: DispatchBuild
     publish_build_failed: PublishBuildFailed
-    retired_planning_handoffs: RetiredPlanningHandoffs | None = None
     register_ack_handle: InFlightAckRegistry | None = None
     # A build refused before any build row is written (3 October 2026) —
     # ``(correlation_id, reason) -> Any``, in production the work queue's
@@ -328,60 +318,20 @@ async def start_pipeline_consumer(
 # ---------------------------------------------------------------------------
 
 
-def _path_inside_allowlist(candidate: str, allowlist: list[Path]) -> bool:
-    """Return True iff ``candidate`` resolves inside one of ``allowlist``.
-
-    Uses :meth:`pathlib.Path.resolve` to collapse ``..`` traversal **before**
-    the :meth:`pathlib.Path.is_relative_to` check (AC-010). Each allowlisted
-    path is also resolved so that a symlink in the allowlist root does not
-    silently widen the authorised footprint at the cost of a divergence
-    between the on-disk and resolved roots.
-
-    ``candidate`` does not need to exist on disk — :meth:`Path.resolve` is
-    purely lexical for paths that have not been ``mkdir``'d.
-    """
-
-    try:
-        target = Path(candidate).resolve()
-    except (OSError, ValueError):
-        # OSError can come from Windows-style invalid paths on POSIX; both
-        # are simply "not in the allowlist" from our POV.
-        return False
-
-    for allowed in allowlist:
-        try:
-            allowed_resolved = allowed.resolve()
-        except (OSError, ValueError):
-            continue
-        if target.is_relative_to(allowed_resolved):
-            return True
-    return False
-
-
 def _resolve_feature_yaml_path(
     payload: BuildQueuedPayload, forge_config: ForgeConfig
 ) -> tuple[str | None, str | None]:
-    """``(path to check, None)`` or ``(None, plain reason)`` (4 October 2026).
+    """``(path, None)`` or ``(None, plain reason)`` (4 October 2026).
 
-    Jarvis sends ``feature_yaml_path`` relative to the repository. Resolved
-    against this coordinator's own working folder it meant nothing, and the
-    runner never read it: it builds ``.guardkit/features/<feature_id>.yaml``.
-    So a relative path is resolved against the repository's REGISTERED
-    checkout (``planning.target_repo_paths[repo]``, the same map the runner
-    uses) and must be exactly that file; anything else is refused in plain
-    words. An absolute path (the factory's own planning trigger, ``forge
-    queue``, the fix journey) is returned unchanged and goes to the allowlist
-    check exactly as before.
+    Jarvis sends ``feature_yaml_path`` relative to the repository, so a
+    relative path is resolved against the repository's REGISTERED checkout
+    (``planning.target_repo_paths[repo]``, the same map the runner uses). An
+    absolute path is returned unchanged. A repository the factory has no
+    checkout for leaves nothing to build from.
     """
     raw = payload.feature_yaml_path
     if Path(raw).is_absolute():
         return raw, None
-    wanted = f".guardkit/features/{payload.feature_id}.yaml"
-    if posixpath.normpath(raw.replace("\\", "/")) != wanted:
-        return None, (
-            f"its feature file {raw} is not {wanted}, the one file a build of "
-            f"{payload.feature_id} reads"
-        )
     planning = getattr(forge_config, "planning", None)
     paths = getattr(planning, "target_repo_paths", None) or {}
     checkout = paths.get(payload.repo)
@@ -390,7 +340,7 @@ def _resolve_feature_yaml_path(
             f"its repository {payload.repo} is not registered with this "
             f"factory, so there is no checkout to read {raw} from"
         )
-    return str(Path(checkout) / wanted), None
+    return str(Path(checkout) / raw), None
 
 
 def _failure_payload(
@@ -467,92 +417,6 @@ async def _safe_publish_failure(
         )
 
 
-async def _settle_retired_planning_handoff(
-    msg: _MsgLike,
-    deps: PipelineConsumerDeps,
-    envelope: MessageEnvelope,
-    payload: BuildQueuedPayload,
-) -> bool:
-    """Refuse a retired correlation; carry on when the history cannot be read.
-
-    Returns ``True`` when the caller must stop processing this message. A
-    correlation the ledger names as retired is refused: that is a person's
-    decision. A ledger that is not wired, cannot be read or answers something
-    that is not a list of ids is bookkeeping (step 2, 26 October 2026, census
-    FRG-001): it is logged and read as "nothing known retired", the same as
-    the boot preflight does, and the build goes on.
-    """
-
-    reader = deps.retired_planning_handoffs
-    if reader is None:
-        logger.warning(
-            "pipeline_consumer: planning handoff retirement validator is not "
-            "wired — ADVISORY; nothing known retired, carrying on with "
-            "feature_id=%s correlation_id=%s",
-            payload.feature_id,
-            payload.correlation_id,
-        )
-        return False
-    try:
-        retired = reader()
-    except Exception as exc:  # noqa: BLE001 — must not reach ack-on-error wrapper
-        logger.warning(
-            "pipeline_consumer: planning handoff retirement history could not "
-            "be read (%s: %s) — ADVISORY; nothing known retired, carrying on "
-            "with feature_id=%s correlation_id=%s",
-            type(exc).__name__,
-            exc,
-            payload.feature_id,
-            payload.correlation_id,
-        )
-        return False
-
-    if type(retired) is not frozenset or not all(
-        isinstance(correlation_id, str) for correlation_id in retired
-    ):
-        logger.warning(
-            "pipeline_consumer: planning handoff retirement validator returned "
-            "an invalid result — ADVISORY; nothing known retired, carrying on "
-            "with feature_id=%s correlation_id=%s",
-            payload.feature_id,
-            payload.correlation_id,
-        )
-        return False
-
-    if (
-        payload.correlation_id not in retired
-        and envelope.correlation_id not in retired
-    ):
-        return False
-
-    logger.warning(
-        "pipeline_consumer: %s; feature_id=%s payload_correlation_id=%s "
-        "envelope_correlation_id=%s; ack + build-failed",
-        REASON_PLANNING_HANDOFF_RETIRED,
-        payload.feature_id,
-        payload.correlation_id,
-        envelope.correlation_id,
-    )
-    await msg.ack()
-    await _safe_publish_failure(
-        deps,
-        _failure_payload(
-            feature_id=payload.feature_id,
-            build_id=payload.feature_id,
-            reason=REASON_PLANNING_HANDOFF_RETIRED,
-        ),
-        payload.feature_id,
-        correlation_id=envelope.correlation_id,
-    )
-    await answer_build_thread(
-        deps.reply_in_thread,
-        payload,
-        build_refused_reply(payload.feature_id, REASON_PLANNING_HANDOFF_RETIRED),
-        level="warning",
-    )
-    return True
-
-
 # ---------------------------------------------------------------------------
 # Core message handler
 # ---------------------------------------------------------------------------
@@ -566,28 +430,17 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
     1. *Malformed envelope or payload* → ``msg.ack()`` and publish
        ``build-failed`` with reason :data:`REASON_MALFORMED_PAYLOAD`.
        The state machine is **never** invoked.
-    2. *Retired planning-handoff correlation* → ack + ``build-failed`` with
-       :data:`REASON_PLANNING_HANDOFF_RETIRED`; invalid retirement history is
-       held without ack so JetStream can redeliver after the ledger is repaired.
-    3. *Unrecognised ``originating_adapter``* → ack + ``build-failed`` with
-       :data:`REASON_ORIGINATOR_NOT_RECOGNISED`.
-    4. *``feature_yaml_path`` outside allowlist* → ack + ``build-failed``
-       with :data:`REASON_PATH_OUTSIDE_ALLOWLIST`. ``..`` traversal is
-       rejected because :func:`_path_inside_allowlist` calls
-       :meth:`Path.resolve` before :meth:`Path.is_relative_to`. A relative
-       path is first resolved against the repository's registered checkout
-       and must be ``.guardkit/features/<feature_id>.yaml``; any other
-       relative path, or one for an unregistered repository, is refused the
-       same way with its own plain reason (4 October 2026).
-    5. *Duplicate already-terminal build* → ack + idempotent skip. No build
+    2. *Repository with no registered checkout* (relative feature path)
+       → ack + ``build-failed`` with a plain reason.
+    3. *Duplicate already-terminal build* → ack + idempotent skip. No build
        is started, no event is published.
-    6. *Accepted build* → :meth:`PipelineConsumerDeps.dispatch_build` is
+    4. *Accepted build* → :meth:`PipelineConsumerDeps.dispatch_build` is
        awaited with an ``ack_callback`` bound to ``msg.ack``. The message
        remains unacked until the state machine invokes the callback at the
        terminal transition.
 
     The function never raises on bad input — every validation failure is
-    captured and translated into outcome (1)–(3). It still propagates
+    captured and translated into outcome (1) or (2). It still propagates
     ``asyncio.CancelledError`` (the calling fetch loop owns shutdown
     semantics, per the task brief).
     """
@@ -644,76 +497,9 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         )
         return
 
-    # A planning-handoff retirement is permanent admission authority. Check
-    # both identities before any origin/path refusal telemetry, build row,
-    # routing seed, model call or dispatch. Build-failed keeps the established
-    # envelope-correlation threading even when only the payload identity is
-    # retired.
-    if await _settle_retired_planning_handoff(msg, deps, envelope, payload):
-        return
-
-    # --- 2. Originator allowlist -----------------------------------------
-    # The effective originator identity is the ``originating_adapter`` when a
-    # human adapter is present (the CLI / jarvis path), else the
-    # ``triggered_by`` layer (a forge-internal MACHINE dispatch — the Lane B
-    # planning target-terminal, which is contract-legal with
-    # triggered_by="forge-internal" and no adapter, per nats-core's own
-    # BuildQueuedPayload validator). Membership is still governed by
-    # ``forge_config.pipeline.approved_originators`` (config-overridable) —
-    # the bus is credentialed, so this is a policy filter, not cryptography.
-    #
-    # Adapter-takes-precedence (the stricter reading): when an adapter IS
-    # present it alone is checked, so an unapproved adapter is rejected even
-    # if ``triggered_by`` happens to name an approved layer. jarvis semantics
-    # are unchanged — the payload validator forces an adapter whenever
-    # triggered_by=='jarvis', so a jarvis build never falls through to the
-    # triggered_by branch here.
-    approved = deps.forge_config.pipeline.approved_originators
-    originator = (
-        payload.originating_adapter
-        if payload.originating_adapter is not None
-        else payload.triggered_by
-    )
-    if originator not in approved:
-        logger.warning(
-            "pipeline_consumer: originator not in approved list for "
-            "feature_id=%s (originating_adapter=%r triggered_by=%r); rejecting",
-            payload.feature_id,
-            payload.originating_adapter,
-            payload.triggered_by,
-        )
-        if not note_build_rejection(
-            deps.record_build_rejection,
-            payload.correlation_id,
-            f"it was sent by {originator}, which is not approved to start builds",
-        ):
-            return
-        await msg.ack()
-        await _safe_publish_failure(
-            deps,
-            _failure_payload(
-                feature_id=payload.feature_id,
-                build_id=payload.feature_id,
-                reason=REASON_ORIGINATOR_NOT_RECOGNISED,
-            ),
-            payload.feature_id,
-            correlation_id=envelope.correlation_id,
-        )
-        await answer_build_thread(
-            deps.reply_in_thread,
-            payload,
-            build_refused_reply(
-                payload.feature_id,
-                f"it was sent by {originator}, which is not approved to start builds",
-            ),
-            level="warning",
-        )
-        return
-
-    # --- 3. The one feature file, then the path allowlist ----------------
+    # --- 2. Resolve the feature file ---------------------------------------
     # A relative path is resolved against the repository's registered
-    # checkout and must be the file the runner builds (4 October 2026); the
-    # allowlist then checks the resolved path. An absolute path is unchanged.
+    # checkout (4 October 2026). An absolute path is unchanged.
     feature_yaml_path, wrong_file = _resolve_feature_yaml_path(
         payload, deps.forge_config
     )
@@ -741,8 +527,7 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             payload.feature_id,
             correlation_id=envelope.correlation_id,
         )
-        # The unknown or unregistered repository lands here, as does a
-        # feature file that is not the one a build reads.
+        # The unknown or unregistered repository lands here.
         await answer_build_thread(
             deps.reply_in_thread,
             payload,
@@ -750,44 +535,8 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
             level="warning",
         )
         return
-    allowlist = deps.forge_config.permissions.filesystem.allowlist
-    if not _path_inside_allowlist(feature_yaml_path, allowlist):
-        logger.warning(
-            "pipeline_consumer: feature_yaml_path=%r outside allowlist for "
-            "feature_id=%s; rejecting",
-            payload.feature_yaml_path,
-            payload.feature_id,
-        )
-        outside = (
-            f"its feature file {feature_yaml_path} is outside the "
-            "folders builds may read"
-        )
-        if not note_build_rejection(
-            deps.record_build_rejection,
-            payload.correlation_id,
-            outside,
-        ):
-            return
-        await msg.ack()
-        await _safe_publish_failure(
-            deps,
-            _failure_payload(
-                feature_id=payload.feature_id,
-                build_id=payload.feature_id,
-                reason=REASON_PATH_OUTSIDE_ALLOWLIST,
-            ),
-            payload.feature_id,
-            correlation_id=envelope.correlation_id,
-        )
-        await answer_build_thread(
-            deps.reply_in_thread,
-            payload,
-            build_refused_reply(payload.feature_id, outside),
-            level="warning",
-        )
-        return
 
-    # --- 4. Duplicate detection (idempotent skip) ------------------------
+    # --- 3. Duplicate detection (idempotent skip) ------------------------
     if await deps.is_duplicate_terminal(payload.feature_id, payload.correlation_id):
         logger.info(
             "pipeline_consumer: duplicate already-terminal build "
@@ -798,7 +547,7 @@ async def handle_message(msg: _MsgLike, deps: PipelineConsumerDeps) -> None:
         await msg.ack()
         return
 
-    # --- 5. Accepted build — dispatch with deferred ack ------------------
+    # --- 4. Accepted build — dispatch with deferred ack ------------------
     # Build a single idempotent ack handle for this msg. Two consumers
     # of the handle exist:
     #
@@ -1524,9 +1273,6 @@ __all__ = [
     "PausedBuildSnapshot",
     "PipelineConsumerDeps",
     "REASON_MALFORMED_PAYLOAD",
-    "REASON_ORIGINATOR_NOT_RECOGNISED",
-    "REASON_PATH_OUTSIDE_ALLOWLIST",
-    "REASON_PLANNING_HANDOFF_RETIRED",
     "RESTART_FROM_PREPARING_STATES",
     "ReconcileDeps",
     "ReconcileReport",

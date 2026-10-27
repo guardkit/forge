@@ -13,7 +13,6 @@ import pytest
 
 from forge.subagents.autobuild_worktree_lifecycle import (
     inspect_autobuild_worktree,
-    inspect_worktree_capacity,
     retire_autobuild_worktree,
 )
 
@@ -195,37 +194,6 @@ def test_unrelated_nested_registration_blocks_outer_cleanup(tmp_path: Path) -> N
     assert str(unexpected) in identity["unexpected_registrations"]
     assert outer.is_dir() and inner.is_dir() and unexpected.is_dir()
 
-
-@pytest.mark.parametrize(
-    ("available_bytes", "available_inodes", "detail"),
-    [(99, 5, "below the required"), (1000, 0, "no available inodes")],
-)
-def test_capacity_preflight_fails_closed_before_creation(
-    tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    available_bytes: int,
-    available_inodes: int,
-    detail: str,
-) -> None:
-    monkeypatch.setattr(
-        "forge.subagents.autobuild_worktree_lifecycle.os.statvfs",
-        lambda _path: SimpleNamespace(
-            f_bavail=available_bytes,
-            f_frsize=1,
-            f_favail=available_inodes,
-        ),
-    )
-    missing = tmp_path / "not-created" / "worktrees"
-    report = inspect_worktree_capacity(missing, min_available_bytes=100)
-    assert report["ok"] is False
-    assert detail in report["detail"]
-    assert not missing.exists()
-
-
-def test_capacity_preflight_accepts_exact_floor(tmp_path: Path) -> None:
-    report = inspect_worktree_capacity(tmp_path, min_available_bytes=1)
-    assert report["ok"] is True
-    assert report["capacity"]["available_inodes"] > 0
 
 
 @pytest.mark.parametrize("location", ["outer", "inner"])

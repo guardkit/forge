@@ -18,11 +18,8 @@ Design boundaries:
   it does so lazily, mirroring the rest of the codebase, so importing this
   module never pulls the wire dependency.
 
-Coach-score floor is a **STUB** (ADR-ARCH-033): ``metrics.last_coach_score`` is
-always ``None`` today because the runner does not yet populate it (the
-coach-score gap — itself a UBS-002 prerequisite). The ``min_coach_score`` branch
-is therefore inert; it is written so it activates automatically the moment a
-real score flows, with no further change here.
+The coach-score floor went in the cull (27 October 2026): a coach score is a
+model's view of the work, and the caps here only end stuck or runaway work.
 
 Integration seam (deferred to the follow-up task — see
 ``tasks/backlog/unattended-build-service/TASK-UBS-002-integration.md``): the
@@ -180,23 +177,6 @@ def evaluate_budget(
             detail=(
                 f"tokens ({metrics.tokens_used}) reached cap "
                 f"({profile.max_build_tokens})"
-            ),
-        )
-
-    # Coach-score floor — STUB (ADR-ARCH-033). Inert while last_coach_score is
-    # None (its value today); activates automatically once the runner populates
-    # the score. A score strictly below the floor is a breach.
-    if (
-        profile.min_coach_score is not None
-        and metrics.last_coach_score is not None
-        and metrics.last_coach_score < profile.min_coach_score
-    ):
-        return BudgetVerdict(
-            ok=False,
-            breached_cap="min_coach_score",
-            detail=(
-                f"coach score ({metrics.last_coach_score:.3f}) below floor "
-                f"({profile.min_coach_score:.3f})"
             ),
         )
 

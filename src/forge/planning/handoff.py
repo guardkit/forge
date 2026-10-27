@@ -152,50 +152,24 @@ PreCommitHook = Callable[[Path], Awaitable[PreCommitResult]]
 # always used, so what a refusal means does not change.
 # ---------------------------------------------------------------------------
 
-#: The checks a sandbox git runner knows how to run, by name. Between them
-#: they are every check the planning chain's four writing legs run before a
-#: commit — the plan leg's two, the spec leg's two, the pass-bar leg's one
-#: (declared once per bar) and the feature-gate leg's one — so every leg can
+#: The checks a sandbox git runner knows how to run, by name, so a leg can
 #: declare instead of handing over a Python function (rule 87, 2026-09-07):
 #:
-#: * ``normalize-stamps``    — ``guardkit qa normalize-stamps --feature <id>
-#:   --repo <worktree> [--no-model]``; args ``feature_id`` and ``no_model``.
-#:   Blocks the commit (when declared blocking) exactly when the driver's own
-#:   hook stops the run: a partial / refused / failed normalizer.
-#: * ``feature-validate``    — ``guardkit feature validate <id> --json``;
-#:   args ``feature_id``. Blocks on a non-zero exit.
-#: * ``classify-scenarios``  — ``guardkit qa classify-scenarios --feature-file
-#:   <path> --repo <worktree> --json``; args ``feature_file``. Never blocks.
 #: * ``normalize-feature``   — the gherkin normalizer the spec leg runs over
 #:   the committed ``.feature`` (``python -m <the normalizer module>
 #:   <worktree>/<path>``, resolved the way
 #:   :func:`~forge.planning.target_terminal_tools.resolve_normalizer_command`
 #:   resolves it); args ``feature_file``. Blocks on a non-zero exit.
-#: * ``validate-pass-bar``   — ``guardkit qa validate pass-bar <path>``; args
-#:   ``bar_file``, declared once per minted bar. Blocks on a non-zero exit.
-#: * ``validate-gate-registry`` — ``guardkit qa validate gate-registry
-#:   <path>``; args ``registry_file``. Blocks on a non-zero exit.
-PRE_COMMIT_CHECK_NAMES: tuple[str, ...] = (
-    "normalize-stamps",
-    "feature-validate",
-    "classify-scenarios",
-    "normalize-feature",
-    "validate-pass-bar",
-    "validate-gate-registry",
-)
+#:   (The stamp normalizer, feature validate, the provability check and the
+#:   pass-bar and gate-registry validators went in the cull, 27 October 2026.)
+PRE_COMMIT_CHECK_NAMES: tuple[str, ...] = ("normalize-feature",)
 
 
 @dataclass(frozen=True)
 class PreCommitCheck:
     """One check to run in the worktree before the commit, named.
 
-    ``blocking`` says whether a failing verdict refuses the commit. The
-    driver sets it from the routing law's enforcement for the stamp
-    normalizer (an unenforced repository proceeds past a refusal, as its
-    closure does); the driver declares ``feature validate`` and
-    ``validate-pass-bar`` not blocking since step 2 (26 October 2026: advice;
-    the sidecar's own default for a caller that does not say is unchanged);
-    ``classify-scenarios`` never blocks whatever is declared.
+    ``blocking`` says whether a failing verdict refuses the commit.
     """
 
     name: str

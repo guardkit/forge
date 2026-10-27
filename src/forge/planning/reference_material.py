@@ -9,15 +9,11 @@ holds the plain rules for that material, read at one commit:
 * :func:`is_reference_path` — a repository path under a declared folder;
 * :func:`named_reference_files` — the files a request names under those
   folders (written ``reference/...`` or ``/reference/...``);
-* :func:`mentions_a_request_word` — whether a request uses one of the
-  project's own marker words, as a whole word, ignoring case;
 * :func:`read_signed_off_record` — the version record, checked: it exists,
   parses, and names a repository and a full 40-character commit;
 * :func:`gather_reference_material` — all of the above for one planning run,
   in the step that records the project's documents, with the named files read
-  whole at the commit the work starts from (each about
-  :data:`MAX_REFERENCE_FILE_BYTES`, together about
-  :data:`MAX_REFERENCE_FILES_BYTES`, a guide logged when passed; never cut);
+  whole at the commit the work starts from;
 * :func:`card_line_about_the_prototype` — the merge card's one line.
 
 A project that declares no ``reference:`` block never reaches any of this:
@@ -45,9 +41,6 @@ from forge.planning.declared_memory import (
 from forge.planning.project_documents import ProjectDocument
 
 __all__ = [
-    "MAX_REFERENCE_FILES_BYTES",
-    "MAX_REFERENCE_FILE_BYTES",
-    "NAMES_NO_BRIEF",
     "PROTOTYPE_NOT_READ_LINE",
     "REFERENCE_FILE_HEADING",
     "REFERENCE_MATERIAL_STAGE",
@@ -57,7 +50,6 @@ __all__ = [
     "card_line_about_the_prototype",
     "gather_reference_material",
     "is_reference_path",
-    "mentions_a_request_word",
     "named_reference_files",
     "prototype_card_line_at_commit",
     "read_signed_off_record",
@@ -79,21 +71,6 @@ REFERENCE_FILE_HEADING: str = (
     "instructions"
 )
 
-#: Each named reference file is given whole, or not at all.
-MAX_REFERENCE_FILE_BYTES: int = 12 * 1024
-#: All named reference files together.
-MAX_REFERENCE_FILES_BYTES: int = 24 * 1024
-
-#: What is logged for a request that uses one of the project's marker words
-#: and names no reference file (design 2.2, Codex R2 round 3), word for word.
-#: Advice since step 2 (26 October 2026, census FRG-027): the run carries on
-#: without reference material.
-NAMES_NO_BRIEF: str = (
-    "This request mentions the prototype but names no screen brief, so the "
-    "spec writer would not see the prototype's behaviour. Ask for a screen "
-    "brief to be prepared (`draft_requests.py --screen`) and send the request "
-    "naming it."
-)
 
 #: The card's line when the record is declared and could not be read for the
 #: build (design 2.6, Codex R4): never silently left out.
@@ -155,16 +132,6 @@ def named_reference_files(request_text: str, paths: Sequence[str]) -> list[str]:
                 found.append(name)
     return found
 
-
-def mentions_a_request_word(request_text: str, words: Sequence[str]) -> bool:
-    """True when the request holds one of ``words`` as a whole word, case
-    ignored (any language's letters count as word characters)."""
-    text = _as_typed(request_text)
-    for word in words:
-        pattern = r"(?<!\w)" + re.escape(word) + r"(?!\w)"
-        if re.search(pattern, text, re.IGNORECASE):
-            return True
-    return False
 
 
 def _inside(name: str, paths: Sequence[str]) -> bool:
@@ -379,11 +346,10 @@ async def gather_reference_material(
 
     In order: the signed-off record, when one is declared, is checked; each
     file the request names under the declared folders must lie inside them
-    and be an ordinary file at ``commit``. The size limits are a guide and a
-    request that uses one of the project's marker words but names no such
-    file carries on without reference material (:data:`NAMES_NO_BRIEF`);
-    both are logged as advice (step 2, 26 October 2026). ``(None, None)``
-    when nothing is declared.
+    and be an ordinary file at ``commit``. Files are given whole, whatever
+    their size, and a request that names none carries on without reference
+    material (the size guide and the marker-word advice went in the cull,
+    27 October 2026). ``(None, None)`` when nothing is declared.
     """
     if not declared.declared:
         return None, None
@@ -395,8 +361,6 @@ async def gather_reference_material(
             return None, why
 
     names = named_reference_files(request_text, declared.paths)
-    if not names and mentions_a_request_word(request_text, declared.request_words):
-        logger.warning("reference material: %s — ADVISORY; carrying on", NAMES_NO_BRIEF)
 
     short = commit[:12]
     folders = ", ".join(declared.paths)
@@ -428,18 +392,6 @@ async def gather_reference_material(
             )
         read.append(ProjectDocument.of(name, text, commit))
 
-    sizes = ", ".join(f"{d.path} ({d.bytes} bytes)" for d in read)
-    if any(d.bytes > MAX_REFERENCE_FILE_BYTES for d in read) or (
-        sum(d.bytes for d in read) > MAX_REFERENCE_FILES_BYTES
-    ):
-        # A guide, never a refusal (step 2, census FRG-026): given whole.
-        logger.warning(
-            "reference material: the prototype files named are over the guide "
-            "of %d bytes each and %d together (%s) — ADVISORY; given whole",
-            MAX_REFERENCE_FILE_BYTES,
-            MAX_REFERENCE_FILES_BYTES,
-            sizes,
-        )
     return (
         ReferenceMaterial(
             paths=declared.paths, files=tuple(read), signed_off=declared.signed_off

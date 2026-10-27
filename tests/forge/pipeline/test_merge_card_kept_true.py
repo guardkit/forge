@@ -379,10 +379,12 @@ def _tables(cx: sqlite3.Connection) -> set[str]:
 
 
 def test_the_table_is_outside_the_ladder_and_made_when_needed(h: Harness) -> None:
-    """Schema stays 19 (coordinator's decision, 16 October 2026); a ledger
-    without the table works, and the first counter write makes it."""
-    assert h.cx.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 19
-    assert migrations.target_schema_version() == 19
+    """The table stays outside the migration ladder (coordinator's decision,
+    16 October 2026; the ladder is at 21 since the requirement amendments of
+    24 October); a ledger without the table works, and the first counter
+    write makes it."""
+    assert h.cx.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 21
+    assert migrations.target_schema_version() == 21
     assert "merge_card_revisions" not in _tables(h.cx)
     assert h.revision("nobody") == 0
     with card_revisions.immediate_transaction(h.cx):
@@ -399,27 +401,14 @@ async def test_a_card_works_on_a_ledger_without_the_table(h: Harness) -> None:
     assert h.card("b1").status == "ready" and h.card("b1").revision >= 1
 
 
-def test_release_2026_10_16_1_accepts_a_ledger_with_the_extra_table(
+def test_the_rollout_helper_accepts_a_ledger_with_the_extra_table(
     tmp_path: Path,
 ) -> None:
-    """Rolling back to 2026.10.16-1 stays an image swap.
-
-    These are the checks that release (Forge 5c45fef7) makes of a ledger:
-    the migrations, the planning-handoff preflight and reader, and the estate
-    rollout helper's ledger_state. The first three files on this branch are
-    byte for byte that release's, and the rollout helper differs from it only
-    by the two boot-step lines that make this table (checked with git diff
-    against 5c45fef7 when this was written), so running them here is running
-    that release's checks.
-    """
+    """The migrations and the estate rollout helper's ledger_state accept a
+    ledger that carries the card-revision table outside the ladder. (This
+    test pinned the 2026.10.16-1 release's schema 19 until the ladder moved
+    to 21 on 24 October 2026.)"""
     import importlib.util
-
-    from forge.lifecycle.planning_handoff_preflight import (
-        preflight_retired_planning_handoff_correlations,
-    )
-    from forge.lifecycle.planning_handoff_retirement import (
-        retired_planning_handoff_correlations,
-    )
 
     db = tmp_path / "forge.db"
     cx = connect_writer(db)
@@ -427,10 +416,8 @@ def test_release_2026_10_16_1_accepts_a_ledger_with_the_extra_table(
     card_revisions.ensure_table(cx)
     with card_revisions.immediate_transaction(cx):
         card_revisions.bump_card_revision(cx, "b1", START)
-    assert migrations.apply_at_boot(cx) == 19  # nothing to apply, nothing refused
-    retired_planning_handoff_correlations(cx)
+    assert migrations.apply_at_boot(cx) == 21  # nothing to apply, nothing refused
     cx.close()
-    preflight_retired_planning_handoff_correlations(db)
 
     bundle = Path(__file__).resolve().parents[3] / "deploy" / "estate"
     spec = importlib.util.spec_from_file_location(
@@ -439,9 +426,9 @@ def test_release_2026_10_16_1_accepts_a_ledger_with_the_extra_table(
     rollout = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(rollout)
-    assert rollout.LEDGER_SCHEMA_VERSION == 19
+    assert rollout.LEDGER_SCHEMA_VERSION == 21
     state = rollout.ledger_state(db)
-    assert state["schema_version"] == 19
+    assert state["schema_version"] == 21
     # The helper's own copy of the boot steps makes the same table, so a
     # started ledger and its loaded copy still match.
     assert "card_revisions.ensure_table(c)" in rollout.BOOT_SQLITE_CODE

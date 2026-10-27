@@ -186,43 +186,6 @@ async def test_tree_write_carries_the_exact_committed_routing_receipt() -> None:
     assert sent[0]["feature_routing_receipt"] == receipt
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "receipt",
-    [
-        None,
-        {
-            "feature_routing_id": "wrong",
-            "attempt_id": "attempt",
-            "server_id": 1,
-        },
-        {
-            "feature_routing_id": "planning_A",
-            "attempt_id": "attempt",
-            "server_id": "1",
-        },
-    ],
-)
-async def test_local_tree_write_refuses_bad_receipt_before_path_or_git(
-    tmp_path: Path, receipt: object
-) -> None:
-    worktrees = tmp_path / "must-not-exist"
-    runner = WorktreeGitRunner(worktrees_root=worktrees)
-
-    result = await runner.prepare_branch_and_write_tree(
-        str(tmp_path / "missing-repo"),
-        BRANCH,
-        PLAN_FILES,
-        "planning: plan",
-        feature_routing_id="planning_A",
-        feature_routing_required=True,
-        feature_routing_receipt=receipt,
-    )
-
-    assert result.status == "failed"
-    assert "feature routing" in result.stderr
-    assert not worktrees.exists()
-
 
 # ---------------------------------------------------------------------------
 # Against the real sidecar
@@ -262,64 +225,6 @@ def a_coordinator_that_recorded_the_run(
     with a_coordinator_that_recorded({THE_RUN: str(commit)}, monkeypatch):
         yield commit
 
-
-@pytest.mark.asyncio
-async def test_a_declared_write_commits_and_answers_with_the_checks(
-    sidecar: str,
-    repo: Path,
-    fake_guardkit: Path,
-    a_coordinator_that_recorded_the_run: str,
-) -> None:
-    runner = SidecarGitRunner(sidecar, repo=REPO_KEY)
-    assert runner.supports_declared_checks() is True
-    result = await runner.prepare_branch_and_write_tree(
-        "/ignored/on/this/side",
-        BRANCH,
-        PLAN_FILES,
-        "planning: plan",
-        pre_commit=_declaration(),
-        launch_settings=STAND_IN_SETTINGS,
-        build=THE_RUN,
-        declared_at=a_coordinator_that_recorded_the_run,
-    )
-    assert isinstance(result, SidecarGitOpResult)
-    assert result.status == "success" and result.exit_code == 0
-    assert result.sha == git_rev_parse(repo, BRANCH)
-    assert [c.name for c in result.checks] == ["normalize-stamps", "feature-validate"]
-    assert all(c.ran and c.passed for c in result.checks)
-    assert json.loads(result.checks[0].stdout)["stamped"] == {"ok": "hurl"}
-    assert "--no-model" in normalize_calls(fake_guardkit)[0]
-    assert 'verifier: "hurl"' in (git_show(repo, BRANCH, PLAN_YAML) or "")
-
-
-@pytest.mark.asyncio
-async def test_a_refused_check_is_a_failed_result_with_the_outcomes(
-    sidecar: str,
-    repo: Path,
-    fake_guardkit: Path,
-    monkeypatch: pytest.MonkeyPatch,
-    a_coordinator_that_recorded_the_run: str,
-) -> None:
-    monkeypatch.setenv("FAKE_GUARDKIT_NORMALIZE", "refused")
-    runner = SidecarGitRunner(sidecar, repo=REPO_KEY)
-    result = await runner.prepare_branch_and_write_tree(
-        str(repo),
-        BRANCH,
-        PLAN_FILES,
-        "planning: plan",
-        pre_commit=_declaration(),
-        launch_settings=STAND_IN_SETTINGS,
-        build=THE_RUN,
-        declared_at=a_coordinator_that_recorded_the_run,
-    )
-    assert result.status == "failed" and result.sha is None
-    assert result.stderr == result.detail
-    assert result.detail.startswith("pre-commit oracle refused the commit: stamp normalizer refused:")
-    norm, validate = result.checks
-    assert norm.ran and not norm.passed and norm.exit_code == 2
-    assert json.loads(norm.stdout)["refused"] == list(REFUSED_TITLES)
-    assert not validate.ran
-    assert git_rev_parse(repo, BRANCH) in (None, git_rev_parse(repo, "HEAD"))
 
 
 @pytest.mark.asyncio

@@ -442,6 +442,8 @@ def _row_to_build_row(row: sqlite3.Row | tuple[Any, ...]) -> BuildRow:
             "memory_project",
             "launch_settings",
             "source_commit",
+            # v20 (requirement amendments, 24 October 2026).
+            "requirement_amendment_required",
             # NOT the two mission columns (17 October 2026): they are outside
             # the migration ladder, added only when a probe finds them
             # missing, so this tuple stays the ladder's columns and a plain
@@ -1712,19 +1714,12 @@ class SqliteLifecyclePersistence:
         """
         return self._planning_plan_line(correlation_id, "repository_unavailable")
 
-    def read_planning_plan_size_note(self, correlation_id: str | None) -> str | None:
-        """The one plain size warning the planning run recorded when its plan
-        is half as big again as the project's usual, or ``None`` (6 October
-        2026, planning improvements item 6). The same query and the same
-        forgiveness as :meth:`read_planning_repository_unavailable`."""
-        return self._planning_plan_line(correlation_id, "plan_size_note")
 
     def read_planning_plan_review_note(self, correlation_id: str | None) -> str | None:
         """The plain line the planning run recorded about the plan's review,
-        or ``None``: the plan reviewer's request-traceability score (step 2,
-        26 October 2026, advice), or that the review record could not be read
-        (24 October 2026). The same query and forgiveness as the two readers
-        above."""
+        or ``None``: the plan reviewer's request-traceability score, or that
+        the reviewer did not approve the plan (display only). The same query
+        and forgiveness as the reader above."""
         return self._planning_plan_line(correlation_id, "plan_review_note")
 
     def read_planning_plan_advice_note(self, correlation_id: str | None) -> str | None:

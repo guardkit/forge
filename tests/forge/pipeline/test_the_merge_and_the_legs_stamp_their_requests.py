@@ -783,9 +783,6 @@ class TestTheGatesReaderStampsTheProjectsOwnCommand:
             sandbox_declaration_loader=lambda _root, **_kw: SimpleNamespace(
                 test="qa/run", test_timeout=30
             ),
-            sandbox_stamps_leg=lambda **_kw: SimpleNamespace(
-                status="not-enforced", detail="", blocks_card=False, attended=()
-            ),
         )
 
         reader(build_id=BUILD_ID, branch=f"fix/{FEATURE_ID}")

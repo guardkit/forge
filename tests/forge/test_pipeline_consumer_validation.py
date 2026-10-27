@@ -39,7 +39,7 @@ from nats_core.events import BuildFailedPayload
 
 from forge.adapters.nats.pipeline_consumer import (
     REASON_MALFORMED_PAYLOAD,
-    REASON_PATH_OUTSIDE_ALLOWLIST,
+
     UNKNOWN_FEATURE_ID,
     PipelineConsumerDeps,
     handle_message,
@@ -103,7 +103,6 @@ def deps_factory(forge_config: ForgeConfig):
             is_duplicate_terminal=is_dup,
             dispatch_build=dispatch,
             publish_build_failed=publish_failed,
-            retired_planning_handoffs=lambda: frozenset(),
         )
         return deps, {
             "is_duplicate_terminal": is_dup,
@@ -260,66 +259,6 @@ class TestDuplicateEnvelopeAcksAndSkipsWithoutBuildStarted:
         )
 
 
-# ---------------------------------------------------------------------------
-# AC-003: worktree-allowlist failure publishes ``build-failed`` BEFORE
-# any orchestrator dispatch
-# ---------------------------------------------------------------------------
-
-
-class TestAllowlistFailurePublishesBuildFailedBeforeDispatch:
-    """AC-003 — Group C scenario "allowlist"."""
-
-    @pytest.mark.asyncio
-    async def test_path_outside_allowlist_publishes_build_failed_and_skips_dispatch(
-        self, deps_factory, tmp_path: Path
-    ) -> None:
-        # Path that resolves outside the allowlist root.
-        outside = tmp_path / "outside" / "feature.yaml"
-        outside.parent.mkdir()
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(outside)))
-        deps, mocks = deps_factory()
-
-        await handle_message(msg, deps)
-
-        # The publish happened.
-        mocks["publish_build_failed"].assert_awaited_once()
-        sent_payload, _feature_id = mocks["publish_build_failed"].await_args.args
-        assert sent_payload.failure_reason == REASON_PATH_OUTSIDE_ALLOWLIST
-        # Critically: orchestrator dispatch was NEVER reached.
-        mocks["dispatch_build"].assert_not_called()
-        # And the inbound was acked — it must not be redelivered.
-        msg.ack.assert_awaited_once()
-
-    @pytest.mark.asyncio
-    async def test_publish_build_failed_is_invoked_before_dispatch_build(
-        self, deps_factory, tmp_path: Path
-    ) -> None:
-        # AC wording: "before any orchestrator dispatch". We verify
-        # ordering by giving both mocks a shared call-recorder — the
-        # publish must appear in the recorder while dispatch never does.
-        outside = tmp_path / "elsewhere" / "feature.yaml"
-        outside.parent.mkdir()
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(outside)))
-
-        call_log: list[str] = []
-
-        async def _record_publish(*_args: Any, **_kwargs: Any) -> None:
-            call_log.append("publish_build_failed")
-
-        async def _record_dispatch(*_args: Any, **_kwargs: Any) -> None:
-            call_log.append("dispatch_build")
-
-        deps, _mocks = deps_factory(
-            publish_build_failed=AsyncMock(side_effect=_record_publish),
-            dispatch_build=AsyncMock(side_effect=_record_dispatch),
-        )
-
-        await handle_message(msg, deps)
-
-        # Publish was invoked exactly once and dispatch was never invoked,
-        # which trivially makes publish "before any dispatch".
-        assert call_log == ["publish_build_failed"]
-
 
 # ---------------------------------------------------------------------------
 # AC-004: publish failure on any rejection path is contained — logs at
@@ -330,7 +269,7 @@ class TestAllowlistFailurePublishesBuildFailedBeforeDispatch:
 class TestPublishFailureDoesNotRegressTransition:
     """AC-004 — Group C scenario "publish failure does not regress" (ADR-ARCH-008).
 
-    We exercise each of the three rejection paths (malformed, allowlist,
+    We exercise the rejection paths (malformed,
     duplicate-not-applicable-here-because-it-doesn't-publish) and verify
     that when ``publish_build_failed`` raises, ``handle_message`` returns
     cleanly: no exception escapes, the message is still acked, and a
@@ -371,31 +310,6 @@ class TestPublishFailureDoesNotRegressTransition:
         # Dispatch was never invoked (rejection path).
         mocks["dispatch_build"].assert_not_called()
 
-    @pytest.mark.asyncio
-    async def test_allowlist_path_swallows_publish_failure(
-        self,
-        deps_factory,
-        tmp_path: Path,
-        caplog: pytest.LogCaptureFixture,
-    ) -> None:
-        outside = tmp_path / "wrong-root" / "feature.yaml"
-        outside.parent.mkdir()
-        publish = AsyncMock(side_effect=ConnectionError("no responders"))
-        msg = _make_msg(_envelope_bytes(_valid_payload_dict(outside)))
-        deps, mocks = deps_factory(publish_build_failed=publish)
-
-        with caplog.at_level(
-            logging.WARNING, logger="forge.adapters.nats.pipeline_consumer"
-        ):
-            await handle_message(msg, deps)
-
-        publish.assert_awaited_once()
-        assert any(
-            "publish_build_failed raised" in rec.message for rec in caplog.records
-        )
-        # Ack happened (the rejection contract is "ack + (try to) publish").
-        msg.ack.assert_awaited_once()
-        mocks["dispatch_build"].assert_not_called()
 
     @pytest.mark.asyncio
     async def test_duplicate_path_does_not_publish_so_no_failure_to_swallow(

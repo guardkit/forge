@@ -551,9 +551,6 @@ class TestTheUpstreamCallersReadTheLedger:
                 test="the declared command", test_timeout=60
             ),
             sandbox_command_runner=_record,
-            sandbox_stamps_leg=lambda **_kw: SimpleNamespace(
-                status="not-enforced", detail="no stamps here", failed=()
-            ),
         )
         try:
             reader(build_id=BUILD_ID, branch="autobuild/FEAT-WS1")

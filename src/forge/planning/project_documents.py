@@ -13,10 +13,9 @@ rule GuardKit applies for the Coach, so every role is given the same bytes:
    Nothing is read unless ``required_documents`` is present and non-empty, and
    then the ``autobuild.player`` block is held to GuardKit's allowed keys.
 2. *Bytes:* the raw committed bytes, decoded strictly as UTF-8 (invalid UTF-8
-   is refused), line endings kept; hash and size are of those bytes, and the
-   :data:`PROJECT_DOCUMENTS_BUDGET_BYTES` budget is the sum of raw sizes after
-   de-duplication. The budget is a guide (step 2, 26 October 2026): documents
-   over it are still given in full and the overrun is logged as advice.
+   is refused), line endings kept; hash and size are of those bytes. They are
+   given in full, whatever their size (the size guide went in the cull,
+   27 October 2026).
 3. *Links:* a ``required_documents`` entry must be an ordinary file; a link is
    refused. An instruction file may be a link: it is resolved inside the commit
    the way a filesystem would (each path component, linked folders included,
@@ -51,16 +50,10 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "INSTRUCTION_FILES",
     "MAX_LINK_STEPS",
-    "PROJECT_DOCUMENTS_BUDGET_BYTES",
     "ProjectDocument",
     "context_texts",
     "read_project_documents_at_commit",
 ]
-
-#: The most project-document text, in bytes, given in full to a planning
-#: writer: instruction files plus binding documents together (about 32,000
-#: tokens). The same value GuardKit uses for the Coach.
-PROJECT_DOCUMENTS_BUDGET_BYTES: int = 128 * 1024
 
 #: The repository instruction files GuardKit's selector adds automatically,
 #: in its order.
@@ -368,17 +361,4 @@ async def read_project_documents_at_commit(
         seen.add(resolved)
         delivered.append(ProjectDocument.of(label, text, commit))
 
-    total = sum(document.bytes for document in delivered)
-    if total > PROJECT_DOCUMENTS_BUDGET_BYTES:
-        # A rough guide, never a refusal (step 2, 26 October 2026, census
-        # FRG-025): the documents are given in full and the overrun is said.
-        sizes = ", ".join(f"{d.path} ({d.bytes} bytes)" for d in delivered)
-        logger.warning(
-            "the project's instruction files and binding documents come to %d "
-            "bytes, over the %d-byte guide for documents given to the spec and "
-            "plan writers in full (%s) — ADVISORY; given in full",
-            total,
-            PROJECT_DOCUMENTS_BUDGET_BYTES,
-            sizes,
-        )
     return tuple(delivered), None

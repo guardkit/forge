@@ -46,14 +46,10 @@ from forge.planning.declared_memory import (
 )
 from forge.planning.driver import PlanningRunDriver
 from forge.planning.reference_material import (
-    MAX_REFERENCE_FILE_BYTES,
-    MAX_REFERENCE_FILES_BYTES,
-    NAMES_NO_BRIEF,
     REFERENCE_FILE_HEADING,
     REFERENCE_WINDOW_LABEL,
     ReferenceMaterial,
     gather_reference_material,
-    mentions_a_request_word,
     named_reference_files,
     read_signed_off_record,
 )
@@ -161,14 +157,6 @@ def test_slack_links_dot_slash_and_fragments_are_read_as_typed() -> None:
     ]
 
 
-def test_marker_words_match_whole_words_ignoring_case() -> None:
-    assert mentions_a_request_word("Build it from the PROTOTYPE's page", ("prototype",))
-    assert not mentions_a_request_word("several prototypes exist", ("prototype",))
-    assert not mentions_a_request_word("anything at all", ())
-    # Any language's letters are word characters.
-    assert not mentions_a_request_word("the prototypeé page", ("prototype",))
-    assert mentions_a_request_word("le prototype: écran", ("prototype",))
-
 
 # ---------------------------------------------------------------------------
 # Read at the start commit: the record and the named files
@@ -258,58 +246,6 @@ async def test_what_stops_the_run_and_why(
     assert material is None
     assert why is not None and said in why
 
-
-@pytest.mark.parametrize(
-    ("request_text", "files", "said"),
-    [
-        (
-            "build reference/a.md",
-            {"reference/a.md": "x" * (MAX_REFERENCE_FILE_BYTES + 1)},
-            "over the guide",
-        ),
-        (
-            "build reference/a.md and reference/b.md and reference/c.md",
-            {
-                "reference/a.md": "x" * MAX_REFERENCE_FILE_BYTES,
-                "reference/b.md": "x" * MAX_REFERENCE_FILE_BYTES,
-                "reference/c.md": "x",
-            },
-            "over the guide",
-        ),
-        ("build the page from the prototype", {}, NAMES_NO_BRIEF),
-    ],
-)
-@pytest.mark.asyncio
-async def test_what_is_advice_and_carries_on(
-    request_text: str,
-    files: dict[str, str],
-    said: str,
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    """Step 2 (26 October 2026, census FRG-026 and FRG-027): the size limits
-    are a guide, and a marker word with no screen brief named is advice. The
-    run carries on; the named files are given whole."""
-    with caplog.at_level("WARNING"):
-        material, why = await _gather(
-            _Tree({RECORD: GOOD_RECORD, **files}), request_text
-        )
-    assert why is None and material is not None
-    assert [d.path for d in material.files] == sorted(files)
-    assert said in caplog.text and "ADVISORY" in caplog.text
-
-
-@pytest.mark.asyncio
-async def test_the_limits_are_whole_files_up_to_the_totals() -> None:
-    files = {
-        "reference/a.md": "x" * MAX_REFERENCE_FILE_BYTES,
-        "reference/b.md": "y" * (MAX_REFERENCE_FILES_BYTES - MAX_REFERENCE_FILE_BYTES),
-    }
-    material, why = await _gather(
-        _Tree({RECORD: GOOD_RECORD, **files}),
-        "the prototype screens reference/a.md and reference/b.md",
-    )
-    assert why is None and material is not None
-    assert [d.text for d in material.files] == list(files.values())
 
 
 # ---------------------------------------------------------------------------
@@ -454,36 +390,6 @@ def test_the_facts_sheet_skips_reference_folders(tmp_path: Path) -> None:
     ).text
     assert "reference/" not in (skipped or "")
 
-
-def test_a_reference_window_never_proves_something_is_built() -> None:
-    descriptor = {
-        "where_the_specs_words_already_appear": [
-            {
-                "evidence": [
-                    {"path": "src/a.code", "first_line": 1, "last_line": 9, "text": ""},
-                    {
-                        "path": "reference/prototype/b.view",
-                        "first_line": 1,
-                        "last_line": 9,
-                        "text": "",
-                        "label": REFERENCE_WINDOW_LABEL,
-                    },
-                ]
-            }
-        ]
-    }
-    claim = nothing_to_build.Claim(
-        parts=(("show gadgets", ("reference/prototype/b.view:3",)),),
-        scenarios=(("lists gadgets", ("src/a.code:2",)),),
-    )
-    everything = nothing_to_build.windows_sent(descriptor)
-    assert len(everything) == 2
-    assert nothing_to_build.citations_outside(claim, everything) == []
-    product_only = nothing_to_build.windows_sent(descriptor, reference_paths=("reference/",))
-    assert [w.path for w in product_only] == ["src/a.code"]
-    assert nothing_to_build.citations_outside(claim, product_only) == [
-        "reference/prototype/b.view:3"
-    ]
 
 
 # ---------------------------------------------------------------------------

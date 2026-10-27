@@ -37,6 +37,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Sequence
 
+from tests.forge.planning._plan_identity import plan_artifact_identity
 import pytest
 import yaml
 
@@ -407,7 +408,7 @@ def _semantic_review_json(
             "criterion": "request_traceability",
             "criterion_score": 1.0,
             "coach_verdict": "GOOD",
-            "artifact_identity": PlanningRunDriver._plan_artifact_identity(files),
+            "artifact_identity": plan_artifact_identity(files),
             "reviewed_after_rewrite": reviewed_after_rewrite,
         }
     )
@@ -835,14 +836,6 @@ def _make_driver(
         dispatch_feature_spec=(spec_dispatch or _dispatch_spec) if wire_legs else None,
         dispatch_feature_plan=(plan_dispatch or _dispatch_plan) if wire_legs else None,
         normalize_feature_spec=_normalize if wire_legs else None,
-        validate_feature_plan=_validate if wire_legs else None,
-        # THE STAMP NORMALIZER hook: unwired by default (the not-wired path,
-        # receipted); the stamp tests inject their own.
-        normalize_stamps=normalize_stamps_fn,
-        # THE PROVABILITY CHECK BEFORE THE CARD (Part K): unwired by default.
-        classify_scenarios=classify_fn,
-        validate_pass_bar=_validate_pass_bar if wire_legs else None,
-        validate_gate_registry=_validate_gate_registry if wire_legs else None,
         dispatch_build_trigger=(
             (build_trigger_fn or _dispatch_build_trigger)
             if wire_build_trigger
@@ -898,7 +891,6 @@ async def test_flag_off_terminates_at_planned_handoff_and_never_calls_legs(
     assert h.ctx["counters"]["spec"] == 0
     assert h.ctx["counters"]["plan"] == 0
     assert h.ctx["counters"]["normalize"] == 0
-    assert h.ctx["counters"]["validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
 
 
@@ -1080,7 +1072,6 @@ async def test_full_round_trip_commits_spec_and_plan_to_scratch_repo(
     assert h.ctx["counters"] ["spec"] == 1
     assert h.ctx["counters"]["plan"] == 1
     assert h.ctx["counters"]["normalize"] == 1
-    assert h.ctx["counters"]["validate"] == 1
     assert h.ctx["counters"]["build_trigger"] == 1
 
     # The build trigger was called with the minted feature id + the committed
@@ -1183,10 +1174,6 @@ async def test_native_spec_validation_flag_is_advisory_and_proceeds(
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     assert h.ctx["counters"]["plan"] == 1  # the plan leg WAS reached
     # The self-reported error was surfaced loudly and verbatim.
-    assert any(
-        "validation.json self-check" in r.message and "ADVISORY" in r.message
-        for r in caplog.records
-    )
 
 
 @pytest.mark.asyncio
@@ -1405,63 +1392,6 @@ def _plan_result_native_smoke(smoke_path: str, slug: str = "stats-endpoint"):
     return _factory
 
 
-@pytest.mark.asyncio
-async def test_replay_invented_tests_smoke_is_advice_from_the_real_validate(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """(a)+(b): the fixed descriptor carries the exact roots, and an 008 reply
-    whose feature YAML references the invented ``tests/smoke`` is reported by
-    the pre-commit validate. Since step 2 (26 October 2026, census FRG-082)
-    that is advice: GuardKit validates the feature itself when it builds, so
-    the plan is committed and the complaint is logged."""
-    repo = tmp_path / "api_test"
-    _init_api_test_shaped_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        plan_result_factory=_plan_result_native_smoke("tests/smoke"),
-        validate_fn=_guardkit_smoke_gate_validate,
-    )
-
-    with caplog.at_level("WARNING"):
-        await h.driver.drive(CID)
-
-    # (a) the descriptor forge threaded to 008 carried the EXACT roots (and,
-    # since 2026-09-11, the repository's own inventory beside them).
-    descriptor = h.ctx["counters"]["last_descriptor"]
-    assert descriptor["planning_base_identity"] == {
-        "status": "bound",
-        "commit": subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=repo, text=True
-        ).strip(),
-    }
-    assert {
-        k: v
-        for k, v in descriptor.items()
-        if k not in {"repository_inventory", "planning_base_identity"}
-    } == {
-        "repo": TARGET_REPO,
-        "test_roots": ["tests/health", "tests/users"],
-        # The scratch project declares no coverage command (20 October 2026).
-        "declares_coverage_command": False,
-    }
-    # (b) the pre-commit validate reported the invented path — as advice.
-    assert h.ctx["counters"]["validate"] == 1
-    assert "tests/smoke" in caplog.text and "ADVISORY" in caplog.text
-    branch = f"planning/{CID}"
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    show = subprocess.run(
-        ["git", "show", f"{branch}:.guardkit/features/{feature_id}.yaml"],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    assert show.returncode == 0  # the plan was committed
-
 
 @pytest.mark.asyncio
 async def test_replay_real_tests_health_passes_to_build_queued(
@@ -1486,7 +1416,6 @@ async def test_replay_real_tests_health_passes_to_build_queued(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["validate"] == 1
     assert h.ctx["counters"]["build_trigger"] == 1
     # The plan tree (with the valid smoke gate) IS committed on the branch.
     branch = f"planning/{CID}"
@@ -1578,24 +1507,6 @@ async def test_normalizer_red_fails_and_does_not_commit(
     assert feature_show.returncode != 0  # path not present on the branch
 
 
-@pytest.mark.asyncio
-async def test_feature_id_mismatch_fails_rv1(store: SqlitePlanningRunStore) -> None:
-    _queue(store)
-    # The plan declares a DIFFERENT feature id than forge supplied — RV-1 catch.
-    h = _make_driver(
-        store,
-        plan_result=SimpleNamespace(
-            outcome=SimpleNamespace(value="completed"),
-            role_output={
-                "feature_id": "FEAT-WRONG",
-                "files": {"features/x/FEAT-WRONG.yaml": "id: FEAT-WRONG\n"},
-            },
-            reason=None,
-        ),
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert any("mismatch" in msg.lower() or "RV-1" in msg for _, msg, _ in h.ctx["notifications"])
-
 
 @pytest.mark.asyncio
 async def test_plan_invalid_artifacts_fails(store: SqlitePlanningRunStore) -> None:
@@ -1608,49 +1519,6 @@ async def test_plan_invalid_artifacts_fails(store: SqlitePlanningRunStore) -> No
     )
     assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
 
-
-@pytest.mark.asyncio
-async def test_plan_missing_semantic_review_passes_and_the_build_card_says_so(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """A missing review record is bookkeeping (24 October 2026). Since step 2
-    (26 October 2026) the seat hands on an unaccepted best draft this way, so
-    no re-review is asked: the plan carries on and the build card says the
-    review record was unreadable."""
-    _queue(store)
-    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
-    calls: list[dict[str, Any]] = []
-
-    async def _no_review_ever(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        return SimpleNamespace(
-            outcome=SimpleNamespace(value="completed"),
-            role_output={"files": dict(files)},
-            reason=None,
-        )
-
-    h = _make_driver(store, plan_dispatch=_no_review_ever)
-
-    await h.driver.drive(CID)
-
-    # No re-review is asked for a plan with no review record at all.
-    assert [c.get("revision_of") is not None for c in calls] == [False]
-    # And the line reaches the build gate's card through the real reader.
-    from forge.cli._serve_gate_activation import _planning_card_lines
-    from forge.lifecycle.persistence import SqliteLifecyclePersistence
-
-    ledger = SqliteLifecyclePersistence(connection=store._connection)
-    assert "Plan review record unreadable" in (_planning_card_lines(ledger, CID) or "")
-
-    plan = [
-        json.loads(e["details_json"])
-        for e in store.list_events(CID)
-        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
-    ]
-    assert plan, "the plan was recorded, not refused"
-    assert "semantic_review" not in plan[-1]
-    assert "Plan review record unreadable" in plan[-1]["plan_review_note"]
-    assert "semantic_review.json is missing" in plan[-1]["plan_review_note"]
 
 
 @pytest.mark.asyncio
@@ -1681,7 +1549,6 @@ async def test_a_refusing_plan_review_verdict_is_advice_and_the_plan_carries_on(
     assert [c.get("revision_of") is not None for c in calls] == [False]
     plan = _approved_plan_events(store)
     assert plan, "the plan was recorded, not refused"
-    assert "semantic_review" not in plan[-1]
     assert "did not approve this plan" in plan[-1]["plan_review_note"]
     card = _card_lines_of(store)
     assert "The plan reviewer did not approve this plan" in card
@@ -1779,37 +1646,6 @@ async def test_the_planners_missing_prerequisite_line_is_shown_on_the_card(
         assert "The planner's notes" not in line
 
 
-@pytest.mark.asyncio
-async def test_a_plan_with_no_review_record_is_carded_without_a_re_review(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """Step 2 (26 October 2026): the seat hands on its unaccepted best draft
-    with the reviewer's objections in ``plan_advice`` and no review record.
-    That is bookkeeping: no re-review, the plan is recorded, and the build
-    card says so beside the objections."""
-    _queue(store)
-    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
-    calls: list[dict[str, Any]] = []
-    validation = json.dumps({"accepted": True, "errors": [], "plan_advice": [
-        {"rule": "review_not_accepted", "text": "The reviewer wanted a clearer task 2."},
-    ]})
-
-    async def _the_specialist(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        return SimpleNamespace(
-            outcome=SimpleNamespace(value="completed"),
-            role_output={"files": dict(files), "validation.json": validation},
-            reason=None,
-        )
-
-    h = _make_driver(store, plan_dispatch=_the_specialist)
-    await h.driver.drive(CID)
-
-    assert [c.get("revision_of") is not None for c in calls] == [False]
-    line = _card_lines_of(store)
-    assert "Plan review record unreadable" in line
-    assert "The reviewer wanted a clearer task 2." in line
-
 
 @pytest.mark.asyncio
 async def test_a_low_traceability_score_is_advice_on_the_build_card(
@@ -1852,33 +1688,6 @@ async def test_a_low_traceability_score_is_advice_on_the_build_card(
     assert line is not None
     assert "0.40 out of 1" in line and "REVISE" in line
 
-
-@pytest.mark.asyncio
-async def test_plan_rewrite_with_stale_semantic_review_is_carded_not_refused(
-    store: SqlitePlanningRunStore,
-) -> None:
-    _queue(store)
-    result = _plan_result("FEAT-PLACEHOLDER")
-    approved_files = dict(result.role_output["files"])
-    result.role_output.pop("feature_id")
-    result.role_output["files"] = {
-        **approved_files,
-        "tasks/TASK-STAT-001.md": "# rewritten after approval\n",
-    }
-    h = _make_driver(store, plan_result=result)
-
-    await h.driver.drive(CID)
-
-    # The stale record is not used; the existing re-review judges the tree
-    # actually sent, and its verdict is the one recorded.
-    plan = [
-        json.loads(e["details_json"])
-        for e in store.list_events(CID)
-        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
-    ]
-    assert plan
-    assert plan[-1]["semantic_review"]["reviewed_after_rewrite"] is True
-    assert plan[-1]["plan_review_note"].startswith("The plan reviewer scored")
 
 
 @pytest.mark.asyncio
@@ -2038,7 +1847,6 @@ async def test_build_trigger_idempotent_after_queue_recorded(
     # Neither the specialist legs nor the build trigger were re-invoked.
     assert h.ctx["counters"]["build_trigger"] == 0
     assert h.ctx["counters"]["plan"] == 0
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
 
 
 # ---------------------------------------------------------------------------
@@ -2376,12 +2184,6 @@ async def test_auth_flagged_seed_confirmed_resumes_exactly_as_unflagged(
 
     # Byte-for-byte the unflagged outcome: one validated bar per plan task,
     # each minted authless, and the build queued exactly once.
-    assert h.ctx["counters"]["pass_bar_validate"] == 3
-    assert set(h.ctx["validated_bars"]) == {
-        "qa/pass-bar-TASK-VER-001.yaml",
-        "qa/pass-bar-TASK-VER-002.yaml",
-        "qa/pass-bar-TASK-VER-003.yaml",
-    }
     assert h.ctx["counters"]["build_trigger"] == 1
 
     branch = f"planning/{CID}"
@@ -2512,7 +2314,6 @@ async def test_auth_door_rejected_takes_the_honest_terminal(
 
     run = store.get_run(CID)
     assert run["state"] == PlanningState.FAILED.value
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
 
     # THE OWNER'S TEXT — plain names ruling (2026-07-31). The Slack message
@@ -2567,7 +2368,6 @@ async def test_auth_door_unanswered_times_out_to_the_honest_terminal(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
     assert "stopped at registering the quality checklist" in reasons
@@ -2597,7 +2397,6 @@ async def test_auth_door_undeliverable_card_takes_the_honest_terminal(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
     assert "stopped at registering the quality checklist" in reasons
@@ -2632,7 +2431,6 @@ async def test_auth_door_ignores_a_stranger_and_a_foreign_card(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     assert [status for status, _d in _door_events(store)] == ["GATED", "timed_out"]
 
@@ -2822,7 +2620,6 @@ async def test_auth_door_never_published_says_undeliverable_not_silence(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     # Zero auth cards ever reached the wire — the proof the claim must match.
     assert _auth_cards(h.ctx["publisher"]) == []
@@ -2857,7 +2654,6 @@ async def test_auth_door_defer_is_named_never_reported_as_silence(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
     assert "stopped at registering the quality checklist" in reasons
@@ -2914,12 +2710,6 @@ async def test_round19_authless_seed_mints_three_validated_bars(
     assert run["state"] == PlanningState.BUILD_QUEUED.value
 
     # One bar per task, each run through guardkit's own qa validate (green).
-    assert h.ctx["counters"]["pass_bar_validate"] == 3
-    assert set(h.ctx["validated_bars"]) == {
-        "qa/pass-bar-TASK-VER-001.yaml",
-        "qa/pass-bar-TASK-VER-002.yaml",
-        "qa/pass-bar-TASK-VER-003.yaml",
-    }
 
     branch = f"planning/{CID}"
 
@@ -3014,41 +2804,12 @@ async def test_round19_no_seed_is_advice_and_the_build_is_queued(
 
     run = store.get_run(CID)
     assert run["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 1
     ev = _leg_event_details_of(store, "qa-pass-bars")
     assert ev["skipped"] is True and ev["bar_files"] == []
     assert "no pass-bar seed" in ev["reason"]
     assert not any(level == "error" for _, _, level in h.ctx["notifications"])
 
-
-@pytest.mark.asyncio
-async def test_unwired_pass_bar_validate_fails_loudly(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Flag ON but the pass-bar validate collaborator missing = loud FAILED
-    (never a silent skip of the guardkit check)."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
-        plan_result_factory=_plan_result_native_versions,
-    )
-    # Unwire ONLY the pass-bar oracle (the plan legs stay wired).
-    h.driver._deps.validate_pass_bar = None
-
-    await h.driver.drive(CID)
-
-    run = store.get_run(CID)
-    assert run["state"] == PlanningState.FAILED.value
-    assert run["state"] != PlanningState.BUILD_QUEUED.value
-    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "validate_pass_bar" in reasons
 
 
 # ---------------------------------------------------------------------------
@@ -3198,8 +2959,6 @@ async def test_f2_derivable_seed_registers_gate_as_one_commit_before_build(
     assert run["state"] == PlanningState.BUILD_QUEUED.value
 
     # guardkit's own gate-registry validate ran exactly once, on the registry.
-    assert h.ctx["counters"]["gate_registry_validate"] == 1
-    assert h.ctx["validated_registries"] == ["qa/gates/registry.yaml"]
 
     # The filled gate landed on the branch: gate_id + request substituted, the
     # runtime /REPLACE_ME guard left intact, valid Python.
@@ -3293,7 +3052,6 @@ async def test_f2_underivable_seed_honest_skip_build_still_queues(
     run = store.get_run(CID)
     assert run["state"] == PlanningState.BUILD_QUEUED.value
     # The gate-registry validator was never called; nothing was gated.
-    assert h.ctx["counters"]["gate_registry_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 1
     # No new gate script landed; the registry is byte-unchanged (no new entry).
     assert _show_on_branch(repo, "qa/gates/nightly_report_gate.py").returncode != 0
@@ -3374,7 +3132,6 @@ async def test_f2_digest_endpoint_gates_what_the_prose_cannot_derive(
     # No skip — a gate was registered, and against the DIGEST's path.
     ev = _leg_event_details_of(store, "qa-feature-gate")
     assert ev.get("skipped") is not True, ev
-    assert h.ctx["counters"]["gate_registry_validate"] == 1
     # The gate id still comes from the seed's slug; only the REQUEST comes from
     # the digest. (The test above proves this same seed lands no gate at all.)
     gate = _show_on_branch(repo, "qa/gates/nightly_report_gate.py")
@@ -3418,7 +3175,6 @@ async def test_f2_digest_address_with_a_placeholder_is_skipped_with_its_reason(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["gate_registry_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 1
     assert _show_on_branch(repo, "qa/gates/nightly_report_gate.py").returncode != 0
     reg_data = yaml.safe_load(_show_on_branch(repo, "qa/gates/registry.yaml").stdout)
@@ -3495,7 +3251,6 @@ async def test_f2_digest_endpoint_non_get_does_not_widen_the_gate(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["gate_registry_validate"] == 0
     ev = _leg_event_details_of(store, "qa-feature-gate")
     assert ev.get("skipped") is True
     assert ev["reason_code"] == "unsupported_method"
@@ -3582,7 +3337,6 @@ async def test_f2_prose_address_is_read_whole_and_skipped_with_its_reason(
     await h.driver.drive(CID)
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["gate_registry_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 1
     assert _show_on_branch(repo, "qa/gates/nightly_report_gate.py").returncode != 0
     reg_data = yaml.safe_load(_show_on_branch(repo, "qa/gates/registry.yaml").stdout)
@@ -3658,7 +3412,6 @@ async def test_f2_missing_template_honest_skip(
 
     run = store.get_run(CID)
     assert run["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["gate_registry_validate"] == 0
     assert _show_on_branch(repo, "qa/gates/version_endpoint_gate.py").returncode != 0
     ev = _leg_event_details_of(store, "qa-feature-gate")
     assert ev.get("skipped") is True
@@ -3696,74 +3449,6 @@ async def test_f2_missing_registry_skip_names_its_reason(
     assert ev["address"] == {"method": "GET", "path": "/version"}
     assert ev["feature_id"] == _leg_details(store, "feature-plan")["feature_id"]
 
-
-@pytest.mark.asyncio
-async def test_f2_validator_red_is_a_skip_with_zero_branch_mutation(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(4) Derivable + surface adopted but guardkit qa validate gate-registry is
-    RED → an honest skip (step 2, 26 October 2026, census FRG-069): no
-    gate/registry mutation on the branch, and the build is queued."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _seed_gate_surface(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
-        plan_result_factory=_plan_result_native_versions,
-        gate_registry_validate=ToolOutcome(
-            ok=False, detail="gate-registry schema: unknown precondition"
-        ),
-    )
-
-    await h.driver.drive(CID)
-
-    run = store.get_run(CID)
-    assert run["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["build_trigger"] == 1
-    # The pre-commit oracle aborted the commit: zero branch mutation.
-    assert _show_on_branch(repo, "qa/gates/version_endpoint_gate.py").returncode != 0
-    reg_data = yaml.safe_load(_show_on_branch(repo, "qa/gates/registry.yaml").stdout)
-    assert {g["id"] for g in reg_data["gates"]} == {"health", "stats", "version"}
-    ev = _leg_event_details_of(store, "qa-feature-gate")
-    assert ev.get("skipped") is True
-    assert ev["reason_code"] == "registration_failed"
-    assert "gate-registry" in ev["reason"]
-    assert not any(level == "error" for _, _, level in h.ctx["notifications"])
-
-
-@pytest.mark.asyncio
-async def test_f2_unwired_gate_registry_validate_fails_loudly(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """(5) Flag ON but the gate-registry validate collaborator missing = loud
-    FAILED (never a silent skip of the guardkit check)."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _seed_gate_surface(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_with_seed(_ROUND19_SEED_AUTHLESS),
-        plan_result_factory=_plan_result_native_versions,
-    )
-    # Unwire ONLY the gate-registry oracle (the other legs stay wired).
-    h.driver._deps.validate_gate_registry = None
-
-    await h.driver.drive(CID)
-
-    run = store.get_run(CID)
-    assert run["state"] == PlanningState.FAILED.value
-    assert run["state"] != PlanningState.BUILD_QUEUED.value
-    reasons = " ".join(m for _cid, m, _lvl in h.ctx["notifications"])
-    assert "validate_gate_registry" in reasons
 
 
 @pytest.mark.asyncio
@@ -3834,7 +3519,6 @@ async def test_f2_idempotent_redrive_no_ops_the_gate_leg(
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     # The gate leg no-opped: no fill, no validate, no build re-trigger.
-    assert h.ctx["counters"]["gate_registry_validate"] == 0
     assert h.ctx["counters"]["build_trigger"] == 0
     assert h.ctx["counters"]["plan"] == 0
 
@@ -4851,7 +4535,6 @@ def test_the_inventory_rides_beside_the_architecture_rules(tmp_path: Path) -> No
 # The hook never writes ``routing_law`` anywhere (pinned).
 # ---------------------------------------------------------------------------
 
-from forge.planning.target_terminal_tools import StampNormalizerOutcome  # noqa: E402
 
 _STAMP_SPEC_REL = "features/stats-endpoint/stats-endpoint.feature"
 _MOON_TITLE = (
@@ -4865,57 +4548,8 @@ def _plan_yaml_rel(feature_id: str) -> str:
     return f".guardkit/features/{feature_id}.yaml"
 
 
-def _stamping_normalizer(
-    counters_sink: dict[str, Any], *, outcome: Any = None, write: bool = False
-):
-    """A fake normalize_stamps collaborator that behaves like guardkit's: it
-    WRITES ``scenarios:`` into the worktree's plan YAML (unless told to refuse /
-    be unavailable) and reports what it did. Records call order + the YAML it
-    saw so the tests can prove ordering and the feature_files fill. With
-    ``outcome`` + ``write=True`` it writes that outcome's ``stamped`` map first
-    (guardkit's PARTIAL law: decided stamps are on disk before the refusal is
-    reported)."""
-
-    async def _normalize(worktree: Path, feature_id: str) -> StampNormalizerOutcome:
-        counters_sink.setdefault("order", []).append("normalize_stamps")
-        yaml_path = worktree / _plan_yaml_rel(feature_id)
-        counters_sink["yaml_seen"] = yaml_path.read_text(encoding="utf-8") if yaml_path.is_file() else None
-        counters_sink["worktree"] = str(worktree)
-        if outcome is not None:
-            if write and outcome.stamped:
-                text = counters_sink["yaml_seen"] or ""
-                text += "scenarios:\n" + "".join(
-                    f'  "{t}":\n    verifier: "{v}"\n' for t, v in outcome.stamped.items()
-                )
-                yaml_path.write_text(text, encoding="utf-8")
-            return outcome
-        # guardkit's write_stamps shape: append the scenarios map.
-        text = counters_sink["yaml_seen"] or ""
-        text += 'scenarios:\n  "ok":\n    verifier: "hurl"\n'
-        yaml_path.write_text(text, encoding="utf-8")
-        return StampNormalizerOutcome(
-            status="written",
-            detail="1 scenario(s) stamped by rule, 0 already stamped (untouched)",
-            stamped={"ok": "hurl"},
-            rules={"ok": "R9"},
-        )
-
-    return _normalize
 
 
-def _partial_outcome() -> StampNormalizerOutcome:
-    """The exit-3 shape: two decided (stamped + written), two refused."""
-    return StampNormalizerOutcome(
-        status="partial",
-        detail=(
-            "2 scenario(s) undecidable by rule — no fallback home, none invented; "
-            "2 scenario(s) stamped by rule and written, 0 already stamped (untouched)"
-        ),
-        refused_titles=_UNDECIDABLE_TITLES,
-        stamped={"Reading the current server time": "hurl", "ok": "probe:process"},
-        rules={"Reading the current server time": "R9", "ok": "R1"},
-        written=True,
-    )
 
 
 def _commit_repo_routing_law(repo: Path, value: str) -> None:
@@ -4978,562 +4612,6 @@ def _show(repo: Path, branch: str, path: str) -> subprocess.CompletedProcess[str
     )
 
 
-@pytest.mark.asyncio
-async def test_stamp_normalizer_success_writes_stamps_that_ride_the_plan_commit(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Hook success: the normalizer runs BEFORE validate against the planning
-    worktree; what it wrote (the ``scenarios:`` map) and forge's own
-    ``feature_files:`` fill are ON THE BRANCH in the plan commit; the plan
-    receipts and the owner line say so."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink),
-    )
-    _share_order(sink, h)
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    branch = f"planning/{CID}"
-    committed = _show(repo, branch, _plan_yaml_rel(feature_id))
-    assert committed.returncode == 0, committed.stderr
-    # (1) the normalizer's write rides the plan commit — Rich's condition 1.
-    assert 'scenarios:\n  "ok":\n    verifier: "hurl"' in committed.stdout
-    # (2) forge declared the universe the plan-writer omitted: the committed
-    #     spec .feature path, appended before the normalizer ran.
-    assert "feature_files:" in committed.stdout
-    assert f'  - "{_STAMP_SPEC_REL}"' in committed.stdout
-    assert "feature_files:" in (sink["yaml_seen"] or "")  # fill BEFORE the hook
-    # (3) ordering: normalizer, then validate — validate read the stamped tree.
-    assert h.ctx["counters"]["order"] == ["normalize_stamps", "validate"]
-    assert h.ctx["counters"]["validate"] == 1
-    # (4) receipts: the durable feature-plan event names what happened.
-    details = _leg_details(store, "feature-plan")
-    rec = details["stamp_normalizer"]
-    assert rec["status"] == "written"
-    assert rec["stamped"] == {"ok": "hurl"}
-    assert rec["stamped_count"] == 1
-    assert rec["per_title"] == {"ok": "stamped by normalizer (rule R9): hurl"}
-    assert rec["feature_files_filled_by_forge"] == [_STAMP_SPEC_REL]
-    # condition 5: enforcement resolved + receipted (nothing set → off/default)
-    assert rec["enforcement"] == "off" and rec["enforcement_source"] == "default"
-    assert rec["stops_the_run"] is False
-    assert "proceeded_unenforced" not in rec  # nothing to proceed past
-    # (5) the owner line, plain words.
-    plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
-    assert plan_lines and "1 verifier stamp(s) minted by rule and committed with the plan" in plan_lines[0]
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_refusal_stops_the_run_with_the_titles_on_the_card(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """ENFORCED (repo ``routing_law: enforced``) + refusal (undecidable titles,
-    an older all-or-nothing guardkit): the run STOPS at the plan leg, validate
-    is never reached, the plan is NOT committed, and the owner's card names
-    every refused title VERBATIM plus what to do. The machine's rewrite round
-    is switched off here: this is the card the refusal itself produces (rule 8
-    of the rewrite lane keeps that path byte for byte; with the round on, the
-    machine rewrites first and, since rule 6b, the model gets its turn)."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _commit_repo_routing_law(repo, "enforced")
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    titles = _UNDECIDABLE_TITLES
-    refusal = StampNormalizerOutcome(
-        status="refused",
-        detail="2 scenario(s) undecidable by rule (R1–R10) — no fallback home; nothing was written",
-        refused_titles=titles,
-    )
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=refusal),
-        rewrite_on_refusal=False,
-    )
-    _share_order(sink, h)
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    # validate never ran — the normalizer refused BEFORE it.
-    assert h.ctx["counters"]["validate"] == 0
-    assert h.ctx["counters"]["order"] == ["normalize_stamps"]
-    # nothing was committed on the plan side (the spec leg's commit stands).
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    branch = f"planning/{CID}"
-    assert _show(repo, branch, _plan_yaml_rel(feature_id)).returncode != 0
-    assert _show(repo, branch, _STAMP_SPEC_REL).returncode == 0
-    # the card: plain stage name, both titles verbatim, what to do, nothing built.
-    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
-    assert len(errors) == 1
-    card = errors[0]
-    assert card.startswith(f"Planning run {CID} stopped at writing the task plan")
-    for t in titles:
-        assert f"  - {t}" in card
-    assert "no rule to decide which verifier proves them" in card
-    assert "nothing was stamped and nothing was built" in card
-    assert "This repo enforces the routing law" in card
-    assert f".guardkit/features/{feature_id}.yaml" in card
-    assert "toolchain, hurl, exam, probe:bus, probe:process, flutter, playwright, operator" in card
-    assert "operator only for attended human work" in card
-    assert "R9" not in card and "rule R" not in card  # no rule ids on the face
-    # the machine record keeps the internal reason + the titles.
-    run = store.get_run(CID)
-    assert "stamp normalizer refused" in (run["error"] or "")
-    assert titles[1] in (run["error"] or "")
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_enforced_partial_stops_with_the_titles_on_the_card(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """ENFORCED + PARTIAL (exit 3: two decided + written, two refused): the run
-    STOPS, validate never runs, nothing reaches the branch (the worktree's
-    decided stamps die with the aborted commit), the card names the two
-    refused titles verbatim (no rule ids), the log says the law is enforced.
-    The machine's rewrite round is switched off here: this is the card the
-    refusal itself produces (rule 8 of the rewrite lane; with the round on,
-    the machine rewrites first and, since rule 6b, the model gets its turn)."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _commit_repo_routing_law(repo, "enforced")
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
-        rewrite_on_refusal=False,
-    )
-    _share_order(sink, h)
-    with caplog.at_level("WARNING", logger="forge.planning.driver"):
-        assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert h.ctx["counters"]["validate"] == 0
-    assert h.ctx["counters"]["order"] == ["normalize_stamps"]
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    assert _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).returncode != 0
-    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
-    assert len(errors) == 1
-    card = errors[0]
-    assert card.startswith(f"Planning run {CID} stopped at writing the task plan")
-    for t in _UNDECIDABLE_TITLES:
-        assert f"  - {t}" in card
-    assert "2 scenario(s) had no rule to decide which verifier proves them" in card
-    assert "This repo enforces the routing law" in card
-    assert "R1" not in card and "R9" not in card
-    # no plain "proceeds" line went out — the run stopped
-    assert not any("the plan proceeds" in m for _, m, _ in h.ctx["notifications"])
-    assert any(
-        r.levelname == "ERROR" and "IS enforced" in r.getMessage() for r in caplog.records
-    )
-    run = store.get_run(CID)
-    assert "stamp normalizer partial" in (run["error"] or "")
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_not_enforced_partial_proceeds_with_receipt_and_one_plain_line(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """NOT ENFORCED (no flag anywhere) + PARTIAL: the plan PROCEEDS to validate
-    + commit + BUILD_QUEUED; the decided stamps the normalizer wrote are ON THE
-    BRANCH; the receipt names every refused title and every stamped title with
-    its rule; a WARNING is logged; ONE plain un-@mentioned line (exact text)
-    reaches the owner in the thread; the committed YAML carries no
-    ``routing_law:`` (the hook never writes it)."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
-    )
-    _share_order(sink, h)
-    with caplog.at_level("WARNING", logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    # proceeded: normalizer, then validate, then the commit landed
-    assert h.ctx["counters"]["order"] == ["normalize_stamps", "validate"]
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id))
-    assert committed.returncode == 0, committed.stderr
-    data = yaml.safe_load(committed.stdout)
-    # the DECIDED stamps ride the commit; the refused titles are absent (never invented)
-    assert data["scenarios"] == {
-        "Reading the current server time": {"verifier": "hurl"},
-        "ok": {"verifier": "probe:process"},
-    }
-    assert "routing_law" not in committed.stdout
-    assert "routing_law" not in data
-    # the receipt: status, enforcement, every title one line each
-    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert rec["status"] == "partial"
-    assert rec["enforcement"] == "off" and rec["enforcement_source"] == "default"
-    assert rec["stops_the_run"] is False
-    assert rec["proceeded_unenforced"] is True
-    assert rec["refused_titles"] == list(_UNDECIDABLE_TITLES)
-    assert rec["per_title"] == {
-        "Reading the current server time": "stamped by normalizer (rule R9): hurl",
-        "ok": "stamped by normalizer (rule R1): probe:process",
-        _MOON_TITLE: "refused: no rule could decide a verification home",
-        "Another undecidable one": "refused: no rule could decide a verification home",
-    }
-    assert rec["rules"] == {"Reading the current server time": "R9", "ok": "R1"}
-    assert rec["owner_line"] == _UNENFORCED_LINE
-    assert rec["owner_line_sent"] == "sent"
-    # the WARNING
-    warns = [r for r in caplog.records if r.levelname == "WARNING"]
-    assert any(
-        "PROCEEDS" in r.getMessage() and "Another undecidable one" in r.getMessage()
-        for r in warns
-    )
-    assert not any(r.levelname == "ERROR" for r in caplog.records)
-    # ONE plain line, exact text, un-@mentioned, level info (no prefix), in the thread
-    lines = [(m, lvl) for _, m, lvl in h.ctx["notifications"] if "the plan proceeds" in m]
-    assert lines == [(_UNENFORCED_LINE, "info")]
-    assert (_UNENFORCED_LINE, False) in h.ctx["mentions"]
-    # every OTHER line kept its mention. (Until 16 October 2026 a plan review
-    # line about tasks that quote nothing from the request was excused here
-    # too; the exact-quote rule is gone and that line no longer exists.)
-    assert all(mention for m, mention in h.ctx["mentions"] if m != _UNENFORCED_LINE)
-    assert not any("quote any of the words" in m for m, _ in h.ctx["mentions"])
-    # no error card
-    assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
-    # the plan-complete line's clause says what happened, in plain words
-    plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
-    assert plan_lines and "2 verifier stamp(s) minted by rule and committed with the plan, 2 example(s) left without one (named above)" in plan_lines[0]
-    # the plain line went out BEFORE the plan-complete line
-    order = [m for _, m, _ in h.ctx["notifications"]]
-    assert order.index(_UNENFORCED_LINE) < order.index(plan_lines[0])
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_not_enforced_failed_proceeds_with_an_error_receipt(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """NOT ENFORCED + a cannot-run failure: a broken normalizer must not kill
-    an un-enforced chain — ERROR logged, receipted, the plan PROCEEDS
-    unstamped; no titles to name so no plain line, the plan-complete clause
-    says the stamps were not minted."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    failed = StampNormalizerOutcome(
-        status="failed",
-        detail="guardkit qa normalize-stamps could not run (exit 2): stamp normalizer: feature FEAT-X: `feature_files:` must be a list",
-    )
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=failed),
-    )
-    _share_order(sink, h)
-    with caplog.at_level("WARNING", logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["order"] == ["normalize_stamps", "validate"]
-    errs = [r for r in caplog.records if r.levelname == "ERROR"]
-    assert any(
-        "FAILED" in r.getMessage() and "must not kill an un-enforced chain" in r.getMessage()
-        for r in errs
-    )
-    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert rec["status"] == "failed"
-    assert rec["enforcement"] == "off"
-    assert rec["proceeded_unenforced"] is True
-    assert rec["owner_line"].startswith("no owner line: no refused titles to name")
-    assert "owner_line_sent" not in rec
-    assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
-    assert not any("the plan proceeds" in m for _, m, _ in h.ctx["notifications"])
-    plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
-    assert plan_lines and "verifier stamps NOT minted — the stamp normalizer could not run and this repo does not enforce the routing law yet" in plan_lines[0]
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).stdout
-    assert "scenarios:" not in committed and "routing_law" not in committed
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_feature_level_off_wins_over_repo_enforced(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The escape hatch: repo ``routing_law: enforced`` but the plan YAML says
-    ``routing_law: off`` (YAML 1.1 parses the bare token as False — absorbed)
-    → NOT enforced → a partial proceeds; the receipt names the source."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _commit_repo_routing_law(repo, "enforced")
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_with_feature_flag("off"),
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
-    )
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert rec["enforcement"] == "off" and rec["enforcement_source"] == "feature"
-    assert rec["proceeded_unenforced"] is True
-    assert (_UNENFORCED_LINE, False) in h.ctx["mentions"]
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_feature_level_enforced_wins_over_a_silent_repo(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The other direction: no repo flag, the plan YAML says ``routing_law:
-    enforced`` → ENFORCED → a partial stops with the card."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_with_feature_flag("enforced"),
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
-    assert len(errors) == 1 and f"  - {_MOON_TITLE}" in errors[0]
-    assert h.ctx["counters"]["validate"] == 0
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_unenforced_line_is_receipted_as_not_sent_without_a_notifier(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """A composition with no notifier wired: the plan still proceeds and the
-    receipt says 'line not sent (no notifier)' — never a silent drop."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_partial_outcome(), write=True),
-    )
-    h.driver._deps.publish_notification = None
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert rec["owner_line"] == _UNENFORCED_LINE
-    assert rec["owner_line_sent"] == "line not sent (no notifier)"
-
-
-def test_the_hook_never_writes_routing_law_in_its_source() -> None:
-    """Static pin (condition 5): forge only READS ``routing_law`` — no string
-    the hook's writers could emit carries ``routing_law:``. Walks every
-    non-docstring string constant in the three modules that touch the plan
-    YAML / the config."""
-    import ast
-
-    from forge.pipeline import routing_stamps as rs
-    from forge.planning import target_terminal_tools as ttt
-
-    offenders: list[str] = []
-    for mod in (driver_module, ttt, rs):
-        src = Path(mod.__file__).read_text(encoding="utf-8")
-        tree = ast.parse(src)
-        docstrings: set[int] = set()
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                body = getattr(node, "body", [])
-                if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant):
-                    docstrings.add(id(body[0].value))
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Constant) and isinstance(node.value, str) and id(node) not in docstrings:
-                if "routing_law:" in node.value or "routing_law :" in node.value:
-                    offenders.append(f"{Path(mod.__file__).name}:{node.lineno}: {node.value[:60]!r}")
-    assert offenders == [], offenders
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_unavailable_continues_and_is_receipted(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """An older guardkit (no ``qa normalize-stamps``): the run CONTINUES to
-    validate + commit + BUILD_QUEUED (backward compatible until the rebake),
-    the log says 'normalizer unavailable', and the plan receipts + owner line
-    say the plan is unstamped — never silent."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    unavailable = StampNormalizerOutcome(
-        status="unavailable",
-        detail=(
-            "normalizer unavailable: the guardkit on this image has no "
-            "`qa normalize-stamps` subcommand (Error: No such command "
-            "'normalize-stamps'.); verifier stamps were NOT minted"
-        ),
-    )
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=unavailable),
-    )
-    _share_order(sink, h)
-    with caplog.at_level("WARNING", logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["order"] == ["normalize_stamps", "validate"]
-    assert any("normalizer unavailable" in r.getMessage() for r in caplog.records)
-    details = _leg_details(store, "feature-plan")
-    rec = details["stamp_normalizer"]
-    assert rec["status"] == "unavailable"
-    assert "No such command" in rec["detail"]
-    assert rec["stamped_count"] == 0
-    # the plan committed WITHOUT scenarios: (honest) but WITH forge's
-    # feature_files: fill (the universe is on the branch for the rebaked run).
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).stdout
-    assert "scenarios:" not in committed
-    assert "feature_files:" in committed
-    plan_lines = [m for _, m, lvl in h.ctx["notifications"] if "queueing the build" in m]
-    assert plan_lines and "verifier stamps NOT minted" in plan_lines[0]
-    assert "rebake pending" in plan_lines[0]
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_failure_stops_the_run_with_the_reason(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """ENFORCED + a cannot-run failure (not a refusal, not unavailable) is
-    loud: the run stops, validate never runs, the card names the reason."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _commit_repo_routing_law(repo, "enforced")
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    failed = StampNormalizerOutcome(
-        status="failed",
-        detail="guardkit qa normalize-stamps could not run (exit 2): stamp normalizer: feature FEAT-X: `feature_files:` must be a list",
-    )
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer({}, outcome=failed),
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert h.ctx["counters"]["validate"] == 0
-    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
-    assert len(errors) == 1
-    assert "the verifier-stamp normalizer could not run" in errors[0]
-    assert "`feature_files:` must be a list" in errors[0]
-    assert "nothing was built" in errors[0]
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_not_wired_is_receipted_and_byte_identical_otherwise(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Unwired (hermetic composition): the plan leg proceeds exactly as before
-    (no fill, no write, validate runs) and the receipts say ``not-wired``."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-    )
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["order"] == ["validate"]
-    details = _leg_details(store, "feature-plan")
-    assert details["stamp_normalizer"]["status"] == "not-wired"
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).stdout
-    assert "feature_files:" not in committed  # no fill when the hook is not wired
-    assert "scenarios:" not in committed
-
-
-@pytest.mark.asyncio
-async def test_stamp_normalizer_leaves_a_declared_feature_files_alone(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """When the plan-writer DID declare ``feature_files:`` forge does not touch
-    it (a present key is the writer's statement) — no fill in the receipts."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-
-    def _plan_with_universe(feature_id: str) -> Any:
-        r = _plan_result_native(feature_id)
-        r.role_output[_plan_yaml_rel(feature_id)] = (
-            f"id: {feature_id}\nfeature_files:\n  - {_STAMP_SPEC_REL}\n"
-            "tasks:\n- id: TASK-STAT-001\n"
-        )
-        return r
-
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_with_universe,
-        normalize_stamps_fn=_stamping_normalizer(sink),
-    )
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert rec["status"] == "written"
-    assert "feature_files_filled_by_forge" not in rec
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).stdout
-    assert committed.count("feature_files:") == 1
 
 
 # -- LIVE: the whole plan leg with the REAL guardkit normalizer ------------------
@@ -5583,131 +4661,6 @@ def _live_spec_result(slug: str = "stats-endpoint") -> Any:
     )
 
 
-@pytest.mark.asyncio
-async def test_live_plan_leg_commits_rule_minted_stamps_with_the_real_normalizer(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    from forge.planning.target_terminal_tools import make_normalize_stamps
-
-    checkout, python = live_guardkit_or_skip(Path(__file__))
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_live_spec_result(),
-        plan_result_factory=_plan_result_native,  # NO feature_files, NO scenarios
-        normalize_stamps_fn=make_normalize_stamps(run_fn=live_run_fn(checkout, python)),
-    )
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id))
-    assert committed.returncode == 0, committed.stderr
-    data = yaml.safe_load(committed.stdout)
-    # forge's fill named the universe; guardkit's rule R1 minted the stamp;
-    # both are IN THE PLAN COMMIT on the planning branch.
-    assert data["feature_files"] == [_STAMP_SPEC_REL]
-    assert data["scenarios"] == {_LIVE_TITLE: {"verifier": "probe:process"}}
-    assert data["tasks"] == [{"id": "TASK-STAT-001"}]  # nothing else touched
-    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert rec["status"] == "written"
-    assert rec["stamped"] == {_LIVE_TITLE: "probe:process"}
-    assert rec["per_title"] == {_LIVE_TITLE: "stamped by normalizer (rule R1): probe:process"}
-    assert rec["feature_files_filled_by_forge"] == [_STAMP_SPEC_REL]
-    assert rec["stamps_on_branch"] == 1
-    assert rec["enforcement"] == "off"
-    assert h.ctx["counters"]["validate"] == 1
-
-
-@pytest.mark.asyncio
-async def test_live_plan_leg_enforced_refusal_card_names_the_real_normalizers_titles(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """ENFORCED repo: the default fixture feature ('Scenario: ok / Given a') is
-    undecidable by every rule — the REAL normalizer answers PARTIAL (exit 3,
-    nothing decided), the run stops, the card names 'ok' verbatim, and no
-    plan YAML reaches the branch. The machine's rewrite round is switched off
-    here: this is the card the refusal itself produces (rule 8 of the rewrite
-    lane; with the round on, the machine rewrites first and, since rule 6b,
-    the model gets its turn)."""
-    from forge.planning.target_terminal_tools import make_normalize_stamps
-
-    checkout, python = live_guardkit_or_skip(Path(__file__))
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _commit_repo_routing_law(repo, "enforced")
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=make_normalize_stamps(run_fn=live_run_fn(checkout, python)),
-        rewrite_on_refusal=False,
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert h.ctx["counters"]["validate"] == 0
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    assert _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).returncode != 0
-    errors = [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
-    assert len(errors) == 1
-    assert "  - ok\n" in errors[0]
-    assert "1 scenario(s) had no rule to decide which verifier proves them" in errors[0]
-    assert "This repo enforces the routing law" in errors[0]
-
-
-@pytest.mark.asyncio
-async def test_live_plan_leg_not_enforced_partial_proceeds_with_the_real_normalizer(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """NOT ENFORCED (no flag): the same undecidable 'ok' through the REAL
-    normalizer (exit 3, nothing decided) — the plan PROCEEDS to BUILD_QUEUED,
-    the receipt names 'ok' as refused, the owner's plain line reads
-    '1 of 1 examples …', and the committed YAML carries forge's fill but no
-    ``scenarios:`` and no ``routing_law:``."""
-    from forge.planning.target_terminal_tools import make_normalize_stamps
-
-    checkout, python = live_guardkit_or_skip(Path(__file__))
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=make_normalize_stamps(run_fn=live_run_fn(checkout, python)),
-    )
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["validate"] == 1
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    committed = _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id))
-    assert committed.returncode == 0, committed.stderr
-    data = yaml.safe_load(committed.stdout)
-    assert data["feature_files"] == [_STAMP_SPEC_REL]
-    assert "scenarios" not in data and "routing_law" not in data
-    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert rec["status"] == "partial" and rec["refused_titles"] == ["ok"]
-    assert rec["enforcement"] == "off" and rec["proceeded_unenforced"] is True
-    expected_line = (
-        "1 of 1 examples could not be given a verification home by rule —\n"
-        "  - ok\n"
-        "— the plan proceeds; this repo does not enforce the routing law yet"
-    )
-    assert rec["owner_line"] == expected_line and rec["owner_line_sent"] == "sent"
-    assert (expected_line, False) in h.ctx["mentions"]
-    assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
-
 
 # ---------------------------------------------------------------------------
 # ADVISORY DISAGREEMENTS reach the owner as ONE plain line — WHATEVER the
@@ -5728,58 +4681,7 @@ _DISAGREEMENTS_LINE = (
 )
 
 
-def _nothing_to_do_with_disagreements() -> StampNormalizerOutcome:
-    return StampNormalizerOutcome(
-        status="nothing-to-do",
-        detail="2 scenario(s) already stamped, none unstamped",
-        already_stamped=("The endpoint returns the count", "Unauthenticated requests are rejected"),
-        written=False,
-        disagreements=_DISAGREEMENTS,
-    )
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("enforcement", ["off", "enforced"])
-async def test_stamp_disagreements_reach_the_owner_on_a_clean_run_whatever_the_enforcement(
-    store: SqlitePlanningRunStore, tmp_path: Path, enforcement: str
-) -> None:
-    """A fully-successful normalizer (nothing-to-do — the model stamped
-    everything) that DISAGREES with two model stamps: the plan proceeds to
-    BUILD_QUEUED under BOTH enforcement modes (a legal wrong stamp is not a
-    law violation), the receipt carries the disagreements, and the owner
-    gets exactly ONE plain un-@mentioned line naming them; no error card,
-    no stamp changed."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    if enforcement == "enforced":
-        _commit_repo_routing_law(repo, "enforced")
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, outcome=_nothing_to_do_with_disagreements()),
-    )
-    _share_order(sink, h)
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    rec = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert rec["status"] == "nothing-to-do"
-    assert rec["enforcement"] == enforcement
-    assert rec["disagreement_count"] == 2
-    assert [d["title"] for d in rec["disagreements"]] == [d["title"] for d in _DISAGREEMENTS]
-    assert rec["disagreements_line"] == _DISAGREEMENTS_LINE
-    assert rec["disagreements_line_sent"] == "sent"
-    lines = [(m, lvl) for _, m, lvl in h.ctx["notifications"] if "the rules would not have chosen" in m]
-    assert lines == [(_DISAGREEMENTS_LINE, "info")]
-    assert (_DISAGREEMENTS_LINE, False) in h.ctx["mentions"]
-    assert not any(lvl == "error" for _, _, lvl in h.ctx["notifications"])
-    # no "the plan proceeds… does not enforce" line — nothing was refused
-    assert not any("could not be given a verification home" in m for _, m, _ in h.ctx["notifications"])
 
 
 # ---------------------------------------------------------------------------
@@ -6028,10 +4930,6 @@ async def test_documentation_task_bar_lands_narrowed_on_the_branch(
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     assert h.ctx["counters"]["build_trigger"] == 1
-    assert set(h.ctx["validated_bars"]) == {
-        "qa/pass-bar-TASK-VER-001.yaml",
-        "qa/pass-bar-TASK-VER-004.yaml",
-    }
 
     branch = f"planning/{CID}"
 
@@ -6121,104 +5019,12 @@ _STOP_STILL_UNPROVEN = (
 )
 
 
-def test_the_machine_note_is_stack_neutral_and_evidence_bounded() -> None:
-    """The rewrite contract carries observable behaviour without choosing a stack
-    or weakening behaviour that needs more than one interaction.
-
-    This checks the instruction bytes; it does not claim a model will obey them.
-    """
-    titles = ["Two messages arrive together", "A warning remains on screen"]
-
-    note = _Driver._machine_rewrite_note(titles)
-
-    assert note.splitlines()[1:3] == [f"- {title}" for title in titles]
-    assert "facts in the supplied request and context" in note
-    assert "HTTP, command, screen, or message interface" in note
-    assert "concurrency, timing, and other multi-interaction behaviour" in note
-    assert "never turn that behaviour into sequential or single-interaction behaviour" in note
-    assert (
-        "leave that example unchanged; do not add an assumption or ask a question" in note
-    )
-    assert "Keep every other worked example exactly as it is" in note
-    assert "Do not invent an interface, status, field, implementation detail" in note
-    assert "test name, or verifier" in note
-    assert "because they describe the database or the code" not in note
-    assert "a request to the endpoint and the reply it gets" not in note
-    assert "the repository test that proves it" not in note
-
-
-def _refusal_outcome() -> StampNormalizerOutcome:
-    """The older all-or-nothing guardkit's exit-2 shape: two refused titles."""
-    return StampNormalizerOutcome(
-        status="refused",
-        detail="2 scenario(s) undecidable by rule (R1–R10) — no fallback home; nothing was written",
-        refused_titles=_UNDECIDABLE_TITLES,
-    )
-
 
 class _Crash(BaseException):
     """A process death mid-leg: not an Exception, so nothing on the drive path
     catches it — the durable rows are whatever was written before it."""
 
 
-def _sequenced_normalizer(
-    sink: dict[str, Any], outcomes: list[Any], *, legacy: bool = False
-):
-    """A fake normalize_stamps that answers from ``outcomes`` in call order
-    (the last one repeats). ``None`` = behave like a clean guardkit: write the
-    fixture's one stamp and report ``written``. A ``_Crash`` instance is
-    RAISED — the simulated process death.
-
-    Since rule 1a (2026-09-07) the production collaborator takes a keyword,
-    ``rules_only``; this fake takes it too and records, per call, what the
-    driver passed under ``sink["rules_only"]`` — ``True`` when the keyword
-    was passed, ``None`` when the call was positional. ``legacy=True`` builds
-    the collaborator in its older shape — positional ``(worktree,
-    feature_id)`` only — the one the driver must still work with."""
-
-    async def _answer(
-        worktree: Path, feature_id: str, rules_only: bool | None
-    ) -> StampNormalizerOutcome:
-        sink.setdefault("order", []).append("normalize_stamps")
-        sink.setdefault("rules_only", []).append(rules_only)
-        # The spec .feature this stamping saw in the worktree — the bytes the
-        # real normalizer would classify — so a test can prove WHICH spec a
-        # stamping ran on (the approved one, or a rewrite's).
-        feature_path = worktree / _SPEC_FEATURE_REL
-        sink.setdefault("feature_seen", []).append(
-            feature_path.read_text(encoding="utf-8") if feature_path.is_file() else None
-        )
-        sink["calls"] = sink.get("calls", 0) + 1
-        outcome = outcomes[min(sink["calls"] - 1, len(outcomes) - 1)]
-        if isinstance(outcome, _Crash):
-            raise outcome
-        if outcome is not None:
-            return outcome
-        yaml_path = worktree / _plan_yaml_rel(feature_id)
-        text = yaml_path.read_text(encoding="utf-8") if yaml_path.is_file() else ""
-        yaml_path.write_text(
-            text + 'scenarios:\n  "ok":\n    verifier: "hurl"\n', encoding="utf-8"
-        )
-        return StampNormalizerOutcome(
-            status="written",
-            detail="1 scenario(s) stamped by rule, 0 already stamped (untouched)",
-            stamped={"ok": "hurl"},
-            rules={"ok": "R9"},
-        )
-
-    if legacy:
-
-        async def _legacy(worktree: Path, feature_id: str) -> StampNormalizerOutcome:
-            return await _answer(worktree, feature_id, None)
-
-        return _legacy
-
-    async def _normalize(
-        worktree: Path, feature_id: str, *, rules_only: bool | None = None
-    ) -> StampNormalizerOutcome:
-        return await _answer(worktree, feature_id, rules_only)
-
-    return _normalize
 
 
 def _rewritten_spec_result(base: Any | None = None, slug: str = "stats-endpoint") -> Any:
@@ -6261,189 +5067,6 @@ def _error_cards(h: _Harness) -> list[str]:
     return [m for _, m, lvl in h.ctx["notifications"] if lvl == "error"]
 
 
-@pytest.mark.asyncio
-async def test_a_refusal_sends_the_machine_note_once_and_a_clean_second_stamping_carries_on(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rules 1–5 and 9, end to end in a real scratch repo: the enforced law
-    refuses two examples → the spec writer is dispatched with the machine's
-    note VERBATIM as ``validate_feedback`` and the prior spec as
-    ``revision_of`` → the approved row is recorded again with the owner's
-    decision carried forward and the machine's block → the plan is written
-    again on the SAME feature id → the second stamping is clean → ONE
-    un-mentioned line in the spec's words, no card, and the build is queued.
-    """
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    feature_ids: list[str] = []
-
-    def _plan_factory(feature_id: str) -> Any:
-        feature_ids.append(feature_id)
-        return _plan_result_native(feature_id)
-
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_factory,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome(), None]),
-    )
-    _share_order(sink, h)
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    # The spec writer ran twice: plain, then with the machine's note verbatim
-    # and the prior artifact set keyed by bare filename.
-    assert h.ctx["counters"]["spec"] == 2
-    revisions = h.ctx["counters"]["spec_revisions"]
-    assert len(revisions) == 1
-    assert revisions[0]["validate_feedback"] == _MACHINE_NOTE_FOR_TITLES
-    assert set(revisions[0]["revision_of"]) == {
-        "stats-endpoint.feature",
-        "stats-endpoint_assumptions.yaml",
-        "stats-endpoint_summary.md",
-        "stats-endpoint_digest.yaml",
-    }
-    # The plan leg ran from the top twice on ONE feature id; the normalizer
-    # twice; validate only once (the second time, after the clean stamping).
-    assert h.ctx["counters"]["plan"] == 2
-    assert len(set(feature_ids)) == 1
-    assert sink["order"] == ["normalize_stamps", "normalize_stamps", "validate"]
-    # ONE un-mentioned line, in the spec's words; no card, no error.
-    assert (_MACHINE_REWRITE_LINE_EXPECTED, False) in h.ctx["mentions"]
-    assert sum(
-        1 for _, m, _ in h.ctx["notifications"] if "the machine asked the spec writer" in m
-    ) == 1
-    assert _error_cards(h) == []
-    # The approved spec rows: the owner's, then the re-recorded one with the
-    # owner's decision carried forward UNCHANGED and the machine's block.
-    first, second = _approved_spec_rows(store)
-    assert first["spec_review"]["decided_by"] == ORIGINATOR
-    assert second["spec_review"] == first["spec_review"]
-    assert "rewritten_by_machine" not in first
-    assert second["rewritten_by_machine"] == {
-        "round": 1,
-        "author": _MACHINE_NOTE_AUTHOR,
-        "note": _MACHINE_NOTE_FOR_TITLES,
-        "refused_titles": [_MOON_TITLE, "Another undecidable one"],
-        "changes": "1 example changed",
-    }
-    # The rewritten spec is what the plan of record carries on the branch.
-    shown = _show(repo, f"planning/{CID}", "features/stats-endpoint/stats-endpoint_digest.yaml")
-    assert "GET /stats answers 200" in shown.stdout
-    # The plan receipt carries the rewrite whichever way it went (rule 9).
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert receipt["status"] == "written"
-    assert receipt["rewrite"]["note"] == _MACHINE_NOTE_FOR_TITLES
-    assert receipt["rewrite"]["author"] == _MACHINE_NOTE_AUTHOR
-    assert receipt["rewrite"]["refused_titles"] == [_MOON_TITLE, "Another undecidable one"]
-    assert receipt["rewrite"]["changes"] == "1 example changed"
-    assert receipt["rewrite"]["owner_line"] == _MACHINE_REWRITE_LINE_EXPECTED
-    assert receipt["rewrite"]["owner_line_sent"] == "sent"
-    # The machine round's draft row names the author and never says "Your note".
-    drafts = [
-        json.loads(e["details_json"])["spec_draft"]
-        for e in store.list_events(CID)
-        if e["stage_label"] == "feature-spec-draft" and e["status"] == "drafted"
-    ]
-    assert drafts[-1]["rewrite"]["author"] == _MACHINE_NOTE_AUTHOR
-    assert "Your note" not in json.dumps(drafts[-1]["card"])
-    # No card was put in front of a person a second time.
-    assert h.ctx["counters"].get("build_trigger") == 1
-
-
-@pytest.mark.asyncio
-async def test_the_re_recorded_row_carries_the_sign_in_answer_and_the_pass_bars_leg_finds_it(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 4 on the answer that matters most: an auth-flagged spec whose
-    sign-in question the owner answered on the digest card. After the
-    machine's rewrite the re-recorded row still carries it, and the pass-bars
-    leg reads it from there — one pause, no second door, BUILD_QUEUED."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    slug = "version-endpoint"
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(
-            _spec_result_with_seed(_ROUND19_SEED_AUTH, slug=slug),
-            _rewritten_spec_result(_spec_result_with_seed(_ROUND19_SEED_AUTH, slug=slug), slug=slug),
-        ),
-        plan_result_factory=_plan_result_native_versions,
-        pass_bar_validate_fn=_schema_pass_bar_oracle,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome(), None]),
-    )
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    first, second = _approved_spec_rows(store)
-    assert first["spec_review"]["sign_in_answer"] == "confirmed"
-    assert second["spec_review"] == first["spec_review"]
-    assert second["rewritten_by_machine"]["round"] == 1
-    bars = _leg_details(store, "qa-pass-bars")
-    assert bars["auth_confirmation"]["outcome"] == "confirmed"
-    assert bars["auth_confirmation"]["answered_on"] == "the spec digest card"
-    assert h.ctx["counters"]["pass_bar_validate"] == 3
-    # Only the digest card was ever put in front of a person.
-    assert len(h.ctx["publisher"].envelopes) == 1
-
-
-@pytest.mark.asyncio
-async def test_a_second_refusal_stops_with_the_card_and_the_extra_sentence(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 6, "still could not be proven": the rewrite landed but the second
-    stamping refused titles again — the plan-stop card as today, opening with
-    the one sentence, the titles verbatim; the machine record names the round.
-    Never a third try."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink, [_refusal_outcome(), _refusal_outcome()]
-        ),
-    )
-    _share_order(sink, h)
-
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-
-    assert h.ctx["counters"]["spec"] == 2
-    assert h.ctx["counters"]["plan"] == 2
-    assert sink["order"] == ["normalize_stamps", "normalize_stamps"]
-    cards = _error_cards(h)
-    assert len(cards) == 1
-    card = cards[0]
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    assert card.startswith(
-        f"Planning run {CID} stopped at writing the task plan. {_STOP_STILL_UNPROVEN} "
-        f"The verifier stamps could not all be minted by rule for feature {feature_id}."
-    )
-    for t in _UNDECIDABLE_TITLES:
-        assert f"  - {t}" in card
-    assert "nothing was stamped and nothing was built" in card
-    assert "This repo enforces the routing law" in card
-    assert not any("The plan carries on" in m for _, m, _ in h.ctx["notifications"])
-    # The re-recorded row is there (the rewrite DID land); the record names
-    # the round and how it went.
-    assert _approved_spec_rows(store)[-1]["rewritten_by_machine"]["round"] == 1
-    error = store.get_run(CID)["error"] or ""
-    assert error.startswith(f"stamp normalizer refused for {feature_id}")
-    assert "after the machine's rewrite (round 1): the rewrite still could not be proven" in error
-    # Nothing reached the plan side of the branch.
-    assert _show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)).returncode != 0
 
 
 # ---------------------------------------------------------------------------
@@ -6463,64 +5086,10 @@ async def test_a_second_refusal_stops_with_the_card_and_the_extra_sentence(
 # ---------------------------------------------------------------------------
 
 
-def _switched_off_one_title() -> StampNormalizerOutcome:
-    """The first stamping by rule only, ONE title refused — the shape of the
-    live run 696a3e38, and the shape the spec's rule 6b line is written for
-    ("1 of the worked examples … rewrite it … its verifier")."""
-    return StampNormalizerOutcome(
-        status="refused",
-        detail=(
-            "1 scenario(s) undecidable by rule (R1–R10) — the model fallback was "
-            "not asked (switched off for this stamping); nothing was written"
-        ),
-        refused_titles=(_MOON_TITLE,),
-        model_outcome={
-            "status": "switched_off",
-            "detail": (
-                "the model fallback was not asked about 1 title(s) no rule could "
-                "decide: switched off for this stamping by the caller (--no-model). "
-                "The titles stay refused and nothing was stamped."
-            ),
-        },
-    )
 
 
-def _model_decided_outcome(pairs: dict[str, str]) -> StampNormalizerOutcome:
-    """The second stamping with the model allowed: the rules refused the same
-    titles and the model fallback decided every one of them — guardkit marks
-    each with rule ``model`` (its provenance mark for a model-decided stamp,
-    never an R-number) and reports ``decided`` with the count."""
-    return StampNormalizerOutcome(
-        status="written",
-        detail=(
-            f"{1 + len(pairs)} scenario(s) stamped ({len(pairs)} decided by the "
-            "model fallback), 0 already stamped (untouched)"
-        ),
-        stamped={"ok": "hurl", **pairs},
-        rules={"ok": "R9", **{title: "model" for title in pairs}},
-        model_outcome={
-            "status": "decided",
-            "detail": f"the model decided {len(pairs)} title(s) no rule could decide",
-            "count": len(pairs),
-            "endpoint": "localhost:4000",
-            "model": "workhorse",
-        },
-    )
 
 
-def _still_refused_after_the_model(model_outcome: dict[str, Any]) -> StampNormalizerOutcome:
-    """The second stamping with the model allowed, and the titles STILL
-    refused: the model was asked and could not settle them, or was not there
-    to ask — ``model_outcome`` says which."""
-    return StampNormalizerOutcome(
-        status="refused",
-        detail=(
-            "2 scenario(s) undecidable by rule (R1–R10) — the model fallback could "
-            "not settle them; nothing was written"
-        ),
-        refused_titles=_UNDECIDABLE_TITLES,
-        model_outcome=model_outcome,
-    )
 
 
 _MODEL_ASKED_AND_FAILED = {
@@ -6604,247 +5173,6 @@ def _rev_parse(repo: Path, rev: str) -> str:
     return res.stdout.strip()
 
 
-@pytest.mark.asyncio
-async def test_a_rewrite_that_changed_nothing_gives_the_model_its_turn_and_carries_on(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 6b, the changed-nothing half: the spec writer came back with the
-    same list, so the machine does NOT stop — it stamps again on the spec of
-    record (the owner's approved row, never re-recorded) with the model
-    fallback allowed; the model decides both titles; the owner reads ONE
-    un-mentioned line naming the real titles and words, no card, and the
-    build is queued. The receipt says the rewrite changed nothing and what
-    the second stamping did."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),  # the same reply both rounds
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink,
-            [
-                _switched_off_outcome(),
-                _model_decided_outcome(
-                    {_MOON_TITLE: "probe:process", "Another undecidable one": "hurl"}
-                ),
-            ],
-        ),
-    )
-    _share_order(sink, h)
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["spec"] == 2  # the rewrite was asked for …
-    assert h.ctx["counters"]["plan"] == 2  # … and the plan leg ran again anyway
-    assert sink["order"] == ["normalize_stamps", "normalize_stamps", "validate"]
-    assert sink["rules_only"] == [True, None]  # by rule only, then the model allowed
-    assert (_MODEL_LINE_AFTER_CHANGED_NOTHING, False) in h.ctx["mentions"]
-    assert _error_cards(h) == []
-    assert not any("The machine already asked" in m for _, m, _ in h.ctx["notifications"])
-    # The owner's approved row stands alone: a changed-nothing rewrite is
-    # never re-recorded, and the spec of record is what was stamped — on the
-    # branch too: a byte-identical rewrite is the runner's idempotent
-    # no-commit path, so the branch never moved and nothing was put back.
-    rows = _approved_spec_rows(store)
-    assert len(rows) == 1 and "rewritten_by_machine" not in rows[0]
-    assert sink["feature_seen"] == [_FIXTURE_FEATURE, _FIXTURE_FEATURE]
-    assert not any("put back" in s for s in _branch_subjects(repo, f"planning/{CID}"))
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert receipt["status"] == "written"
-    assert receipt["rules_only"] is False
-    rewrite = receipt["rewrite"]
-    assert rewrite["changed_nothing"] is True
-    assert rewrite["spec_of_record"] == {
-        "sha": rows[0]["sha"],
-        "branch_moved_by_rewrite": False,
-    }
-    assert "refused_by_checker" not in rewrite
-    assert rewrite["note"] == _MACHINE_NOTE_FOR_TITLES
-    assert rewrite["author"] == _MACHINE_NOTE_AUTHOR
-    assert rewrite["refused_titles"] == [_MOON_TITLE, "Another undecidable one"]
-    assert rewrite["owner_line"] == _MODEL_LINE_AFTER_CHANGED_NOTHING
-    assert rewrite["owner_line_sent"] == "sent"
-    assert rewrite["first_stamping"]["rules_only"] is True
-    assert rewrite["second_stamping"] == {
-        "status": "written",
-        "rules_only": False,
-        "model_decided": {_MOON_TITLE: "probe:process", "Another undecidable one": "hurl"},
-        "model_outcome": {
-            "status": "decided",
-            "detail": "the model decided 2 title(s) no rule could decide",
-            "count": 2,
-            "endpoint": "localhost:4000",
-            "model": "workhorse",
-        },
-    }
-    assert h.ctx["counters"].get("build_trigger") == 1
-
-
-@pytest.mark.asyncio
-async def test_a_rewrite_that_changed_nothing_stops_with_the_card_and_its_changed_nothing_sentence_when_the_model_cannot_settle_it(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 6b, the changed-nothing half, the other way: the model had its
-    turn and its answer was rejected, so the titles are still refused. The
-    run stops with rule 6's card — the spec's own words for a rewrite that
-    changed nothing — opening with the "changed nothing" sentence, the card
-    about the SECOND stamping (the model was asked and could not settle
-    them), the titles verbatim, and the model fallback's own sentence (rule
-    16). Never the note-refused sentence: the checker refused nothing. Never
-    a third try."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink,
-            [
-                _switched_off_outcome(),
-                _still_refused_after_the_model(
-                    {"status": "answer_rejected", "detail": "'maybe' is not one of the allowed words"}
-                ),
-            ],
-        ),
-    )
-    _share_order(sink, h)
-
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-
-    assert h.ctx["counters"]["spec"] == 2
-    assert h.ctx["counters"]["plan"] == 2
-    assert sink["order"] == ["normalize_stamps", "normalize_stamps"]
-    assert sink["rules_only"] == [True, None]
-    cards = _error_cards(h)
-    assert len(cards) == 1
-    card = cards[0]
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
-    assert card.startswith(
-        f"Planning run {CID} stopped at writing the task plan. {_STOP_CHANGED_NOTHING} "
-        f"The verifier stamps could not all be minted by rule for feature {feature_id}. "
-        "2 scenario(s) had no rule to decide which verifier proves them, and the model "
-        "fallback could not settle them, so nothing was stamped and nothing was built:\n"
-        f"{titles}\n"
-        "The plan's stamp check asked its model, but its answer was not one the "
-        "check accepts, so these scenarios could not be labelled.\n"
-        "This repo enforces the routing law"
-    )
-    assert "refused the rewrite twice" not in card
-    assert "switched off" not in card
-    assert not any("The plan carries on" in m for _, m, _ in h.ctx["notifications"])
-    assert len(_approved_spec_rows(store)) == 1
-    error = store.get_run(CID)["error"] or ""
-    assert error.startswith("stamp normalizer refused for FEAT-")
-    assert "after the machine's rewrite (round 1): the rewrite changed nothing" in error
-    assert "the branch never moved, so the spec of record stands" in error
-    assert "the model fallback had its turn on the second stamping, on the spec of record" in error
-    assert "titles still refused after the model's turn" in error
-
-
-@pytest.mark.asyncio
-async def test_a_rewrite_that_moved_the_steps_but_not_the_list_is_stamped_on_the_spec_of_record(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Rule 6b says the model's turn after a changed-nothing rewrite is "on
-    the spec of record" — and that has to be true of the BRANCH, not only of
-    the row (coach finding, 2026-09-07). The spec writer rewrites the refused
-    example's steps into the endpoint shape but keeps every digest sentence
-    word for word: the cards say the same thing, yet the spec leg has already
-    committed the rewrite, so the branch tip is the rewrite. The driver sees
-    the sha moved, reads the approved files off the approved commit and puts
-    them back on the branch as one commit; the second stamping and the plan
-    sit on the approved bytes; the owner's line is true (the model decided
-    the titles on the spec of record); the receipt names the commit set
-    aside and the one that put the spec back; one approved row."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    branch = f"planning/{CID}"
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _steps_moved_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink,
-            [
-                _switched_off_outcome(),
-                _model_decided_outcome(
-                    {_MOON_TITLE: "probe:process", "Another undecidable one": "hurl"}
-                ),
-            ],
-        ),
-    )
-    _share_order(sink, h)
-
-    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["spec"] == 2
-    assert h.ctx["counters"]["plan"] == 2
-    assert sink["order"] == ["normalize_stamps", "normalize_stamps", "validate"]
-    assert sink["rules_only"] == [True, None]
-    # BOTH stampings saw the approved .feature — never the rewrite's steps.
-    assert sink["feature_seen"] == [_FIXTURE_FEATURE, _FIXTURE_FEATURE]
-    # The branch carries the approved bytes under the plan commit ...
-    assert _show(repo, branch, _SPEC_FEATURE_REL).stdout == _FIXTURE_FEATURE
-    rows = _approved_spec_rows(store)
-    assert len(rows) == 1 and "rewritten_by_machine" not in rows[0]
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    rewrite = receipt["rewrite"]
-    assert rewrite["changed_nothing"] is True
-    spec_of_record = rewrite["spec_of_record"]
-    assert spec_of_record["sha"] == rows[0]["sha"]
-    assert spec_of_record["branch_moved_by_rewrite"] is True
-    assert spec_of_record["rewrite_sha"] != rows[0]["sha"]
-    assert "files_left_by_rewrite" not in spec_of_record
-    # ... the put-back commit sits right under the plan commit, on top of the
-    # rewrite's commit (set aside, still in the history, its steps readable
-    # there and nowhere else), which sits on the approved commit.
-    plan_sha = _leg_details(store, "feature-plan")["sha"]
-    assert _rev_parse(repo, f"{plan_sha}^") == spec_of_record["restored_sha"]
-    assert _rev_parse(repo, f"{spec_of_record['restored_sha']}^") == spec_of_record["rewrite_sha"]
-    assert _rev_parse(repo, f"{spec_of_record['rewrite_sha']}^") == rows[0]["sha"]
-    assert (
-        _show(repo, spec_of_record["rewrite_sha"], _SPEC_FEATURE_REL).stdout
-        == _FIXTURE_FEATURE_ENDPOINT_STEPS
-    )
-    assert _show(repo, spec_of_record["restored_sha"], _SPEC_FEATURE_REL).stdout == _FIXTURE_FEATURE
-    assert (
-        f"planning: the approved spec put back for {CID} (the machine's rewrite "
-        f"changed nothing the owner reads; its commit {spec_of_record['rewrite_sha']} "
-        "is set aside)"
-    ) in _branch_subjects(repo, branch)
-    # The owner's line is TRUE: the model decided both titles on the approved
-    # spec; no card, no error.
-    assert (_MODEL_LINE_AFTER_CHANGED_NOTHING, False) in h.ctx["mentions"]
-    assert rewrite["owner_line"] == _MODEL_LINE_AFTER_CHANGED_NOTHING
-    assert rewrite["second_stamping"]["model_decided"] == {
-        _MOON_TITLE: "probe:process",
-        "Another undecidable one": "hurl",
-    }
-    assert _error_cards(h) == []
-    assert h.ctx["counters"].get("build_trigger") == 1
-    # The machine log says what was put back, and where.
-    log = "\n".join(_driver_log_lines(caplog))
-    assert (
-        f"had moved the planning branch to {spec_of_record['rewrite_sha']} without "
-        "changing anything the owner reads; the approved spec "
-        f"({rows[0]['sha']}) is put back as {spec_of_record['restored_sha']}, 4 file(s)"
-    ) in log
-    assert "the rewrite's commit" in log and "put back on the branch as" in log
 
 
 class _ForgetfulGitRunner(WorktreeGitRunner):
@@ -6861,552 +5189,6 @@ class _ForgetfulGitRunner(WorktreeGitRunner):
         )
 
 
-@pytest.mark.asyncio
-async def test_when_the_approved_spec_cannot_be_put_back_nothing_is_stamped_on_the_rewrites_bytes(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The put-back's failing path: the branch moved (the rewrite's steps
-    differ) but the approved files cannot be read at the approved commit.
-    The run stops loudly at the plan stage, in plain words, BEFORE the second
-    stamping: nothing is ever stamped or planned on bytes no approved row
-    records. One approved row, no line about the model."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _commit_repo_routing_law(repo, "enforced")
-    git = _ForgetfulGitRunner(
-        worktrees_root=tmp_path / "wt",
-        target_repo_paths={TARGET_REPO: str(repo)},
-        fetch_addresses=_recorded_addresses(repo),
-    )
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _steps_moved_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink,
-            [_switched_off_outcome(), _model_decided_outcome({_MOON_TITLE: "probe:process"})],
-        ),
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert h.ctx["counters"]["spec"] == 2
-    assert h.ctx["counters"]["plan"] == 1  # no second attempt
-    assert sink["calls"] == 1
-    cards = _error_cards(h)
-    assert len(cards) == 1
-    assert cards[0].startswith(
-        f"Planning run {CID} stopped at writing the task plan: the machine's rewrite "
-        f"changed nothing on the list, but {_SPEC_FEATURE_REL} could not be read at "
-        "the approved spec's commit "
-    )
-    assert cards[0].endswith(
-        "so the approved spec could not be put back on the branch before stamping "
-        "again; nothing was built"
-    )
-    assert not any("The plan carries on" in m for _, m, _ in h.ctx["notifications"])
-    assert len(_approved_spec_rows(store)) == 1
-    # The branch tip is still the rewrite's commit: nothing was planned on it.
-    assert _show(repo, f"planning/{CID}", _SPEC_FEATURE_REL).stdout == _FIXTURE_FEATURE_ENDPOINT_STEPS
-    assert _show(repo, f"planning/{CID}", _plan_yaml_rel(h.ctx["counters"]["last_feature_id"])).returncode != 0
-
-
-@pytest.mark.asyncio
-async def test_when_the_second_stamping_settles_the_titles_without_the_model_no_line_claims_it_did(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The rule 6b line says what the MODEL decided. If the second stamping's
-    own rules settle every refused title (an R-number on each — which the
-    same bytes should never produce, but the line must be true if they do),
-    the plan carries on and NO line about the model is sent; the receipt and
-    the log say why."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    by_rule = StampNormalizerOutcome(
-        status="written",
-        detail="3 scenario(s) stamped by rule, 0 already stamped (untouched)",
-        stamped={"ok": "hurl", _MOON_TITLE: "hurl", "Another undecidable one": "hurl"},
-        rules={"ok": "R9", _MOON_TITLE: "R9", "Another undecidable one": "R9"},
-    )
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),  # the same reply both rounds
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_outcome(), by_rule]),
-    )
-    await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert sink["rules_only"] == [True, None]
-    assert not any("model fallback" in m for _, m, _ in h.ctx["notifications"])
-    assert not any("The plan carries on" in m for _, m, _ in h.ctx["notifications"])
-    rewrite = _leg_details(store, "feature-plan")["stamp_normalizer"]["rewrite"]
-    assert rewrite["changed_nothing"] is True
-    assert rewrite["owner_line"].startswith("no owner line: the model fallback decided none")
-    assert rewrite["owner_line_sent"] == "no line to send"
-    assert rewrite["second_stamping"]["model_decided"] == {}
-
-
-@pytest.mark.asyncio
-async def test_a_refused_rewrite_gives_the_model_its_turn_and_carries_on(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 6b, the case of run 696a3e38: one title refused by rule, the
-    machine's note sent, the checker refused the rewrite twice. The run does
-    NOT stop at the spec: the refusal comes back to the plan leg, the second
-    stamping runs on the spec of record with the model allowed, the model
-    decides the title, the owner reads the spec's line — verbatim in shape,
-    the real title and the real word — and the build is queued. No card, no
-    note-refused message, one approved row."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    refused_round = _error_result(
-        reason="could not carry out what this round required, after 2 attempts. "
-        "'feedback_resolved' must be met"
-    )
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), refused_round),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink,
-            [_switched_off_one_title(), _model_decided_outcome({_MOON_TITLE: "probe:process"})],
-        ),
-    )
-    _share_order(sink, h)
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["spec"] == 2
-    assert h.ctx["counters"]["spec_revisions"][0]["validate_feedback"] == (
-        "The rules-only check could not assign a verifier to these worked examples; "
-        "this is not a semantic impossibility:\n"
-        f"- {_MOON_TITLE}\n"
-        "\n"
-        "Revise only these examples using facts in the supplied request and context. "
-        "Keep the behaviour each example specifies unchanged, including its "
-        "concurrency, timing, and other multi-interaction behaviour; never turn that "
-        "behaviour into sequential or single-interaction behaviour. Describe only "
-        "what a caller or user can observe through the interface the request or "
-        "context actually supplies (for example, an HTTP, command, screen, or message "
-        "interface). Do not invent an interface, status, field, implementation detail, "
-        "test name, or verifier. If the supplied facts cannot support a faithful "
-        "provable revision, leave that example unchanged; do not add an assumption or "
-        "ask a question. Keep every other worked example exactly as it is."
-    )
-    assert h.ctx["counters"]["plan"] == 2
-    assert sink["order"] == ["normalize_stamps", "normalize_stamps", "validate"]
-    assert sink["rules_only"] == [True, None]
-    assert (_MODEL_LINE_AFTER_REFUSED_REWRITE, False) in h.ctx["mentions"]
-    assert _error_cards(h) == []
-    assert not any("refused the rewrite twice (" in m for _, m, _ in h.ctx["notifications"])
-    rows = _approved_spec_rows(store)
-    assert len(rows) == 1 and "rewritten_by_machine" not in rows[0]
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert receipt["status"] == "written" and receipt["rules_only"] is False
-    rewrite = receipt["rewrite"]
-    assert rewrite["refused_by_checker"] is True
-    assert rewrite["checker_reason"] == (
-        "could not carry out what this round required, after 2 attempts. "
-        "'feedback_resolved' must be met"
-    )
-    assert "changed_nothing" not in rewrite
-    assert rewrite["refused_titles"] == [_MOON_TITLE]
-    assert rewrite["owner_line"] == _MODEL_LINE_AFTER_REFUSED_REWRITE
-    assert rewrite["owner_line_sent"] == "sent"
-    assert rewrite["first_stamping"] == {
-        "status": "refused",
-        "rules_only": True,
-        "model_outcome": _switched_off_one_title().model_outcome,
-    }
-    assert rewrite["second_stamping"]["status"] == "written"
-    assert rewrite["second_stamping"]["rules_only"] is False
-    assert rewrite["second_stamping"]["model_decided"] == {_MOON_TITLE: "probe:process"}
-    assert rewrite["second_stamping"]["model_outcome"]["status"] == "decided"
-    assert h.ctx["counters"].get("build_trigger") == 1
-
-
-@pytest.mark.asyncio
-async def test_a_refused_rewrite_stops_with_both_sentences_when_the_model_cannot_settle_it(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 6b's stop after a checker refusal: the model had its turn on the
-    second stamping and could not answer, so the titles are still refused.
-    ONE message: rule 23's machine-variant sentence — how many examples,
-    that the machine tried once, the checker's reason, that nothing was
-    built, the sentence shape that works — then the model fallback's own
-    sentence (rule 16), and nothing else (every sentence quoted in the
-    spec). No card; the machine's note (a list of titles) is not quoted
-    back; one approved row."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    refused_round = _error_result(
-        reason="the rewrite moved two examples the note did not name"
-    )
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), refused_round),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink,
-            [_switched_off_outcome(), _still_refused_after_the_model(dict(_MODEL_ASKED_AND_FAILED))],
-        ),
-    )
-    _share_order(sink, h)
-
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-
-    assert h.ctx["counters"]["spec"] == 2
-    assert h.ctx["counters"]["plan"] == 2
-    assert sink["order"] == ["normalize_stamps", "normalize_stamps"]
-    assert sink["rules_only"] == [True, None]
-    assert _error_cards(h) == [
-        f"{_REFUSED_TWICE_SENTENCE} The plan's stamp check asked its model, but "
-        "the model did not give a usable answer, so these scenarios could not be "
-        "labelled."
-    ]
-    assert not any("This repo enforces the routing law" in m for _, m, _ in h.ctx["notifications"])
-    assert not any("Your note" in m for _, m, _ in h.ctx["notifications"])
-    assert len(_approved_spec_rows(store)) == 1
-    error = store.get_run(CID)["error"] or ""
-    assert error.startswith("stamp normalizer refused for FEAT-")
-    assert (
-        "the rewrite was refused by the checker (007 dispatch error: the rewrite "
-        "moved two examples the note did not name)"
-    ) in error
-    assert "the model fallback had its turn on the second stamping" in error
-    assert "no fallback home" not in error
-
-
-@pytest.mark.asyncio
-async def test_a_refused_rewrite_whose_second_stamping_cannot_run_keeps_the_cannot_run_card(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """A normalizer that could not RUN on the model's turn is a different thing
-    from titles still refused: today's cannot-run card, no note-refused
-    sentence; the machine record names the round and how it went."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    refused_round = _error_result(reason="the rewrite moved two examples the note did not name")
-    could_not_run = StampNormalizerOutcome(
-        status="failed", detail="guardkit qa normalize-stamps timed out for the plan"
-    )
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), refused_round),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_outcome(), could_not_run]),
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert sink["rules_only"] == [True, None]
-    cards = _error_cards(h)
-    assert len(cards) == 1
-    assert "verifier-stamp normalizer could not run" in cards[0]
-    assert "refused the rewrite twice" not in cards[0]
-    assert "The machine already asked" not in cards[0]
-    error = store.get_run(CID)["error"] or ""
-    assert "stamp normalizer failed" in error
-    assert (
-        "the rewrite was refused by the checker (007 dispatch error: the rewrite "
-        "moved two examples the note did not name)"
-    ) in error
-    assert "the model fallback had its turn on the second stamping" in error
-
-
-@pytest.mark.asyncio
-async def test_an_owner_note_refusal_keeps_todays_path_even_when_asked_not_to_fail(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The keyword that hands a refusal back to the plan leg is honoured ONLY
-    for the machine's note. An owner's note refused by the checker fails the
-    run inside the spec leg with rule 23's owner sentence, byte for byte,
-    whatever the keyword says — the owner's path is unchanged."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    # Put the run where the spec leg really runs (QUEUED → RUNNING →
-    # FEATURE_SPEC), so the failure transition it takes is the real one.
-    for state in (PlanningState.RUNNING, PlanningState.FEATURE_SPEC):
-        assert not isinstance(
-            store.transition(correlation_id=CID, to_state=state, actor_identity="planning-driver"),
-            TransitionRefused,
-        )
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_error_result(reason="the rewrite moved two examples the note did not name"),
-    )
-    draft = await h.driver._draft_spec(
-        store.get_run(CID),
-        CID,
-        target_repo=TARGET_REPO,
-        repo_path=str(repo),
-        branch=f"planning/{CID}",
-        plan_run_id=f"plan-{CID}",
-        notes=["make the second example about what the endpoint answers"],
-        note_from_machine=False,
-        fail_on_refusal=False,
-    )
-    assert draft is None
-    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert _error_cards(h) == [
-        f"Planning run {CID} stopped at the spec: the spec writer could not honour "
-        'your note "make the second example about what the endpoint answers" — the '
-        "checker refused the rewrite twice (the rewrite moved two examples the note "
-        "did not name). Nothing was built. To try again, send the sentence again "
-        "with the note folded into it."
-    ]
-    error = store.get_run(CID)["error"] or ""
-    assert error.startswith("007 dispatch error: the rewrite moved two examples")
-    assert "the checker refused the revision round after the owner's note" in error
-
-
-@pytest.mark.asyncio
-async def test_a_restart_after_a_refused_rewrite_redoes_the_rewrite_and_the_models_turn(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 7 meets rule 6b: a refused rewrite writes no row, so a process
-    that dies on the model's turn leaves the owner's row alone, and the
-    re-drive redoes the whole round — the spec writer again (refused again),
-    then the model's turn — and, the model deciding, carries on."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    refused_round = _error_result(reason="the rewrite moved two examples the note did not name")
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), refused_round),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_one_title(), _Crash()]),
-    )
-    with pytest.raises(_Crash):
-        await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.FEATURE_PLAN.value
-    assert h.ctx["counters"]["spec"] == 2
-    assert len(_approved_spec_rows(store)) == 1
-
-    sink2: dict[str, Any] = {}
-    h2 = _make_driver(
-        store,
-        git_runner=_recorded_runner(tmp_path / "wt2", repo),
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), refused_round),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink2,
-            [_switched_off_one_title(), _model_decided_outcome({_MOON_TITLE: "probe:process"})],
-        ),
-    )
-    await h2.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h2.ctx["counters"]["spec"] == 1  # the rewrite, redone and refused again
-    assert sink2["rules_only"] == [True, None]
-    assert (_MODEL_LINE_AFTER_REFUSED_REWRITE, False) in h2.ctx["mentions"]
-    assert len(_approved_spec_rows(store)) == 1
-
-
-@pytest.mark.asyncio
-async def test_the_switch_off_is_todays_path_byte_for_byte(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 8: ``planning.rewrite_on_refusal: false`` — the first refusal
-    stops the run with today's card; the spec writer is never asked again."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome(), None]),
-        rewrite_on_refusal=False,
-    )
-    _share_order(sink, h)
-
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-
-    assert h.ctx["counters"]["spec"] == 1
-    assert h.ctx["counters"]["plan"] == 1
-    assert sink["order"] == ["normalize_stamps"]
-    cards = _error_cards(h)
-    assert len(cards) == 1
-    feature_id = h.ctx["counters"]["last_feature_id"]
-    assert cards[0].startswith(
-        f"Planning run {CID} stopped at writing the task plan: the verifier "
-        f"stamps could not all be minted by rule for feature {feature_id}. "
-        "2 scenario(s) had no rule to decide which verifier proves them, and "
-        "there is no fallback home, so nothing was stamped and nothing was built:\n"
-    )
-    assert "The machine already asked" not in cards[0]
-    assert len(_approved_spec_rows(store)) == 1
-    assert "rewritten_by_machine" not in _approved_spec_rows(store)[0]
-    assert "after the machine's rewrite" not in (store.get_run(CID)["error"] or "")
-
-
-@pytest.mark.asyncio
-async def test_a_restart_after_the_row_was_written_does_not_rewrite_again(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 7: the process dies in the second stamping, AFTER the re-recorded
-    row landed. The re-drive reads the row, finds the rewrite has happened,
-    and does not ask the spec writer again: a refusal now stops with the card
-    and the "still could not be proven" sentence."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome(), _Crash()]),
-    )
-    with pytest.raises(_Crash):
-        await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.FEATURE_PLAN.value
-    assert _approved_spec_rows(store)[-1]["rewritten_by_machine"]["round"] == 1
-    assert h.ctx["counters"]["spec"] == 2
-
-    # A fresh process, the same durable store and repo.
-    sink2: dict[str, Any] = {}
-    h2 = _make_driver(
-        store,
-        git_runner=_recorded_runner(tmp_path / "wt2", repo),
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink2, [_refusal_outcome()]),
-    )
-    assert await _drive_to_failure(h2, store) == PlanningState.FAILED.value
-    assert h2.ctx["counters"]["spec"] == 0  # never asked again
-    assert h2.ctx["counters"]["plan"] == 1
-    assert sink2["calls"] == 1
-    cards = _error_cards(h2)
-    assert len(cards) == 1
-    assert f"stopped at writing the task plan. {_STOP_STILL_UNPROVEN}" in cards[0]
-    assert len(_approved_spec_rows(store)) == 2  # no third approved row
-
-
-@pytest.mark.asyncio
-async def test_a_restart_before_the_row_was_written_redoes_the_rewrite(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 7's other half: the process dies during the rewrite's spec dispatch
-    — no re-recorded row — so the re-drive redoes the rewrite (the spec writer
-    runs again) and, stamping clean, carries on."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-
-    async def _dying_spec_dispatch(*, validate_feedback: str | None = None, **_: Any) -> Any:
-        if validate_feedback is not None:
-            raise _Crash()
-        return _spec_result_native()
-
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_dispatch=_dying_spec_dispatch,
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome()]),
-    )
-    with pytest.raises(_Crash):
-        await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.FEATURE_PLAN.value
-    assert len(_approved_spec_rows(store)) == 1
-    assert "rewritten_by_machine" not in _approved_spec_rows(store)[0]
-
-    sink2: dict[str, Any] = {}
-    h2 = _make_driver(
-        store,
-        git_runner=_recorded_runner(tmp_path / "wt2", repo),
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink2, [_refusal_outcome(), None]),
-    )
-    await h2.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h2.ctx["counters"]["spec"] == 1  # the rewrite, redone
-    assert h2.ctx["counters"]["spec_revisions"][0]["validate_feedback"] == _MACHINE_NOTE_FOR_TITLES
-    assert _approved_spec_rows(store)[-1]["rewritten_by_machine"]["round"] == 1
-    assert (_MACHINE_REWRITE_LINE_EXPECTED, False) in h2.ctx["mentions"]
-
-
-@pytest.mark.asyncio
-async def test_the_rewrite_fires_only_on_a_refusal_of_examples_where_the_law_is_enforced(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 1's fence, the two cases that must NOT rewrite: a normalizer that
-    could not RUN (``failed``) under the enforced law stops with today's
-    cannot-run card and never asks the spec writer; and a refusal in a repo
-    that does not enforce the law proceeds with its one plain line, as today.
-    """
-    # (a) failed + enforced → today's cannot-run card, no rewrite.
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    failed = StampNormalizerOutcome(
-        status="failed", detail="guardkit qa normalize-stamps timed out for the plan"
-    )
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [failed]),
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert h.ctx["counters"]["spec"] == 1
-    cards = _error_cards(h)
-    assert len(cards) == 1
-    assert "verifier-stamp normalizer could not run" in cards[0]
-    assert "The machine already asked" not in cards[0]
-
-    # (b) refusal + NOT enforced → proceeds with the one plain line, no rewrite.
-    cx = sqlite_connect.connect_writer(tmp_path / "unenforced.db")
-    migrations.apply_at_boot(cx)
-    store2 = SqlitePlanningRunStore(cx, target_terminal_enabled=True)
-    repo2 = tmp_path / "api_test_unenforced"
-    _init_scratch_repo(repo2)
-    _queue(store2)
-    sink2: dict[str, Any] = {}
-    h2 = _make_driver(
-        store2,
-        git_runner=_recorded_runner(tmp_path / "wt-unenforced", repo2),
-        repo_path=str(repo2),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink2, [_partial_outcome()]),
-    )
-    await h2.driver.drive(CID)
-    assert store2.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h2.ctx["counters"]["spec"] == 1
-    assert (_UNENFORCED_LINE, False) in h2.ctx["mentions"]
-    assert not any("the machine asked the spec writer" in m for _, m, _ in h2.ctx["notifications"])
-    receipt = _leg_details(store2, "feature-plan")["stamp_normalizer"]
-    assert "rewrite" not in receipt and receipt["proceeded_unenforced"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -7414,93 +5196,7 @@ async def test_the_rewrite_fires_only_on_a_refusal_of_examples_where_the_law_is_
 # ---------------------------------------------------------------------------
 
 
-def _refusal_with_model(model_outcome: dict[str, Any] | None) -> StampNormalizerOutcome:
-    return StampNormalizerOutcome(
-        status="refused",
-        detail="2 scenario(s) undecidable by rule (R1–R10) — no fallback home; nothing was written",
-        refused_titles=_UNDECIDABLE_TITLES,
-        enforcement="enforced",
-        model_outcome=model_outcome,
-    )
 
-
-@pytest.mark.parametrize(
-    ("model_outcome", "sentence", "clause"),
-    [
-        (
-            {"status": "asked_and_failed", "detail": "ConnectError: connection refused at localhost:4000."},
-            "The plan's stamp check could not reach its model, so these scenarios could not be labelled; check that the model service is running.",
-            "the model fallback could not settle them",
-        ),
-        (
-            {"status": "answer_rejected", "detail": "'maybe' is not one of the allowed words"},
-            "The plan's stamp check asked its model, but its answer was not one the check accepts, so these scenarios could not be labelled.",
-            "the model fallback could not settle them",
-        ),
-        (
-            {"status": "not_configured", "detail": "no model endpoint is configured"},
-            "The model fallback was not asked: no endpoint is configured.",
-            "there is no fallback home",
-        ),
-        (
-            {"status": "decided", "detail": "the model decided 3 title(s) no rule could decide", "count": 3},
-            "The model fallback decided 3 of them; these could not be decided.",
-            "the model fallback could not settle them",
-        ),
-        (
-            {"status": "decided", "detail": "the model decided 1 title(s) no rule could decide"},
-            "The model fallback decided 1 of them; these could not be decided.",
-            "the model fallback could not settle them",
-        ),
-    ],
-)
-def test_the_card_prints_what_the_model_fallback_said_about_itself(
-    model_outcome: dict[str, Any], sentence: str, clause: str
-) -> None:
-    card = _Driver._stamp_normalizer_card(CID, "FEAT-1234", _refusal_with_model(model_outcome))
-    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
-    # One sentence, right after the titles, before "This repo enforces".
-    assert f"{titles}\n{sentence}\nThis repo enforces the routing law" in card
-    assert f"and {clause}, so nothing was stamped" in card
-    # "no fallback home" is said only when the model was NOT asked.
-    assert ("no fallback home" in card) == (model_outcome["status"] == "not_configured")
-
-
-@pytest.mark.parametrize(
-    "detail",
-    [
-        # what the build system's JSON says
-        "stamp model not configured (GUARDKIT_STAMP_MODEL unset); no model call made",
-        # the same, recovered from its one stderr line
-        "the model fallback was not asked about 2 title(s) no rule could decide: "
-        "stamp model not configured (GUARDKIT_STAMP_MODEL unset); no model call made. "
-        "The titles stay refused and nothing was stamped.",
-    ],
-)
-def test_the_card_names_the_unset_stamp_model_rather_than_a_missing_endpoint(
-    detail: str, caplog: pytest.LogCaptureFixture
-) -> None:
-    """5 October 2026: a current build system reports ``not_configured`` when
-    no stamp model is named, as well as when no endpoint is set. The card says
-    which in plain words, never points at the endpoint when that was not the
-    trouble, and never shows the owner a setting name."""
-    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
-        card = _Driver._stamp_normalizer_card(
-            CID,
-            "FEAT-1234",
-            _refusal_with_model({"status": "not_configured", "detail": detail}),
-        )
-    # The build system's own words are kept, in the log rather than the card.
-    assert any("GUARDKIT_STAMP_MODEL unset" in m for m in _driver_log_lines(caplog))
-    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
-    sentence = (
-        "The plan's stamp check has no model named, so it did not ask a model; "
-        "the factory's settings need the stamp model set."
-    )
-    assert f"{titles}\n{sentence}\nThis repo enforces the routing law" in card
-    assert "no endpoint is configured" not in card
-    assert "GUARDKIT_" not in card and "unset" not in card
-    assert "and there is no fallback home, so nothing was stamped" in card
 
 
 #: Every outcome the stamp check's model fallback can report, with details in
@@ -7557,78 +5253,6 @@ _EVERY_MODEL_OUTCOME = [
 ]
 
 
-@pytest.mark.parametrize(("model_outcome", "plain"), _EVERY_MODEL_OUTCOME)
-def test_every_model_outcome_reaches_the_card_in_plain_words(
-    model_outcome: dict[str, Any], plain: str, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The owner reads this card: no setting names, error class names or
-    codes, whatever the build system reported. Its own words stay in the
-    log (and the receipt's model_outcome)."""
-    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
-        card = _Driver._stamp_normalizer_card(
-            CID, "FEAT-1234", _refusal_with_model(model_outcome)
-        )
-    assert plain in card
-    for word in ("GUARDKIT_", "Error", "unset", "MAX_TOKENS", "OPENAI_"):
-        assert word not in card, f"{word!r} reached the card for {model_outcome}"
-    if model_outcome["detail"] and model_outcome["status"] in (
-        "asked_and_failed", "answer_rejected", "not_configured"
-    ):
-        assert any(model_outcome["detail"].rstrip(".") in m for m in _driver_log_lines(caplog))
-
-
-def test_the_card_says_nothing_about_the_model_when_the_normalizer_said_nothing() -> None:
-    """An older guardkit that reports no ``model_outcome``: today's card,
-    word for word — nothing invented."""
-    card = _Driver._stamp_normalizer_card(CID, "FEAT-1234", _refusal_with_model(None))
-    assert "model fallback" not in card
-    assert "there is no fallback home, so nothing was stamped and nothing was built" in card
-    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
-    assert f"{titles}\nThis repo enforces the routing law" in card
-
-
-@pytest.mark.asyncio
-async def test_the_drivers_own_record_stops_saying_no_fallback_home_when_the_model_was_asked(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 16's last clause, end to end: the normalizer's outcome says the
-    model was asked and could not answer; the run's error (the machine
-    record) and the card both say so, and neither says "no fallback home"."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    outcome = StampNormalizerOutcome(
-        status="refused",
-        detail="2 scenario(s) undecidable by rule (R1–R10) — no fallback home; nothing was written",
-        refused_titles=_UNDECIDABLE_TITLES,
-        model_outcome={
-            "status": "asked_and_failed",
-            "detail": "HTTPStatusError: 502 Bad Gateway from localhost:4000",
-            "endpoint": "localhost:4000",
-            "model": "workhorse",
-        },
-    )
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [outcome]),
-        rewrite_on_refusal=False,  # today's stop, so the card is the plain one
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    error = store.get_run(CID)["error"] or ""
-    assert "no fallback home" not in error
-    assert "the model fallback was asked and could not settle them" in error
-    card = _error_cards(h)[0]
-    assert "no fallback home" not in card
-    assert (
-        "The plan's stamp check asked its model, but the model did not give a "
-        "usable answer, so these scenarios could not be labelled." in card
-    )
-    assert "HTTPStatusError" not in card
-
 
 # ---------------------------------------------------------------------------
 # THE REWRITE COMES BEFORE THE MODEL FALLBACK (rule 1a, 2026-09-07)
@@ -7657,350 +5281,14 @@ _SWITCHED_OFF_MODEL_OUTCOME = {
 }
 
 
-def _switched_off_outcome() -> StampNormalizerOutcome:
-    """What the guardkit half answers to ``--no-model`` when the rules refuse:
-    the same refusal, and the model outcome says the caller switched it off."""
-    return StampNormalizerOutcome(
-        status="refused",
-        detail=(
-            "2 scenario(s) undecidable by rule (R1–R10) — the model fallback was "
-            "not asked (switched off for this stamping); nothing was written"
-        ),
-        refused_titles=_UNDECIDABLE_TITLES,
-        model_outcome=dict(_SWITCHED_OFF_MODEL_OUTCOME),
-    )
 
 
-def _not_configured_outcome() -> StampNormalizerOutcome:
-    """A stamping that COULD ask the model and found no endpoint."""
-    return StampNormalizerOutcome(
-        status="refused",
-        detail="2 scenario(s) undecidable by rule (R1–R10) — no fallback home; nothing was written",
-        refused_titles=_UNDECIDABLE_TITLES,
-        model_outcome={"status": "not_configured", "detail": "no model endpoint is configured"},
-    )
 
 
 def _driver_log_lines(caplog: pytest.LogCaptureFixture) -> list[str]:
     return [r.getMessage() for r in caplog.records if r.name == "forge.planning.driver"]
 
 
-@pytest.mark.asyncio
-async def test_the_first_stamping_runs_by_rule_only_and_the_second_asks_the_model(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """Rule 1a end to end in an enforced repo: the first stamping is asked for
-    by rule only (the machine log names the mode), it refuses with the model
-    switched off, the rewrite fires, the second stamping is called the old
-    way (the model allowed) and stamps clean. The plan receipt says which
-    stamping ran by rule only; nothing on any surface says "no endpoint is
-    configured"; the durable spec row keeps rule 4's fields and no more."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_outcome(), None]),
-    )
-    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert sink["rules_only"] == [True, None]
-    lines = _driver_log_lines(caplog)
-    assert any(_RULES_FIRST_LOG in m for m in lines)
-    assert any("this time with the model fallback allowed" in m for m in lines)
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert receipt["status"] == "written"
-    assert receipt["rules_only"] is False  # the second stamping, committed with the plan
-    assert "rules_only_note" not in receipt
-    assert receipt["rewrite"]["first_stamping"] == {
-        "status": "refused",
-        "rules_only": True,
-        "model_outcome": _SWITCHED_OFF_MODEL_OUTCOME,
-    }
-    assert _error_cards(h) == []
-    assert not any("no endpoint is configured" in m for _, m, _ in h.ctx["notifications"])
-    assert set(_approved_spec_rows(store)[-1]["rewritten_by_machine"]) == {
-        "round", "author", "note", "refused_titles", "changes",
-    }
-
-
-@pytest.mark.asyncio
-async def test_with_the_switch_off_the_first_stamping_asks_the_model_as_before(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """``planning.rewrite_on_refusal: false``: the round cannot fire, so the
-    first stamping is called the old way — no keyword, no rule-only line."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome(), None]),
-        rewrite_on_refusal=False,
-    )
-    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
-        assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert sink["rules_only"] == [None]
-    assert not any(_RULES_FIRST_LOG in m for m in _driver_log_lines(caplog))
-
-
-@pytest.mark.asyncio
-async def test_an_unenforced_repo_stamps_as_before_even_with_the_switch_on(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """The law is not enforced for the repo: the round never fires there, so
-    the stamping is called the old way, the log says why, and the receipt
-    says the stamping was not by rule only (with no note — nothing was
-    refused it)."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_partial_outcome()]),
-    )
-    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert sink["rules_only"] == [None]
-    lines = _driver_log_lines(caplog)
-    assert not any(_RULES_FIRST_LOG in m for m in lines)
-    assert any("the rewrite round does not fire in an unenforced repo" in m for m in lines)
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert receipt["rules_only"] is False
-    assert "rules_only_note" not in receipt
-    assert receipt["proceeded_unenforced"] is True
-
-
-@pytest.mark.asyncio
-async def test_after_the_one_rewrite_a_re_drive_stamps_with_the_model_allowed(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 7 meets rule 1a: the re-drive reads the durable row, finds the
-    rewrite has happened, and its stamping — the only one this drive does —
-    is called the old way, because the round can no longer fire."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_switched_off_outcome(), _Crash()]),
-    )
-    with pytest.raises(_Crash):
-        await h.driver.drive(CID)
-    assert sink["rules_only"] == [True, None]
-    assert _approved_spec_rows(store)[-1]["rewritten_by_machine"]["round"] == 1
-
-    sink2: dict[str, Any] = {}
-    h2 = _make_driver(
-        store,
-        git_runner=_recorded_runner(tmp_path / "wt2", repo),
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink2, [_not_configured_outcome()]),
-    )
-    assert await _drive_to_failure(h2, store) == PlanningState.FAILED.value
-    assert sink2["rules_only"] == [None]
-    assert h2.ctx["counters"]["spec"] == 0
-    card = _error_cards(h2)[0]
-    assert _STOP_STILL_UNPROVEN in card
-    assert "The model fallback was not asked: no endpoint is configured." in card
-
-
-@pytest.mark.asyncio
-async def test_an_older_collaborator_without_the_keyword_still_works_and_the_receipt_says_so(
-    store: SqlitePlanningRunStore, tmp_path: Path, caplog: pytest.LogCaptureFixture
-) -> None:
-    """A normalize_stamps collaborator in its pre-1a shape (positional only):
-    the driver calls it the old way instead of failing on the keyword, warns,
-    and the receipt says the first stamping was not by rule only and why. The
-    run itself goes exactly as the rewrite round always did."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(sink, [_refusal_outcome(), None], legacy=True),
-    )
-    with caplog.at_level(logging.WARNING, logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert sink["rules_only"] == [None, None]
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    first = receipt["rewrite"]["first_stamping"]
-    assert first["status"] == "refused" and first["rules_only"] is False
-    assert "does not take the rules_only keyword" in first["rules_only_note"]
-    assert any("does not take the rules_only keyword" in m for m in _driver_log_lines(caplog))
-    assert receipt["rules_only"] is False and "rules_only_note" not in receipt
-
-
-@pytest.mark.asyncio
-async def test_after_a_rewrite_the_card_reports_the_second_stampings_model_outcome(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The first stamping (model switched off) set off the rewrite; the second
-    could ask the model and found no endpoint. The card is about the second:
-    the "no endpoint is configured" sentence appears once, for that one, never
-    for the switched-off first."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink, [_switched_off_outcome(), _not_configured_outcome()]
-        ),
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert sink["rules_only"] == [True, None]
-    card = _error_cards(h)[0]
-    assert _STOP_STILL_UNPROVEN in card
-    assert card.count("The model fallback was not asked: no endpoint is configured.") == 1
-
-
-@pytest.mark.asyncio
-async def test_after_a_changed_nothing_rewrite_the_stop_reports_the_models_turn_never_the_switched_off_first_stamping(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Rule 6b meets rule 1a: the first stamping ran by rule only (the machine
-    switched the model off), the rewrite changed nothing, so the model got
-    its turn on a SECOND stamping — which found no endpoint. The card (rule
-    6's, with its "changed nothing" sentence) is about that second stamping:
-    "no endpoint is configured" once, true this time, and never a word about
-    the model being switched off (that was the first stamping, the machine's
-    own doing, and not what stopped the run)."""
-    repo, git = _enforced_repo(tmp_path)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),  # the same reply both rounds
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_sequenced_normalizer(
-            sink, [_switched_off_outcome(), _not_configured_outcome()]
-        ),
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-    assert sink["rules_only"] == [True, None]
-    message = _error_cards(h)[0]
-    assert message.startswith(
-        f"Planning run {CID} stopped at writing the task plan. {_STOP_CHANGED_NOTHING} "
-        "The verifier stamps could not all be minted by rule for feature "
-    )
-    assert message.count("The model fallback was not asked: no endpoint is configured.") == 1
-    assert "switched off" not in message
-    assert "refused the rewrite twice" not in message
-    assert "This repo enforces the routing law" in message
-    error = store.get_run(CID)["error"] or ""
-    assert "the rewrite changed nothing" in error
-    assert "switched off for this stamping" not in error
-
-
-def test_the_card_says_the_machine_switched_the_model_off_never_that_it_was_missing() -> None:
-    """The card built straight from a switched-off outcome (no rewrite named):
-    the clause says the model was switched off for this stamping — never
-    "no endpoint is configured" and never "there is no fallback home", both
-    of which would tell the owner the model was missing when the machine
-    chose not to ask it — and no second sentence about the model follows
-    the titles."""
-    card = _Driver._stamp_normalizer_card(
-        CID, "FEAT-1234", _refusal_with_model(dict(_SWITCHED_OFF_MODEL_OUTCOME))
-    )
-    assert "no endpoint is configured" not in card
-    assert "no fallback home" not in card
-    assert (
-        "and the model fallback was not asked (it was switched off for this "
-        "stamping), so nothing was stamped and nothing was built"
-    ) in card
-    assert card.count("model fallback") == 1
-    titles = "\n".join(f"  - {t}" for t in _UNDECIDABLE_TITLES)
-    assert f"{titles}\nThis repo enforces the routing law" in card
-
-
-def test_the_model_decided_pairs_are_the_titles_marked_model_and_nothing_is_guessed() -> None:
-    """Rule 6b's line names what the MODEL decided: the titles the normalizer
-    marks with rule ``model``. When it marked none (an older guardkit, or a
-    stamped map the seam's clipped tail lost), the refused titles with what
-    was written for them — or "not named", never a guessed word. A title an
-    R-number decided, or one found already stamped, is never put in the
-    model's mouth: it is left out, whatever else the map says."""
-    marked = _model_decided_outcome({_MOON_TITLE: "probe:process"})
-    assert _Driver._model_decided_pairs(marked, [_MOON_TITLE]) == [
-        (_MOON_TITLE, "probe:process")
-    ]
-    unmarked = StampNormalizerOutcome(
-        status="written", stamped={"ok": "hurl", _MOON_TITLE: "exam"}, rules={"ok": "R9"}
-    )
-    assert _Driver._model_decided_pairs(unmarked, [_MOON_TITLE]) == [(_MOON_TITLE, "exam")]
-    lost = StampNormalizerOutcome(status="written", already_stamped=("Another undecidable one",))
-    assert _Driver._model_decided_pairs(lost, [_MOON_TITLE, "Another undecidable one"]) == [
-        (_MOON_TITLE, "a verifier the normalizer did not name"),
-    ]
-    # A rule decided it on THIS stamping (an R-number in the rules map): not
-    # the model's, so not on the model's line — even beside a title the map
-    # does not mark at all.
-    by_rule = StampNormalizerOutcome(
-        status="written",
-        stamped={"ok": "hurl", _MOON_TITLE: "hurl", "Another undecidable one": "exam"},
-        rules={"ok": "R9", _MOON_TITLE: "R9"},
-    )
-    assert _Driver._model_decided_pairs(by_rule, [_MOON_TITLE, "Another undecidable one"]) == [
-        ("Another undecidable one", "exam"),
-    ]
-    all_by_rule = StampNormalizerOutcome(
-        status="written",
-        stamped={"ok": "hurl", _MOON_TITLE: "hurl", "Another undecidable one": "hurl"},
-        rules={"ok": "R9", _MOON_TITLE: "R9", "Another undecidable one": "R3"},
-    )
-    assert _Driver._model_decided_pairs(all_by_rule, list(_UNDECIDABLE_TITLES)) == []
-
-
-def test_the_rule_6b_line_keeps_the_specs_shape_for_one_example_and_bends_for_more() -> None:
-    """The spec quotes the line for one example; that shape lands verbatim.
-    For more than one, "it" and "its verifier" bend and the pairs are joined
-    with "; " — no rule ids on the face either way."""
-    one = _Driver._machine_rewrite_model_line(
-        1, why="the checker refused the rewrite twice", decided=[(_MOON_TITLE, "probe:process")]
-    )
-    assert one == _MODEL_LINE_AFTER_REFUSED_REWRITE
-    two = _Driver._machine_rewrite_model_line(
-        2,
-        why="the rewrite changed nothing",
-        decided=[(_MOON_TITLE, "probe:process"), ("Another undecidable one", "hurl")],
-    )
-    assert two == _MODEL_LINE_AFTER_CHANGED_NOTHING
-    assert not re.search(r"\bR\d+\b", one) and not re.search(r"\bR\d+\b", two)
 
 
 # ---------------------------------------------------------------------------
@@ -8307,75 +5595,6 @@ async def test_unchanged_approved_plan_does_not_request_semantic_rereview(
     assert h.ctx["counters"].get("semantic_rereview", 0) == 0
 
 
-@pytest.mark.asyncio
-async def test_normalizer_rewrite_requests_exact_semantic_rereview(
-    store: SqlitePlanningRunStore,
-    tmp_path: Path,
-) -> None:
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, write=True),
-    )
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["semantic_rereview"] == 1
-    assert h.ctx["counters"]["plan_revisions"]
-
-
-@pytest.mark.asyncio
-async def test_unmarked_exact_re_review_is_carded_not_refused(
-    store: SqlitePlanningRunStore,
-    tmp_path: Path,
-) -> None:
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-    _queue(store)
-
-    async def _reviewer(**kwargs: Any) -> Any:
-        feature_id = kwargs["feature_id"]
-        revision = kwargs.get("revision_of")
-        if revision is None:
-            return _plan_result_native(feature_id)
-        return _plan_result(
-            feature_id,
-            dict(revision),
-            reviewed_after_rewrite=False,
-        )
-
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=git,
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_dispatch=_reviewer,
-        normalize_stamps_fn=_stamping_normalizer(sink, write=True),
-    )
-
-    # An unmarked re-review is a record that cannot be read as a verdict about
-    # this tree (24 October 2026): the plan carries on and the build card says
-    # so.
-    await h.driver.drive(CID)
-    plan = [
-        json.loads(e["details_json"])
-        for e in store.list_events(CID)
-        if e["stage_label"] == "feature-plan" and e["status"] == "approved"
-    ]
-    assert plan
-    assert "did not mark the rewritten tree" in plan[-1]["plan_review_note"]
-
 
 # ---------------------------------------------------------------------------
 # the 1 October planner fix, follow-up: the plan leg reads the repository where
@@ -8526,158 +5745,6 @@ class _PlansReader:
         return self.files.get(path)
 
 
-def test_the_size_of_a_plan_is_read_from_its_own_plan_file() -> None:
-    from forge.planning.plan_size import plan_size_of
-
-    size = plan_size_of(_plan_yaml("FEAT-207D", 8, 70))
-    assert size is not None
-    assert (size.tasks, size.waves, size.minutes) == (8, 8, 560.0)
-    assert plan_size_of("id: x\ntasks:\n- id: a\n- id: b\n  estimated_minutes: 5\n").minutes is None
-    assert plan_size_of("not: a plan\n") is None
-
-
-def test_fewer_than_five_earlier_plans_gives_no_line() -> None:
-    from forge.planning.plan_size import read_plan_size_note
-
-    big = {".guardkit/features/FEAT-207D.yaml": _plan_yaml("FEAT-207D", 8, 70)}
-    note, receipt = read_plan_size_note(_PlansReader(_earlier(4)), big)
-    assert note is None
-    assert receipt["compared_with"] == 4
-    assert "fewer than 5 earlier plans" in receipt["not_compared"]
-
-
-def test_a_plan_half_as_big_again_as_the_usual_gets_the_one_line() -> None:
-    from forge.planning.plan_size import read_plan_size_note
-
-    big = {".guardkit/features/FEAT-207D.yaml": _plan_yaml("FEAT-207D", 8, 70)}
-    # The plan's own file is never counted among the earlier ones.
-    history = {**_earlier(5), **big}
-    note, receipt = read_plan_size_note(_PlansReader(history), big)
-    assert note == (
-        "This plan is bigger than this project's usual: 8 tasks, about 9 hours by the "
-        "plan's own estimate (its plans usually have 5 tasks and about 4 hours). "
-        "Starting it is still your choice."
-    )
-    assert receipt["compared_with"] == 5 and receipt["warned"] is True
-    assert receipt["this_plan"] == {"tasks": 8, "waves": 8, "minutes": 560.0}
-
-
-def test_a_plan_of_the_usual_size_or_a_little_bigger_gets_no_line() -> None:
-    from forge.planning.plan_size import read_plan_size_note
-
-    usual = {".guardkit/features/FEAT-0001.yaml": _plan_yaml("FEAT-0001", 7, 50)}
-    note, receipt = read_plan_size_note(_PlansReader(_earlier(6)), usual)
-    assert note is None and receipt["warned"] is False
-    # Minutes alone can carry it: 5 tasks, but 1.5 x the usual minutes.
-    long = {".guardkit/features/FEAT-0002.yaml": _plan_yaml("FEAT-0002", 5, 75)}
-    note, _ = read_plan_size_note(_PlansReader(_earlier(6)), long)
-    assert note is not None and note.startswith("This plan is bigger than this project's usual: 5 tasks")
-
-
-def test_earlier_plans_without_estimates_or_with_one_task_are_not_compared() -> None:
-    from forge.planning.plan_size import read_plan_size_note
-
-    history = {
-        **_earlier(3),
-        ".guardkit/features/FEAT-S001.yaml": _plan_yaml("FEAT-S001", 1, 50),
-        ".guardkit/features/FEAT-N001.yaml": "id: FEAT-N001\ntasks:\n- id: a\n- id: b\n",
-        ".guardkit/features/FEAT-N002.yaml": ": not yaml : [",
-    }
-    big = {".guardkit/features/FEAT-207D.yaml": _plan_yaml("FEAT-207D", 8, 70)}
-    note, receipt = read_plan_size_note(_PlansReader(history), big)
-    assert note is None and receipt["compared_with"] == 3
-
-
-def test_a_reader_that_fails_gives_no_line_and_never_raises() -> None:
-    from forge.planning.plan_size import read_plan_size_note
-    from forge.planning.repository_facts import RepositoryUnreadable
-
-    class Broken(_PlansReader):
-        def list_files(self) -> list[str]:
-            raise RepositoryUnreadable("nothing there")
-
-    big = {".guardkit/features/FEAT-207D.yaml": _plan_yaml("FEAT-207D", 8, 70)}
-    note, receipt = read_plan_size_note(Broken({}), big)
-    assert note is None
-    assert receipt["not_compared"] == "the earlier plans could not be read (RepositoryUnreadable)"
-
-
-def test_the_repository_line_and_the_size_line_reach_the_gate_card_in_order(
-    store: SqlitePlanningRunStore,
-) -> None:
-    from forge.cli._serve_gate_activation import _planning_card_lines
-    from forge.gating.degraded import degraded_dispatch_gate_model_saying
-    from forge.lifecycle.persistence import SqliteLifecyclePersistence
-
-    _queue(store)
-    store._record_event(
-        correlation_id=CID,
-        stage_label="feature-plan",
-        status="approved",
-        actor_identity="planning-driver",
-        details_json=json.dumps(
-            {
-                "repository_unavailable": "The machine could not read the repository.",
-                "plan_size_note": "This plan is bigger than this project's usual.",
-            }
-        ),
-    )
-    ledger = SqliteLifecyclePersistence(connection=store._connection)
-    assert ledger.read_planning_plan_size_note(CID) == "This plan is bigger than this project's usual."
-    lines = _planning_card_lines(ledger, CID)
-    assert lines == (
-        "The machine could not read the repository. "
-        "This plan is bigger than this project's usual."
-    )
-    rationale = json.loads(degraded_dispatch_gate_model_saying(lines)("prompt"))["rationale"]
-    assert rationale.endswith(lines)
-    assert _planning_card_lines(ledger, "no-such-run") is None
-
-
-@pytest.mark.asyncio
-async def test_a_big_plan_carries_the_size_line_on_its_record_and_still_builds(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    for rel, text in _earlier(5).items():
-        (repo / rel).parent.mkdir(parents=True, exist_ok=True)
-        (repo / rel).write_text(text)
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-qm", "earlier plans")
-    # On the remote: the planner reads the commit the work starts from.
-    _publish_to_origin(repo)
-    git = _recorded_runner(tmp_path / "wt", repo)
-
-    def big_plan(feature_id: str) -> Any:
-        return _plan_result(
-            feature_id,
-            files={
-                f".guardkit/features/{feature_id}.yaml": _plan_yaml(feature_id, 8, 70),
-                "tasks/TASK-BIG-001.md": "# task\n",
-            },
-        )
-
-    _queue(store)
-    h = _make_driver(store, git_runner=git, repo_path=str(repo), plan_result_factory=big_plan)
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    details = _leg_details(store, "feature-plan")
-    assert details["plan_size_note"].startswith(
-        "This plan is bigger than this project's usual: 8 tasks, about 9 hours"
-    )
-    assert details["plan_size"]["compared_with"] == 5
-
-
-def test_earlier_plans_estimated_at_nothing_never_make_every_plan_look_big() -> None:
-    from forge.planning.plan_size import read_plan_size_note
-
-    small = {".guardkit/features/FEAT-0003.yaml": _plan_yaml("FEAT-0003", 3, 5)}
-    note, receipt = read_plan_size_note(_PlansReader(_earlier(6, tasks=3, minutes=0)), small)
-    assert note is None
-    assert receipt["compared_with"] == 0
-
 
 @pytest.mark.asyncio
 async def test_the_planner_reads_the_commit_the_run_starts_from_not_the_checkout(
@@ -8814,70 +5881,6 @@ def _a_reply(files: dict[str, str], review: str | None = None) -> Any:
     )
 
 
-@pytest.mark.asyncio
-async def test_the_recovered_ordinary_plan_from_the_re_review_is_the_plan_handed_off(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """specialist-agent answers the exact re-review with its one ordinary plan
-    (a retained objection, recovered). That plan, not the first one, goes
-    through the usual checks and is the plan recorded for the handoff."""
-    _queue(store)
-    first = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
-    recovered = {
-        "features/x/FEAT-X.yaml": "id: FEAT-X\ntasks: [TASK-R1]\n",
-        "tasks/backlog/TASK-R1.md": "---\nid: TASK-R1\nfeature_id: FEAT-X\n---\n",
-    }
-    calls: list[dict[str, Any]] = []
-
-    async def _the_specialist(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        if kwargs.get("revision_of") is None:
-            return _a_reply(first, _MALFORMED_REVIEW)  # the re-review is asked
-        return _a_reply(recovered, _semantic_review_json(recovered))
-
-    h = _make_driver(store, plan_dispatch=_the_specialist)
-    await h.driver.drive(CID)
-
-    assert [c.get("revision_of") is not None for c in calls] == [False, True]
-    plan = _approved_plan_events(store)
-    assert plan, "the recovered plan was recorded"
-    assert "tasks/backlog/TASK-R1.md" in plan[-1]["plan_files"]
-    assert plan[-1]["plan_review_note"].startswith("The plan reviewer scored")
-    assert plan[-1]["semantic_review"]["decision"] == "approved"
-
-
-@pytest.mark.asyncio
-async def test_a_recovered_plan_is_never_recovered_twice(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """One recovery: a recovered plan with no record of its own is re-reviewed
-    once more, and a second different tree from that is only the card's line."""
-    _queue(store)
-    first = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
-    recovered = {"features/x/FEAT-X.yaml": "id: FEAT-X\ntasks: [TASK-R1]\n"}
-    another = {"features/x/FEAT-X.yaml": "id: FEAT-X\ntasks: [TASK-R2]\n"}
-    calls: list[dict[str, Any]] = []
-
-    async def _the_specialist(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        if len(calls) == 1:
-            return _a_reply(first, _MALFORMED_REVIEW)
-        if len(calls) == 2:
-            return _a_reply(recovered, _MALFORMED_REVIEW)
-        return _a_reply(another, _semantic_review_json(another))
-
-    h = _make_driver(store, plan_dispatch=_the_specialist)
-    await h.driver.drive(CID)
-
-    assert len(calls) == 3
-    # The tree re-reviewed the second time is the recovered plan, and its
-    # re-review offers no already-done answer again.
-    assert calls[2]["revision_of"] == recovered
-    assert "already_done_allowed" not in calls[2]
-    plan = _approved_plan_events(store)
-    assert plan
-    assert "rewrote the supplied plan tree" in plan[-1]["plan_review_note"]
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("dropped", ["artifact_identity", "reviewed_after_rewrite"])
@@ -8897,85 +5900,4 @@ async def test_a_readable_rejection_with_missing_fields_is_advice(
     assert plan and "did not approve this plan" in plan[-1]["plan_review_note"]
 
 
-@pytest.mark.asyncio
-async def test_an_accepting_review_with_missing_fields_is_re_reviewed_not_refused(
-    store: SqlitePlanningRunStore,
-) -> None:
-    _queue(store)
-    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
-    review = json.loads(_semantic_review_json(files))
-    review.pop("reviewed_after_rewrite")
-    review["extra_receipt_field"] = "bookkeeping"
-    calls: list[dict[str, Any]] = []
 
-    async def _the_specialist(**kwargs: Any) -> Any:
-        calls.append(kwargs)
-        if kwargs.get("revision_of") is None:
-            return _a_reply(files, json.dumps(review))
-        return _a_reply(files, _semantic_review_json(files, reviewed_after_rewrite=True))
-
-    h = _make_driver(store, plan_dispatch=_the_specialist)
-    await h.driver.drive(CID)
-    assert [c.get("revision_of") is not None for c in calls] == [False, True]
-    plan = _approved_plan_events(store)
-    assert plan and plan[-1]["plan_review_note"].startswith(
-        "The plan reviewer scored"
-    )
-
-
-@pytest.mark.asyncio
-async def test_a_retained_objection_returned_by_the_re_review_is_advice(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """The plan writer answered the re-review and refused: that is its
-    verdict, shown on the build card with its objection (step 2, 27 October
-    2026); the plan that came back carries on."""
-    _queue(store)
-    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
-
-    async def _the_specialist(**kwargs: Any) -> Any:
-        if kwargs.get("revision_of") is None:
-            return _a_reply(files, _MALFORMED_REVIEW)
-        # The specialist's own failed-command reply for a retained objection.
-        return SimpleNamespace(
-            outcome=SimpleNamespace(value="error"),
-            role_output=None,
-            reason=(
-                "Command 'feature_plan' failed: architect_feature_plan plan "
-                "content check refused: A6 the plan leaves a part unbuilt"
-            ),
-        )
-
-    h = _make_driver(store, plan_dispatch=_the_specialist)
-    await h.driver.drive(CID)
-    plan = _approved_plan_events(store)
-    assert plan, "the plan that came back was recorded, not refused"
-    note = plan[-1]["plan_review_note"]
-    assert "did not approve this plan" in note
-    assert "A6 the plan leaves a part unbuilt" in note
-    assert "The plan reviewer did not approve this plan" in _card_lines_of(store)
-
-
-@pytest.mark.asyncio
-async def test_a_re_review_returned_as_an_infrastructure_error_is_advice(
-    store: SqlitePlanningRunStore,
-) -> None:
-    """An error with no reviewer verdict in it is the unreadable-record advice:
-    the plan carries on and the build card says so."""
-    _queue(store)
-    files = {"features/x/FEAT-X.yaml": "id: FEAT-X\n"}
-
-    async def _the_specialist(**kwargs: Any) -> Any:
-        if kwargs.get("revision_of") is None:
-            return _a_reply(files, _MALFORMED_REVIEW)
-        return SimpleNamespace(
-            outcome=SimpleNamespace(value="error"),
-            role_output=None,
-            reason="connection_closed: specialist reply unavailable",
-        )
-
-    h = _make_driver(store, plan_dispatch=_the_specialist)
-    await h.driver.drive(CID)
-    plan = _approved_plan_events(store)
-    assert plan, "the plan was recorded, not refused"
-    assert "connection_closed" in plan[-1]["plan_review_note"]

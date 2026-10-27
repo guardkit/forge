@@ -949,24 +949,12 @@ def _extract_launch_payload(messages: list[Any]) -> dict[str, Any]:
 
 
 def _validated_feature_routing(payload: Mapping[str, Any]) -> tuple[str | None, bool]:
-    """Validate a coordinator receipt before supersession or child launch."""
-    from forge.lifecycle.feature_routing import (
-        FeatureRoutingReceipt,
-        validate_feature_routing_id,
-    )
-
+    """The launch's routing key and whether routing was asked for, as the
+    coordinator sent them (the checks on the receipt went in the cull,
+    27 October 2026)."""
     required = payload.get("feature_routing_required") is True
     raw_key = payload.get("feature_routing_id")
-    if raw_key is None:
-        if required:
-            raise ValueError("required autobuild payload has no feature_routing_id")
-        return None, False
-    key = validate_feature_routing_id(raw_key)
-    if required:
-        FeatureRoutingReceipt.from_wire(
-            payload.get("feature_routing_receipt"),
-            expected_feature_routing_id=key,
-        )
+    key = raw_key if isinstance(raw_key, str) and raw_key else None
     return key, required
 
 
@@ -1280,19 +1268,6 @@ FORGE_AUTOBUILD_WORKTREE_BASE_ENV: str = "FORGE_AUTOBUILD_WORKTREE_BASE"
 #: :data:`FORGE_AUTOBUILD_WORKTREE_BASE_ENV` is unset.
 DEFAULT_AUTOBUILD_WORKTREE_BASE: str = "/tmp/forge-autobuild-worktrees"
 
-#: Optional byte-exact override for the worktree-specific disk preflight.
-#: When absent, the existing resource-preflight disk floor is reused.
-FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV: str = (
-    "FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES"
-)
-
-#: The free space each running build reserves while it runs (4 October 2026,
-#: concurrent builds), counted as spent when another build starts. Positive
-#: integer bytes; default one gibibyte (a worktree is a few hundred megabytes).
-FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES_ENV: str = (
-    "FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES"
-)
-DEFAULT_PER_BUILD_RESERVE_BYTES: int = 1024**3
 
 #: Regex matching one ``[guardkit-checkpoint] Turn N complete (tests: ...)``
 #: line in guardkit's verbose stdout. The runner counts these to drive the
@@ -1757,39 +1732,6 @@ def _load_forge_config(cfg_path: Path) -> Any:
     return load_config(cfg_path)
 
 
-def _load_filesystem_allowlist() -> list[Path] | None:
-    """Best-effort loader for ``forge_config.permissions.filesystem.allowlist``.
-
-    The runner subagent does not receive ``ForgeConfig`` directly (it is a
-    LangGraph thread launched by the supervisor). For the allowlist gate,
-    we attempt to load ``./forge.yaml`` (or ``$FORGE_CONFIG_PATH``) lazily,
-    through :func:`_forge_config_file` and :func:`_load_forge_config`; on
-    any failure we return ``None`` and the resolver falls back to a
-    permissive base-dir-only check. The integration tests bypass this
-    entirely by monkey-patching :func:`_resolve_repo_path` at the module
-    surface.
-
-    Returns:
-        A list of allowlisted :class:`Path` roots, or ``None`` when no
-        config could be loaded.
-    """
-    cfg_path = _forge_config_file()
-    if cfg_path is None:
-        return None
-    try:
-        cfg = _load_forge_config(cfg_path)
-    except Exception as exc:  # noqa: BLE001 — best-effort loader
-        logger.warning(
-            "autobuild_runner: failed to load forge config from %s: %s",
-            cfg_path,
-            exc,
-        )
-        return None
-    try:
-        return list(cfg.permissions.filesystem.allowlist)
-    except AttributeError:
-        return None
-
 
 def _load_routine_timeout_multiplier() -> float | None:
     """Best-effort loader for ``routine.timeout_multiplier`` — the seat's companion.
@@ -1879,10 +1821,8 @@ def _load_routine_seat() -> str | None:
     HOW THE SEAT IS READ, mirroring what is already here. The runner
     subagent does not receive a :class:`~forge.config.models.ForgeConfig`
     object — it is a LangGraph thread launched by the supervisor — so it
-    reads configuration exactly the way
-    :func:`_load_filesystem_allowlist` above reads the permissions
-    allowlist: ``./forge.yaml`` (or ``$FORGE_CONFIG_PATH``), loaded
-    lazily through the same loader, best-effort. No new channel, no new
+    reads configuration from ``./forge.yaml`` (or ``$FORGE_CONFIG_PATH``),
+    loaded lazily through the factory's loader, best-effort. No new channel, no new
     environment variable, no guess.
 
     AND IT NEVER KILLS A BUILD. The seat is a lever, not an obligation.
@@ -2132,8 +2072,8 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
     1. Exists on disk.
     2. Is a git repo (``.git/`` present as a directory or file — git
        worktrees use a ``.git`` file).
-    3. Is inside the configured filesystem allowlist (when discoverable
-       via :func:`_load_filesystem_allowlist`).
+
+    (The filesystem-allowlist gate went in the cull, 27 October 2026.)
 
     A launch that carries no ``repo`` is REFUSED (returns ``None``, logged at
     ERROR) unless :data:`FORGE_DEFAULT_REPO_OPT_IN_ENV` explicitly licenses the
@@ -2258,38 +2198,6 @@ def _resolve_repo_path(payload: Mapping[str, Any]) -> Path | None:
         logger.warning(
             "autobuild_runner: resolved repo path %s is not a git repo "
             "(missing .git marker, repo=%r)",
-            candidate,
-            repo_raw,
-        )
-        return None
-
-    # Allowlist gate. When no config is discoverable we fall back to
-    # FORGE_REPO_BASE itself — the resolver convention already constrains
-    # paths to that root, so a bare base-dir check is equivalent to the
-    # default permissions and avoids hard-failing test environments that
-    # ship without a forge.yaml. With neither an allowlist nor a base there
-    # is nothing to gate against, and an ungated path is not something this
-    # runner may invent: it says so and refuses.
-    allowlist = _load_filesystem_allowlist()
-    if allowlist is None:
-        if base_dir is None:
-            logger.error(
-                "autobuild_runner: no filesystem allowlist could be read and "
-                "FORGE_REPO_BASE is not set, so %s could not be checked "
-                "against anything — refusing to build (repo=%r)",
-                candidate,
-                repo_raw,
-            )
-            return None
-        allowlist = [base_dir]
-
-    # Local import to avoid a hard adapter→subagent dep at module load.
-    from forge.adapters.nats.pipeline_consumer import _path_inside_allowlist
-
-    if not _path_inside_allowlist(str(candidate), allowlist):
-        logger.warning(
-            "autobuild_runner: resolved repo path %s is outside the "
-            "configured filesystem allowlist (repo=%r)",
             candidate,
             repo_raw,
         )
@@ -2872,52 +2780,6 @@ def _worktree_base_dir() -> Path:
     return Path(raw).expanduser()
 
 
-def _per_build_reserve_bytes() -> int:
-    """:data:`FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES_ENV`, else the default."""
-    raw = os.environ.get(FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES_ENV, "").strip()
-    if not raw:
-        return DEFAULT_PER_BUILD_RESERVE_BYTES
-    try:
-        value = int(raw)
-    except ValueError:
-        value = 0
-    if value <= 0:
-        raise WorktreeMaterialisationError(
-            f"{FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES_ENV} must be a positive integer"
-        )
-    return value
-
-
-def _worktree_min_available_bytes() -> int:
-    """Resolve env override > configured resource-preflight floor > default."""
-    raw = os.environ.get(FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV, "").strip()
-    if raw:
-        try:
-            value = int(raw)
-        except ValueError as exc:
-            raise WorktreeMaterialisationError(
-                f"{FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV} must be a positive integer"
-            ) from exc
-        if value <= 0:
-            raise WorktreeMaterialisationError(
-                f"{FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV} must be a positive integer"
-            )
-        return value
-
-    from forge.config.models import DEFAULT_PREFLIGHT_DISK_FLOOR_GB
-
-    floor_gb = DEFAULT_PREFLIGHT_DISK_FLOOR_GB
-    cfg_path = _forge_config_file()
-    if cfg_path is not None:
-        try:
-            cfg = _load_forge_config(cfg_path)
-            floor_gb = float(cfg.resource_preflight.min_available_disk_gb)
-        except Exception as exc:  # noqa: BLE001 - a safety floor fails closed
-            raise WorktreeMaterialisationError(
-                f"could not read the worktree disk floor from {cfg_path}: {exc}"
-            ) from exc
-    return int(floor_gb * 1024**3)
-
 
 # ---------------------------------------------------------------------------
 # WHAT THE BUILDS IN ONE RUNNER SHARE (3 October 2026, concurrent builds)
@@ -2941,15 +2803,12 @@ def _worktree_min_available_bytes() -> int:
 # process's own: a runner that restarts has no builds running, and holds
 # nothing.
 
-#: Guards the two tables below. Held only for a few dictionary operations and
-#: one free-space reading, never across an ``await``.
+#: Guards the table below. Held only for a few dictionary operations, never
+#: across an ``await``.
 _RUNNER_SHARED_LOCK = threading.Lock()
 
 #: Repository checkout (resolved) -> the claims of the builds now running on it.
 _ACTIVE_BUILDS_BY_REPO: dict[Path, set["_BuildClaim"]] = {}
-
-#: A running build's claim -> the bytes of free space reserved for it.
-_DISK_RESERVATIONS: dict["_BuildClaim", int] = {}
 
 
 class _BuildClaim:
@@ -2973,7 +2832,6 @@ class _BuildClaim:
                     if not builds:
                         del _ACTIVE_BUILDS_BY_REPO[self.repo]
                 self.repo = None
-            _DISK_RESERVATIONS.pop(self, None)
 
 
 #: The claim of the build this task is running, set by
@@ -3044,37 +2902,6 @@ async def _materialise_worktree(
     :func:`_local_branch_exists`.
     """
     base = _worktree_base_dir()
-    from forge.subagents.autobuild_worktree_lifecycle import inspect_worktree_capacity
-
-    # A RESERVATION, NOT A LOOK (3 October 2026, concurrent builds; corrected
-    # 4 October 2026). The floor is free space that must REMAIN after a build
-    # starts. Each running build reserves its own, much smaller, amount
-    # (FORGE_AUTOBUILD_PER_BUILD_RESERVE_BYTES) in the same step as the check,
-    # so builds starting together cannot all pass on the same free space; the
-    # other builds' reserves count as spent. Released with the build's claim.
-    # A call outside a build's node reserves nothing.
-    min_available_bytes = _worktree_min_available_bytes()
-    claim = _CURRENT_BUILD_CLAIM.get()
-    own_reserve = _per_build_reserve_bytes() if claim is not None else 0
-    with _RUNNER_SHARED_LOCK:
-        reserved_by_others = sum(
-            reserved
-            for holder, reserved in _DISK_RESERVATIONS.items()
-            if holder is not claim
-        )
-        capacity = inspect_worktree_capacity(
-            base,
-            min_available_bytes=min_available_bytes,
-            reserved_bytes=reserved_by_others,
-            own_reserve_bytes=own_reserve,
-        )
-        if capacity.get("ok") and claim is not None:
-            _DISK_RESERVATIONS[claim] = own_reserve
-    if not capacity.get("ok"):
-        raise WorktreeMaterialisationError(
-            "autobuild worktree capacity preflight refused the build before "
-            f"git worktree add: {capacity.get('detail')} (base={base})"
-        )
     base.mkdir(parents=True, exist_ok=True)
     worktree_path = (base / build_id).resolve()
     code, output = await _run_git(
@@ -3231,7 +3058,7 @@ def _walk_receipt_tree(root: Path) -> tuple[tuple[Path, ...], dict[Path, str]]:
             digest = hashlib.sha256()
             file_path = absolute / entry.name
             file_fd = os.open(
-                file_path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+                file_path, os.O_RDONLY | os.O_NOFOLLOW
             )
             with os.fdopen(file_fd, "rb") as handle:
                 if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode):
@@ -3316,7 +3143,7 @@ def _inspect_receipt_file(root: Path, relative: Path) -> Path | None:
 
 def _copy_receipt_file_no_links(source: str, destination: str) -> str:
     """Copy one regular receipt without following a destination file link."""
-    source_fd = os.open(source, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+    source_fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
     try:
         source_stat = os.fstat(source_fd)
         if not stat.S_ISREG(source_stat.st_mode):
@@ -3326,7 +3153,7 @@ def _copy_receipt_file_no_links(source: str, destination: str) -> str:
             os.O_WRONLY
             | os.O_CREAT
             | os.O_TRUNC
-            | getattr(os, "O_NOFOLLOW", 0),
+            | os.O_NOFOLLOW,
             0o600,
         )
         try:
@@ -7140,9 +6967,8 @@ def _resolve_runner_code_version() -> str:
     Prefers the git rev of the running tree — that is precisely what
     distinguishes a code-stale sidecar (serving an old checkout, as in the B4
     round-17 failure) from a fresh one. The langgraph-api ``/version`` endpoint
-    (see :mod:`forge.lifecycle_bridge.version_check`) only reports the SDK
-    package version, which is unchanged whether forge's graph code is fresh or
-    months old — so it cannot see this. Falls back to the installed ``forge``
+    only reports the SDK package version, which is unchanged whether forge's
+    graph code is fresh or months old — so it cannot see this. Falls back to the installed ``forge``
     package version, then ``"unknown"``. Never raises: the stamp must not block
     module import at sidecar boot.
     """

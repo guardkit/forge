@@ -276,41 +276,6 @@ class TestMalformedPayloadHandling:
 class TestCorrelationIdValidation:
     """AC-3: Trust boundary validation on correlation_id."""
 
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize(
-        "invalid_id,reason",
-        [
-            ("", "blank"),
-            ("a" * 129, "exceeds 128 chars"),
-            ("has/slash", "contains /"),
-            ("has..dots", "contains .."),
-            ("has space", "contains whitespace"),
-            ("has~tilde", "contains ~"),
-            ("has:colon", "contains :"),
-            ("has?question", "contains ?"),
-            ("has*star", "contains *"),
-            ("has[bracket", "contains ["),
-        ],
-    )
-    async def test_invalid_correlation_id_rejected(
-        self, store: SqlitePlanningRunStore, invalid_id: str, reason: str
-    ) -> None:
-        """Invalid correlation_id patterns must be rejected with ack + log."""
-        payload = _valid_planning_payload()
-        payload["correlation_id"] = invalid_id
-        msg = _make_msg(_envelope_bytes(payload, correlation_id=invalid_id))
-        deps = _make_deps(store)
-
-        await handle_planning_message(msg, deps)
-
-        # Assert: ack was called
-        msg.ack.assert_awaited_once()
-
-        # Assert: no row created
-        conn = store._connection
-        cursor = conn.execute("SELECT COUNT(*) FROM planning_runs")
-        count = cursor.fetchone()[0]
-        assert count == 0, f"No row should be created for {reason}"
 
     @pytest.mark.asyncio
     async def test_valid_correlation_id_accepted(
@@ -551,45 +516,6 @@ class TestErrorHandling:
 # Test CORRELATION_ID_PATTERN regex
 # ---------------------------------------------------------------------------
 
-
-def test_correlation_id_pattern_regex() -> None:
-    """Verify CORRELATION_ID_PATTERN validation via _is_valid_correlation_id.
-
-    TASK-MP-012: dots are rejected outright — a dotted correlation_id
-    fragments the approval subject past jarvis's 4-token gate (silent
-    drop), so the pattern excludes '.' entirely.
-    """
-    from forge.adapters.nats.planning_consumer import _is_valid_correlation_id
-
-    # Valid cases
-    valid = [
-        "simple",
-        "with-dashes",
-        "with_underscores",
-        "MixedCase123",
-        "a" * 128,
-    ]
-    for test_id in valid:
-        assert _is_valid_correlation_id(test_id), f"Should accept valid: {test_id}"
-
-    # Invalid cases
-    invalid = [
-        "",
-        "with.dots",  # dots fragment the approval subject (TASK-MP-012)
-        "has/slash",
-        "has space",
-        "has~tilde",
-        "has:colon",
-        "has?question",
-        "has*star",
-        "has[bracket",
-        "has..consecutive",  # Rejected by additional .. check
-        "a" * 129,  # Too long
-    ]
-    for test_id in invalid:
-        assert not _is_valid_correlation_id(test_id), (
-            f"Should reject invalid: {test_id}"
-        )
 
 
 # ---------------------------------------------------------------------------

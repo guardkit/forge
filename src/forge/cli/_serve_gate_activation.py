@@ -302,7 +302,7 @@ def _bind_amendment_transport(publisher: Any, subscriber: Any, pool: Any) -> Non
 
 def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | None:
     """The plain lines the planning run left for the build gate's card, in
-    order: the repository line, the size line, the plan review line, then the
+    order: the repository line, the plan review line, then the
     planner's own notes for the approver (step 2, 26 October 2026: display
     only).
     ``None`` when there are
@@ -311,7 +311,6 @@ def _planning_card_lines(sqlite_pool: Any, correlation_id: str | None) -> str | 
     lines: list[str] = []
     for name in (
         "read_planning_repository_unavailable",
-        "read_planning_plan_size_note",
         "read_planning_plan_review_note",
         "read_planning_plan_advice_note",
     ):

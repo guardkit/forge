@@ -9,18 +9,16 @@ mission to READY once nothing more can run; everything after READY is here:
    must be the last confirmed landing ``J`` (from the feature builds'
    publication records). Anything else changed the branch, so it is
    NOT_MERGED.
-3. **The routing receipt** of the mission's own correlation id must exist when
-   the routing gate is configured. Missing is NOT_MERGED and never retried.
-4. ``T`` is stored as ``final_commit``, and the mission gets one new
+3. ``T`` is stored as ``final_commit``, and the mission gets one new
    ``builds`` row of its own (``mission_role = 'mission-merge'``), written in
    one transaction by ``record_mission_merge_build``.
-5. **The frozen source:** ``forge/source/<build_id>`` is made at ``T`` in the
+4. **The frozen source:** ``forge/source/<build_id>`` is made at ``T`` in the
    clone the press works in, by the rule of the prepared route's
    ``_make_source_branch`` (local commits only, ``branch --force``), and read
    back before anything is offered. A restart puts it back at ``final_commit``.
-6. **The card** is the ordinary merge offer for that build, with the mission's
+5. **The card** is the ordinary merge offer for that build, with the mission's
    own words and its list of files to look at first.
-7. **The answer:** approve is the ordinary press (deploy on, preview pin on,
+6. **The answer:** approve is the ordinary press (deploy on, preview pin on,
    integration names ``mission-<id>``): READY → MERGING → MERGED. Reject, or a
    press that did not reach main, is NOT_MERGED, and the branch is kept.
 
@@ -161,12 +159,8 @@ def mission_card_words(
     risky: Sequence[str] | None,
     risky_unread: str | None = None,
     left_standing: Sequence[str] = (),
-    advice: Sequence[str] = (),
 ) -> str:
     """The mission merge card's own sentences (design section 7).
-
-    ``advice`` (step 1, 24 October 2026) is bookkeeping that no longer ends
-    a mission, said on the card instead: one line each.
 
     The offer adds the preview line and the merge-check line under these,
     as it does for every card.
@@ -212,8 +206,6 @@ def mission_card_words(
     # the same sentence the mission's thread was given.
     for sentence in left_standing:
         lines.append(f"Left standing: {sentence}")
-    for sentence in advice:
-        lines.append(sentence)
     lines.append(
         "Approve = merge the mission into main and deploy. Reject = nothing "
         "reaches main; the branch is kept."
@@ -1042,32 +1034,6 @@ async def _the_risky_files(
     return risky_files(changed), None
 
 
-def _routing_advice(deps: MissionFinishDeps, mission: Mission) -> tuple[str, ...]:
-    """FRG-161 as a card line (step 1, 24 October 2026).
-
-    A fully built mission whose routing receipt is missing used to end
-    NOT_MERGED, never retried. The receipt is bookkeeping about the work, not
-    the work, so its absence is now one plain line on the card."""
-    if not deps.feature_routing_required:
-        return ()
-    try:
-        if deps.feature_routing_gate is None:
-            raise RuntimeError("no routing gate is composed")
-        deps.feature_routing_gate.require_committed_success(mission.correlation_id)
-    except Exception as exc:  # noqa: BLE001 — bookkeeping, said on the card
-        logger.warning(
-            "missions: %s has no committed routing receipt (%s: %s) — said on "
-            "the card",
-            mission.id,
-            type(exc).__name__,
-            exc,
-        )
-        return (
-            "Note: the factory's model routing record for this mission is "
-            "missing; the work itself is unaffected.",
-        )
-    return ()
-
 
 async def _freeze_and_offer(
     deps: MissionFinishDeps,
@@ -1116,7 +1082,6 @@ async def _freeze_and_offer(
         risky=risky,
         risky_unread=unread,
         left_standing=_left_standing_sentences(deps.pool, mission_id=mission.id),
-        advice=_routing_advice(deps, mission),
     )
     row = deps.pool.get_build_row(build_id)
     landed = [f.key for f in features if _status(latest, f.key) == "LANDED"]

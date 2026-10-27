@@ -51,9 +51,7 @@ from forge.pipeline.stage_taxonomy import StageClass
 
 __all__ = [
     "PLANNING_CHAIN",
-    "PLANNING_FORBIDDEN_STAGES",
     "PRODUCT_DOCS_STAGE_LABEL",
-    "BoundaryViolation",
     "DispatchProductOwner",
     "ExecuteHandoff",
     "Fail",
@@ -86,25 +84,6 @@ PLANNING_CHAIN: tuple[StageClass, ...] = (
 #: Used to identify the checkpoint pause in the planning run events.
 PRODUCT_DOCS_STAGE_LABEL = "product_docs"
 
-
-#: Forbidden stages in planning runs — all build stages
-#:
-#: Covers everything in MODE_A_CHAIN except PRODUCT_OWNER, plus AUTOBUILD
-#: and PULL_REQUEST_REVIEW explicitly. Planning runs never advance into
-#: build stages; finding any of these in history triggers BoundaryViolation.
-PLANNING_FORBIDDEN_STAGES: frozenset[StageClass] = frozenset(
-    {
-        StageClass.ARCHITECT,
-        StageClass.SYSTEM_ARCH,
-        StageClass.SYSTEM_DESIGN,
-        StageClass.FEATURE_SPEC,
-        StageClass.FEATURE_PLAN,
-        StageClass.AUTOBUILD,
-        StageClass.PULL_REQUEST_REVIEW,
-        StageClass.TASK_REVIEW,
-        StageClass.TASK_WORK,
-    }
-)
 
 
 # ---------------------------------------------------------------------------
@@ -205,22 +184,6 @@ class Fail:
     stage: StageClass | None = None
 
 
-@dataclass(frozen=True)
-class BoundaryViolation:
-    """Decision: planning run violated stage boundary.
-
-    Returned when history contains any PLANNING_FORBIDDEN_STAGES entry.
-    This is a security boundary: planning runs must never advance into
-    build stages.
-
-    Attributes:
-        violated_stage: The forbidden stage that appeared in history.
-        rationale: Human-readable reason for this violation.
-    """
-
-    violated_stage: StageClass
-    rationale: str
-
 
 #: Union of all planning decision types
 PlanningDecision = Union[
@@ -228,7 +191,6 @@ PlanningDecision = Union[
     PauseAtCheckpoint,
     ExecuteHandoff,
     Fail,
-    BoundaryViolation,
 ]
 
 
@@ -247,18 +209,17 @@ def plan_next_step(
     decision (no I/O, no model calls, no side effects).
 
     Decision flow:
-        1. Check for boundary violations (forbidden stages in history)
-        2. Check for dispatch failures (failed/error status)
-        3. Empty history → DispatchProductOwner
-        4. PRODUCT_OWNER approved → PauseAtCheckpoint
-        5. Checkpoint cleared → ExecuteHandoff
+        1. Check for dispatch failures (failed/error status)
+        2. Empty history → DispatchProductOwner
+        3. PRODUCT_OWNER approved → PauseAtCheckpoint
+        4. Checkpoint cleared → ExecuteHandoff
 
     Args:
         history: Sequence of planning events (planning_run_events rows).
 
     Returns:
         PlanningDecision: One of DispatchProductOwner, PauseAtCheckpoint,
-            ExecuteHandoff, Fail, or BoundaryViolation.
+            ExecuteHandoff, or Fail.
 
     Examples:
         >>> plan_next_step(history=())
@@ -273,14 +234,6 @@ def plan_next_step(
         >>> plan_next_step(history)
         PauseAtCheckpoint(rationale='PRODUCT_OWNER complete: pause at PRODUCT_DOCS_CHECKPOINT for review')
     """
-    # AC-003: Boundary violation check (MUST come first)
-    for event in history:
-        if event.stage in PLANNING_FORBIDDEN_STAGES:
-            return BoundaryViolation(
-                violated_stage=event.stage,
-                rationale=f"Stage {event.stage.value} is forbidden in planning runs",
-            )
-
     # AC-005: Dispatch failure check
     for event in history:
         if event.status in ("failed", "error"):

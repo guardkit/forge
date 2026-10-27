@@ -635,9 +635,6 @@ class TestTheGateSetCarriesTheEvidence:
                 cwd=kw["cwd"],
                 timeout_seconds=kw["timeout_seconds"],
             ),
-            stamps_leg=lambda **kw: SimpleNamespace(
-                status="not-enforced", detail="", blocks_card=False, attended=()
-            ),
         )
 
         report = read(build_id=BUILD_ID, branch=f"fix/{BUILD_ID}")
@@ -690,9 +687,6 @@ class TestTheGateSetCarriesTheEvidence:
                 ),
                 cwd=kw["cwd"],
                 timeout_seconds=kw["timeout_seconds"],
-            ),
-            stamps_leg=lambda **kw: SimpleNamespace(
-                status="not-enforced", detail="", blocks_card=False, attended=()
             ),
         )
 

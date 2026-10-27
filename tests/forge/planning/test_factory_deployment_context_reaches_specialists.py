@@ -44,7 +44,6 @@ from forge.planning.reference_material import REFERENCE_FILE_HEADING
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.target_terminal_tools import (
     make_normalize_feature_spec,
-    make_validate_feature_plan,
 )
 from tests.forge.planning import test_driver_spec_digest_door as door
 from tests.forge.planning.test_memory_name_at_the_door import _git
@@ -84,7 +83,9 @@ def _load_fixture(name: str, path: Path) -> Any:
 
 
 def _fixture_sources(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
+    pytest.importorskip("specialist_agent", reason="a sibling repository this test reads (specialist_agent) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     import specialist_agent
+    pytest.importorskip("specialist_agent", reason="a sibling repository this test reads (specialist_agent) is not checked out here (the GitHub workflow checks out forge, nats-core and guardkit only)")
     from specialist_agent.adapters.manifest import _ensure_roles_registered
 
     root = Path(specialist_agent.__file__).resolve().parents[2]
@@ -109,7 +110,6 @@ def _fixture_sources(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
 def _plan_output(fixtures: SimpleNamespace, args: dict[str, Any]) -> str:
     """Use the conformant plan fixture, naming this driver's spec and identity."""
     from fixtures.plan_content_list import plan_output_with_list
-    from fixtures.plan_list_references import output_with_references
 
     source = fixtures.plan
     output = source._multi_task_output().replace(source._FID, args["feature_id"])
@@ -142,7 +142,7 @@ def _plan_output(fixtures: SimpleNamespace, args: dict[str, Any]) -> str:
         + "scenario_owners:\n",
         1,
     )
-    return output_with_references(plan_output_with_list(output, _REQUEST))
+    return plan_output_with_list(output, _REQUEST)
 
 
 class _RecordingSeat:
@@ -186,283 +186,3 @@ def _records(
     ]
 
 
-@pytest.mark.asyncio
-async def test_captured_reference_reaches_real_writers_and_coaches_after_restart(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    from specialist_agent.core.api import run_specialist_mode
-    from specialist_agent.criteria.loader import load_criteria, select_criteria
-
-    fixtures = _fixture_sources(monkeypatch)
-    allow_local_remotes(monkeypatch, tmp_path / "fetch-copies")
-    for name in ("GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"):
-        monkeypatch.setenv(name, "Fixture Author")
-    for name in ("GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"):
-        monkeypatch.setenv(name, "fixture@example.invalid")
-    remote, project = _seed_project(
-        tmp_path,
-        extra={
-            ".guardkit/config.yaml": DECLARES_DOCUMENTS
-            + 'reference:\n  paths: ["reference/"]\n',
-            _REFERENCE_PATH: _REFERENCE_TEXT,
-        },
-    )
-    start_commit = _git(project, "rev-parse", "HEAD")
-    original = factory_context.load_bundled_document()
-    expected = [
-        f"File: AGENTS.md\n{AGENTS}",
-        f"File: {DECLARED[0]}\n{MISSION_V1}",
-        f"File: {DECLARED[1]}\n{TECH_V1}",
-        f"{REFERENCE_FILE_HEADING}\nFile: {_REFERENCE_PATH}\n{_REFERENCE_TEXT}",
-        original.text,
-    ]
-    db = tmp_path / "planning.db"
-    calls: list[dict[str, Any]] = []
-    stores: list[SqlitePlanningRunStore] = []
-    connections: list[Any] = []
-    interrupted: set[StageClass] = set()
-    notifications: list[tuple[str, str]] = []
-    current: SqlitePlanningRunStore
-
-    def open_store() -> SqlitePlanningRunStore:
-        connection = sqlite_connect.connect_writer(db)
-        connections.append(connection)
-        migrations.apply_at_boot(connection)
-        store = SqlitePlanningRunStore(connection, target_terminal_enabled=True)
-        stores.append(store)
-        return store
-
-    def assert_recorded_pair() -> None:
-        assert _records(current, factory_context.EXPECTATION_STAGE) == [
-            {"factory_context": original.receipt()}
-        ]
-        assert _records(current, factory_context.CAPTURE_STAGE) == [
-            {"factory_context": original.to_record()}
-        ]
-        assert current.get_run(door.CID)["request_text"].encode("utf-8") == _REQUEST.encode("utf-8")
-
-    async def dispatch(stage: StageClass, kwargs: dict[str, Any]) -> StageDispatchResult:
-        assert_recorded_pair()  # Before either model seat can be created/called.
-        assert kwargs["context"] == expected
-        assert kwargs["request_text"].encode("utf-8") == _REQUEST.encode("utf-8")
-        fields = {k: v for k, v in kwargs.items() if k not in {"plan_run_id", "correlation_id"}}
-        if stage is StageClass.FEATURE_SPEC:
-            fields["from_input"] = fields.pop("spec_input")
-            built = build_feature_spec_command_args(**fields)
-            role = "product-owner"
-            output = fixtures.spec._valid_triple()
-            feedback = "Add a summary sentence naming the small-file and size-limit upload cases."
-            revision = "The specification covers uploads of small files and files at the size limit."
-            revised_output = output.replace(
-                "# Feature Spec Summary: File Upload\n",
-                f"# Feature Spec Summary: File Upload\n\n{revision}\n",
-                1,
-            )
-        else:
-            built = build_feature_plan_command_args(**fields)
-            role = "architect"
-            output = _plan_output(fixtures, built)
-            feedback = "Replace the generic task acceptance criteria with the concrete upload outcome."
-            revision = "Uploads of small files and files at the size limit succeed."
-            revised_output = output.replace(
-                "- [ ] Does the thing.", f"- [ ] {revision}"
-            )
-        assert revision not in output
-        assert revision in revised_output and revised_output != output
-        command, wire = build_specialist_command(
-            stage, request_text=None, context_entries=[], extra_command_args=built
-        )
-        # A JSON roundtrip stands in for the transport, not for argument validation.
-        wire = json.loads(json.dumps(wire, ensure_ascii=False))
-        assert wire["context"] == expected
-        assert wire["request_text"] == _REQUEST
-        definitions = load_criteria(fixtures.root / "roles" / role / "criteria" / f"{command}.yaml")
-        criteria = select_criteria(definitions, revision=bool(wire.get("validate_feedback")))
-
-        def scoring_reply(score: float) -> str:
-            return json.dumps({
-                "criterion_scores": [
-                    {"criterion_id": c.id, "weight": c.weight, "score": score,
-                     "reasoning": feedback if score < 1 else "The requested revision is present."}
-                    for c in criteria
-                ],
-                "detection_findings": [],
-                "feedback": [feedback] if score < 1 else [],
-            })
-
-        # Both fixtures make an actual content revision after rejection. The
-        # real loop's unchanged-draft safeguard remains active on plan retries.
-        player = _RecordingSeat([output, revised_output])
-        exact_review = "semantic_review_artifacts" in wire
-        coach = _RecordingSeat(
-            [scoring_reply(1)] if exact_review else [scoring_reply(0.4), scoring_reply(1)]
-        )
-        coherence_prompt = (fixtures.root / "roles/product-owner/prompts/coach_coherence.md").read_text()
-        support_prompt = (fixtures.root / "roles/product-owner/prompts/coach_example_support.md").read_text()
-
-        def create_coach(_self: Any, system_prompt: str | None = None) -> Any:
-            assert_recorded_pair()
-            if system_prompt == coherence_prompt:
-                return _RecordingSeat([json.dumps({"contradictions": []})])
-            if system_prompt == support_prompt:
-                return _RecordingSeat([json.dumps({"examples": [
-                    {"title": title, "obligation": "upload", "verdict": "FOLLOWS", "why": "fixture"}
-                    for title in ("Upload a small file", "Upload at the exact size limit")
-                ]})])
-            return coach
-
-        with (
-            monkeypatch.context() as specialist_runtime,
-            patch("specialist_agent.orchestrator.session.Orchestrator._create_player", return_value=player),
-            patch("specialist_agent.orchestrator.session.Orchestrator._create_coach", create_coach),
-        ):
-            # The public API loads roles/ relative to the service working
-            # directory. Reproduce that supported runtime layout using this
-            # candidate's checkout; all generated output still goes to tmp_path.
-            specialist_runtime.chdir(fixtures.root)
-            result = await run_specialist_mode(
-                role, command, wire, output_path=str(tmp_path / f"specialist-{len(calls)}")
-            )
-        assert result.success, result
-        assert json.loads(result.artifacts["validation.json"])["accepted"] is True
-        if not exact_review:
-            assert len(player.inputs) == len(coach.inputs) == 2
-            for payload in player.inputs:
-                _assert_documents(payload, expected)
-            assert feedback in _message_text(player.inputs[1])
-            assert output in _message_text(coach.inputs[0])
-            assert revised_output in _message_text(coach.inputs[1])
-            assert any(revision in text for text in result.artifacts.values())
-        for payload in coach.inputs:
-            _assert_documents(payload, expected)
-            assert _REQUEST in _message_text(payload)
-        calls.append({"stage": stage, "wire": wire, "player": player, "coach": coach})
-        if stage not in interrupted:
-            interrupted.add(stage)
-            raise _ResponseInterrupted()
-        return StageDispatchResult(
-            outcome=StageDispatchOutcome.COMPLETED,
-            stage=stage,
-            build_id=kwargs["plan_run_id"],
-            correlation_id=kwargs["correlation_id"],
-            stage_log_entry_id=f"fixture-{len(calls)}",
-            coach_score=1.0,
-            role_output=result.artifacts,
-        )
-
-    async def dispatch_spec(**kwargs: Any) -> StageDispatchResult:
-        return await dispatch(StageClass.FEATURE_SPEC, kwargs)
-
-    async def dispatch_plan(**kwargs: Any) -> StageDispatchResult:
-        return await dispatch(StageClass.FEATURE_PLAN, kwargs)
-
-    async def product_owner(**kwargs: Any) -> StageDispatchResult:
-        return StageDispatchResult(
-            outcome=StageDispatchOutcome.COMPLETED,
-            stage=StageClass.PRODUCT_OWNER,
-            build_id=kwargs["plan_run_id"],
-            correlation_id=kwargs["correlation_id"],
-            stage_log_entry_id="fixture-product-owner",
-            coach_score=1.0,
-            role_output={"title": "File Upload", "problem_statement": _REQUEST},
-        )
-
-    async def notify(_cid: str, message: str, level: str) -> None:
-        notifications.append((level, message))
-        # This is the last scope of this test. The plan receipt already exists;
-        # no task execution, broker publish, deployment, or real product follows.
-        if level == "info" and _records(current, "feature-plan", status="approved"):
-            raise _PlanCommitted()
-
-    def new_driver() -> PlanningRunDriver:
-        clock = lambda: datetime.now(UTC)
-        repository, state_machine = build_planning_gate_adapters(current, clock=clock)
-        locations = {
-            "target_repo_paths": {_REPO: str(project)},
-            "fetch_addresses": {_REPO: str(remote)},
-        }
-        return PlanningRunDriver(PlanningDriverDeps(
-            store=current,
-            repository=repository,
-            state_machine=state_machine,
-            approval_publisher=door.FakePublisher(),
-            subscriber_factory=door.SharedScriptFactory([door._answer("approve")]),
-            dispatch_product_owner=product_owner,
-            second_opinion_provider=door.FakeSecondOpinion(),
-            git_runner=WorktreeGitRunner(worktrees_root=tmp_path / "worktrees", **locations),
-            planning_config=PlanningConfig(
-                enabled=True, target_terminal=TargetTerminalConfig(enabled=True), **locations
-            ),
-            clock=clock,
-            publish_notification=notify,
-            dispatch_feature_spec=dispatch_spec,
-            dispatch_feature_plan=dispatch_plan,
-            normalize_feature_spec=make_normalize_feature_spec(command_prefix=None),
-            validate_feature_plan=make_validate_feature_plan(),
-        ))
-
-    try:
-        current = open_store()
-        current.record_queued(
-            correlation_id=door.CID,
-            originating_user=door.ORIGINATOR,
-            expected_approver=door.ORIGINATOR,
-            request_text=_REQUEST,
-            triggered_by="jarvis",
-            target_repo=_REPO,
-        )
-        with pytest.raises(_ResponseInterrupted):
-            await new_driver().drive(door.CID)
-        assert [c["stage"] for c in calls] == [StageClass.FEATURE_SPEC]
-        assert_recorded_pair()
-
-        changed = factory_context.FactoryDeploymentDocument.of(
-            original.text + "\nA later installed reference must not enter this run.\n",
-            version="next-fixture-version",
-        )
-        assert changed.sha256 != original.sha256
-        bundle_reads: list[None] = []
-
-        def current_bundle() -> Any:
-            bundle_reads.append(None)
-            return changed
-
-        monkeypatch.setattr(factory_context, "load_bundled_document", current_bundle)
-        connections[-1].close()
-        current = open_store()
-        with pytest.raises(_ResponseInterrupted):
-            await new_driver().drive(door.CID)
-        assert [c["stage"] for c in calls] == [
-            StageClass.FEATURE_SPEC, StageClass.FEATURE_SPEC, StageClass.FEATURE_PLAN,
-        ]
-
-        connections[-1].close()
-        current = open_store()
-        with pytest.raises(_PlanCommitted):
-            await new_driver().drive(door.CID)
-        assert len({id(store) for store in stores}) == 3
-        assert_recorded_pair()
-        assert bundle_reads == [], "A valid captured pair must not consult today's package"
-        assert [c["stage"] for c in calls if "semantic_review_artifacts" not in c["wire"]] == [
-            StageClass.FEATURE_SPEC, StageClass.FEATURE_SPEC,
-            StageClass.FEATURE_PLAN, StageClass.FEATURE_PLAN,
-        ]
-        assert all(changed.text not in _message_text(p)
-                   for call in calls for p in call["coach"].inputs + call["player"].inputs)
-        drafts = _records(current, "feature-spec-draft")
-        assert len(drafts) == 1
-        assert drafts[0]["spec_draft"]["factory_context"] == original.receipt()
-        (plan,) = _records(current, "feature-plan")
-        assert plan["factory_context"] == original.receipt()
-        assert plan["semantic_review"]["decision"] == "approved"
-        project_capture = _records(current, "project-documents")
-        assert len(project_capture) == 1
-        assert [d["path"] for d in project_capture[0]["project_documents"]] == ["AGENTS.md", *DECLARED]
-        assert {d["commit"] for d in project_capture[0]["project_documents"]} == {start_commit}
-        dispatches = _records(current, factory_context.DISPATCH_STAGE)
-        assert len(dispatches) >= 4
-        assert all(d["factory_context"] == original.receipt() for d in dispatches)
-        assert not [message for level, message in notifications if level == "error"]
-    finally:
-        for connection in connections:
-            connection.close()

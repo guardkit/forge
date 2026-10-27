@@ -25,8 +25,6 @@ from forge.adapters.git.planning_runner import WorktreeGitRunner
 from forge.deploy.candidate_tree import read_file_at_commit
 from forge.pipeline.prepared_admission import (
     admit_prepared_build,
-    guide_claims_routes,
-    relative_markdown_links,
 )
 
 from tests.forge.recorded_fetch_address import local_remotes, origin_of  # noqa: F401
@@ -389,24 +387,6 @@ _MISSING_CASES = {
 }
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize("case", sorted(_MISSING_CASES))
-async def test_each_missing_bundle_item_is_refused_by_name(
-    project: Project, runner: WorktreeGitRunner, case: str
-) -> None:
-    path, words = _MISSING_CASES[case]
-    files = bundle()
-    files.pop(path)
-    # The summary links to the guide and the guide to the mission; drop
-    # nothing else, so the FIRST missing item is the one removed.
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok, case
-    assert path in (answer.refusal or ""), answer.refusal
-    assert words in (answer.refusal or ""), answer.refusal
-
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
@@ -429,52 +409,6 @@ async def test_missing_qa_files_are_left_to_guardkits_own_precondition(
     assert answer.ok, answer.refusal
 
 
-@pytest.mark.asyncio
-async def test_a_feature_file_naming_another_feature_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    files = bundle()
-    files[f".guardkit/features/{FEATURE}.yaml"] = files[
-        f".guardkit/features/{FEATURE}.yaml"
-    ].replace(f"id: {FEATURE}", "id: FEAT-0THER")
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "FEAT-0THER" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_broken_relative_link_is_refused_naming_the_link(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    files = bundle()
-    task_path = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
-    files[task_path] += "\nAlso read [the contract](../../../docs/contracts/api.md).\n"
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "docs/contracts/api.md" in (answer.refusal or "")
-    assert task_path in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_link_to_a_folder_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    files = bundle()
-    task_path = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
-    files[task_path] += "\nThe [constitution](../../../docs/constitution) folder.\n"
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "docs/constitution" in (answer.refusal or "")
-
 
 @pytest.mark.asyncio
 async def test_back_quoted_paths_urls_and_anchors_are_not_checked(
@@ -494,30 +428,6 @@ async def test_back_quoted_paths_urls_and_anchors_are_not_checked(
     assert answer.ok, answer.refusal
 
 
-@pytest.mark.asyncio
-async def test_a_declared_document_that_is_a_symbolic_link_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    files = bundle()
-    files.pop("docs/constitution/mission.md")
-    files["docs/constitution/real-mission.md"] = "The mission.\n"
-    project.commit_on(BRANCH, files)
-    # Make mission.md a symbolic link on the branch.
-    _git(project.writer, "checkout", "-q", BRANCH)
-    (project.writer / "docs" / "constitution" / "mission.md").symlink_to(
-        "real-mission.md"
-    )
-    _git(project.writer, "add", "-A")
-    _git(project.writer, "commit", "-qm", "a link")
-    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
-    _git(project.writer, "checkout", "-q", "main")
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "docs/constitution/mission.md" in (answer.refusal or "")
-    assert "symbolic link" in (answer.refusal or "")
-
 
 # ---------------------------------------------------------------------------
 # The one reading rule: admission refuses what planning and the Coach refuse
@@ -534,86 +444,6 @@ def _commit_bytes_on(project: Project, branch: str, files: dict[str, bytes]) -> 
     _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{branch}")
     _git(project.writer, "checkout", "-q", "main")
 
-
-@pytest.mark.asyncio
-async def test_a_binding_document_that_is_not_utf8_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    project.commit_on(BRANCH, bundle())
-    _commit_bytes_on(project, BRANCH, {"docs/constitution/mission.md": b"The \xff mission\n"})
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "docs/constitution/mission.md" in (answer.refusal or "")
-    assert "not UTF-8 text" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_documents_over_the_budget_are_advice_not_a_refusal(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    """Step 2 (26 October 2026, census FRG-025): the budget is a guide."""
-    from forge.planning.project_documents import PROJECT_DOCUMENTS_BUDGET_BYTES
-
-    files = bundle()
-    files["docs/constitution/mission.md"] = "m" * (PROJECT_DOCUMENTS_BUDGET_BYTES + 1)
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert answer.ok, answer.refusal
-
-
-@pytest.mark.asyncio
-async def test_a_declared_instruction_file_must_be_there(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    config = config_text().replace(
-        "    required_documents:", "    instructions: [docs/how-we-work.md]\n    required_documents:"
-    )
-    project.commit_on(BRANCH, bundle(config=config))
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "docs/how-we-work.md" in (answer.refusal or "")
-    assert "autobuild.player.instructions" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_an_instruction_link_out_of_the_repository_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    project.commit_on(BRANCH, bundle())
-    _git(project.writer, "checkout", "-q", BRANCH)
-    (project.writer / "AGENTS.md").symlink_to("../../outside/AGENTS.md")
-    _git(project.writer, "add", "-A")
-    _git(project.writer, "commit", "-qm", "a link out")
-    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
-    _git(project.writer, "checkout", "-q", "main")
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "AGENTS.md" in (answer.refusal or "")
-    assert "outside the repository" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_an_unknown_player_key_is_refused_only_when_documents_are_declared(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    declared = config_text() + "    surprise: [x]\n"
-    project.commit_on(BRANCH, bundle(config=declared))
-    refused = await _admit(project, runner)
-
-    undeclared = config_text(documents=()) + "autobuild:\n  player:\n    surprise: [x]\n"
-    project.commit_on(BRANCH, bundle(config=undeclared))
-    admitted = await _admit(project, runner)
-
-    assert not refused.ok and "surprise" in (refused.refusal or "")
-    assert admitted.ok, admitted.refusal
 
 
 # ---------------------------------------------------------------------------
@@ -632,37 +462,6 @@ async def test_the_specialist_digest_is_optional(
 
     assert answer.ok, answer.refusal
 
-
-@pytest.mark.asyncio
-async def test_routing_law_off_still_needs_a_spec_file(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    project.commit_on(BRANCH, bundle(routing_off=True))
-    assert (await _admit(project, runner)).ok
-
-    files = bundle(routing_off=True)
-    plan_path = f".guardkit/features/{FEATURE}.yaml"
-    files[plan_path] = files[plan_path].replace(
-        f'feature_files:\n  - "{SPEC_DIR}/{SPEC_NAME}.feature"\n', ""
-    )
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "lists no spec file" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_guide_declaring_a_route_needs_the_leak_sweep_manifest(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    project.commit_on(BRANCH, bundle(routes=True, leak_sweep=False))
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "qa/leak-sweep.yaml" in (answer.refusal or "")
 
 
 @pytest.mark.asyncio
@@ -692,20 +491,6 @@ def _colon_guide(files: dict[str, str]) -> dict[str, str]:
     )
     return files
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("digest", [True, False], ids=["with-digest", "without-digest"])
-async def test_a_colon_heading_route_needs_the_manifest_whoever_wrote_it(
-    project: Project, runner: WorktreeGitRunner, digest: bool
-) -> None:
-    """GuardKit's documented ``## §4: Integration Contracts`` counts for every
-    guide, with or without the specialist-only digest (R5)."""
-    project.commit_on(BRANCH, _colon_guide(bundle(digest=digest, routes=True)))
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "qa/leak-sweep.yaml" in (answer.refusal or "")
 
 
 @pytest.mark.asyncio
@@ -738,74 +523,6 @@ def _replace_with_link(project: Project, path: str, target: str) -> None:
     _git(project.writer, "checkout", "-q", "main")
 
 
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    ("path", "target"),
-    [
-        (f"{TASK_DIR}/IMPLEMENTATION-GUIDE.md", "../../../README.md"),
-        (f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md", "../../../../outside.md"),
-        (f"{SPEC_DIR}/{SPEC_NAME}_digest.yaml", f"{SPEC_NAME}_summary.md"),
-    ],
-    ids=["linked-guide", "linked-task-escaping", "linked-digest"],
-)
-async def test_a_bundle_file_that_is_a_symbolic_link_is_refused_by_name(
-    project: Project, runner: WorktreeGitRunner, path: str, target: str
-) -> None:
-    project.commit_on(BRANCH, bundle())
-    _replace_with_link(project, path, target)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert path in (answer.refusal or "")
-    assert "symbolic link" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_bundle_file_reached_through_a_linked_folder_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    # The QA files are no longer read here (step 2), so the linked folder is
-    # the one the task files live in.
-    files = bundle()
-    real = {k.replace("tasks/", "real-tasks/", 1): v for k, v in files.items() if k.startswith("tasks/")}
-    files = {k: v for k, v in files.items() if not k.startswith("tasks/")}
-    project.commit_on(BRANCH, {**files, **real})
-    _git(project.writer, "checkout", "-q", BRANCH)
-    (project.writer / "tasks").symlink_to("real-tasks")
-    _git(project.writer, "add", "-A")
-    _git(project.writer, "commit", "-qm", "tasks is a linked folder")
-    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
-    _git(project.writer, "checkout", "-q", "main")
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "reached through tasks, a symbolic link" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "file_path",
-    [f"/{TASK_DIR}/{TASKS[0]}-do-the-thing.md", "../other/TASK.md"],
-    ids=["absolute", "escaping"],
-)
-async def test_a_task_file_path_outside_the_repository_is_refused_not_rewritten(
-    project: Project, runner: WorktreeGitRunner, file_path: str
-) -> None:
-    files = bundle()
-    plan_path = f".guardkit/features/{FEATURE}.yaml"
-    files[plan_path] = files[plan_path].replace(
-        f'"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"', f'"{file_path}"', 1
-    )
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert file_path in (answer.refusal or "")
-    assert "not a path inside the repository" in (answer.refusal or "")
-
 
 def _commit_with_links(project: Project, files: dict[str, str], links: dict[str, str]) -> None:
     project.commit_on(BRANCH, files)
@@ -818,28 +535,6 @@ def _commit_with_links(project: Project, files: dict[str, str], links: dict[str,
     _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
     _git(project.writer, "checkout", "-q", "main")
 
-
-@pytest.mark.asyncio
-async def test_a_task_path_with_dot_dot_through_a_link_is_refused_not_collapsed(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    """``{TASK_DIR}/link/../TASK.md`` with ``link -> ../../../other/nested``:
-    textually it is the task file beside the link, on a filesystem it is
-    other/TASK.md. Both exist; the path is refused rather than guessed (R6)."""
-    task = f"{TASKS[0]}-do-the-thing.md"
-    files = bundle()
-    plan_path = f".guardkit/features/{FEATURE}.yaml"
-    sneaky = f"{TASK_DIR}/link/../{task}"
-    files[plan_path] = files[plan_path].replace(f'"{TASK_DIR}/{task}"', f'"{sneaky}"', 1)
-    files[f"other/{task}"] = "# another task\n"
-    files["other/nested/x.md"] = "x\n"
-    _commit_with_links(project, files, {f"{TASK_DIR}/link": "../../../other/nested"})
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert sneaky in (answer.refusal or "")
-    assert "not a path inside the repository" in (answer.refusal or "")
 
 
 @pytest.mark.asyncio
@@ -856,31 +551,6 @@ async def test_a_markdown_reference_up_and_across_to_a_real_file_is_admitted(
 
     assert answer.ok, answer.refusal
 
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "reference",
-    ["../../../linked-docs/design/API.md", "link/../../../../docs/design/API.md"],
-    ids=["through-a-linked-folder", "dot-dot-after-a-link"],
-)
-async def test_a_markdown_reference_through_a_link_is_refused(
-    project: Project, runner: WorktreeGitRunner, reference: str
-) -> None:
-    files = bundle()
-    task = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
-    files[task] += f"\nSee [the API]({reference}).\n"
-    files["docs/design/API.md"] = "# API\n"
-    _commit_with_links(
-        project,
-        files,
-        {"linked-docs": "docs", f"{TASK_DIR}/link": "../../../docs/design"},
-    )
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "symbolic link" in (answer.refusal or "")
-    assert reference in (answer.refusal or "")
 
 
 _PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\xff\xfe\x00binary"
@@ -906,80 +576,6 @@ async def test_a_committed_picture_referenced_from_the_guide_is_admitted(
     assert answer.ok, answer.refusal
 
 
-@pytest.mark.asyncio
-async def test_a_missing_picture_referenced_from_the_guide_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    project.commit_on(BRANCH, _guide_referencing_a_picture(bundle()))
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "docs/flow.png is not in the commit" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_linked_picture_referenced_from_the_guide_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    files = _guide_referencing_a_picture(bundle())
-    project.commit_on(BRANCH, files)
-    _commit_bytes_on(project, BRANCH, {"docs/real-flow.png": _PNG})
-    _git(project.writer, "checkout", "-q", BRANCH)
-    (project.writer / "docs" / "flow.png").symlink_to("real-flow.png")
-    _git(project.writer, "add", "-A")
-    _git(project.writer, "commit", "-qm", "a linked picture")
-    _git(project.writer, "push", "-q", "-f", "origin", f"HEAD:refs/heads/{BRANCH}")
-    _git(project.writer, "checkout", "-q", "main")
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "docs/flow.png is a symbolic link" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_task_path_with_a_leading_space_is_refused_not_trimmed(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    """`` ./tasks/...`` is a folder named `` .`` to GuardKit, which a
-    committed link can redirect; trimmed, it would be checked as the real task
-    file. Both exist here; the path is refused (R8)."""
-    task = f"{TASKS[0]}-do-the-thing.md"
-    files = bundle()
-    plan_path = f".guardkit/features/{FEATURE}.yaml"
-    padded = f" ./{TASK_DIR}/{task}"
-    files[plan_path] = files[plan_path].replace(f'"{TASK_DIR}/{task}"', f'"{padded}"', 1)
-    files[f"elsewhere/{TASK_DIR}/{task}"] = "# a different task\n"
-    _commit_with_links(project, files, {" .": "elsewhere"})
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert repr(padded) in (answer.refusal or "")
-    assert "begins or ends with a space" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("which", ["task", "spec"])
-async def test_a_yaml_path_with_a_trailing_space_is_refused(
-    project: Project, runner: WorktreeGitRunner, which: str
-) -> None:
-    files = bundle()
-    plan_path = f".guardkit/features/{FEATURE}.yaml"
-    path = (
-        f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
-        if which == "task"
-        else f"{SPEC_DIR}/{SPEC_NAME}.feature"
-    )
-    files[plan_path] = files[plan_path].replace(f'"{path}"', f'"{path} "', 1)
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "begins or ends with a space" in (answer.refusal or "")
-
 
 @pytest.mark.asyncio
 async def test_the_same_paths_written_plainly_are_admitted(
@@ -990,169 +586,10 @@ async def test_the_same_paths_written_plainly_are_admitted(
     assert (await _admit(project, runner)).ok
 
 
-@pytest.mark.asyncio
-async def test_a_reference_whose_path_still_has_a_space_at_an_end_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    files = bundle()
-    task = f"{TASK_DIR}/{TASKS[0]}-do-the-thing.md"
-    files[task] += "\nSee [the API](../../../docs/API.md%20).\n"
-    files["docs/API.md"] = "# API\n"
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "begins or ends with a space" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_task_id_with_a_space_at_an_end_is_refused_not_trimmed(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    """GuardKit reads ``qa/pass-bar-<id>.yaml`` with the id exactly as written:
-    `` TASK-AB12-001`` names a different bar (here a link) from the ordinary
-    canonical one, so the id is refused rather than trimmed."""
-    files = bundle()
-    plan_path = f".guardkit/features/{FEATURE}.yaml"
-    files[plan_path] = files[plan_path].replace(
-        f"- id: {TASKS[0]}", f'- id: " {TASKS[0]}"', 1
-    )
-    _commit_with_links(
-        project, files, {f"qa/pass-bar- {TASKS[0]}.yaml": f"pass-bar-{TASKS[1]}.yaml"}
-    )
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert repr(f" {TASKS[0]}") in (answer.refusal or "")
-    assert "begins or ends with a space" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_a_feature_id_with_a_space_at_an_end_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    files = bundle()
-    plan_path = f".guardkit/features/{FEATURE}.yaml"
-    files[plan_path] = files[plan_path].replace(f"id: {FEATURE}", f'id: "{FEATURE} "', 1)
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert repr(f"{FEATURE} ") in (answer.refusal or "")
-    assert "begins or ends with a space" in (answer.refusal or "")
-
-
-@pytest.mark.asyncio
-async def test_an_absolute_spec_file_path_is_refused(
-    project: Project, runner: WorktreeGitRunner
-) -> None:
-    files = bundle()
-    plan_path = f".guardkit/features/{FEATURE}.yaml"
-    files[plan_path] = files[plan_path].replace(
-        f'"{SPEC_DIR}/{SPEC_NAME}.feature"', f'"/{SPEC_DIR}/{SPEC_NAME}.feature"'
-    )
-    project.commit_on(BRANCH, files)
-
-    answer = await _admit(project, runner)
-
-    assert not answer.ok
-    assert "not a path inside the repository" in (answer.refusal or "")
-
 
 # ---------------------------------------------------------------------------
 # The two text rules, directly
 # ---------------------------------------------------------------------------
 
 
-def test_the_integration_contracts_rule_matches_the_producers() -> None:
-    assert guide_claims_routes("## §4 Integration Contracts\n- route: /a\n")
-    assert guide_claims_routes("### Integration Contracts\nroute: /a\n## Next\n")
-    assert guide_claims_routes("## §4\n  - route: /a\n")
-    assert guide_claims_routes("## 4 Integration Contract\nROUTE: /a\n")
-    assert not guide_claims_routes("## Integration Contracts\nnone\n## B\nroute: /b\n")
-    assert not guide_claims_routes("## Overview\nroute: /a\n")
-    assert not guide_claims_routes("## §4 Integration Contracts\nroute:   \n")
-    # A level-one heading is a heading too, as the emitter reads it.
-    assert guide_claims_routes("# Integration Contracts\nroute: /a\n")
-    # "#tag" is not a heading.
-    assert not guide_claims_routes("#Integration Contracts\nroute: /a\n")
 
-
-def test_every_heading_form_the_emitter_reads_is_recognised() -> None:
-    """The specialist emitter's heading forms (specialist-agent
-    leak_sweep_emit.py, 7 October 2026): numbering, §, a colon, qualifiers in
-    round or square brackets, any case and spacing, up to three spaces in."""
-    for heading in (
-        "## §4: Integration Contracts",
-        "## §4 Integration Contracts",
-        "## 4. Integration Contracts",
-        "## 4) Integration Contracts",
-        "## 4: Integration Contracts",
-        "## 4. §4: Integration Contracts (MANDATORY for multi-task features)",
-        "## §4: Integration Contracts [MANDATORY]",
-        "## integration contracts",
-        "## INTEGRATION  CONTRACTS",
-        "##4Integration Contracts",
-        "   ## §4: Integration Contracts",
-        "## §4:",
-        "## 4",
-    ):
-        assert guide_claims_routes(f"{heading}\n- route: /a\n"), heading
-    # Four spaces in is indented code, not a heading.
-    assert not guide_claims_routes("    ## Integration Contracts\n- route: /a\n")
-    assert not guide_claims_routes("## Integration Contractors\n- route: /a\n")
-
-
-def test_every_integration_section_is_read() -> None:
-    # GuardKit's template has a diagram section and a §4 section; the
-    # routes may be in either.
-    assert guide_claims_routes(
-        "## Integration Contracts\nsee below\n## Other\n\n## §4: Integration Contracts\n"
-        "### Contract: users\n- route: /late\n"
-    )
-
-
-def test_routes_only_in_a_fenced_example_need_no_manifest() -> None:
-    """A refusal layout the leak-sweep builder found: the only Integration
-    Contracts heading is inside a fenced example. The emitter writes no
-    manifest, so admission must not ask for one."""
-    for fence in ("```", "~~~"):
-        guide = (
-            "## Overview\nHow a guide declares a route:\n\n"
-            f"{fence}markdown\n## §4: Integration Contracts\n- route: /example\n{fence}\n\n"
-            "## Tasks\nnothing else\n"
-        )
-        assert not guide_claims_routes(guide), fence
-    # A fenced heading-like line does not end a real section either.
-    assert guide_claims_routes(
-        "## §4: Integration Contracts\n```\n## not a heading\n```\n- route: /a\n"
-    )
-
-
-def test_routes_after_an_empty_section_and_a_level_one_heading_need_no_manifest() -> None:
-    """The other refusal layout: an empty §4, then ``# Appendix`` with routes
-    under it. A level-one heading ends the section, so the emitter writes no
-    manifest and admission must not ask for one."""
-    guide = (
-        "## §4: Integration Contracts\n\nNone for this feature.\n\n"
-        "# Appendix\n\n- route: /users/{user_id}\n"
-    )
-    assert not guide_claims_routes(guide)
-
-
-def test_only_relative_markdown_links_are_collected() -> None:
-    text = (
-        "[a](docs/a.md#part) ![i](img/x.png) [u](https://x.invalid) [h](#top) "
-        "`[c](code.md)` [s](//cdn.invalid/x) [q](b.md?raw=1) [sp](a%20b.md)\n"
-        "```\n[f](fenced.md)\n```\n[t](c.md \"title\")"
-    )
-    assert relative_markdown_links(text) == [
-        "docs/a.md",
-        "img/x.png",
-        "b.md",
-        "a b.md",
-        "c.md",
-    ]

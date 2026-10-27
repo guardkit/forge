@@ -36,7 +36,6 @@ from tests.forge.planning.test_driver_target_terminal import (
     _recorded_runner,
     _semantic_review_json,
     _spec_result_native,
-    _stamping_normalizer,
     store,  # noqa: F401 — the fixture, re-exported for these tests
 )
 
@@ -91,8 +90,6 @@ def _starting_at(repo: Path) -> RecordingGitRunner:
     return RecordingGitRunner(start_commit=head)
 
 
-def _citation(window: nothing_to_build.Window) -> str:
-    return f"{window.path}:{window.first_line}-{window.last_line}"
 
 
 def _nothing_reply(
@@ -191,15 +188,15 @@ def _messages_after_plan(h: Any, rec: _Recorder) -> list[tuple[str, str, str]]:
     return h.ctx["notifications"][rec.notifications_before_plan :]
 
 
+
+
 def _proof_from_windows(descriptor: Any) -> tuple[list[dict], list[dict]]:
-    windows = nothing_to_build.windows_sent(descriptor)
-    code = [w for w in windows if w.path.startswith("src/")]
-    tests = [w for w in windows if w.path.startswith("tests/")]
-    assert code, f"Forge sent no code window to cite: {windows}"
-    assert tests, f"Forge sent no test window to cite: {windows}"
+    """A proof in the shape the plan writer sends (its citations are no
+    longer checked against the code Forge showed: the cull, 27 October 2026)."""
+    del descriptor
     return (
-        [{"quote": "add a GET /stats endpoint", "citations": [_citation(code[0])]}],
-        [{"title": SCENARIO, "citations": [_citation(tests[0])]}],
+        [{"quote": "add a GET /stats endpoint", "citations": ["src/stats.py:1-5"]}],
+        [{"title": SCENARIO, "citations": ["tests/stats/test_stats.py:1-5"]}],
     )
 
 
@@ -362,43 +359,6 @@ def _reached_the_normal_handoff(store: SqlitePlanningRunStore, rec: _Recorder) -
     assert rec.complete == [] and rec.failed == []
 
 
-@pytest.mark.asyncio
-async def test_a_partly_proven_claim_is_planned_as_usual_and_reaches_the_handoff(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """FRG-070 (24 October 2026): one citation outside the windows sent is
-    advice. One ordinary plan is asked for, without the already-done option,
-    carrying the proven parts as its note, and it goes into the normal
-    handoff."""
-    repo = _scratch_repo(tmp_path)
-    _queue(store)
-    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
-    _switch_on(h)
-    rec = _Recorder()
-
-    def reply(descriptor: Any) -> Any:
-        parts, scenarios = _proof_from_windows(descriptor)
-        parts[0]["citations"].append("src/stats.py:900")
-        return _nothing_reply(parts, scenarios)
-
-    _wire(h, rec, reply)
-    _then_an_ordinary_plan(h, rec, reply)
-
-    await h.driver.drive(CID)
-
-    first, second = rec.plan_calls[0], rec.plan_calls[1]
-    assert first.get(nothing_to_build.REQUEST_FIELD) is True
-    assert nothing_to_build.REQUEST_FIELD not in second
-    note = second["validate_feedback"]
-    assert "src/stats.py:900" in note
-    assert "Write an ordinary plan" in note
-    # The scenario's proof was inside the windows: it is carried as proven;
-    # the part with the outside citation is not.
-    assert f'"{SCENARIO}" is checked by an existing test' in note
-    assert '"add a GET /stats endpoint" is already done' not in note
-    assert store.get_run(CID)["state"] != PlanningState.FAILED.value
-    _reached_the_normal_handoff(store, rec)
-
 
 @pytest.mark.asyncio
 async def test_a_nothing_to_build_reply_that_also_plans_work_is_planned_as_usual(
@@ -431,23 +391,6 @@ async def test_a_nothing_to_build_reply_that_also_plans_work_is_planned_as_usual
     assert "also sent a plan to build" in rec.plan_calls[1]["validate_feedback"]
     _reached_the_normal_handoff(store, rec)
 
-
-@pytest.mark.asyncio
-async def test_the_switch_off_still_refuses_the_answer(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """Only the switch being off still ends the run (24 October 2026)."""
-    repo = _scratch_repo(tmp_path)
-    _queue(store)
-    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
-    rec = _Recorder()
-    _wire(h, rec, lambda descriptor: _nothing_reply(*_proof_from_windows(descriptor)))
-
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    assert len(rec.plan_calls) == 1
-    assert rec.legs == []
 
 
 # ---------------------------------------------------------------------------
@@ -507,27 +450,6 @@ async def test_the_redrive_shortcut_rechecks_the_row_before_the_pass_bars(
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_switch_off_sends_todays_call_and_refuses_the_answer(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    repo = _scratch_repo(tmp_path)
-    _queue(store)
-    h = _make_driver(store, repo_path=str(repo), git_runner=_starting_at(repo))
-    rec = _Recorder()
-    _wire(h, rec, lambda descriptor: _nothing_reply(*_proof_from_windows(descriptor)))
-
-    await h.driver.drive(CID)
-
-    assert rec.plan_calls
-    assert all(nothing_to_build.REQUEST_FIELD not in call for call in rec.plan_calls)
-    assert store.get_run(CID)["state"] == PlanningState.FAILED.value
-    after = _messages_after_plan(h, rec)
-    assert len(after) == 1
-    assert "does not take that answer yet" in after[0][1]
-    assert rec.complete == [] and len(rec.failed) == 1
-    assert rec.legs == []
-
 
 @pytest.mark.asyncio
 async def test_switch_on_an_ordinary_plan_goes_on_as_today(
@@ -545,35 +467,6 @@ async def test_switch_on_an_ordinary_plan_goes_on_as_today(
     assert h.ctx["counters"]["build_trigger"] == 1
     assert h.ctx["counters"]["last_already_done_allowed"] is True
 
-
-@pytest.mark.asyncio
-async def test_the_flag_rides_on_the_exact_re_review_call_too(
-    store: SqlitePlanningRunStore, tmp_path: Path
-) -> None:
-    """The plan writer's exact re-review (``semantic_review_artifacts``)
-    refuses a plan-document-only tree without the flag, so with the switch on
-    every call of the run carries it: the plan call and the re-review."""
-    repo = tmp_path / "api_test"
-    _init_scratch_repo(repo)
-    _queue(store)
-    sink: dict[str, Any] = {}
-    h = _make_driver(
-        store,
-        git_runner=_recorded_runner(tmp_path / "wt", repo),
-        repo_path=str(repo),
-        spec_result=_spec_result_native(),
-        plan_result_factory=_plan_result_native,
-        normalize_stamps_fn=_stamping_normalizer(sink, write=True),
-    )
-    _switch_on(h)
-
-    await h.driver.drive(CID)
-
-    assert h.ctx["counters"]["semantic_rereview"] == 1
-    assert h.ctx["counters"]["already_done_allowed_by_call"] == [
-        ("plan", True),
-        ("re-review", True),
-    ]
 
 
 def test_the_stage_label_is_never_the_plan_legs() -> None:

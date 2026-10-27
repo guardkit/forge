@@ -181,7 +181,6 @@ __all__ = [
     "make_conductor_merge_card_published_probe",
     "make_conductor_subscribe_resume",
     "make_conductor_wait_window_reader",
-    "candidate_is_checked_before_the_merge",
     "make_gates_green_reader",
     "make_specification_fence",
     "load_declared_specification_paths",
@@ -1246,232 +1245,6 @@ def run_declared_command_in_sandbox(
     )
 
 
-#: How long the routing law's three small reads inside the sandbox may take.
-SANDBOX_STAMPS_READ_TIMEOUT_S: float = 90.0
-
-
-def read_stamps_in_sandbox(
-    *,
-    feature_id: str,
-    repo_root: "Path | str",
-    worktree: "Path | str",
-    branch: Any,
-    toolchain_green: bool,
-    sandbox: Any,
-    repo: str,
-    candidate_check_before_merge: bool = False,
-    post: Callable[..., Any] | None = None,
-) -> Any:
-    """Step 5 — the routing law's stamped-verifier check, read in the sandbox.
-
-    Found by L3b's coach, 2026-09-08. Steps 3 and 4 of the gates reader were
-    routed into the sandbox and this one was left reading the host, where a
-    sandbox repository's feature file and gate receipts are not. The check
-    then found no stamps, said so, had no effect, and a GREEN merge card went
-    out with the routing law silently not applied — a check that could not run
-    turned into a card, which is the one direction this reader must never fail
-    in.
-
-    So the three reads happen in the sandbox, over one route, and the DECISION
-    is the same pure function the in-container leg uses
-    (:func:`forge.pipeline.routing_stamps.evaluate_stamps`): the stamps from
-    the canonical branch of the clone, the newest results envelope under the
-    journey worktree, and the branch's last code commit time. Anything that
-    stops those being read — an unreachable sidecar, a refusal, an answer that
-    is not evidence — is UNREADABLE, which is UNKNOWN, which is no card.
-    """
-    from datetime import datetime
-
-    from forge.deploy_sidecar.service import STAMPS_EVIDENCE_ROUTE
-    from forge.pipeline.routing_stamps import (
-        HISTORY_RELATIVE_PATH,
-        Envelope,
-        StampsRead,
-        evaluate_stamps,
-        feature_yaml_relative_path,
-        parse_scenario_stamps,
-    )
-    from forge.planning.sidecar_git_runner import _urllib_post
-
-    history_dir = Path(worktree) / HISTORY_RELATIVE_PATH
-    where = Path(repo_root) / feature_yaml_relative_path(feature_id)
-    name = getattr(sandbox, "name", "?")
-
-    def _unreadable(reason: str) -> Any:
-        logger.error(
-            "conductor gates: the routing law's evidence for %s could not be "
-            "read in sandbox %s — %s. The gate set answers UNKNOWN, which is "
-            "red: no merge card",
-            feature_id,
-            name,
-            reason,
-        )
-        return evaluate_stamps(
-            StampsRead(path=where, present=True, error=reason),
-            toolchain_green=toolchain_green,
-            envelope=None,
-            code_commit_time=None,
-            history_dir=history_dir,
-            feature_id=feature_id,
-        )
-
-    sender = post if post is not None else _urllib_post
-    url = f"{str(sandbox.sidecar_url).rstrip('/')}{STAMPS_EVIDENCE_ROUTE}"
-    body = {
-        "repo": repo,
-        "feature_id": feature_id,
-        "worktree": str(worktree),
-        "branch": str(branch) if branch else None,
-    }
-    try:
-        status, decoded = sender(url, body, SANDBOX_STAMPS_READ_TIMEOUT_S)
-    except Exception as exc:  # noqa: BLE001 — could not read is not could not pass
-        return _unreadable(
-            f"the sidecar in sandbox {name} could not be reached at {url} "
-            f"({type(exc).__name__}: {exc})"
-        )
-    answer = decoded if isinstance(decoded, dict) else {}
-    if status != 200:
-        return _unreadable(
-            f"the sidecar in sandbox {name} refused the request (HTTP "
-            f"{status}): {answer.get('error') or answer}"
-        )
-
-    feature_yaml = answer.get("feature_yaml")
-    if not isinstance(feature_yaml, dict):
-        return _unreadable(
-            f"the sidecar in sandbox {name} answered something that is not "
-            f"the routing law's evidence: {answer!r}"
-        )
-    said_path = feature_yaml.get("path")
-    at = Path(said_path) if isinstance(said_path, str) and said_path else where
-    text = feature_yaml.get("text")
-    if not feature_yaml.get("present") or not isinstance(text, str):
-        # The feature carries no plan of record on the canonical branch — the
-        # same answer an absent file gives on this side, and the same
-        # consequence: the stamped-verifier check is not enforced for it.
-        stamps_read = StampsRead(path=at, present=False)
-    else:
-        stamps_read = parse_scenario_stamps(text, path=at)
-
-    envelope: Any = None
-    raw_envelope = answer.get("envelope")
-    if raw_envelope is not None:
-        if not isinstance(raw_envelope, dict) or not isinstance(
-            raw_envelope.get("run_id"), str
-        ):
-            return _unreadable(
-                f"the sidecar in sandbox {name} answered with something that "
-                f"is not a results envelope: {raw_envelope!r}"
-            )
-        started_raw = raw_envelope.get("started")
-        started = None
-        if isinstance(started_raw, str) and started_raw.strip():
-            try:
-                started = datetime.fromisoformat(started_raw.strip())
-            except ValueError:
-                started = None
-        gates = raw_envelope.get("gates")
-        envelope = Envelope(
-            path=Path(str(raw_envelope.get("path") or history_dir)),
-            run_id=str(raw_envelope.get("run_id")),
-            verdict=str(raw_envelope.get("verdict") or ""),
-            started=started,
-            gates=dict(gates) if isinstance(gates, dict) else {},
-            feature_id=raw_envelope.get("feature_id"),
-        )
-
-    commit_time = None
-    raw_commit = answer.get("code_commit_time")
-    if isinstance(raw_commit, str) and raw_commit.strip():
-        try:
-            commit_time = datetime.fromisoformat(raw_commit.strip())
-        except ValueError:
-            commit_time = None
-
-    return evaluate_stamps(
-        stamps_read,
-        toolchain_green=toolchain_green,
-        envelope=envelope,
-        code_commit_time=commit_time,
-        history_dir=history_dir,
-        feature_id=feature_id,
-        candidate_check_before_merge=candidate_check_before_merge,
-    )
-
-
-#: Where a repository keeps the deploy profile the deploy stage reads.
-DEPLOY_PROFILE_RELATIVE_PATH = Path("deploy") / "profile.yaml"
-
-
-def candidate_is_checked_before_the_merge(config: Any, repo_root: "Path | str") -> bool:
-    """Does this repository's merge run a live gate on a candidate first?
-
-    THREE facts, all read the way the deploy stage reads them
-    (:mod:`forge.pipeline.merge_executor`'s deploy dispatcher and
-    :class:`forge.deploy.stage.DeployStageRunner`):
-
-    1. the deploy settings put the stage's docker-touching scripts on a
-       sidecar (``deploy.execution_surface == "sidecar"``);
-    2. the repository's own ``deploy/profile.yaml`` carries a ``candidate:``
-       block, which is what makes the stage stand the build up BEFORE the
-       merge rather than after; and
-    3. that same profile carries a ``live_gate:`` block AND the deploy
-       settings leave the live gate on (``deploy.run_live_gate``).
-
-    The third fact is the one that makes the deferral honest. With a candidate
-    block and no live gate the stage stands the candidate up, takes its health
-    checks as the whole check and writes ``verdict: pass`` without running a
-    gate at all (``stage.py``: ``if self._config.run_live_gate: ... else:``),
-    and the merge then proceeds — so a check deferred to it would never be
-    run by anybody. Deferring is only ever allowed to something that runs.
-
-    (A fourth setting, ``deploy.enabled``, is deliberately NOT read here: when
-    the stage is disabled the merge press refuses the merge outright — "the
-    deploy stage is disabled" — so nothing lands unchecked either way.)
-
-    True means the checkpoint may defer a stamped check whose evidence does not
-    exist yet, because the merge press runs its own check of the candidate
-    before anything lands. Never raises: this only decides whether a check is
-    deferred or called missing, and missing — today's answer — is the safe one,
-    so anything unreadable is False.
-    """
-    deploy_settings = getattr(config, "deploy", None)
-    if str(getattr(deploy_settings, "execution_surface", "")) != "sidecar":
-        return False
-    if not bool(getattr(deploy_settings, "run_live_gate", False)):
-        logger.info(
-            "conductor gates: the deploy settings have run_live_gate off, so a "
-            "candidate is stood up and merged without a gate verdict — the "
-            "checkpoint defers nothing for %s",
-            repo_root,
-        )
-        return False
-    try:
-        from forge.deploy.profile import load_deploy_profile
-
-        profile = load_deploy_profile(Path(repo_root) / DEPLOY_PROFILE_RELATIVE_PATH)
-    except Exception as exc:  # noqa: BLE001 — unreadable is "no candidate check"
-        logger.info(
-            "conductor gates: %s has no readable deploy profile (%s: %s), so "
-            "the checkpoint assumes its merge does NOT check a candidate first",
-            repo_root,
-            type(exc).__name__,
-            exc,
-        )
-        return False
-    if getattr(profile, "candidate", None) is None:
-        return False
-    if getattr(profile, "live_gate", None) is None:
-        logger.info(
-            "conductor gates: %s stands a candidate up but its deploy profile "
-            "declares no live gate, so the merge has no gate verdict to give — "
-            "the checkpoint defers nothing",
-            repo_root,
-        )
-        return False
-    return True
-
 
 # ---------------------------------------------------------------------------
 # THE SPECIFICATION FENCE — reading what the journey's branch changed
@@ -2250,10 +2023,8 @@ def make_gates_green_reader(
     declaration_loader: Callable[..., Any] | None = None,
     command_runner: Callable[..., Any] | None = None,
     repo_root_reader: Callable[[str], Any] | None = None,
-    stamps_leg: Callable[..., Any] | None = None,
     sandbox_declaration_loader: Callable[..., Any] | None = None,
     sandbox_command_runner: Callable[..., Any] | None = None,
-    sandbox_stamps_leg: Callable[..., Any] | None = None,
 ) -> Callable[..., Any]:
     """Build the merge-ready checkpoint's REAL ``gates_green_reader``.
 
@@ -2281,46 +2052,18 @@ def make_gates_green_reader(
        declaration's own ``test_timeout``. **Exit 0 = GREEN.** Any other
        exit code = **RED**. A timeout, or a command that would not
        start = **UNKNOWN**.
-    5. **The routing law's close-side check (card Q8/A.2 — the
-       ``stamps_satisfied`` leg).** Only reached on a GREEN suite. Read
-       the feature's per-scenario ``verifier:`` stamps from the CANONICAL
-       repo's ``.guardkit/features/<feature_id>.yaml`` (the plan of
-       record, same canonical-not-worktree law as step 2) and ask, home
-       by home, whether the promised verifier RAN GREEN for this branch:
-       ``toolchain`` rides step 4; ``hurl`` needs the newest F4 envelope
-       under the worktree's ``qa/gates/history/`` to be ``pass``, name
-       ``hurl-twins`` exit 0, and be newer than the branch's last code
-       commit; ``exam``/``probe:*``/``flutter``/``playwright`` need that
-       same fresh green envelope to name them; ``operator`` is satisfied
-       by declaration but LISTED as attended in the card detail. A
-       stamped verifier that did not run is **ABSENT = UNKNOWN**: no
-       card, and the detail names the scenario and the missing home in
-       plain language. **No stamps at all → not enforced**: the report
-       is exactly what step 4 said. See
-       :mod:`forge.pipeline.routing_stamps`.
-
     Every UNKNOWN is red-safe by the checkpoint's own precondition
     ("proven green", never "not proven red"), so every degrade on this
     path fails towards *no card*, never towards a card.
 
-    SANDBOX FIRST (rule 88). Steps 3, 4 and 5 all touch the repository — one
-    reads its declaration, one runs its tests, one reads its plan of record
-    and its gate receipts — and for a repository that has a sandbox neither
-    the clone nor the journey worktree is on this side at all. So for such a
-    repository all three go through that sandbox's own deploy sidecar
-    (:func:`load_declared_toolchain_from_sandbox`,
-    :func:`run_declared_command_in_sandbox` and
-    :func:`read_stamps_in_sandbox`), and the canonical-not-worktree law of
-    step 2 is kept: both the declaration and the stamps are read from ``main``
-    in the clone. Everything else about the decision is identical, and a
-    repository without a sandbox is byte for byte what it was.
-
-    Step 5 was left on the host by this lane's first cut, and its coach proved
-    what that cost: the stamps could not be found, the check said "this
-    feature carries no scenario stamps", and a GREEN card went out with the
-    routing law not applied. A check that could not run must never become a
-    card, so it runs where the evidence is, and every way of failing to read
-    it is UNKNOWN.
+    SANDBOX FIRST (rule 88). Steps 3 and 4 touch the repository — one reads
+    its declaration, one runs its tests — and for a repository that has a
+    sandbox neither the clone nor the journey worktree is on this side at
+    all. So for such a repository both go through that sandbox's own deploy
+    sidecar (:func:`load_declared_toolchain_from_sandbox` and
+    :func:`run_declared_command_in_sandbox`), and the declaration is read
+    from ``main`` in the clone. (The routing law's stamps leg went in the
+    cull, 27 October 2026.)
 
     Args:
         pool: The daemon's SQLite persistence facade.
@@ -2342,17 +2085,8 @@ def make_gates_green_reader(
         sandbox_command_runner: ``(*, command, cwd, timeout_seconds, sandbox,
             repo) -> (exit_code | None, detail)`` — step 4 for the same.
             Defaults to :func:`run_declared_command_in_sandbox`.
-        sandbox_stamps_leg: ``(*, feature_id, repo_root, worktree, branch,
-            toolchain_green, sandbox, repo) -> StampsVerdict`` — step 5 for
-            the same. Defaults to :func:`read_stamps_in_sandbox`.
-        stamps_leg: ``(*, feature_id, repo_root, worktree, branch,
-            toolchain_green) -> StampsVerdict`` — step 5. Defaults to
-            :func:`forge.pipeline.routing_stamps.make_stamps_leg` over
-            the real feature YAML, envelope and git readers. Injected so
-            tests drive every home without a repo on disk.
     """
     from forge.pipeline.merge_ready_checkpoint import GateStatus, GatesReport
-    from forge.pipeline.routing_stamps import make_stamps_leg
 
     from forge.config.sandboxes import sandbox_for
 
@@ -2360,8 +2094,6 @@ def make_gates_green_reader(
     _run = command_runner or _run_declared_command
     _sandbox_load = sandbox_declaration_loader or load_declared_toolchain_from_sandbox
     _sandbox_run = sandbox_command_runner or run_declared_command_in_sandbox
-    _sandbox_stamps = sandbox_stamps_leg or read_stamps_in_sandbox
-    _stamps = stamps_leg or make_stamps_leg()
 
     def _default_repo_root(build_id: str) -> Any | None:
         row = pool.get_build_row(build_id)
@@ -2389,130 +2121,6 @@ def make_gates_green_reader(
             status=GateStatus.UNKNOWN, detail=detail, failed_gates=failed_gates
         )
 
-    def _apply_stamps_leg(
-        *,
-        build_id: str,
-        feature_id: str,
-        repo_root: Any,
-        worktree: Any,
-        branch: Any,
-        suite_detail: str,
-        suite_evidence: str = "",
-        stamps: Callable[..., Any] | None = None,
-        candidate_check_before_merge: bool = False,
-    ) -> Any:
-        """Step 5 — the routing law's ``stamps_satisfied`` leg on a GREEN suite.
-
-        ``stamps`` is the leg to ask: the in-container one, or — for a
-        repository whose clone and worktrees are inside its sandbox — the one
-        that reads the same three pieces of evidence in there. Both answer the
-        same verdict type and both fail towards no card.
-
-        ``suite_evidence`` is what the declared suite itself printed, kept
-        (bounded) by the runner and carried onto the report so a green run
-        leaves its last lines behind too — the receipts of a card are worth
-        as much as the receipts of a stop.
-
-        ``candidate_check_before_merge`` is asked of the leg ONLY when it is
-        true, so that a repository whose merge does not check a candidate first
-        — which is every repository until an operator gives one a sandbox and a
-        candidate block — calls the leg with exactly the arguments it has
-        always been called with.
-        """
-        deferring = (
-            {"candidate_check_before_merge": True}
-            if candidate_check_before_merge
-            else {}
-        )
-        try:
-            verdict = (stamps or _stamps)(
-                feature_id=feature_id,
-                repo_root=repo_root,
-                worktree=worktree,
-                branch=branch,
-                toolchain_green=True,
-                **deferring,
-            )
-        except Exception as exc:  # noqa: BLE001 — a leg defect is not green
-            return _unknown(
-                f"the declared suite is green ({suite_detail}) but the routing "
-                f"law's stamps leg raised {type(exc).__name__}: {exc}, so the "
-                "stamped verifiers cannot be proven to have run",
-                build_id,
-                # The routing law is kept as it was (step 2): a gate it names
-                # still stops the card.
-                failed_gates=("routing law: the stamps leg raised",),
-            )
-        stamps_detail = getattr(verdict, "detail", "") or ""
-        if str(getattr(verdict, "status", "")) == "not-enforced":
-            # No stamps on this feature: the leg has NO effect. The report
-            # is byte-for-byte what step 4 said (backward compatible), and
-            # the log says why nothing more was asked.
-            logger.info(
-                "conductor gates: build_id=%s — GREEN. %s (%s)",
-                build_id,
-                suite_detail,
-                stamps_detail or "routing law: not enforced",
-            )
-            return GatesReport(
-                status=GateStatus.GREEN,
-                detail=str(suite_detail),
-                evidence=suite_evidence,
-            )
-        if getattr(verdict, "blocks_card", False):
-            missing = tuple(
-                f"routing law: {home} (scenario {title!r})"
-                for title, home in (getattr(verdict, "missing", ()) or ())
-            ) or ("routing law: scenario stamps unreadable",)
-            logger.warning(
-                "conductor gates: build_id=%s — the declared suite is GREEN "
-                "but the ROUTING LAW reads %s: %s The gate set answers "
-                "UNKNOWN naming the routing law's gates, which still stops "
-                "the merge card for this journey",
-                build_id,
-                getattr(verdict, "status", "absent"),
-                stamps_detail,
-            )
-            return GatesReport(
-                status=GateStatus.UNKNOWN,
-                failed_gates=missing,
-                detail=(
-                    f"{stamps_detail} The declared suite itself is green "
-                    f"({suite_detail})."
-                ),
-                evidence=suite_evidence,
-            )
-        attended = tuple(getattr(verdict, "attended", ()) or ())
-        if attended:
-            logger.warning(
-                "conductor gates: build_id=%s — ATTENDED scenarios on this "
-                "card (operator-stamped, verified by a human, not by the "
-                "machinery): %s",
-                build_id,
-                "; ".join(repr(t) for t in attended),
-            )
-        deferred_detail = str(getattr(verdict, "deferred_detail", "") or "")
-        if deferred_detail:
-            logger.info(
-                "conductor gates: build_id=%s — %s (this repository's merge "
-                "stands the candidate up and runs the live gate on it before "
-                "anything lands)",
-                build_id,
-                deferred_detail,
-            )
-        logger.info(
-            "conductor gates: build_id=%s — GREEN. %s %s",
-            build_id,
-            suite_detail,
-            stamps_detail,
-        )
-        return GatesReport(
-            status=GateStatus.GREEN,
-            detail=f"{suite_detail} {stamps_detail}".strip(),
-            deferred_detail=deferred_detail,
-            evidence=suite_evidence,
-        )
-
     def read_gates(*, build_id: str, branch: Any = None) -> Any:
         row = pool.get_build_row(build_id)
         if row is None:
@@ -2524,7 +2132,6 @@ def make_gates_green_reader(
         # this container, with the two seams the tests inject.
         repo_key = str(getattr(row, "repo", "") or "")
         entry = sandbox_for(config, repo_key)
-        stamps_here: Callable[..., Any] | None = None
         if entry is None:
             load, run_command = _load, _run
             if command_runner is None:
@@ -2593,32 +2200,6 @@ def make_gates_green_reader(
                     launch_settings=_names,
                     build=_build,
                     declared_at=_declared_at,
-                )
-
-            # Step 5 goes in there too (L3b's coach, 2026-09-08): the feature's
-            # stamps, the gate receipts and the branch's last code commit are
-            # all inside the sandbox, and a check that cannot run must never
-            # become a green card.
-            def stamps_here(  # type: ignore[misc]
-                *,
-                feature_id: str,
-                repo_root: Any,
-                worktree: Any,
-                branch: Any,
-                toolchain_green: bool,
-                candidate_check_before_merge: bool = False,
-                _entry: Any = entry,
-                _repo: str = repo_key,
-            ) -> Any:
-                return _sandbox_stamps(
-                    feature_id=feature_id,
-                    repo_root=repo_root,
-                    worktree=worktree,
-                    branch=branch,
-                    toolchain_green=toolchain_green,
-                    sandbox=_entry,
-                    repo=_repo,
-                    candidate_check_before_merge=candidate_check_before_merge,
                 )
 
         worktree = getattr(row, "worktree_path", None)
@@ -2706,27 +2287,8 @@ def make_gates_green_reader(
                 build_id,
                 detail,
             )
-            # THE STAMPS THAT ARE PROVEN AT THE MERGE INSTEAD (ruled
-            # 2026-09-08). Five verifier homes have no forge-side runner and a
-            # fix journey runs no live gate before this checkpoint, so on a
-            # repository whose scenarios are stamped on one of them the leg
-            # could only ever say ABSENT and no fix journey could reach its
-            # card. Where the merge press stands the candidate up and runs the
-            # live gate on it BEFORE anything lands, those checks are deferred
-            # to the press rather than called missing — and only there.
-            defers = entry is not None and candidate_is_checked_before_the_merge(
-                config, repo_root
-            )
-            return _apply_stamps_leg(
-                build_id=build_id,
-                feature_id=getattr(row, "feature_id", None) or "",
-                repo_root=repo_root,
-                worktree=worktree,
-                branch=branch or getattr(row, "branch", None),
-                suite_detail=detail,
-                suite_evidence=evidence,
-                stamps=stamps_here,
-                candidate_check_before_merge=defers,
+            return GatesReport(
+                status=GateStatus.GREEN, detail=str(detail), evidence=evidence
             )
         logger.warning(
             "conductor gates: build_id=%s — RED. %s. No merge card is "

@@ -259,12 +259,9 @@ def test_a_good_mission_upper_cases_keys_and_needs() -> None:
             ],
             "circle",
         ),
-        ([{"key": "A", "needs": ["Z"], "sentence": "x"}], "not in this mission"),
-        ([{"key": f"K{i}", "sentence": "x"} for i in range(21)], "between 1 and 20"),
-        ([], "between 1 and 20"),
+        ([], "no features"),
         ([{"key": "A", "sentence": "x"}, {"key": "a", "sentence": "y"}], "used twice"),
         ([{"key": "A", "sentence": "   "}], "no sentence"),
-        ([{"key": "A-1", "sentence": "x"}], "not a usable key"),
         ([{"key": "A", "needs": ["A"], "sentence": "x"}], "circle"),
     ],
 )
@@ -272,18 +269,6 @@ def test_a_bad_mission_gets_one_sentence(features: list[Any], words: str) -> Non
     refusal = validate_mission(_command(features=features), mission_correlation_id=CID)
     assert isinstance(refusal, str) and words in refusal
 
-
-def test_a_mission_whose_attempt_id_would_be_too_long_is_refused() -> None:
-    long_cid = "c" * 120
-    refusal = validate_mission(
-        _command(features=[{"key": "ABCDEFGHIJKL", "sentence": "x"}]),
-        mission_correlation_id=long_cid,
-    )
-    assert isinstance(refusal, str) and "too long" in refusal
-    fine = validate_mission(
-        _command(features=[{"key": "A", "sentence": "x"}]), mission_correlation_id=long_cid
-    )
-    assert not isinstance(fine, str)
 
 
 def test_the_plan_card_lists_the_waves_and_the_no_sign_in_note(cx) -> None:
@@ -401,11 +386,11 @@ async def test_the_intake_answers_switched_off_and_refusals_in_one_sentence(cx) 
         msg, _intake_deps(cx, _FakeFlow(missions), enabled=False, said=said)
     )
     assert msg.acked and said == ["That mission was not started: missions are switched off."]
-    msg = _message(_command(features=[{"key": "A", "needs": ["Q"], "sentence": "x"}]))
+    msg = _message(_command(features=[{"key": "A", "needs": ["A"], "sentence": "x"}]))
     await handle_planning_message(
         msg, _intake_deps(cx, _FakeFlow(missions), enabled=True, said=said)
     )
-    assert msg.acked and "not in this mission" in said[-1]
+    assert msg.acked and "circle" in said[-1]
     msg = _message(_command(), target_repo="no-such-project")
     await handle_planning_message(
         msg, _intake_deps(cx, _FakeFlow(missions), enabled=True, said=said)

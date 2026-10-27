@@ -502,46 +502,39 @@ def test_feature_file_rel_finds_the_projected_feature() -> None:
 # ---- poison: a missing suffix file is invalid-artifacts (None) -------------
 
 
-def test_spec_triple_missing_a_suffix_file_is_none() -> None:
+def test_spec_triple_missing_a_summary_still_commits_the_rest() -> None:
+    """Only the .feature is needed (the cull, 27 October 2026): a reply
+    without its summary commits what came."""
     native = _clean_native_map()
-    del native["uptime-endpoint_summary.md"]  # drop one leg of the triple
+    del native["uptime-endpoint_summary.md"]
+    slug = PlanningRunDriver._slug_of(native, "CID-123")
+    files = PlanningRunDriver._spec_triple_files(native, slug)
+    assert files is not None
+    assert any(name.endswith(".feature") for name in files)
+    assert not any(name.endswith("_summary.md") for name in files)
+
+
+def test_spec_triple_without_a_feature_is_none() -> None:
+    native = {
+        name: content
+        for name, content in _clean_native_map().items()
+        if not str(name).endswith(".feature")
+    }
     slug = PlanningRunDriver._slug_of(native, "CID-123")
     assert PlanningRunDriver._spec_triple_files(native, slug) is None
 
 
-def test_spec_triple_duplicate_suffix_is_none() -> None:
+def test_spec_triple_duplicate_suffix_takes_the_first() -> None:
     native = _clean_native_map()
     native["other-endpoint.feature"] = "Feature: other\n"  # a second .feature
     slug = PlanningRunDriver._slug_of(native, "CID-123")
-    assert PlanningRunDriver._spec_triple_files(native, slug) is None
+    files = PlanningRunDriver._spec_triple_files(native, slug)
+    assert files is not None
+    assert sum(1 for name in files if name.endswith(".feature")) == 1
 
 
 # ---- VALIDATION CHANNEL (ADVISORY): errors surfaced verbatim, oracles decide
 
-
-def test_real_validation_json_with_errors_is_surfaced_verbatim() -> None:
-    """The REAL B4 gold set carried accepted=false — the extractor surfaces the
-    self-check errors verbatim so the leg can WARN loudly (advisory posture:
-    the normalizer/validate oracles decide; C5 revision re-invoke = follow-on)."""
-    native = _load_real_native_map()  # the REAL (accepted:false) channel
-    failures = PlanningRunDriver._validation_failures(native)
-    assert failures  # non-empty => the leg fails loudly
-    assert any("@negative" in f for f in failures)
-
-
-def test_clean_validation_channel_proceeds() -> None:
-    assert PlanningRunDriver._validation_failures(_clean_native_map()) == []
-
-
-def test_absent_validation_channel_proceeds() -> None:
-    assert PlanningRunDriver._validation_failures({"x.feature": "Feature: x\n"}) == []
-
-
-def test_unparseable_validation_json_is_surfaced() -> None:
-    failures = PlanningRunDriver._validation_failures(
-        {"validation.json": "{not json"}
-    )
-    assert failures and "not parseable" in failures[0]
 
 
 # ---- 008: the native plan tree is already repo-relative paths --------------
@@ -577,14 +570,6 @@ def test_plan_tree_native_carries_a_feature_yaml_for_build_trigger() -> None:
     assert files is not None
     assert any(f.endswith(".yaml") and "features/" in f for f in files)
 
-
-def test_plan_validation_errors_are_surfaced_verbatim() -> None:
-    poisoned = dict(_PLAN_NATIVE_MAP)
-    poisoned["validation.json"] = json.dumps(
-        {"accepted": False, "errors": ["ungated waves without an activation notice"]}
-    )
-    failures = PlanningRunDriver._validation_failures(poisoned)
-    assert failures == ["ungated waves without an activation notice"]
 
 
 def test_plan_tree_empty_map_is_none() -> None:
@@ -632,12 +617,6 @@ def test_wire_true_spec_triple_projects_end_to_end() -> None:
         "features/uptime-endpoint/uptime-endpoint_summary.md",
     }
 
-
-def test_wire_true_validation_channel_extracts_the_real_error() -> None:
-    wire = _load_wire_reply()
-    ro = PlanningRunDriver._role_output_of(SimpleNamespace(role_output=wire))
-    failures = PlanningRunDriver._validation_failures(ro)
-    assert any("@negative" in f for f in failures)
 
 
 def test_the_coachs_ground_truth_rides_only_when_given() -> None:

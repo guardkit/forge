@@ -18,10 +18,7 @@ discipline (concern ``sc_002`` from TASK-REV-3EEE). The flow is, in order:
    :func:`forge.lifecycle.identifiers.validate_feature_id` (concern
    ``sc_003``). On :class:`InvalidIdentifierError` we exit ``4`` *before*
    any SQLite write or NATS publish runs — no side effects.
-2. **Allowlist check** — refuse with exit ``2`` when ``--repo`` is not in
-   ``ForgeConfig.queue.repo_allowlist`` (Group C "path-allowlist
-   refused"). An empty allowlist (the schema default) means "no
-   restriction" per :class:`forge.config.models.QueueConfig`.
+2. (The ``queue.repo_allowlist`` check went in the cull, 27 October 2026.)
 3. **Merge defaults** — CLI flags override ``ForgeConfig.queue.default_*``.
 4. **Build the wire payload** —
    :class:`nats_core.events.BuildQueuedPayload` with
@@ -255,20 +252,6 @@ def _resolved_db_path() -> Path:
     return Path(raw_path).expanduser() if raw_path else DEFAULT_DB_PATH.expanduser()
 
 
-def _planning_handoff_retirement_preflight(db_path: Path) -> frozenset[str]:
-    """Run the shared read-only retirement preflight.
-
-    Kept as a module-level seam so CLI tests can remain hermetic without a
-    real Forge database. Production always uses the canonical lifecycle helper.
-    """
-
-    from forge.lifecycle.planning_handoff_preflight import (
-        preflight_retired_planning_handoff_correlations,
-    )
-
-    return preflight_retired_planning_handoff_correlations(db_path)
-
-
 # ---------------------------------------------------------------------------
 # Module-level seams (mockable in tests)
 # ---------------------------------------------------------------------------
@@ -309,52 +292,6 @@ def make_persistence(config: ForgeConfig) -> _PersistenceLike:
     # WAL-mode tuning) plumb new fields without breaking the seam.
     _ = config
     return SqliteLifecyclePersistence(connection=connection, db_path=db_path)
-
-
-def _planning_handoff_retirement_after_migration(
-    persistence: _PersistenceLike,
-) -> frozenset[str]:
-    """Validate the migrated ledger on the persistence writer connection."""
-
-    from forge.lifecycle.planning_handoff_retirement import (
-        retired_planning_handoff_correlations,
-    )
-
-    connection = getattr(persistence, "connection", None)
-    if connection is None:
-        raise RuntimeError(
-            "queue persistence does not expose its migrated SQLite connection"
-        )
-    return retired_planning_handoff_correlations(connection)
-
-
-def _close_persistence_connection(persistence: _PersistenceLike) -> None:
-    """Close a refused queue command's writer without masking its refusal."""
-
-    connection = getattr(persistence, "connection", None)
-    if connection is None:
-        return
-    try:
-        connection.close()
-    except Exception as exc:  # pragma: no cover - best-effort diagnostic
-        logger.warning(
-            "forge queue: could not close refused persistence connection (%s)",
-            exc,
-        )
-
-
-def _make_validated_persistence(
-    config: ForgeConfig,
-) -> tuple[_PersistenceLike, frozenset[str]]:
-    """Create one persistence facade and validate its post-migration ledger."""
-
-    persistence = make_persistence(config)
-    try:
-        retired = _planning_handoff_retirement_after_migration(persistence)
-    except Exception:
-        _close_persistence_connection(persistence)
-        raise
-    return persistence, retired
 
 
 def publish(subject: str, body: bytes) -> None:
@@ -421,18 +358,6 @@ def _resolve_originating_user() -> str | None:
     except OSError:
         return os.environ.get("USER") or os.environ.get("LOGNAME") or None
 
-
-def _path_in_allowlist(repo: Path, allowlist: list[Path]) -> bool:
-    """Return ``True`` when ``repo`` matches an entry in ``allowlist``.
-
-    One statement, two callers: the rule itself lives in
-    :func:`forge.pipeline.fix_admission.path_in_allowlist`, because the work
-    queue's in-process admission has to apply exactly the same allowlist
-    this command does.
-    """
-    from forge.pipeline.fix_admission import path_in_allowlist
-
-    return path_in_allowlist(repo, allowlist)
 
 
 def _path_to_repo_slug(repo: Path) -> str:
@@ -537,7 +462,6 @@ _FIX_REFUSAL_EXIT_CODES: dict[str, int] = {
     "cap": EXIT_MODE_USAGE,
     "task-id": EXIT_INVALID_IDENTIFIER,
     "parent-feature": EXIT_INVALID_IDENTIFIER,
-    "repo-not-allowed": EXIT_PATH_REFUSED,
     "duplicate": EXIT_DUPLICATE,
     "repair-task": EXIT_PUBLISH_FAILED,
 }
@@ -964,7 +888,7 @@ def queue_cmd(
     rendered = ", ".join(
         f"{name}={value}"
         + (
-            " (dormant — coach-score feed pending, ADR-ARCH-033)"
+            " (no longer read)"
             if name == "min_coach_score"
             else ""
         )
@@ -1021,15 +945,7 @@ def queue_cmd(
             )
             sys.exit(EXIT_INVALID_IDENTIFIER)
 
-    # 2. Allowlist check (AC-004 / Group C "path-allowlist refused").
     repo_path = Path(repo)
-    if not _path_in_allowlist(repo_path, config.queue.repo_allowlist):
-        click.echo(
-            f"Repository {repo!r} is not in queue.repo_allowlist; "
-            "refusing to enqueue (Group C path-allowlist refused).",
-            err=True,
-        )
-        sys.exit(EXIT_PATH_REFUSED)
 
     # 3. Merge defaults (AC-005).
     effective_max_turns = (
@@ -1042,51 +958,7 @@ def queue_cmd(
     )
     effective_correlation_id = correlation_id or str(uuid.uuid4())
 
-    # Retirement is checked through a read-only handle before make_persistence
-    # can create directories, open a writer or apply migrations. A receipt-free
-    # legacy database retains the ordinary migration path; selected retirement
-    # history is always validated by the canonical shared reader.
-    try:
-        retired_handoffs = _planning_handoff_retirement_preflight(
-            _resolved_db_path()
-        )
-    except Exception as exc:
-        click.echo(
-            "Nothing was queued: planning handoff retirement history could "
-            f"not be validated ({type(exc).__name__}: {exc}).",
-            err=True,
-        )
-        sys.exit(EXIT_PUBLISH_FAILED)
-    if effective_correlation_id in retired_handoffs:
-        click.echo(
-            "Nothing was queued: planning handoff was permanently retired "
-            "before routing.",
-            err=True,
-        )
-        sys.exit(EXIT_PUBLISH_FAILED)
-
-    # Construct one persistence facade after the read-only preflight, migrate
-    # through its writer, then validate the resulting v18 ledger on that same
-    # connection before either queue path can create a row, seed, model call or
-    # publication. This second authoritative snapshot also closes the race in
-    # which a retirement becomes visible after the read-only preflight.
-    try:
-        persistence, retired_handoffs = _make_validated_persistence(config)
-    except Exception as exc:
-        click.echo(
-            "Nothing was queued: planning handoff retirement history could "
-            f"not be validated after migration ({type(exc).__name__}: {exc}).",
-            err=True,
-        )
-        sys.exit(EXIT_PUBLISH_FAILED)
-    if effective_correlation_id in retired_handoffs:
-        _close_persistence_connection(persistence)
-        click.echo(
-            "Nothing was queued: planning handoff was permanently retired "
-            "before routing.",
-            err=True,
-        )
-        sys.exit(EXIT_PUBLISH_FAILED)
+    persistence = make_persistence(config)
 
     # 3c. THE FIX JOURNEY GOES THROUGH THE SHARED ADMISSION.
     #     Everything a fix journey needs — the cap law, the TASK-id check,
@@ -1137,9 +1009,6 @@ def queue_cmd(
         mode=build_mode.value,
         task_id=task_id,
     )
-
-    # 5. The persistence facade was constructed after the read-only retirement
-    #    preflight above (production: SQLite; tests: monkey-patched fake).
 
     # 6. Active in-flight check (Group C "active duplicate").
     if persistence.exists_active_build(feature_id):

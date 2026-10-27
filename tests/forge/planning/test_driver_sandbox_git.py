@@ -29,7 +29,6 @@ import logging
 import subprocess
 import threading
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -43,45 +42,32 @@ from forge.deploy_sidecar.service import (
 )
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.lifecycle import migrations
-from forge.planning.driver import PlanningRunDriver
 from forge.planning.run_store import SqlitePlanningRunStore
 from forge.planning.sidecar_git_runner import CLOSURE_REFUSED_SENTENCE, SidecarGitRunner
 from forge.planning.states import PlanningState
 
 from tests.forge.deploy_sidecar._fake_guardkit import (
     NORMALIZED_MARKER,
-    REFUSED_TITLES,
-    classify_calls,
     fake_normalizer,
     git_show,
-    normalize_calls,
     normalizer_calls,
-    qa_validate_calls,
-    validate_calls,
     write_fake_guardkit,
 )
 from tests.forge.planning.test_driver_target_terminal import (
     CID,
     _ROUND19_SEED_AUTHLESS,
-    _approved_spec_rows,
     _commit_repo_routing_law,
     _drive_to_failure,
-    _git_env,
     _error_cards,
     _init_scratch_repo,
     _leg_details,
     _make_driver,
-    _plan_result,
     _plan_result_native,
     _plan_result_native_versions,
     _plan_yaml_rel,
     _queue,
     _recorded_runner,
-    _rewritten_spec_result,
-    _semantic_review_json,
     _seed_gate_surface,
-    _spec_by_round,
-    _spec_result_native,
     _spec_result_with_seed,
 )
 
@@ -245,382 +231,6 @@ def _driver(store: SqlitePlanningRunStore, sandbox_repo, **kwargs: Any):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.asyncio
-async def test_the_plan_legs_checks_run_in_the_sandbox_and_the_stamps_ride_the_commit(
-    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path, caplog
-) -> None:
-    """A clean run: the plan leg declares the two checks instead of running
-    them, the sidecar runs them in ITS worktree in order, the stamps the
-    normalizer wrote ride the plan commit, and the receipt says the first
-    stamping ran by rule only — the same words as when the checks run here."""
-    repo, _, _ = sandbox_repo
-    _queue(store)
-    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-
-    # (1) The checks ran in the sandbox's worktree, in order, with the
-    #     normalizer first and the model switched off on the first stamping.
-    normalizes = normalize_calls(fake_guardkit)
-    assert len(normalizes) == 1 and "--no-model" in normalizes[0]
-    assert len(validate_calls(fake_guardkit)) == 1
-
-    # (2) The driver said out loud that it declared them rather than ran them.
-    declared = [
-        r.getMessage()
-        for r in caplog.records
-        if "the plan leg's pre-commit checks" in r.getMessage()
-    ]
-    assert declared and "normalize-stamps(blocking, --no-model)" in declared[0]
-    # Advice since step 2 (26 October 2026, census FRG-082).
-    assert "feature-validate(not blocking)" in declared[0]
-
-    # (3) The stamps the sandbox wrote are on the planning branch.
-    feature_id = _leg_details(store, "feature-plan")["feature_id"]
-    committed = git_show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)) or ""
-    assert 'verifier: "hurl"' in committed
-
-    # (4) The receipt is the one the closure writes.
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert receipt["status"] == "written"
-    assert receipt["rules_only"] is True
-    assert receipt["stamped"] == {"ok": "hurl"}
-    assert receipt["enforcement"] == "enforced"
-    # The sidecar normalizer changed the tree after the first approval. Forge
-    # sent the exact committed tree through the existing Coach-only review once
-    # and stored that decision, bound to those bytes. Nothing rewrites the tree
-    # after that review.
-    # There are exactly two real mutations: Forge first fills feature_files,
-    # then the sidecar appends stamps. Each changed tree is reviewed once.
-    assert h.ctx["counters"]["semantic_rereview"] == 2
-    first_reviewed, final_reviewed = h.ctx["counters"]["plan_revisions"]
-    assert "feature_files:" in first_reviewed[_plan_yaml_rel(feature_id)]
-    assert "scenarios:" not in first_reviewed[_plan_yaml_rel(feature_id)]
-    assert final_reviewed[_plan_yaml_rel(feature_id)] == committed
-    semantic = _leg_details(store, "feature-plan")["semantic_review"]
-    assert semantic["reviewed_after_rewrite"] is True
-    assert semantic["artifact_identity"] == PlanningRunDriver._plan_artifact_identity(
-        final_reviewed
-    )
-    assert _error_cards(h) == []
-
-
-@pytest.mark.asyncio
-async def test_sidecar_normalizer_review_refusal_is_advice_and_the_plan_goes_on(
-    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path
-) -> None:
-    """A mutating declared check cannot inherit the pre-normalization receipt.
-
-    The sidecar has already made the immutable plan commit when Forge can ask
-    the async specialist to judge its exact bytes. A refused review is advice
-    (step 2, 27 October 2026): the committed plan carries on, and the build
-    card says the reviewer did not approve it, with its objection.
-    """
-    repo, _, _ = sandbox_repo
-    _queue(store)
-
-    async def reviewer(**kwargs: Any) -> Any:
-        revision = kwargs.get("revision_of")
-        if revision is None:
-            return _plan_result_native(kwargs["feature_id"])
-        plan_yaml = revision[_plan_yaml_rel(kwargs["feature_id"])]
-        if "scenarios:" not in plan_yaml:
-            return _plan_result(
-                kwargs["feature_id"],
-                dict(revision),
-                reviewed_after_rewrite=True,
-            )
-        return SimpleNamespace(
-            outcome=SimpleNamespace(value="error"),
-            role_output={},
-            # The specialist's own wording for a refused exact review.
-            reason=(
-                "Command 'feature_plan' failed: architect_feature_plan exact "
-                "semantic re-review refused: Coach refused normalized tree"
-            ),
-        )
-
-    h = _driver(store, sandbox_repo, plan_dispatch=reviewer)
-
-    assert await _drive_to_failure(h, store) != PlanningState.FAILED.value
-    assert len(normalize_calls(fake_guardkit)) == 1
-    assert _plan_yaml_on_branch(repo, f"planning/{CID}")
-    note = _leg_details(store, "feature-plan")["plan_review_note"]
-    assert "did not approve this plan" in note
-    assert "Coach refused normalized tree" in note
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("case", ["as-recorded", "spec-without-sha", "main-moved"])
-async def test_a_recovered_plan_from_the_final_review_after_the_commit_reaches_handoff(
-    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path, case: str, caplog
-) -> None:
-    """The final review of the committed, normalized tree answers with the
-    plan writer's one ordinary-plan recovery (code review R2 and R3, finding 2
-    and 12, 25 October 2026). That plan goes through the same normalization,
-    validation and plan write, on a branch of its own, and its committed files
-    and commit are what is handed off. The audit commit of the first plan
-    stays where it was.
-
-    One commit is used both to cut the recovered branch and to read its
-    settings: the approved spec's commit, or the run's start commit when the
-    spec's record names none (``spec-without-sha``: a bookkeeping gap, said as
-    advice, and the spec's files are carried). ``main-moved``: main changes
-    its routing setting before the recovered branch's settings are read; the
-    branch's own commit still governs."""
-    from forge.planning.driver import BuildTriggerResult
-
-    repo, _, _ = sandbox_repo
-    _queue(store)
-    state = {"recovered": False}
-    if case == "spec-without-sha":
-        real_record = store._record_event
-
-        def without_the_spec_commit(**kwargs: Any) -> Any:
-            if (
-                kwargs.get("stage_label") == "feature-spec"
-                and kwargs.get("status") == "approved"
-            ):
-                details = json.loads(kwargs["details_json"])
-                details.pop("sha", None)
-                kwargs["details_json"] = json.dumps(details)
-            return real_record(**kwargs)
-
-        store._record_event = without_the_spec_commit  # type: ignore[method-assign]
-
-    def _recovered(feature_id: str) -> Any:
-        role_output = {
-            f".guardkit/features/{feature_id}.yaml": (
-                f"id: {feature_id}\ntasks:\n- id: TASK-RECOVERED-001\n"
-            ),
-            "tasks/backlog/stats-endpoint/TASK-RECOVERED-001.md": "# recovered\n",
-            "validation.json": json.dumps(
-                {"accepted": True, "errors": [], "gates_run": ["feature_validate"]}
-            ),
-        }
-        plan_files = PlanningRunDriver._plan_tree_files(role_output)
-        assert plan_files is not None
-        role_output["semantic_review.json"] = _semantic_review_json(plan_files)
-        return SimpleNamespace(
-            outcome=SimpleNamespace(value="completed"),
-            role_output=role_output,
-            reason=None,
-        )
-
-    async def reviewer(**kwargs: Any) -> Any:
-        revision = kwargs.get("revision_of")
-        if revision is None:
-            return _plan_result_native(kwargs["feature_id"])
-        plan_yaml = revision[_plan_yaml_rel(kwargs["feature_id"])]
-        if "scenarios:" in plan_yaml and not state["recovered"]:
-            # The retained objection at final review, recovered by the
-            # specialist with its one ordinary plan.
-            state["recovered"] = True
-            if case == "main-moved":
-                _commit_repo_routing_law(repo, "off")
-            return _recovered(kwargs["feature_id"])
-        return _plan_result(
-            kwargs["feature_id"], dict(revision), reviewed_after_rewrite=True
-        )
-
-    triggered: list[dict[str, Any]] = []
-
-    async def trigger(**kwargs: Any) -> Any:
-        triggered.append(kwargs)
-        return BuildTriggerResult(queued=True, build_id="build-1")
-
-    h = _driver(store, sandbox_repo, plan_dispatch=reviewer, build_trigger_fn=trigger)
-    with caplog.at_level(logging.INFO, logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-
-    recovered_branch = f"planning/{CID}-recovered"
-    plan = _leg_details(store, "feature-plan")
-    assert plan["branch"] == recovered_branch
-    assert "tasks/backlog/stats-endpoint/TASK-RECOVERED-001.md" in plan["plan_files"]
-    # The handed-off commit is the recovered plan's, on its branch (later
-    # planning steps may add commits on top).
-    assert subprocess.run(
-        ["git", "merge-base", "--is-ancestor", plan["sha"], recovered_branch],
-        cwd=repo,
-    ).returncode == 0
-    assert "tasks/backlog/stats-endpoint/TASK-RECOVERED-001.md" in subprocess.run(
-        ["git", "ls-tree", "-r", "--name-only", plan["sha"]],
-        cwd=repo, capture_output=True, text=True, check=True,
-    ).stdout
-    # The recovered plan went through the normalizer again, and none of the
-    # first plan's files ride along on its branch.
-    assert len(normalize_calls(fake_guardkit)) == 2
-    listed = subprocess.run(
-        ["git", "ls-tree", "-r", "--name-only", recovered_branch],
-        cwd=repo, capture_output=True, text=True, check=True,
-    ).stdout.splitlines()
-    assert "tasks/backlog/stats-endpoint/TASK-RECOVERED-001.md" in listed
-    assert "tasks/backlog/stats-endpoint/TASK-STAT-001.md" not in listed
-    # The first plan's audit commit is still on the planning branch.
-    assert "tasks/backlog/stats-endpoint/TASK-STAT-001.md" in subprocess.run(
-        ["git", "ls-tree", "-r", "--name-only", f"planning/{CID}"],
-        cwd=repo, capture_output=True, text=True, check=True,
-    ).stdout
-    assert [t["branch"] for t in triggered] == [recovered_branch]
-    assert plan["plan_review_note"].startswith("The plan reviewer scored")
-    # The recovered plan's checks were declared from its own commit's
-    # settings: the routing law enforced, as on the first plan.
-    normalizes = normalize_calls(fake_guardkit)
-    assert all("--no-model" in call for call in normalizes)
-    declared = [
-        r.getMessage()
-        for r in caplog.records
-        if "the plan leg's pre-commit checks" in r.getMessage()
-    ]
-    assert len(declared) == 2
-    assert all("normalize-stamps(blocking, --no-model)" in line for line in declared)
-    if case == "spec-without-sha":
-        # Cut from the run's start commit, carrying the approved spec's files,
-        # and said as advice.
-        spec_files = _leg_details(store, "feature-spec")["spec_files"]
-        assert spec_files and all(path in listed for path in spec_files)
-        assert any(
-            "ADVISORY: the approved spec's record names no commit" in r.getMessage()
-            for r in caplog.records
-        )
-
-
-@pytest.mark.asyncio
-async def test_a_refusal_in_the_sandbox_still_fires_the_machines_rewrite_round(
-    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path, monkeypatch
-) -> None:
-    """Rules 1a and 2 through the wire: the first stamping runs by rule only
-    and the sandbox's guardkit refuses two worked examples, so the machine
-    sends its own note to the spec writer, the plan is written again, and the
-    second stamping — this time with the model allowed — stamps clean. The
-    run carries on to the build queue with one plain line and no card."""
-    _queue(store)
-    # The stand-in refuses a ``--no-model`` call and writes a plain one: the
-    # shape of a run whose rules refuse and whose model fallback then decides.
-    monkeypatch.setenv("FAKE_GUARDKIT_NO_MODEL_REFUSES", "1")
-    h = _driver(
-        store,
-        sandbox_repo,
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-    )
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-
-    # Two stampings in the sandbox: by rule only, then with the model allowed.
-    normalizes = normalize_calls(fake_guardkit)
-    assert len(normalizes) == 2
-    assert "--no-model" in normalizes[0] and "--no-model" not in normalizes[1]
-
-    # The machine's note named the refused titles verbatim and was its own.
-    rewritten = _approved_spec_rows(store)[-1]["rewritten_by_machine"]
-    assert rewritten["round"] == 1
-    assert rewritten["refused_titles"] == list(REFUSED_TITLES)
-    assert rewritten["author"] == "planning-driver (stamp normalizer refusal)"
-    for title in REFUSED_TITLES:
-        assert title in rewritten["note"]
-
-    # Rich sees one plain line, never a card.
-    assert _error_cards(h) == []
-    assert any(
-        "could not be proven as written, so the machine asked the spec writer"
-        in message
-        for _, message, _ in h.ctx["notifications"]
-    )
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert receipt["status"] == "written"
-    assert receipt["rewrite"]["first_stamping"]["status"] == "refused"
-
-
-@pytest.mark.asyncio
-async def test_a_second_refusal_in_the_sandbox_stops_the_run_with_the_card(
-    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path, monkeypatch
-) -> None:
-    """Every stamping refuses: the round fires once and the run stops with the
-    plan-stop card, exactly as it does when the checks run here — and the
-    plan was never committed."""
-    repo, _, _ = sandbox_repo
-    _queue(store)
-    monkeypatch.setenv("FAKE_GUARDKIT_NORMALIZE", "refused")
-    h = _driver(
-        store,
-        sandbox_repo,
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-    )
-    assert await _drive_to_failure(h, store) == PlanningState.FAILED.value
-
-    assert len(normalize_calls(fake_guardkit)) == 2
-    # The commit never landed: a blocking check refused it, so the branch has
-    # no plan YAML on it.
-    assert _plan_yaml_on_branch(repo, f"planning/{CID}") == []
-    cards = _error_cards(h)
-    assert cards and any("The machine already asked the spec writer once" in c for c in cards)
-    for title in REFUSED_TITLES:
-        assert any(title in c for c in cards)
-
-
-@pytest.mark.asyncio
-@pytest.mark.parametrize("sandbox_repo", ["off"], indirect=True)
-async def test_where_the_law_is_not_enforced_the_refusal_never_blocks_the_commit(
-    store: SqlitePlanningRunStore, sandbox_repo, fake_guardkit: Path, monkeypatch
-) -> None:
-    """The stop is gated on the routing law here as it is there: with the law
-    off, the normalizer is declared as a check that does not block, the
-    refusal rides the receipts, and the plan commit lands anyway."""
-    repo, _, _ = sandbox_repo
-    _queue(store)
-    monkeypatch.setenv("FAKE_GUARDKIT_NORMALIZE", "refused")
-    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    # One stamping only: the rewrite round needs the law enforced.
-    normalizes = normalize_calls(fake_guardkit)
-    assert len(normalizes) == 1 and "--no-model" not in normalizes[0]
-    feature_id = _leg_details(store, "feature-plan")["feature_id"]
-    assert git_show(repo, f"planning/{CID}", _plan_yaml_rel(feature_id)) is not None
-    receipt = _leg_details(store, "feature-plan")["stamp_normalizer"]
-    assert receipt["status"] == "refused"
-    assert receipt["enforcement"] == "off"
-    assert _error_cards(h) == []
-
-
-@pytest.mark.asyncio
-async def test_a_red_feature_validate_in_the_sandbox_is_advice_and_the_plan_lands(
-    store: SqlitePlanningRunStore,
-    sandbox_repo,
-    fake_guardkit: Path,
-    monkeypatch,
-    caplog,
-) -> None:
-    """Step 2 (26 October 2026, census FRG-082): the declared ``feature
-    validate`` does not block. A red answer in the sandbox is advice, the
-    plan commits, and GuardKit validates the feature when it builds. The
-    sandbox's answer is logged as the same ADVISORY warning the in-container
-    closure gives, so it is not lost (27 October 2026)."""
-    repo, _, _ = sandbox_repo
-    _queue(store)
-    monkeypatch.setenv("FAKE_GUARDKIT_VALIDATE", "red")
-    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    with caplog.at_level(logging.WARNING, logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-
-    assert len(validate_calls(fake_guardkit)) == 1
-    assert _plan_yaml_on_branch(repo, f"planning/{CID}") != []
-    assert store.get_run(CID)["state"] != PlanningState.FAILED.value
-    advice = [
-        r.getMessage()
-        for r in caplog.records
-        if "feature-validate complained in the sandbox" in r.getMessage()
-    ]
-    assert len(advice) == 1
-    assert "ADVISORY" in advice[0]
-    assert "task file TASK-STAT-001.md missing" in advice[0]
-
 
 # ---------------------------------------------------------------------------
 # The fence, pinned
@@ -653,92 +263,6 @@ async def test_a_caller_that_hands_over_a_closure_is_refused_out_loud(
 # The routing law itself, read across the wire
 # ---------------------------------------------------------------------------
 
-
-@pytest.mark.asyncio
-async def test_the_law_is_read_from_the_repository_even_before_the_branch_exists(
-    sandbox_repo, fake_guardkit: Path
-) -> None:
-    """What says whether a refusal stops the run is the repository's own
-    routing-law file. When the plan is the first thing written to a planning
-    branch, that branch does not exist yet, so the law is read from the
-    repository's current tip instead — never quietly read as "off".
-    """
-    from forge.planning.driver import PlanningRunDriver
-
-    repo, in_container, sandbox_runner = sandbox_repo
-    driver = PlanningRunDriver.__new__(PlanningRunDriver)
-    declared = await PlanningRunDriver._declare_plan_checks(
-        driver,
-        sandbox_runner,
-        {".guardkit/features/FEAT-C5B0.yaml": "id: FEAT-C5B0\ntasks:\n- id: TASK-STAT-001\n"},
-        "FEAT-C5B0",
-        ["features/stats-endpoint/stats-endpoint.feature"],
-        rules_only=True,
-        repo_path=str(repo),
-        branch="planning/never-made",
-    )
-    assert declared.prelude.enforcement["enforcement"] == "enforced"
-    normalize = declared.checks.checks[0]
-    assert normalize.name == "normalize-stamps"
-    assert normalize.blocking is True
-    assert normalize.args == {"feature_id": "FEAT-C5B0", "no_model": True}
-    assert [c.name for c in declared.checks.checks] == [
-        "normalize-stamps",
-        "feature-validate",
-    ]
-    # forge wrote the committed spec's .feature path into the plan YAML it is
-    # about to commit, exactly as it does in a worktree of its own.
-    filled = declared.files[".guardkit/features/FEAT-C5B0.yaml"]
-    assert "features/stats-endpoint/stats-endpoint.feature" in filled
-
-
-@pytest.mark.asyncio
-async def test_a_law_that_cannot_be_read_at_all_says_so_and_does_not_block(
-    tmp_path: Path, fake_guardkit: Path, caplog
-) -> None:
-    """A repository with no routing-law file: the law is off, the normalizer
-    is declared as a check that does not block, and the machine log says the
-    file could not be read rather than leaving a silent "off"."""
-    from forge.planning.driver import PlanningRunDriver
-
-    repo = tmp_path / "lawless"
-    _init_scratch_repo(repo)
-    # This test is about a settings file that cannot be read AT ALL, so this
-    # copy has none. Every other scratch copy carries one since 2026-09-21,
-    # because a project that declares no memory is refused at the door — but
-    # nothing here goes through the door: it calls the plan leg's check
-    # declaration directly.
-    subprocess.run(
-        ["git", "rm", "-q", "-r", ".guardkit"], cwd=repo, check=True, env=_git_env()
-    )
-    subprocess.run(
-        ["git", "commit", "-qm", "no settings file at all"],
-        cwd=repo,
-        check=True,
-        env=_git_env(),
-    )
-    runner, shutdown = _sandbox(repo, tmp_path)
-    try:
-        driver = PlanningRunDriver.__new__(PlanningRunDriver)
-        with caplog.at_level(logging.WARNING, logger="forge.planning.driver"):
-            declared = await PlanningRunDriver._declare_plan_checks(
-                driver,
-                runner,
-                {".guardkit/features/FEAT-C5B0.yaml": "id: FEAT-C5B0\n"},
-                "FEAT-C5B0",
-                [],
-                rules_only=True,
-                repo_path=str(repo),
-                branch="planning/never-made",
-            )
-    finally:
-        shutdown()
-    assert declared.prelude.enforcement["enforcement"] == "off"
-    assert declared.checks.checks[0].blocking is False
-    assert any(
-        "could not be read" in r.getMessage() and "routing law reads as off" in r.getMessage()
-        for r in caplog.records
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -842,61 +366,6 @@ async def test_a_red_normalizer_in_the_sandbox_fails_the_spec_leg_with_the_same_
     assert "could not be reached" not in failure
 
 
-@pytest.mark.asyncio
-async def test_the_pass_bar_leg_declares_one_check_per_bar_in_the_sandbox(
-    store: SqlitePlanningRunStore,
-    sandbox_repo,
-    fake_guardkit: Path,
-    fake_normalizer_module: Path,
-) -> None:
-    """guardkit's own ``qa validate pass-bar`` runs in the sandbox, once per
-    minted bar, and the bars land."""
-    repo, _, _ = sandbox_repo
-    _queue(store)
-    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["pass_bar_validate"] == 0
-    calls = qa_validate_calls(fake_guardkit, "pass-bar")
-    assert calls == [["qa", "validate", "pass-bar", "qa/pass-bar-TASK-STAT-001.yaml"]]
-    assert _on_branch(repo, f"planning/{CID}", "qa/pass-bar-") == [
-        "qa/pass-bar-TASK-STAT-001.yaml"
-    ]
-
-
-@pytest.mark.asyncio
-async def test_a_malformed_bar_in_the_sandbox_is_advice_and_the_bar_lands(
-    store: SqlitePlanningRunStore,
-    sandbox_repo,
-    fake_guardkit: Path,
-    fake_normalizer_module: Path,
-    monkeypatch,
-    caplog,
-) -> None:
-    """Step 2 (26 October 2026, census FRG-068): GuardKit's task-start
-    precondition validates the bar where it is enforced; the declared check
-    here does not block, so the bar is written. The sandbox's complaint is
-    logged as the same ADVISORY warning the in-container loop gives (27
-    October 2026)."""
-    repo, _, _ = sandbox_repo
-    _queue(store)
-    monkeypatch.setenv("FAKE_GUARDKIT_QA_VALIDATE", "red-pass-bar")
-    h = _driver(store, sandbox_repo, plan_result_factory=_plan_result_native)
-    with caplog.at_level(logging.WARNING, logger="forge.planning.driver"):
-        await h.driver.drive(CID)
-
-    assert _on_branch(repo, f"planning/{CID}", "qa/pass-bar-") != []
-    assert store.get_run(CID)["state"] != PlanningState.FAILED.value
-    advice = [
-        r.getMessage()
-        for r in caplog.records
-        if "validate-pass-bar complained in the sandbox" in r.getMessage()
-    ]
-    assert advice and all("ADVISORY" in line for line in advice)
-    assert "'criteria' is a required property" in advice[0]
-    assert "qa/pass-bar-" in advice[0]
-
 
 @pytest.mark.asyncio
 async def test_the_feature_gate_legs_check_runs_in_the_sandbox(
@@ -929,9 +398,6 @@ async def test_the_feature_gate_legs_check_runs_in_the_sandbox(
 
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     assert h.ctx["counters"]["gate_registry_validate"] == 0
-    assert qa_validate_calls(fake_guardkit, "gate-registry") == [
-        ["qa", "validate", "gate-registry", "qa/gates/registry.yaml"]
-    ]
     branch = f"planning/{CID}"
     assert git_show(repo, branch, "qa/gates/version_endpoint_gate.py") is not None
     registry = git_show(repo, branch, "qa/gates/registry.yaml") or ""
@@ -952,70 +418,6 @@ def _never_classify_here():
 
     return _classify
 
-
-@pytest.mark.asyncio
-async def test_the_provability_check_answers_from_the_sandbox_with_the_spec_commit(
-    store: SqlitePlanningRunStore,
-    sandbox_repo,
-    fake_guardkit: Path,
-    fake_normalizer_module: Path,
-) -> None:
-    """Rule 87's last item: for a sandboxed repository Part K's check rides
-    the spec commit as a declared, non-blocking check, so it runs on the
-    bytes that landed — and the check in the forge container is never run."""
-    _queue(store)
-    h = _driver(
-        store,
-        sandbox_repo,
-        plan_result_factory=_plan_result_native,
-        classify_fn=_never_classify_here(),
-    )
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert len(classify_calls(fake_guardkit)) == 1
-    receipts = _draft_provability(store)
-    assert len(receipts) == 1
-    assert receipts[0]["checked_by_rule"] is True
-    assert receipts[0]["refused_titles"] == []
-    assert receipts[0]["rewritten"] is False
-    assert _error_cards(h) == []
-
-
-@pytest.mark.asyncio
-async def test_a_refused_example_in_the_sandbox_is_named_on_the_card(
-    store: SqlitePlanningRunStore,
-    sandbox_repo,
-    fake_guardkit: Path,
-    fake_normalizer_module: Path,
-    monkeypatch,
-) -> None:
-    """The sandbox's own guardkit refuses two examples by rule. Since step 2
-    (26 October 2026, census FRG-043) that is advice, exactly as when the
-    check runs in the container: one spec-writer call, one check, and the
-    card names the examples that cannot be proven."""
-    _queue(store)
-    monkeypatch.setenv("FAKE_GUARDKIT_CLASSIFY", "refused")
-    h = _driver(
-        store,
-        sandbox_repo,
-        spec_result_factory=_spec_by_round(_spec_result_native(), _rewritten_spec_result()),
-        plan_result_factory=_plan_result_native,
-        classify_fn=_never_classify_here(),
-    )
-    await h.driver.drive(CID)
-
-    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
-    assert h.ctx["counters"]["spec"] == 1
-    assert len(classify_calls(fake_guardkit)) == 1
-    receipt = _draft_provability(store)[-1]
-    assert "round" not in receipt
-    assert receipt["rewritten"] is False
-    assert receipt["refused_titles"] == list(REFUSED_TITLES)
-    text = _digest_card_text(h)
-    assert "The rules-only check could not assign a verifier to 2 worked example(s)" in text
-    for title in REFUSED_TITLES:
-        assert title in text
 
 
 def _digest_card_text(h) -> str:
@@ -1084,13 +486,6 @@ async def test_a_whole_run_for_a_sandbox_repository_reaches_the_build_queue(
 
     # Every one of them ran in the sandbox instead.
     assert len(normalizer_calls(fake_guardkit)) == 1
-    assert len(normalize_calls(fake_guardkit)) == 1
-    assert len(validate_calls(fake_guardkit)) == 1
-    assert qa_validate_calls(fake_guardkit, "pass-bar") == [
-        ["qa", "validate", "pass-bar", f"qa/pass-bar-TASK-VER-00{n}.yaml"]
-        for n in (1, 2, 3)
-    ]
-    assert len(qa_validate_calls(fake_guardkit, "gate-registry")) == 1
 
     # And the four legs' artefacts are all on the planning branch.
     branch = f"planning/{CID}"

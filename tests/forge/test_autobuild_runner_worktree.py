@@ -532,28 +532,6 @@ def test_materialise_uses_detach_and_does_not_claim_branch(
     assert _git(wt, "branch", "--show-current") == ""
 
 
-def test_materialise_refuses_low_capacity_before_git_or_directory_creation(
-    throwaway_repo: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    base = tmp_path / "capacity-refused"
-    monkeypatch.setenv(ar.FORGE_AUTOBUILD_WORKTREE_BASE_ENV, str(base))
-    monkeypatch.setenv(ar.FORGE_AUTOBUILD_MIN_AVAILABLE_BYTES_ENV, str(10**30))
-    calls: list[list[str]] = []
-
-    async def _must_not_run(args: list[str], *, cwd: Path):
-        calls.append(args)
-        return 1, "unexpected"
-
-    monkeypatch.setattr(ar, "_run_git", _must_not_run)
-    with pytest.raises(ar.WorktreeMaterialisationError, match="capacity preflight"):
-        asyncio.run(
-            ar._materialise_worktree(
-                throwaway_repo, PLANNING_BRANCH, "build-NO-CAPACITY"
-            )
-        )
-    assert calls == []
-    assert not base.exists()
-
 
 def test_run_git_keeps_git_output_apart_and_failures_are_the_fixed_sentence(
     throwaway_repo: Path, tmp_path: Path

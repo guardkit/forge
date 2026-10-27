@@ -313,13 +313,3 @@ class TestTheCapMappingLaw:
 
         assert kwargs["budget_guards"].max_review_cycles == 2
 
-    def test_the_attended_profile_can_never_be_armed(self) -> None:
-        """ASSUM-010 stands — the fix-journey profile is a SEPARATE name."""
-        from pydantic import ValidationError
-
-        from forge.config.models import BudgetConfig
-
-        with pytest.raises(ValidationError):
-            BudgetConfig(
-                profiles={"attended": BudgetGuards(max_review_cycles=2)},
-            )

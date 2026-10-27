@@ -65,14 +65,14 @@ def _tables(cx: sqlite3.Connection) -> set[str]:
     return {r[0] for r in cx.execute("SELECT name FROM sqlite_master WHERE type='table'")}
 
 
-def test_ensure_tables_adds_tables_and_columns_and_keeps_schema_19(cx) -> None:
+def test_ensure_tables_adds_tables_and_columns_and_keeps_the_schema_version(cx) -> None:
     assert not builds_record_missions(cx)
     ensure_tables(cx)
     ensure_tables(cx)  # idempotent
     assert {"missions", "mission_features", "mission_needs", "mission_attempts"} <= _tables(cx)
     assert builds_record_missions(cx)
-    assert cx.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 19
-    assert lifecycle_migrations.apply_at_boot(cx) == 19
+    assert cx.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 21
+    assert lifecycle_migrations.apply_at_boot(cx) == 21
 
 
 def test_the_rollout_helper_boot_steps_make_the_mission_tables() -> None:
@@ -121,18 +121,6 @@ def test_approval_first_answer_wins_and_status_is_compare_and_swap(cx) -> None:
     assert closed.closed_at and closed.closed_reason == "x"
     assert store.list_active() == []
 
-
-def test_attempt_ids_pass_the_routing_and_intake_patterns(cx) -> None:
-    from forge.adapters.nats.planning_consumer import _is_valid_correlation_id
-
-    store = MissionStore(cx)
-    mission = _mission(store)
-    assert store.file_first_attempts(mission.id) == 4
-    assert store.file_first_attempts(mission.id) == 0  # a restart files nothing new
-    for attempt in store.attempts(mission.id):
-        assert attempt.correlation_id == attempt_correlation_id(CID, attempt.key, 1)
-        assert validate_feature_routing_id(attempt.correlation_id)
-        assert _is_valid_correlation_id(attempt.correlation_id)
 
 
 def test_links_follow_keys_through_a_rebuild(cx) -> None:

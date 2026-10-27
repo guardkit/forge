@@ -1,8 +1,8 @@
 """A build refused before its row is written still reaches the work queue.
 
 Review finding R6 (3 October 2026): the pipeline refuses some builds before it
-writes any build row — an originator that is not approved, a feature file
-outside the allowed folders, a repository the sandbox policy will not build —
+writes any build row — a repository the sandbox policy will not build, or a
+feature another build of is already running —
 and acknowledges the message. Nothing durable said so, and a sentence waiting
 "after" the refused one waited for ever without being asked.
 
@@ -87,14 +87,8 @@ def _config(tmp_path: Path, how: str) -> tuple[ForgeConfig, Path]:
     allowed = tmp_path / "allowed"
     allowed.mkdir(exist_ok=True)
     feature_yaml = allowed / "feature.yaml"
-    if how == "path":
-        elsewhere = tmp_path / "elsewhere"
-        elsewhere.mkdir(exist_ok=True)
-        feature_yaml = elsewhere / "feature.yaml"
     feature_yaml.write_text("name: synthetic\n", encoding="utf-8")
     raw: dict[str, Any] = {"permissions": {"filesystem": {"allowlist": [str(allowed)]}}}
-    if how == "originator":
-        raw["pipeline"] = {"approved_originators": ["jarvis"]}
     if how == "sandbox":
         raw["planning"] = {
             "target_repo_paths": {
@@ -176,8 +170,6 @@ def _another_build_of_the_feature_is_running(
 @pytest.mark.parametrize(
     ("how", "words"),
     [
-        ("originator", "it was sent by cli-wrapper, which is not approved"),
-        ("path", "is outside the folders builds may read"),
         ("sandbox", "sandbox-required"),
         # 3 October 2026, round 2 (R6): another build of the same feature is
         # already running, so this one is refused before its row is written.
@@ -242,7 +234,7 @@ async def test_a_redelivered_refusal_is_noted_once(
     tmp_path: Path, cx: sqlite3.Connection
 ) -> None:
     store, a_id, _b_id, _c_id = _a_handed_over_with_b_after_it(cx)
-    config, feature_yaml = _config(tmp_path, "originator")
+    config, feature_yaml = _config(tmp_path, "sandbox")
     deps = build_pipeline_consumer_deps(
         _StubNatsClient(),
         config,
@@ -285,7 +277,7 @@ def test_a_refusal_for_work_the_queue_never_filed_writes_nothing(
     assert cx.execute("SELECT COUNT(*) FROM work_queue_events").fetchone()[0] == 0
 
 
-@pytest.mark.parametrize("how", ["originator", "path", "sandbox", "same-feature"])
+@pytest.mark.parametrize("how", ["sandbox", "same-feature"])
 @pytest.mark.asyncio
 async def test_a_note_that_cannot_be_written_holds_the_refusal_for_redelivery(
     tmp_path: Path, cx: sqlite3.Connection, how: str

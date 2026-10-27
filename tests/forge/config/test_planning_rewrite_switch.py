@@ -31,9 +31,3 @@ def test_the_field_is_declared_on_the_closed_surface() -> None:
         PlanningConfig.model_validate({"rewrite_on_refusa": False})
 
 
-def test_the_description_is_plain_words() -> None:
-    """The settings file is a surface a person reads: no rule ids, no house
-    shorthand in the description."""
-    description = PlanningConfig.model_fields["rewrite_on_refusal"].description or ""
-    assert "spec writer" in description and "stamps again" in description
-    assert "rule " not in description.lower()

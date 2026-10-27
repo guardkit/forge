@@ -37,8 +37,6 @@ from nats_core.events import BuildQueuedPayload
 from pydantic import ValidationError
 
 from forge.adapters.nats.pipeline_consumer import (
-    REASON_ORIGINATOR_NOT_RECOGNISED,
-    REASON_PATH_OUTSIDE_ALLOWLIST,
     PipelineConsumerDeps,
     handle_message,
 )
@@ -130,7 +128,6 @@ def _consumer_deps(
         is_duplicate_terminal=is_dup,
         dispatch_build=dispatch,
         publish_build_failed=publish_failed,
-        retired_planning_handoffs=lambda: frozenset(),
     )
     return deps, {
         "is_duplicate_terminal": is_dup,
@@ -237,24 +234,6 @@ class TestFixtureProvenance:
 
 
 class TestRound14Replay:
-    def test_old_gate_would_reject_the_fixture_non_vacuous(self) -> None:
-        """Pre-fix regression witness: the OLD originator gate refuses it.
-
-        Replicates the pre-fix predicate (``originating_adapter`` is the only
-        identity; the allowlist is the six human adapters) so the captured
-        fixture provably reproduces the live defect rather than passing
-        vacuously.
-        """
-        env = MessageEnvelope.model_validate_json(_load_fixture_bytes())
-        payload = BuildQueuedPayload.model_validate(env.payload)
-        old_originator = payload.originating_adapter
-        old_rejected = (
-            old_originator is None or old_originator not in OLD_HUMAN_ONLY_ORIGINATORS
-        )
-        assert old_rejected, (
-            "fixture no longer reproduces the round-14 defect — the old "
-            "adapter-only gate must refuse this machine dispatch"
-        )
 
     @pytest.mark.asyncio
     async def test_fixed_consumer_passes_gates_and_reaches_dispatch(self) -> None:
@@ -335,83 +314,6 @@ class TestMachineDispatchOriginatorGate:
                 _payload_dict(triggered_by="jarvis", originating_adapter=None)
             )
 
-    @pytest.mark.asyncio
-    async def test_forge_internal_not_in_custom_config_is_rejected(self) -> None:
-        """Config still governs: a deployment whose ``approved_originators``
-        omits forge-internal rejects the machine dispatch."""
-        deps, mocks = _consumer_deps(approved_originators=["terminal", "cli-wrapper"])
-        msg = _make_msg(_envelope_bytes(_payload_dict()))
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        mocks["dispatch_build"].assert_not_called()
-        sent, _feature_id = mocks["publish_build_failed"].await_args.args
-        assert sent.failure_reason == REASON_ORIGINATOR_NOT_RECOGNISED
-
-    @pytest.mark.asyncio
-    async def test_wire_valid_adapter_not_in_policy_is_rejected(self) -> None:
-        """An adapter that is valid on the wire (a member of the
-        OriginatingAdapter Literal) but not in the deployment's
-        ``approved_originators`` policy is rejected by the consumer gate —
-        config, not the wire schema, is the final authority."""
-        # triggered_by=jarvis satisfies nats-core's adapter-required rule;
-        # ``telegram`` is a valid Literal member but absent from the policy.
-        payload = _payload_dict(triggered_by="jarvis", originating_adapter="telegram")
-        deps, mocks = _consumer_deps(
-            approved_originators=["forge-internal", "slack"]
-        )
-        msg = _make_msg(_envelope_bytes(payload))
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        mocks["dispatch_build"].assert_not_called()
-        sent, _feature_id = mocks["publish_build_failed"].await_args.args
-        assert sent.failure_reason == REASON_ORIGINATOR_NOT_RECOGNISED
-
-    @pytest.mark.asyncio
-    async def test_adapter_precedence_unapproved_adapter_rejected_even_if_triggered_by_approved(
-        self,
-    ) -> None:
-        """Adapter-takes-precedence (stricter reading): when an adapter is
-        present it alone is checked — an unapproved adapter is rejected even
-        though ``triggered_by`` names an approved layer."""
-        # triggered_by=jarvis (kept in the policy) with adapter=slack (NOT in
-        # the policy). The effective identity is the adapter, so the build is
-        # rejected despite the approved triggered_by layer.
-        payload = _payload_dict(triggered_by="jarvis", originating_adapter="slack")
-        deps, mocks = _consumer_deps(
-            approved_originators=["jarvis", "forge-internal", "terminal"]
-        )
-        msg = _make_msg(_envelope_bytes(payload))
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        mocks["dispatch_build"].assert_not_called()
-        sent, _feature_id = mocks["publish_build_failed"].await_args.args
-        assert sent.failure_reason == REASON_ORIGINATOR_NOT_RECOGNISED
-
-    @pytest.mark.asyncio
-    async def test_path_outside_allowlist_still_rejected_with_new_semantics(
-        self,
-    ) -> None:
-        """Gate 3 still rejects an absolute path outside the allowlist — the
-        machine dispatch now clears gate 2 but a mis-targeted checkout is
-        caught at the path gate."""
-        payload = _payload_dict(
-            feature_yaml_path="/etc/passwd-not-a-checkout/FEAT-1DF4.yaml"
-        )
-        deps, mocks = _consumer_deps()
-        msg = _make_msg(_envelope_bytes(payload))
-
-        await handle_message(msg, deps)
-
-        msg.ack.assert_awaited_once()
-        mocks["dispatch_build"].assert_not_called()
-        sent, _feature_id = mocks["publish_build_failed"].await_args.args
-        assert sent.failure_reason == REASON_PATH_OUTSIDE_ALLOWLIST
 
     @pytest.mark.asyncio
     async def test_duplicate_terminal_machine_dispatch_is_skipped(self) -> None:

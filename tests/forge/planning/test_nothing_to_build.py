@@ -133,63 +133,6 @@ def test_a_malformed_answer_says_why(overrides: dict, files: Any, expected: str)
 # ---------------------------------------------------------------------------
 
 
-def test_windows_are_read_wherever_the_description_carries_them() -> None:
-    windows = ntb.windows_sent(DESCRIPTOR)
-    assert windows == [
-        ntb.Window("src/stats.py", 3, 18),
-        ntb.Window("tests/stats/test_stats.py", 1, 14),
-    ]
-    assert ntb.windows_sent({"repo": "x", "test_roots": []}) == []
-    assert ntb.windows_sent(None) == []
-
-
-def test_every_citation_inside_a_window_passes() -> None:
-    role_output, files = _reply(_validation())
-    claim, _ = ntb.read_claim(role_output, files)
-    assert claim is not None
-    assert ntb.citations_outside(claim, ntb.windows_sent(DESCRIPTOR)) == []
-
-
-@pytest.mark.parametrize(
-    "citation",
-    [
-        "src/stats.py:2",  # one line before the window
-        "src/stats.py:17-19",  # runs past its end
-        "src/other.py:6",  # a file never shown
-        "src/stats.py",  # no line
-        "src/stats.py:9-7",  # backwards
-        "src/stats.py:6 the route",  # not a bare citation
-    ],
-)
-def test_a_citation_outside_every_window_is_named(citation: str) -> None:
-    role_output, files = _reply(
-        _validation(parts=[{"quote": "q", "citations": ["src/stats.py:6", citation]}])
-    )
-    claim, _ = ntb.read_claim(role_output, files)
-    assert claim is not None
-    assert ntb.citations_outside(claim, ntb.windows_sent(DESCRIPTOR)) == [citation]
-
-
-def test_a_citation_splits_at_its_last_colon() -> None:
-    """The plan writer's rule: a path may hold a colon; the line is after
-    the last one."""
-    windows = [ntb.Window("docs/a:b.md", 10, 20)]
-    role_output, files = _reply(
-        _validation(
-            parts=[{"quote": "q", "citations": ["docs/a:b.md:12", "docs/a:b.md:11-19"]}],
-            scenarios=[{"title": "t", "citations": ["docs/a:b.md:20"]}],
-        )
-    )
-    claim, _ = ntb.read_claim(role_output, files)
-    assert claim is not None
-    assert ntb.citations_outside(claim, windows) == []
-    role_output, files = _reply(
-        _validation(parts=[{"quote": "q", "citations": ["docs/a:12"]}])
-    )
-    claim, _ = ntb.read_claim(role_output, files)
-    assert claim is not None
-    assert ntb.citations_outside(claim, windows) == ["docs/a:12", "tests/stats/test_stats.py:1-4"]
-
 
 def test_the_planners_full_validation_shape_is_read() -> None:
     """Exactly what the plan writer sends (specialist-agent 820d701): the
@@ -202,16 +145,6 @@ def test_the_planners_full_validation_shape_is_read() -> None:
     claim, problem = ntb.read_claim(role_output, files)
     assert problem is None and claim is not None
 
-
-def test_no_windows_sent_means_nothing_is_inside() -> None:
-    role_output, files = _reply(_validation())
-    claim, _ = ntb.read_claim(role_output, files)
-    assert claim is not None
-    assert ntb.citations_outside(claim, []) == [
-        "src/stats.py:6",
-        "src/stats.py:7-9",
-        "tests/stats/test_stats.py:1-4",
-    ]
 
 
 # ---------------------------------------------------------------------------

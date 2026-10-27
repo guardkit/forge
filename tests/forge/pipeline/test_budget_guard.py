@@ -81,10 +81,6 @@ class TestCoachScoreStub:
         prof = BudgetGuards(min_coach_score=0.8)
         assert evaluate_budget(prof, BuildBudgetMetrics(last_coach_score=None)).ok
 
-    def test_active_once_score_present_and_below_floor(self) -> None:
-        prof = BudgetGuards(min_coach_score=0.8)
-        v = evaluate_budget(prof, BuildBudgetMetrics(last_coach_score=0.5))
-        assert v.breached and v.breached_cap == "min_coach_score"
 
     def test_score_at_or_above_floor_ok(self) -> None:
         prof = BudgetGuards(min_coach_score=0.8)

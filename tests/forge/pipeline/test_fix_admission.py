@@ -489,19 +489,6 @@ class TestTheOtherRefusals:
         assert "Invalid parent_feature" in caught.value.message
         assert build_rows(pool) == []
 
-    def test_a_repository_outside_the_allowlist_is_refused(
-        self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path,
-        tmp_path: Path,
-    ) -> None:
-        elsewhere = tmp_path / "somewhere_else"
-        elsewhere.mkdir()
-
-        with pytest.raises(FixAdmissionRefused) as caught:
-            self._admit(config, pool, repo_root, repo_path=elsewhere)
-
-        assert caught.value.reason == "repo-not-allowed"
-        assert caught.value.permanent is True
-        assert build_rows(pool) == []
 
     def test_an_active_build_for_the_same_feature_is_refused(
         self, config: ForgeConfig, pool: SqliteLifecyclePersistence, repo_root: Path
