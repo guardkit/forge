@@ -525,6 +525,10 @@ async def _read(
         "read": True,
         "reason": None,
         "changes_read": changes is not None,
+        # The project's protected paths as declared at that commit (28
+        # October 2026), so whoever answers the card can tell a planned
+        # change the builder was not allowed to make from unfinished work.
+        "protected_paths": [shown_path(p) for p in protected],
         "judge_files": judges,
         "config_changed": CONFIG_PATH in paths,
         "listing_unreadable": unlisted,

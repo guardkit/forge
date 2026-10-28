@@ -1765,6 +1765,7 @@ async def test_a_judge_outside_the_protected_paths_runs_the_builds_copy(
     ) in words
     fates = {j["path"]: j["main_copy"] for j in reading["judge_files"]}
     assert fates == {"scripts/check.sh": False, "reference/check.sh": True}
+    assert reading["protected_paths"] == ["reference"]
 
 
 @pytest.mark.asyncio
