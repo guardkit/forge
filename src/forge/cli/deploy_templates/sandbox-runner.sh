@@ -707,6 +707,12 @@ FACTORY_ENV_NAMES=(
   FLEET_MEMORY_EMBED_URL
   FLEET_MEMORY_EMBED_MODEL
   FLEET_MEMORY_EMBED_DIMS
+  # THE PLANNER IMAGE (28 October 2026). The helper starts one container from
+  # it for each planning step (POST /planning-step); unset, it answers that
+  # the planner image is not configured. The second is passed on to that
+  # container when set: it turns the plan writer's thinking on.
+  FORGE_PLANNER_IMAGE
+  SPECIALIST_AGENT_WRITER_THINKING
 )
 
 # NOTHING CREDENTIAL-SHAPED CROSSES IN (14 October 2026). Every process in the

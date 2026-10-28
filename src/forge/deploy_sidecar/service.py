@@ -16,7 +16,14 @@ The narrow contract:
     POST /guardkit-leg/cancel {build} | {leg}
               -> {cancelled: [{leg, build, started}]}
               (stops a running fix-journey leg and everything it started;
-              see the block above :func:`process_guardkit_leg_request`)
+              see the block above :func:`process_guardkit_leg_request`; it
+              stops a running planning step of that build the same way)
+    POST /planning-step {repo, build, declared_at, role, request,
+                         start_commit?, memory_project?, timeout?}
+              -> {result, exit_code, timed_out, stdout, stderr_tail,
+                  container, warnings, cancelled?, error?}
+              (one planning step in a container from the planner image; see
+              the block above :func:`process_planning_step_request`)
     POST /run  {repo, script, env, timeout_seconds, cwd?}
               -> {exit_code, output_tail, cwd}
     POST /run  {repo, driver, args, env, timeout_seconds, cwd?}
@@ -201,6 +208,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -6120,6 +6128,490 @@ def process_guardkit_leg_request(
 
 
 # ---------------------------------------------------------------------------
+# ONE PLANNING STEP IN THIS SANDBOX (28 October 2026)
+# ---------------------------------------------------------------------------
+#
+# Specialist-agent's planner (the product owner's ``greenfield`` and
+# ``feature_spec``, the architect's ``feature_plan``) used to run only in the
+# two shared seat containers on the Dell, reached over the message bus, with no
+# copy of the project to read. Rich, 27 October: "option A please" — the seat
+# image is copied into each sandbox, and this helper starts ONE short-lived
+# container from it per planning step, on this sandbox's own engine.
+#
+# Forge's request is unchanged: the CommandPayload it would have published on
+# the bus (``{"command", "args", "correlation_id"}``) is written to a file and
+# handed to ``specialist-agent run-mode``, which answers through the seat's own
+# command handler and writes the ResultPayload the bus path publishes to
+# ``result.json``. That is returned as it is, so Forge reads it with the very
+# parser it reads a bus reply with.
+#
+# Built from the leg route's parts: a fixed argument list, no shell, a time
+# limit, scrubbed output, listed on ``GET /busy`` and stopped by
+# ``POST /guardkit-leg/cancel`` with the build it belongs to. A container is
+# not stopped by stopping the client that started it, so it is NAMED, and
+# removed by that name (``docker rm -f``) when the step is stopped at its time
+# limit, cancelled, or lost.
+#
+# The spec and plan steps read a plain copy of the project at the planning
+# start commit, laid out with the candidate-tree internals (tracked files only,
+# no branch) under the clone, which is bound into this helper at the same path
+# as on the sandbox's engine, so the engine can mount it. It is mounted
+# read-only and removed afterwards, whatever the ending. The request file and
+# the answer folder sit beside it for the same reason (this helper's own
+# temporary folder is not visible to the engine). ``greenfield`` runs before
+# the start commit is recorded and has no tools, so it gets no copy and no
+# memory.
+#
+# The container is given the seats' non-secret planning settings, per role
+# (:data:`PLANNER_ROLE_SETTINGS`), the model door as its model address and the
+# project's own memory door. None of the seats' secrets: there is no bus login,
+# database address or model key in here to give.
+
+#: The route.
+PLANNING_STEP_ROUTE: str = "/planning-step"
+
+#: This helper's setting naming the planner image (the seat image, copied into
+#: the sandbox at release). Unset: the route answers that it is not configured.
+PLANNER_IMAGE_ENV: str = "FORGE_PLANNER_IMAGE"
+
+#: Passed through to the planner when this helper has it set (it turns the
+#: writer's thinking on; unset leaves it off, as on the seats).
+PLANNER_WRITER_THINKING_ENV: str = "SPECIALIST_AGENT_WRITER_THINKING"
+
+#: The two roles, and the three verbs Forge sends them.
+PLANNER_ROLES: tuple[str, ...] = ("architect", "product-owner")
+PLANNING_VERBS: tuple[str, ...] = ("greenfield", "feature_spec", "feature_plan")
+#: The verbs that read the project: a copy at the start commit, the code root
+#: and the project's memory.
+PLANNING_VERBS_WITH_A_COPY: tuple[str, ...] = ("feature_spec", "feature_plan")
+
+#: The user the planner image runs as.
+PLANNER_USER: str = "1000:1000"
+
+#: Where the step's three folders appear inside the container.
+PLANNER_CODE_ROOT: str = "/work"
+PLANNER_OUTPUT_DIR: str = "/app/output"
+PLANNER_REQUEST_FILE: str = "/in/request.json"
+
+#: The seats' non-secret planning settings, per role and for both (read off
+#: the live seats on 28 October 2026). The key is the builder's placeholder:
+#: the model door replaces whatever key a caller sends with its own.
+PLANNER_ROLE_SETTINGS: dict[str, dict[str, str]] = {
+    "architect": {
+        "LOCAL_MODEL": "architect-agent",
+        "SPECIALIST_AGENT_REASK_TEMPERATURE": "0",
+        "SPECIALIST_AGENT_SCENARIO_OWNERSHIP": "on",
+        "SPECIALIST_AGENT_TASK_MAX_CRITERIA": "8",
+        "SPECIALIST_AGENT_TASK_MAX_MINUTES": "180",
+    },
+    "product-owner": {
+        "LOCAL_MODEL": "product-owner-agent",
+        "SPECIALIST_AGENT_REASK_TEMPERATURE": "1.0",
+    },
+}
+PLANNER_SHARED_SETTINGS: dict[str, str] = {
+    "SPECIALIST_AGENT_LOCAL_TIMEOUT": "900",
+    "SPECIALIST_AGENT_FEATURE_ROUTING_REQUIRED": "1",
+    "AGENT_MODELS__REASONING_MODEL": "local",
+    "HOME": "/tmp",
+    "OPENAI_API_KEY": "no-key-the-model-door-adds-it",
+}
+
+#: The step's time limit when the request names none (Forge's own planning
+#: cut-off). A longer one is cut back to the leg route's ceiling, never refused.
+PLANNING_STEP_TIMEOUT_DEFAULT: float = 3600.0
+
+#: How long removing a stopped step's container may take.
+PLANNER_REMOVE_TIMEOUT_SECONDS: float = 60.0
+
+#: The largest request and answer this route carries (a plan step's request
+#: holds the spec it plans from).
+PLANNING_REQUEST_MAX_BYTES: int = 16 * 1024 * 1024
+PLANNING_RESULT_MAX_BYTES: int = 16 * 1024 * 1024
+
+#: The settings the container client itself is started with: enough to find
+#: the engine, nothing of the factory's.
+_PLANNER_CLIENT_ENV_NAMES: tuple[str, ...] = (
+    "PATH",
+    "HOME",
+    "LANG",
+    "LC_ALL",
+    "TMPDIR",
+    "DOCKER_HOST",
+    "DOCKER_CONFIG",
+    "DOCKER_CONTEXT",
+)
+
+
+def run_planning_container(
+    *,
+    argv: list[str],
+    cwd: str,
+    timeout: float,
+    what: str = "the planning step's container",
+) -> tuple[int, str, str]:
+    """Run the container client with no shell; the planning route's runner.
+
+    The client gets only what it needs to reach this sandbox's engine; the
+    container's own settings travel in the env file the route writes. Never
+    raises (see :func:`_start_and_collect`).
+    """
+    env = {
+        name: os.environ[name]
+        for name in _PLANNER_CLIENT_ENV_NAMES
+        if os.environ.get(name)
+    }
+    return _start_and_collect(argv=argv, cwd=cwd, env=env, timeout=timeout, what=what)
+
+
+def _planner_container_name(build: str | None, command: str) -> str:
+    """A container name from the build and the step, unique per request."""
+    stem = re.sub(r"[^A-Za-z0-9_.-]+", "-", build or "unnamed").strip("-.") or "unnamed"
+    return f"forge-planning-{stem[:80]}-{command.replace('_', '-')}-{uuid.uuid4().hex[:8]}"
+
+
+def planner_container_settings(
+    *,
+    role: str,
+    with_copy: bool,
+    memory_project: str | None,
+    env: Mapping[str, str],
+) -> dict[str, str]:
+    """The planner container's settings, from the table and this helper's own.
+
+    ``LLM_BASE_URL`` is this helper's ``OPENAI_BASE_URL`` (the model door) and
+    ``FLEET_MEMORY_MCP_URL`` its own memory door. The code root and memory are
+    given only to the steps that read the project; memory is on only when the
+    step names the project's memory.
+    """
+    settings = {**PLANNER_SHARED_SETTINGS, **PLANNER_ROLE_SETTINGS[role]}
+    model_door = str(env.get("OPENAI_BASE_URL") or "").strip()
+    if model_door:
+        settings["LLM_BASE_URL"] = model_door
+    thinking = str(env.get(PLANNER_WRITER_THINKING_ENV) or "").strip()
+    if thinking:
+        settings[PLANNER_WRITER_THINKING_ENV] = thinking
+    if with_copy:
+        settings["SPECIALIST_CODE_ROOT"] = PLANNER_CODE_ROOT
+        memory_door = str(env.get("FLEET_MEMORY_MCP_URL") or "").strip()
+        if memory_project and memory_door:
+            settings["FLEET_MEMORY_ENABLED"] = "true"
+            settings["FLEET_MEMORY_MCP_URL"] = memory_door
+            settings["SPECIALIST_MEMORY_PROJECT"] = memory_project
+        else:
+            settings["FLEET_MEMORY_ENABLED"] = "false"
+    else:
+        settings["FLEET_MEMORY_ENABLED"] = "false"
+    # One setting per line: a value that would break the file is left out.
+    return {name: value for name, value in settings.items() if "\n" not in value}
+
+
+def process_planning_step_request(
+    payload: Any,
+    *,
+    config: ForgeConfig,
+    runner: MergeRunner = run_planning_container,
+    stop_run: StoppableRun | None = None,
+    env: Mapping[str, str] | None = None,
+    ask: Any = FROM_THIS_SERVICES_SETTINGS,
+    docker: str | None = None,
+) -> tuple[int, dict[str, Any]]:
+    """Validate and run one ``/planning-step``; return ``(status, body)``.
+
+    ``{repo, build, declared_at, role, request, start_commit, memory_project,
+    timeout}`` → a 200 carrying ``{result, exit_code, timed_out, stdout,
+    stderr_tail, container, warnings}``, where ``result`` is the planner's
+    ``result.json`` (the ResultPayload) or ``null`` with an ``error`` saying
+    why there is none. Everything is checked before anything is made or
+    started; a refusal is a 4xx in one sentence. ``stop_run`` is the leg-style
+    handle a cancel stops the container client through. Never raises.
+    """
+    source = os.environ if env is None else env
+    if not isinstance(payload, dict):
+        return 400, {"error": "request body must be a JSON object"}
+    if not sidecar_is_inside_sandbox(dict(source)):
+        return 400, {"error": _not_inside_a_sandbox("planning step", verb="start")}
+    repo_path, error = _resolve_repo_key(payload, config)
+    if error or repo_path is None:
+        return 400, {"error": error}
+    role = payload.get("role")
+    if role not in PLANNER_ROLES:
+        return 400, {
+            "error": f"'role' must be one of {', '.join(PLANNER_ROLES)}; got {role!r}"
+        }
+    request = payload.get("request")
+    if not isinstance(request, dict):
+        return 400, {
+            "error": (
+                "'request' must be the command as Forge publishes it: an object "
+                "with 'command', 'args' and 'correlation_id'"
+            )
+        }
+    command = request.get("command")
+    if command not in PLANNING_VERBS:
+        return 400, {
+            "error": (
+                f"'request.command' must be one of {', '.join(PLANNING_VERBS)}; "
+                f"got {command!r}"
+            )
+        }
+    if not isinstance(request.get("args", {}), dict):
+        return 400, {"error": "'request.args' must be an object"}
+    try:
+        request_bytes = json.dumps(request).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        return 400, {"error": f"'request' could not be written as JSON: {exc}"}
+    if len(request_bytes) > PLANNING_REQUEST_MAX_BYTES:
+        return 400, {
+            "error": (
+                f"'request' may be at most {PLANNING_REQUEST_MAX_BYTES} bytes as "
+                f"JSON; it is {len(request_bytes)}"
+            )
+        }
+    with_copy = command in PLANNING_VERBS_WITH_A_COPY
+    start_commit: str | None = None
+    if with_copy:
+        raw_start = payload.get("start_commit")
+        if not isinstance(raw_start, str) or not MAIN_SHA_PATTERN.match(raw_start):
+            return 400, {
+                "error": (
+                    f"'start_commit' is required for {command}, as the full "
+                    f"40-character commit the planning started from; got "
+                    f"{raw_start!r}"
+                )
+            }
+        start_commit = raw_start.lower()
+    memory_project, _settings, launch_error, _bound_at = _launch_fields(
+        payload,
+        repo_path=repo_path,
+        repo=str(payload.get("repo") or "") or None,
+        ask=ask,
+    )
+    if launch_error is not None:
+        return 400, {"error": launch_error}
+    timeout = PLANNING_STEP_TIMEOUT_DEFAULT
+    warnings: list[dict[str, str]] = []
+    raw_timeout = payload.get("timeout")
+    if raw_timeout is not None:
+        if (
+            isinstance(raw_timeout, bool)
+            or not isinstance(raw_timeout, (int, float))
+            or raw_timeout <= 0
+        ):
+            return 400, {"error": "'timeout' must be a positive number of seconds"}
+        timeout = float(raw_timeout)
+        if timeout > LEG_TIMEOUT_MAX:
+            warnings.append(
+                {
+                    "code": "planning_step_timeout_clamped",
+                    "message": (
+                        f"this planning step was asked for up to {timeout:g} "
+                        "seconds, which is longer than this route allows, so "
+                        f"it was given {LEG_TIMEOUT_MAX:g} seconds instead"
+                    ),
+                }
+            )
+            timeout = LEG_TIMEOUT_MAX
+    image = str(source.get(PLANNER_IMAGE_ENV) or "").strip()
+    if not image:
+        return 500, {
+            "error": (
+                "planner image not configured: this helper has no "
+                f"{PLANNER_IMAGE_ENV}, so it cannot start a planning step"
+            )
+        }
+    engine = docker or shutil.which("docker") or "docker"
+
+    from forge.deploy.candidate_tree import (
+        CandidateTreeError,
+        candidate_tree_path,
+        ensure_candidate_trees_excluded,
+        materialise_candidate_tree,
+        remove_candidate_tree,
+    )
+
+    raw_build = payload.get("build")
+    build = raw_build.strip() if isinstance(raw_build, str) else None
+    name = _planner_container_name(build, str(command))
+    try:
+        copy_path = candidate_tree_path(repo_path, name)
+        io_path = candidate_tree_path(repo_path, f"{name}.io")
+    except CandidateTreeError as exc:
+        return 400, {"error": str(exc)}
+    output_path = io_path / "output"
+    request_path = io_path / "request.json"
+    env_file: str | None = None
+    laid_out = False
+    try:
+        try:
+            _run_coroutine(ensure_candidate_trees_excluded(repo_path))
+            if start_commit is not None:
+                _run_coroutine(
+                    materialise_candidate_tree(repo_path, name, start_commit)
+                )
+                laid_out = True
+        except CandidateTreeError as exc:
+            return 400, {"error": str(exc)}
+        output_path.mkdir(parents=True, exist_ok=False)
+        _writable_by_the_planner(output_path)
+        request_path.write_bytes(request_bytes)
+        request_path.chmod(0o644)
+        settings = planner_container_settings(
+            role=str(role),
+            with_copy=with_copy,
+            memory_project=memory_project if with_copy else None,
+            env=source,
+        )
+        handle, env_file = tempfile.mkstemp(prefix="forge-planning-", suffix=".env")
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            os.fchmod(stream.fileno(), 0o600)
+            for key, value in settings.items():
+                stream.write(f"{key}={value}\n")
+        argv = [
+            engine,
+            "run",
+            "--rm",
+            "--name",
+            name,
+            "--user",
+            PLANNER_USER,
+            "--network",
+            "host",
+            *(["-v", f"{copy_path}:{PLANNER_CODE_ROOT}:ro"] if laid_out else []),
+            "-v",
+            f"{output_path}:{PLANNER_OUTPUT_DIR}",
+            "-v",
+            f"{request_path}:{PLANNER_REQUEST_FILE}:ro",
+            "--env-file",
+            env_file,
+            image,
+            "run-mode",
+            "--role",
+            str(role),
+            "--request",
+            PLANNER_REQUEST_FILE,
+            "--output",
+            PLANNER_OUTPUT_DIR,
+        ]
+        logger.info(
+            "forge-deploy-sidecar: starting the %s planning step for %s as "
+            "container %s (up to %g seconds, %s)",
+            command,
+            build or "an unnamed build",
+            name,
+            timeout,
+            f"a copy at {start_commit}" if laid_out else "no copy",
+        )
+        with stoppable(stop_run) if stop_run is not None else contextlib.nullcontext():
+            ran = runner(
+                argv=argv,
+                cwd=str(io_path),
+                timeout=timeout,
+                what="the planning step's container",
+            )
+        cancelled = stop_run is not None and stop_run.stop_requested
+        started = not getattr(ran, "refused_before_running", False)
+        if started and (
+            cancelled
+            or getattr(ran, "timed_out", False)
+            or getattr(ran, "answer_lost", False)
+        ):
+            # Stopping the client does not stop the container it started.
+            removed = runner(
+                argv=[engine, "rm", "-f", name],
+                cwd=str(io_path),
+                timeout=PLANNER_REMOVE_TIMEOUT_SECONDS,
+                what="removing the planning step's container",
+            )
+            if removed[0] != 0:
+                logger.warning(
+                    "forge-deploy-sidecar: the planning container %s could not "
+                    "be removed (exit %s): %s",
+                    name,
+                    removed[0],
+                    str(removed[2])[-500:],
+                )
+        if cancelled:
+            exit_code, stdout, stderr = ran
+            return 200, {
+                "result": None,
+                "error": "the planning step was cancelled",
+                "exit_code": exit_code,
+                "timed_out": False,
+                "cancelled": True,
+                "stdout": _tail_chars(stdout, MERGE_STDERR_TAIL_CHARS),
+                "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+                "container": name,
+                "warnings": warnings,
+            }
+        unfinished = _a_program_that_did_not_finish(ran)
+        if unfinished is not None:
+            status, body = unfinished
+            body["container"] = name
+            return status, body
+        exit_code, stdout, stderr = ran
+        timed_out = bool(getattr(ran, "timed_out", False))
+        result, why_not = _read_planner_result(output_path / "result.json")
+        body: dict[str, Any] = {
+            "result": result,
+            "exit_code": exit_code,
+            "timed_out": timed_out,
+            "stdout": _tail_chars(stdout, MERGE_STDERR_TAIL_CHARS),
+            "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+            "container": name,
+            "warnings": warnings,
+        }
+        if result is None:
+            body["error"] = (
+                f"the planning step was stopped after {timeout:g} seconds"
+                if timed_out
+                else f"the planning step exited {exit_code} and {why_not}"
+            )
+        return 200, body
+    except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+        return 500, {"error": f"sidecar execution error: {type(exc).__name__}: {exc}"}
+    finally:
+        if env_file is not None:
+            with contextlib.suppress(OSError):
+                os.unlink(env_file)
+        for path in (copy_path, io_path):
+            if not _run_coroutine(remove_candidate_tree(path)):
+                logger.warning(
+                    "forge-deploy-sidecar: %s could not be removed after the "
+                    "planning step",
+                    path,
+                )
+
+
+def _writable_by_the_planner(path: Path) -> None:
+    """Let the planner's user write the answer folder."""
+    owner, group = (int(part) for part in PLANNER_USER.split(":"))
+    if os.geteuid() == owner:
+        return
+    try:
+        os.chown(path, owner, group)
+    except OSError:
+        path.chmod(0o777)
+
+
+def _read_planner_result(path: Path) -> tuple[dict[str, Any] | None, str]:
+    """The planner's ``result.json`` as an object, or ``None`` and why not."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return None, "wrote no result.json"
+    if size > PLANNING_RESULT_MAX_BYTES:
+        return None, f"wrote a result.json of {size} bytes, more than this route carries"
+    try:
+        parsed = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"its result.json could not be read: {type(exc).__name__}: {exc}"
+    if not isinstance(parsed, dict):
+        return None, "its result.json is not a JSON object"
+    return parsed, ""
+
+
+# ---------------------------------------------------------------------------
 # THE CODE DOOR — FOUR READ-ONLY ROUTES INTO A REPOSITORY'S OWN SOURCE
 # (Rich's ruling, 2026-09-11: do the long-term thing now)
 # ---------------------------------------------------------------------------
@@ -8355,6 +8847,7 @@ class _SidecarServer(ThreadingHTTPServer):
         worktrees_root: Path | None = None,
         deploy_executor: DeployExecutor | None = None,
         project_runner: MergeRunner = run_project_program,
+        planning_runner: MergeRunner = run_planning_container,
     ) -> None:
         super().__init__(server_address, handler_cls)
         # WHAT THIS HELPER IS EXECUTING NOW (one sandbox per project, stage S2,
@@ -8380,6 +8873,9 @@ class _SidecarServer(ThreadingHTTPServer):
         # test and the live-gate driver on ``/run``) with none of it.
         self.merge_runner = merge_runner
         self.project_runner = project_runner
+        # The container client a planning step is started with (28 October
+        # 2026): only what it needs to reach this sandbox's engine.
+        self.planning_runner = planning_runner
         # The git routes' seams: the subprocess core the declared checks run
         # through, and where the worktrees are made (None = the runner's own
         # default under the temp directory).
@@ -8407,10 +8903,20 @@ class _SidecarServer(ThreadingHTTPServer):
                 "repo": str(repo)[:200] if isinstance(repo, str) else None,
                 "started": time.monotonic(),
             }
-            if route == GUARDKIT_LEG_ROUTE:
+            if route in (GUARDKIT_LEG_ROUTE, PLANNING_STEP_ROUTE):
+                # A planning step is stopped exactly as a leg is, by its
+                # build or its number (28 October 2026).
                 raw = payload.get("build") if isinstance(payload, dict) else None
                 build = raw.strip() if isinstance(raw, str) and raw.strip() else None
-                leg = _RunningLeg(number=number, build=build)
+                leg = _RunningLeg(
+                    number=number,
+                    build=build,
+                    what=(
+                        "planning step"
+                        if route == PLANNING_STEP_ROUTE
+                        else "fix-journey leg"
+                    ),
+                )
                 self.running_legs[number] = leg
         return number, leg
 
@@ -8510,11 +9016,14 @@ class _RunningLeg:
     runs stops it and everything it started, never once it has finished.
     """
 
-    def __init__(self, *, number: int, build: str | None) -> None:
+    def __init__(
+        self, *, number: int, build: str | None, what: str = "fix-journey leg"
+    ) -> None:
         self.number = number
         self.build = build
+        self.what = what
         self.run = StoppableRun(
-            label=f"the fix-journey leg number {number} (build {build or 'not named'})"
+            label=f"the {what} number {number} (build {build or 'not named'})"
         )
 
     @property
@@ -8527,8 +9036,9 @@ class _RunningLeg:
 
     def cancel(self) -> None:
         logger.warning(
-            "forge-deploy-sidecar: stopping the fix-journey leg number %d "
+            "forge-deploy-sidecar: stopping the %s number %d "
             "(build %s) and everything it started, because it was cancelled",
+            self.what,
             self.number,
             self.build or "not named",
         )
@@ -8601,6 +9111,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 RECEIPTS_EXPORT_ROUTE,
                 GUARDKIT_LEG_ROUTE,
                 GUARDKIT_LEG_CANCEL_ROUTE,
+                PLANNING_STEP_ROUTE,
                 CODE_LIST_FILES_ROUTE,
                 CODE_READ_FILE_ROUTE,
                 CODE_IMPORTS_ROUTE,
@@ -8740,6 +9251,26 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
             status, body = process_code_query_request(payload, config=config)
         elif route in PREVIEW_ROUTES:
             status, body = process_preview_request(route, payload, config=config)
+        elif route == PLANNING_STEP_ROUTE:
+            if leg is not None and leg.cancelled:
+                # Cancelled before it started: it never starts.
+                status, body = 200, {
+                    "result": None,
+                    "error": "the planning step was cancelled before it started",
+                    "exit_code": MERGE_NOT_STARTED_EXIT_CODE,
+                    "timed_out": False,
+                    "cancelled": True,
+                    "stdout": "",
+                    "stderr_tail": "",
+                    "warnings": [],
+                }
+            else:
+                status, body = process_planning_step_request(
+                    payload,
+                    config=config,
+                    runner=self.server.planning_runner,  # type: ignore[attr-defined]
+                    stop_run=leg.run if leg is not None else None,
+                )
         elif route == GUARDKIT_LEG_ROUTE:
             if leg is not None and leg.cancelled:
                 # Cancelled before it started: it never starts.
@@ -8806,6 +9337,7 @@ def build_server(
     worktrees_root: Path | None = None,
     deploy_executor: DeployExecutor | None = None,
     project_runner: MergeRunner = run_project_program,
+    planning_runner: MergeRunner = run_planning_container,
 ) -> _SidecarServer:
     """Build (but do not start) the loopback-only sidecar HTTP server.
 
@@ -8835,6 +9367,7 @@ def build_server(
         worktrees_root=worktrees_root,
         deploy_executor=deploy_executor,
         project_runner=project_runner,
+        planning_runner=planning_runner,
     )
 
 
@@ -8991,6 +9524,12 @@ __all__ = [
     "LEG_TIMEOUT_MAX",
     "LEG_MAX_PATHS",
     "process_guardkit_leg_request",
+    "PLANNING_STEP_ROUTE",
+    "PLANNER_IMAGE_ENV",
+    "PLANNER_ROLE_SETTINGS",
+    "planner_container_settings",
+    "process_planning_step_request",
+    "run_planning_container",
     "CODE_LIST_FILES_ROUTE",
     "CODE_READ_FILE_ROUTE",
     "CODE_IMPORTS_ROUTE",

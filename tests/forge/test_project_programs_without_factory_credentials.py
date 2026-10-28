@@ -1985,6 +1985,11 @@ ALLOWED: dict[tuple[str, str], str] = {
         "is checked below"
     ),
     ("deploy_sidecar/service.py", "run_merge_command"): "starts GuardKit (merge, legs, checks) with the factory's launch list",
+    ("deploy_sidecar/service.py", "run_planning_container"): (
+        "the container engine for one planning step (28 October 2026): PATH, "
+        "HOME, the locale and the engine's own address settings only; the "
+        "container's non-secret settings travel in the route's env file"
+    ),
     ("network_git.py", "run_network_git"): (
         "the network boundary's one git launch: an environment built from "
         "nothing (forge.network_git.isolated_environment), a fresh empty home"

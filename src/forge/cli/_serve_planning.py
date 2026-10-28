@@ -1129,6 +1129,21 @@ async def compose_planning_consumer_and_dispatch(
         )
         stage_log_writer = _PlanningStageLogWriter(store)
 
+        # PLANNING IN THE PROJECT'S SANDBOX (28 October 2026). A run whose
+        # repository has a sandbox runs each planning step there, through its
+        # helper; every other run keeps the bus orchestrator above, unchanged.
+        from forge.adapters.sandbox_planning import planning_dispatch_surface
+
+        def _planning_surface(correlation_id: str, *, reads_project: bool) -> Any:
+            return planning_dispatch_surface(
+                config=config,
+                store=store,
+                correlation_id=correlation_id,
+                bus=orchestrator,
+                reads_project=reads_project,
+                timeout_seconds=planning_dispatch_budget_seconds,
+            )
+
         async def dispatch_product_owner(
             *,
             plan_run_id: str,
@@ -1167,7 +1182,9 @@ async def compose_planning_consumer_and_dispatch(
                 build_id=plan_run_id,
                 correlation_id=correlation_id,
                 forward_context_builder=forward_context_builder,
-                dispatch_surface=orchestrator,
+                dispatch_surface=_planning_surface(
+                    correlation_id, reads_project=False
+                ),
                 stage_log_writer=stage_log_writer,
                 feature_id=plan_run_id,
                 request_text=request_text,
@@ -1203,7 +1220,9 @@ async def compose_planning_consumer_and_dispatch(
                 build_id=plan_run_id,
                 correlation_id=correlation_id,
                 forward_context_builder=forward_context_builder,
-                dispatch_surface=orchestrator,
+                dispatch_surface=_planning_surface(
+                    correlation_id, reads_project=True
+                ),
                 stage_log_writer=stage_log_writer,
                 feature_id=plan_run_id,
                 extra_command_args=build_feature_spec_command_args(
@@ -1242,7 +1261,9 @@ async def compose_planning_consumer_and_dispatch(
                 build_id=plan_run_id,
                 correlation_id=correlation_id,
                 forward_context_builder=forward_context_builder,
-                dispatch_surface=orchestrator,
+                dispatch_surface=_planning_surface(
+                    correlation_id, reads_project=True
+                ),
                 stage_log_writer=stage_log_writer,
                 feature_id=plan_run_id,
                 extra_command_args=build_feature_plan_command_args(
