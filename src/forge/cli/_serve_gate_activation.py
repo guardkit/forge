@@ -943,15 +943,15 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
 
     sentences: list[str] = []
     for verb, hows, will in (
-        ("changes", ("changed", "added"), "run this build's version of"),
+        ("changes", ("changed", "added"), "keep this build's version of"),
         ("deletes", ("deleted",), "run without"),
     ):
         mine = [str(j.get("path")) for j in judges if own(j) and j.get("how") in hows]
         if mine:
             many = len(mine) > 1
             sentences.append(
-                f"This build {verb} {_named(mine)}, which the project's declared "
-                f"commands run. {'They are' if many else 'It is'} not under the "
+                f"This build {verb} {_named(mine)}, named by the project's declared "
+                f"commands. {'They are' if many else 'It is'} not under the "
                 f"project's protected paths, so the merge will {will} "
                 f"{'them' if many else 'it'}."
             )

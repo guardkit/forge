@@ -1754,9 +1754,9 @@ async def test_a_judge_outside_the_protected_paths_runs_the_builds_copy(
     )
 
     assert (
-        "This build changes scripts/check.sh, which the project's declared commands "
-        "run. It is not under the project's protected paths, so the merge will run "
-        "this build's version of it."
+        "This build changes scripts/check.sh, named by the project's declared "
+        "commands. It is not under the project's protected paths, so the merge will "
+        "keep this build's version of it."
     ) in words
     assert (
         "This build changes reference/check.sh, which runs the project's checks. "
@@ -1775,8 +1775,8 @@ async def test_a_deleted_judge_outside_the_protected_paths_is_left_out(config, p
     )
 
     assert (
-        "This build deletes scripts/check.sh, which the project's declared commands "
-        "run. It is not under the project's protected paths, so the merge will run "
-        "without it."
+        "This build deletes scripts/check.sh, named by the project's declared "
+        "commands. It is not under the project's protected paths, so the merge will "
+        "run without it."
     ) in words
     assert "main's version" not in words
