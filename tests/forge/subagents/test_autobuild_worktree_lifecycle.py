@@ -372,9 +372,17 @@ def test_read_only_folders_in_a_nested_worktree_and_its_record_are_removed(
 
 
 def _todays_state(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
-    """Today's state, made the way it was made live: the earlier attempt's
+    """Today's state, as it was left live: the earlier attempt's
     `git worktree remove --force` deleted the working folder and stopped on the
-    read-only record folder, leaving a prunable registration."""
+    read-only record folder, leaving a prunable registration.
+
+    The state is made directly (the working folder deleted, the record folder
+    kept with its read-only cache) rather than by running that failing
+    remove: how far git's remove gets inside the record folder depends on the
+    order the filesystem lists it, and on the CI runner it took the record's
+    ``gitdir`` file before it stopped, so no registration was left at all."""
+    import shutil
+
     repo, base, outer, inner = _repo_with_nested(tmp_path)
     record = _record_folder(repo, inner)
     _read_only_cache(record / "guardkit-scratch")
@@ -383,13 +391,7 @@ def _todays_state(tmp_path: Path) -> tuple[Path, Path, Path, Path, Path, dict]:
     )
     assert offered["ok"] is True, offered
     offered["cleanup_registrations"] = offered["nested_registrations"]
-    failed = subprocess.run(
-        ["git", "worktree", "remove", "--force", str(inner)],
-        cwd=repo,
-        capture_output=True,
-        text=True,
-    )
-    assert failed.returncode != 0
+    shutil.rmtree(inner)
     assert not inner.exists() and record.exists()
     assert "prunable" in _git(repo, "worktree", "list", "--porcelain")
     return repo, base, outer, inner, record, offered

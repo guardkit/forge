@@ -88,7 +88,12 @@ class TestThePruneThatKilledThePlan:
         assert str(worktree) not in _registered(repo)
         status = _git(worktree, "status", check=False)
         assert status.returncode != 0
-        assert "not a git repository" in status.stderr
+        # Git 2.43 says "not a git repository"; Git 2.56 says the gitfile
+        # "does not point to a valid repository". The same broken worktree.
+        assert (
+            "not a git repository" in status.stderr
+            or "does not point to a valid repository" in status.stderr
+        ), status.stderr
 
     def test_a_locked_worktree_out_of_sight_survives_the_prune(
         self, repo: Path, tmp_path: Path

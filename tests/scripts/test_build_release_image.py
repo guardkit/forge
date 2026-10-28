@@ -944,25 +944,39 @@ sweep_exceptions:
 def test_a_plan_reports_an_existing_tag_rather_than_refusing(tmp_path):
     """Planning a release on the machine that built it should not need a flag.
 
-    The image used is whichever one this machine already has — the question is
-    about an EXISTING tag, so the test asks the daemon for one rather than
-    building or pulling anything. The name is only read.
+    The test makes its own existing tag: an empty image imported from an
+    empty archive (nothing is built or pulled), under a name and tag of its
+    own, removed again afterwards. It used to take whichever tagged image
+    the machine already had, and on a CI runner the first one was a
+    ':latest' tag, which the script rightly refuses as a floating tag.
     """
-    listing = subprocess.run(
-        ["docker", "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
+    import tarfile
+    import uuid
+
+    name = "forge-plan-existing-tag-check"
+    tag = f"2000.01.01-{uuid.uuid4().hex[:12]}"
+    empty = tmp_path / "empty.tar"
+    with tarfile.open(empty, "w"):
+        pass
+    made = subprocess.run(
+        ["docker", "image", "import", str(empty), f"{name}:{tag}"],
         capture_output=True,
         text=True,
-        timeout=60,
+        timeout=120,
     )
-    existing = [
-        line
-        for line in listing.stdout.splitlines()
-        if line and "<none>" not in line and ":" in line
-    ]
-    if not existing:
-        pytest.skip("this machine has no tagged image, so there is no existing tag to plan over")
+    assert made.returncode == 0, made.stderr
+    try:
+        _plan_over_an_existing_tag(tmp_path, name, tag)
+    finally:
+        subprocess.run(
+            ["docker", "image", "rm", f"{name}:{tag}"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
 
-    name, _, tag = existing[0].rpartition(":")
+
+def _plan_over_an_existing_tag(tmp_path, name, tag):
     manifest = _manifest(
         tmp_path,
         f"""

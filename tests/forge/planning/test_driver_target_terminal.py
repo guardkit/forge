@@ -4234,6 +4234,14 @@ def test_the_git_command_is_an_argument_list_with_no_shell(
     from forge import project_git
 
     repo = _repo_with_files(tmp_path, ["src/users/crud.py"])
+    # Git reads only the repository's own settings here: a filter in this
+    # machine's system or personal settings (the CI runner's system file has
+    # Git LFS's) is switched off on the command line, which is right but
+    # would add its own settings to the command pinned below.
+    empty = tmp_path / "no-personal-settings"
+    empty.write_text("")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(empty))
     seen: dict[str, Any] = {}
     real_run = subprocess.run
 

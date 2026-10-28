@@ -1148,8 +1148,22 @@ WITHHELD_VALUE = "a-value-that-must-never-be-shown-" + "w" * 12
 UNSET_DECLARED = "STANDIN_UNSET"
 
 
+#: What the factory's environment keeps for these checks. Everything else
+#: this machine happens to have is taken out, so the note's list of withheld
+#: names is the same short one everywhere: on a CI runner with a hundred more
+#: settings, the 2000-character tail of the failure detail kept only the end
+#: of the note and lost its first sentence.
+_KEPT_FOR_THE_FAILED_PROGRAM_CHECKS = frozenset(
+    {"PATH", "HOME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "USER", "LOGNAME", "SHELL"}
+)
+
+
 @pytest.fixture
 def failing(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    planted = {*SENTINELS, DECLARED, "FORGE_SIDECAR_IN_SANDBOX"}  # by _plant
+    for name in list(os.environ):
+        if name not in _KEPT_FOR_THE_FAILED_PROGRAM_CHECKS | planted:
+            monkeypatch.delenv(name)
     monkeypatch.setenv(WITHHELD, WITHHELD_VALUE)
     monkeypatch.delenv(UNSET_DECLARED, raising=False)
     return _a_project(
