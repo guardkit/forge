@@ -2418,10 +2418,10 @@ async def execute_merge_deploy(
       The same question settles an "about to join" that was never answered;
     * **a step counts as done only when it PASSED on exactly this joined
       commit.** The existence of a "done" line says the step finished, not
-      that it was green: a red run writes one too. So a press that picks up a
-      join whose post-join checks went red says so — "the checks after the
-      join did not pass" stays the result until a new attempt's checks pass —
-      and a person never reads "checked" for a red run. The factory's own
+      that it was green: a red run writes one too, and a person never reads
+      "checked" for a red run. Since 28 October 2026 a press that picks up a
+      join whose post-join checks went red sets it aside under its own name
+      and joins and checks again on the next attempt. The factory's own
       live check is re-run on every press and never inherited at all.
 
     A record held by a live lease is left alone; a takeover needs the lease to
@@ -6413,14 +6413,11 @@ async def execute_merge_deploy(
                     )
 
             # ------------------------------------------------------------------
-            # A RED SET OF CHECKS STAYS RED. This press may have picked up a join
-            # an earlier one made; if the earlier press ran the build system's
-            # checks on exactly this joined commit and they went red, that is
-            # still the answer. It is not re-run here — the checks live inside the
-            # merge command, and running that command again would try to merge
-            # again — so there is nothing that could have changed it. The result
-            # says what happened, word for word as the press that ran them said
-            # it, and it stays the result until a NEW attempt's checks pass.
+            # A RECORDED RED RESULT ON A PICKED-UP JOIN. A join whose checks went
+            # red is set aside and joined and checked again before this point
+            # (28 October 2026), so this is kept only as the last word for a red
+            # line that is still on this exact join: it is said as it was, and
+            # never read back as "checked".
             # ------------------------------------------------------------------
             if not merge_checks_ran_here:
                 # A join an earlier press made: what it recorded about main's
