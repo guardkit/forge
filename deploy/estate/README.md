@@ -98,8 +98,12 @@ in `../compose/`, and is referenced from here rather than copied.
 
 ## Walk (a): a clean local machine
 
-1. **Install Docker**, and `sbx` if this machine will look after a project's
-   sandbox.
+1. **Install Docker**, with **Docker Compose 5.0.0 or later** (the factory's
+   machine runs v5.2.0), and `sbx` if this machine will look after a
+   project's sandbox. `compose.yaml` includes Forge's own compose file and
+   adds to its coordinator service; every Compose 2.x release refuses that
+   with "services.coordinator conflicts with imported resource" (checked on
+   27 October 2026 with 2.38.2, 2.39.4 and 2.40.3).
 2. **Clone this bundle.** No product repository is cloned: the factory's code
    is in the release images, and a project's code lives in its own sandbox.
 3. **Build the estate's own two images and fill the bus's volume:**

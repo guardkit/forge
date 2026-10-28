@@ -459,6 +459,24 @@ jobs:
           git config --global user.email "ci@forge.invalid"
           git config --global user.name "forge CI"
 
+      # THE ESTATE BUNDLE IS MADE FOR COMPOSE 5. deploy/estate/compose.yaml
+      # includes Forge's own compose file and then adds to its coordinator
+      # service; Compose 5.0.0 and later merge that, every 2.x release
+      # refuses it ("services.coordinator conflicts with imported
+      # resource"). Checked on 27 October 2026 with the release binaries of
+      # 2.38.2 (this runner image's), 2.39.4, 2.40.3, 5.0.0, 5.1.0 and 5.2.0.
+      # The factory's machine runs Compose v5.2.0, so the runner is given
+      # the same one, from Docker's release, checksum-checked, as the
+      # user's own plugin (which the docker client prefers to the system's).
+      - name: Use the Compose version the estate bundle is made for (v5.2.0)
+        run: |
+          mkdir -p "$HOME/.docker/cli-plugins"
+          curl -fsSL -o "$HOME/.docker/cli-plugins/docker-compose" \
+            https://github.com/docker/compose/releases/download/v5.2.0/docker-compose-linux-x86_64
+          echo "018f9612ecabc5f2d7aaa53d6f5f44453a87611e2d72c8ef84d7b1eca070e719  $HOME/.docker/cli-plugins/docker-compose" | sha256sum -c -
+          chmod +x "$HOME/.docker/cli-plugins/docker-compose"
+          docker compose version
+
       - name: Run the suite
         working-directory: forge
         env:
