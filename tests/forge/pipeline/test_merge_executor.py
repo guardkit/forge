@@ -1406,11 +1406,10 @@ class TestExecutorSequencing:
     ) -> None:
         """The second blocker: press one goes red, press two must say so.
 
-        Press one's post-join checks fail. Press two finds the same join —
-        the build's tip has not moved, so it is a legitimate reuse — runs the
-        merge command not at all, and must NOT report "checked and ready to
-        publish". The red answer stays the answer until a new attempt's
-        checks pass.
+        Press one's post-join checks fail. Since 28 October 2026 press two
+        sets that join aside and joins and checks again (a release can change
+        the answer: step 2's requests 7 and 9). Checks that are still red
+        say so, and red is never reported as "checked and ready to publish".
         """
         joiner = _JoinsForReal(verify_ok=False, verify_detail="3 checks went red")
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
@@ -1431,21 +1430,41 @@ class TestExecutorSequencing:
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         second = await _run_executor(deps, repo_root)
 
-        # Nothing was re-run, and nothing was laundered.
-        assert len(joiner.calls) == 1
+        # Checked again on a fresh join, and still red: nothing laundered.
+        assert len(joiner.calls) == 2
         assert second.result == "merged-verify-failed"
         assert second.status == "FAILED"
-        assert second.merged_sha == first.merged_sha
-        assert second.detail == (
-            f"{FEATURE_ID} was joined onto main ({str(first.merged_sha)[:10]}), "
-            "but the checks after the join did not pass: 3 checks went red. "
-            "Nothing was published."
-        )
+        assert "the checks after the join did not pass" in second.detail
+        assert "3 checks went red" in second.detail
         assert "checked and ready to publish" not in second.detail
         assert "was checked" not in second.detail
         assert "publication-pending" != second.result
         # The live check never ran either — the press stopped before it.
         assert _legs(dp) == []
+
+    @pytest.mark.asyncio
+    async def test_a_press_after_the_checking_was_fixed_joins_again_and_passes(
+        self, config, pool, repo_root
+    ) -> None:
+        """28 October 2026, step 2 requests 7 and 9: a join went red only
+        because of how the merge checked it; after the fix was released, a
+        press joins again, checks again and is not held to the old red."""
+        joiner = _JoinsForReal(verify_ok=False, verify_detail="main's check.sh ran")
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        first = await _run_executor(deps, repo_root)
+        assert first.result == "merged-verify-failed"
+
+        joiner.verify_ok = True
+        joiner.verify_detail = ""
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
+        second = await _run_executor(deps, repo_root)
+
+        assert len(joiner.calls) == 2
+        assert second.result != "merged-verify-failed"
+        assert "did not pass" not in second.detail
+        assert second.merged_sha and second.merged_sha != first.merged_sha
+        # The red join is kept under its own name, not deleted.
+        assert _git(repo_root, "cat-file", "-t", str(first.merged_sha)) == "commit"
 
     @pytest.mark.asyncio
     async def test_a_red_live_check_is_never_inherited_from_the_record(
@@ -2095,10 +2114,11 @@ class TestAResumedJoinKeepsCouldNotRun:
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         second = await _run_executor(deps, repo_root)
 
-        assert len(joiner.calls) == 1
+        # Joined and checked again (28 October 2026), still red.
+        assert len(joiner.calls) == 2
         assert second.result == "merged-verify-failed"
         assert second.verify_status == "failed"
-        assert "did not pass: 3 checks went red" in second.detail
+        assert "3 checks went red" in second.detail
         # The resumed red result is handed to the repair filing as red; the
         # queue itself keeps one open repair per build.
         assert len(filed) == 2

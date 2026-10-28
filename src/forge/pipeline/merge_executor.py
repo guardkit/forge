@@ -5799,6 +5799,45 @@ async def execute_merge_deploy(
                     return check_join_said.passed
                 return _the_recorded_step_passed(STEP_MERGE_CHECKS)
 
+            # A PRESS AFTER A RED CHECK TRIES AGAIN (28 October 2026). A join
+            # whose post-join checks went red used to stay red on every later
+            # press, on the reasoning that nothing could have changed the
+            # answer. A release can: step 2's requests 7 and 9 went red only
+            # because the merge ran main's copy of the project's check script,
+            # and after the fix was released a press still read back the old
+            # red result. A person pressing again is asking for another try,
+            # so that join is set aside under its own name (nothing is
+            # deleted) and a fresh join is made and checked on the next
+            # attempt. Red is still never read back as "checked".
+            if j_commit is not None:
+                red_before = _why_the_recorded_step_failed(STEP_MERGE_CHECKS)
+                if red_before is not None:
+                    logger.warning(
+                        "merge-executor: %s's join (%s) went red on an earlier "
+                        "press (%s) — it is set aside under its own name (%s) "
+                        "and joined and checked again",
+                        feature_id,
+                        str(j_commit)[:10],
+                        red_before,
+                        integration_branch(join_as, attempt),
+                    )
+                    if store is not None and not store.done(
+                        build_id=build_id,
+                        turn=turn,
+                        now=deps.clock(),
+                        step=STEP_JOIN,
+                        attempt=attempt,
+                        result={
+                            "set_aside": True,
+                            "branch_kept": integration_branch(join_as, attempt),
+                            "commit_kept": j_commit,
+                            "why": f"its checks went red on an earlier press: {red_before}",
+                        },
+                        j_commit=None,
+                    ):
+                        return _replaced_here()
+                    j_commit = None
+
             unfinished = record.unfinished() if record is not None else None
             if j_commit is None and unfinished is not None and unfinished.step == STEP_JOIN:
                 # The last line says a join was about to happen and never said
