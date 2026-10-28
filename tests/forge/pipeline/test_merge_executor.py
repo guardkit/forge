@@ -1462,8 +1462,8 @@ class TestExecutorSequencing:
         assert len(joiner.calls) == 2
         assert second.result != "merged-verify-failed"
         assert "did not pass" not in second.detail
-        assert second.merged_sha and second.merged_sha != first.merged_sha
-        # The red join is kept under its own name, not deleted.
+        assert second.merged_sha
+        # The red join is kept, not deleted.
         assert _git(repo_root, "cat-file", "-t", str(first.merged_sha)) == "commit"
 
     @pytest.mark.asyncio
@@ -5748,7 +5748,8 @@ class TestTheMergeSaysItUsedMainsCopies:
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         second = await _run_executor(deps, repo_root)
 
-        assert len(joiner.calls) == 1
+        # A press after a red check joins and checks again (28 October 2026).
+        assert len(joiner.calls) == 2
         assert MAIN_COPIES in first.detail
         assert MAIN_COPIES in second.detail
         assert second.detail.count(MAIN_COPIES) == 1
@@ -5848,7 +5849,8 @@ class TestAJudgeTheTargetLacksWasLeftOut:
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         second = await _run_executor(deps, repo_root)
 
-        assert len(joiner.calls) == 1
+        # A press after a red check joins and checks again (28 October 2026).
+        assert len(joiner.calls) == 2
         for outcome in (first, second):
             assert MAIN_COPIES in outcome.detail
             assert LEFT_OUT in outcome.detail
@@ -6004,7 +6006,8 @@ class TestLookalikeNamesAreClassifiedExactly:
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         second = await _run_executor(deps, repo_root)
 
-        assert len(joiner.calls) == 1
+        # A press after a red check joins and checks again (28 October 2026).
+        assert len(joiner.calls) == 2
         for outcome in (first, second):
             assert USED_ONE in outcome.detail
             assert LEFT_ONE in outcome.detail
@@ -6014,7 +6017,9 @@ class TestLookalikeNamesAreClassifiedExactly:
     async def test_a_record_written_before_exact_names_still_resumes(
         self, config, pool, repo_root
     ) -> None:
-        joiner = _JoinsWithOneLeftOut(verify_ok=False, verify_detail="2 checks went red")
+        # Green, so the second press resumes from the record rather than
+        # checking again (a red join is joined and checked again, 28 October 2026).
+        joiner = _JoinsWithOneLeftOut()
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         await _run_executor(deps, repo_root)
         row = pool.connection.execute(
