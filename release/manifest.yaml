@@ -190,7 +190,7 @@ schema: 2
 # 27 October 2026, night: release 2026.10.27-2, the cull (every check not on Rich's
 # keep-list deleted): Forge 42102a2f, GuardKit 4d14e347, guardkitfactory e9bb235.
 # Other pins as 2026.10.27-1.
-version: 2026.10.28-1
+version: 2026.10.28-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -251,7 +251,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: ecbbaf8cadef137c9ab771a37671cf5dcb97c066
+    commit: e50f7bff7e79002a009c8fc0b24d2523272e374f
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
