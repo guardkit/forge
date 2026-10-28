@@ -1413,6 +1413,20 @@ class PlanningConfig(BaseModel):
         ),
     )
 
+    planner_in_sandbox: bool = Field(
+        default=False,
+        description=(
+            "Run the planner's steps (greenfield, feature_spec, feature_plan) "
+            "inside the project's sandbox, in a container from the planner "
+            "image the sandbox holds (its helper's FORGE_PLANNER_IMAGE), for "
+            "repositories listed in 'sandboxes'. Off by default: every "
+            "planning step goes to the planning seats over the bus, as "
+            "before. Turn it on only once the planner image is in every "
+            "listed sandbox (Rich, 27 October 2026: the planner moves into "
+            "the sandbox)."
+        ),
+    )
+
     sandbox_starter: SandboxStarterConfig = Field(
         default_factory=SandboxStarterConfig,
         description=(

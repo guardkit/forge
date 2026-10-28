@@ -279,6 +279,7 @@ class TestYamlRoundTrip:
                 # their own sandbox); the unfiltered dump always includes both.
                 "rewrite_on_refusal": True,
                 "sandboxes": {},
+                "planner_in_sandbox": False,
                 # Added 7, 12 and 14 October 2026 (the "nothing to build"
                 # switch, the ranked source switch, the per-repository fetch
                 # addresses); the unfiltered dump always includes them.

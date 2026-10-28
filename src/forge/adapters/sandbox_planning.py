@@ -243,13 +243,16 @@ def planning_dispatch_surface(
 ) -> Any:
     """The bus orchestrator, or the project's sandbox helper for this step.
 
-    A run whose target repository has a sandbox (``planning.sandboxes``, the
-    same lookup a fix journey's legs use) runs its step there; every other run
-    gets ``bus`` unchanged. The repository is the run's own, or the default,
+    With ``planning.planner_in_sandbox`` on, a run whose target repository has
+    a sandbox (``planning.sandboxes``, the same lookup a fix journey's legs
+    use) runs its step there; every other run, and every run while the switch
+    is off, gets ``bus`` unchanged. The repository is the run's own, or the default,
     as the planning driver resolves it. ``reads_project`` (the spec and plan
     steps) also sends the run's recorded start commit and memory name.
     """
     planning = getattr(config, "planning", None)
+    if not getattr(planning, "planner_in_sandbox", False):
+        return bus
     sandboxes = dict(getattr(planning, "sandboxes", None) or {})
     if not sandboxes:
         return bus

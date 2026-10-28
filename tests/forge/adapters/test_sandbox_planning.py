@@ -53,9 +53,12 @@ REPLY = {
 }
 
 
-def _config(sandboxes: dict[str, Any] | None = None, default: str | None = None) -> ForgeConfig:
+def _config(
+    sandboxes: dict[str, Any] | None = None, default: str | None = None, in_sandbox: bool = True
+) -> ForgeConfig:
     planning: dict[str, Any] = {
         "target_repo_paths": {REPO: "/srv/notes-app", OTHER_REPO: "/srv/other"},
+        "planner_in_sandbox": in_sandbox,
     }
     if sandboxes is not None:
         planning["sandboxes"] = sandboxes
@@ -95,6 +98,17 @@ class TestTheChoice:
             reads_project=True,
         )
         assert surface is BUS
+
+    def test_the_switch_off_keeps_the_bus_even_with_a_sandbox(self) -> None:
+        surface = planning_dispatch_surface(
+            config=_config(SANDBOXES, in_sandbox=False), store=_Store(), correlation_id=RUN,
+            bus=BUS, reads_project=True,
+        )
+        assert surface is BUS
+        # And it is off unless forge.yaml says otherwise.
+        assert ForgeConfig.model_validate(
+            {"permissions": {"filesystem": {"allowlist": ["/srv"]}}, "planning": {}}
+        ).planning.planner_in_sandbox is False
 
     def test_a_repository_without_a_sandbox_keeps_the_bus(self) -> None:
         surface = planning_dispatch_surface(

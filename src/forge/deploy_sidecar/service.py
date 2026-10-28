@@ -6224,10 +6224,9 @@ PLANNING_STEP_TIMEOUT_DEFAULT: float = 3600.0
 #: How long removing a stopped step's container may take.
 PLANNER_REMOVE_TIMEOUT_SECONDS: float = 60.0
 
-#: The largest request and answer this route carries (a plan step's request
-#: holds the spec it plans from).
+#: The largest request this route carries (a plan step's request holds the
+#: spec it plans from).
 PLANNING_REQUEST_MAX_BYTES: int = 16 * 1024 * 1024
-PLANNING_RESULT_MAX_BYTES: int = 16 * 1024 * 1024
 
 #: The settings the container client itself is started with: enough to find
 #: the engine, nothing of the factory's.
@@ -6596,12 +6595,8 @@ def _writable_by_the_planner(path: Path) -> None:
 
 def _read_planner_result(path: Path) -> tuple[dict[str, Any] | None, str]:
     """The planner's ``result.json`` as an object, or ``None`` and why not."""
-    try:
-        size = path.stat().st_size
-    except OSError:
+    if not path.exists():
         return None, "wrote no result.json"
-    if size > PLANNING_RESULT_MAX_BYTES:
-        return None, f"wrote a result.json of {size} bytes, more than this route carries"
     try:
         parsed = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
