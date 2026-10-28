@@ -974,10 +974,13 @@ run_the_services_items() {
     publisher="$(container_of forge-publisher)"
     publisher_ip="$(docker inspect "${publisher}" --format "{{(index .NetworkSettings.Networks \"${PROJECT}_forge-publisher-net\").IPAddress}}" 2>/dev/null)"
     from_host=""
-    if [ "$(id -u)" = "1000" ] && [ -n "${publisher_ip}" ]; then
+    # An ORDINARY host request is one from any user but root. (This used to
+    # say UID 1000, which is this machine's login and not the policy's: the
+    # host policy drops every host-originated request to the publisher.)
+    if [ "$(id -u)" != "0" ] && [ -n "${publisher_ip}" ]; then
         from_host="$(curl --noproxy "*" -s -o /dev/null --connect-timeout 2 --max-time 4 -w "%{http_code}" "http://${publisher_ip}:8711/healthz" 2>/dev/null)"
     else
-        policy_problem="${policy_problem} ordinary host check requires UID 1000 and a readable publisher IPv4 address;"
+        policy_problem="${policy_problem} ordinary host check must run as a user other than root and needs a readable publisher IPv4 address;"
     fi
     if publisher_policy_verify members; then
         policy_after="$(printf "%s" "${POLICY_SAID}" | sed -n "s/.*drop_packets=\([0-9][0-9]*\).*/\1/p")"
@@ -990,13 +993,13 @@ run_the_services_items() {
         from_coordinator="$(docker exec "${coordinator}" curl -s -o /dev/null --max-time 8 -w "%{http_code}" "${publisher_url}/healthz" 2>/dev/null)"
         from_elsewhere="$(docker exec "${answer}" curl -s -o /dev/null --max-time 8 -w "%{http_code}" "${publisher_url}/healthz" 2>/dev/null)"
         if [ "${from_coordinator}" = "200" ] && [ "${from_elsewhere}" != "200" ] && [ "${from_host}" != "200" ] && [ -z "${policy_problem}" ] && [ -n "${policy_before}" ] && [ "${policy_after}" -gt "${policy_before}" ]; then
-            ok 8g "the publisher answers the coordinator, refuses the answer service, and an ordinary UID 1000 host GET to ${publisher_ip}:8711 was dropped by the current owned rule (counter ${policy_before} to ${policy_after}). The broader sandbox and LAN origin matrix remains a separate rollout gate."
+            ok 8g "the publisher answers the coordinator, refuses the answer service, and an ordinary (not root) host GET to ${publisher_ip}:8711 was dropped by the current owned rule (counter ${policy_before} to ${policy_after}). The broader sandbox and LAN origin matrix remains a separate rollout gate."
         elif [ "${from_coordinator}" != "200" ]; then
             fail 8g "the coordinator could not reach the publisher at ${publisher_url} (it said ${from_coordinator:-nothing})."
         elif [ "${from_elsewhere}" = "200" ]; then
             fail 8g "the answer service CAN reach the publisher at ${publisher_url}."
         elif [ "${from_host}" = "200" ]; then
-            fail 8g "an ordinary UID 1000 host request reached the publisher at ${publisher_ip}:8711."
+            fail 8g "an ordinary (not root) host request reached the publisher at ${publisher_ip}:8711."
         else
             fail 8g "the current host policy and its matching drop counter did not prove the ordinary host refusal: ${policy_problem:-counter did not increase}."
         fi

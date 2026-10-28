@@ -66,7 +66,7 @@ else: raise SystemExit(1)
     _executable(tools / "sbx", "#!/bin/sh\ncase \"$1\" in ls) echo codex-owned-fake-sandbox;; exec) echo 200;; *) exit 1;; esac\n")
     _executable(tools / "sudo", r"""#!/usr/bin/env python3
 import os, sys, pathlib
-assert os.getuid()==1000, 'must exercise ordinary operator sudo caller'
+assert os.getuid()!=0, 'must exercise an ordinary (not root) operator sudo caller'
 a=sys.argv[1:]; assert a[0]=='--' and a[1]=='/usr/local/libexec/forge-publisher-host-policy' and a[2]=='verify'
 assert a[a.index('--docker-host')+1]=='unix:///var/run/docker.sock'
 assert a[a.index('--project')+1]=='codex-review'
