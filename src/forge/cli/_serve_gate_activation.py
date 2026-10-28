@@ -925,16 +925,36 @@ def card_line_about_the_merge_check(reading: Mapping[str, Any] | None) -> str:
             return None if value is None else bool(value)
         return j.get("how") != "added"
 
+    # Only a judge file under the project's protected paths is checked with
+    # main's copy (28 October 2026); the merge runs the build's own copy of
+    # any other. A record from before carries no ``main_copy``.
+    def own(j: Mapping[str, Any]) -> bool:
+        return j.get("how") != "link" and j.get("main_copy") is False
+
     def paths(how: str, *roles: str, target: bool | None = True) -> list[str]:
         return [
             str(j.get("path"))
             for j in judges
             if j.get("how") == how
+            and not own(j)
             and (not roles or j.get("role") in roles)
             and (j.get("how") == "link" or on_target(j) is target)
         ]
 
     sentences: list[str] = []
+    for verb, hows, will in (
+        ("changes", ("changed", "added"), "run this build's version of"),
+        ("deletes", ("deleted",), "run without"),
+    ):
+        mine = [str(j.get("path")) for j in judges if own(j) and j.get("how") in hows]
+        if mine:
+            many = len(mine) > 1
+            sentences.append(
+                f"This build {verb} {_named(mine)}, which the project's declared "
+                f"commands run. {'They are' if many else 'It is'} not under the "
+                f"project's protected paths, so the merge will {will} "
+                f"{'them' if many else 'it'}."
+            )
     checks = paths("changed", "check")
     if checks:
         many = len(checks) > 1

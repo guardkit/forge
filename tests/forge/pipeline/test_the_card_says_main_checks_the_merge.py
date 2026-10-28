@@ -59,7 +59,13 @@ JOINED = "refs/forge/preview/lease-1"
 #: The commit the build started from.
 START = "9" * 40
 
-CHECK_AND_INSTALL = (
+#: The project protects its scripts (28 October 2026: only a judge file under
+#: the protected paths is checked with main's copy; see
+#: ``test_a_judge_outside_the_protected_paths_runs_the_builds_copy``).
+PROTECTS_SCRIPTS = (
+    "autobuild:\n  player:\n    protected_paths: [scripts, tools, docs]\n"
+)
+CHECK_AND_INSTALL = PROTECTS_SCRIPTS + (
     "toolchain:\n  test: bash scripts/check.sh\n  install: bash scripts/install.sh\n"
 )
 
@@ -109,13 +115,24 @@ class StandInGuardKit:
         if "broken" in data:
             return None, ".guardkit/config.yaml is not valid"
         block = data.get("toolchain") or {}
+        player = (data.get("autobuild") or {}).get("player") or {}
         return (
             SimpleNamespace(
                 declared_test=block.get("test"),
                 toolchain=SimpleNamespace(install=block.get("install") or ""),
+                protected_paths=tuple(player.get("protected_paths") or ()),
             ),
             None,
         )
+
+    def judges_kept_from_target(
+        self, paths: Sequence[str], protected_paths: Sequence[str]
+    ) -> list[str]:
+        roots = [p.rstrip("/") for p in protected_paths if p.rstrip("/")]
+        return [
+            path for path in paths
+            if any(path == root or path.startswith(root + "/") for root in roots)
+        ]
 
     def judge_words(self, command: str, *, through_shell: bool) -> tuple[Any, str | None]:
         self.calls.append(("judge_words", command))
@@ -477,6 +494,7 @@ CASES: dict[str, dict[str, Any]] = {
     },
     "named install list": {
         "target": _project(
+            "autobuild:\n  player:\n    protected_paths: [scripts, requirements.txt]\n"
             "toolchain:\n  test: bash scripts/check.sh\n  install: pip install -r requirements.txt\n",
             **{"requirements.txt": ("100644", "a-library\n")},
         ),
@@ -743,7 +761,7 @@ async def test_a_listing_that_cannot_be_read_is_said_plainly(config, pool, rules
 
 @pytest.mark.asyncio
 async def test_a_judge_the_target_renamed_is_listed_when_the_joined_version_differs(config, pool, rules) -> None:
-    renamed = "toolchain:\n  test: bash scripts/verify.sh\n"
+    renamed = PROTECTS_SCRIPTS + "toolchain:\n  test: bash scripts/verify.sh\n"
     base = _project(renamed, **{"scripts/verify.sh": ("100755", "main's checks\n")})
     del base["scripts/check.sh"]
     joined = dict(base, **{"scripts/verify.sh": ("100755", "main's checks, weakened\n")})
@@ -1110,7 +1128,7 @@ async def test_real_unreadable_changes_with_mains_judge_a_link(config, pool, rul
 
 @pytest.mark.asyncio
 async def test_real_a_renamed_judge_is_listed_from_the_listings(config, pool, rules, real) -> None:
-    renamed = "toolchain:\n  test: bash scripts/verify.sh\n"
+    renamed = PROTECTS_SCRIPTS + "toolchain:\n  test: bash scripts/verify.sh\n"
     real.main = real.commit(MAIN_FILES, "main before the rename")
     _git_run(real.root, "checkout", "-q", "-b", f"autobuild/{FEATURE_ID}")
     real.candidate = real.commit({"scripts/check.sh": "#!/bin/sh\nrun the checks\nexit 0\n"}, "weakened")
@@ -1540,8 +1558,9 @@ async def test_with_mains_listing_unreadable_the_card_does_not_guess(config, poo
 # Coach review 3: a file name never adds its own words or lines to the card
 # ---------------------------------------------------------------------------
 
-#: A name with a line break, followed by words of its own.
-EVIL = "evil\nThe merge will pass/check.sh"
+#: A name with a line break, followed by words of its own (under a protected
+#: folder, so the card's sentence about main's copy is the one shown).
+EVIL = "tools/evil\nThe merge will pass/check.sh"
 
 
 @pytest.mark.parametrize("card", sorted(CARDS))
@@ -1552,8 +1571,8 @@ async def test_a_name_with_a_line_break_stays_on_its_own_line(config, pool, rule
     )
 
     assert not any(line.startswith("The merge will pass") for line in words.splitlines())
-    assert "This build adds evil\\nThe merge will pass/check.sh, which has the same name" in words
-    assert [j["path"] for j in reading["judge_files"]] == ["evil\\nThe merge will pass/check.sh"]
+    assert "This build adds tools/evil\\nThe merge will pass/check.sh, which has the same name" in words
+    assert [j["path"] for j in reading["judge_files"]] == ["tools/evil\\nThe merge will pass/check.sh"]
 
 
 @pytest.mark.parametrize(
@@ -1616,8 +1635,8 @@ async def test_a_right_to_left_override_in_a_name_is_shown_not_obeyed(
 
 @pytest.mark.asyncio
 async def test_lookalike_names_are_decided_on_exactly(config, pool, rules) -> None:
-    on_main = "x\n/check.sh"
-    not_on_main = "x\\n/check.sh"
+    on_main = "tools/x\n/check.sh"  # under a protected folder
+    not_on_main = "tools/x\\n/check.sh"
     target = _project(**{on_main: ("100755", "main's copy\n")})
     candidate = dict(target, **{not_on_main: ("100755", "the build's copy\n")})
 
@@ -1627,7 +1646,7 @@ async def test_lookalike_names_are_decided_on_exactly(config, pool, rules) -> No
     )
 
     fates = sorted((j["path"], j["on_target"]) for j in reading["judge_files"])
-    assert fates == [("x\\n/check.sh", False), ("x\\n/check.sh", True)]
+    assert fates == [("tools/x\\n/check.sh", False), ("tools/x\\n/check.sh", True)]
     assert "Main has its own copy, so the merge will use main's version of it" in words
     assert "The merge will run without it." in words
 
@@ -1703,3 +1722,61 @@ async def test_an_existing_file_name_never_adds_a_line_to_the_card(
     assert not any(line.startswith("The merge will pass") for line in words.splitlines())
     assert "\u202e" not in words
     _no_stray_characters(words)
+
+
+# ---------------------------------------------------------------------------
+# 28 October 2026: only a judge file under the protected paths uses main's copy
+# ---------------------------------------------------------------------------
+#
+# Step 2's request 7 (FEAT-9107): a feature that extended the root check
+# script failed its own tests of it, because the merge ran main's copy. The
+# merge now runs the build's copy of a judge file outside the project's
+# protected paths, and the card says so before approval.
+
+#: The career copies' shape: the design's check is protected, the root check
+#: script is the project's own.
+CAREER_SHAPE = (
+    "autobuild:\n  player:\n    protected_paths: [reference]\n"
+    "toolchain:\n  test: bash reference/check.sh reference/fence.txt && bash scripts/check.sh\n"
+)
+
+
+@pytest.mark.parametrize("card", sorted(CARDS))
+@pytest.mark.asyncio
+async def test_a_judge_outside_the_protected_paths_runs_the_builds_copy(
+    config, pool, rules, card: str
+) -> None:
+    target = _project(CAREER_SHAPE, **{"reference/check.sh": ("100755", "design\n")})
+
+    words, reading = await CARDS[card](
+        config, pool, trees=_trees(target), rules=rules,
+        name_status="M\0scripts/check.sh\0M\0reference/check.sh\0",
+    )
+
+    assert (
+        "This build changes scripts/check.sh, which the project's declared commands "
+        "run. It is not under the project's protected paths, so the merge will run "
+        "this build's version of it."
+    ) in words
+    assert (
+        "This build changes reference/check.sh, which runs the project's checks. "
+        "The merge will check the joined code with main's version of that file "
+        "and will not run this build's changes to it."
+    ) in words
+    fates = {j["path"]: j["main_copy"] for j in reading["judge_files"]}
+    assert fates == {"scripts/check.sh": False, "reference/check.sh": True}
+
+
+@pytest.mark.asyncio
+async def test_a_deleted_judge_outside_the_protected_paths_is_left_out(config, pool, rules) -> None:
+    words, _reading = await _routine_card(
+        config, pool, trees=_trees(_project(CAREER_SHAPE)), rules=rules,
+        name_status="D\0scripts/check.sh\0",
+    )
+
+    assert (
+        "This build deletes scripts/check.sh, which the project's declared commands "
+        "run. It is not under the project's protected paths, so the merge will run "
+        "without it."
+    ) in words
+    assert "main's version" not in words

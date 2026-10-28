@@ -27,6 +27,10 @@ before anyone approves:
   on the target means the merge uses main's copy (``on_target`` true), not
   on the target means the merge leaves it out (``on_target`` false), and an
   unreadable listing means the card cannot say (``on_target`` ``None``).
+  Since 28 October 2026 that holds only for a judge file under the project's
+  protected paths, as GuardKit's ``judges_kept_from_target`` decides on the
+  same declaration (``main_copy`` true); the merge runs the build's own copy
+  of any other (``main_copy`` false).
   What the build did to the file (``how``) is only why the line appears;
 * **links** are found on their own, with GuardKit's exact merge rule on the
   same inputs (coach review 1, 15 October 2026): the whole tree of the target
@@ -88,6 +92,7 @@ def guardkit_rules() -> Any | None:
         from guardkit.orchestrator.merge_environment import (  # type: ignore[import-not-found]
             judge_files,
             judge_words,
+            judges_kept_from_target,
             links_on_judge_paths,
             pin_merge_environment,
             read_merge_declarations,
@@ -105,6 +110,7 @@ def guardkit_rules() -> Any | None:
         pin_merge_environment=pin_merge_environment,
         judge_words=judge_words,
         judge_files=judge_files,
+        judges_kept_from_target=judges_kept_from_target,
         links_on_judge_paths=links_on_judge_paths,
     )
 
@@ -421,6 +427,7 @@ async def _read(
             "listing_unreadable": [],
         }
     words = tuple(getattr(pinned, "judge_words", ()) or ())
+    protected = tuple(getattr(declarations, "protected_paths", ()) or ())
     test_words: tuple[str, ...] = ()
     if test_command:
         said, _refusal = rules.judge_words(test_command, through_shell=True)
@@ -475,6 +482,7 @@ async def _read(
             "how": how,
             "role": role_of(path),
             "on_target": (path in mains) if mains is not None else None,
+            "main_copy": bool(rules.judges_kept_from_target([path], protected)),
         }
 
     # -- the build's changed judge files ------------------------------------
