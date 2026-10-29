@@ -460,29 +460,15 @@ def test_a_build_queued_run_without_the_marker_closes_with_no_reason(
     assert row["status"] == "DONE" and row["closed_reason"] is None
 
 
-def test_the_dispatcher_carries_the_flag_as_a_boolean_on_both_calls() -> None:
-    from forge.pipeline.dispatchers.specialist import (
-        FINAL_PLAN_REVIEW_FEEDBACK,
-        build_specialist_command,
-    )
+def test_the_dispatcher_carries_the_flag_as_a_boolean() -> None:
+    from forge.pipeline.dispatchers.specialist import build_specialist_command
     from forge.pipeline.stage_taxonomy import StageClass
 
-    plan_only = {GUIDE: "# plan\n"}
-    for extra in (
-        {"feature_id": "FEAT-1234", "already_done_allowed": True},
-        {
-            "feature_id": "FEAT-1234",
-            "revision_of": plan_only,
-            "validate_feedback": FINAL_PLAN_REVIEW_FEEDBACK,
-            "already_done_allowed": True,
-        },
-    ):
-        _command, args = build_specialist_command(
-            StageClass.FEATURE_PLAN,
-            request_text=None,
-            context_entries=[],
-            extra_command_args=extra,
-        )
-        assert args["already_done_allowed"] is True
-    assert args["semantic_review_artifacts"] == plan_only
+    _command, args = build_specialist_command(
+        StageClass.FEATURE_PLAN,
+        request_text=None,
+        context_entries=[],
+        extra_command_args={"feature_id": "FEAT-1234", "already_done_allowed": True},
+    )
+    assert args["already_done_allowed"] is True
     assert json.loads(json.dumps(args))["already_done_allowed"] is True

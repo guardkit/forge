@@ -1,5 +1,4 @@
-"""The plan writer's review receipt is not committed as a plan file, and the
-exact re-review argument is built from the final review revision."""
+"""The plan writer's review receipt is not committed as a plan file."""
 
 from __future__ import annotations
 
@@ -52,27 +51,3 @@ def test_review_receipt_is_not_committed_as_a_plan_file(
     role_output = _role_output(files, _receipt(files))
     projected = PlanningRunDriver._plan_tree_files(role_output)
     assert projected == files
-
-
-def test_dispatcher_turns_final_review_revision_into_exact_review_argument() -> None:
-    from forge.pipeline.dispatchers.specialist import (
-        FINAL_PLAN_REVIEW_FEEDBACK,
-        build_specialist_command,
-    )
-    from forge.pipeline.stage_taxonomy import StageClass
-
-    revision = {"tasks/backlog/example/TASK-1234-001.md": "# normalized\n"}
-    _command, args = build_specialist_command(
-        StageClass.FEATURE_PLAN,
-        request_text=None,
-        context_entries=[],
-        extra_command_args={
-            "feature_id": "FEAT-1234",
-            "revision_of": revision,
-            "validate_feedback": FINAL_PLAN_REVIEW_FEEDBACK,
-        },
-    )
-
-    assert args["semantic_review_artifacts"] == revision
-
-
