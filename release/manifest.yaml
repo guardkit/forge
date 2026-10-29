@@ -193,7 +193,10 @@ schema: 2
 # 29 October 2026: release 2026.10.29-1, planning in the sandbox: Forge 1e23a8d6 (the
 # /planning-step route, behind planning.planner_in_sandbox), GuardKit f039e5c9 (tests only
 # since 82861c80), guardkitfactory da9f2b3 (the planner image's). Other pins as 2026.10.28-3.
-version: 2026.10.29-1
+# 29 October 2026, late: release 2026.10.29-2, the build reviewer reads the change: Forge 6473c381
+# (its leftover findings on the merge card, as advice), GuardKit a3a47787 (rebuilt reviewer, builder
+# tools and skills guidance, thinking setting; repair turn shipped off), guardkitfactory cd00e2d.
+version: 2026.10.29-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -254,12 +257,12 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 1e23a8d61ef6a6973c46e7a197a61af61a508d5a
+    commit: 6473c381002d906ff60335c2368867e7194d7e27
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: f039e5c9b8345bffc52ea2fbf171b0cf84d8b6e3
+    commit: a3a47787ec1a447072b8f15ab8c83bea3ea27cb0
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
@@ -274,7 +277,7 @@ repositories:
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
-    commit: da9f2b3431ea6771a9f160bed1bd1c1b47e49234
+    commit: cd00e2d520e2e2517cc333dffcfd634c0b3c42f1
     role: named-context
   # THE SIXTH REPOSITORY (25 September 2026). It is a named context like the
   # four above — the jarvis image is built from ITS clone, at this pin, and
