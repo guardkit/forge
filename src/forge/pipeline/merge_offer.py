@@ -606,6 +606,56 @@ def _read_one_record(
         return None, f"{name} could not be looked for ({type(exc).__name__})", None
 
 
+# ---------------------------------------------------------------------------
+# The build reviewer's notes (the build reviewer design of 29 October 2026)
+# ---------------------------------------------------------------------------
+
+#: GuardKit writes what each task's final review left (at most ten findings,
+#: each with its pattern, place and one sentence) beside the code-checks
+#: summary, in the folder the runner exports.
+BUILD_REVIEW_NOTES_NAME = "build_review_notes.json"
+
+#: The card's line, the way the build card shows the planner's notes. Advice
+#: for the person deciding: nothing waits or refuses on it.
+BUILD_REVIEW_NOTES_LINE = "The build reviewer's notes for you: {notes}"
+
+
+def card_line_about_the_build_review(record: Any) -> str:
+    """The reviewer's leftover findings as one card line, or ``""`` for none."""
+    if not isinstance(record, Mapping):
+        return ""
+    notes = record.get("notes")
+    if not isinstance(notes, list):
+        return ""
+    parts = []
+    for note in notes[:10]:
+        if not isinstance(note, Mapping):
+            continue
+        where = " ".join(
+            _tidy(note.get(key)) for key in ("task_id", "pattern", "location")
+            if _tidy(note.get(key))
+        )
+        what = _shorten(note.get("description"), 200).rstrip(".")
+        if where or what:
+            parts.append(f"{where}: {what}." if where and what else f"{where or what}.")
+    if not parts:
+        return ""
+    total = record.get("total")
+    if isinstance(total, int) and total > len(parts):
+        parts.append(f"({total - len(parts)} more in the build's records.)")
+    return BUILD_REVIEW_NOTES_LINE.format(notes=" ".join(parts))
+
+
+def read_build_review_notes(
+    build_id: str, feature_id: str | None = None, *, repo: str | None = None
+) -> str:
+    """The card line for the build reviewer's notes, or ``""``. Never raises."""
+    record, _why_not, _other = _read_one_record(
+        build_id, BUILD_REVIEW_NOTES_NAME, feature_id, repo
+    )
+    return card_line_about_the_build_review(record)
+
+
 def read_what_was_checked(
     build_id: str, feature_id: str | None = None, *, repo: str | None = None
 ) -> tuple[
@@ -2113,6 +2163,30 @@ class MergeOfferService:
         # stop "nothing was reported" reading like "nothing was wrong".
         checked = await self._read_what_was_checked(event)
 
+        # THE BUILD REVIEWER'S NOTES (29 October 2026): what each task's
+        # final review left, shown as advice under the build, as the build
+        # card shows the planner's notes. Off the event loop; a reader that
+        # falls over leaves the card as it was.
+        try:
+            review_notes = await asyncio.wait_for(
+                asyncio.to_thread(
+                    read_build_review_notes,
+                    event.build_id,
+                    event.feature_id,
+                    repo=self._repo_of(event.build_id),
+                ),
+                timeout=FINISHED_FEATURE_READ_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001 — a reader never stops a card
+            logger.warning(
+                "merge-offer: the build reviewer's notes for %s could not be "
+                "read (%s: %s) — the card says nothing about them",
+                event.build_id,
+                type(exc).__name__,
+                exc,
+            )
+            review_notes = ""
+
         # WHEN PLANNING REGISTERED NO AFTER-DEPLOY CHECK (4 October 2026).
         # One sentence, read from planning's own record of the step, and
         # nothing at all when a check was registered or nothing can be read.
@@ -2181,6 +2255,8 @@ class MergeOfferService:
             if prototype:
                 lines.append(prototype)
             lines.extend(line for line in checked.lines if line)
+            if review_notes:
+                lines.append(review_notes)
             # FILES THAT ALREADY EXISTED (repair 2 part B, 12 October 2026),
             # straight after what was checked, because it says what that
             # result was measured with.
