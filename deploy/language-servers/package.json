@@ -1,0 +1,10 @@
+{
+  "name": "factory-language-servers",
+  "private": true,
+  "description": "The language servers in the factory's image, for GuardKitFactory's code_references tool. Installed by the Dockerfile with npm ci into /opt/language-servers/node.",
+  "dependencies": {
+    "pyright": "1.1.414",
+    "typescript": "6.0.3",
+    "typescript-language-server": "6.0.1"
+  }
+}

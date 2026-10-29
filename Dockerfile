@@ -563,6 +563,53 @@ RUN curl -fsSL "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/
     && ln -s /usr/local/bin/uv /usr/bin/uv \
     && ln -s /usr/local/bin/uvx /usr/bin/uvx
 
+# 29 October 2026 — the language servers behind GuardKitFactory's
+# code_references tool ("who uses this, what does a change reach"; design:
+# ai-transition docs/designs/find-references-tool-2026-10-28.md): gopls,
+# pyright and typescript-language-server, at the versions the 28 October
+# measurement used. They go in /opt/language-servers, which is on no PATH: the
+# tool runs a server a project declares only from /opt/language-servers/bin,
+# with its own fixed PATH (that folder, /usr/local/go/bin and /usr/local/bin).
+# The planner's image (specialist-agent) copies this folder, /usr/local/go and
+# /usr/local/bin/node from this image, so one set of pins serves both.
+#
+# gopls is built from source with the pinned Go above (GOTOOLCHAIN=local, no
+# cgo, so the binary needs nothing from the system); `go install` checks every
+# module it downloads against gopls's go.sum and Go's checksum database. Its
+# home, module cache and build cache, npm's cache and node's compile cache are
+# a temporary folder, removed here.
+# pyright, typescript-language-server and the typescript it runs come from the
+# npm registry at the exact versions in deploy/language-servers/package-lock.json,
+# checked by npm against the integrity recorded there; none of the three has an
+# install script, and --ignore-scripts keeps it that way. The two launchers run
+# them with the image's node by absolute path. pyright-langserver has no
+# --version, so the pyright package's own command answers for it.
+ARG GOPLS_VERSION=0.23.0
+ARG PYRIGHT_VERSION=1.1.414
+ARG TYPESCRIPT_LANGUAGE_SERVER_VERSION=6.0.1
+ARG TYPESCRIPT_VERSION=6.0.3
+COPY deploy/language-servers/package.json deploy/language-servers/package-lock.json /opt/language-servers/node/
+RUN build_home="$(mktemp -d)" \
+    && export NODE_COMPILE_CACHE="${build_home}/node-compile-cache" \
+    && mkdir -p /opt/language-servers/bin \
+    && HOME="${build_home}" GOPATH="${build_home}/go" GOCACHE="${build_home}/go-build" \
+       GOTOOLCHAIN=local CGO_ENABLED=0 GOBIN=/opt/language-servers/bin \
+       /usr/local/go/bin/go install -trimpath "golang.org/x/tools/gopls@v${GOPLS_VERSION}" \
+    && (cd /opt/language-servers/node \
+        && npm_config_cache="${build_home}/npm" /usr/local/bin/npm ci --omit=dev --ignore-scripts \
+           --no-audit --no-fund) \
+    && printf '#!/bin/sh\nexec /usr/local/bin/node /opt/language-servers/node/node_modules/pyright/langserver.index.js "$@"\n' \
+        > /opt/language-servers/bin/pyright-langserver \
+    && printf '#!/bin/sh\nexec /usr/local/bin/node /opt/language-servers/node/node_modules/typescript-language-server/lib/cli.mjs "$@"\n' \
+        > /opt/language-servers/bin/typescript-language-server \
+    && chmod 0755 /opt/language-servers/bin/pyright-langserver /opt/language-servers/bin/typescript-language-server \
+    && HOME="${build_home}" /opt/language-servers/bin/gopls version | grep -qx "golang.org/x/tools/gopls v${GOPLS_VERSION}" \
+    && test "$(/usr/local/bin/node /opt/language-servers/node/node_modules/pyright/index.js --version)" = "pyright ${PYRIGHT_VERSION}" \
+    && test "$(/opt/language-servers/bin/typescript-language-server --version)" = "${TYPESCRIPT_LANGUAGE_SERVER_VERSION}" \
+    && test "$(/usr/local/bin/node /opt/language-servers/node/node_modules/typescript/bin/tsc --version)" = "Version ${TYPESCRIPT_VERSION}" \
+    && rm -rf "${build_home}" \
+    && chmod -R a+rX,go-w /opt/language-servers
+
 # ---------------------------------------------------------------------------
 # THE SECURITY SCANNERS (security check design, 17 October 2026, piece 2).
 #
