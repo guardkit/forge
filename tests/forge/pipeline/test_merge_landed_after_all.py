@@ -747,7 +747,7 @@ async def test_a_refusal_that_merged_nothing_gives_the_press_back(
 
 
 @pytest.mark.asyncio
-async def test_a_merge_that_landed_is_never_run_twice(
+async def test_a_merge_that_landed_unchecked_is_joined_and_checked_again(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     repo: Path,
@@ -772,8 +772,18 @@ async def test_a_merge_that_landed_is_never_run_twice(
     second, _, _ = await _press_merge(
         config=config, pool=pool, sidecar_url=sidecar, repo=repo, expect_main_sha=_main_sha(repo)
     )
-    # The join was already made, so the second press picks it up: the same
-    # joined commit, the merge command not run again, no second merge word.
-    assert second.result == "publication-pending"
-    assert second.merged_sha == first.merged_sha
+    # The join was made, but its check never finished. Since the after-task
+    # check redesign (31 October 2026) such a join is not picked up as it
+    # is: it is set aside under its own name, kept, and the join is made and
+    # checked again (it used to be reused, with the check asked of a
+    # `check-join` command that never existed). The new join's commit may
+    # equal the old one (same parents, tree and second), so that is not
+    # asserted either way.
+    assert second.result == "publication-pending", second.detail
+    assert subprocess.run(
+        ["git", "cat-file", "-t", str(first.merged_sha)],
+        cwd=str(repo),
+        capture_output=True,
+        text=True,
+    ).stdout.strip() == "commit"
 
