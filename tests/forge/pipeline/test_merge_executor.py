@@ -2239,6 +2239,193 @@ class TestTheSameMergeThroughTheSidecar:
             assert self._normalise(left) == self._normalise(right), name
 
 
+class TestTheMergeWallComesFromTheDeclaration:
+    """31 October 2026: the merge runs the root install, then every part's
+    install and tests, each to its own declared limit. A fixed four runs of
+    ten minutes could fire mid-join, so the wall is sized from the project's
+    declaration, never below today's and never above the sidecar's cap."""
+
+    MULTI_PART = (
+        "toolchain:\n"
+        "  install: bash scripts/install.sh\n"
+        "  install_timeout: 900\n"
+        "  test: bash scripts/check.sh\n"
+        "  test_timeout: 600\n"
+        "  components:\n"
+        "    api:\n"
+        "      cwd: api\n"
+        "      install: make deps\n"
+        "      test: make test\n"
+        "      test_timeout: 420\n"
+        "    web:\n"
+        "      cwd: web\n"
+        "      test: npm test\n"
+    )
+
+    #: GuardKit's own default limit, for a command declared without one. Its
+    #: parser is not importable in Forge's test environment (its own
+    #: dependencies are not installed here), so a stand-in under the same
+    #: name reads the declaration the way it does.
+    GUARDKITS_DEFAULT = 300
+
+    @staticmethod
+    def _block(raw: dict[str, Any]) -> SimpleNamespace:
+        return SimpleNamespace(
+            install=raw.get("install"),
+            install_timeout=int(
+                raw.get("install_timeout", TestTheMergeWallComesFromTheDeclaration.GUARDKITS_DEFAULT)
+            ),
+            test=raw.get("test"),
+            test_timeout=int(
+                raw.get("test_timeout", TestTheMergeWallComesFromTheDeclaration.GUARDKITS_DEFAULT)
+            ),
+        )
+
+    @pytest.fixture(autouse=True)
+    def _guardkits_reader(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import yaml as _yaml
+
+        import forge.pipeline.merge_check_reading as reading
+
+        def read_merge_declarations(folder: Path) -> tuple[Any, Any]:
+            path = Path(folder) / ".guardkit" / "config.yaml"
+            raw = (_yaml.safe_load(path.read_text(encoding="utf-8")) or {}).get(
+                "toolchain"
+            )
+            if raw is None:
+                return SimpleNamespace(toolchain=None), None
+            toolchain = self._block(raw)
+            toolchain.components = {
+                name: self._block(block)
+                for name, block in (raw.get("components") or {}).items()
+            }
+            toolchain.parts = None
+            return SimpleNamespace(toolchain=toolchain), None
+
+        monkeypatch.setattr(
+            reading,
+            "guardkit_rules",
+            lambda: SimpleNamespace(read_merge_declarations=read_merge_declarations),
+        )
+
+    def _declarations(self, tmp_path: Path, text: str) -> Any:
+        from forge.pipeline.merge_check_reading import guardkit_rules
+
+        (tmp_path / ".guardkit").mkdir()
+        (tmp_path / ".guardkit" / "config.yaml").write_text(text, encoding="utf-8")
+        declarations, problem = guardkit_rules().read_merge_declarations(tmp_path)
+        assert problem is None, problem
+        return declarations.toolchain
+
+    def test_every_declared_limit_is_added_with_guardkits_defaults(
+        self, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_executor import declared_check_seconds
+
+        toolchain = self._declarations(tmp_path, self.MULTI_PART)
+        # root 900 + 600; api's install at GuardKit's default (300) + 420;
+        # web's test at GuardKit's default (300); web declares no install.
+        # (The read is the stand-in above; GuardKit's own defaults are 300.)
+        assert declared_check_seconds(toolchain, {}) == 900 + 600 + 300 + 420 + 300
+
+    def test_a_folder_pattern_counts_once_per_matching_folder(self) -> None:
+        from forge.pipeline.merge_executor import (
+            declared_check_seconds,
+            part_folders_in,
+        )
+
+        entry = SimpleNamespace(
+            under="apps",
+            marker="package.json",
+            install="npm ci",
+            install_timeout=240,
+            test="npm test",
+            test_timeout=360,
+        )
+        toolchain = SimpleNamespace(
+            install=None, test="bash check.sh", test_timeout=300,
+            components=None, parts=[entry],
+        )
+        paths = [
+            "apps/web/package.json",
+            "apps/admin/package.json",
+            "apps/docs/README.md",  # no marker: not a part
+            "apps/web/src/package.json",  # not directly under apps
+            "package.json",
+        ]
+        assert part_folders_in(entry, paths) == {"web", "admin"}
+        assert declared_check_seconds(toolchain, {0: 2}) == 300 + 2 * (240 + 360)
+
+    @pytest.mark.asyncio
+    async def test_the_merge_command_gets_the_declared_wall(
+        self, config, pool, repo_root
+    ) -> None:
+        bigger = (
+            "toolchain:\n"
+            "  install: bash scripts/install.sh\n"
+            "  install_timeout: 900\n"
+            "  test: bash scripts/check.sh\n"
+            "  test_timeout: 900\n"
+            "  components:\n"
+            "    api:\n"
+            "      cwd: api\n"
+            "      test: make test\n"
+            "      test_timeout: 900\n"
+        )
+        (repo_root / ".guardkit").mkdir()
+        (repo_root / ".guardkit" / "config.yaml").write_text(bigger, encoding="utf-8")
+        _git(repo_root, "add", ".guardkit/config.yaml")
+        _git(repo_root, "commit", "-q", "-m", "declare the checks")
+        _git(repo_root, "push", "-q", "origin", "main")
+
+        deps, _publisher, gk, _dp = _deps(config, pool)
+        await _run_executor(deps, repo_root, expect_main_sha=_git(repo_root, "rev-parse", "main"))
+
+        # 900 + 900 + 900 + the 180-second join allowance, above today's 2580.
+        assert gk.calls[0]["timeout_seconds"] == 900 + 900 + 900 + 180
+
+    @pytest.mark.asyncio
+    async def test_a_small_declaration_keeps_todays_floor(
+        self, config, pool, repo_root
+    ) -> None:
+        (repo_root / ".guardkit").mkdir()
+        (repo_root / ".guardkit" / "config.yaml").write_text(
+            "toolchain:\n  test: bash scripts/check.sh\n", encoding="utf-8"
+        )
+        _git(repo_root, "add", ".guardkit/config.yaml")
+        _git(repo_root, "commit", "-q", "-m", "declare the check")
+        _git(repo_root, "push", "-q", "origin", "main")
+
+        deps, _publisher, gk, _dp = _deps(config, pool)
+        await _run_executor(deps, repo_root, expect_main_sha=_git(repo_root, "rev-parse", "main"))
+
+        assert gk.calls[0]["timeout_seconds"] == 4 * 600 + 180
+
+    @pytest.mark.asyncio
+    async def test_a_declaration_past_the_cap_is_held_to_it(
+        self, config, pool, repo_root
+    ) -> None:
+        (repo_root / ".guardkit").mkdir()
+        (repo_root / ".guardkit" / "config.yaml").write_text(
+            "toolchain:\n"
+            "  install: bash scripts/install.sh\n"
+            "  install_timeout: 3600\n"
+            "  test: bash scripts/check.sh\n"
+            "  test_timeout: 3600\n",
+            encoding="utf-8",
+        )
+        _git(repo_root, "add", ".guardkit/config.yaml")
+        _git(repo_root, "commit", "-q", "-m", "declare long checks")
+        _git(repo_root, "push", "-q", "origin", "main")
+
+        deps, _publisher, gk, _dp = _deps(config, pool)
+        await _run_executor(deps, repo_root, expect_main_sha=_git(repo_root, "rev-parse", "main"))
+
+        from forge.pipeline.merge_executor import MERGE_WALL_CAP_SECONDS
+
+        assert gk.calls[0]["timeout_seconds"] == MERGE_WALL_CAP_SECONDS
+
+
 class TestTheTwoTimeLimits:
     """One limit holds each run of the checks; the other holds the whole
     command. They have to compose, or the outer one fires first and kills a

@@ -73,6 +73,7 @@ from forge.deploy.candidate_tree import (
     FileAtCommit,
     RemoteStartPoint,
     SourceBranch,
+    TreeListing,
     WorkingFolder,
     answered_for_branch,
 )
@@ -317,6 +318,21 @@ class SidecarCandidateGit:
                 "sandbox git: read %s at %s: %s", file_path, commit, answer.refusal
             )
         return answer
+
+    async def list_tree_at_commit(self, commit: str) -> TreeListing:
+        """Every file at ``commit`` in the sandbox's clone: names, modes, types
+        and object ids, never any content (``/git/list-tree-at-commit``). A
+        sandbox that could not be reached or refused is a refusal in its own
+        words. Never raises."""
+        decoded, why = await self._ok(
+            "/git/list-tree-at-commit",
+            {"repo": self._repo, "commit": str(commit)},
+            timeout=self._read_timeout_s,
+        )
+        if decoded is None:
+            logger.error("sandbox git: list the files at %s: %s", commit, why)
+            return TreeListing(refusal=str(why))
+        return TreeListing.from_wire(decoded)
 
     async def ensure_candidate_trees_excluded(self) -> bool | None:
         """Nothing to do on its own here.

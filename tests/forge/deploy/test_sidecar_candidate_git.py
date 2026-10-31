@@ -554,3 +554,30 @@ class TestATimeoutIsReadFirstInEveryGitReply:
             assert retired["confirmed"] is False
         finally:
             sidecar.close()
+
+
+class TestTheSandboxListsACommitsFilesAsHereDoes:
+    """The merge's time limit counts a project's part folders at a commit
+    (31 October 2026), so a sandboxed repository's clone is listed through
+    its helper, with the same answer as a listing here."""
+
+    @pytest.mark.asyncio
+    async def test_the_listing_is_the_same_on_both_sides(
+        self, git: SidecarCandidateGit, clone: Path
+    ) -> None:
+        from forge.deploy.candidate_tree import list_tree_at_commit
+
+        tip = _git(clone, "rev-parse", f"autobuild/{FEATURE_ID}")
+        there = await git.list_tree_at_commit(tip)
+        here = await list_tree_at_commit(clone, tip)
+        assert there.ok and here.ok
+        assert sorted(e.path for e in there.entries) == ["README.md", "feature.txt"]
+        assert there.entries == here.entries
+
+    @pytest.mark.asyncio
+    async def test_a_commit_the_clone_does_not_have_is_a_refusal(
+        self, git: SidecarCandidateGit
+    ) -> None:
+        listing = await git.list_tree_at_commit("c" * 40)
+        assert not listing.ok
+        assert listing.refusal

@@ -134,7 +134,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from typing import Any, AsyncIterator, Awaitable, Callable
 
 from nats_core.events import ApprovalResponsePayload, StageCompletePayload
@@ -246,6 +246,9 @@ __all__ = [
     "execute_merge_deploy",
     "deployed_in_for",
     "merge_wall_seconds",
+    "declared_check_seconds",
+    "part_folders_in",
+    "the_merge_wall",
     "sandbox_merge_words",
     "why_a_previewed_offer_is_refused",
 ]
@@ -294,14 +297,16 @@ MERGE_REPORT_TARGET_IDENTIFIER: str = "merge_deploy_executor"
 #: does not say (``merge_executor.verify_timeout_seconds``).
 MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS: int = 600
 
-#: Seconds allowed for the merge itself, on top of the four install-or-check
-#: runs, when sizing the wall around the whole command.
+#: Seconds allowed for the merge itself, on top of the install and check runs,
+#: when sizing the wall around the whole command.
 MERGE_WALL_MERGE_ALLOWANCE_SECONDS: int = 180
 
 #: How many runs, each held to one check run's limit, the merge command may
 #: make: the project's declared install and the checks on the target branch,
 #: then the install and the checks again on the merged tree (13 October 2026,
-#: the merge-install design, item 8).
+#: the merge-install design, item 8). Since 31 October 2026 this sizes only
+#: the FLOOR of the wall; :func:`the_merge_wall` sizes it from the project's
+#: declared install and test limits when they need more.
 MERGE_WALL_RUNS: int = 4
 
 #: How much longer than the merge command's wall the press holds the build's
@@ -332,6 +337,53 @@ def merge_wall_seconds(verify_timeout_seconds: int) -> int:
         + MERGE_WALL_MERGE_ALLOWANCE_SECONDS
     )
     return min(wall, MERGE_WALL_CAP_SECONDS)
+
+
+def declared_check_seconds(toolchain: Any, part_folders: Mapping[int, int]) -> int:
+    """How long the merge's full check may take by the project's declaration.
+
+    The merge runs the root install, then every part's install and tests, each
+    held to its own declared limit (after-task check redesign, 31 October
+    2026). This adds up those limits: the root's ``install_timeout`` and
+    ``test_timeout``, each component's, and each ``parts:`` entry's once for
+    every folder it matches (``part_folders`` maps the entry's position to
+    that count). A limit counts only where its command is declared. The
+    values come from GuardKit's own parser, so a missing limit is already
+    GuardKit's default. Nothing here names a language or a tool.
+    """
+    def _of(block: Any) -> int:
+        total = 0
+        if getattr(block, "install", None):
+            total += int(getattr(block, "install_timeout", 0) or 0)
+        if getattr(block, "test", None):
+            total += int(getattr(block, "test_timeout", 0) or 0)
+        return total
+
+    if toolchain is None:
+        return 0
+    total = _of(toolchain)
+    for component in (getattr(toolchain, "components", None) or {}).values():
+        total += _of(component)
+    for index, entry in enumerate(getattr(toolchain, "parts", None) or ()):
+        total += _of(entry) * int(part_folders.get(index, 0))
+    return total
+
+
+def part_folders_in(entry: Any, paths: Iterable[str]) -> set[str]:
+    """The folders directly under ``entry.under`` that hold ``entry.marker``."""
+    under = str(getattr(entry, "under", "") or "").strip().strip("/")
+    marker = str(getattr(entry, "marker", "") or "").strip()
+    if not marker:
+        return set()
+    prefix = "" if under in ("", ".") else under + "/"
+    found: set[str] = set()
+    for path in paths:
+        if not path.startswith(prefix):
+            continue
+        rest = path[len(prefix):].split("/")
+        if len(rest) == 2 and rest[1] == marker and rest[0]:
+            found.add(rest[0])
+    return found
 
 
 #: How many times one merge word may join and send before it stops. Three by
@@ -2119,6 +2171,118 @@ async def _the_profile_where_it_lives(
     except Exception as exc:  # noqa: BLE001 — a read, never a crash
         return None, f"{type(exc).__name__}: {exc}"
     return _the_profile_out_of(answer, at)
+
+
+async def the_merge_wall(
+    git: Any,
+    repo_root: Path | str,
+    *,
+    target_commit: str,
+    build_tip: str,
+    verify_timeout_seconds: int,
+) -> int:
+    """The merge command's wall, sized from the project's own declaration.
+
+    The declaration is read at the target commit (where the build system pins
+    it), where the repository lives, with GuardKit's own reader, the same one
+    the merge card uses. Pattern parts are counted in the target's tree and
+    the build's together, since the joined tree holds both. The wall is the
+    declared limits plus the join allowance, never below today's
+    (:func:`merge_wall_seconds`) and never above what the deploy sidecar
+    accepts. Anything that cannot be read leaves the floor. Never raises.
+    """
+    floor = merge_wall_seconds(verify_timeout_seconds)
+    try:
+        toolchain, why = await _the_declared_toolchain(git, repo_root, target_commit)
+        if toolchain is None:
+            if why:
+                logger.info(
+                    "merge-executor: the merge's time limit stays %ss (%s)", floor, why
+                )
+            return floor
+        counts: dict[int, int] = {}
+        entries = list(getattr(toolchain, "parts", None) or ())
+        if entries:
+            paths: set[str] = set()
+            for commit in (target_commit, build_tip):
+                listing = await _the_tree_where_it_lives(git, repo_root, commit)
+                if listing is None or not listing.ok:
+                    logger.warning(
+                        "merge-executor: the files at %s could not be listed (%s); "
+                        "parts found only elsewhere are not counted in the merge's "
+                        "time limit",
+                        str(commit)[:10],
+                        getattr(listing, "refusal", None) or "no listing",
+                    )
+                    continue
+                paths.update(e.path for e in listing.entries or ())
+            counts = {
+                index: len(part_folders_in(entry, paths))
+                for index, entry in enumerate(entries)
+            }
+        needed = declared_check_seconds(toolchain, counts)
+        wall = max(floor, needed + MERGE_WALL_MERGE_ALLOWANCE_SECONDS)
+        if wall > MERGE_WALL_CAP_SECONDS:
+            logger.warning(
+                "merge-executor: the project's declared install and test limits "
+                "add up to %ss, more than the %ss the merge may be given; it is "
+                "given %ss",
+                needed,
+                MERGE_WALL_CAP_SECONDS,
+                MERGE_WALL_CAP_SECONDS,
+            )
+        return min(wall, MERGE_WALL_CAP_SECONDS)
+    except Exception as exc:  # noqa: BLE001 — sizing never stops a merge
+        logger.warning(
+            "merge-executor: the merge's time limit stays %ss (sizing raised %s: %s)",
+            floor,
+            type(exc).__name__,
+            exc,
+        )
+        return floor
+
+
+async def _the_declared_toolchain(
+    git: Any, repo_root: Path | str, commit: str
+) -> tuple[Any | None, str | None]:
+    """The ``toolchain`` block at ``commit``, read with GuardKit's own parser."""
+    import tempfile
+
+    from forge.deploy.candidate_tree import read_file_at_commit
+    from forge.pipeline.merge_check_reading import CONFIG_PATH, guardkit_rules
+
+    rules = guardkit_rules()
+    if rules is None:
+        return None, "GuardKit's merge rules are not importable here"
+    reader = getattr(git, "read_file_at_commit", None)
+    if reader is not None:
+        answer = await reader(commit, CONFIG_PATH, ordinary_file_only=True)
+    else:
+        answer = await read_file_at_commit(
+            repo_root, commit, CONFIG_PATH, ordinary_file_only=True
+        )
+    if not answer.ok:
+        return None, str(answer.refusal or "the declaration could not be read")
+    if not answer.found:
+        return None, "the project declares nothing"
+    with tempfile.TemporaryDirectory(prefix="forge-merge-wall-") as folder:
+        where = Path(folder) / CONFIG_PATH
+        where.parent.mkdir(parents=True, exist_ok=True)
+        where.write_text(str(answer.content or ""), encoding="utf-8")
+        declarations, problem = rules.read_merge_declarations(Path(folder))
+    if problem is not None or declarations is None:
+        return None, str(problem or "the declaration could not be read")
+    return getattr(declarations, "toolchain", None), None
+
+
+async def _the_tree_where_it_lives(git: Any, repo_root: Path | str, commit: str) -> Any:
+    """Every file at ``commit``, listed where the repository lives."""
+    from forge.deploy.candidate_tree import list_tree_at_commit
+
+    lister = getattr(git, "list_tree_at_commit", None)
+    if lister is not None:
+        return await lister(commit)
+    return await list_tree_at_commit(repo_root, commit)
 
 
 # ---------------------------------------------------------------------------
@@ -5945,7 +6109,16 @@ async def execute_merge_deploy(
                 )
 
                 verify_timeout = _verify_timeout_from(deps.config)
-                merge_wall = merge_wall_seconds(verify_timeout)
+                # SIZED FROM THE PROJECT'S DECLARATION (31 October 2026): the
+                # merge runs every part's install and tests, each to its own
+                # declared limit, so a fixed number of runs could fire mid-join.
+                merge_wall = await the_merge_wall(
+                    git,
+                    repo_root,
+                    target_commit=g_commit,
+                    build_tip=candidate_sha,
+                    verify_timeout_seconds=verify_timeout,
+                )
                 args = [
                     "merge",
                     feature_id,
@@ -5960,8 +6133,8 @@ async def execute_merge_deploy(
                     # copy is never switched.
                     "--in-worktree",
                     folder,
-                    # How long ONE run of the checks may take. The wall below holds
-                    # the whole command: four check-or-install runs plus the merge.
+                    # How long ONE run of the checks may take. The wall around the
+                    # whole command is sized from the declaration (the_merge_wall).
                     "--verify-timeout",
                     str(verify_timeout),
                     "--json",
