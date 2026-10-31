@@ -138,6 +138,9 @@ COMPLETE_BY_KIND: dict[str, dict[str, str]] = {
     },
     "deploy_sidecar/service.py": {
         "_start_and_collect": "the spawn itself failed: nothing ran",
+        "run_project_program": (
+            "the project command's environment was refused: nothing ran"
+        ),
     },
 }
 
