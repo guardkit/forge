@@ -111,3 +111,21 @@ def _fence_guardkit_binary(tmp_path_factory: pytest.TempPathFactory):
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv(GUARDKIT_PATH_ENV, str(fenced))
         yield
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _fence_short_tmp_root(tmp_path_factory: pytest.TempPathFactory):
+    """Keep the project commands' short ``TMPDIR`` folders out of ``/tmp``.
+
+    A project command's ``TMPDIR`` is ``/tmp/fg-<8 hex>`` (1 November 2026),
+    one per repository, and the suite makes thousands of throwaway
+    repositories. They are made under this run's own temporary folder
+    instead, so a run leaves nothing behind. The test that checks the real
+    root's length puts it back for itself.
+    """
+    import forge.launch_environment as launch_environment
+
+    fenced = tmp_path_factory.mktemp("fg")
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(launch_environment, "SHORT_TMP_ROOT", str(fenced))
+        yield

@@ -11,7 +11,8 @@ the factory's key.
 
 So a project program's environment is built from nothing by
 :func:`forge.launch_environment.build_project_command_env`: ``PATH``, a private
-``HOME`` and ``TMPDIR`` under ``<repository>/.git/forge-project-home``, the
+``HOME`` under ``<repository>/.git/forge-project-home``, a short private
+``TMPDIR`` at ``/tmp/fg-<8 hex>`` (1 November 2026), the
 locale, the proxy settings, the names the project declared, the values the
 factory sets for that one command, the review preview's issued values, the
 profile-allowed overlay, a proxy check and the run-owner marker last.
@@ -218,10 +219,16 @@ def _no_sentinel(given: dict[str, str] | str, what: str) -> None:
 
 
 def _home_is_private(given: dict[str, str], root: Path) -> None:
+    from forge.launch_environment import short_tmpdir_path
+
     home = Path(given["HOME"])
     private = (root / ".git" / "forge-project-home").resolve()
     assert private in home.resolve().parents, given["HOME"]
-    assert private in Path(given["TMPDIR"]).resolve().parents, given["TMPDIR"]
+    # TMPDIR is short and private to this repository (1 November 2026).
+    assert given["TMPDIR"] == str(short_tmpdir_path((root / ".git").resolve()))
+    tmp = Path(given["TMPDIR"])
+    assert tmp.is_dir() and not tmp.is_symlink()
+    assert (tmp.stat().st_mode & 0o777) == 0o700
 
 
 @pytest.fixture(autouse=True)
@@ -765,6 +772,64 @@ def factory_python(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
 
 def _on_path(given: dict[str, str]) -> list[str]:
     return [os.path.realpath(p) for p in given.get("PATH", "").split(os.pathsep) if p]
+
+
+class TestTheTemporaryFolderIsShortAndPrivate:
+    """1 November 2026: ``dotnet test`` opens a named pipe in ``TMPDIR`` with
+    a 32-character name, and a Unix socket path may be at most 103 bytes, so
+    a TMPDIR under a deep repository's git directory aborted every test
+    project. A project command's TMPDIR is now ``/tmp/fg-<8 hex>``."""
+
+    def test_a_socket_fits_under_a_deep_repository(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import shutil
+
+        import forge.launch_environment as launch_environment
+        from forge.launch_environment import build_project_command_env
+
+        monkeypatch.setattr(launch_environment, "SHORT_TMP_ROOT", "/tmp")
+        deep = tmp_path / ("a" * 60) / ("b" * 60) / ("c" * 60) / "shop"
+        root = _a_project(deep)
+        # Under the git directory, the old place, it would not fit.
+        old = root / ".git" / "forge-project-home" / "TMPDIR"
+        assert len(os.fsencode(f"{old}/{'x' * 32}")) > 103
+        env = build_project_command_env(root, repository=root)
+        try:
+            assert env["TMPDIR"].startswith("/tmp/fg-")
+            assert len(os.fsencode(env["TMPDIR"] + "/" + "x" * 32)) <= 103
+            assert (Path(env["TMPDIR"]).stat().st_mode & 0o777) == 0o700
+            # The same folder on every call, for the same repository.
+            again = build_project_command_env(root, repository=root)
+            assert again["TMPDIR"] == env["TMPDIR"]
+        finally:
+            shutil.rmtree(env["TMPDIR"], ignore_errors=True)
+
+    def test_a_link_in_its_place_is_refused(
+        self, project: Path, tmp_path: Path
+    ) -> None:
+        from forge.launch_environment import (
+            ProjectCommandEnvironmentError,
+            build_project_command_env,
+            short_tmpdir_path,
+        )
+
+        where = short_tmpdir_path((project / ".git").resolve())
+        elsewhere = tmp_path / "somewhere-else"
+        elsewhere.mkdir()
+        where.symlink_to(elsewhere)
+        with pytest.raises(ProjectCommandEnvironmentError, match="not a folder"):
+            build_project_command_env(project, repository=project)
+
+    def test_a_loose_folder_is_made_owner_only(self, project: Path) -> None:
+        from forge.launch_environment import build_project_command_env, short_tmpdir_path
+
+        where = short_tmpdir_path((project / ".git").resolve())
+        where.mkdir(mode=0o755)
+        where.chmod(0o755)
+        env = build_project_command_env(project, repository=project)
+        assert env["TMPDIR"] == str(where)
+        assert (where.stat().st_mode & 0o777) == 0o700
 
 
 class TestTheFactorysOwnPythonStaysOut:

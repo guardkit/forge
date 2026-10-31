@@ -706,11 +706,60 @@ PROJECT_CHECKED_PROXY_NAMES: frozenset[str] = frozenset(
 )
 
 #: The folder, inside the repository's own git directory, that holds a
-#: project program's private ``HOME`` and ``TMPDIR``. Outside the project's
-#: files, and outside every candidate tree (those are copies with no git
-#: directory), so nothing a program writes there is ever committed or
-#: deployed.
+#: project program's private ``HOME``. Outside the project's files, and
+#: outside every candidate tree (those are copies with no git directory), so
+#: nothing a program writes there is ever committed or deployed.
 PROJECT_HOME_DIRNAME: str = "forge-project-home"
+
+#: Where a project program's short private ``TMPDIR`` lives (1 November
+#: 2026). Fixed and short on purpose: a tool that opens a Unix socket there,
+#: such as ``dotnet test``'s named pipe, needs the whole socket path within
+#: 103 bytes, and a 32-character name under ``<git directory>/
+#: forge-project-home/TMPDIR`` is too long once a repository lives deep.
+#: GuardKit does the same with ``/tmp/gk-<8 hex>``.
+SHORT_TMP_ROOT: str = "/tmp"
+
+
+def short_tmpdir_path(git_directory: Path | str) -> Path:
+    """``/tmp/fg-<first 8 hex of the git directory's SHA-256>``: one per
+    repository, as the folder under its git directory was, and the same on
+    every call."""
+    import hashlib
+
+    digest = hashlib.sha256(
+        str(Path(git_directory)).encode("utf-8", "surrogateescape")
+    ).hexdigest()
+    return Path(SHORT_TMP_ROOT) / f"fg-{digest[:8]}"
+
+
+def _short_private_tmpdir(directory: Path) -> Path:
+    """Make ``directory`` (owner-only) or reuse it, only when it is a real
+    folder this user owns; then make it owner-only. It sits in a folder every
+    user can write to, so a name someone else made first, or a link, is
+    refused and never followed."""
+    import stat
+
+    try:
+        try:
+            directory.mkdir(mode=0o700)
+        except FileExistsError:
+            pass
+        info = directory.lstat()
+        if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid():
+            raise ProjectCommandEnvironmentError(
+                f"the private temporary folder {directory} is not a folder this "
+                f"user owns, so the project program was not run"
+            )
+        if stat.S_IMODE(info.st_mode) != 0o700:
+            directory.chmod(0o700)
+    except ProjectCommandEnvironmentError:
+        raise
+    except OSError as exc:
+        raise ProjectCommandEnvironmentError(
+            f"the private temporary folder {directory} could not be made "
+            f"({exc.strerror or exc}), so the project program was not run"
+        ) from exc
+    return directory
 
 
 class ProjectCommandEnvironmentError(OSError):
@@ -1003,8 +1052,9 @@ def build_project_command_env(
     1. **The base:** ``PATH`` from ``parent``, without the factory's own
        Python folders (:func:`factory_python_folders`) unless the caller
        passes ``keep_factory_python=True`` and says why at the call site;
-       ``HOME`` and ``TMPDIR`` set to
-       private folders under ``<git directory>/forge-project-home``; ``LANG``,
+       ``TMPDIR`` set to the short private folder
+       ``/tmp/fg-<8 hex>`` (:func:`short_tmpdir_path`); ``HOME`` set to
+       a private folder under ``<git directory>/forge-project-home``; ``LANG``,
        ``LC_ALL`` and ``LC_*`` when set; the eight proxy names when set; and
        the names the project ``declared`` (``launch.settings``), when set and
        when the project may declare them.
@@ -1075,7 +1125,7 @@ def build_project_command_env(
         )
     home_root = _private_folder(git_directory / PROJECT_HOME_DIRNAME)
     env["HOME"] = str(_private_folder(home_root / "HOME"))
-    env["TMPDIR"] = str(_private_folder(home_root / "TMPDIR"))
+    env["TMPDIR"] = str(_short_private_tmpdir(short_tmpdir_path(git_directory)))
     for raw in declared or ():
         refusal = declared_setting_refusal(raw)
         name = str(raw).strip()
