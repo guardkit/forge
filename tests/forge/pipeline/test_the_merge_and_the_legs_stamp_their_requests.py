@@ -60,6 +60,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tests.forge.full_check_stand_in import parts_reader as stand_in_parts_reader
+
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli._serve_conductor import (
     CONDUCTOR_STAGE_TIMEOUT_SECONDS,
@@ -775,6 +777,7 @@ class TestTheGatesReaderStampsTheProjectsOwnCommand:
         worktree = _a_journey_worktree(project)
         _a_build_row(pool, start_commit=start_commit, worktree=worktree)
         reader = make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
             pool=pool,
             config=_config(project, sandbox_url=helper.url),
             # Only the command runner is the real one: what this test is about

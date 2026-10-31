@@ -42,6 +42,8 @@ from typing import Any
 
 import pytest
 
+from tests.forge.full_check_stand_in import parts_reader as stand_in_parts_reader
+
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli._serve_conductor import (
     DECLARED_TEST_EVIDENCE_LIMIT_BYTES,
@@ -583,6 +585,7 @@ class TestTheRunnerInsideASandboxKeepsTheSameRun:
 
 def _reader(pool: Any, *, command: str, **kwargs: Any) -> Any:
     return make_gates_green_reader(
+        parts_reader=stand_in_parts_reader,
         pool=pool,
         config=_config({REPO: "/canonical/api-test"}),
         declaration_loader=lambda _root: _Declaration(command),

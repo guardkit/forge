@@ -33,6 +33,8 @@ from typing import Any
 
 import pytest
 
+from tests.forge.full_check_stand_in import parts_reader as stand_in_parts_reader
+
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli import _serve_conductor as conductor
 from forge.config.models import ForgeConfig
@@ -102,6 +104,10 @@ def fake_guardkit_loader(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
         return _Declaration(command) if command else None
 
     module.load_toolchain_declaration = load_toolchain_declaration  # type: ignore[attr-defined]
+    # GuardKit's full-check reader, stood in under the same module.
+    from tests.forge.full_check_stand_in import full_check_parts
+
+    module.full_check_parts = full_check_parts  # type: ignore[attr-defined]
     monkeypatch.setitem(sys.modules, FAKE_LOADER_MODULE, module)
     return module
 
@@ -214,6 +220,8 @@ def sidecar_reads_the_real_declaration(
             repo_path, module_candidates=(FAKE_LOADER_MODULE,)
         ),
     )
+    # The full check reads the declaration and its parts the same way.
+    monkeypatch.setattr(service, "TOOLCHAIN_MODULE_CANDIDATES", (FAKE_LOADER_MODULE,))
 
 
 @pytest.fixture
@@ -436,6 +444,7 @@ class TestTheReaderChoosesPerRepository:
         on_the_host: list[str] = []
 
         reader = conductor.make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
             pool=pool,
             config=sidecar.config,
             # If either of today's in-container seams were used for this
@@ -467,6 +476,7 @@ class TestTheReaderChoosesPerRepository:
             return 0, f"`{command}` exited 0 in {cwd}"
 
         reader = conductor.make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
             pool=pool,
             config=sidecar.config,
             declaration_loader=lambda _root: _Declaration("npm test"),
@@ -495,6 +505,7 @@ class TestTheReaderChoosesPerRepository:
         _row(pool, REPO_WITH, worktree)
 
         reader = conductor.make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
             pool=pool,
             config=sidecar.config,
             sandbox_declaration_loader=lambda root, **kw: _Declaration("the suite"),
@@ -515,6 +526,7 @@ class TestTheReaderChoosesPerRepository:
         asked: list[str] = []
 
         reader = conductor.make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
             pool=pool,
             config=sidecar.config,
             sandbox_declaration_loader=lambda root, **kw: _Declaration("the suite"),

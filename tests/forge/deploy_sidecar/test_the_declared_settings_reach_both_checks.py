@@ -38,6 +38,8 @@ from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
+
+from tests.forge.full_check_stand_in import parts_reader as stand_in_parts_reader
 import yaml
 
 from forge.adapters.sqlite import connect as sqlite_connect
@@ -531,6 +533,7 @@ class TestTheUpstreamCallersReadTheLedger:
             return 0, "`the declared command` exited 0"
 
         reader = make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
             pool=pool,
             config=ForgeConfig.model_validate(
                 {

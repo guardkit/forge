@@ -21,6 +21,8 @@ from typing import Any
 
 import pytest
 
+from tests.forge.full_check_stand_in import parts_reader as stand_in_parts_reader
+
 from forge.adapters.sqlite import connect as sqlite_connect
 from forge.cli import serve as serve_mod
 from forge.cli import _serve_conductor as serve_conductor_mod
@@ -1195,6 +1197,158 @@ def gates_pool(tmp_path: Path) -> SqliteLifecyclePersistence:
     return SqliteLifecyclePersistence(connection=cx)
 
 
+class TestTheMergeCardRunsTheFullCheck:
+    """1 November 2026: the merge-card step runs the same full check as the
+    join (the root command plus every declared component and part, each in
+    its own folder with its own install and limit), so no card is offered
+    for work the join would then fail. Red goes back for repair; a check
+    that could not run stops, as at the join."""
+
+    @staticmethod
+    def _multi_part(tmp_path: Path) -> Any:
+        from types import SimpleNamespace
+
+        apps = tmp_path / "wt" / "apps"
+        for name in ("web", "admin"):
+            (apps / name).mkdir(parents=True)
+            (apps / name / "package.json").write_text("{}", encoding="utf-8")
+        (apps / "notes").mkdir()  # no marker: not a part
+        api = SimpleNamespace(
+            cwd="api", test="go test ./...", test_timeout=420,
+            install="go mod download", install_timeout=240,
+        )
+        (tmp_path / "wt" / "api").mkdir()
+        apps_entry = SimpleNamespace(
+            under="apps", marker="package.json", test="npm test",
+            test_timeout=360, install="npm ci", install_timeout=180,
+        )
+        return SimpleNamespace(
+            test="bash scripts/check.sh", test_timeout=600,
+            install="bash scripts/install.sh", install_timeout=900,
+            components={"api": api}, parts=[apps_entry],
+        )
+
+    @staticmethod
+    def _reader(pool: Any, declaration: Any, answer: Any, calls: list) -> Any:
+        from forge.cli._serve_conductor import make_gates_green_reader
+
+        def _run(*, command: str, cwd: Any, timeout_seconds: int):
+            calls.append((command, Path(cwd).name, timeout_seconds))
+            return answer(command), f"`{command}` exited {answer(command)}"
+
+        return make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
+            pool=pool,
+            config=_gates_config({"org/target": "/canonical/target"}),
+            declaration_loader=lambda _root: declaration,
+            command_runner=_run,
+        )
+
+    def test_every_part_runs_in_its_folder_with_its_install_first(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        calls: list = []
+        report = self._reader(
+            gates_pool, self._multi_part(tmp_path), lambda _c: 0, calls
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert report.status is GateStatus.GREEN
+        # The root's install is the build's own bootstrap, as in GuardKit's
+        # full check; a component's and a pattern part's run first.
+        assert calls == [
+            ("bash scripts/check.sh", "wt", 600),
+            ("go mod download", "api", 240),
+            ("go test ./...", "api", 420),
+            ("npm ci", "admin", 180),
+            ("npm test", "admin", 360),
+            ("npm ci", "web", 180),
+            ("npm test", "web", 360),
+        ]
+
+    def test_a_red_part_is_red_and_names_the_part(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        calls: list = []
+        report = self._reader(
+            gates_pool,
+            self._multi_part(tmp_path),
+            lambda c: 1 if c == "npm test" else 0,
+            calls,
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert report.status is GateStatus.RED
+        assert report.failed_gates == (
+            "declared toolchain test (apps/admin)",
+            "declared toolchain test (apps/web)",
+        )
+
+    def test_a_part_that_could_not_run_stops_without_a_card(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        calls: list = []
+        report = self._reader(
+            gates_pool,
+            self._multi_part(tmp_path),
+            lambda c: 1 if c == "npm ci" else 0,
+            calls,
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        # An install that failed is "could not run", never red and never
+        # advice: the gate is named, so the checkpoint offers no card.
+        assert report.status is GateStatus.UNKNOWN
+        assert report.failed_gates == ("the declared check could not run",)
+        assert "declared install (`npm ci`)" in str(report.detail)
+
+    def test_without_guardkits_reader_the_check_cannot_be_read(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.cli._serve_conductor import make_gates_green_reader
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        report = make_gates_green_reader(
+            parts_reader=lambda _d, _t: None,
+            pool=gates_pool,
+            config=_gates_config({"org/target": "/canonical/target"}),
+            declaration_loader=lambda _root: _Declaration("npm test"),
+            command_runner=lambda **_kw: pytest.fail("nothing may run"),
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert report.status is GateStatus.UNKNOWN
+        assert report.failed_gates == ("the declared check could not run",)
+
+    def test_could_not_run_ends_the_journey_without_a_repair_turn(
+        self, gates_pool: Any
+    ) -> None:
+        from forge.cli._serve_conductor import make_merge_ready_checkpoint
+        from forge.pipeline.merge_ready_checkpoint import (
+            GatesReport,
+            GateStatus,
+            RedGateAction,
+        )
+
+        checkpoint = make_merge_ready_checkpoint(
+            pool=gates_pool, publish_card=None, review_cycle_cap=5
+        )
+        could_not = GatesReport(
+            status=GateStatus.UNKNOWN,
+            failed_gates=("the declared check could not run",),
+            detail="the declared install failed",
+        )
+        red = GatesReport(status=GateStatus.RED, failed_gates=("x",), detail="red")
+        assert checkpoint._resolve_red_gate_action(BUILD_ID, could_not) is (
+            RedGateAction.TERMINATE_FAILED
+        )
+        assert checkpoint._resolve_red_gate_action(BUILD_ID, red) is (
+            RedGateAction.LOOP_BACK
+        )
+
+
 class TestGatesGreenReader:
     """The exit-code-is-the-verdict law, and every honest degrade around it."""
 
@@ -1221,6 +1375,7 @@ class TestGatesGreenReader:
             return exit_code, f"`{command}` exited {exit_code}"
 
         return make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
             pool=pool,
             config=_gates_config(
                 repo_paths
@@ -1336,6 +1491,7 @@ class TestGatesGreenReader:
             raise RuntimeError("the runner fell over")
 
         read = make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
             pool=gates_pool,
             config=_gates_config({"org/target": "/canonical/target"}),
             declaration_loader=lambda _root: _Declaration("npm test"),

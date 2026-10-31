@@ -53,6 +53,14 @@ from types import MappingProxyType
 from typing import Any, Awaitable, Callable, Mapping, Sequence
 
 from forge.cli._conductor_worktree import JOURNEY_BASE_REF
+from forge.full_check import (
+    COULD_NOT_RUN,
+    FAILED,
+    PASSED,
+    FullCheck,
+    full_check_parts_of,
+    run_full_check,
+)
 from forge.pipeline.conductor_driver import (
     CHECKPOINT_VERDICT_RECORDED_KEY,
     ConductorDriverDeps,
@@ -968,6 +976,34 @@ SANDBOX_TOOLCHAIN_READ_TIMEOUT_S: float = 30.0
 #: so the sidecar's timeout always fires before the socket gives up.
 SANDBOX_TEST_HTTP_MARGIN_S: float = 30.0
 
+#: How long the sandbox's helper may take for the whole declared full check
+#: (every part, each to its own limit): the merge's own two-hour cap.
+SANDBOX_FULL_CHECK_TIMEOUT_S: int = 7200
+
+#: The gate a check that could not run is named as, so the merge-ready
+#: checkpoint offers no card for it (1 November 2026).
+CHECK_COULD_NOT_RUN_GATE: str = "the declared check could not run"
+
+
+def _a_full_check_from(exit_code: int | None, detail: Any) -> FullCheck:
+    """The sandbox helper's one answer for the whole check, as a FullCheck."""
+    if exit_code is None:
+        return FullCheck(status=COULD_NOT_RUN, detail=str(detail))
+    if exit_code == 0:
+        return FullCheck(
+            status=PASSED,
+            detail=str(detail),
+            evidence=str(getattr(detail, "evidence", "") or ""),
+            only_detail=detail,
+        )
+    return FullCheck(
+        status=FAILED,
+        detail=str(detail),
+        failing_cases=tuple(getattr(detail, "failing_cases", ()) or ()),
+        evidence=str(getattr(detail, "evidence", "") or ""),
+        only_detail=detail,
+    )
+
 
 def load_declared_toolchain_from_sandbox(
     repo_root: "Path | str",
@@ -1134,8 +1170,15 @@ def run_declared_command_in_sandbox(
     build: str | None = None,
     declared_at: str | None = None,
     by_hand: bool = False,
+    full_check: bool = False,
 ) -> "tuple[int | None, str]":
     """Run the declared test command in the sandbox. ``(exit_code, detail)``.
+
+    With ``full_check`` (1 November 2026) the helper runs the project's whole
+    declared check instead — the root command plus every component and part,
+    found in ``cwd`` by GuardKit's own reader, each in its folder with its own
+    install and limit — and answers once for all of it: ``0`` passed, ``1``
+    failed, and ``None`` when any part could not run.
 
     Same contract as :func:`_run_declared_command`, which the reader already
     depends on: **the exit code is the verdict**, and ``None`` means the
@@ -1177,6 +1220,8 @@ def run_declared_command_in_sandbox(
         "cwd": str(cwd),
         "timeout_seconds": float(timeout_seconds),
     }
+    if full_check:
+        body["full_check"] = True
     if memory_project:
         body["memory_project"] = str(memory_project)
     if launch_settings:
@@ -1203,6 +1248,11 @@ def run_declared_command_in_sandbox(
             f"the sidecar in sandbox {getattr(sandbox, 'name', '?')} refused "
             f"to run the declared test command {command!r} (HTTP {status}): "
             f"{answer.get('error') or answer}"
+        )
+    if full_check and answer.get("could_not_run"):
+        return None, (
+            f"the declared check could not run in {cwd} inside sandbox "
+            f"{getattr(sandbox, 'name', '?')}: {answer.get('could_not_run')}"
         )
     if answer.get("timed_out") is True:
         return None, (
@@ -1231,8 +1281,9 @@ def run_declared_command_in_sandbox(
         .strip()
         .splitlines()
     )
+    shown = "the declared full check" if full_check else f"`{command}`"
     return exit_code, _detail_with_the_run_kept(
-        f"`{command}` exited {exit_code} in {cwd} inside sandbox "
+        f"{shown} exited {exit_code} in {cwd} inside sandbox "
         f"{getattr(sandbox, 'name', '?')}"
         + (f" — last line: {tail[-1]}" if tail else ""),
         # The sidecar answers with both streams; a test tool's summary is
@@ -2025,6 +2076,7 @@ def make_gates_green_reader(
     repo_root_reader: Callable[[str], Any] | None = None,
     sandbox_declaration_loader: Callable[..., Any] | None = None,
     sandbox_command_runner: Callable[..., Any] | None = None,
+    parts_reader: Callable[..., Any] | None = None,
 ) -> Callable[..., Any]:
     """Build the merge-ready checkpoint's REAL ``gates_green_reader``.
 
@@ -2083,8 +2135,18 @@ def make_gates_green_reader(
             sandbox. Defaults to
             :func:`load_declared_toolchain_from_sandbox`.
         sandbox_command_runner: ``(*, command, cwd, timeout_seconds, sandbox,
-            repo) -> (exit_code | None, detail)`` — step 4 for the same.
-            Defaults to :func:`run_declared_command_in_sandbox`.
+            repo, full_check) -> (exit_code | None, detail)`` — step 4 for the
+            same: with ``full_check`` the sandbox's helper finds and runs the
+            whole check. Defaults to :func:`run_declared_command_in_sandbox`.
+        parts_reader: ``(declaration, tree) -> list[CheckPart] | None`` —
+            what the full check runs, found in the worktree. Defaults to
+            :func:`forge.full_check.full_check_parts_of` (GuardKit's own
+            ``full_check_parts``). Injected so tests need no GuardKit.
+
+    THE FULL CHECK (1 November 2026). Step 4 runs what the join runs: the
+    root command plus every declared component and part, each in its own
+    folder with its own install and limit. Red goes back for repair before
+    the card; a check that could not run stops, as it does at the join.
     """
     from forge.pipeline.merge_ready_checkpoint import GateStatus, GatesReport
 
@@ -2094,6 +2156,7 @@ def make_gates_green_reader(
     _run = command_runner or _run_declared_command
     _sandbox_load = sandbox_declaration_loader or load_declared_toolchain_from_sandbox
     _sandbox_run = sandbox_command_runner or run_declared_command_in_sandbox
+    _parts = parts_reader or full_check_parts_of
 
     def _default_repo_root(build_id: str) -> Any | None:
         row = pool.get_build_row(build_id)
@@ -2110,15 +2173,21 @@ def make_gates_green_reader(
     def _unknown(
         detail: str, build_id: str, failed_gates: tuple[str, ...] = ()
     ) -> Any:
+        # THE CHECK COULD NOT RUN: A STOP, AS AT THE JOIN (1 November 2026).
+        # It used to be advice, and a card was offered for work the join then
+        # refused. The gate is named, so the checkpoint offers no card, and
+        # the journey ends without a repair turn (no code change mends a check
+        # that could not run).
         logger.warning(
-            "conductor gates: build_id=%s — %s. The gate set answers UNKNOWN: "
-            "the tests could not be run, which the merge card says (advice "
-            "since step 2, 26 October 2026)",
+            "conductor gates: build_id=%s — %s. The declared check could not "
+            "run, so no merge card is offered",
             build_id,
             detail,
         )
         return GatesReport(
-            status=GateStatus.UNKNOWN, detail=detail, failed_gates=failed_gates
+            status=GateStatus.UNKNOWN,
+            detail=detail,
+            failed_gates=failed_gates or (CHECK_COULD_NOT_RUN_GATE,),
         )
 
     def read_gates(*, build_id: str, branch: Any = None) -> Any:
@@ -2189,6 +2258,7 @@ def make_gates_green_reader(
                 _names: tuple[str, ...] = declared_names,
                 _build: str = build_id,
                 _declared_at: str | None = declared_at,
+                full_check: bool = False,
             ) -> Any:
                 return _sandbox_run(
                     command=command,
@@ -2200,6 +2270,7 @@ def make_gates_green_reader(
                     launch_settings=_names,
                     build=_build,
                     declared_at=_declared_at,
+                    **({"full_check": True} if full_check else {}),
                 )
 
         worktree = getattr(row, "worktree_path", None)
@@ -2242,59 +2313,75 @@ def make_gates_green_reader(
                 f"{repo_root}/.guardkit/config.yaml declares no toolchain",
                 build_id,
             )
-        command = getattr(declaration, "test", None)
-        if not command:
-            return _unknown(
-                f"{repo_root}/.guardkit/config.yaml declares a toolchain but "
-                "no `test:` command, so there is no verdict-bearing gate to "
-                "run",
-                build_id,
-            )
-        timeout_seconds = int(getattr(declaration, "test_timeout", 300) or 300)
 
-        logger.info(
-            "conductor gates: build_id=%s running the DECLARED test command "
-            "for the merge-ready checkpoint — %r in %s (branch=%s, bound=%ss)",
-            build_id,
-            command,
-            worktree,
-            branch,
-            timeout_seconds,
-        )
-        try:
-            exit_code, detail = run_command(
-                command=command, cwd=worktree, timeout_seconds=timeout_seconds
-            )
-        except Exception as exc:  # noqa: BLE001 — a runner defect is not green
-            return _unknown(
-                f"running the declared test command raised "
-                f"{type(exc).__name__}: {exc}",
-                build_id,
-            )
-
-        # WHAT THE RUN ITSELF SAID. The runner keeps it on the sentence it
-        # returns (:class:`DeclaredTestDetail`); a runner that returns a plain
-        # string — every injected test double, and any older seam — simply has
-        # none, and the report is what it always was.
-        evidence = str(getattr(detail, "evidence", "") or "")
-        failing_cases = tuple(getattr(detail, "failing_cases", ()) or ())
-
-        if exit_code is None:
-            return _unknown(detail, build_id)
-        if exit_code == 0:
+        # THE SAME FULL CHECK THE JOIN RUNS (1 November 2026): the root
+        # command plus every declared component and part, each in its own
+        # folder with its own install and limit. Here, the parts are found in
+        # the journey's worktree by GuardKit's own reader; for a repository
+        # with a sandbox, its helper finds and runs them in there.
+        if entry is None:
+            parts = _parts(declaration, worktree)
+            if parts is None:
+                return _unknown(
+                    "GuardKit's own reader of the full check "
+                    "(toolchain_declaration.full_check_parts) is not available "
+                    "here, so what the full check runs cannot be read",
+                    build_id,
+                )
             logger.info(
-                "conductor gates: build_id=%s — declared suite GREEN. %s",
+                "conductor gates: build_id=%s running the DECLARED full check "
+                "for the merge-ready checkpoint — %d part(s) in %s (branch=%s)",
                 build_id,
-                detail,
+                len(parts),
+                worktree,
+                branch,
+            )
+            check = run_full_check(parts, tree=Path(worktree), run=run_command)
+        else:
+            root_test = str(getattr(declaration, "test", "") or "")
+            logger.info(
+                "conductor gates: build_id=%s asking sandbox %s for the DECLARED "
+                "full check in %s (branch=%s)",
+                build_id,
+                getattr(entry, "name", "?"),
+                worktree,
+                branch,
+            )
+            try:
+                exit_code, detail = run_command(
+                    command=root_test,
+                    cwd=worktree,
+                    timeout_seconds=SANDBOX_FULL_CHECK_TIMEOUT_S,
+                    full_check=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — a runner defect is not green
+                exit_code, detail = None, (
+                    f"running the declared full check raised "
+                    f"{type(exc).__name__}: {exc}"
+                )
+            check = _a_full_check_from(exit_code, detail)
+
+        evidence = (
+            str(getattr(check.only_detail, "evidence", "") or "")
+            if check.only_detail is not None
+            else check.evidence
+        )
+        if check.status == COULD_NOT_RUN:
+            return _unknown(check.detail, build_id)
+        if check.status == PASSED:
+            logger.info(
+                "conductor gates: build_id=%s — declared full check GREEN. %s",
+                build_id,
+                check.detail,
             )
             return GatesReport(
-                status=GateStatus.GREEN, detail=str(detail), evidence=evidence
+                status=GateStatus.GREEN, detail=str(check.detail), evidence=evidence
             )
         logger.warning(
             "conductor gates: build_id=%s — RED. %s. No merge card is "
             "published; the fix cycle runs BEFORE the merge word",
             build_id,
-            detail,
+            check.detail,
         )
         if evidence:
             logger.warning(
@@ -2304,24 +2391,25 @@ def make_gates_green_reader(
                 build_id,
                 evidence,
             )
-        # THE FAILING GATE'S NAME CARRIES THE FAILING TESTS. The reason a
-        # journey stops with (``conductor_driver._red_gate_reason``) names the
-        # failed gates when there are any, so the tests that failed have to be
-        # in the name for a person to read them there. With no names to add —
-        # a tool that wrote no summary, or an injected runner — the name is
-        # the one word it has always been.
-        gate_name = "declared toolchain test"
-        if failing_cases:
-            gate_name = f"{gate_name} — {_names_the_failing_cases(failing_cases)}"
-        # ``detail`` is passed as the runner returned it, not re-flattened
-        # with ``str()``: it IS the sentence (``DeclaredTestDetail`` is a
-        # string), and keeping the object lets the checkpoint's own row carry
-        # the command that ran and the code it exited with. Every reader that
-        # only wants the sentence sees exactly the sentence it saw before.
+        # THE FAILING GATE'S NAME CARRIES THE FAILING PART AND TESTS. The
+        # reason a journey stops with (``conductor_driver._red_gate_reason``)
+        # names the failed gates, so the part and the tests that failed have
+        # to be in the name for a person to read them there.
+        gate_names = [
+            "declared toolchain test"
+            + ("" if label in ("root", "the full check") else f" ({label})")
+            for label in (check.failed or ("the full check",))
+        ]
+        if check.failing_cases:
+            gate_names[0] = (
+                f"{gate_names[0]} — {_names_the_failing_cases(check.failing_cases)}"
+            )
+        # One part: its own answer is passed as the runner returned it (it
+        # may carry the command that ran and the code it exited with).
         return GatesReport(
             status=GateStatus.RED,
-            failed_gates=(gate_name,),
-            detail=detail,
+            failed_gates=tuple(gate_names),
+            detail=check.only_detail if check.only_detail is not None else check.detail,
             evidence=evidence,
         )
 

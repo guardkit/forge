@@ -3791,6 +3791,16 @@ DYNAMIC_IMPORT_ALLOWED: dict[tuple[str, str], str] = {
         "the same toolchain loader, the same two candidate module names and "
         "the same tested seam"
     ),
+    ("deploy_sidecar/service.py", "_declared_toolchain_here"): (
+        "the same toolchain loader and candidate names, for the full check "
+        "(1 November 2026); the module is used only as the base of one "
+        "attribute"
+    ),
+    ("full_check.py", "full_check_parts_of"): (
+        "the build system's own full-check reader (full_check_parts) from the "
+        "same toolchain module the loaders import, a seam tests replace; the "
+        "module is used only as the base of one attribute"
+    ),
     ("deploy_sidecar/service.py", "_load_code_search_once"): (
         "loads the build system's code_search.py from its installed location "
         "by file, because that package's own __init__ needs the model "

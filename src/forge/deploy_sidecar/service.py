@@ -1930,6 +1930,124 @@ def declared_test_command(
     )
 
 
+def _declared_toolchain_here(
+    repo_path: "Path | str",
+    *,
+    module_candidates: Sequence[str] | None = None,
+) -> tuple[Any | None, str | None]:
+    """The repository's whole ``toolchain`` declaration, read by GuardKit's
+    own loader where it lives; ``(declaration, None)`` or ``(None, why)``."""
+    module_candidates = (
+        TOOLCHAIN_MODULE_CANDIDATES if module_candidates is None else module_candidates
+    )
+    for candidate in module_candidates:
+        try:
+            import_module(candidate)
+        except (ImportError, ModuleNotFoundError, ValueError):
+            continue
+        try:
+            declaration = import_module(candidate).load_toolchain_declaration(
+                Path(repo_path)
+            )
+        except Exception as exc:  # noqa: BLE001 — a loader defect is not a pass
+            return None, (
+                f"{repo_path}/.guardkit/config.yaml could not be read: "
+                f"{type(exc).__name__}: {exc}"
+            )
+        if declaration is None:
+            return None, f"{repo_path}/.guardkit/config.yaml declares no toolchain"
+        return declaration, None
+    return None, (
+        "guardkit's toolchain declaration loader is not importable in this "
+        f"service (tried {', '.join(module_candidates)})"
+    )
+
+
+def _process_declared_full_check(
+    *,
+    cwd: str,
+    repo_path: Path,
+    command_runner: "MergeRunner",
+    memory_project: str | None,
+    launch_settings: Sequence[str] | None,
+) -> tuple[int, dict[str, Any]]:
+    """The project's whole declared check, run here (1 November 2026).
+
+    The same full check the join runs: the root command plus every declared
+    component and part, found in the journey's worktree ``cwd`` by GuardKit's
+    own reader, each run in its own folder with its own install first and its
+    own declared limit (:mod:`forge.full_check`). The declaration is read from
+    the repository's own clone, never from the worktree, as for the root
+    command. Answers 200 with ``exit_code`` 0 (passed) or 1 (failed), or with
+    ``could_not_run`` and no exit code when any part could not run.
+    """
+    from forge.full_check import full_check_parts_of, run_full_check
+
+    declaration, error = _declared_toolchain_here(repo_path)
+    if error or declaration is None:
+        return 200, {"cwd": cwd, "exit_code": None, "could_not_run": error}
+    parts = full_check_parts_of(
+        declaration, cwd, module_candidates=TOOLCHAIN_MODULE_CANDIDATES
+    )
+    if parts is None:
+        return 200, {
+            "cwd": cwd,
+            "exit_code": None,
+            "could_not_run": (
+                "GuardKit's own reader of the full check "
+                "(toolchain_declaration.full_check_parts) is not available here"
+            ),
+        }
+
+    def run(*, command: str, cwd: Any, timeout_seconds: int) -> tuple[int | None, str]:
+        timeout = min(float(timeout_seconds), MERGE_TIMEOUT_MAX)
+        try:
+            ran = command_runner(
+                argv=["/bin/sh", "-c", command],
+                cwd=str(cwd),
+                timeout=timeout,
+                what="the declared check",
+                memory_project=memory_project,
+                launch_settings=launch_settings,
+                repository=str(repo_path),
+            )
+            exit_code, stdout, stderr = ran
+        except Exception as exc:  # noqa: BLE001 — never raise past the boundary
+            return None, f"it raised {type(exc).__name__}: {exc}"
+        if _a_program_that_did_not_finish(ran) is not None:
+            return None, f"`{command}` could not be started or did not finish: {stderr}"
+        if exit_code == MERGE_TIMEOUT_EXIT_CODE:
+            return None, f"`{command}` did not finish within {timeout:g}s in {cwd}"
+        tail = (str(stderr or "") or str(stdout or "")).strip().splitlines()
+        return exit_code, (
+            f"`{command}` exited {exit_code} in {cwd}"
+            + (f" — last line: {tail[-1]}" if tail else "")
+        )
+
+    logger.info(
+        "forge-deploy-sidecar: running the declared full check (%d part(s)) in %s",
+        len(parts),
+        cwd,
+    )
+    check = run_full_check(parts, tree=cwd, run=run)
+    if check.exit_code is None:
+        return 200, {
+            "cwd": cwd,
+            "exit_code": None,
+            "could_not_run": check.detail,
+            "parts": list(check.parts),
+        }
+    return 200, {
+        "cwd": cwd,
+        "exit_code": check.exit_code,
+        "stdout": "\n".join(
+            f"{p['label']}: {p['status']} — {p['detail']}" for p in check.parts
+        ),
+        "stderr_tail": "",
+        "parts": list(check.parts),
+    }
+
+
 def _bounded_timeout(value: Any, *, default: float, ceiling: float) -> tuple[
     float, list[dict[str, str]], str | None
 ]:
@@ -2136,6 +2254,14 @@ def process_declared_test_run(
                 "nowhere to run the declared test command"
             )
         }
+    if payload.get("full_check") is True:
+        return _process_declared_full_check(
+            cwd=cwd,
+            repo_path=repo_path,
+            command_runner=command_runner,
+            memory_project=memory_project,
+            launch_settings=launch_settings,
+        )
     declared, declared_timeout, error = declared_test_command(repo_path)
     if error or declared is None:
         return 400, {"error": error}

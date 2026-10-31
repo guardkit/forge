@@ -167,14 +167,13 @@ class GateStatus(StrEnum):
     Members:
         GREEN: Every gate passed.
         RED: At least one gate failed. No card; the repair loops back.
-        UNKNOWN: The gate set could not be evaluated (no reader wired, a
-            reader raised, a probe timed out). Since step 2 (26 October
-            2026, census FRG-138) this is advice: tests that could not run
-            are not tests that ran and failed. The card is published with a
-            plain "the tests could not be run" line, and the merge press
-            still runs the project's own checks on the joined code. An
-            UNKNOWN that names failed gates is the routing law's own block,
-            kept as it was: no card, as for RED.
+        UNKNOWN: The gate set could not be evaluated. An UNKNOWN that
+            names failed gates — which is what the production reader answers
+            when the declared check could not run (1 November 2026) — stops:
+            no card, and the journey ends without a repair turn, as the merge
+            would stop on it at the join. One that names none (no reader
+            wired, a reader that raised) is still advice: the card says the
+            tests could not be run.
     """
 
     GREEN = "green"
@@ -1889,6 +1888,18 @@ class MergeReadyCheckpointPublisher:
     def _resolve_red_gate_action(
         self, build_id: str, gates: GatesReport
     ) -> RedGateAction:
+        # A CHECK THAT COULD NOT RUN ENDS THE JOURNEY (1 November 2026): no
+        # code change mends it, so no repair turn is spent on it, and the
+        # merge would stop on it at the join as well.
+        if gates.status is GateStatus.UNKNOWN:
+            logger.warning(
+                "%s: the declared check could not run for build_id=%s (%s) — "
+                "no card and no repair turn; the journey ends FAILED",
+                MERGE_READY_CHECKPOINT_LABEL,
+                build_id,
+                gates.detail or "no detail",
+            )
+            return RedGateAction.TERMINATE_FAILED
         if self._red_gate_action is None:
             return RedGateAction.LOOP_BACK
         try:
