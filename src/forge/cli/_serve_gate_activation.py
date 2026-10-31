@@ -1155,20 +1155,14 @@ def merge_card_words(
     deferred = str(getattr(gates, "deferred_detail", "") or "").strip()
     named = feature_id or "this repair"
     checked = detail or "the checks this repository declares came back green"
-    could_not_run = getattr(getattr(gates, "status", None), "value", None) == "unknown"
     sentences = [f"{named} is ready to merge on branch {branch}."]
     if supplied_plan:
         sentences.append(supplied_plan)
     if prototype:
         sentences.append(prototype)
-    if could_not_run:
-        # Step 2 (26 October 2026, census FRG-138): advice, never red.
-        sentences.append(
-            f"The tests could not be run here ({detail or 'no reason was given'}); "
-            "the merge still runs the project's own checks on the joined code."
-        )
-    else:
-        sentences.append(f"What was checked: {checked}.")
+    # A check that could not run offers no card at all (1 November 2026), so
+    # a card always says what was checked.
+    sentences.append(f"What was checked: {checked}.")
     tests = card_line_about_tests(getattr(gates, "test_changes", None))
     if tests:
         sentences.append(tests)

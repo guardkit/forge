@@ -981,10 +981,6 @@ SANDBOX_TEST_HTTP_MARGIN_S: float = 30.0
 #: (every part, each to its own limit): the merge's own two-hour cap.
 SANDBOX_FULL_CHECK_TIMEOUT_S: int = 7200
 
-#: The gate a check that could not run is named as, so the merge-ready
-#: checkpoint offers no card for it (1 November 2026).
-CHECK_COULD_NOT_RUN_GATE: str = "the declared check could not run"
-
 
 def _a_full_check_from(exit_code: int | None, detail: Any) -> FullCheck:
     """The sandbox helper's one answer for the whole check, as a FullCheck."""
@@ -2149,7 +2145,11 @@ def make_gates_green_reader(
     folder with its own install and limit. Red goes back for repair before
     the card; a check that could not run stops, as it does at the join.
     """
-    from forge.pipeline.merge_ready_checkpoint import GateStatus, GatesReport
+    from forge.pipeline.merge_ready_checkpoint import (
+        CHECK_COULD_NOT_RUN,
+        GateStatus,
+        GatesReport,
+    )
 
     from forge.config.sandboxes import sandbox_for
 
@@ -2188,7 +2188,7 @@ def make_gates_green_reader(
         return GatesReport(
             status=GateStatus.UNKNOWN,
             detail=detail,
-            failed_gates=failed_gates or (CHECK_COULD_NOT_RUN_GATE,),
+            failed_gates=failed_gates or (CHECK_COULD_NOT_RUN,),
         )
 
     def read_gates(*, build_id: str, branch: Any = None) -> Any:

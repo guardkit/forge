@@ -114,14 +114,14 @@ class TestGatesGreenPrecondition:
             pytest.param(lambda **_: "probably fine", "str", id="nonsense-reader"),
         ],
     )
-    def test_tests_that_could_not_run_are_advice_and_the_card_goes(
+    def test_a_missing_or_failing_reader_stops_with_no_card_and_no_repair(
         self, reader: Any, said: str
     ) -> None:
-        """Step 2 (26 October 2026, census FRG-138): tests that could not run
-        are not tests that ran and failed. The card is published and its
-        words say the tests could not be run; the merge press still runs the
-        project's own checks on the joined code."""
-        from forge.cli._serve_gate_activation import merge_card_words
+        """1 November 2026: a reader that is not wired, that raised, or that
+        answered nonsense is "the check could not run". It used to be advice
+        and the card went (step 2, 26 October 2026); that let a card reach the
+        merge word with nothing checked. Now no card is offered, the reason is
+        named, and the journey ends without a repair turn."""
 
         def boom(**_: Any) -> Any:
             raise RuntimeError("gate runner died")
@@ -130,20 +130,20 @@ class TestGatesGreenPrecondition:
         publisher = MergeReadyCheckpointPublisher(
             publish_card=card,
             gates_green_reader=boom if reader == "boom" else reader,
+            # Even a red-gate choice that would loop back does not spend a
+            # repair turn on a check that could not run.
+            red_gate_action=lambda _bid, _gates: RedGateAction.LOOP_BACK,
         )
 
         decision = _submit(publisher)
 
-        assert decision.outcome is MergeCardOutcome.CARD_PUBLISHED
+        assert decision.outcome is MergeCardOutcome.RED_GATE_FAILED
+        assert decision.card_published is False
+        assert card.calls == []
         assert decision.gates is not None
         assert decision.gates.status is GateStatus.UNKNOWN
+        assert decision.gates.failed_gates == ("the declared check could not run",)
         assert said in decision.gates.detail
-        assert len(card.calls) == 1
-        words = merge_card_words(
-            feature_id="FEAT-X", branch="fix/TASK-X-0001", gates=decision.gates
-        )
-        assert "The tests could not be run here" in words
-        assert "What was checked" not in words
 
     def test_an_unknown_naming_the_routing_laws_gates_still_stops_the_card(
         self,

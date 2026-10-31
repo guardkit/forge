@@ -114,6 +114,7 @@ __all__ = [
     "DECLARED_TEST_OUTPUT_FILENAME",
     "DEFAULT_SPECIFICATION_PATHS",
     "DEFAULT_TEST_PATHS",
+    "CHECK_COULD_NOT_RUN",
     "MERGE_READY_CHECKPOINT_LABEL",
     "TEST_CHANGE_MARKER",
     "ApprovalLineChange",
@@ -150,6 +151,10 @@ __all__ = [
 #: codename (``pull-request-review``) stays on the durable stage rows.
 MERGE_READY_CHECKPOINT_LABEL: str = "the merge-ready checkpoint"
 
+#: The gate a check that could not run is named as (1 November 2026), so no
+#: card is offered for it and the journey ends without a repair turn.
+CHECK_COULD_NOT_RUN: str = "the declared check could not run"
+
 #: Where the declared test's own output is filed on a decision's ``details``,
 #: so anything reading a decision back — the receipts writer, an operator
 #: looking at the run report — finds it under one agreed name.
@@ -167,13 +172,10 @@ class GateStatus(StrEnum):
     Members:
         GREEN: Every gate passed.
         RED: At least one gate failed. No card; the repair loops back.
-        UNKNOWN: The gate set could not be evaluated. An UNKNOWN that
-            names failed gates — which is what the production reader answers
-            when the declared check could not run (1 November 2026) — stops:
-            no card, and the journey ends without a repair turn, as the merge
-            would stop on it at the join. One that names none (no reader
-            wired, a reader that raised) is still advice: the card says the
-            tests could not be run.
+        UNKNOWN: The gate set could not be evaluated: the declared check
+            could not run, no reader is wired, or the reader raised. Since 1
+            November 2026 it always stops: no card, and the journey ends
+            without a repair turn, as the merge would stop on it at the join.
     """
 
     GREEN = "green"
@@ -1458,16 +1460,7 @@ class MergeReadyCheckpointPublisher:
             else {}
         )
 
-        if gates.status is GateStatus.UNKNOWN and not gates.failed_gates:
-            logger.warning(
-                "%s: the tests could not be run for build_id=%s (%s) — "
-                "ADVISORY; the card says so and the merge press still runs "
-                "the project's checks on the joined code",
-                MERGE_READY_CHECKPOINT_LABEL,
-                build_id,
-                gates.detail or "no detail",
-            )
-        elif not gates.is_green:
+        if not gates.is_green:
             return await self._red_gate_decision(
                 build_id=build_id,
                 feature_id=feature_id,
@@ -1852,9 +1845,15 @@ class MergeReadyCheckpointPublisher:
             return False
 
     async def _read_gates(self, build_id: str, branch: str | None) -> GatesReport:
+        # EVERY "COULD NOT READ" NAMES ITS GATE (1 November 2026): no reader
+        # wired, a reader that raised, or one that answered neither a report
+        # nor a yes or no. Each is "the check could not run" — no card and no
+        # repair turn, never advice, so nothing reaches the merge word
+        # unchecked.
         if self._gates_green_reader is None:
             return GatesReport(
                 status=GateStatus.UNKNOWN,
+                failed_gates=(CHECK_COULD_NOT_RUN,),
                 detail="no reader of this repository's tests is wired",
             )
         try:
@@ -1864,6 +1863,7 @@ class MergeReadyCheckpointPublisher:
         except Exception as exc:  # noqa: BLE001 — unknown is red, never green
             return GatesReport(
                 status=GateStatus.UNKNOWN,
+                failed_gates=(CHECK_COULD_NOT_RUN,),
                 detail=(
                     f"the reader of this repository's tests raised "
                     f"{type(exc).__name__}: {exc}"
@@ -1879,6 +1879,7 @@ class MergeReadyCheckpointPublisher:
             )
         return GatesReport(
             status=GateStatus.UNKNOWN,
+            failed_gates=(CHECK_COULD_NOT_RUN,),
             detail=(
                 f"the reader of this repository's tests answered "
                 f"{type(raw).__name__}, which is neither a report nor a yes or no"
