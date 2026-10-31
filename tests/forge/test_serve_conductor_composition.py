@@ -1388,6 +1388,133 @@ class TestTheMergeCardRunsTheFullCheck:
         )
 
 
+def _git_here(root: Path, *args: str) -> None:
+    subprocess.run(
+        [
+            "git",
+            "-c", "user.email=tests@example.invalid",
+            "-c", "user.name=tests",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(root),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+class TestTheMergeCardsFullCheckThroughTheRealRunner:
+    """Codex's check, 31 October 2026: the full check's parts run through the
+    REAL command runner, which builds each command's environment from
+    nothing, with its private home in the checkout's own git directory.
+
+    The tests above replace the runner, so they never saw that a component
+    or pattern part below the worktree's root was refused its environment
+    (its folder has no ``.git`` of its own). Here nothing is replaced but
+    GuardKit's reader of the parts (stood in, as GuardKit's dependencies are
+    not installed in Forge's tests): a real canonical repository, a real
+    linked journey worktree at the build row's recorded path, and real
+    commands in each part's folder."""
+
+    @staticmethod
+    def _journey_worktree(tmp_path: Path) -> tuple[Path, Path]:
+        canonical = tmp_path / "canonical"
+        (canonical / "api").mkdir(parents=True)
+        (canonical / "api" / "go.mod").write_text("module api\n", encoding="utf-8")
+        (canonical / "apps" / "web").mkdir(parents=True)
+        (canonical / "apps" / "web" / "package.json").write_text("{}", encoding="utf-8")
+        _git_here(canonical, "init", "-q", "-b", "main")
+        _git_here(canonical, "add", "-A")
+        _git_here(canonical, "commit", "-q", "-m", "seed")
+        # The gates pool's build row records tmp_path/wt (made empty there).
+        worktree = tmp_path / "wt"
+        _git_here(canonical, "worktree", "add", "-q", "-b", "fix/g", str(worktree))
+        return canonical, worktree
+
+    @staticmethod
+    def _declaration(api_test: str, *, root_test: str = "test -d api") -> Any:
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            test=root_test, test_timeout=60,
+            install=None, install_timeout=60,
+            components={
+                "api": SimpleNamespace(
+                    cwd="api", test=api_test, test_timeout=60,
+                    install="test -f go.mod", install_timeout=60,
+                )
+            },
+            parts=[
+                SimpleNamespace(
+                    under="apps", marker="package.json",
+                    test='test "${PWD##*/}" = web && test -f package.json',
+                    test_timeout=60, install="true", install_timeout=60,
+                )
+            ],
+        )
+
+    @staticmethod
+    def _read(pool: Any, canonical: Path, declaration: Any) -> Any:
+        from forge.cli._serve_conductor import make_gates_green_reader
+
+        return make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
+            pool=pool,
+            config=_gates_config({"org/target": str(canonical)}),
+            declaration_loader=lambda _root: declaration,
+        )(build_id=BUILD_ID, branch="fix/g")
+
+    def test_a_good_multi_part_feature_reaches_its_card(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        canonical, worktree = self._journey_worktree(tmp_path)
+        git_dir = str((canonical / ".git").resolve())
+        # The component runs in its own folder, and its private home is in
+        # the checkout's shared git directory, never among the project's
+        # files and never above the checkout.
+        api_test = (
+            'test "${PWD##*/}" = api && test -f go.mod && '
+            f'case "$HOME" in {git_dir}/*) exit 0;; *) exit 3;; esac'
+        )
+        report = self._read(gates_pool, canonical, self._declaration(api_test))
+
+        assert report.status is GateStatus.GREEN, report.detail
+        assert "api" in str(report.detail) and "apps/web" in str(report.detail)
+        assert not (worktree / "api" / ".git").exists()
+
+    def test_a_part_that_exits_127_after_running_is_red(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        """A project script that ran and ended with 127 failed: it goes back
+        for repair, like any other failed test."""
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        canonical, _worktree = self._journey_worktree(tmp_path)
+        report = self._read(gates_pool, canonical, self._declaration("exit 127"))
+
+        assert report.status is GateStatus.RED
+        assert report.failed_gates == ("declared toolchain test (api)",)
+
+    def test_an_environment_that_is_refused_could_not_run(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        """When the command's environment cannot be built, nothing ran: the
+        check could not run, so no card and no repair."""
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        canonical, worktree = self._journey_worktree(tmp_path)
+        # The worktree's link to its git directory is broken, so there is no
+        # git directory to put the private home in.
+        (worktree / ".git").write_text("not a git directory\n", encoding="utf-8")
+        report = self._read(gates_pool, canonical, self._declaration("true"))
+
+        assert report.status is GateStatus.UNKNOWN
+        assert report.failed_gates == ("the declared check could not run",)
+
+
 class TestGatesGreenReader:
     """The exit-code-is-the-verdict law, and every honest degrade around it."""
 

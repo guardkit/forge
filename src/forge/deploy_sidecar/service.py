@@ -1999,6 +1999,11 @@ def _process_declared_full_check(
             ),
         }
 
+    # THE CHECKOUT IS THE JOURNEY'S WORKTREE (Codex's check, 31 October
+    # 2026): every part runs in its own folder, and the worktree it sits in is
+    # the checkout the command belongs to, as on the coordinator's side.
+    worktree = cwd
+
     def run(*, command: str, cwd: Any, timeout_seconds: int) -> tuple[int | None, str]:
         timeout = min(float(timeout_seconds), MERGE_TIMEOUT_MAX)
         try:
@@ -2009,7 +2014,7 @@ def _process_declared_full_check(
                 what="the declared check",
                 memory_project=memory_project,
                 launch_settings=launch_settings,
-                repository=str(repo_path),
+                repository=worktree,
             )
             exit_code, stdout, stderr = ran
         except Exception as exc:  # noqa: BLE001 — never raise past the boundary

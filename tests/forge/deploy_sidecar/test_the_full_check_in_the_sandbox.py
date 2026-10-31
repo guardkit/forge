@@ -151,3 +151,106 @@ def test_a_part_test_that_runs_out_of_time_is_exit_one(
     assert status == 200
     assert body["exit_code"] == 1
     assert "`npm test` did not finish within its limit of 360s" in body["stdout"]
+
+
+# ---------------------------------------------------------------------------
+# Through the REAL runner (Codex's check, 31 October 2026)
+# ---------------------------------------------------------------------------
+
+
+def _git(root: Path, *args: str) -> None:
+    import subprocess
+
+    subprocess.run(
+        [
+            "git",
+            "-c", "user.email=tests@example.invalid",
+            "-c", "user.name=tests",
+            "-c", "commit.gpgsign=false",
+            *args,
+        ],
+        cwd=str(root),
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+@pytest.fixture
+def a_real_journey(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace:
+    """A real clone with a real linked journey worktree under
+    ``.forge/worktrees``, a component ``api`` and a pattern part
+    ``apps/web``; only GuardKit's reader is stood in."""
+    from forge.deploy_sidecar import service
+
+    clone = tmp_path / "clone"
+    (clone / "api").mkdir(parents=True)
+    (clone / "api" / "go.mod").write_text("module api\n", encoding="utf-8")
+    (clone / "apps" / "web").mkdir(parents=True)
+    (clone / "apps" / "web" / "package.json").write_text("{}", encoding="utf-8")
+    _git(clone, "init", "-q", "-b", "main")
+    _git(clone, "add", "-A")
+    _git(clone, "commit", "-q", "-m", "seed")
+    worktree = clone / ".forge" / "worktrees" / "journey-1"
+    _git(clone, "worktree", "add", "-q", "-b", "fix/one", str(worktree))
+    answers = SimpleNamespace(
+        api_test="true", worktree=worktree, repo=clone, git_dir=(clone / ".git").resolve()
+    )
+
+    def load(_root: Any) -> Any:
+        return SimpleNamespace(
+            test="test -d api", test_timeout=60,
+            components={
+                "api": SimpleNamespace(
+                    cwd="api", test=answers.api_test, test_timeout=60,
+                    install="test -f go.mod", install_timeout=60,
+                )
+            },
+            parts=[
+                SimpleNamespace(
+                    under="apps", marker="package.json",
+                    test='test "${PWD##*/}" = web && test -f package.json',
+                    test_timeout=60, install="true", install_timeout=60,
+                )
+            ],
+        )
+
+    module = ModuleType(LOADER)
+    module.load_toolchain_declaration = load  # type: ignore[attr-defined]
+    module.full_check_parts = full_check_parts  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, LOADER, module)
+    monkeypatch.setattr(service, "TOOLCHAIN_MODULE_CANDIDATES", (LOADER,))
+    return answers
+
+
+def _check_with_the_real_runner(
+    journey: SimpleNamespace, launch_settings: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    from forge.deploy_sidecar.service import (
+        _process_declared_full_check,
+        run_project_program,
+    )
+
+    status, body = _process_declared_full_check(
+        cwd=str(journey.worktree),
+        repo_path=journey.repo,
+        command_runner=run_project_program,
+        memory_project=None,
+        launch_settings=launch_settings,
+    )
+    assert status == 200
+    return body
+
+
+def test_a_nested_component_runs_through_the_real_runner(
+    a_real_journey: SimpleNamespace,
+) -> None:
+    """A good multi-part feature passes: each part runs in its own folder,
+    and its private home is in the clone's own git directory."""
+    a_real_journey.api_test = (
+        'test "${PWD##*/}" = api && test -f go.mod && '
+        f'case "$HOME" in {a_real_journey.git_dir}/*) exit 0;; *) exit 3;; esac'
+    )
+    body = _check_with_the_real_runner(a_real_journey)
+    assert body["exit_code"] == 0, body
+    assert [p["label"] for p in body["parts"]] == ["root", "api", "apps/web"]

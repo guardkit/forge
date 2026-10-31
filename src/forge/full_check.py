@@ -264,4 +264,3 @@ def _run_part(
         return PASSED, said, evidence, ()
     cases = tuple(str(c) for c in (getattr(said, "failing_cases", ()) or ()))
     return FAILED, said, evidence, cases
-

@@ -2200,6 +2200,13 @@ def make_gates_green_reader(
         # worktree are inside it, so both happen through its own deploy
         # sidecar. Every other repository takes the path it always took, in
         # this container, with the two seams the tests inject.
+        worktree = getattr(row, "worktree_path", None)
+        if not worktree:
+            return _unknown(
+                "the build row carries no worktree_path, so there is nowhere "
+                "to run the gate set",
+                build_id,
+            )
         repo_key = str(getattr(row, "repo", "") or "")
         entry = sandbox_for(config, repo_key)
         if entry is None:
@@ -2211,18 +2218,28 @@ def make_gates_green_reader(
                 # ledger exactly as the sandbox branch below reads it.
                 local_names = _the_builds_declared_settings(pool, build_id)
 
+                # THE CHECKOUT IS THE JOURNEY'S WORKTREE, WHEREVER THE PART
+                # RUNS (Codex's check, 31 October 2026). A component or a
+                # pattern part runs in its own folder below the worktree's
+                # root; with no repository named, that folder was taken as
+                # the checkout, it has no ``.git`` of its own, and the
+                # command's environment was refused, so a good multi-part
+                # feature never reached its card. The worktree is named, and
+                # the part's folder stays the working folder.
                 def run_command(  # type: ignore[misc]
                     *,
                     command: str,
                     cwd: Any,
                     timeout_seconds: int,
                     _names: tuple[str, ...] = local_names,
+                    _repository: str = str(worktree),
                 ) -> Any:
                     return _run_declared_command(
                         command=command,
                         cwd=cwd,
                         timeout_seconds=timeout_seconds,
                         launch_settings=_names,
+                        repository=_repository,
                     )
         else:
             def load(repo_root: Any, _entry: Any = entry, _repo: str = repo_key) -> Any:
@@ -2274,13 +2291,6 @@ def make_gates_green_reader(
                     **({"full_check": True} if full_check else {}),
                 )
 
-        worktree = getattr(row, "worktree_path", None)
-        if not worktree:
-            return _unknown(
-                "the build row carries no worktree_path, so there is nowhere "
-                "to run the gate set",
-                build_id,
-            )
         if entry is None and not Path(worktree).is_dir():
             # A sandbox repository's worktree is inside its sandbox and is not
             # a directory on this side at all; the sidecar checks that it is
