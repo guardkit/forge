@@ -3344,7 +3344,14 @@ def run_project_program(
             keep_factory_python=keep_factory_python,
         )
     except (OSError, ValueError) as exc:
-        return (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} was not started: {exc}")
+        # NOTHING RAN, AND THE RESULT SAYS SO IN ITS OWN FIELD (Codex's check,
+        # 31 October 2026). A plain (127, "", reason) tuple read exactly like
+        # a project script that ran and exited 127, so a refused environment
+        # became a failed test and a repair cycle. It is the same "refused
+        # before it started" result the spawn's own refusal gives.
+        return RefusedBeforeStart(
+            MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} was not started: {exc}"
+        )
     ran = _start_and_collect(argv=argv, cwd=cwd, env=env, timeout=timeout, what=what)
     exit_code, stdout, stderr = ran
     if exit_code != 0:

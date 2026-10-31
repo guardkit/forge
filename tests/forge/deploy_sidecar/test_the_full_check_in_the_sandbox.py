@@ -254,3 +254,52 @@ def test_a_nested_component_runs_through_the_real_runner(
     body = _check_with_the_real_runner(a_real_journey)
     assert body["exit_code"] == 0, body
     assert [p["label"] for p in body["parts"]] == ["root", "api", "apps/web"]
+
+
+def test_a_refused_environment_is_could_not_run_and_no_repair(
+    a_real_journey: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Codex's check, 31 October 2026: when the command's environment is
+    refused (here a declared proxy that carries a password), nothing ran.
+    That is "could not run" (no exit code), which stops the journey with the
+    reason and files no repair; it is never a failed test."""
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:SENTINEL_pw@proxy.invalid:3128")
+    body = _check_with_the_real_runner(a_real_journey, launch_settings=("HTTPS_PROXY",))
+    assert body["exit_code"] is None, body
+    assert "HTTPS_PROXY" in body["could_not_run"]
+    assert "SENTINEL_pw" not in str(body)
+
+
+def test_a_script_that_ran_and_exited_127_is_a_failed_test(
+    a_real_journey: SimpleNamespace,
+) -> None:
+    """A project script that really ran and ended with 127 failed, like any
+    other non-zero exit: it goes back for repair."""
+    a_real_journey.api_test = "exit 127"
+    body = _check_with_the_real_runner(a_real_journey)
+    assert body["exit_code"] == 1, body
+    assert {p["label"]: p["status"] for p in body["parts"]}["api"] == "failed"
+
+
+def test_the_runner_marks_a_refused_environment_as_not_started(
+    a_real_journey: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from forge.deploy_sidecar.service import (
+        MERGE_NOT_STARTED_EXIT_CODE,
+        _a_program_that_did_not_finish,
+        run_project_program,
+    )
+
+    monkeypatch.setenv("HTTPS_PROXY", "http://user:SENTINEL_pw@proxy.invalid:3128")
+    marker = a_real_journey.worktree / "it-ran"
+    ran = run_project_program(
+        argv=["/bin/sh", "-c", f"touch {marker}"],
+        cwd=str(a_real_journey.worktree),
+        launch_settings=("HTTPS_PROXY",),
+        repository=str(a_real_journey.worktree),
+    )
+    assert getattr(ran, "refused_before_running", False) is True
+    assert ran[0] == MERGE_NOT_STARTED_EXIT_CODE
+    assert "was not started" in ran[2]
+    assert _a_program_that_did_not_finish(ran) is not None
+    assert not marker.exists(), "it ran"
