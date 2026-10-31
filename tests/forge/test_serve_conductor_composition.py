@@ -1433,7 +1433,12 @@ class TestTheMergeCardsFullCheckThroughTheRealRunner:
         return canonical, worktree
 
     @staticmethod
-    def _declaration(api_test: str, *, root_test: str = "test -d api") -> Any:
+    def _declaration(
+        api_test: str,
+        *,
+        root_test: str = "test -d api",
+        api_declares: dict[str, Any] | None = None,
+    ) -> Any:
         from types import SimpleNamespace
 
         return SimpleNamespace(
@@ -1443,6 +1448,7 @@ class TestTheMergeCardsFullCheckThroughTheRealRunner:
                 "api": SimpleNamespace(
                     cwd="api", test=api_test, test_timeout=60,
                     install="test -f go.mod", install_timeout=60,
+                    **(api_declares or {}),
                 )
             },
             parts=[
@@ -1513,6 +1519,102 @@ class TestTheMergeCardsFullCheckThroughTheRealRunner:
 
         assert report.status is GateStatus.UNKNOWN
         assert report.failed_gates == ("the declared check could not run",)
+
+    # Codex's second check, 31 October 2026: the card reads each part's run
+    # with GuardKit's own rules, so a part whose declared "no tests ran" text
+    # shows is red at the card, as the join would refuse it.
+
+    def test_an_exit_zero_part_that_ran_no_tests_is_red_at_the_card(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        canonical, _worktree = self._journey_worktree(tmp_path)
+        api_test = 'echo "ok   example.com/api [no test files]"'
+        report = self._read(
+            gates_pool,
+            canonical,
+            self._declaration(
+                api_test, api_declares={"absent_substrings": ["[no test files]"]}
+            ),
+        )
+
+        assert report.status is GateStatus.RED, report.detail
+        assert report.failed_gates == ("declared toolchain test (api)",)
+        assert (
+            f'no tests ran in part api ({api_test}): the output contains '
+            '"[no test files]"'
+        ) in str(report.detail)
+
+    def test_a_part_whose_tests_ran_reaches_its_card(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        canonical, _worktree = self._journey_worktree(tmp_path)
+        report = self._read(
+            gates_pool,
+            canonical,
+            self._declaration(
+                'echo "ok   example.com/api 0.012s"',
+                api_declares={
+                    "absent_substrings": ["[no test files]"],
+                    "ran_marker_regex": r"ok\s+\S+\s+[0-9.]+s",
+                },
+            ),
+        )
+
+        assert report.status is GateStatus.GREEN, report.detail
+
+    def test_a_missing_ran_marker_is_red_at_the_card(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        canonical, _worktree = self._journey_worktree(tmp_path)
+        report = self._read(
+            gates_pool,
+            canonical,
+            self._declaration(
+                "echo nothing to see",
+                api_declares={"ran_marker_regex": r"[0-9]+ passed"},
+            ),
+        )
+
+        assert report.status is GateStatus.RED, report.detail
+        assert "no line matched [0-9]+ passed" in str(report.detail)
+
+    def test_with_nothing_declared_the_exit_code_decides(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        canonical, _worktree = self._journey_worktree(tmp_path)
+        report = self._read(
+            gates_pool, canonical, self._declaration('echo "[no test files]"')
+        )
+
+        assert report.status is GateStatus.GREEN, report.detail
+
+    def test_a_required_marker_with_no_regex_could_not_run(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        canonical, worktree = self._journey_worktree(tmp_path)
+        marker = worktree / "api-test-ran"
+        report = self._read(
+            gates_pool,
+            canonical,
+            self._declaration(
+                f"touch {marker}", api_declares={"requires_ran_marker": True}
+            ),
+        )
+
+        assert report.status is GateStatus.UNKNOWN
+        assert report.failed_gates == ("the declared check could not run",)
+        assert "requires_ran_marker: true" in str(report.detail)
+        assert not marker.exists(), "the part's test ran"
 
 
 class TestGatesGreenReader:

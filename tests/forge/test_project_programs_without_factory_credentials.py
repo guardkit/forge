@@ -3797,9 +3797,11 @@ DYNAMIC_IMPORT_ALLOWED: dict[tuple[str, str], str] = {
         "attribute"
     ),
     ("full_check.py", "full_check_parts_of"): (
-        "the build system's own full-check reader (full_check_parts) from the "
-        "same toolchain module the loaders import, a seam tests replace; the "
-        "module is used only as the base of one attribute"
+        "the build system's own full-check reader (full_check_parts) and its "
+        "two verdict rules (declared_no_tests_ran, ran_marker_problem, 31 "
+        "October 2026) from the same toolchain module the loaders import, a "
+        "seam tests replace; the module is used only to read those three "
+        "attributes"
     ),
     ("deploy_sidecar/service.py", "_load_code_search_once"): (
         "loads the build system's code_search.py from its installed location "

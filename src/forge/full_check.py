@@ -20,6 +20,20 @@ failed (a test that runs out of its time is a failed part, as at the join);
 otherwise any part that could not run (nothing declared for it, an install
 that failed, a command that would not start) makes it "could not run"; only
 every part passing is a pass.
+
+WHETHER A PART'S RUN COUNTS is GuardKit's answer too (31 October 2026, from
+Codex's second check of the after-task check redesign). A project may
+declare, for any part, what "no tests ran" looks like in its output
+(``absent_substrings``, ``ran_marker_regex``, ``requires_ran_marker``).
+The join applies those with GuardKit's own ``declared_no_tests_ran`` and
+``ran_marker_problem``; this check used to drop them and call every exit 0 a
+pass, so a card could be offered for a part that ran no test and the join
+then refused. Each part now carries those fields, and its verdict is read
+with the same two GuardKit functions, taken from the same module as
+``full_check_parts``: a part whose declaration says nothing ran FAILED, in
+GuardKit's words, and goes back for repair before the card; a declaration
+that requires a marker and names none could not run. Where those functions
+are missing, the check could not be read, as for the reader.
 """
 
 from __future__ import annotations
@@ -34,6 +48,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "TimedOut",
+    "RanOutput",
+    "VerdictRules",
     "CheckPart",
     "FullCheck",
     "PASSED",
@@ -65,9 +81,47 @@ class TimedOut(str):
     timed_out = True
 
 
+class RanOutput(str):
+    """A runner's sentence with the run's whole output kept on it.
+
+    It IS the sentence; ``output`` is what the command printed, standard
+    output then a line break then standard error, as GuardKit's join reads
+    it, so GuardKit's ``declared_no_tests_ran`` sees the same text here
+    (31 October 2026). A runner whose answer has no ``output`` kept none.
+    """
+
+    output: str
+
+    def __new__(cls, sentence: str, *, output: str) -> "RanOutput":
+        said = super().__new__(cls, sentence)
+        said.output = output
+        return said
+
+
+@dataclass(frozen=True)
+class VerdictRules:
+    """GuardKit's own rules for reading one part's run (31 October 2026).
+
+    ``no_tests_ran`` is ``toolchain_declaration.declared_no_tests_ran``
+    ``(commands, returncode, output) -> why | None`` and ``marker_problem``
+    is ``toolchain_declaration.ran_marker_problem`` ``(commands) -> why |
+    None``, taken from the module that listed the parts, so the merge card
+    and the join can never read a run differently.
+    """
+
+    no_tests_ran: Callable[[Any, int | None, str | None], str | None]
+    marker_problem: Callable[[Any], str | None]
+
+
 @dataclass(frozen=True)
 class CheckPart:
-    """One part of the full check: where it runs and what it runs."""
+    """One part of the full check: where it runs and what it runs.
+
+    The three "no tests ran" fields are the part's own declaration (the top
+    level for the root, the component's or ``parts:`` entry's otherwise), in
+    the shape GuardKit's rules read; ``rules`` are those rules. A part with
+    no ``rules`` is never run: its result could not be read.
+    """
 
     label: str
     cwd: str
@@ -75,6 +129,19 @@ class CheckPart:
     install: str | None = None
     install_timeout: int = 300
     test_timeout: int = 300
+    name: str = ""
+    absent_substrings: tuple[str, ...] | None = None
+    ran_marker_regex: str | None = None
+    requires_ran_marker: bool | None = None
+    rules: VerdictRules | None = field(default=None, compare=False, repr=False)
+
+    @property
+    def declares_what_no_tests_looks_like(self) -> bool:
+        return (
+            self.absent_substrings is not None
+            or self.ran_marker_regex is not None
+            or self.requires_ran_marker is not None
+        )
 
 
 @dataclass(frozen=True)
@@ -102,11 +169,15 @@ class FullCheck:
         return None
 
 
-def _as_check_part(part: Any, declaration: Any) -> CheckPart:
+def _as_check_part(
+    part: Any, declaration: Any, rules: VerdictRules | None = None
+) -> CheckPart:
     name = str(getattr(part, "name", "") or "")
     cwd = str(getattr(part, "cwd", ".") or ".")
     toolchain = getattr(part, "toolchain", None)
     limits = toolchain if toolchain is not None else declaration
+    absent = getattr(limits, "absent_substrings", None)
+    requires = getattr(limits, "requires_ran_marker", None)
     return CheckPart(
         label=name if cwd in (".", name) else f"{name} (in {cwd})",
         cwd=cwd,
@@ -116,7 +187,16 @@ def _as_check_part(part: Any, declaration: Any) -> CheckPart:
         install=(getattr(toolchain, "install", None) or None) if toolchain else None,
         install_timeout=int(getattr(limits, "install_timeout", 300) or 300),
         test_timeout=int(getattr(limits, "test_timeout", 300) or 300),
+        name=name,
+        absent_substrings=None if absent is None else tuple(str(a) for a in absent),
+        ran_marker_regex=getattr(limits, "ran_marker_regex", None),
+        requires_ran_marker=None if requires is None else bool(requires),
+        rules=rules,
     )
+
+
+#: The names of GuardKit's own verdict rules in its toolchain module.
+VERDICT_RULE_NAMES = ("declared_no_tests_ran", "ran_marker_problem")
 
 
 def full_check_parts_of(
@@ -127,9 +207,11 @@ def full_check_parts_of(
 ) -> list[CheckPart] | None:
     """GuardKit's own list of what the full check runs, found in ``tree``.
 
-    ``None`` when GuardKit's reader is not importable here or has no
-    ``full_check_parts`` (an older GuardKit), or when it raised; the caller
-    says the check could not be read. Never raises.
+    Each part carries GuardKit's own verdict rules (:class:`VerdictRules`)
+    from the same module. ``None`` when GuardKit's reader is not importable
+    here, or it has no ``full_check_parts``, ``declared_no_tests_ran`` or
+    ``ran_marker_problem`` (an older GuardKit), or when it raised; the
+    caller says the check could not be read. Never raises.
     """
     if declaration is None:
         return []
@@ -138,11 +220,18 @@ def full_check_parts_of(
             import_module(candidate)
         except (ImportError, ModuleNotFoundError, ValueError):
             continue
-        reader = getattr(import_module(candidate), "full_check_parts", None)
-        if reader is None:
+        module = import_module(candidate)
+        reader = getattr(module, "full_check_parts", None)
+        no_tests_ran = getattr(module, VERDICT_RULE_NAMES[0], None)
+        marker_problem = getattr(module, VERDICT_RULE_NAMES[1], None)
+        if reader is None or no_tests_ran is None or marker_problem is None:
             return None
+        rules = VerdictRules(no_tests_ran=no_tests_ran, marker_problem=marker_problem)
         try:
-            return [_as_check_part(p, declaration) for p in reader(declaration, Path(tree))]
+            return [
+                _as_check_part(p, declaration, rules)
+                for p in reader(declaration, Path(tree))
+            ]
         except Exception as exc:  # noqa: BLE001 — a reader defect is not a pass
             logger.error(
                 "full check: GuardKit's full_check_parts raised %s: %s in %s",
@@ -227,6 +316,15 @@ def _run_part(
 ) -> tuple[str, Any, str, tuple[str, ...]]:
     if not part.test:
         return COULD_NOT_RUN, "nothing is declared for it", "", ()
+    if part.rules is None:
+        return (
+            COULD_NOT_RUN,
+            "GuardKit's own rules for reading a part's run "
+            "(declared_no_tests_ran, ran_marker_problem) were not given, so "
+            "its result could not be read",
+            "",
+            (),
+        )
     folder = _inside(tree, part.cwd)
     if folder is None:
         return COULD_NOT_RUN, f"its folder {part.cwd} is outside the tree", "", ()
@@ -244,6 +342,14 @@ def _run_part(
                 str(getattr(said, "evidence", "") or ""),
                 (),
             )
+    # As at the join: after the install, before the test, a declaration that
+    # requires a marker and names none is a fault in the declaration.
+    try:
+        problem = part.rules.marker_problem(part)
+    except Exception as exc:  # noqa: BLE001 — a rule defect is not a pass
+        problem = f"could not be read: {type(exc).__name__}: {exc}"
+    if problem is not None:
+        return COULD_NOT_RUN, f"the declaration of part {part.label} {problem}", "", ()
     try:
         code, said = run(command=part.test, cwd=folder, timeout_seconds=part.test_timeout)
     except Exception as exc:  # noqa: BLE001 — a runner defect is not a pass
@@ -260,6 +366,34 @@ def _run_part(
         )
     if code is None:
         return COULD_NOT_RUN, said, evidence, ()
+    # The run finished: GuardKit's own rule says whether the part's own
+    # declaration says no tests ran, in GuardKit's own sentence.
+    output = getattr(said, "output", None)
+    if output is None and part.declares_what_no_tests_looks_like:
+        return (
+            COULD_NOT_RUN,
+            f"its test `{part.test}` exited {code}, but the run's output was "
+            "not kept, so the part's declared \"no tests ran\" text could not "
+            "be looked for",
+            evidence,
+            (),
+        )
+    try:
+        why = part.rules.no_tests_ran(part, code, output)
+    except Exception as exc:  # noqa: BLE001 — a rule defect is not a pass
+        return (
+            COULD_NOT_RUN,
+            f"reading its run raised {type(exc).__name__}: {exc}",
+            evidence,
+            (),
+        )
+    if why is not None:
+        return (
+            FAILED,
+            f"no tests ran in part {part.name or part.label} ({part.test}): {why}",
+            evidence,
+            (),
+        )
     if code == 0:
         return PASSED, said, evidence, ()
     cases = tuple(str(c) for c in (getattr(said, "failing_cases", ()) or ()))

@@ -105,9 +105,9 @@ def fake_guardkit_loader(monkeypatch: pytest.MonkeyPatch) -> ModuleType:
 
     module.load_toolchain_declaration = load_toolchain_declaration  # type: ignore[attr-defined]
     # GuardKit's full-check reader, stood in under the same module.
-    from tests.forge.full_check_stand_in import full_check_parts
+    from tests.forge.full_check_stand_in import stand_in_for_guardkit
 
-    module.full_check_parts = full_check_parts  # type: ignore[attr-defined]
+    stand_in_for_guardkit(module)
     monkeypatch.setitem(sys.modules, FAKE_LOADER_MODULE, module)
     return module
 

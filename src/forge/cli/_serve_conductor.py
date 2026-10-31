@@ -569,6 +569,10 @@ class DeclaredTestDetail(str):
       red checkpoint hands the review seat: "these tests failed" is not
       actionable without "this is what was run, and this is what it said".
       ``None`` for a run that never started.
+    * ``output`` — the command's whole output, standard output then a line
+      break then standard error, as GuardKit's join reads it. The full check
+      applies the project's declared "no tests ran" text to it with
+      GuardKit's own rule (31 October 2026); empty when nothing was kept.
 
     Carrying them on the sentence rather than widening the runners' return
     means the two runner seams keep the shape every existing caller and every
@@ -576,7 +580,7 @@ class DeclaredTestDetail(str):
     simply has no evidence, and the reader says so by keeping none.
     """
 
-    __slots__ = ("evidence", "failing_cases", "command", "exit_code")
+    __slots__ = ("evidence", "failing_cases", "command", "exit_code", "output")
 
     # Named for the type checker as well as for the reader: the four things
     # a slot holds, said once, so nothing has to be silenced below.
@@ -584,6 +588,7 @@ class DeclaredTestDetail(str):
     failing_cases: "tuple[str, ...]"
     command: str
     exit_code: "int | None"
+    output: str
 
     def __new__(
         cls,
@@ -593,12 +598,14 @@ class DeclaredTestDetail(str):
         failing_cases: "tuple[str, ...]" = (),
         command: str = "",
         exit_code: "int | None" = None,
+        output: str = "",
     ) -> "DeclaredTestDetail":
         detail = super().__new__(cls, sentence)
         detail.evidence = evidence
         detail.failing_cases = tuple(failing_cases)
         detail.command = command
         detail.exit_code = exit_code
+        detail.output = output
         return detail
 
 
@@ -824,7 +831,12 @@ def _counts_the_failure_lines(count: int) -> str:
 
 
 def _detail_with_the_run_kept(
-    sentence: str, output: str, *, exit_code: "int | None", command: str = ""
+    sentence: str,
+    output: str,
+    *,
+    exit_code: "int | None",
+    command: str = "",
+    whole_output: str = "",
 ) -> DeclaredTestDetail:
     """One sentence about the run, with the run's own evidence on it.
 
@@ -857,7 +869,7 @@ def _detail_with_the_run_kept(
             exc,
         )
         return DeclaredTestDetail(
-            sentence, command=command, exit_code=exit_code
+            sentence, command=command, exit_code=exit_code, output=whole_output
         )
     if names:
         sentence = f"{sentence} — {_names_the_failing_cases(names)}"
@@ -871,6 +883,7 @@ def _detail_with_the_run_kept(
         failing_cases=names,
         command=command,
         exit_code=exit_code,
+        output=whole_output,
     )
 
 
@@ -886,7 +899,10 @@ def _run_declared_command(
 
     **THE EXIT CODE IS THE VERDICT** (guardkit's own law, design §B.4).
     Nothing here parses stdout to decide anything; the returned detail is
-    for a human reading the decision back, never for the verdict.
+    for a human reading the decision back, never for the verdict. The
+    detail keeps the whole output (``output``) for the full check, which
+    applies the project's declared "no tests ran" text with GuardKit's own
+    rule (:mod:`forge.full_check`, 31 October 2026).
 
     A timeout, or a command that could not be started at all, answers
     ``None`` — which the caller turns into UNKNOWN rather than into a
@@ -954,6 +970,8 @@ def _run_declared_command(
         _both_streams(completed.stdout, completed.stderr),
         exit_code=completed.returncode,
         command=command,
+        # As GuardKit's join reads it, for the declared "no tests ran" text.
+        whole_output=(completed.stdout or "") + "\n" + (completed.stderr or ""),
     )
 
 
@@ -2335,8 +2353,9 @@ def make_gates_green_reader(
             if parts is None:
                 return _unknown(
                     "GuardKit's own reader of the full check "
-                    "(toolchain_declaration.full_check_parts) is not available "
-                    "here, so what the full check runs cannot be read",
+                    "(toolchain_declaration.full_check_parts, with its "
+                    "declared_no_tests_ran and ran_marker_problem) is not "
+                    "available here, so what the full check runs cannot be read",
                     build_id,
                 )
             logger.info(

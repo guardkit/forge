@@ -1981,7 +1981,12 @@ def _process_declared_full_check(
     command. Answers 200 with ``exit_code`` 0 (passed) or 1 (failed), or with
     ``could_not_run`` and no exit code when any part could not run.
     """
-    from forge.full_check import TimedOut, full_check_parts_of, run_full_check
+    from forge.full_check import (
+        RanOutput,
+        TimedOut,
+        full_check_parts_of,
+        run_full_check,
+    )
 
     declaration, error = _declared_toolchain_here(repo_path)
     if error or declaration is None:
@@ -1995,7 +2000,9 @@ def _process_declared_full_check(
             "exit_code": None,
             "could_not_run": (
                 "GuardKit's own reader of the full check "
-                "(toolchain_declaration.full_check_parts) is not available here"
+                "(toolchain_declaration.full_check_parts, with its "
+                "declared_no_tests_ran and ran_marker_problem) is not "
+                "available here"
             ),
         }
 
@@ -2026,9 +2033,13 @@ def _process_declared_full_check(
                 f"`{command}` did not finish within {timeout:g}s in {cwd}"
             )
         tail = (str(stderr or "") or str(stdout or "")).strip().splitlines()
-        return exit_code, (
+        # The whole output is kept, as GuardKit's join reads it, so the
+        # part's declared "no tests ran" text is looked for in the same text
+        # (31 October 2026).
+        return exit_code, RanOutput(
             f"`{command}` exited {exit_code} in {cwd}"
-            + (f" — last line: {tail[-1]}" if tail else "")
+            + (f" — last line: {tail[-1]}" if tail else ""),
+            output=str(stdout or "") + "\n" + str(stderr or ""),
         )
 
     logger.info(

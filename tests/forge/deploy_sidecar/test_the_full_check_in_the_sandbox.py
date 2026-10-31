@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from tests.forge.full_check_stand_in import full_check_parts
+from tests.forge.full_check_stand_in import stand_in_for_guardkit
 
 LOADER = "tests_full_check_toolchain_declaration"
 
@@ -42,7 +42,7 @@ def declared(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNamespace
     )
     module = ModuleType(LOADER)
     module.load_toolchain_declaration = lambda _root: declaration  # type: ignore[attr-defined]
-    module.full_check_parts = full_check_parts  # type: ignore[attr-defined]
+    stand_in_for_guardkit(module)
     monkeypatch.setitem(sys.modules, LOADER, module)
     monkeypatch.setattr(service, "TOOLCHAIN_MODULE_CANDIDATES", (LOADER,))
     return SimpleNamespace(worktree=worktree, repo=tmp_path / "clone")
@@ -194,7 +194,8 @@ def a_real_journey(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNam
     worktree = clone / ".forge" / "worktrees" / "journey-1"
     _git(clone, "worktree", "add", "-q", "-b", "fix/one", str(worktree))
     answers = SimpleNamespace(
-        api_test="true", worktree=worktree, repo=clone, git_dir=(clone / ".git").resolve()
+        api_test="true", worktree=worktree, repo=clone, git_dir=(clone / ".git").resolve(),
+        api_declares={},
     )
 
     def load(_root: Any) -> Any:
@@ -204,6 +205,7 @@ def a_real_journey(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNam
                 "api": SimpleNamespace(
                     cwd="api", test=answers.api_test, test_timeout=60,
                     install="test -f go.mod", install_timeout=60,
+                    **answers.api_declares,
                 )
             },
             parts=[
@@ -217,7 +219,7 @@ def a_real_journey(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> SimpleNam
 
     module = ModuleType(LOADER)
     module.load_toolchain_declaration = load  # type: ignore[attr-defined]
-    module.full_check_parts = full_check_parts  # type: ignore[attr-defined]
+    stand_in_for_guardkit(module)
     monkeypatch.setitem(sys.modules, LOADER, module)
     monkeypatch.setattr(service, "TOOLCHAIN_MODULE_CANDIDATES", (LOADER,))
     return answers
@@ -303,3 +305,84 @@ def test_the_runner_marks_a_refused_environment_as_not_started(
     assert "was not started" in ran[2]
     assert _a_program_that_did_not_finish(ran) is not None
     assert not marker.exists(), "it ran"
+
+
+# ---------------------------------------------------------------------------
+# The part's declared "no tests ran" text (Codex's second check, 31 October
+# 2026): the helper reads each part's run with GuardKit's own rules, on the
+# whole output the real runner kept, as the join does.
+# ---------------------------------------------------------------------------
+
+
+def test_an_exit_zero_part_that_ran_no_tests_is_a_failed_part(
+    a_real_journey: SimpleNamespace,
+) -> None:
+    a_real_journey.api_test = 'echo "ok   example.com/api [no test files]"'
+    a_real_journey.api_declares = {"absent_substrings": ["[no test files]"]}
+    body = _check_with_the_real_runner(a_real_journey)
+    assert body["exit_code"] == 1, body
+    api = {p["label"]: p for p in body["parts"]}["api"]
+    assert api["status"] == "failed"
+    assert api["detail"] == (
+        "no tests ran in part api (" + a_real_journey.api_test + "): "
+        'the output contains "[no test files]"'
+    )
+
+
+def test_the_declared_text_is_found_on_standard_error_too(
+    a_real_journey: SimpleNamespace,
+) -> None:
+    a_real_journey.api_test = 'echo "no test files" >&2'
+    a_real_journey.api_declares = {"absent_substrings": ["No Test Files"]}
+    body = _check_with_the_real_runner(a_real_journey)
+    assert body["exit_code"] == 1, body
+
+
+def test_a_part_whose_tests_ran_passes(a_real_journey: SimpleNamespace) -> None:
+    a_real_journey.api_test = 'echo "ok   example.com/api 0.012s"'
+    a_real_journey.api_declares = {
+        "absent_substrings": ["[no test files]"],
+        "ran_marker_regex": r"ok\s+\S+\s+[0-9.]+s",
+    }
+    body = _check_with_the_real_runner(a_real_journey)
+    assert body["exit_code"] == 0, body
+
+
+def test_a_required_marker_with_no_regex_could_not_run(
+    a_real_journey: SimpleNamespace,
+) -> None:
+    marker = a_real_journey.worktree / "api-test-ran"
+    a_real_journey.api_test = f"touch {marker}"
+    a_real_journey.api_declares = {"requires_ran_marker": True}
+    body = _check_with_the_real_runner(a_real_journey)
+    assert body["exit_code"] is None, body
+    assert "requires_ran_marker: true" in body["could_not_run"]
+    assert not marker.exists(), "the part's test ran"
+
+
+def test_with_nothing_declared_the_exit_code_decides(
+    a_real_journey: SimpleNamespace,
+) -> None:
+    a_real_journey.api_test = 'echo "[no test files]"'
+    body = _check_with_the_real_runner(a_real_journey)
+    assert body["exit_code"] == 0, body
+
+
+def test_without_guardkits_verdict_rules_it_could_not_run(
+    declared: SimpleNamespace,
+) -> None:
+    from forge.deploy_sidecar.service import _process_declared_full_check
+
+    del sys.modules[LOADER].declared_no_tests_ran
+    calls: list = []
+    status, body = _process_declared_full_check(
+        cwd=str(declared.worktree),
+        repo_path=declared.repo,
+        command_runner=_runner({}, calls),
+        memory_project=None,
+        launch_settings=(),
+    )
+    assert status == 200
+    assert body["exit_code"] is None
+    assert "declared_no_tests_ran" in body["could_not_run"]
+    assert calls == []
