@@ -673,9 +673,6 @@ def _make_driver(
             # files that may hold a set the request names ("all the X").
             "where_the_specs_words_already_appear",
             "sets_the_request_names",
-            # Whether the project already declares a coverage command
-            # (20 October 2026): always sent on the plan leg, true or false.
-            "declares_coverage_command",
         }
         counters["last_feature_id"] = feature_id
         counters["last_descriptor"] = target_repo_descriptor
@@ -1186,8 +1183,6 @@ async def test_plan_leg_threads_spec_contents_and_discovered_descriptor(
     } == {
         "repo": TARGET_REPO,
         "test_roots": ["tests/health", "tests/users"],
-        # The scratch project declares no coverage command (20 October 2026).
-        "declares_coverage_command": False,
     }
     # The optional assumptions content was threaded (the default spec triple
     # carries an _assumptions.yaml).

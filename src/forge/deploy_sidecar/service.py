@@ -32,8 +32,7 @@ The narrow contract:
               -> {exit_code, stdout, stderr_tail, timed_out, cwd, command,
                   warnings}
     POST /guardkit-merge  {repo, feature_id, branch, expect_main_sha,
-                           baseline_failing, timeout_seconds,
-                           verify_timeout_seconds}
+                           timeout_seconds, verify_timeout_seconds}
               -> {exit_code, stdout, stderr_tail}
     POST /git/prepare-branch-and-write-tree
               {repo, branch, files, message, checks: [{name, args, blocking}]}
@@ -496,10 +495,6 @@ GUARDKIT_PATH_ENV: str = "FORGE_GUARDKIT_PATH"
 #: sidecar unit's PATH puts ``~/.agentecflow/bin`` first, which is where the
 #: host's guardkit lives.
 GUARDKIT_BINARY_NAME: str = "guardkit"
-
-#: Where the sidecar writes its own copy of the pre-merge baseline, relative to
-#: the target repository.
-MERGE_BASELINE_DIR: tuple[str, str] = (".guardkit", "tmp")
 
 
 # ---------------------------------------------------------------------------
@@ -3358,10 +3353,11 @@ def process_guardkit_merge_request(
     Everything is checked before a process starts: the repository must be one
     the forge configuration names, the feature name and the target commit must
     both be well formed, the branch to merge — when one is named — must be a
-    name git will accept, the timeout must be a positive number no larger than
-    an hour, and a pre-merge baseline, if one is sent, must be a list of
-    test names. A refusal is a 4xx with one plain sentence saying what was
-    wrong.
+    name git will accept, and the timeout must be a positive number no larger
+    than an hour. A refusal is a 4xx with one plain sentence saying what was
+    wrong. A ``baseline_failing`` field from an older caller is ignored: the
+    merge no longer compares against a list of tests already failing (after-
+    task check redesign, 31 October 2026).
 
     ``branch`` is how a fix journey's repair reaches the merge: its commits
     are on ``fix/<task id>-<build8>``, so the merge word has to say so or the
@@ -3545,25 +3541,6 @@ def process_guardkit_merge_request(
             }
         verify_timeout = int(verify_timeout_seconds)
 
-    # A pre-merge baseline, when one is sent, is a list of test names.
-    baseline_failing = payload.get("baseline_failing")
-    if baseline_failing is not None:
-        if not isinstance(baseline_failing, list):
-            return 400, {
-                "error": (
-                    "'baseline_failing' must be a list of test names; got "
-                    f"{type(baseline_failing).__name__}"
-                )
-            }
-        for entry in baseline_failing:
-            if not isinstance(entry, str):
-                return 400, {
-                    "error": (
-                        "every entry in 'baseline_failing' must be a test name "
-                        f"written as text; got {type(entry).__name__}"
-                    )
-                }
-
     command = command_resolver()
     if not command:
         # A refusal BEFORE anything runs is a 4xx (15 October 2026): only that
@@ -3599,32 +3576,6 @@ def process_guardkit_merge_request(
     # build's command is byte for byte the one it has always been.
     if branch is not None:
         argv += ["--branch", branch]
-
-    # The sidecar writes its OWN copy of the baseline: the caller's file lives
-    # inside the forge container and is not on this host at all. Failing to
-    # write it stops the run, because a merge that quietly loses its baseline
-    # would blame the feature for tests that were already red.
-    if baseline_failing is not None:
-        baseline_path = repo_path.joinpath(*MERGE_BASELINE_DIR) / (
-            f"merge-baseline-{feature_id}.json"
-        )
-        try:
-            baseline_path.parent.mkdir(parents=True, exist_ok=True)
-            baseline_path.write_text(
-                json.dumps(
-                    {"failing_node_ids": list(baseline_failing)}, indent=2
-                ),
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            # Before the command is started: a refusal, so a 4xx.
-            return 400, {
-                "error": (
-                    "the sidecar could not write the list of tests that were "
-                    f"already failing to {baseline_path}: {exc}"
-                )
-            }
-        argv += ["--baseline-json", str(baseline_path)]
 
     logger.info(
         "forge-deploy-sidecar: running the merge word's checks for %s (%s) in "

@@ -94,7 +94,6 @@ class TestThePressReports:
                 expect_main_sha="a" * 40,
                 correlation_id="c-1",
                 decided_by="rich",
-                baseline_failing=None,
                 merge_branch=None,
                 expected_candidate_sha=None,
                 expected_candidate_tree=None,

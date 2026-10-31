@@ -107,7 +107,6 @@ __all__ = [
     "git_rev_parse_main",
     "merge_request_id",
     "placeholders_in",
-    "read_baseline_failing",
     "read_what_was_checked",
     "read_after_deploy_check_skip",
     "request_behind_the_build",
@@ -299,39 +298,6 @@ def _the_default_branch_was_renamed(refusal: str | None) -> bool:
     return "now says its default branch is" in str(refusal or "")
 
 
-def read_baseline_failing(build_id: str, *, repo: str | None = None) -> list[str] | None:
-    """Best-effort pre-merge baseline failing set — fail-open ``None``.
-
-    Globs ``<receipts of repo>/<build_id>/**/baseline.json`` (one sandbox per
-    project: :func:`forge.receipts.receipts_root_for`) and accepts either
-    a bare list of test names or a dict carrying a ``failing`` list. Any
-    read/parse trouble reads as "no baseline recorded" — the merge verb then
-    runs without a ``--baseline-json`` and compares against its own record.
-    """
-    try:
-        root = receipts_root_for(repo) / build_id
-        for path in sorted(root.glob("**/baseline.json")):
-            try:
-                data = json.loads(path.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                continue
-            if isinstance(data, list) and all(isinstance(x, str) for x in data):
-                return list(data)
-            if isinstance(data, dict):
-                failing = data.get("failing")
-                if isinstance(failing, list) and all(
-                    isinstance(x, str) for x in failing
-                ):
-                    return list(failing)
-    except Exception as exc:  # noqa: BLE001 — fail-open by contract
-        logger.debug(
-            "merge-offer: baseline read failed for %s (%s); proceeding without",
-            build_id,
-            exc,
-        )
-    return None
-
-
 # ---------------------------------------------------------------------------
 # What was actually checked about the finished feature — the card's own words
 # ---------------------------------------------------------------------------
@@ -518,9 +484,9 @@ def _read_one_record(
 
     Returns ``(record, why not, the other feature it was written for)``.
 
-    Globs ``<receipts of repo>/<build_id>/**/<name>``, exactly as
-    :func:`read_baseline_failing` does, so nothing here knows or assumes
-    where in the exported tree a record landed.
+    Globs ``<receipts of repo>/<build_id>/**/<name>`` (one sandbox per
+    project: :func:`forge.receipts.receipts_root_for`), so nothing here knows
+    or assumes where in the exported tree a record landed.
 
     **A record that names a DIFFERENT feature is refused, never returned**
     (21 September 2026, after the coordinator's review of parts 1 and 2). It
@@ -1970,8 +1936,6 @@ class MergeOfferService:
             ``publish``.
         git_head: Injectable ``async (repo_root) -> sha | None`` seam;
             defaults to :func:`git_rev_parse_main`.
-        baseline_reader: Injectable ``(build_id) -> list[str] | None`` seam;
-            defaults to :func:`read_baseline_failing`.
         finished_feature_reader: Injectable ``(build_id, feature_id) ->
             (record, code checks, why not, the code-checks summary was
             another feature's)`` seam, whose last value may be left off;
@@ -1999,7 +1963,6 @@ class MergeOfferService:
         pipeline_publisher: Any,
         raw_publish: Callable[[str, bytes], Awaitable[Any]],
         git_head: Callable[[Path], Awaitable[str | None]] = git_rev_parse_main,
-        baseline_reader: Callable[[str], list[str] | None] = read_baseline_failing,
         finished_feature_reader: Callable[..., Any] = read_what_was_checked,
         scope_pass: Callable[..., Any] = run_the_scope_pass,
         git_surface: Callable[[str, Path], Any | None] | None = None,
@@ -2017,7 +1980,6 @@ class MergeOfferService:
         self._publisher = pipeline_publisher
         self._raw_publish = raw_publish
         self._git_head = git_head
-        self._baseline_reader = baseline_reader
         self._finished_feature_reader = finished_feature_reader
         self._scope_pass = scope_pass
         self._git_surface = git_surface
@@ -3053,14 +3015,6 @@ class MergeOfferService:
                 )
 
 
-        # The build's own project's receipts (one sandbox per project); a
-        # reader put here by something else is asked as it always was.
-        baseline_failing = (
-            read_baseline_failing(build_id, repo=row.repo)
-            if self._baseline_reader is read_baseline_failing
-            else self._baseline_reader(build_id)
-        )
-
         # (c) DURABLE LATCH FIRST — probe, then write, BEFORE any wire.
         stages = self._pool.read_stages(build_id)
         if any(
@@ -3093,7 +3047,6 @@ class MergeOfferService:
             ),
             **dict(extra_details or {}),
             **change,
-            "baseline_failing": baseline_failing,
             "resume_options": ["approve", "reject"],
         }
         # A REVIEW PREVIEW (web-readiness W7, 12 October 2026), prepared after

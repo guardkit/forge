@@ -160,7 +160,6 @@ class Harness:
             raw_publish=raw_publish,
             git_head=git_head,
             git_surface=lambda _repo, _root: FakeGit(),
-            baseline_reader=lambda _b: None,
             finished_feature_reader=lambda *_a, **_k: (None, None, "nothing"),
             scope_pass=lambda **_k: None,
             after_deploy_check_reader=lambda _p, _r: None,

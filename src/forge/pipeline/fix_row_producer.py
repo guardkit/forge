@@ -64,8 +64,8 @@ journey and decides what to do.
 
 **No repair of a project's setup** (19 October 2026). GuardKit stops a task
 before any model call, as a configuration error, when the project's setup
-cannot support it (no declared coverage command for a task that needs one, a
-task type it does not know, binding documents too large to give whole). A
+cannot support it (a task type it does not know, binding documents too large
+to give whole). A
 repair build changes code, not the project's setup, so a build whose failure
 pack records such a stop files nothing, and says so in one log line. The
 build's failure reason, which every failed-build notice shows, carries

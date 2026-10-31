@@ -72,7 +72,6 @@ def _service(config, pool, recorder: _Recorder, **kwargs: Any) -> MergeOfferServ
         raw_publish=recorder.raw_publish,
         git_head=_git_head,
         git_surface=lambda _repo, _root: _CandidatePins(),
-        baseline_reader=lambda _build_id: None,
         finished_feature_reader=lambda *_a, **_k: (
             None,
             None,

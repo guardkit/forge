@@ -757,7 +757,8 @@ class TestTheRedMergeHook:
                 subcommand=kwargs.get("subcommand", "merge"),
                 duration_secs=0.1,
                 stdout_tail=json.dumps(
-                    {"outcome": "merged", "post_sha": merged, "verify_ok": True}
+                    {"outcome": "merged", "post_sha": merged, "verify_ok": True,
+                     "verify_status": "passed"}
                 ),
                 stderr=None,
                 exit_code=0,

@@ -383,7 +383,7 @@ class _FakeMergeCommand:
             subcommand=kwargs.get("subcommand", "autobuild"),
             duration_secs=0.1,
             stdout_tail=json.dumps(
-                {"status": "merged", "merged_sha": self.merged_sha}
+                {"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": self.merged_sha}
             ),
             exit_code=0,
         )

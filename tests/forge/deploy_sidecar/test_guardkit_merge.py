@@ -1,8 +1,8 @@
 """The deploy sidecar's second operation: the merge word's checks, on the host.
 
 Every refusal (unknown repository, a feature name of the wrong shape, a target
-commit that is not a full hash, a timeout longer than the cap, a pre-merge
-baseline that is not a list of test names), the happy path through an injected
+commit that is not a full hash, a timeout longer than the cap), the happy
+path through an injected
 runner that records what would have been run, and a real end-to-end HTTP round
 trip on an ephemeral loopback port against a fake ``guardkit`` executable that
 prints a merge report.
@@ -82,53 +82,18 @@ def repo(tmp_path: Path) -> Path:
     return root
 
 
-# The baseline reader's shape contract, copied from guardkit's own source
-# (guardkit/cli/autobuild.py, _load_baseline_failing): a bare list of test
-# names, or an object carrying a failing_node_ids list, and an error for
-# anything else. Every stand-in guardkit in these tests reads the file this
-# way, so a file the real command would refuse fails here too.
-REAL_BASELINE_READER = """
-def read_baseline(path):
-    import json
-    with open(path) as fh:
-        data = json.load(fh)
-    if isinstance(data, list):
-        return [str(x) for x in data]
-    if isinstance(data, dict):
-        ids = data.get('failing_node_ids')
-        if isinstance(ids, list):
-            return [str(x) for x in ids]
-        raise ValueError(
-            str(path) + ' is an object without a failing_node_ids list')
-    raise ValueError(
-        str(path) + ' must be a JSON list of node ids or a baseline.json object')
-"""
-
-
 @pytest.fixture
 def fake_guardkit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    """A real executable named guardkit that echoes its arguments as JSON.
-
-    It reads any baseline file the way the real command reads it, so a file
-    written in a shape guardkit refuses stops this stand-in too.
-    """
+    """A real executable named guardkit that echoes its arguments as JSON."""
     binary = tmp_path / "bin" / "guardkit"
     binary.parent.mkdir(parents=True, exist_ok=True)
     binary.write_text(
         "#!/usr/bin/env python3\n"
         "import json, sys\n"
-        + REAL_BASELINE_READER
-        + "argv = sys.argv[1:]\n"
-        "baseline = None\n"
-        "if '--baseline-json' in argv:\n"
-        "    try:\n"
-        "        baseline = read_baseline(argv[argv.index('--baseline-json') + 1])\n"
-        "    except ValueError as exc:\n"
-        "        sys.stderr.write('Unexpected error: ' + str(exc))\n"
-        "        sys.exit(1)\n"
+        "argv = sys.argv[1:]\n"
         "print(json.dumps({'outcome': 'merged', 'post_sha': 'b' * 40,\n"
-        "                  'verify_ok': True, 'argv': argv,\n"
-        "                  'baseline_seen': baseline}))\n",
+        "                  'verify_ok': True, 'verify_status': 'passed',\n"
+        "                  'argv': argv}))\n",
         encoding="utf-8",
     )
     binary.chmod(binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -275,30 +240,6 @@ def test_timeout_at_the_cap_is_allowed(repo: Path, fake_guardkit: Path) -> None:
     assert runner.calls[0]["timeout"] == MERGE_TIMEOUT_MAX
 
 
-def test_baseline_must_be_a_list(repo: Path) -> None:
-    runner = _RecordingMergeRunner()
-    status, body = process_guardkit_merge_request(
-        _payload(baseline_failing={"failing": ["tests/test_a.py::test_b"]}),
-        config=_config({REPO_KEY: str(repo)}),
-        merge_runner=runner,
-    )
-    assert status == 400
-    assert "'baseline_failing' must be a list" in body["error"]
-    assert runner.calls == []
-
-
-def test_baseline_entries_must_be_text(repo: Path) -> None:
-    runner = _RecordingMergeRunner()
-    status, body = process_guardkit_merge_request(
-        _payload(baseline_failing=["tests/test_a.py::test_b", 7]),
-        config=_config({REPO_KEY: str(repo)}),
-        merge_runner=runner,
-    )
-    assert status == 400
-    assert "written as text" in body["error"]
-    assert runner.calls == []
-
-
 def test_no_guardkit_on_the_host_is_reported_plainly(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -362,125 +303,18 @@ def test_a_non_zero_exit_code_is_data_not_an_error(
     assert body["stderr_tail"] == "red"
 
 
-def test_baseline_is_written_on_the_host_and_passed(
-    repo: Path, fake_guardkit: Path
-) -> None:
-    failing = ["tests/test_a.py::test_one", "tests/test_b.py::test_two"]
+def test_an_older_callers_baseline_is_ignored(repo: Path, fake_guardkit: Path) -> None:
+    """The merge no longer compares against tests already failing (after-task
+    check redesign, 31 October 2026): a list sent by an older coordinator is
+    neither checked nor passed on."""
     runner = _RecordingMergeRunner()
     status, _ = process_guardkit_merge_request(
-        _payload(baseline_failing=failing),
-        config=_config({REPO_KEY: str(repo)}),
-        merge_runner=runner,
-    )
-    assert status == 200
-    argv = runner.calls[0]["argv"]
-    assert "--baseline-json" in argv
-    written = Path(argv[argv.index("--baseline-json") + 1])
-    assert written == repo / ".guardkit" / "tmp" / f"merge-baseline-{FEATURE}.json"
-    assert json.loads(written.read_text(encoding="utf-8")) == {
-        "failing_node_ids": failing
-    }
-
-
-def test_an_empty_baseline_is_still_written(repo: Path, fake_guardkit: Path) -> None:
-    """An empty list means "main was green" — it is not the same as no list."""
-    runner = _RecordingMergeRunner()
-    status, _ = process_guardkit_merge_request(
-        _payload(baseline_failing=[]),
-        config=_config({REPO_KEY: str(repo)}),
-        merge_runner=runner,
-    )
-    assert status == 200
-    argv = runner.calls[0]["argv"]
-    assert "--baseline-json" in argv
-    written = Path(argv[argv.index("--baseline-json") + 1])
-    assert json.loads(written.read_text(encoding="utf-8")) == {
-        "failing_node_ids": []
-    }
-
-
-def test_the_shape_guardkit_refuses_really_does_stop_the_merge(
-    repo: Path, fake_guardkit: Path, tmp_path: Path
-) -> None:
-    """Proof the baseline assertions have teeth.
-
-    This does NOT run the real merge command. It runs a stand-in that reads
-    the baseline file by the rule copied from guardkit's own source
-    (``guardkit/cli/autobuild.py``, ``_load_baseline_failing``): a bare JSON
-    list of test names, or an object carrying a ``failing_node_ids`` list, and
-    a ValueError for anything else. What is proven here is that shape contract
-    and the sidecar's side of it — written the old way, an object with a
-    ``failing`` list, the command exits non-zero and nothing merges; written
-    the way the sidecar writes it, the same command is happy. It was also
-    checked against the real binary by hand on 2026-09-06; if guardkit ever
-    changes that reader, the copy in ``REAL_BASELINE_READER`` must change with
-    it — this test cannot notice on its own.
-    """
-    wrong_shape = tmp_path / "old-shape-baseline.json"
-    wrong_shape.write_text(
-        json.dumps({"failing": ["tests/test_a.py::test_one"]}), encoding="utf-8"
-    )
-    exit_code, _stdout, stderr = run_merge_command(
-        argv=[
-            str(fake_guardkit),
-            "autobuild",
-            "merge",
-            FEATURE,
-            "--json",
-            "--baseline-json",
-            str(wrong_shape),
-        ],
-        cwd=str(repo),
-    )
-    assert exit_code == 1
-    assert "without a failing_node_ids list" in stderr
-
-    # Written the way the sidecar writes it, the same command is happy.
-    right_shape = tmp_path / "baseline.json"
-    right_shape.write_text(
-        json.dumps({"failing_node_ids": ["tests/test_a.py::test_one"]}),
-        encoding="utf-8",
-    )
-    exit_code, stdout, _stderr = run_merge_command(
-        argv=[
-            str(fake_guardkit),
-            "autobuild",
-            "merge",
-            FEATURE,
-            "--json",
-            "--baseline-json",
-            str(right_shape),
-        ],
-        cwd=str(repo),
-    )
-    assert exit_code == 0
-    assert json.loads(stdout)["baseline_seen"] == ["tests/test_a.py::test_one"]
-
-
-def test_no_baseline_means_no_baseline_flag(repo: Path, fake_guardkit: Path) -> None:
-    runner = _RecordingMergeRunner()
-    process_guardkit_merge_request(
-        _payload(), config=_config({REPO_KEY: str(repo)}), merge_runner=runner
-    )
-    assert "--baseline-json" not in runner.calls[0]["argv"]
-
-
-def test_a_baseline_that_cannot_be_written_stops_the_run(
-    repo: Path, fake_guardkit: Path
-) -> None:
-    """Losing the baseline would blame the feature for tests already red."""
-    blocker = repo / ".guardkit"
-    blocker.write_text("not a directory", encoding="utf-8")
-    runner = _RecordingMergeRunner()
-    status, body = process_guardkit_merge_request(
         _payload(baseline_failing=["tests/test_a.py::test_one"]),
         config=_config({REPO_KEY: str(repo)}),
         merge_runner=runner,
     )
-    # Refused before anything ran: a 4xx (15 October 2026).
-    assert status == 400
-    assert "already failing" in body["error"]
-    assert runner.calls == []
+    assert status == 200
+    assert "--baseline-json" not in runner.calls[0]["argv"]
 
 
 def test_a_runner_that_blows_up_never_escapes(repo: Path, fake_guardkit: Path) -> None:
@@ -629,7 +463,7 @@ def test_end_to_end_over_loopback(repo: Path, fake_guardkit: Path) -> None:
         assert host == "127.0.0.1"
         body = _post(
             f"http://{host}:{port}/guardkit-merge",
-            _payload(baseline_failing=["tests/test_a.py::test_one"]),
+            _payload(),
         )
         assert body["exit_code"] == 0
         report = json.loads(body["stdout"])
@@ -642,12 +476,7 @@ def test_end_to_end_over_loopback(repo: Path, fake_guardkit: Path) -> None:
             MAIN_SHA,
         ]
         assert "--json" in report["argv"]
-        baseline = Path(report["argv"][report["argv"].index("--baseline-json") + 1])
-        assert json.loads(baseline.read_text(encoding="utf-8")) == {
-            "failing_node_ids": ["tests/test_a.py::test_one"]
-        }
-        # The command really read it: it did not merely receive a path.
-        assert report["baseline_seen"] == ["tests/test_a.py::test_one"]
+        assert "--baseline-json" not in report["argv"]
     finally:
         server.shutdown()
         server.server_close()

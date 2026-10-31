@@ -3,9 +3,7 @@
 Driven against a REAL sidecar handler on an ephemeral loopback port, with a
 fake ``guardkit`` executable on PATH — never a mocked client. The tests prove
 the door is one command wide, that the payload carries what the sidecar needs,
-that the pre-merge baseline travels inline (the file the executor wrote lives
-in the container and is not on the host), and that the result the executor
-reads is the same shape it reads today.
+and that the result the executor reads is the same shape it reads today.
 """
 
 from __future__ import annotations
@@ -32,8 +30,8 @@ FEATURE = "FEAT-3ABD"
 MAIN_SHA = "c" * 40
 
 #: The argument list the merge executor builds today, unchanged.
-def _executor_args(baseline_path: str | None = None) -> list[str]:
-    args = [
+def _executor_args() -> list[str]:
+    return [
         "merge",
         FEATURE,
         "--target",
@@ -42,9 +40,6 @@ def _executor_args(baseline_path: str | None = None) -> list[str]:
         MAIN_SHA,
         "--json",
     ]
-    if baseline_path is not None:
-        args += ["--baseline-json", baseline_path]
-    return args
 
 
 def _git(where: Path, *args: str) -> str:
@@ -94,24 +89,11 @@ def guardkit_on_the_host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Pat
         "#!/usr/bin/env python3\n"
         "import json, os, sys\n"
         "argv = sys.argv[1:]\n"
-        "baseline = None\n"
-        "if '--baseline-json' in argv:\n"
-        "    with open(argv[argv.index('--baseline-json') + 1]) as fh:\n"
-        "        data = json.load(fh)\n"
-        # The real command accepts a bare list or an object carrying a
-        # failing_node_ids list, and stops with an error for anything else.
-        "    if isinstance(data, list):\n"
-        "        baseline = [str(x) for x in data]\n"
-        "    elif isinstance(data.get('failing_node_ids'), list):\n"
-        "        baseline = [str(x) for x in data['failing_node_ids']]\n"
-        "    else:\n"
-        "        sys.stderr.write('is an object without a failing_node_ids list')\n"
-        "        sys.exit(1)\n"
         "print(json.dumps({\n"
         "    'outcome': 'merged', 'post_sha': 'd' * 40, 'verify_ok': True,\n"
         "    'verify_status': 'passed', 'charged_failures': [],\n"
         "    'checks_passed': 17, 'checks_total': 17,\n"
-        "    'argv': argv, 'cwd': os.getcwd(), 'baseline_seen': baseline}))\n"
+        "    'argv': argv, 'cwd': os.getcwd()}))\n"
         "sys.exit(int(os.environ.get('FAKE_GUARDKIT_EXIT', '0')))\n",
         encoding="utf-8",
     )
@@ -233,7 +215,7 @@ async def test_the_merge_runs_on_the_host_and_reports_back(
     report = json.loads(result.stdout_tail)
     assert report["argv"][:3] == ["autobuild", "merge", FEATURE]
     assert report["cwd"] == str(repo.resolve())
-    assert report["baseline_seen"] is None
+    assert "--baseline-json" not in report["argv"]
     assert result.duration_secs >= 0
 
 
@@ -272,84 +254,6 @@ async def test_a_red_merge_is_a_failed_result_with_the_report_intact(
     assert result.status == "failed"
     assert result.exit_code == 4
     assert json.loads(result.stdout_tail)["outcome"] == "merged"
-
-
-@pytest.mark.asyncio
-async def test_the_baseline_travels_inline_not_as_a_path(
-    sidecar: str, repo: Path, guardkit_on_the_host: Path, tmp_path: Path
-) -> None:
-    """The executor writes its baseline inside the forge container. The host
-    has no such file, so the list itself is sent and the sidecar writes its
-    own copy."""
-    container_file = tmp_path / "container-only" / "merge-baseline.json"
-    container_file.parent.mkdir()
-    failing = ["tests/test_a.py::test_one", "tests/test_b.py::test_two"]
-    container_file.write_text(
-        json.dumps({"failing_node_ids": failing}), encoding="utf-8"
-    )
-
-    run = _run(sidecar, repo)
-    result = await run(
-        subcommand="autobuild",
-        args=_executor_args(str(container_file)),
-        repo_path=repo,
-        read_allowlist=[repo],
-        timeout_seconds=900,
-        with_nats_streaming=False,
-    )
-    report = json.loads(result.stdout_tail)
-    assert result.status == "success"
-    # The command on the host read the list, so the file the sidecar wrote is
-    # in a shape the real merge command accepts.
-    assert report["baseline_seen"] == failing
-    # The host's own copy is the one the command was pointed at.
-    on_host = Path(report["argv"][report["argv"].index("--baseline-json") + 1])
-    assert on_host == repo / ".guardkit" / "tmp" / f"merge-baseline-{FEATURE}.json"
-    assert on_host != container_file
-
-
-@pytest.mark.asyncio
-async def test_a_baseline_file_written_the_old_way_is_still_read(
-    sidecar: str, repo: Path, guardkit_on_the_host: Path, tmp_path: Path
-) -> None:
-    """Earlier versions of forge wrote the list under the name "failing".
-
-    A build whose baseline file was written before this change still has its
-    list carried across, so an upgrade never silently drops a baseline.
-    """
-    container_file = tmp_path / "old-shape" / "merge-baseline.json"
-    container_file.parent.mkdir()
-    failing = ["tests/test_a.py::test_one"]
-    container_file.write_text(json.dumps({"failing": failing}), encoding="utf-8")
-
-    run = _run(sidecar, repo)
-    result = await run(
-        subcommand="autobuild",
-        args=_executor_args(str(container_file)),
-        repo_path=repo,
-        read_allowlist=[repo],
-        timeout_seconds=900,
-        with_nats_streaming=False,
-    )
-    assert result.status == "success"
-    assert json.loads(result.stdout_tail)["baseline_seen"] == failing
-
-
-@pytest.mark.asyncio
-async def test_a_baseline_file_that_is_not_there_still_merges(
-    sidecar: str, repo: Path, guardkit_on_the_host: Path, tmp_path: Path
-) -> None:
-    run = _run(sidecar, repo)
-    result = await run(
-        subcommand="autobuild",
-        args=_executor_args(str(tmp_path / "missing.json")),
-        repo_path=repo,
-        read_allowlist=[repo],
-        timeout_seconds=900,
-        with_nats_streaming=False,
-    )
-    assert result.status == "success"
-    assert json.loads(result.stdout_tail)["baseline_seen"] is None
 
 
 # ---------------------------------------------------------------------------

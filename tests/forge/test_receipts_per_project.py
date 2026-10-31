@@ -257,16 +257,11 @@ def _the_two_folders(tmp_path) -> tuple[Path, Path]:
     return own, single
 
 
-def test_the_merge_card_reads_the_baseline_and_records_from_the_build_s_project(tmp_path):
-    from forge.pipeline.merge_offer import read_baseline_failing, read_what_was_checked
+def test_the_merge_card_reads_the_records_from_the_build_s_project(tmp_path):
+    from forge.pipeline.merge_offer import read_what_was_checked
 
     own, single = _the_two_folders(tmp_path)
-    for root, failing in ((own, ["t_own"]), (single, ["t_single"])):
-        (root / BUILD / "x").mkdir(parents=True)
-        (root / BUILD / "x" / "baseline.json").write_text(json.dumps(failing))
-    assert read_baseline_failing(BUILD, repo=OWN_REPO) == ["t_own"]
-    assert read_baseline_failing(BUILD, repo=LEGACY_REPO) == ["t_single"]
-    assert read_baseline_failing(BUILD) == ["t_single"], "no repository: the single root, as before"
+    (own / BUILD).mkdir(parents=True)
 
     _, _, why_not, _ = read_what_was_checked(BUILD, "FEAT-1234", repo=OWN_REPO)
     assert why_not and "no " in why_not, "looked in the project's own build folder"

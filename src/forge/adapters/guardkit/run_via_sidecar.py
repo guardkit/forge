@@ -27,13 +27,8 @@ so that the repository's own code is installed and run there and never on the
 host. It is a separate builder rather than a widening of the merge door,
 because each door should be exactly as wide as the work it carries.
 
-The pre-merge baseline — the list of tests the target branch was already
-failing — is sent inline rather than as a path. The executor writes that file
-inside the container, where the sidecar cannot read it; the sidecar writes its
-own copy on the host from the list this module sends.
-
-The branch to be merged travels the same way, as its own field, for the same
-reason the two time limits do: the sidecar builds the command itself, so a
+The branch to be merged travels as its own field, for the same reason the
+two time limits do: the sidecar builds the command itself, so a
 flag left in the argument list here would simply be dropped. It was, and on
 2026-09-10 a fix journey's repair passed every check inside the sandbox and
 then had its merge refused — "branch autobuild/FEAT-39F6 does not exist" —
@@ -162,45 +157,6 @@ def _flag_value(args: list[str], flag: str) -> str | None:
         if token.startswith(f"{flag}="):
             return token.split("=", 1)[1]
     return None
-
-
-def _read_baseline_failing(path_text: str) -> list[str] | None:
-    """Read the list of already-failing tests out of the baseline file.
-
-    Returns ``None`` when the file cannot be read or does not carry a list —
-    the merge then runs without a pre-merge baseline, which is what happens
-    today when the file could not be written either.
-    """
-    try:
-        data = json.loads(Path(path_text).read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        logger.warning(
-            "guardkit merge over the sidecar: could not read the list of "
-            "tests that were already failing from %s (%s) — the merge runs "
-            "without one",
-            path_text,
-            exc,
-        )
-        return None
-    failing: Any = None
-    if isinstance(data, list):
-        failing = data
-    elif isinstance(data, dict):
-        # "failing_node_ids" is the name guardkit itself uses, both in the
-        # baseline file it accepts and in the baseline.json it writes; the
-        # older "failing" is still read so a file written by a previous
-        # version of forge is not thrown away.
-        failing = data.get("failing_node_ids")
-        if failing is None:
-            failing = data.get("failing")
-    if not isinstance(failing, list):
-        logger.warning(
-            "guardkit merge over the sidecar: %s does not carry a list of "
-            "tests that were already failing — the merge runs without one",
-            path_text,
-        )
-        return None
-    return [str(entry) for entry in failing]
 
 
 def _resolve_repo_key(repo_path: Path, repo_paths: Mapping[str, str]) -> str | None:
@@ -470,11 +426,6 @@ def build_sidecar_guardkit_run(
                     "--verify-timeout must be a whole number of seconds; got "
                     f"{verify_timeout!r}"
                 ) from None
-        baseline_path = _flag_value(args, "--baseline-json")
-        if baseline_path:
-            failing = _read_baseline_failing(baseline_path)
-            if failing is not None:
-                body["baseline_failing"] = failing
 
         http_timeout = float(timeout_seconds) + http_timeout_margin
         try:

@@ -162,7 +162,7 @@ def _wire(
         order.append("merge")
         return SimpleNamespace(
             status="success",
-            stdout_tail=json.dumps({"status": "merged", "merged_sha": merged}),
+            stdout_tail=json.dumps({"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": merged}),
             stderr=None, exit_code=0, artefacts=[],
         )
 
@@ -284,7 +284,7 @@ def _wire_recording_argv(
         argv.append(list(kwargs["args"]))
         return SimpleNamespace(
             status="success",
-            stdout_tail=json.dumps({"status": "merged", "merged_sha": merged}),
+            stdout_tail=json.dumps({"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": merged}),
             stderr=None, exit_code=0, artefacts=[],
         )
 

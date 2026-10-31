@@ -188,7 +188,7 @@ def fakes(
         gk_calls.append(kwargs)
         return SimpleNamespace(
             status="success",
-            stdout_tail=json.dumps({"status": "merged", "merged_sha": merged}),
+            stdout_tail=json.dumps({"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": merged}),
             stderr=None,
             exit_code=0,
             artefacts=[],

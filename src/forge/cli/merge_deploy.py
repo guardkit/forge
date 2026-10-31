@@ -250,7 +250,6 @@ async def _arun_holding(
         release_the_offers_own_preview,
         why_a_previewed_offer_is_refused,
     )
-    from forge.pipeline.merge_offer import read_baseline_failing
     from forge.pipeline.publisher_client import the_publishers_self_check
 
     pool = _open_pool(_resolve_db_path())
@@ -363,7 +362,6 @@ async def _arun_holding(
 
         venue = surface if surface is not None else InContainerCandidateGit(repo_root)
         expect_main_sha = str(await venue.rev_parse(recorded_branch) or "")
-    baseline_failing = read_baseline_failing(row.build_id, repo=getattr(row, "repo", None))
     # The branch the build made, when the conductor recorded one (a repair).
     merge_branch = str(getattr(row, "merge_branch", None) or "").strip() or None
     # AN OFFER WITH A REVIEW PREVIEW (web-readiness W7) is pressed here on the
@@ -449,7 +447,6 @@ async def _arun_holding(
             expect_main_sha=expect_main_sha,
             correlation_id=row.correlation_id or f"merge-{row.build_id}",
             decided_by=decided_by,
-            baseline_failing=baseline_failing,
             dry_run=dry_run,
             merge_branch=merge_branch,
             **(

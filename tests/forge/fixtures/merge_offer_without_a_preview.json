@@ -37,7 +37,6 @@
         "change_summary": "the change could not be read",
         "change_text": "",
         "change_text_truncated": false,
-        "baseline_failing": null,
         "resume_options": [
           "approve",
           "reject"
@@ -59,7 +58,6 @@
     "latch": {
       "merge_offer": {
         "approval_subject": "agents.approval.forge.merge-FEAT-MO1",
-        "baseline_failing": null,
         "branch": "autobuild/FEAT-MO1",
         "build_id": "build-FEAT-MO1-20260824",
         "candidate_identity_version": 1,
@@ -121,7 +119,6 @@
         "change_summary": "the change could not be read",
         "change_text": "",
         "change_text_truncated": false,
-        "baseline_failing": null,
         "resume_options": [
           "approve",
           "reject"
@@ -143,7 +140,6 @@
     "latch": {
       "merge_offer": {
         "approval_subject": "agents.approval.forge.merge-FEAT-MO1",
-        "baseline_failing": null,
         "branch": "autobuild/FEAT-MO1",
         "build_id": "build-FEAT-MO1-20260825",
         "candidate_identity_version": 1,

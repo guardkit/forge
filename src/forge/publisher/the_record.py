@@ -130,11 +130,14 @@ def a_step_that_could_not_run_on(
 ) -> str | None:
     """Why this step could not run on exactly this commit, or ``None``.
 
-    Step 1 (24 October 2026): a check that could not run is recorded as
-    exactly that — ``unavailable`` with its reason and a ``verify_ok`` that is
-    never ``True`` — and is advice, not a refusal. Only the LAST ``done`` line
-    for the step on this commit counts, so a later red or green line wins. A
-    red line (checks that ran, ``verify_ok`` false) is never this.
+    Step 1 (24 October 2026): the factory's live check that could not run is
+    recorded as exactly that — ``unavailable`` with its reason and a
+    ``verify_ok`` that is never ``True`` — and is advice, not a refusal. The
+    publisher asks this only of the live check: the build system's check
+    after the join must pass (after-task check redesign, 31 October 2026).
+    Only the LAST ``done`` line for the step on this commit counts, so a
+    later red or green line wins. A red line (checks that ran, ``verify_ok``
+    false) is never this.
     """
     wanted = str(joined_commit)
     last: dict[str, Any] | None = None
@@ -153,12 +156,6 @@ def a_step_that_could_not_run_on(
     why = last.get("unavailable")
     if isinstance(why, str) and why.strip():
         return why.strip()
-    # A line that says the checks did not run (``verify_ran`` false, or the
-    # build system's ``unverified``) reads the same way (25 October 2026).
-    if last.get("verify_ran") is False or (
-        str(last.get("verify_status") or "").strip().lower() == "unverified"
-    ):
-        return str(last.get("verify_detail") or "the checks could not run").strip()
     return None
 
 

@@ -126,7 +126,6 @@ def _write_previewed_offer(
                     "feature_id": FEATURE_ID,
                     "repo": REPO,
                     "expect_main_sha": MAIN_SHA,
-                    "baseline_failing": None,
                     "review_evidence": evidence,
                     "preview_tree": preview_tree,
                 }
@@ -597,7 +596,6 @@ async def _offer_with_a_preview(config, pool, preview) -> dict[str, Any]:
         pool=pool,
         pipeline_publisher=SimpleNamespace(publish_build_paused=_publish),
         raw_publish=_publish,
-        baseline_reader=lambda _b: None,
         finished_feature_reader=lambda *_a, **_k: (None, None, "nothing exported"),
         scope_pass=lambda **_k: None,
         after_deploy_check_reader=lambda _p, _r: None,

@@ -1250,10 +1250,17 @@ class Publisher:
         ):
             if a_step_that_passed_on(record, step, j_commit) is not None:
                 continue
-            # FRG-178 AS ADVICE (step 1, 24 October 2026): a check recorded
-            # as unavailable on this commit did not run, so it is not a red
-            # result. It is logged and the send goes ahead; red still blocks.
-            unavailable = a_step_that_could_not_run_on(record, step, j_commit)
+            # FRG-178 AS ADVICE (step 1, 24 October 2026): the factory's own
+            # live check recorded as unavailable on this commit did not run,
+            # so it is logged and the send goes ahead. The build system's
+            # check after the join is NOT advice (after-task check redesign,
+            # 31 October 2026): it must be recorded as passed, or nothing is
+            # sent.
+            unavailable = (
+                a_step_that_could_not_run_on(record, step, j_commit)
+                if step == STEP_CANDIDATE_CHECK
+                else None
+            )
             if unavailable is not None:
                 logger.warning(
                     "publisher: build %s — %s could not run on %s (%s); "

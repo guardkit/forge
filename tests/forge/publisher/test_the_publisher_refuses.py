@@ -181,26 +181,22 @@ class TestBothKindsOfCheckHaveToHavePassedOnThisCommit:
 
 
 class TestACheckThatCouldNotRunIsAdvice:
-    """Step 1 (24 October 2026): FRG-178 and the live check's "could not run"
-    are recorded as unavailable, never as a pass, and the publisher treats
-    them as advice. A red line still blocks (the class above)."""
+    """Step 1 (24 October 2026): the factory's live check that could not run
+    is recorded as unavailable, never as a pass, and the publisher treats it
+    as advice. The build system's check after the join is not advice (after-
+    task check redesign, 31 October 2026): unless it is recorded as passed on
+    this commit, nothing is sent. A red line still blocks (the class above)."""
 
-    def test_the_build_systems_checks_unavailable_on_a_reused_join_publishes(
-        self, tmp_path: Path, project: dict
+    @pytest.mark.parametrize("shape", ["unavailable", "unverified"])
+    def test_the_build_systems_check_that_could_not_run_is_refused(
+        self, tmp_path: Path, project: dict, shape: str
     ) -> None:
-        publisher = _publisher(tmp_path, project, merge_checks="unavailable")
+        publisher = _publisher(tmp_path, project, merge_checks=shape)
+        before = what_the_remote_has(project["bare"], project["branch"])
         answer = publisher.publish(a_request(project))
-        assert answer.published is True, answer.refusal
-        assert answer.contains_j is True
-
-    def test_checks_that_said_they_could_not_run_publish(
-        self, tmp_path: Path, project: dict
-    ) -> None:
-        """25 October 2026: a failed install is advice, read off the record
-        the same way whatever shape the line has."""
-        publisher = _publisher(tmp_path, project, merge_checks="unverified")
-        answer = publisher.publish(a_request(project))
-        assert answer.published is True, answer.refusal
+        assert answer.published is False
+        assert answer.refusal_kind == "the-checks-are-not-recorded-as-passed"
+        _nothing_moved(project, before)
 
     def test_the_live_check_that_could_not_run_publishes(
         self, tmp_path: Path, project: dict
@@ -213,7 +209,7 @@ class TestACheckThatCouldNotRunIsAdvice:
         self, tmp_path: Path, project: dict
     ) -> None:
         publisher = _publisher(
-            tmp_path, project, merge_checks="unavailable", ran_on=project["g"]
+            tmp_path, project, candidate_check="unavailable", ran_on=project["g"]
         )
         answer = publisher.publish(a_request(project))
         assert answer.published is False

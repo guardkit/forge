@@ -142,7 +142,6 @@ def _offer_service(
         raw_publish=_raw_publish,
         git_head=_git_head,
         git_surface=lambda _repo, _root: _CandidatePins(),
-        baseline_reader=lambda _build_id: None,
         clock=lambda: datetime(2026, 9, 9, 9, 8, tzinfo=UTC),
     )
     return service, publisher, raw

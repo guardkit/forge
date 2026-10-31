@@ -294,7 +294,7 @@ class TestOneCardAndOneMergeHoldOnlyTheApprovedTasks:
         return task_a, task_b, service
 
     async def _press(self, config: Any, pool: Any, task_a: str) -> Any:
-        gk = _FakeGuardKit(report={"status": "merged", "merged_sha": task_a})
+        gk = _FakeGuardKit(report={"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": task_a})
         deps, publisher, gk, _dp = _deps(config, pool, guardkit=gk)
         consumer = MergeApprovalConsumer(deps)
         await consumer.handle_envelope(_envelope(correlation_id=f"corr-{BUILD_ID}"))

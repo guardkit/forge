@@ -36,7 +36,6 @@ from forge.pipeline.merge_offer import (
     git_rev_parse_main,
     head_reader_takes_a_branch,
     merge_request_id,
-    read_baseline_failing,
 )
 
 BUILD_ID = "build-FEAT-MO1-20260824"
@@ -347,7 +346,7 @@ class TestDualEnvelope:
         assert details["expect_main_sha"] == "mainsha1234"
         assert details["tasks_completed"] == 5
         assert details["tasks_total"] == 5
-        assert details["baseline_failing"] is None
+        assert "baseline_failing" not in details
         assert details["resume_options"] == ["approve", "reject"]
 
         # --- the pipeline build-paused mirror, SECOND ------------------
@@ -432,55 +431,8 @@ class TestDualEnvelope:
 
 
 # ---------------------------------------------------------------------------
-# The baseline read (fail-open) and the git pin
+# The git pin
 # ---------------------------------------------------------------------------
-
-
-class TestBaseline:
-    @pytest.mark.asyncio
-    async def test_baseline_rides_the_offer(
-        self, config, pool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        receipts = tmp_path / "receipts"
-        (receipts / BUILD_ID / "task-1").mkdir(parents=True)
-        (receipts / BUILD_ID / "task-1" / "baseline.json").write_text(
-            json.dumps({"failing": ["test_a", "test_b"]}), encoding="utf-8"
-        )
-        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
-        _insert_build(pool)
-        recorder = _Recorder()
-        await _service(config, pool, recorder).maybe_offer(_event())
-        _, (subject, body) = recorder.events[0]
-        details = MessageEnvelope.model_validate_json(body).payload["details"]
-        assert details["baseline_failing"] == ["test_a", "test_b"]
-
-    def test_garbage_baseline_fails_open(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        receipts = tmp_path / "receipts"
-        (receipts / BUILD_ID).mkdir(parents=True)
-        (receipts / BUILD_ID / "baseline.json").write_text(
-            "not json at all", encoding="utf-8"
-        )
-        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
-        assert read_baseline_failing(BUILD_ID) is None
-
-    def test_bare_list_baseline_accepted(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        receipts = tmp_path / "receipts"
-        (receipts / BUILD_ID).mkdir(parents=True)
-        (receipts / BUILD_ID / "baseline.json").write_text(
-            json.dumps(["only_one"]), encoding="utf-8"
-        )
-        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(receipts))
-        assert read_baseline_failing(BUILD_ID) == ["only_one"]
-
-    def test_missing_tree_fails_open(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        monkeypatch.setenv("FORGE_RECEIPTS_DIR", str(tmp_path / "nowhere"))
-        assert read_baseline_failing(BUILD_ID) is None
 
 
 class TestGitPin:

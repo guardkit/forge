@@ -381,7 +381,6 @@ def _service(
         raw_publish=recorder.raw_publish,
         git_head=_git_head,
         git_surface=lambda _repo, _root: git or TargetGit(),
-        baseline_reader=lambda _build_id: None,
         finished_feature_reader=lambda *_a, **_k: (None, None, "nothing was exported"),
         scope_pass=lambda **_k: _scope(name_status),
         after_deploy_check_reader=lambda _pool, _row: None,

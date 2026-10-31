@@ -233,7 +233,6 @@ def _write_offer(
     feature_id: str = FEATURE_ID,
     repo: str = REPO,
     correlation_id: str = CORRELATION,
-    baseline_failing: list[str] | None = None,
     request_id: str | None = None,
 ) -> None:
     _ensure_build(pool, build_id=build_id, feature_id=feature_id)
@@ -256,7 +255,6 @@ def _write_offer(
                     "feature_id": feature_id,
                     "repo": repo,
                     "expect_main_sha": MAIN_SHA,
-                    "baseline_failing": baseline_failing,
                 }
             },
         )
@@ -269,34 +267,6 @@ class _FakePublisher:
 
     async def publish_stage_complete(self, payload: Any) -> None:
         self.reports.append(payload)
-
-
-def a_build_system_without_check_join(kwargs: dict[str, Any]) -> GuardKitResult | None:
-    """What an installed build system says when asked for a verb it has not got.
-
-    ``None`` when the call is not the check-join question at all, so every
-    stand-in below answers merges exactly as it always did.
-
-    THE FACTORY ASKS THIS QUESTION of every join it picked up rather than made
-    (23 September 2026): `autobuild check-join <FEAT> --joined <J>` would run
-    the build system's own checks on an already-joined commit. Nothing has that
-    verb today — the factory runs its build system from a frozen container
-    image — so the honest stand-in is a command line that has never heard of
-    it, and the press must stay GATED and say so by name.
-    """
-    args = list(kwargs.get("args") or [])
-    if not args or args[0] != "check-join":
-        return None
-    return GuardKitResult(
-        # A complete answer from the build system (15 October 2026).
-        confirmed=True,
-        status="failed",
-        subcommand=str(kwargs.get("subcommand", "autobuild")),
-        duration_secs=0.01,
-        stdout_tail="",
-        stderr="Usage: autobuild [OPTIONS] COMMAND\nError: No such command 'check-join'.",
-        exit_code=2,
-    )
 
 
 class _FakeGuardKit:
@@ -324,13 +294,10 @@ class _FakeGuardKit:
             return self.report
         repo = Path(kwargs["repo_path"])
         feature = kwargs["args"][1]
-        return {"status": "merged", "merged_sha": _tip(repo, feature)}
+        return {"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": _tip(repo, feature)}
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
-        not_there = a_build_system_without_check_join(kwargs)
-        if not_there is not None:
-            return not_there
         return GuardKitResult(
             # A complete answer from the build system (15 October 2026).
             confirmed=True,
@@ -359,9 +326,6 @@ class _DiesWhileMerging:
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
-        not_there = a_build_system_without_check_join(kwargs)
-        if not_there is not None:
-            return not_there
         args = list(kwargs["args"])
         folder = Path(args[args.index("--in-worktree") + 1])
         _git(
@@ -415,9 +379,6 @@ class _JoinsForReal:
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         self.calls.append(kwargs)
-        not_there = a_build_system_without_check_join(kwargs)
-        if not_there is not None:
-            return not_there
         args = list(kwargs["args"])
         folder = Path(args[args.index("--in-worktree") + 1])
         _git(
@@ -939,7 +900,6 @@ async def _run_executor(
     deps: MergeExecutorDeps,
     repo_root: Path,
     *,
-    baseline_failing: list[str] | None = None,
     dry_run: bool = False,
     expect_main_sha: str = MAIN_SHA,
 ) -> Any:
@@ -953,7 +913,6 @@ async def _run_executor(
         expect_main_sha=expect_main_sha,
         correlation_id=CORRELATION,
         decided_by="rich",
-        baseline_failing=baseline_failing,
         dry_run=dry_run,
     )
 
@@ -1057,7 +1016,7 @@ class TestExecutorSequencing:
         merged = _tip(repo_root)
         gk = _FakeGuardKit(
             report={
-                "status": "merged",
+                "status": "merged", "verify_status": "passed", "verify_ok": True,
                 "merged_sha": merged,
                 "checks_passed": 7,
                 "checks_total": 7,
@@ -1193,79 +1152,6 @@ class TestExecutorSequencing:
         assert outcome.result == "publication-pending"
         assert len(gk.calls) == 1  # the real merge ran, unblocked
         assert len(publisher.reports) == 1  # and the real outcome published
-
-    @pytest.mark.asyncio
-    async def test_baseline_file_written_and_flag_passed(
-        self, config, pool, repo_root
-    ) -> None:
-        deps, publisher, gk, dp = _deps(config, pool)
-        await _run_executor(deps, repo_root, baseline_failing=["test_x"])
-        args = gk.calls[0]["args"]
-        assert "--baseline-json" in args
-        baseline_path = Path(args[args.index("--baseline-json") + 1])
-        assert baseline_path.is_file()
-        assert baseline_path.parent == repo_root / ".guardkit" / "tmp"
-        # "failing_node_ids" is the name the merge command's own reader
-        # requires; an object under any other name stops the merge.
-        assert json.loads(baseline_path.read_text()) == {
-            "failing_node_ids": ["test_x"]
-        }
-
-    @pytest.mark.asyncio
-    async def test_the_baseline_file_is_in_a_shape_the_merge_command_accepts(
-        self, config, pool, repo_root, tmp_path
-    ) -> None:
-        """Drive the written file through the merge command's own reader.
-
-        The merge command reads the file as a bare list of test names, or as an
-        object carrying a ``failing_node_ids`` list, and stops with an error for
-        anything else. This runs a stand-in command with exactly that rule over
-        the file the executor wrote: it must be read, not refused.
-        """
-        import stat as stat_module
-        import subprocess
-
-        deps, _publisher, gk, _dp = _deps(config, pool)
-        await _run_executor(deps, repo_root, baseline_failing=["test_x"])
-        args = gk.calls[0]["args"]
-        baseline_path = args[args.index("--baseline-json") + 1]
-
-        reader = tmp_path / "reads-the-baseline-the-real-way"
-        reader.write_text(
-            "#!/usr/bin/env python3\n"
-            "import json, sys\n"
-            "data = json.load(open(sys.argv[1]))\n"
-            "if isinstance(data, list):\n"
-            "    print(json.dumps([str(x) for x in data]))\n"
-            "elif isinstance(data.get('failing_node_ids'), list):\n"
-            "    print(json.dumps([str(x) for x in data['failing_node_ids']]))\n"
-            "else:\n"
-            "    sys.stderr.write('is an object without a failing_node_ids list')\n"
-            "    sys.exit(1)\n",
-            encoding="utf-8",
-        )
-        reader.chmod(
-            reader.stat().st_mode | stat_module.S_IXUSR | stat_module.S_IXOTH
-        )
-
-        done = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            [str(reader), str(baseline_path)],
-            capture_output=True,
-            text=True,
-        )
-        assert done.returncode == 0, done.stderr
-        assert json.loads(done.stdout) == ["test_x"]
-
-        # And the shape it refuses really is refused, so this has teeth.
-        old_shape = tmp_path / "old-shape.json"
-        old_shape.write_text(json.dumps({"failing": ["test_x"]}), encoding="utf-8")
-        refused = subprocess.run(  # noqa: S603 — fixed argv, no shell
-            [str(reader), str(old_shape)],
-            capture_output=True,
-            text=True,
-        )
-        assert refused.returncode == 1
-        assert "failing_node_ids" in refused.stderr
 
     @pytest.mark.asyncio
     async def test_a_second_press_picks_the_join_up_and_never_merges_twice(
@@ -1415,7 +1301,7 @@ class TestExecutorSequencing:
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         first = await _run_executor(deps, repo_root)
         assert first.result == "merged-verify-failed"
-        assert "the checks after the join did not pass" in first.detail
+        assert "the check did not pass" in first.detail
 
         # The record says the checks are done AND that they went red.
         lines = json.loads(
@@ -1434,7 +1320,7 @@ class TestExecutorSequencing:
         assert len(joiner.calls) == 2
         assert second.result == "merged-verify-failed"
         assert second.status == "FAILED"
-        assert "the checks after the join did not pass" in second.detail
+        assert "the check did not pass" in second.detail
         assert "3 checks went red" in second.detail
         assert "checked and ready to publish" not in second.detail
         assert "was checked" not in second.detail
@@ -1525,79 +1411,49 @@ class TestExecutorSequencing:
         j_left = _git(repo_root, "rev-parse", f"factory-integration/{FEATURE_ID}")
 
         _the_kept_hold_runs_out(pool)
-        # The next merge word picks it up: the join is found, not made again,
-        # and the press runs on to the checks.
-        deps, publisher, gk, dp = _deps(config, pool)
+        # The next merge word picks it up. The join that was left has never
+        # had its check finish, so it is set aside under its own name and the
+        # join is made and checked afresh (after-task check redesign, 31
+        # October 2026): no `check-join`, no advice.
+        joiner = _JoinsForReal()
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         outcome = await _run_executor(deps, repo_root)
-        assert outcome.result == "publication-pending"
-        assert outcome.merged_sha == j_left
-        # The merge command was never run a second time. The one thing asked of
-        # the build system is the check-join question this stage added, and the
-        # installed one has no such sub-command.
-        assert [call["args"][0] for call in gk.calls] == ["check-join"]
+        assert outcome.result == "publication-pending", outcome.detail
+        assert outcome.status == "PASSED"
+        assert "checked and ready to publish" in outcome.detail
+        assert "advice:" not in outcome.detail
+        # The merge command ran once more, on a fresh join of its own name.
+        assert [call["args"][0] for call in joiner.calls] == ["merge"]
+        assert outcome.merged_sha != j_left
+        # The left-behind join is kept, not deleted.
+        assert (
+            _git(repo_root, "rev-parse", f"factory-integration/{FEATURE_ID}")
+            == j_left
+        )
         assert _legs(dp) == ["candidate_check", "candidate_down"]
-        steps = [
-            (l["kind"], l["step"])
-            for l in json.loads(
-                pool.connection.execute(
-                    "SELECT lines_json FROM publication_records WHERE build_id = ?",
-                    (BUILD_ID,),
-                ).fetchone()[0]
-            )
-        ]
-        # The build system's checks could not be run on the reused join; that
-        # is recorded as unavailable (step 1, 24 October 2026), never a pass.
-        assert steps == [
-            ("about to", "join"),
-            ("done", "join"),
-            ("done", "merge-checks"),
-            ("about to", "candidate-check"),
-            ("done", "candidate-check"),
-        ]
-
-    @pytest.mark.asyncio
-    async def test_a_pick_up_never_claims_checks_it_did_not_re_run(
-        self, config, pool, repo_root
-    ) -> None:
-        """Say which checks ran, and no more.
-
-        A press that picks an already-made join up does not re-run the build
-        system's own post-merge checks on it — only the factory's live check
-        runs, and its counts are the ones in the sentence. So the sentence
-        must not record them as passed. Since step 1 (24 October 2026,
-        FRG-178) the record says they were UNAVAILABLE, with the build
-        system's own sentence, and that is advice: the join is ready to
-        publish, and the sentence says what could not run.
-        """
-        dying = _DiesWhileMerging()
-        deps, publisher, gk, dp = _deps(config, pool, guardkit=dying)
-        with pytest.raises(KeyboardInterrupt):
-            await _run_executor(deps, repo_root)
-
-        _the_kept_hold_runs_out(pool)
-        deps, publisher, gk, dp = _deps(config, pool)
-        outcome = await _run_executor(deps, repo_root)
-        assert outcome.result == "publication-pending"
         lines = json.loads(
             pool.connection.execute(
                 "SELECT lines_json FROM publication_records WHERE build_id = ?",
                 (BUILD_ID,),
             ).fetchone()[0]
         )
+        assert [(l["kind"], l["step"]) for l in lines] == [
+            ("about to", "join"),
+            ("done", "join"),
+            ("about to", "join"),
+            ("done", "join"),
+            ("done", "merge-checks"),
+            ("about to", "candidate-check"),
+            ("done", "candidate-check"),
+        ]
+        set_aside = lines[1]["detail"]
+        assert set_aside["set_aside"] is True
+        assert set_aside["commit_kept"] == j_left
         merge_checks = [
             l for l in lines if (l["kind"], l["step"]) == ("done", "merge-checks")
         ]
-        assert len(merge_checks) == 1
-        # Recorded as exactly what it was: never a pass, never red.
-        assert merge_checks[0]["detail"]["verify_ok"] is None
-        assert "autobuild check-join" in merge_checks[0]["detail"]["unavailable"]
-        # AND IT NAMES WHAT WOULD RUN THEM (23 September 2026): the installed
-        # build system has no check-join, and the sentence says so as advice.
-        assert "advice:" in outcome.detail
-        assert "autobuild check-join" in outcome.detail
-        assert "does not have it" in outcome.detail
-        assert "checked and ready to publish" in outcome.detail
-        assert outcome.status == "PASSED"
+        assert merge_checks[0]["detail"]["verify_ok"] is True
+        assert merge_checks[0]["detail"]["ran_on"] == outcome.merged_sha
 
     @pytest.mark.asyncio
     async def test_checks_derived_from_the_live_gate_verdict(
@@ -1858,13 +1714,14 @@ class TestChecksThatCouldNotRun:
         return report
 
     @pytest.mark.asyncio
-    async def test_checks_that_could_not_run_are_advice(
+    async def test_a_check_that_could_not_run_stops_the_merge(
         self, config, pool, repo_root
     ) -> None:
-        """Step 1 (25 October 2026): checks that could not run (an install
-        that failed, a runner that would not start) are advice. The press
-        goes on to publication, records them as unavailable, and never as a
-        pass; only checks that ran and went red block."""
+        """After-task check redesign (31 October 2026): a check that could
+        not run did not pass. Nothing is published, nothing is deployed, and
+        the record and the sentence say the check did not pass and why. It
+        used to be advice (step 1, 25 October 2026), and FEAT-8BB4 reached
+        main that way."""
         gk = _FakeGuardKit(
             status="failed",
             report=self._report("unverified", post_sha=_tip(repo_root)),
@@ -1872,9 +1729,14 @@ class TestChecksThatCouldNotRun:
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
         outcome = await _run_executor(deps, repo_root)
 
-        assert outcome.result == "publication-pending"
-        assert "advice: test runner could not start" in outcome.detail
-        assert "did not pass" not in outcome.detail
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.verify_status == "unverified"
+        assert (
+            "the check did not pass: it could not run (test runner could not "
+            "start). Nothing was published." in outcome.detail
+        )
+        assert "advice" not in outcome.detail
+        assert _legs(dp) == []
         lines = json.loads(
             pool.connection.execute(
                 "SELECT lines_json FROM publication_records WHERE build_id = ?",
@@ -1886,8 +1748,49 @@ class TestChecksThatCouldNotRun:
             for line in lines
             if line.get("step") == "merge-checks" and line.get("kind") == "done"
         ]
-        assert checks and checks[-1]["detail"]["verify_ok"] is None
-        assert checks[-1]["detail"]["unavailable"] == "test runner could not start"
+        assert checks and checks[-1]["detail"]["verify_ok"] is False
+        assert checks[-1]["detail"]["verify_ran"] is False
+        assert "unavailable" not in checks[-1]["detail"]
+
+    @pytest.mark.asyncio
+    async def test_an_older_build_systems_unverified_pass_is_not_a_pass(
+        self, config, pool, repo_root
+    ) -> None:
+        """FEAT-8BB4 (29 October 2026): the merge check exited 127 on a
+        missing eslint, and the build system then in use recorded
+        ``verify_status: unverified`` with ``verify_ok: true``. Only a
+        recorded "passed" counts, whatever ``verify_ok`` says."""
+        gk = _FakeGuardKit(
+            status="success",
+            report=self._report(
+                "unverified",
+                post_sha=_tip(repo_root),
+                verify_ok=True,
+                verify_ran=True,
+                verify_detail="verification command could not start",
+            ),
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-verify-failed"
+        assert "the check did not pass" in outcome.detail
+        assert "Nothing was published." in outcome.detail
+        assert _legs(dp) == []
+
+    @pytest.mark.asyncio
+    async def test_a_report_that_says_nothing_about_the_check_is_not_a_pass(
+        self, config, pool, repo_root
+    ) -> None:
+        gk = _FakeGuardKit(
+            report={"outcome": "merged", "post_sha": _tip(repo_root)},
+        )
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+
+        assert outcome.result == "merged-verify-failed"
+        assert "the check did not pass" in outcome.detail
+        assert _legs(dp) == []
 
     @pytest.mark.asyncio
     async def test_checks_that_could_not_run_file_no_repair(
@@ -1920,9 +1823,8 @@ class TestChecksThatCouldNotRun:
         outcome = await _run_executor(deps, repo_root)
 
         assert outcome.verify_status == "failed"
-        assert "did not pass" in outcome.detail
+        assert "the check did not pass: 2 charged failures." in outcome.detail
         assert "could not run" not in outcome.detail
-        assert "2 charged failure(s)" in outcome.detail
 
     @pytest.mark.asyncio
     async def test_checks_that_ran_and_went_red_file_a_repair(
@@ -2017,53 +1919,14 @@ def _spy_on_repair_filing(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any
     return asked
 
 
-class _ACheckJoinThatCouldNotRunTheChecks:
-    """An installed build system that has check-join, and whose checks on the
-    joined commit could not run (its install failed there).
-
-    ``verify_ran`` is either left out, with the process exiting 0, or said to
-    be true with the process exiting 1. Both shapes are read as "it ran" by the
-    question's reader, which is how an "unverified" answer reaches the path
-    for a join this press did not make.
-    """
-
-    def __init__(self, *, shape: str) -> None:
-        self.shape = shape
-        self.calls: list[dict[str, Any]] = []
-
-    async def __call__(self, **kwargs: Any) -> GuardKitResult:
-        self.calls.append(kwargs)
-        args = list(kwargs.get("args") or [])
-        assert args and args[0] == "check-join", args
-        report: dict[str, Any] = {
-            "outcome": "checked",
-            "joined_commit": args[args.index("--joined") + 1],
-            "verify_ok": False,
-            "verify_status": "unverified",
-            "verify_detail": INSTALL_FAILED,
-        }
-        if self.shape == "said-ran":
-            report["verify_ran"] = True
-        exits_zero = self.shape == "silent"
-        return GuardKitResult(
-            # A complete answer from the build system (15 October 2026).
-            confirmed=True,
-            status="success" if exits_zero else "failed",
-            subcommand="autobuild",
-            duration_secs=0.1,
-            stdout_tail=json.dumps(report),
-            stderr=None,
-            exit_code=0 if exits_zero else 1,
-        )
-
-
 class TestAResumedJoinKeepsCouldNotRun:
-    """A press that picks a recorded join up must not turn "the checks could
-    not run" into "the checks went red".
+    """A press that picks a recorded join up must not turn "the check could
+    not run" into a pass, nor into "the check went red".
 
-    Since step 1 (25 October 2026) checks that could not run are advice: the
-    press records them as unavailable, never as a pass, files no repair and
-    goes on to publication. Checks that ran and went red still block.
+    Since the after-task check redesign (31 October 2026) a check that could
+    not run stops the merge like a red one, and files no repair (no code
+    change mends a check that could not start). A later press sets that join
+    aside and joins and checks again.
     """
 
     @pytest.mark.asyncio
@@ -2076,26 +1939,21 @@ class TestAResumedJoinKeepsCouldNotRun:
         )
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         first = await _run_executor(deps, repo_root)
-        assert first.result == "publication-pending"
-        assert f"advice: {INSTALL_FAILED}" in first.detail
-        assert "did not pass" not in first.detail
-        lines = json.loads(
-            pool.connection.execute(
-                "SELECT lines_json FROM publication_records WHERE build_id = ?",
-                (BUILD_ID,),
-            ).fetchone()[0]
-        )
-        recorded = [
-            l for l in lines if l["step"] == "merge-checks" and l["kind"] == "done"
-        ]
-        assert recorded and recorded[-1]["detail"]["verify_ok"] is None
-        assert recorded[-1]["detail"]["unavailable"] == INSTALL_FAILED
+        assert first.result == "merged-verify-failed"
+        assert first.verify_status == "unverified"
+        assert f"it could not run ({INSTALL_FAILED})" in first.detail
+        assert _legs(dp) == []
         assert _repair_rows(pool) == []
 
         deps, publisher, gk, dp = _deps(config, pool, guardkit=joiner)
         second = await _run_executor(deps, repo_root)
 
-        assert "did not pass" not in second.detail
+        # Joined and checked again, and it still could not run: stopped,
+        # never a pass, never red, no repair.
+        assert len(joiner.calls) == 2
+        assert second.result == "merged-verify-failed"
+        assert second.verify_status == "unverified"
+        assert _legs(dp) == []
         assert filed == []
         assert _repair_rows(pool) == []
 
@@ -2124,40 +1982,6 @@ class TestAResumedJoinKeepsCouldNotRun:
         assert len(filed) == 2
         assert "did not pass" in str(filed[-1]["detail"])
         assert len(_repair_rows(pool)) == 1
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("shape", ["silent", "said-ran"])
-    async def test_a_reused_join_the_build_system_could_not_check_is_not_red(
-        self, config, pool, repo_root, shape, monkeypatch
-    ) -> None:
-        filed = _spy_on_repair_filing(monkeypatch)
-        # A press dies while the merge command runs, leaving a join whose
-        # build-system checks never ran.
-        dying = _DiesWhileMerging()
-        deps, publisher, gk, dp = _deps(config, pool, guardkit=dying)
-        with pytest.raises(KeyboardInterrupt):
-            await _run_executor(deps, repo_root)
-        _the_kept_hold_runs_out(pool)
-
-        # The next press asks the build system to check that join, and the
-        # build system says its checks could not run there.
-        asked = _ACheckJoinThatCouldNotRunTheChecks(shape=shape)
-        deps, publisher, gk, dp = _deps(config, pool, guardkit=asked)
-        outcome = await _run_executor(deps, repo_root)
-
-        assert [c["args"][0] for c in asked.calls] == ["check-join"]
-        assert outcome.result == "publication-pending"
-        assert f"advice: {INSTALL_FAILED}" in outcome.detail
-        assert "did not pass" not in outcome.detail
-        assert _repair_rows(pool) == []
-
-        # And a press after that, which reads the answer back off the record,
-        # still never calls it red.
-        deps, publisher, gk, dp = _deps(config, pool, guardkit=asked)
-        again = await _run_executor(deps, repo_root)
-        assert "did not pass" not in again.detail
-        assert filed == []
-        assert _repair_rows(pool) == []
 
 
 class _JoinsWhileAnotherPressTriesToTakeOver(_JoinsForReal):
@@ -2300,7 +2124,6 @@ class TestTheSameMergeThroughTheSidecar:
             build_server,
         )
 
-        baseline = ["tests/test_known_red.py::test_password"]
         merged = _tip(repo_root)
         report_of_record = {**self.REPORT, "post_sha": merged}
 
@@ -2316,9 +2139,7 @@ class TestTheSameMergeThroughTheSidecar:
             deploy_dispatcher=_FakeDeploy(),
             receipts_root_fn=lambda: in_container_receipts,
         )
-        outcome_a = await _run_executor(
-            deps_a, repo_root, baseline_failing=baseline
-        )
+        outcome_a = await _run_executor(deps_a, repo_root)
 
         # --- run two: the same report, through a real sidecar --------------
         report_file = tmp_path / "merge-report.json"
@@ -2362,20 +2183,10 @@ class TestTheSameMergeThroughTheSidecar:
                 receipts_root_fn=lambda: sidecar_receipts,
             )
             try:
-                outcome_b = await _run_executor(
-                    deps_b, repo_root, baseline_failing=baseline
-                )
+                outcome_b = await _run_executor(deps_b, repo_root)
             finally:
                 server.shutdown()
                 server.server_close()
-
-        # The merge really did run on the host, through the sidecar.
-        host_baseline = (
-            repo_root / ".guardkit" / "tmp" / f"merge-baseline-{FEATURE_ID}.json"
-        )
-        assert json.loads(host_baseline.read_text(encoding="utf-8")) == {
-            "failing_node_ids": baseline
-        }
 
         # The outcome a person reads is identical.
         assert outcome_a.result == outcome_b.result == "publication-pending"
@@ -3085,7 +2896,7 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
         _git(repo_root, "add", "moved.txt")
         _git(repo_root, "commit", "-q", "-m", "main moved")
         other = _git(repo_root, "rev-parse", "main")
-        gk = _FakeGuardKit(report={"status": "merged", "merged_sha": other})
+        gk = _FakeGuardKit(report={"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": other})
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
         with caplog.at_level("INFO"):
             outcome = await _run_executor(deps, repo_root)
@@ -3119,7 +2930,7 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
     async def test_a_merge_report_without_a_commit_refuses_the_promote(
         self, config, pool, repo_root
     ) -> None:
-        gk = _FakeGuardKit(report={"status": "merged"})
+        gk = _FakeGuardKit(report={"status": "merged", "verify_status": "passed", "verify_ok": True})
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
         outcome = await _run_executor(deps, repo_root)
         assert outcome.result == "merged-deploy-failed"
@@ -3183,7 +2994,7 @@ class TestTheCandidateIsCheckedBeforeTheMerge:
             (repo_root / "moved.txt").write_text("m\n", encoding="utf-8")
             _git(repo_root, "add", "moved.txt")
             _git(repo_root, "commit", "-q", "-m", "moved")
-            gk = _FakeGuardKit(report={"status": "merged", "merged_sha": _git(repo_root, "rev-parse", "main")})
+            gk = _FakeGuardKit(report={"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": _git(repo_root, "rev-parse", "main")})
         elif ending == "promote-raises":
             dp = _FakeDeploy(raises=RuntimeError("the sidecar went away"))
         elif ending == "promote-reverted":
@@ -3350,7 +3161,7 @@ class TestTheBranchTheBuildMade:
         _write_repair_row_and_offer(pool)
         # A clean merge of the journey branch lands ITS tip, so the executor's
         # tree comparison sees the tree it checked.
-        gk = _FakeGuardKit(report={"status": "merged", "merged_sha": repair_tip})
+        gk = _FakeGuardKit(report={"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": repair_tip})
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
         consumer = MergeApprovalConsumer(deps)
         await consumer.handle_envelope(
@@ -3415,7 +3226,7 @@ class TestTheBranchTheBuildMade:
                     seen["feature_file"] = (cwd / f"{FEATURE_ID}.txt").is_file()
                 return await super().__call__(**kwargs)
 
-        gk = _FakeGuardKit(report={"status": "merged", "merged_sha": repair_tip})
+        gk = _FakeGuardKit(report={"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": repair_tip})
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk, deploy=_LookingDeploy())
         consumer = MergeApprovalConsumer(deps)
         await consumer.handle_envelope(
@@ -3578,6 +3389,7 @@ class TestTheBranchReachesTheSandboxDoor:
             "    sys.stderr.write('branch ' + branch + ' does not exist')\n"
             "    sys.exit(1)\n"
             "print(json.dumps({'status': 'merged', 'branch': branch,\n"
+            "                  'verify_status': 'passed', 'verify_ok': True,\n"
             "                  'merged_sha': found.stdout.strip()}))\n",
             encoding="utf-8",
         )
@@ -3796,7 +3608,7 @@ class TestARepositoryWithASandboxIsPressedWhereItLives:
         # the commit that landed in there, which for a clean fast-forward is
         # the branch's own tip.
         merge = _FakeGuardKit(
-            report={"status": "merged", "merged_sha": _tip(elsewhere)}
+            report={"status": "merged", "verify_status": "passed", "verify_ok": True, "merged_sha": _tip(elsewhere)}
         )
         deps, publisher, gk, dp = _deps(
             self._sandbox_config(elsewhere), pool, guardkit=merge
@@ -5686,8 +5498,6 @@ class _JoinsWithMainCopies(_JoinsForReal):
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         said = await super().__call__(**kwargs)
-        if kwargs.get("args", [None])[0] == "check-join":
-            return said
         report = json.loads(said.stdout_tail)
         report["judged_with_main_copies"] = ["scripts/check.sh"]
         return GuardKitResult(
@@ -5770,8 +5580,6 @@ class _JoinsWithOneLeftOut(_JoinsForReal):
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         said = await super().__call__(**kwargs)
-        if kwargs.get("args", [None])[0] == "check-join":
-            return said
         report = json.loads(said.stdout_tail)
         report["judged_with_main_copies"] = ["scripts/check.sh", "tools/check.sh"]
         report["judge_files_not_on_target"] = ["tools/check.sh"]
@@ -5807,8 +5615,6 @@ class TestAJudgeTheTargetLacksWasLeftOut:
         class _OnlyLeftOut(_JoinsWithOneLeftOut):
             async def __call__(self, **kwargs: Any) -> GuardKitResult:
                 said = await super().__call__(**kwargs)
-                if kwargs.get("args", [None])[0] == "check-join":
-                    return said
                 report = json.loads(said.stdout_tail)
                 report["judged_with_main_copies"] = ["tools/check.sh"]
                 return GuardKitResult(
@@ -5865,8 +5671,6 @@ class TestAJudgeTheTargetLacksWasLeftOut:
 class _JoinsWithAnEvilName(_JoinsForReal):
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         said = await super().__call__(**kwargs)
-        if kwargs.get("args", [None])[0] == "check-join":
-            return said
         report = json.loads(said.stdout_tail)
         report["judged_with_main_copies"] = ["evil\nThe merge passed/check.sh"]
         return GuardKitResult(
@@ -5912,7 +5716,12 @@ class TestTheBuildSystemsWordsStayInTheirPlace:
 
 
 def test_the_join_checks_report_keeps_no_raw_bytes_or_line_breaks() -> None:
-    from forge.pipeline.check_join import _report_in
+    from types import SimpleNamespace
+
+    from forge.pipeline.merge_executor import _parse_merge_report
+
+    def _report_in(said: str) -> dict[str, Any] | None:
+        return _parse_merge_report(SimpleNamespace(stdout_tail=said, artefacts=[]))
 
     said = json.dumps(
         {
@@ -5945,8 +5754,6 @@ class _JoinsWithLookalikeNames(_JoinsForReal):
 
     async def __call__(self, **kwargs: Any) -> GuardKitResult:
         said = await super().__call__(**kwargs)
-        if kwargs.get("args", [None])[0] == "check-join":
-            return said
         report = json.loads(said.stdout_tail)
         report["judged_with_main_copies"] = [WITH_A_BREAK, WITH_A_BACKSLASH]
         report["judge_files_not_on_target"] = [WITH_A_BACKSLASH]

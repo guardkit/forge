@@ -775,15 +775,13 @@ class TestNothingHalfCheckedIsEverSent:
         pool: SqliteLifecyclePersistence,  # noqa: F811
         repo_root: Path,  # noqa: F811
     ) -> None:
-        """The press that reuses a join does not re-run them; it says so.
+        """A join whose check never finished is joined and checked again.
 
         Press one is killed after the join is made but before its checks can
         be reported, which is the shape that leaves a joined commit with only
-        one kind of check ever run on it. Press two picks that join up. Since
-        step 1 (24 October 2026, FRG-178) the build system's checks being
-        unavailable is recorded as exactly that and treated as advice: the
-        join is sent, nothing claims those checks passed, and a red result
-        would still block.
+        one kind of check ever run on it. Press two does not send that join:
+        it sets it aside and joins and checks afresh (after-task check
+        redesign, 31 October 2026), and only then sends.
         """
         from tests.forge.pipeline.test_merge_executor import _DiesWhileMerging
 
@@ -810,17 +808,15 @@ class TestNothingHalfCheckedIsEverSent:
         second = await _press(deps_two, repo_root)
 
         assert second.result == "published-deployment-pending", second.detail
-        # THE MERGE COMMAND WAS NOT RUN AGAIN. The only thing asked of the
-        # build system is the check-join question, and the installed one has
-        # no such sub-command: the record says "unavailable", never a pass.
-        assert [call["args"][0] for call in joins_two.calls] == ["check-join"]
+        # The merge command ran again, on a fresh join, and its check passed.
+        assert [call["args"][0] for call in joins_two.calls] == ["merge"]
         merge_checks = [
             line
             for line in _record(pool).lines
             if (line.kind, line.step) == ("done", "merge-checks")
         ]
-        assert merge_checks[-1].detail["verify_ok"] is None
-        assert "autobuild check-join" in merge_checks[-1].detail["unavailable"]
+        assert merge_checks[-1].detail["verify_ok"] is True
+        assert merge_checks[-1].detail["ran_on"] == second.merged_sha
         assert _legs(deploy_two).count("candidate_check") == 1
         assert len(publisher.asked) == 1
 
@@ -883,121 +879,13 @@ class TestThePressAndThePublisherReadTheRecordTheSameWay:
         )
         second = await _press(deps_two, repo_root)
 
-        # The join is picked up, so the merge command is not run again; the one
-        # thing asked is the check-join question, which the installed build
-        # system has no sub-command for, so those checks never run on this
-        # commit at all.
-        assert [call["args"][0] for call in joins_two.calls] == ["check-join"]
-        # The line naming no commit did not count. The press then recorded
-        # the build system's checks as UNAVAILABLE on this commit (step 1,
-        # FRG-178), which both readers take as advice, so it was sent — and
-        # the publisher, reading the same record, agreed.
+        # The line naming no commit did not count, so that join was set aside
+        # and joined and checked again (after-task check redesign, 31 October
+        # 2026), and the new line names its commit — the publisher, reading
+        # the same record, agreed and sent it.
+        assert [call["args"][0] for call in joins_two.calls] == ["merge"]
         assert second.result == "published-deployment-pending", second.detail
         assert len(publisher.asked) == 1
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("publication", ["on", "off"])
-    @pytest.mark.parametrize(
-        "answer, kept",
-        [
-            ("could-not-run", False),
-            ("lost", True),
-            # Codex R6, round 4: a call that raised after it may have been
-            # sent keeps the hold; the door's own refusal, raised before
-            # anything is sent, does not. A timeout keeps it whatever report
-            # survived.
-            ("raised", True),
-            ("refused-before-sending", False),
-            ("timed-out", True),
-        ],
-    )
-    async def test_a_reused_join_whose_checks_could_not_run(
-        self,
-        config_with_publication_off: ForgeConfig,
-        config_with_publication_on: ForgeConfig,
-        pool: SqliteLifecyclePersistence,  # noqa: F811
-        repo_root: Path,  # noqa: F811
-        publication: str,
-        answer: str,
-        kept: bool,
-    ) -> None:
-        """15 October 2026, Codex R6 (settled by default): the second press
-        picks the join up and asks the build system to check it. When the
-        build system ANSWERS that its checks could not run, they are advice
-        (step 1): the join is ready (publication off) or sent (publication
-        on), its candidate's teardown answers that it is down, and the hold
-        is put down. When the check-join's answer is lost (no report of its own),
-        the command may still be running, and the hold is kept."""
-        from forge.adapters.guardkit.models import GuardKitResult
-
-        deps, _deploy, _joins, _bus = _deps_naming_the_candidate(
-            config_with_publication_off, pool
-        )
-        first = await _press(deps, repo_root)
-        assert first.result == "publication-pending"
-        self._forget_which_commit_the_checks_ran_on(pool)
-
-        asked: list[list[str]] = []
-
-        async def _check_join(**kwargs: Any) -> GuardKitResult:
-            from forge.adapters.guardkit.run_via_sidecar import MergeCallRefused
-
-            args = list(kwargs.get("args") or [])
-            asked.append(args)
-            if answer == "raised":
-                raise ConnectionResetError("the check-join's answer was lost")
-            if answer == "refused-before-sending":
-                raise MergeCallRefused("the door carries only the merge command")
-            if answer == "lost":
-                return GuardKitResult(
-                    status="failed",
-                    subcommand="autobuild",
-                    duration_secs=0.1,
-                    stdout_tail="",
-                    stderr="the deploy sidecar could not be reached",
-                    exit_code=1,
-                )
-            report = {
-                "outcome": "checked",
-                "joined_commit": args[args.index("--joined") + 1],
-                "verify_ran": False,
-                "verify_ok": False,
-                "verify_status": "unverified",
-                "verify_detail": "the install failed in the joined tree",
-            }
-            return GuardKitResult(
-                # A complete answer from the build system (15 October 2026).
-                confirmed=answer != "timed-out",
-                status="timeout" if answer == "timed-out" else "failed",
-                subcommand="autobuild",
-                duration_secs=0.1,
-                stdout_tail=json.dumps(report),
-                stderr=None,
-                exit_code=124 if answer == "timed-out" else 1,
-            )
-
-        import dataclasses
-
-        config_two = (
-            config_with_publication_on if publication == "on" else config_with_publication_off
-        )
-        deps_two, deploy_two, _joins_two, _bus_two = _deps_naming_the_candidate(
-            config_two, pool, publisher=_APublisherThatSays([_published("c" * 40)])
-        )
-        deps_two = dataclasses.replace(deps_two, guardkit_run=_check_join)
-        second = await _press(deps_two, repo_root)
-
-        assert [a[0] for a in asked] == ["check-join"]
-        # Step 1 (24 and 25 October 2026, FRG-178): with no answer from the
-        # checks, or an answer saying they could not run, they are
-        # unavailable, which is advice, so with publication on the join is
-        # sent. Only checks that ran and went red hold it back.
-        sent = publication == "on"
-        assert second.result == (
-            "published-deployment-pending" if sent else "publication-pending"
-        ), second.detail
-        assert "candidate_down" in _legs(deploy_two)
-        assert (_record(pool).lease_holder is not None) is kept
 
     @pytest.mark.asyncio
     async def test_a_done_line_naming_this_commit_still_counts(
@@ -1526,58 +1414,12 @@ class TestACommandATakeoverStoppedIsNoDeploy:
         assert _record(pool).result == RESULT_PUBLISHED_DEPLOYMENT_PENDING
 
 
-class _ABuildSystemWithCheckJoin:
-    """An installed build system that HAS the check-join sub-command.
-
-    It answers the merge command exactly as :class:`_JoinsForReal` does — the
-    join is made for real, because reuse is settled by asking git — and
-    answers `check-join` with a report of its own.
-    """
-
-    def __init__(self, *, verify_ok: bool = True, detail: str = "") -> None:
-        self._merges = _JoinsForReal()
-        self.verify_ok = verify_ok
-        self.detail = detail
-        self.calls: list[dict[str, Any]] = []
-
-    async def __call__(self, **kwargs: Any) -> Any:
-        from forge.adapters.guardkit.models import GuardKitResult
-
-        self.calls.append(kwargs)
-        args = list(kwargs.get("args") or [])
-        if not args or args[0] != "check-join":
-            return await self._merges(**kwargs)
-        report = {
-            "outcome": "checked",
-            "joined_commit": args[args.index("--joined") + 1],
-            "verify_ran": True,
-            "verify_ok": self.verify_ok,
-            "verify_status": "passed" if self.verify_ok else "failed",
-            "verify_detail": self.detail or ("" if self.verify_ok else "2 checks went red"),
-            "checks_passed": 3 if self.verify_ok else 1,
-            "checks_total": 3,
-        }
-        return GuardKitResult(
-            # A complete answer from the build system (15 October 2026).
-            confirmed=True,
-            status="success" if self.verify_ok else "failed",
-            subcommand="autobuild",
-            duration_secs=0.1,
-            stdout_tail=json.dumps(report),
-            stderr=None,
-            exit_code=0 if self.verify_ok else 1,
-        )
-
-
-class TestAReusedJoinIsCheckedWhenTheBuildSystemCan:
-    """Item 6, the half that IS built: the press asks, and uses the answer.
-
-    The build system's own checks after a join live inside its merge command,
-    which a press that picked up a join does not run again. The press now asks
-    for a sub-command that checks an already-joined commit. A build system
-    that has it closes the GATED ending by itself; one that has not — every
-    one today — leaves the build gated with that sub-command named.
-    """
+class TestAReusedJoinIsJoinedAndCheckedAgain:
+    """A join an earlier press left without a passing check is not asked
+    about with a `check-join` command (the build system never had one) and
+    is never published as advice: it is set aside under its own name and the
+    join is made and checked afresh (after-task check redesign, 31 October
+    2026)."""
 
     async def _a_join_nobody_checked(
         self, config, pool, repo_root  # noqa: ANN001
@@ -1599,7 +1441,7 @@ class TestAReusedJoinIsCheckedWhenTheBuildSystemCan:
         _the_kept_hold_runs_out(pool)
 
     @pytest.mark.asyncio
-    async def test_a_build_system_that_has_it_is_asked_and_its_pass_is_used(
+    async def test_a_join_whose_check_never_finished_is_joined_and_checked_again(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -1608,31 +1450,15 @@ class TestAReusedJoinIsCheckedWhenTheBuildSystemCan:
         await self._a_join_nobody_checked(config_with_publication_on, pool, repo_root)
 
         publisher = _APublisherThatSays([_published("c" * 40)])
-        build_system = _ABuildSystemWithCheckJoin(verify_ok=True)
-        deps = MergeExecutorDeps(
-            config=config_with_publication_on,
-            pool=pool,
-            pipeline_publisher=_FakePublisher(),
-            guardkit_run=build_system,
-            deploy_dispatcher=_FakeDeploy(),
-            publisher=publisher,
-            what_the_machine_says=EVERY_WALL_STANDS,
+        deps, _deploy, joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=publisher
         )
-
         outcome = await _press(deps, repo_root)
 
-        # It was ASKED, with the feature and the joined commit.
-        asked = [c for c in build_system.calls if c["args"][0] == "check-join"]
-        assert len(asked) == 1
-        assert asked[0]["args"][1] == FEATURE_ID
-        assert asked[0]["args"][2] == "--joined"
-        # The merge command was NOT run again.
-        assert [c["args"][0] for c in build_system.calls].count("merge") == 0
-        # ...and both kinds of check have now run on it, so it was published.
+        # The merge command ran once more and nothing else was asked.
+        assert [c["args"][0] for c in joins.calls] == ["merge"]
         assert outcome.result == "published-deployment-pending", outcome.detail
-        assert publisher.asked != []
-        assert "It is NOT yet checked" not in outcome.detail
-        # The record carries the answer as a merge-checks line on this J.
+        assert len(publisher.asked) == 1
         lines = json.loads(
             pool.connection.execute(
                 "SELECT lines_json FROM publication_records WHERE build_id = ?",
@@ -1644,15 +1470,18 @@ class TestAReusedJoinIsCheckedWhenTheBuildSystemCan:
             for line in lines
             if line.get("kind") == "done" and line.get("step") == "merge-checks"
         ]
-        assert checked, "the answer was not written down"
-        assert checked[-1]["detail"]["verify_ok"] is True
-        assert checked[-1]["detail"]["ran_on"] == outcome.merged_sha
-        assert (
-            checked[-1]["detail"]["asked_the_build_system_about_a_reused_join"] is True
+        assert len(checked) == 1
+        assert checked[0]["detail"]["verify_ok"] is True
+        assert checked[0]["detail"]["ran_on"] == outcome.merged_sha
+        assert any(
+            line.get("kind") == "done"
+            and line.get("step") == "join"
+            and (line.get("detail") or {}).get("set_aside") is True
+            for line in lines
         )
 
     @pytest.mark.asyncio
-    async def test_a_build_system_that_has_it_and_says_red_is_not_published(
+    async def test_a_rejoin_whose_check_does_not_pass_is_not_published(
         self,
         config_with_publication_on: ForgeConfig,
         pool: SqliteLifecyclePersistence,  # noqa: F811
@@ -1661,23 +1490,21 @@ class TestAReusedJoinIsCheckedWhenTheBuildSystemCan:
         await self._a_join_nobody_checked(config_with_publication_on, pool, repo_root)
 
         publisher = _APublisherThatSays([_published("c" * 40)])
-        build_system = _ABuildSystemWithCheckJoin(verify_ok=False)
-        deps = MergeExecutorDeps(
-            config=config_with_publication_on,
-            pool=pool,
-            pipeline_publisher=_FakePublisher(),
-            guardkit_run=build_system,
-            deploy_dispatcher=_FakeDeploy(),
-            publisher=publisher,
-            what_the_machine_says=EVERY_WALL_STANDS,
+        deps, _deploy, joins, _bus = _deps(
+            config_with_publication_on, pool, publisher=publisher
         )
-
+        joins.verify_ok = False
+        joins.verify_status = "unverified"
+        joins.verify_detail = "eslint: not found"
         outcome = await _press(deps, repo_root)
 
+        assert [c["args"][0] for c in joins.calls] == ["merge"]
         assert outcome.result == "merged-verify-failed"
         assert outcome.status == "FAILED"
-        assert "did not pass" in outcome.detail
-        assert "Nothing was published" in outcome.detail
+        assert (
+            "the check did not pass: it could not run (eslint: not found). "
+            "Nothing was published." in outcome.detail
+        )
         assert publisher.asked == []
 
 

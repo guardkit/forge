@@ -37,7 +37,6 @@ def _defaults() -> list[tuple[str, Any]]:
     from forge.deploy.stage import DeployStageResult
     from forge.deploy_sidecar.deploy_executor import ExecutorAnswer
     from forge.executor.programs import RaisedWhileRunning, TimedOut
-    from forge.pipeline.check_join import CheckJoinAnswer
     from forge.pipeline.merge_join import JoinOutcome
 
     return [
@@ -53,7 +52,6 @@ def _defaults() -> list[tuple[str, Any]]:
             "GuardKitResult",
             GuardKitResult(status="success", subcommand="x", duration_secs=0, exit_code=0),
         ),
-        ("CheckJoinAnswer", CheckJoinAnswer(ran=True, passed=True, sentence="s")),
         ("LiveGateInvocation", LiveGateInvocation(verdict="pass", run_id="r")),
         ("NoAnswer", NoAnswer("s")),
         ("TimedOut", TimedOut(124, "")),
@@ -119,9 +117,6 @@ ALLOWED: dict[str, dict[str, str]] = {
         "_slot_with_no_note": "the request refused before anything was started",
         "_confirm_with_the_coordinator": "the request refused before anything was started",
         "_start": "the request refused before the command was started",
-    },
-    "pipeline/check_join.py": {
-        "ask_the_build_system_to_check_the_join": "the door refused (MergeCallRefused) before anything was sent",
     },
     "pipeline/merge_executor.py": {
         "execute_merge_deploy": "the retained worktree kept by the press's own decision: nothing touched",
