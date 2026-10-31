@@ -1423,8 +1423,9 @@ class TestExecutorSequencing:
         assert "checked and ready to publish" in outcome.detail
         assert "advice:" not in outcome.detail
         # The merge command ran once more, on a fresh join of its own name.
+        # (Its commit can equal the left one: same parents, same tree, same
+        # second. The record below says which attempt made it.)
         assert [call["args"][0] for call in joiner.calls] == ["merge"]
-        assert outcome.merged_sha != j_left
         # The left-behind join is kept, not deleted.
         assert (
             _git(repo_root, "rev-parse", f"factory-integration/{FEATURE_ID}")
