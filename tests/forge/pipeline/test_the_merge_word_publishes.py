@@ -53,6 +53,7 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     FEATURE_ID,
     MAIN_SHA,
     REPO,
+    SANDBOX_PROFILE,
     ASidecarThat,
     _ensure_build,
     _FakeDeploy,
@@ -61,7 +62,11 @@ from tests.forge.pipeline.test_merge_executor import (  # noqa: F401 - fixtures
     _JoinsForReal,
     _legs,
     _receipts_env,
+    _repair_rows,
+    _report_rows,
     _the_kept_hold_runs_out,
+    _utcnow,
+    _write_deploy_profile,
     pool,
     repo_root,
 )
@@ -2812,3 +2817,241 @@ class TestALiveCheckThatCouldNotRunIsAdvice:
         assert outcome.result == "candidate-refused"
         assert outcome.status == "FAILED"
         assert publisher.asked == []
+
+
+# ---------------------------------------------------------------------------
+# The deploy half, through the publication path (31 October 2026)
+# ---------------------------------------------------------------------------
+
+
+class _APromoteThatRaises(_AProjectWithATarget):
+    """A promote leg whose dispatch raises: nothing says the candidate came
+    down, so the press's own clean-up has to take it down."""
+
+    def __init__(self, error: BaseException) -> None:
+        super().__init__()
+        self.error = error
+
+    async def __call__(self, **kwargs: Any) -> Any:
+        if kwargs.get("leg") == "promote":
+            self.calls.append(kwargs)
+            raise self.error
+        return await super().__call__(**kwargs)
+
+
+class TestTheDeployHalf:
+    """Moved here from ``test_merge_executor.py`` on 31 October 2026, where
+    they had been skipped since 22 September because "the publisher and the
+    executor are the next two stages". Both stages are built, so each one is
+    driven through them now: publication switched on, the publisher's answer,
+    the target asked what is running, and the promote. A deploy that did not
+    put what was checked live ends "merged-deploy-failed" (the remote has the
+    work; the old local word "merged-deploy-reverted" is no longer produced).
+    """
+
+    @staticmethod
+    def _deps(config: ForgeConfig, pool: Any, deploy: Any) -> MergeExecutorDeps:
+        return _deps_that_can_deploy(
+            config,
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=deploy,
+        )
+
+    @pytest.mark.asyncio
+    async def test_deploy_reverted_reports_honestly(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        deploy = _APromoteThatReverted(revert_worked=True)
+        outcome = await _press(
+            self._deps(config_with_publication_on, pool, deploy), repo_root
+        )
+        assert outcome.result == "merged-deploy-failed", outcome.detail
+        assert outcome.status == "FAILED"
+        assert outcome.failed_step == "deploy"
+        # Said, not softened: the work is on the remote and NOT running, and
+        # the reason names the revert.
+        assert "is on the remote, but it is NOT running" in outcome.detail
+        assert "did not finish (reverted)" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_deploy_raise_is_caught_and_reported(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        deploy = _APromoteThatRaises(ValueError("sidecar surface needs a target_repo"))
+        outcome = await _press(
+            self._deps(config_with_publication_on, pool, deploy), repo_root
+        )
+        assert outcome.result == "merged-deploy-failed", outcome.detail
+        assert outcome.failed_step == "deploy"
+        assert "raised (ValueError: sidecar surface needs a target_repo)" in outcome.detail
+
+    @pytest.mark.asyncio
+    async def test_the_candidate_comes_down_when_the_promote_raises(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        deploy = _APromoteThatRaises(RuntimeError("the sidecar went away"))
+        outcome = await _press(
+            self._deps(config_with_publication_on, pool, deploy), repo_root
+        )
+        assert outcome.result == "merged-deploy-failed", outcome.detail
+        assert outcome.failed_step == "deploy"
+        assert "RuntimeError: the sidecar went away" in outcome.detail
+        # The promote never said the candidate came down, so the press's own
+        # clean-up took it down after it.
+        assert _legs(deploy) == [
+            "candidate_check",
+            "what_is_running",
+            "promote",
+            "candidate_down",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_a_red_report_is_recorded_with_its_red_word(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        deploy = _APromoteThatReverted(revert_worked=True)
+        outcome = await _press(
+            self._deps(config_with_publication_on, pool, deploy), repo_root
+        )
+        assert outcome.result == "merged-deploy-failed"
+
+        rows = _report_rows(pool)
+        assert len(rows) == 1
+        assert rows[0].status == "FAILED"
+        assert rows[0].details["result"] == "merged-deploy-failed"
+
+    @pytest.mark.asyncio
+    async def test_a_reverted_deploy_still_files_a_repair(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        deploy = _APromoteThatReverted(revert_worked=True)
+        outcome = await _press(
+            self._deps(config_with_publication_on, pool, deploy), repo_root
+        )
+        assert outcome.result == "merged-deploy-failed"
+        assert len(_repair_rows(pool)) == 1
+
+    @pytest.mark.asyncio
+    async def test_a_revert_still_says_where_it_ran(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        _write_deploy_profile(repo_root, SANDBOX_PROFILE)
+        deploy = _APromoteThatReverted(revert_worked=True)
+        outcome = await _press(
+            self._deps(config_with_publication_on, pool, deploy), repo_root
+        )
+        assert outcome.result == "merged-deploy-failed"
+        assert outcome.deployed_in == "docker-sandbox"
+
+    @pytest.mark.asyncio
+    async def test_the_self_closed_defect_rate_counts_a_real_green_run(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+    ) -> None:
+        """The two ends meet: what the executor writes is what M5 reads.
+
+        A repair row, its build, Rich's merge-ready card, and then a real
+        run of the executor through publication and the deploy — no seeded
+        report row anywhere — reads 1 of 1.
+        """
+        from forge.lifecycle.metrics import (
+            MERGE_READY_TARGET_IDENTIFIER,
+            self_closed_defect_rate,
+        )
+        from forge.lifecycle.persistence import StageLogEntry
+
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        correlation_id = f"corr-{BUILD_ID}"  # what _ensure_build gives the build
+        pool.connection.execute(
+            "INSERT INTO work_queue (sentence, target_repo, kind, status, rank,"
+            " originating_user, correlation_id, queued_at) VALUES"
+            " (?, ?, 'fix', 'ADMITTED', 1.0, 'rich', ?, '2026-09-05T09:00:00+00:00')",
+            ("The merge of FEAT-MX1 went red.", REPO, correlation_id),
+        )
+        pool.connection.commit()
+        now = _utcnow()
+        pool.record_stage(
+            StageLogEntry(
+                build_id=BUILD_ID,
+                stage_label="the merge-ready checkpoint",
+                target_kind="local_tool",
+                target_identifier=MERGE_READY_TARGET_IDENTIFIER,
+                status="GATED",
+                started_at=now,
+                completed_at=now,
+                duration_secs=0.0,
+                details={"merge_ready": {"gates": "green"}},
+            )
+        )
+        assert self_closed_defect_rate(pool.connection) == (0, 1)
+
+        outcome = await _press(
+            self._deps(config_with_publication_on, pool, _ADeployStepThatSays()),
+            repo_root,
+        )
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+
+        assert self_closed_defect_rate(pool.connection) == (1, 1)
+
+    @pytest.mark.asyncio
+    async def test_merged_and_running_retires_nested_then_outer(
+        self,
+        config_with_publication_on: ForgeConfig,
+        pool: SqliteLifecyclePersistence,  # noqa: F811
+        repo_root: Path,  # noqa: F811
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        _receipts_env: Path,  # noqa: F811
+    ) -> None:
+        from tests.forge.pipeline import test_merge_executor as executor_tests
+
+        identity, outer, inner, sha, tree = (
+            executor_tests.TestRetainedAutobuildWorktreeEndOfLifecycle._retained(
+                repo_root, tmp_path, monkeypatch
+            )
+        )
+        _ensure_build(pool, build_id=BUILD_ID, feature_id=FEATURE_ID)
+        deps = self._deps(config_with_publication_on, pool, _ADeployStepThatSays())
+
+        outcome = await execute_merge_deploy(
+            deps=deps,
+            build_id=BUILD_ID,
+            feature_id=FEATURE_ID,
+            repo=REPO,
+            repo_root=repo_root,
+            expect_main_sha=MAIN_SHA,
+            correlation_id=CORRELATION,
+            decided_by="rich",
+            expected_candidate_sha=sha,
+            expected_candidate_tree=tree,
+            worktree_retention=identity,
+        )
+
+        assert outcome.result == "merged-into-the-remote-and-running", outcome.detail
+        assert not outer.exists() and not inner.exists()
+        receipt = json.loads(
+            (_receipts_env / f"merge-{BUILD_ID}/autobuild_worktree_cleanup.json")
+            .read_text()
+        )
+        assert receipt["status"] == "removed"

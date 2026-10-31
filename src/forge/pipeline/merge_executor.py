@@ -5197,6 +5197,10 @@ async def execute_merge_deploy(
                 f"but it is NOT running: {why}. Nothing claims to be running "
                 "that has not been shown to be."
             ),
+            # THE DEPLOY RAN, SO WHERE IT RAN IS SAID (31 October 2026): a
+            # failed or reverted deploy in a Docker Sandbox ran in there, as
+            # a green one does, and the card says so.
+            deployed_in=_deployed_in(),
             gate_before_merge=_gate_for_report() if gate_began else None,
         )
 

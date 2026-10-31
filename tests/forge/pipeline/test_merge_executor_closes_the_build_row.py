@@ -115,6 +115,28 @@ def config(repo_root: Path) -> ForgeConfig:
     )
 
 
+def _config_with_publication_on(repo_root: Path) -> ForgeConfig:
+    """The same configuration with publication switched on, so the press
+    sends the joined result to the remote and then deploys it."""
+    return ForgeConfig.model_validate(
+        {
+            "permissions": {"filesystem": {"allowlist": ["/tmp"]}},
+            "planning": {
+                "target_repo_paths": {REPO: str(repo_root)},
+                "fetch_addresses": {REPO: origin_of(repo_root)},
+            },
+            "approval": {"expected_approver": "rich"},
+            "merge_executor": {"enabled": True},
+            "publication": {
+                "enabled": True,
+                "publisher_url": "http://127.0.0.1:1",
+                "builds_may_run_inside_the_coordinator": False,
+                "publisher_credential_file": "/etc/forge-publisher/credential",
+            },
+        }
+    )
+
+
 @pytest.fixture(autouse=True)
 def receipts_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     root = tmp_path / "receipts"
@@ -307,28 +329,32 @@ class TestEveryRefusalClosesTheRowWithItsOwnSentence:
         assert row.status is BuildState.COMPLETE
         assert MERGE_STEP_MERGE_TARGET_IDENTIFIER in _stage_ids(pool, BUILD_ID)
 
-    @pytest.mark.skip(
-        reason=(
-            "the publisher and the executor are the next two stages: while "
-            "publication is switched off the press stops at \"checked and ready "
-            "to publish\", so nothing is sent and nothing is deployed, and this "
-            "test drives the deploy half. It comes back with that stage."
-        )
-    )
     @pytest.mark.asyncio
     async def test_a_merge_that_landed_and_then_went_red_is_also_closed(
-        self, config, pool, repo_root
+        self, pool, repo_root
     ) -> None:
-        """The merge landed and the live checks failed: the journey did not
-        deliver, so the row says FAILED and carries the same words."""
+        """The merge landed on the remote and the deploy after it reverted: the
+        journey did not deliver, so the row says FAILED and carries the same
+        words. Driven through publication and the deploy (31 October 2026;
+        skipped since 22 September while those stages were not built)."""
+        from tests.forge.pipeline.test_the_merge_word_publishes import (
+            _APromoteThatReverted,
+            _APublisherThatSays,
+            _deps_that_can_deploy,
+            _published,
+        )
+
         _seed_build(pool)
-        deps, publisher, gk, dp = _deps(
-            config, pool, deploy=_FakeDeploy(outcome="reverted", verdict="fail")
+        deps = _deps_that_can_deploy(
+            _config_with_publication_on(repo_root),
+            pool,
+            publisher=_APublisherThatSays([_published("c" * 40)]),
+            deploy=_APromoteThatReverted(revert_worked=True),
         )
 
         outcome = await _press(deps, repo_root)
 
-        assert outcome.result == "merged-deploy-reverted"
+        assert outcome.result == "merged-deploy-failed", outcome.detail
         row = _row(pool)
         assert row.status is BuildState.FAILED
         assert row.error == outcome.detail

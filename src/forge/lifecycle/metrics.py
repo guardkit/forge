@@ -91,12 +91,21 @@ MERGED_AND_RUNNING: str = "merged-and-running"
 # stops at "checked and ready to publish" while publication is switched off,
 # and its result word is ``publication-pending``. This constant is still the
 # right reading of every row written BEFORE that change, which is what this
-# metric counts over, so it stays; a rate measured over a window after the
-# change will read zero until the publisher and the executor are built, and
-# that is honest rather than broken. When they are, the word this reads
-# becomes ``merged-into-github-and-running``
-# (``forge.pipeline.merge_executor.RESULT_WORD_MERGED_AND_RUNNING``) and this
-# line is the one place that has to learn it.
+# metric counts over, so it stays.
+
+#: The same ending as the press words it now that the publisher and the
+#: deploy are built: the joined commit is on the remote and what was checked
+#: is running (``forge.pipeline.merge_executor.RESULT_WORD_MERGED_AND_RUNNING``,
+#: kept equal by a test). Learned 31 October 2026, when the test that drives a
+#: real green press through this metric was brought back: until then this
+#: metric could only read zero for any repair closed after 22 September.
+MERGED_INTO_THE_REMOTE_AND_RUNNING: str = "merged-into-the-remote-and-running"
+
+#: Every word that means the repair closed itself, old and new.
+SELF_CLOSED_WORDS: tuple[str, ...] = (
+    MERGED_AND_RUNNING,
+    MERGED_INTO_THE_REMOTE_AND_RUNNING,
+)
 
 
 #: Every repair row inside the window that somebody has not withdrawn.
@@ -131,7 +140,7 @@ SELECT COUNT(*)
              ON report.build_id = b.build_id
             AND report.stage_label = ?
             AND report.target_identifier = ?
-            AND json_extract(report.details_json, '$.result') = ?
+            AND json_extract(report.details_json, '$.result') IN (?, ?)
             AND (
                   report.started_at > gate.started_at
                   OR (report.started_at = gate.started_at
@@ -185,7 +194,7 @@ def self_closed_defect_rate(pool: Any, since: str = M5_SINCE) -> tuple[int, int]
                 MERGE_READY_TARGET_IDENTIFIER,
                 MERGE_REPORT_STAGE_LABEL,
                 MERGE_REPORT_TARGET_IDENTIFIER,
-                MERGED_AND_RUNNING,
+                *SELF_CLOSED_WORDS,
             ),
         ).fetchone()[0]
     )
@@ -196,9 +205,11 @@ __all__ = [
     "DENOMINATOR_SQL",
     "M5_SINCE",
     "MERGED_AND_RUNNING",
+    "MERGED_INTO_THE_REMOTE_AND_RUNNING",
     "MERGE_READY_TARGET_IDENTIFIER",
     "MERGE_REPORT_STAGE_LABEL",
     "MERGE_REPORT_TARGET_IDENTIFIER",
     "NUMERATOR_SQL",
+    "SELF_CLOSED_WORDS",
     "self_closed_defect_rate",
 ]

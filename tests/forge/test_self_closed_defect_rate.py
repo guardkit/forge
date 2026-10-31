@@ -286,6 +286,32 @@ class TestTheRate:
 
         assert self_closed_defect_rate(cx) == (1, 2)
 
+    def test_the_press_s_current_green_word_counts_too(
+        self, cx: sqlite3.Connection
+    ) -> None:
+        """31 October 2026: since the publisher and the deploy were built, a
+        repair that closed itself ends "merged into the remote and running".
+        The rate reads that word as well as the old one."""
+        from forge.lifecycle.metrics import MERGED_INTO_THE_REMOTE_AND_RUNNING
+        from forge.pipeline.merge_executor import RESULT_WORD_MERGED_AND_RUNNING
+
+        assert MERGED_INTO_THE_REMOTE_AND_RUNNING == RESULT_WORD_MERGED_AND_RUNNING
+        correlation_id = "fix-build-FEAT-NEW1-20261031090000"
+        file_repair_row(cx, correlation_id=correlation_id, queued_at=INSIDE)
+        repair_build = "build-FEAT-NEW1-20261031090000-repair"
+        open_build(cx, build_id=repair_build, correlation_id=correlation_id)
+        merge_ready_card(cx, repair_build, at=f"{INSIDE[:11]}10:00:00+00:00")
+        record_stage(
+            cx,
+            build_id=repair_build,
+            stage_label=MERGE_REPORT_STAGE_LABEL,
+            target_identifier=MERGE_REPORT_TARGET_IDENTIFIER,
+            at=f"{INSIDE[:11]}10:05:00+00:00",
+            status="PASSED",
+            details={"result": MERGED_INTO_THE_REMOTE_AND_RUNNING},
+        )
+        assert self_closed_defect_rate(cx) == (1, 1)
+
     def test_the_drive_era_mode_c_builds_are_not_queue_rows_at_all(
         self, cx: sqlite3.Connection
     ) -> None:

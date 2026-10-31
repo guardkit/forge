@@ -649,7 +649,7 @@ class TestTheRedMergeHook:
         allow_local_remotes(monkeypatch, tmp_path / "factory-fetch-copies")
 
     @staticmethod
-    def _config(repo_root: Path) -> Any:
+    def _config(repo_root: Path, *, publication_on: bool = False) -> Any:
         from forge.config.models import ForgeConfig
         from tests.forge.recorded_fetch_address import origin_of
 
@@ -666,6 +666,20 @@ class TestTheRedMergeHook:
                 },
                 "approval": {"expected_approver": "rich"},
                 "merge_executor": {"enabled": True},
+                **(
+                    {
+                        "publication": {
+                            "enabled": True,
+                            "publisher_url": "http://127.0.0.1:1",
+                            "builds_may_run_inside_the_coordinator": False,
+                            "publisher_credential_file": (
+                                "/etc/forge-publisher/credential"
+                            ),
+                        }
+                    }
+                    if publication_on
+                    else {}
+                ),
             }
         )
 
@@ -705,6 +719,7 @@ class TestTheRedMergeHook:
         *,
         deploy_outcome: str | None = "reverted",
         dry_run: bool = False,
+        publication_on: bool = False,
     ) -> Any:
         from forge.adapters.guardkit.models import GuardKitResult
         from forge.pipeline.merge_executor import (
@@ -807,6 +822,29 @@ class TestTheRedMergeHook:
                 f"{repo}::live", _a_project_that_declares_its_identity()
             ),
         )
+        if publication_on:
+            # THE CURRENT PATH TO A DEPLOY (31 October 2026): publication
+            # switched on, the publisher's answer, the target asked what is
+            # running, and a promote whose check after the deploy failed and
+            # was reverted.
+            import dataclasses
+
+            from forge.pipeline.deployment_lock import DeploymentLockStore
+            from tests.forge.pipeline.test_the_merge_word_publishes import (
+                EVERY_WALL_STANDS,
+                _APromoteThatReverted,
+                _APublisherThatSays,
+                _published,
+            )
+
+            deps = dataclasses.replace(
+                deps,
+                config=self._config(repo_root, publication_on=True),
+                deploy_dispatcher=_APromoteThatReverted(revert_worked=True),
+                publisher=_APublisherThatSays([_published("c" * 40)]),
+                what_the_machine_says=EVERY_WALL_STANDS,
+                deployment_lock=lambda: DeploymentLockStore(pool.connection),
+            )
         outcome = await execute_merge_deploy(
             deps=deps,
             build_id=self.MERGE_BUILD,
@@ -820,25 +858,24 @@ class TestTheRedMergeHook:
         )
         return outcome, published
 
-    @pytest.mark.skip(
-        reason=(
-            "while publication is switched off the press stops at \"checked and "
-            "ready to publish\": nothing is deployed, so there is no reverted "
-            "deploy to file a repair for. It comes back with the executor stage."
-        )
-    )
     def test_a_reverted_deploy_files_a_repair_row(
         self, pool: SqliteLifecyclePersistence, tmp_path: Path, receipts: Path
     ) -> None:
-        outcome, published = asyncio.run(self._run(pool, tmp_path))
+        """The merge landed on the remote and the deploy after it was reverted:
+        one repair row. (Skipped from 22 September until publication and the
+        deploy were built; driven through them since 31 October 2026, where
+        that ending is called "merged-deploy-failed".)"""
+        outcome, published = asyncio.run(
+            self._run(pool, tmp_path, publication_on=True)
+        )
 
-        assert outcome.result == "merged-deploy-reverted"
+        assert outcome.result == "merged-deploy-failed", outcome.detail
         assert published and published[0].status == "FAILED"
         rows = queue_rows(pool)
         assert len(rows) == 1
         assert rows[0]["kind"] == "fix"
         assert rows[0]["correlation_id"] == fix_correlation_id(self.MERGE_BUILD)
-        assert "merged-deploy-reverted" in str(rows[0]["sentence"])
+        assert "merged-deploy-failed" in str(rows[0]["sentence"])
 
     def test_a_green_merge_files_nothing(
         self, pool: SqliteLifecyclePersistence, tmp_path: Path, receipts: Path
