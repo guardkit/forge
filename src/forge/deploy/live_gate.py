@@ -697,6 +697,10 @@ class RepoDriverLiveGateInvoker:
                 declared=self._launch_settings,
                 overlay=self._extra_env,
                 repository=self._repository,
+                # NAMED EXCEPTION (31 October 2026): the live gate is factory
+                # tooling the project's script calls, and it imports GuardKit's
+                # live_gate library, which lives only in the factory's Python.
+                keep_factory_python=True,
             )
         except (OSError, ValueError) as exc:
             # The driver's environment was refused (a credential-shaped

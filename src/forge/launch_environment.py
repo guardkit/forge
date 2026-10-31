@@ -94,6 +94,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+import sys
 from pathlib import Path
 from typing import TYPE_CHECKING, Iterable, Mapping, Sequence
 
@@ -122,6 +123,7 @@ __all__ = [
     "SETTINGS_DELIBERATELY_NOT_PASSED",
     "build_launch_env",
     "build_project_command_env",
+    "factory_python_folders",
     "declared_settings_not_set",
     "minimal_environment_note",
     "project_program_note",
@@ -947,6 +949,35 @@ def _carries_a_factory_value(
     return None
 
 
+def factory_python_folders() -> tuple[str, ...]:
+    """The folders on PATH that hold the factory's OWN Python and its packages.
+
+    That is the bin folder of the virtual environment this process runs from
+    (``/opt/venv/bin`` in the image), and nothing when it runs from no virtual
+    environment. A project's own commands do not get it (31 October 2026,
+    Rich: "Hidden Python defaults: I don't want any more hidden surprises"):
+    with it first on PATH, a project that never declared Python still ran the
+    factory's ``python``, ``pip`` and ``pytest``, and a verdict could depend
+    on what the factory happened to have installed.
+    """
+    if sys.prefix == sys.base_prefix:
+        return ()
+    return (os.path.realpath(os.path.join(sys.prefix, "bin")),)
+
+
+def _without_factory_python(path: str) -> str:
+    """``path`` with the factory's own Python folders taken out, order kept."""
+    dropped = set(factory_python_folders())
+    if not dropped:
+        return path
+    kept = [
+        entry
+        for entry in path.split(os.pathsep)
+        if not entry or os.path.realpath(entry) not in dropped
+    ]
+    return os.pathsep.join(kept)
+
+
 def build_project_command_env(
     work_folder: Path | str,
     *,
@@ -957,6 +988,7 @@ def build_project_command_env(
     run_owner: str | None = None,
     parent: Mapping[str, str] | None = None,
     repository: Path | str | None = None,
+    keep_factory_python: bool = False,
 ) -> dict[str, str]:
     """The whole environment for one of a project's own programs.
 
@@ -968,7 +1000,10 @@ def build_project_command_env(
     Built from an empty dictionary, in this order, each step working on the
     one before:
 
-    1. **The base:** ``PATH`` from ``parent``; ``HOME`` and ``TMPDIR`` set to
+    1. **The base:** ``PATH`` from ``parent``, without the factory's own
+       Python folders (:func:`factory_python_folders`) unless the caller
+       passes ``keep_factory_python=True`` and says why at the call site;
+       ``HOME`` and ``TMPDIR`` set to
        private folders under ``<git directory>/forge-project-home``; ``LANG``,
        ``LC_ALL`` and ``LC_*`` when set; the eight proxy names when set; and
        the names the project ``declared`` (``launch.settings``), when set and
@@ -1013,7 +1048,11 @@ def build_project_command_env(
     # Step 1: the base, from an empty dictionary.
     env: dict[str, str] = {}
     if "PATH" in source:
-        env["PATH"] = str(source["PATH"])
+        env["PATH"] = (
+            str(source["PATH"])
+            if keep_factory_python
+            else _without_factory_python(str(source["PATH"]))
+        )
     for name, value in source.items():
         if name in ("LANG", "LC_ALL") or name.startswith("LC_"):
             env[name] = str(value)

@@ -742,6 +742,157 @@ class TestEveryOtherProjectProgram:
 
 
 # ---------------------------------------------------------------------------
+# The factory's own Python stays out of a project's commands, except the live
+# gate (31 October 2026, Rich: "Hidden Python defaults: I don't want any more
+# hidden surprises"). The live gate is the one named exception: it is factory
+# tooling the project's script calls, and it imports GuardKit's live_gate
+# library, which lives only in the factory's Python.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def factory_python(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> str:
+    """This process runs from a virtual environment, as the image's does from
+    /opt/venv, and that environment's bin folder is first on PATH."""
+    venv = tmp_path / "factory-venv"
+    (venv / "bin").mkdir(parents=True)
+    monkeypatch.setattr(sys, "prefix", str(venv))
+    monkeypatch.setattr(sys, "base_prefix", str(tmp_path / "system-python"))
+    folder = str(venv / "bin")
+    monkeypatch.setenv("PATH", f"{folder}{os.pathsep}{os.environ['PATH']}")
+    return folder
+
+
+def _on_path(given: dict[str, str]) -> list[str]:
+    return [os.path.realpath(p) for p in given.get("PATH", "").split(os.pathsep) if p]
+
+
+class TestTheFactorysOwnPythonStaysOut:
+    def test_the_helper_drops_it_unless_a_caller_keeps_it(
+        self, project: Path, factory_python: str
+    ) -> None:
+        from forge.launch_environment import (
+            build_project_command_env,
+            factory_python_folders,
+        )
+
+        assert factory_python_folders() == (os.path.realpath(factory_python),)
+        dropped = build_project_command_env(project, repository=project)
+        assert os.path.realpath(factory_python) not in _on_path(dropped)
+        # Everything else on PATH is kept, in order.
+        rest = [p for p in os.environ["PATH"].split(os.pathsep) if p != factory_python]
+        assert dropped["PATH"].split(os.pathsep) == rest
+        kept = build_project_command_env(
+            project, repository=project, keep_factory_python=True
+        )
+        assert kept["PATH"] == os.environ["PATH"]
+
+    def test_the_deploy_script_does_not_get_it(
+        self, project: Path, factory_python: str
+    ) -> None:
+        from forge.executor.shell_steps import _run_script_step
+
+        exit_code, output = _run_script_step(
+            cwd=str(project),
+            script="deploy/deploy.sh",
+            env_file=None,
+            launch_settings=[DECLARED],
+        )
+        assert exit_code == 0, output
+        assert os.path.realpath(factory_python) not in _on_path(_given(project, "deploy"))
+
+    def test_the_owned_deploy_does_not_get_it(
+        self, project: Path, tmp_path: Path, factory_python: str
+    ) -> None:
+        from forge.deploy_sidecar.deploy_executor import DeployExecutor, DeployRequest
+
+        env = DeployExecutor(notes_root=tmp_path / "notes")._child_environment(
+            DeployRequest(
+                target="shop-live",
+                target_counter=3,
+                build=BUILD,
+                cwd=str(project),
+                script="deploy/deploy.sh",
+                env_file="/the/project/.env",
+                extra_env={},
+                launch_settings=(DECLARED,),
+                identity="shop:abc123",
+                identity_setting="DEPLOY_IDENTITY",
+                artifact="sha256:" + "0" * 64,
+                artifact_setting="DEPLOY_ARTIFACT",
+            )
+        )
+        assert os.path.realpath(factory_python) not in _on_path(env)
+
+    def test_the_declared_test_does_not_get_it(
+        self, project: Path, factory_python: str
+    ) -> None:
+        from forge.cli._serve_conductor import _run_declared_command
+
+        exit_code, detail = _run_declared_command(
+            command=str(project / "deploy" / "test.sh"),
+            cwd=project,
+            timeout_seconds=60,
+        )
+        assert exit_code == 0, detail
+        assert os.path.realpath(factory_python) not in _on_path(_given(project, "test"))
+
+    def test_the_declared_test_through_the_helper_does_not_get_it(
+        self,
+        helper: tuple[Any, str],
+        project: Path,
+        toolchain_loader: ModuleType,
+        factory_python: str,
+    ) -> None:
+        from forge.cli._serve_conductor import run_declared_command_in_sandbox
+
+        _server, url = helper
+        tree = project / ".forge" / "worktrees" / "journey-1"
+        tree.mkdir(parents=True)
+        exit_code, detail = run_declared_command_in_sandbox(
+            command=str(project / "deploy" / "test.sh"),
+            cwd=tree,
+            timeout_seconds=60,
+            sandbox=SimpleNamespace(name="shop-sbx", sidecar_url=url),
+            repo=REPO,
+            launch_settings=[DECLARED],
+            by_hand=True,
+        )
+        assert exit_code == 0, detail
+        assert os.path.realpath(factory_python) not in _on_path(_given(tree, "test"))
+
+    def test_the_live_gate_keeps_it(self, project: Path, factory_python: str) -> None:
+        from forge.deploy.live_gate import RepoDriverLiveGateInvoker
+
+        outcome = RepoDriverLiveGateInvoker(
+            repo_path=project,
+            driver_argv=[str(project / "deploy" / "journey.sh")],
+            timeout_seconds=60,
+        ).invoke(feature=FEATURE, target="candidate")
+        assert outcome.verdict == "pass", outcome.detail
+        assert os.path.realpath(factory_python) in _on_path(_given(project, "journey"))
+
+    def test_the_live_gate_through_the_helper_keeps_it(
+        self, helper: tuple[Any, str], project: Path, factory_python: str
+    ) -> None:
+        from forge.deploy.live_gate import SidecarLiveGateInvoker
+
+        _server, url = helper
+        outcome = SidecarLiveGateInvoker(
+            base_url=url,
+            repo=REPO,
+            repo_path=project,
+            driver_argv=["deploy/journey.sh"],
+            timeout_seconds=60,
+            extra_env={ALLOWED_NAME: ALLOWED_VALUE},
+            launch_settings=[DECLARED],
+            by_hand=True,
+        ).invoke(feature=FEATURE, target="candidate")
+        assert outcome.verdict == "pass", outcome.detail
+        assert os.path.realpath(factory_python) in _on_path(_given(project, "journey"))
+
+
+# ---------------------------------------------------------------------------
 # The review preview's issued values (R4): one narrow path of their own
 # ---------------------------------------------------------------------------
 

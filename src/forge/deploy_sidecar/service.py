@@ -2064,6 +2064,10 @@ def process_live_gate_run(
             # The checkout the driver belongs to, so its private home is
             # made in that checkout's own git directory and nowhere above.
             repository=str(repo_path),
+            # NAMED EXCEPTION (31 October 2026): the live gate is factory
+            # tooling the project's script calls, and it imports GuardKit's
+            # live_gate library, which lives only in the factory's Python.
+            keep_factory_python=True,
             **issued_kwargs,
         )
         exit_code, stdout, stderr = ran
@@ -3162,6 +3166,7 @@ def run_project_program(
     issued: IssuedPreviewValues | None = None,
     run_owner: str | None = None,
     repository: str | None = None,
+    keep_factory_python: bool = False,
 ) -> tuple[int, str, str]:
     """Run one of the PROJECT'S own programs; return exit code and output.
 
@@ -3184,6 +3189,9 @@ def run_project_program(
     knows it: the private home then goes in that checkout's own git directory
     and ``cwd`` must be inside it.
 
+    ``keep_factory_python`` leaves the factory's own Python on ``PATH``; only
+    the live-gate driver asks for it, at its call site, with the reason.
+
     Never raises: a program whose environment is refused (a credential-shaped
     overlay name, a proxy carrying a password, an issued value that does not
     check out) is reported as not started, with a sentence that names the
@@ -3199,6 +3207,7 @@ def run_project_program(
             overlay=extra_env,
             run_owner=run_owner,
             repository=repository,
+            keep_factory_python=keep_factory_python,
         )
     except (OSError, ValueError) as exc:
         return (MERGE_NOT_STARTED_EXIT_CODE, "", f"{what} was not started: {exc}")
