@@ -740,21 +740,6 @@ class TestEveryOtherProjectProgram:
         assert given[ALLOWED_NAME] == ALLOWED_VALUE
         _home_is_private(given, project)
 
-    def test_the_build_packages_test_run_hides_factory_credentials(
-        self, project: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """F8: ``verify_tests``, through its own seam."""
-        from forge.build.test_verification import verify_tests
-
-        bin_dir = tmp_path / "pytest-bin"
-        _writer(bin_dir / "pytest", "pytest")
-        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-
-        asyncio.run(verify_tests(project, test_command="pytest"))
-        given = _given(project, "pytest")
-        _no_sentinel(given, "the build package's test run")
-        _home_is_private(given, project)
-
 
 # ---------------------------------------------------------------------------
 # The review preview's issued values (R4): one narrow path of their own
@@ -1748,40 +1733,6 @@ class TestEveryProjectScriptStepGetsTheDeclaredNames:
 
 
 class TestTimeoutsAndTheBuildPackageAreToldWhatWasWithheld:
-    def test_the_build_packages_failed_run(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from forge.build.test_verification import verify_tests
-
-        monkeypatch.setenv(WITHHELD, WITHHELD_VALUE)
-        root = _a_project(tmp_path / "shop")
-        bin_dir = tmp_path / "pytest-bin"
-        _writer(bin_dir / "pytest", "pytest", exit_code=1)
-        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-        result = asyncio.run(verify_tests(root, test_command="pytest"))
-        assert result["passed"] is False
-        assert WITHHELD in result["output_tail"]
-        assert WITHHELD_VALUE not in json.dumps(result)
-        _no_sentinel(json.dumps(result), "the build package's failed run")
-
-    def test_the_build_packages_timed_out_run(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        from forge.build.test_verification import verify_tests
-
-        monkeypatch.setenv(WITHHELD, WITHHELD_VALUE)
-        root = _a_project(tmp_path / "shop")
-        bin_dir = tmp_path / "pytest-bin"
-        bin_dir.mkdir()
-        slow = bin_dir / "pytest"
-        slow.write_text("#!/bin/sh\nexec sleep 30\n", encoding="utf-8")
-        slow.chmod(0o755)
-        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ['PATH']}")
-        result = asyncio.run(verify_tests(root, test_command="pytest", timeout_seconds=1))
-        assert result["passed"] is False
-        assert WITHHELD in result["output_tail"]
-        assert WITHHELD_VALUE not in json.dumps(result)
-
     def test_the_coordinators_declared_test_that_times_out(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1947,18 +1898,6 @@ _ANY_RECEIVER_LAUNCHES = {
 ALLOWED: dict[tuple[str, str], str] = {
     ("adapters/gh/operations.py", "_execute"): "runs gh, the factory's own GitHub client",
     ("adapters/guardkit/run.py", "_execute_subprocess"): "starts GuardKit with the factory's launch list",
-    ("build/git_operations.py", "_execute_via_deepagents"): (
-        "generic runner for gh and pytest (git goes to forge.project_git); every "
-        "call to it is checked below"
-    ),
-    ("build/git_operations.py", "_run_via_execute"): (
-        "gh with the factory's own environment; git with none (the git helper "
-        "builds its own)"
-    ),
-    ("build/test_verification.py", "_execute_via_deepagents"): (
-        "a pass-through seam onto the git operations' runner; it is a generic "
-        "runner itself, so every call to it (verify_tests) is checked"
-    ),
     ("build_processes.py", "_engine_ids"): "the container engine, called through a variable",
     ("build_processes.py", "_remove_networks_and_volumes"): "the container engine, called through a variable",
     ("build_processes.py", "remove_fixture_containers"): "the container engine, run in a worker thread",
@@ -2022,14 +1961,6 @@ ALLOWED: dict[tuple[str, str], str] = {
 #: name or a module attribute is still recognised; ``names`` are the
 #: attribute names it is reached by on an object (``self._spawn``).
 GENERIC_RUNNERS: dict[tuple[str, str], dict[str, Any]] = {
-    ("build/git_operations.py", "_execute_via_deepagents"): {
-        "dotted": {"forge.build.git_operations._execute_via_deepagents"},
-        "names": {"_execute_via_deepagents"},
-    },
-    ("build/test_verification.py", "_execute_via_deepagents"): {
-        "dotted": {"forge.build.test_verification._execute_via_deepagents"},
-        "names": {"_execute_via_deepagents"},
-    },
     ("deploy_sidecar/deploy_executor.py", "_spawn"): {
         "dotted": {
             "forge.deploy_sidecar.deploy_executor.DeployExecutor._spawn",
@@ -4395,7 +4326,7 @@ def test_the_strict_rules_catch_every_probe(tmp_path: Path) -> None:
     assert not {n for n in named if n.startswith("ok_")}, problems
 
 
-#: The forwarding seam in the build package and the one-statement wrapper
+#: A forwarding seam onto a generic runner and the one-statement wrapper
 #: rule, probed (14 October 2026): the seam's local call and an imported
 #: alias of it carrying this process's environment, the seam held as a
 #: value, and wrappers that can fall through to an implicit None (an
@@ -4404,23 +4335,23 @@ GUARD_PROBES_5_SEAM = textwrap.dedent(
     '''\
     import os
 
-    from forge.build.git_operations import _execute_via_deepagents as _inner
+    from forge.executor.programs import run_program as _inner
 
 
-    async def _execute_via_deepagents(*, command, cwd, timeout, env):
-        return await _inner(command=command, cwd=cwd, timeout=timeout, env=env)
+    def _start_and_collect(*, command, cwd, timeout, env):
+        return _inner(command=command, cwd=cwd, timeout=timeout, env=env)
 
 
-    async def p5_local_call(cmd):
-        return await _execute_via_deepagents(
+    def p5_local_call(cmd):
+        return _start_and_collect(
             command=cmd, cwd=".", timeout=1, env=dict(os.environ)
         )
 
 
-    async def ok_local_call_with_helper(cmd, folder):
+    def ok_local_call_with_helper(cmd, folder):
         from forge.launch_environment import build_project_command_env
 
-        return await _execute_via_deepagents(
+        return _start_and_collect(
             command=cmd, cwd=".", timeout=1, env=build_project_command_env(folder)
         )
     '''
@@ -4430,12 +4361,12 @@ GUARD_PROBES_5 = textwrap.dedent(
     import os
     import subprocess
 
-    from forge.build.test_verification import _execute_via_deepagents as seam
+    from forge.deploy_sidecar.service import _start_and_collect as seam
     from forge.launch_environment import build_project_command_env
 
 
-    async def p5_imported_alias(cmd):
-        return await seam(command=cmd, cwd=".", timeout=1, env=dict(os.environ))
+    def p5_imported_alias(cmd):
+        return seam(command=cmd, cwd=".", timeout=1, env=dict(os.environ))
 
 
     def p5_seam_as_value(cmd):
@@ -4485,18 +4416,18 @@ GUARD_PROBES_5 = textwrap.dedent(
         subprocess.run(cmd, env=build_project_command_env(folder))
 
 
-    async def ok_alias_with_helper(cmd, folder):
-        return await seam(command=cmd, cwd=".", timeout=1, env=build_project_command_env(folder))
+    def ok_alias_with_helper(cmd, folder):
+        return seam(command=cmd, cwd=".", timeout=1, env=build_project_command_env(folder))
     '''
 )
 
 
-def test_the_build_seam_and_the_wrapper_rule_catch_every_probe(tmp_path: Path) -> None:
+def test_a_forwarding_seam_and_the_wrapper_rule_catch_every_probe(tmp_path: Path) -> None:
     pkg = tmp_path / "forge"
-    (pkg / "build").mkdir(parents=True)
+    (pkg / "deploy_sidecar").mkdir(parents=True)
     (pkg / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "build" / "__init__.py").write_text("", encoding="utf-8")
-    (pkg / "build" / "test_verification.py").write_text(GUARD_PROBES_5_SEAM, encoding="utf-8")
+    (pkg / "deploy_sidecar" / "__init__.py").write_text("", encoding="utf-8")
+    (pkg / "deploy_sidecar" / "service.py").write_text(GUARD_PROBES_5_SEAM, encoding="utf-8")
     (pkg / "zz_probe5.py").write_text(GUARD_PROBES_5, encoding="utf-8")
     problems = unaccounted_launches(pkg)
     named = {p.split(" in ", 1)[1].split(":", 1)[0] for p in problems}
