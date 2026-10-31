@@ -2363,9 +2363,9 @@ class TestTheMergeWallComesFromTheDeclaration:
         bigger = (
             "toolchain:\n"
             "  install: bash scripts/install.sh\n"
-            "  install_timeout: 900\n"
+            "  install_timeout: 1800\n"
             "  test: bash scripts/check.sh\n"
-            "  test_timeout: 900\n"
+            "  test_timeout: 1800\n"
             "  components:\n"
             "    api:\n"
             "      cwd: api\n"
@@ -2381,8 +2381,9 @@ class TestTheMergeWallComesFromTheDeclaration:
         deps, _publisher, gk, _dp = _deps(config, pool)
         await _run_executor(deps, repo_root, expect_main_sha=_git(repo_root, "rev-parse", "main"))
 
-        # 900 + 900 + 900 + the 180-second join allowance, above today's 2580.
-        assert gk.calls[0]["timeout_seconds"] == 900 + 900 + 900 + 180
+        # 1800 + 1800 + 900 + the 180-second join allowance: above the old
+        # one-hour cap and inside the two-hour one (1 November 2026).
+        assert gk.calls[0]["timeout_seconds"] == 1800 + 1800 + 900 + 180
 
     @pytest.mark.asyncio
     async def test_a_small_declaration_keeps_todays_floor(
@@ -2399,7 +2400,7 @@ class TestTheMergeWallComesFromTheDeclaration:
         deps, _publisher, gk, _dp = _deps(config, pool)
         await _run_executor(deps, repo_root, expect_main_sha=_git(repo_root, "rev-parse", "main"))
 
-        assert gk.calls[0]["timeout_seconds"] == 4 * 600 + 180
+        assert gk.calls[0]["timeout_seconds"] == 2580
 
     @pytest.mark.asyncio
     async def test_a_declaration_past_the_cap_is_held_to_it(
@@ -2433,25 +2434,28 @@ class TestTheTwoTimeLimits:
     drive of this lane caught.
     """
 
-    def test_the_wall_holds_four_runs_and_the_merge(self) -> None:
+    def test_the_wall_is_an_install_a_check_and_the_join_with_a_floor(self) -> None:
         from forge.pipeline.merge_executor import (
+            MERGE_WALL_FLOOR_SECONDS,
             MERGE_WALL_MERGE_ALLOWANCE_SECONDS,
             merge_wall_seconds,
         )
 
         assert MERGE_WALL_MERGE_ALLOWANCE_SECONDS == 180
-        # The merge command may install and check twice: on main to see what
-        # was already failing, and on the merged tree. Each install is held
-        # to one check run's limit, so four of those plus the merge.
+        # The build system no longer checks the target before the join: one
+        # install and one check of the joined tree, each held to one run's
+        # limit, plus the join, and never less than the wall had before.
+        assert MERGE_WALL_FLOOR_SECONDS == 2580
         assert merge_wall_seconds(600) == 2580
-        assert merge_wall_seconds(60) == 4 * 60 + 180
+        assert merge_wall_seconds(60) == 2580
+        assert merge_wall_seconds(2000) == 2 * 2000 + 180
 
-    def test_both_caps_are_an_hour(self) -> None:
+    def test_both_caps_are_two_hours(self) -> None:
         from forge.deploy_sidecar.service import MERGE_TIMEOUT_MAX
         from forge.pipeline.merge_executor import MERGE_WALL_CAP_SECONDS
 
-        assert MERGE_WALL_CAP_SECONDS == 3600
-        assert MERGE_TIMEOUT_MAX == 3600.0
+        assert MERGE_WALL_CAP_SECONDS == 7200
+        assert MERGE_TIMEOUT_MAX == 7200.0
 
     def test_the_wall_never_asks_for_more_than_is_allowed(self) -> None:
         from forge.pipeline.merge_executor import (
@@ -2459,7 +2463,7 @@ class TestTheTwoTimeLimits:
             merge_wall_seconds,
         )
 
-        assert merge_wall_seconds(1000) == MERGE_WALL_CAP_SECONDS
+        assert merge_wall_seconds(4000) == MERGE_WALL_CAP_SECONDS
         assert merge_wall_seconds(9999) == MERGE_WALL_CAP_SECONDS
 
     def test_the_cap_written_here_is_the_one_the_sidecar_enforces(self) -> None:
@@ -2471,7 +2475,7 @@ class TestTheTwoTimeLimits:
         assert float(MERGE_WALL_CAP_SECONDS) == MERGE_TIMEOUT_MAX
 
     @pytest.mark.asyncio
-    async def test_the_default_limits_are_ten_minutes_and_a_wall_that_holds_four(
+    async def test_the_default_limits_are_ten_minutes_and_the_floor(
         self, config, pool, repo_root
     ) -> None:
         deps, _publisher, gk, _dp = _deps(config, pool)
@@ -2480,10 +2484,10 @@ class TestTheTwoTimeLimits:
         args = gk.calls[0]["args"]
         assert "--verify-timeout" in args
         assert args[args.index("--verify-timeout") + 1] == "600"
-        assert gk.calls[0]["timeout_seconds"] == 4 * 600 + 180
+        assert gk.calls[0]["timeout_seconds"] == 2580
 
     @pytest.mark.asyncio
-    async def test_a_longer_limit_for_the_checks_widens_the_wall(
+    async def test_a_longer_limit_for_the_checks_widens_the_wall_past_the_floor(
         self, pool, repo_root, tmp_path
     ) -> None:
         config = ForgeConfig.model_validate(
@@ -2496,7 +2500,7 @@ class TestTheTwoTimeLimits:
                 "approval": {"expected_approver": "rich"},
                 "merge_executor": {
                     "enabled": True,
-                    "verify_timeout_seconds": 300,
+                    "verify_timeout_seconds": 1500,
                 },
             }
         )
@@ -2504,8 +2508,8 @@ class TestTheTwoTimeLimits:
         await _run_executor(deps, repo_root)
 
         args = gk.calls[0]["args"]
-        assert args[args.index("--verify-timeout") + 1] == "300"
-        assert gk.calls[0]["timeout_seconds"] == 4 * 300 + 180
+        assert args[args.index("--verify-timeout") + 1] == "1500"
+        assert gk.calls[0]["timeout_seconds"] == 2 * 1500 + 180
 
     @pytest.mark.asyncio
     async def test_a_very_long_limit_is_held_to_the_cap(
@@ -2521,14 +2525,14 @@ class TestTheTwoTimeLimits:
                 "approval": {"expected_approver": "rich"},
                 "merge_executor": {
                     "enabled": True,
-                    "verify_timeout_seconds": 1200,
+                    "verify_timeout_seconds": 4000,
                 },
             }
         )
         deps, _publisher, gk, _dp = _deps(config, pool)
         await _run_executor(deps, repo_root)
 
-        assert gk.calls[0]["timeout_seconds"] == 3600
+        assert gk.calls[0]["timeout_seconds"] == 7200
 
 
 class TestARefusalSpeaksTheMergeCommandsOwnSentence:

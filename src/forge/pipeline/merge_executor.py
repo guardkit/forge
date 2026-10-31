@@ -231,7 +231,7 @@ __all__ = [
     "MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS",
     "MERGE_WALL_CAP_SECONDS",
     "MERGE_WALL_MERGE_ALLOWANCE_SECONDS",
-    "MERGE_WALL_RUNS",
+    "MERGE_WALL_FLOOR_SECONDS",
     "MERGE_LEASE_MARGIN_SECONDS",
     "MergeApprovalConsumer",
     "RESULT_WORD_MERGED_AND_RUNNING",
@@ -301,40 +301,39 @@ MERGE_VERIFY_TIMEOUT_DEFAULT_SECONDS: int = 600
 #: when sizing the wall around the whole command.
 MERGE_WALL_MERGE_ALLOWANCE_SECONDS: int = 180
 
-#: How many runs, each held to one check run's limit, the merge command may
-#: make: the project's declared install and the checks on the target branch,
-#: then the install and the checks again on the merged tree (13 October 2026,
-#: the merge-install design, item 8). Since 31 October 2026 this sizes only
-#: the FLOOR of the wall; :func:`the_merge_wall` sizes it from the project's
-#: declared install and test limits when they need more.
-MERGE_WALL_RUNS: int = 4
+#: The least wall a merge is given (the wall before 31 October 2026, kept so no
+#: project gets less time than it had). :func:`the_merge_wall` gives more when
+#: the project's declared install and test limits need it.
+MERGE_WALL_FLOOR_SECONDS: int = 2580
 
 #: How much longer than the merge command's wall the press holds the build's
 #: record while that command runs: the HTTP wait beyond the wall, and the time
 #: to read and record the answer.
 MERGE_LEASE_MARGIN_SECONDS: int = 300
 
-#: The longest wall the deploy sidecar will accept (an hour). Written out here
-#: rather than imported so this module does not depend on the sidecar; a test
-#: pins the two together (``deploy_sidecar.service.MERGE_TIMEOUT_MAX``).
-MERGE_WALL_CAP_SECONDS: int = 3600
+#: The longest wall the deploy sidecar will accept (two hours since 1 November
+#: 2026: the merge runs the root install, then each part's install, then the
+#: root and every part's tests one after another, and a project with several
+#: parts needs more than an hour). Written out here rather than imported so
+#: this module does not depend on the sidecar; a test pins the two together
+#: (``deploy_sidecar.service.MERGE_TIMEOUT_MAX``).
+MERGE_WALL_CAP_SECONDS: int = 7200
 
 
 def merge_wall_seconds(verify_timeout_seconds: int) -> int:
-    """How long the whole merge command may take, given one check run's limit.
+    """The least the whole merge command is given, before the declaration.
 
-    The merge command may install and check TWICE — on the target branch to
-    see what was already failing, and on the merged tree — and merges in
-    between. The build system holds each install to the shorter of the
-    project's own install limit and one check run's limit, so the wall around
-    the whole thing holds four such runs plus three minutes, and never more
-    than the deploy sidecar will accept. Sized any smaller, the outer wall
-    fires first and the merge is killed mid-flight: the branch is joined and
-    nothing says so.
+    The merge joins, installs and checks the joined tree once (the build
+    system no longer checks the target first). With nothing else known that
+    is an install and a check, each held to one run's limit, plus the join,
+    and never less than :data:`MERGE_WALL_FLOOR_SECONDS` nor more than the
+    deploy sidecar accepts. :func:`the_merge_wall` adds the project's own
+    declared limits on top. Sized too small, the outer wall fires first and
+    the merge is killed mid-flight.
     """
-    wall = (
-        MERGE_WALL_RUNS * int(verify_timeout_seconds)
-        + MERGE_WALL_MERGE_ALLOWANCE_SECONDS
+    wall = max(
+        MERGE_WALL_FLOOR_SECONDS,
+        2 * int(verify_timeout_seconds) + MERGE_WALL_MERGE_ALLOWANCE_SECONDS,
     )
     return min(wall, MERGE_WALL_CAP_SECONDS)
 

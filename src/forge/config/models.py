@@ -2167,10 +2167,9 @@ class MergeExecutorConfig(BaseModel):
         description=(
             "How long one run of the post-merge checks may take, in seconds, "
             "before the merge command stops it. Ten minutes by default. The "
-            "wall forge puts around the whole merge is worked out from this "
-            "number, because the merge command may run the checks twice — "
-            "once on main to see what was already failing, once on the "
-            "merged tree — with time for the merge itself in between."
+            "wall forge puts around the whole merge is at least an install "
+            "and a check of this length plus the join, and more when the "
+            "project's own declared install and test limits need it."
         ),
     )
 
