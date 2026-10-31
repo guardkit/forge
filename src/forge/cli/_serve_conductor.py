@@ -58,6 +58,7 @@ from forge.full_check import (
     FAILED,
     PASSED,
     FullCheck,
+    TimedOut,
     full_check_parts_of,
     run_full_check,
 )
@@ -928,7 +929,7 @@ def _run_declared_command(
     except subprocess.TimeoutExpired:
         # A TIMED-OUT COMMAND IS TOLD WHAT IT WAS NOT GIVEN too (design
         # section 4): names only, never a value.
-        return None, (
+        return None, TimedOut(
             f"the declared test command {command!r} did not finish within "
             f"{timeout_seconds}s in {cwd}. "
             + project_program_note(declared=launch_settings or ())

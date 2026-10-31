@@ -1981,7 +1981,7 @@ def _process_declared_full_check(
     command. Answers 200 with ``exit_code`` 0 (passed) or 1 (failed), or with
     ``could_not_run`` and no exit code when any part could not run.
     """
-    from forge.full_check import full_check_parts_of, run_full_check
+    from forge.full_check import TimedOut, full_check_parts_of, run_full_check
 
     declaration, error = _declared_toolchain_here(repo_path)
     if error or declaration is None:
@@ -2017,7 +2017,9 @@ def _process_declared_full_check(
         if _a_program_that_did_not_finish(ran) is not None:
             return None, f"`{command}` could not be started or did not finish: {stderr}"
         if exit_code == MERGE_TIMEOUT_EXIT_CODE:
-            return None, f"`{command}` did not finish within {timeout:g}s in {cwd}"
+            return None, TimedOut(
+                f"`{command}` did not finish within {timeout:g}s in {cwd}"
+            )
         tail = (str(stderr or "") or str(stdout or "")).strip().splitlines()
         return exit_code, (
             f"`{command}` exited {exit_code} in {cwd}"

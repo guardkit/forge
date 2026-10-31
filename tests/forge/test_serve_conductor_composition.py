@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import subprocess
 from pathlib import Path
 from typing import Any
 
@@ -1304,6 +1305,44 @@ class TestTheMergeCardRunsTheFullCheck:
         assert report.status is GateStatus.UNKNOWN
         assert report.failed_gates == ("the declared check could not run",)
         assert "declared install (`npm ci`)" in str(report.detail)
+
+    def test_a_part_test_that_runs_out_of_time_is_red_and_named(
+        self, gates_pool: Any, tmp_path: Path
+    ) -> None:
+        """1 November 2026: a part's test that runs out of its time is a failed
+        part, as GuardKit counts it at the join, so it goes back for repair."""
+        from forge.cli._serve_conductor import make_gates_green_reader
+        from forge.full_check import TimedOut
+        from forge.pipeline.merge_ready_checkpoint import GateStatus
+
+        def _run(*, command: str, cwd: Any, timeout_seconds: int):
+            if command == "go test ./...":
+                return None, TimedOut(f"`{command}` did not finish within {timeout_seconds}s")
+            return 0, f"`{command}` exited 0"
+
+        report = make_gates_green_reader(
+            parts_reader=stand_in_parts_reader,
+            pool=gates_pool,
+            config=_gates_config({"org/target": "/canonical/target"}),
+            declaration_loader=lambda _root: self._multi_part(tmp_path),
+            command_runner=_run,
+        )(build_id=BUILD_ID, branch="fix/g")
+
+        assert report.status is GateStatus.RED
+        assert report.failed_gates == ("declared toolchain test (api)",)
+        assert "`go test ./...` did not finish within its limit of 420s" in str(
+            report.detail
+        )
+
+    def test_the_real_runner_says_a_timeout_is_one(self, tmp_path: Path) -> None:
+        from forge.cli._serve_conductor import _run_declared_command
+
+        subprocess.run(["git", "init", "-q", str(tmp_path)], check=True)
+        code, detail = _run_declared_command(
+            command="sleep 5", cwd=tmp_path, timeout_seconds=1
+        )
+        assert code is None
+        assert getattr(detail, "timed_out", False) is True
 
     def test_without_guardkits_reader_the_check_cannot_be_read(
         self, gates_pool: Any, tmp_path: Path

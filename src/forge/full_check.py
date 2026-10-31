@@ -16,9 +16,10 @@ HOW EACH PART IS RUN is the caller's runner, so the coordinator and the
 sandbox's helper each run a project's commands the way they already do (an
 environment built from nothing, the project's declared names). The verdict
 is the same as the merge's: any part that failed makes the whole check
-failed; otherwise any part that could not run (nothing declared for it, an
-install that failed, a command that would not start or finish) makes it
-"could not run"; only every part passing is a pass.
+failed (a test that runs out of its time is a failed part, as at the join);
+otherwise any part that could not run (nothing declared for it, an install
+that failed, a command that would not start) makes it "could not run"; only
+every part passing is a pass.
 """
 
 from __future__ import annotations
@@ -32,6 +33,7 @@ from typing import Any, Callable, Sequence
 logger = logging.getLogger(__name__)
 
 __all__ = [
+    "TimedOut",
     "CheckPart",
     "FullCheck",
     "PASSED",
@@ -48,6 +50,19 @@ COULD_NOT_RUN = "could not run"
 #: Where GuardKit keeps its declaration reader (the same module Forge's
 #: declaration loaders ask).
 TOOLCHAIN_MODULE = "guardkit.orchestrator.toolchain_declaration"
+
+
+class TimedOut(str):
+    """A runner's sentence for a command stopped at its time limit.
+
+    It IS the sentence (an ordinary string); what it adds is that it says so,
+    because a runner answers a timeout with no exit code, exactly as it
+    answers a command that would not start. A part's test that runs out of
+    its time is a FAILED part, as GuardKit's join counts it (1 November
+    2026), and goes back for repair; one that would not start could not run.
+    """
+
+    timed_out = True
 
 
 @dataclass(frozen=True)
@@ -234,6 +249,15 @@ def _run_part(
     except Exception as exc:  # noqa: BLE001 — a runner defect is not a pass
         return COULD_NOT_RUN, f"running it raised {type(exc).__name__}: {exc}", "", ()
     evidence = str(getattr(said, "evidence", "") or "")
+    if code is None and getattr(said, "timed_out", False) is True:
+        return (
+            FAILED,
+            f"its test `{part.test}` did not finish within its limit of "
+            f"{part.test_timeout}s, which counts as failed, as at the join "
+            f"({said})",
+            evidence,
+            (),
+        )
     if code is None:
         return COULD_NOT_RUN, said, evidence, ()
     if code == 0:

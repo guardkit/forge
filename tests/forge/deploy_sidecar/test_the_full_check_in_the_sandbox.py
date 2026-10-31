@@ -130,3 +130,24 @@ def test_without_guardkits_reader_it_could_not_run(
     assert status == 200
     assert body["exit_code"] is None
     assert "full_check_parts" in body["could_not_run"]
+
+
+def test_a_part_test_that_runs_out_of_time_is_exit_one(
+    declared: SimpleNamespace,
+) -> None:
+    from forge.deploy_sidecar.service import (
+        MERGE_TIMEOUT_EXIT_CODE,
+        _process_declared_full_check,
+    )
+
+    calls: list = []
+    status, body = _process_declared_full_check(
+        cwd=str(declared.worktree),
+        repo_path=declared.repo,
+        command_runner=_runner({"npm test": MERGE_TIMEOUT_EXIT_CODE}, calls),
+        memory_project=None,
+        launch_settings=(),
+    )
+    assert status == 200
+    assert body["exit_code"] == 1
+    assert "`npm test` did not finish within its limit of 360s" in body["stdout"]
