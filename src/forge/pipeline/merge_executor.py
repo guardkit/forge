@@ -1952,23 +1952,6 @@ def git_surface_for(
 # ``main`` into central code again.
 
 
-def _could_not_run(report: Mapping[str, Any]) -> bool:
-    """Did the build system say its own check could not run (rather than fail)?
-
-    ``verify_status: unverified`` or ``verify_ran: false``, as the merge
-    command reports it, or as the record keeps it. Since the after-task check
-    redesign (31 October 2026) this no longer makes the check advice: a check
-    that could not run did not pass, so nothing is published. It only decides
-    the words, and that no repair is filed (no code change mends a check that
-    could not start).
-    """
-    if not isinstance(report, Mapping):
-        return False
-    return report.get("verify_ran") is False or (
-        str(report.get("verify_status") or "").strip().lower() == "unverified"
-    )
-
-
 def _the_merge_check_passed(report: Mapping[str, Any] | None) -> bool:
     """Did the project's full check run on the joined result and pass?
 
@@ -6243,9 +6226,15 @@ async def execute_merge_deploy(
                 # redesign, 31 October 2026). A check that could not run used
                 # to be advice, and FEAT-8BB4 reached main that way; it is now
                 # a stop like a red one. Whether it could not run only decides
-                # the words and that no repair is filed.
+                # the words and that no repair is filed. Only a recorded
+                # "failed" is red; a report that says anything else about the
+                # check, or nothing at all, is "could not run": no code change
+                # mends it, so no repair is filed.
                 passed = _the_merge_check_passed(report)
-                could_not_run = not passed and _could_not_run(report or {})
+                could_not_run = not passed and (
+                    str((report or {}).get("verify_status") or "").strip().lower()
+                    != "failed"
+                )
                 if store is not None and not store.done(
                     build_id=build_id,
                     turn=turn,

@@ -1845,11 +1845,14 @@ class TestChecksThatCouldNotRun:
         assert FEATURE_ID in rows[0]
 
     @pytest.mark.asyncio
-    async def test_a_report_with_no_word_about_the_checks_still_files(
+    async def test_a_report_with_no_word_about_the_checks_files_no_repair(
         self, config, pool, repo_root
     ) -> None:
-        """An older merge report says only verify_ok=false. The checks ran as
-        far as anyone can tell, so the repair is still filed."""
+        """A merge report that says verify_ok=false and gives no status does
+        not say the check ran and failed. Only a recorded "failed" files a
+        repair (after-task check redesign, 31 October 2026); anything else
+        that is not "passed" is "could not run": stopped, nothing published,
+        no repair. (It used to file one.)"""
         gk = _FakeGuardKit(
             status="failed",
             report={
@@ -1861,8 +1864,28 @@ class TestChecksThatCouldNotRun:
         )
         deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
         outcome = await _run_executor(deps, repo_root)
-        assert outcome.verify_status == "failed"
-        assert len(_repair_rows(pool)) == 1
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.verify_status == "unverified"
+        assert "it could not run (3 tests failed)" in outcome.detail
+        assert _legs(dp) == []
+        assert _repair_rows(pool) == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", [None, "skipped", "unknown", ""])
+    async def test_only_a_recorded_failure_files_a_repair(
+        self, config, pool, repo_root, status
+    ) -> None:
+        report: dict[str, Any] = {"outcome": "merged", "post_sha": _tip(repo_root)}
+        if status is not None:
+            report["verify_status"] = status
+        gk = _FakeGuardKit(report=report)
+        deps, publisher, gk, dp = _deps(config, pool, guardkit=gk)
+        outcome = await _run_executor(deps, repo_root)
+        assert outcome.result == "merged-verify-failed"
+        assert outcome.verify_status == "unverified"
+        assert "Nothing was published." in outcome.detail
+        assert _legs(dp) == []
+        assert _repair_rows(pool) == []
 
     @pytest.mark.skip(
         reason=(
