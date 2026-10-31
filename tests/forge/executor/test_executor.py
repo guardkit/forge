@@ -375,13 +375,50 @@ def test_empty_runbook_is_refused(
     executor: RunbookExecutor,
     repository: RunbookRepository,
     mock_publisher: AsyncMock,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """AC-008: An empty runbook is refused before execution; no lifecycle events."""
-    # Note: The Runbook model's __post_init__ enforces at least one step,
-    # so we can't create a truly empty runbook through the normal API.
-    # This test documents the expected behavior if such a runbook existed.
-    # In practice, the validation happens at model construction time.
-    pytest.skip("Runbook model enforces non-empty steps at construction time")
+    """AC-008: An empty runbook is refused before execution; no lifecycle events.
+
+    Both refusals are checked (31 October 2026; this test used to skip
+    itself unconditionally): the model refuses to construct one, and the
+    executor's own guard refuses one that reaches it anyway, for instance
+    from a record the model never validated.
+    """
+    from forge.persistence.repositories.runbook_models import (
+        RunbookValidationError,
+    )
+
+    created = datetime.now(timezone.utc)
+    with pytest.raises(RunbookValidationError):
+        Runbook(
+            runbook_id="rb-empty",
+            target="t",
+            steps=(),
+            current_step_index=0,
+            status=StepStatus.pending,
+            created_at=created,
+        )
+
+    empty = object.__new__(Runbook)
+    for name, value in (
+        ("runbook_id", "rb-empty"),
+        ("target", "t"),
+        ("steps", ()),
+        ("current_step_index", 0),
+        ("status", StepStatus.pending),
+        ("created_at", created),
+    ):
+        object.__setattr__(empty, name, value)
+    monkeypatch.setattr(
+        repository, "load_runbook", lambda runbook_id, **_kw: empty
+    )
+
+    result = asyncio.run(executor.run("rb-empty", correlation_id="corr-008"))
+
+    assert result.status == "escalated"
+    assert mock_publisher.publish_runbook_started.call_count == 0
+    assert mock_publisher.publish_step_started.call_count == 0
+    assert mock_publisher.publish_runbook_complete.call_count == 0
 
 
 # ---------------------------------------------------------------------------
