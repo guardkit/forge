@@ -384,3 +384,125 @@ class TestNothingSecretIsKept:
     def test_ordinary_names(self, name: str) -> None:
         clean, found = planning_records.redact_json({name: "value"})
         assert clean == {name: "value"} and found == []
+
+
+class TestTheOutputIsCheckedLikeTheRequest:
+    """Review finding R1, 1 November 2026: the planner's output was checked by
+    shape only, on its serialized text."""
+
+    def _keep(self, config, first_commit, tmp_path, write) -> Path:
+        receipts = tmp_path / "receipts"
+        client = _FakeClient(result=None)
+        client.during_run = lambda: write(client.output)
+        status, _ = _run(
+            config, _body("feature_plan", first_commit), client,
+            env=_receipts_env(receipts),
+        )
+        assert status == 200
+        return _the_record(receipts)
+
+    def test_a_token_right_after_a_serialized_newline_in_a_trace(
+        self, config, clone, first_commit, tmp_path
+    ) -> None:
+        line = json.dumps({"prompt": f"first line\n{FAKE_GITHUB}\nlast line"})
+        assert f"\\n{FAKE_GITHUB}" in line  # the shape the finding names
+
+        def write(output: Path) -> None:
+            (output / "result.json").write_text(json.dumps(RESULT))
+            (output / "trace").mkdir()
+            (output / "trace" / "calls.jsonl").write_text(
+                json.dumps({"tokens": 12}) + "\n" + line + "\n"
+            )
+            # The same, in a file that is not JSON at all.
+            (output / "trace" / "prompt.log").write_text(f"said: {line}\n")
+
+        record = self._keep(config, first_commit, tmp_path, write)
+        assert FAKE_GITHUB not in _every_kept_byte(record).decode()
+        lines = (record / "output" / "trace" / "calls.jsonl").read_text().splitlines()
+        # The untouched line is kept as it was; the other is re-written.
+        assert lines[0] == json.dumps({"tokens": 12})
+        assert json.loads(lines[1]) == {
+            "prompt": f"first line\n{REDACTED}\nlast line"
+        }
+        step = json.loads((record / "step.json").read_text())
+        assert sorted(step["redacted"]["output"]) == [
+            "trace/calls.jsonl",
+            "trace/prompt.log",
+        ]
+
+    def test_an_ordinary_password_under_a_credential_named_field(
+        self, config, clone, first_commit, tmp_path
+    ) -> None:
+        answer = {
+            **RESULT,
+            "result": {"role_output": {"plan": "yes", "db_password": "correct horse"}},
+        }
+
+        def write(output: Path) -> None:
+            (output / "result.json").write_text(json.dumps(answer, indent=2) + "\n")
+
+        record = self._keep(config, first_commit, tmp_path, write)
+        kept = (record / "output" / "result.json").read_text()
+        assert "correct horse" not in kept
+        assert json.loads(kept)["result"]["role_output"] == {
+            "plan": "yes",
+            "db_password": REDACTED,
+        }
+        assert kept.endswith("\n")
+        step = json.loads((record / "step.json").read_text())
+        assert step["redacted"]["output"] == ["result.json"]
+
+    def test_json_that_needs_nothing_keeps_its_original_bytes(
+        self, config, clone, first_commit, tmp_path
+    ) -> None:
+        # Spacing, key order and escapes a re-write would change.
+        result_text = '{ "success" : true,\n  "command":"feature_plan", "x": "caf\\u00e9" }\n'
+        trace_text = '{"a":1}\n\n{"b" : [1, 2]}\r\n'
+
+        def write(output: Path) -> None:
+            (output / "result.json").write_text(result_text)
+            (output / "calls.jsonl").write_bytes(trace_text.encode())
+
+        record = self._keep(config, first_commit, tmp_path, write)
+        assert (record / "output" / "result.json").read_text() == result_text
+        assert (record / "output" / "calls.jsonl").read_bytes() == trace_text.encode()
+        step = json.loads((record / "step.json").read_text())
+        assert step["redacted"]["output"] == []
+
+    def test_an_output_file_that_breaks_the_reader_never_fails_the_step(
+        self, config, clone, first_commit, tmp_path
+    ) -> None:
+        deep = "[" * 100_000 + "]" * 100_000
+
+        def write(output: Path) -> None:
+            (output / "result.json").write_text(json.dumps(RESULT))
+            (output / "deep.json").write_text(deep)
+
+        record = self._keep(config, first_commit, tmp_path, write)
+        assert (record / "output" / "deep.json").read_text() == deep
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            f"\\n{FAKE_GITHUB}",
+            f"\\t{FAKE_GITHUB}",
+            "\\nBearer " + "t" * 30,
+            "\\nAKIA" + "A" * 16,
+            "\\nhttps://someone:a-password@example.invalid/x",
+        ],
+    )
+    def test_a_shape_after_a_written_escape_is_caught(self, text: str) -> None:
+        clean, count = planning_records.redact_text(text)
+        assert count == 1 and REDACTED in clean
+        assert clean.startswith("\\")
+
+    @pytest.mark.parametrize(
+        "text",
+        [
+            "commit " + "a1b2c3d4" * 5,
+            "nghp_" + "Z" * 36,  # inside a word, not after an escape
+            "Authorization: Bearer <token>",
+        ],
+    )
+    def test_ordinary_text_is_left_alone(self, text: str) -> None:
+        assert planning_records.redact_text(text) == (text, 0)

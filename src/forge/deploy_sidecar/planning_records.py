@@ -35,8 +35,9 @@ settings file is never kept). As a guard, any field whose NAME says it is a
 credential, and any value of an unmistakable credential shape (a provider key,
 a GitHub or Slack token, a private key, a password inside an address), is
 replaced before anything is written, and ``step.json`` lists each replacement
-so a replay knows its input was changed. The same value check runs over the
-planner's output files. Nothing here refuses or stops a step: it only keeps
+so a replay knows its input was changed. The planner's output files get the
+same check: JSON and JSON-per-line files are read and checked value by value,
+other text by shape. A file that needed nothing keeps its original bytes. Nothing here refuses or stops a step: it only keeps
 records, and a record that cannot be kept is logged and the step goes on.
 """
 
@@ -93,23 +94,32 @@ _CREDENTIAL_NAME_PAIRS: frozenset[tuple[str, str]] = frozenset(
 #: request is mostly a project's own documents, and replacing ordinary text
 #: (a commit id, the word "Bearer" in a README) would spoil the replay this
 #: record exists for.
+#:
+#: Where a shape starts: not inside a word, or straight after a written escape
+#: such as ``\n`` or ``\t``. A plain word boundary is not enough, because in
+#: serialized JSON a token at the start of a line follows the letter ``n`` of
+#: ``\n`` (review finding, 1 November 2026).
+_START: str = r"(?:(?<=\\[A-Za-z])|(?<![A-Za-z0-9_]))"
 _CREDENTIAL_VALUE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"sk-ant-[A-Za-z0-9_\-]{8,}"),
-    re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_\-]{32,}"),
+    re.compile(_START + r"sk-(?:proj-)?[A-Za-z0-9_\-]{32,}"),
     re.compile(r"github_pat_[A-Za-z0-9_]{30,}"),
-    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{30,}"),
-    re.compile(r"\bglpat-[A-Za-z0-9_\-]{20,}"),
-    re.compile(r"\bxox[abprs]-[A-Za-z0-9\-]{10,}"),
-    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(_START + r"gh[pousr]_[A-Za-z0-9]{30,}"),
+    re.compile(_START + r"glpat-[A-Za-z0-9_\-]{20,}"),
+    re.compile(_START + r"xox[abprs]-[A-Za-z0-9\-]{10,}"),
+    re.compile(_START + r"AKIA[0-9A-Z]{16}(?![0-9A-Z])"),
     re.compile(
         r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?(?:-----END [A-Z ]*PRIVATE KEY-----|$)",
         re.S,
     ),
-    re.compile(r"\bBearer [A-Za-z0-9._\-]{20,}"),
+    re.compile(_START + r"Bearer [A-Za-z0-9._\-]{20,}"),
 )
 #: A password inside an address (``scheme://user:password@host``): the scheme
-#: and user are kept, the password replaced.
-_URL_WITH_LOGIN = re.compile(r"\b([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/?#@\"']*):[^\s/?#@\"']+@")
+#: and user are kept, the password replaced. The scheme may follow a written
+#: escape, which then stays in front of it untouched.
+_URL_WITH_LOGIN = re.compile(
+    _START + r"([A-Za-z][A-Za-z0-9+.\-]*://[^\s:/?#@\"'\\]*):[^\s/?#@\"'\\]+@"
+)
 REDACTED: str = "***REDACTED***"
 
 
@@ -230,9 +240,67 @@ def _write_json_or_bytes(
     return found, False
 
 
+def _redact_json_text(text: str) -> str | None:
+    """``text`` as JSON with :func:`redact_json` applied: the original text
+    when nothing needed replacing, the re-written JSON when something did, or
+    ``None`` when ``text`` is not one JSON document."""
+    try:
+        value = json.loads(text)
+    except ValueError:
+        return None
+    clean, found = redact_json(value)
+    if not found:
+        return text
+    ending = "\n" if text.endswith("\n") else ""
+    return json.dumps(clean, ensure_ascii=False) + ending
+
+
+def _redact_json_lines(text: str) -> str | None:
+    """``text`` as one JSON document per line, each line through
+    :func:`redact_json`; a line that needed nothing is kept as it was.
+    ``None`` when any non-blank line is not JSON, or there are none."""
+    lines = text.splitlines(keepends=True)
+    out: list[str] = []
+    seen = False
+    for line in lines:
+        body = line.rstrip("\r\n")
+        if not body.strip():
+            out.append(line)
+            continue
+        seen = True
+        try:
+            value = json.loads(body)
+        except ValueError:
+            return None
+        clean, found = redact_json(value)
+        if found:
+            out.append(json.dumps(clean, ensure_ascii=False) + line[len(body):])
+        else:
+            out.append(line)
+    return "".join(out) if seen else None
+
+
+def redact_output_text(text: str) -> str:
+    """One planner output file's text with credentials replaced.
+
+    JSON, or JSON with one document per line, is read and every value checked
+    the way the request is (credential-named fields and credential-shaped
+    strings, on the decoded text); anything else goes through
+    :func:`redact_text`. Text that needed nothing comes back unchanged, byte
+    for byte."""
+    try:
+        for reader in (_redact_json_text, _redact_json_lines):
+            answer = reader(text)
+            if answer is not None:
+                return answer
+    except (RecursionError, ValueError, TypeError):
+        pass
+    return redact_text(text)[0]
+
+
 def _copy_output(source: Path, dest: Path) -> dict[str, Any]:
     """Copy the planner's output folder: regular files only (a link is named,
-    not followed), each text file through :func:`redact_text`."""
+    not followed), each text file through :func:`redact_output_text`."""
     copied = 0
     total = 0
     skipped: list[str] = []
@@ -269,8 +337,8 @@ def _copy_output(source: Path, dest: Path) -> dict[str, Any]:
             except UnicodeDecodeError:
                 text = None
             if text is not None:
-                clean, count = redact_text(text)
-                if count:
+                clean = redact_output_text(text)
+                if clean != text:
                     redacted.append(str(relative))
                     data = clean.encode("utf-8")
             target.write_bytes(data)
@@ -431,5 +499,6 @@ __all__ = [
     "prune_planning_records",
     "record_folder_name",
     "redact_json",
+    "redact_output_text",
     "redact_text",
 ]
