@@ -198,7 +198,9 @@ schema: 2
 # tools and skills guidance, thinking setting; repair turn shipped off), guardkitfactory cd00e2d.
 # 1 November 2026: release 2026.11.01-1, the after-task check redesign: Forge e01aa79c, GuardKit
 # 3059c6a4, guardkitfactory 2333a5f. nats-core, fleet-memory and Jarvis as 2026.10.29-2.
-version: 2026.11.01-1
+# 1 November 2026: release 2026.11.01-2, the build reviewer's timing fixes and the feature's other
+# tasks (reviewer experiment 2): GuardKit bd00dbcd, guardkitfactory a2845cf. Other pins as 2026.11.01-1.
+version: 2026.11.01-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -264,7 +266,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 3059c6a4120de397ff8f4eb98e2973e973615d39
+    commit: bd00dbcdd9e1a60e1a6611ce1aa22ef9eb93d677
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
@@ -279,7 +281,7 @@ repositories:
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
-    commit: 2333a5f57dc404d0df0982f59f7c7b7a377648d3
+    commit: a2845cfde3316a1b913d887a429b44cf4f2164a8
     role: named-context
   # THE SIXTH REPOSITORY (25 September 2026). It is a named context like the
   # four above — the jarvis image is built from ITS clone, at this pin, and
