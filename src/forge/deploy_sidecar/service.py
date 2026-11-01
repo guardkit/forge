@@ -21,9 +21,11 @@ The narrow contract:
     POST /planning-step {repo, build, declared_at, role, request,
                          start_commit?, memory_project?, timeout?}
               -> {result, exit_code, timed_out, stdout, stderr_tail,
-                  container, warnings, cancelled?, error?}
+                  container, warnings, record, cancelled?, error?}
               (one planning step in a container from the planner image; see
-              the block above :func:`process_planning_step_request`)
+              the block above :func:`process_planning_step_request`; each
+              step is kept under <receipts>/planning, see
+              :mod:`forge.deploy_sidecar.planning_records`)
     POST /run  {repo, script, env, timeout_seconds, cwd?}
               -> {exit_code, output_tail, cwd}
     POST /run  {repo, driver, args, env, timeout_seconds, cwd?}
@@ -253,6 +255,7 @@ from forge.deploy_sidecar.deploy_executor import (
     DeployExecutor,
     request_from as deploy_request_from,
 )
+from forge.deploy_sidecar.planning_records import keep_planning_step
 from forge.executor.programs import (
     RaisedWhileRunning,
     RefusedBeforeStart,
@@ -6270,9 +6273,12 @@ def process_guardkit_leg_request(
 # as on the sandbox's engine, so the engine can mount it. It is mounted
 # read-only and removed afterwards, whatever the ending. The request file and
 # the answer folder sit beside it for the same reason (this helper's own
-# temporary folder is not visible to the engine). ``greenfield`` runs before
-# the start commit is recorded and has no tools, so it gets no copy and no
-# memory.
+# temporary folder is not visible to the engine). Before they are removed, the
+# request (byte for byte as Forge posted it), the request file and the whole
+# answer folder are kept under the project's receipts folder (1 November 2026,
+# :mod:`forge.deploy_sidecar.planning_records`), so every step can be replayed.
+# ``greenfield`` runs before the start commit is recorded and has no tools, so
+# it gets no copy and no memory.
 #
 # The container is given the seats' non-secret planning settings, per role
 # (:data:`PLANNER_ROLE_SETTINGS`), the model door as its model address and the
@@ -6426,6 +6432,7 @@ def process_planning_step_request(
     env: Mapping[str, str] | None = None,
     ask: Any = FROM_THIS_SERVICES_SETTINGS,
     docker: str | None = None,
+    raw_body: bytes | None = None,
 ) -> tuple[int, dict[str, Any]]:
     """Validate and run one ``/planning-step``; return ``(status, body)``.
 
@@ -6436,6 +6443,11 @@ def process_planning_step_request(
     why there is none. Everything is checked before anything is made or
     started; a refusal is a 4xx in one sentence. ``stop_run`` is the leg-style
     handle a cancel stops the container client through. Never raises.
+
+    Every step that starts is kept before its files are removed (1 November
+    2026, :mod:`forge.deploy_sidecar.planning_records`): ``raw_body`` is the
+    request exactly as Forge posted it, and the answer names the kept folder
+    as ``record`` (``null`` when none could be kept).
     """
     source = os.environ if env is None else env
     if not isinstance(payload, dict):
@@ -6553,6 +6565,22 @@ def process_planning_step_request(
     request_path = io_path / "request.json"
     env_file: str | None = None
     laid_out = False
+
+    def answered(status: int, body: dict[str, Any]) -> tuple[int, dict[str, Any]]:
+        """Keep the step (its files still exist here), then answer."""
+        kept = keep_planning_step(
+            env=source,
+            container=name,
+            payload=payload,
+            raw_body=raw_body,
+            request_path=request_path,
+            output_path=output_path,
+            status=status,
+            reply=body,
+        )
+        body["record"] = str(kept) if kept is not None else None
+        return status, body
+
     try:
         try:
             _run_coroutine(ensure_candidate_trees_excluded(repo_path))
@@ -6644,22 +6672,25 @@ def process_planning_step_request(
                 )
         if cancelled:
             exit_code, stdout, stderr = ran
-            return 200, {
-                "result": None,
-                "error": "the planning step was cancelled",
-                "exit_code": exit_code,
-                "timed_out": False,
-                "cancelled": True,
-                "stdout": _tail_chars(stdout, MERGE_STDERR_TAIL_CHARS),
-                "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
-                "container": name,
-                "warnings": warnings,
-            }
+            return answered(
+                200,
+                {
+                    "result": None,
+                    "error": "the planning step was cancelled",
+                    "exit_code": exit_code,
+                    "timed_out": False,
+                    "cancelled": True,
+                    "stdout": _tail_chars(stdout, MERGE_STDERR_TAIL_CHARS),
+                    "stderr_tail": _tail_chars(stderr, MERGE_STDERR_TAIL_CHARS),
+                    "container": name,
+                    "warnings": warnings,
+                },
+            )
         unfinished = _a_program_that_did_not_finish(ran)
         if unfinished is not None:
             status, body = unfinished
             body["container"] = name
-            return status, body
+            return answered(status, body)
         exit_code, stdout, stderr = ran
         timed_out = bool(getattr(ran, "timed_out", False))
         result, why_not = _read_planner_result(output_path / "result.json")
@@ -6678,9 +6709,11 @@ def process_planning_step_request(
                 if timed_out
                 else f"the planning step exited {exit_code} and {why_not}"
             )
-        return 200, body
+        return answered(200, body)
     except Exception as exc:  # noqa: BLE001 — never raise past the boundary
-        return 500, {"error": f"sidecar execution error: {type(exc).__name__}: {exc}"}
+        return answered(
+            500, {"error": f"sidecar execution error: {type(exc).__name__}: {exc}"}
+        )
     finally:
         if env_file is not None:
             with contextlib.suppress(OSError):
@@ -9242,7 +9275,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                 hook = self.server.after_admission  # type: ignore[attr-defined]
                 if hook is not None:
                     hook(number, route)
-                self._answer_post(route, payload, leg=leg)
+                self._answer_post(route, payload, leg=leg, raw_body=raw)
             finally:
                 self.server.end_request(number)  # type: ignore[attr-defined]
         except Exception as exc:  # noqa: BLE001 — never crash the server
@@ -9250,7 +9283,12 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
             self._safe_500(exc)
 
     def _answer_post(
-        self, route: str, payload: Any, *, leg: "_RunningLeg | None" = None
+        self,
+        route: str,
+        payload: Any,
+        *,
+        leg: "_RunningLeg | None" = None,
+        raw_body: bytes | None = None,
     ) -> None:
         """Route one POST and write its answer (counted on ``/busy`` meanwhile)."""
         if route == GUARDKIT_LEG_CANCEL_ROUTE:
@@ -9377,6 +9415,7 @@ class DeploySidecarHandler(BaseHTTPRequestHandler):
                     config=config,
                     runner=self.server.planning_runner,  # type: ignore[attr-defined]
                     stop_run=leg.run if leg is not None else None,
+                    raw_body=raw_body,
                 )
         elif route == GUARDKIT_LEG_ROUTE:
             if leg is not None and leg.cancelled:

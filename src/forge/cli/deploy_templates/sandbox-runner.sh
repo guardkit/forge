@@ -713,6 +713,9 @@ FACTORY_ENV_NAMES=(
   # container when set: it turns the plan writer's thinking on.
   FORGE_PLANNER_IMAGE
   SPECIALIST_AGENT_WRITER_THINKING
+  # How many days the helper keeps each planning step's request and answer
+  # under the receipts folder's planning/ (1 November 2026; unset, 14).
+  FORGE_PLANNING_RECORDS_DAYS
 )
 
 # NOTHING CREDENTIAL-SHAPED CROSSES IN (14 October 2026). Every process in the
