@@ -16,6 +16,9 @@ service. The "parent environment" in every test is a dictionary made here.
 
 from __future__ import annotations
 
+import re
+from pathlib import Path
+
 from forge.launch_environment import (
     GUARDKIT_FACTORY_LAUNCH_ENV,
     GUARDKIT_MEMORY_PROJECT_ENV,
@@ -42,6 +45,7 @@ PARENT = {
     "OPENAI_BASE_URL": "http://localhost:9000/v1",
     "OPENAI_API_KEY": "placeholder",
     "ANTHROPIC_BASE_URL": "http://localhost:9000",
+    "GUARDKIT_LOCAL_SEAT_HOSTS": "seat.internal",
     "GUARDKIT_TIMEOUT_MULTIPLIER": "4.0",
     "GUARDKIT_AUTOBUILD_TASK_TIMEOUT_FLOOR": "900",
     "GUARDKIT_SDK_TIMEOUT": "1800",
@@ -59,6 +63,8 @@ PARENT = {
     "GUARDKIT_ZERO_TEST_BLOCKING": "1",
     "GUARDKIT_BOOT_SMOKE_BLOCKING": "1",
     "GUARDKIT_SECURITY_CHECK_BLOCKING": "1",
+    "GUARDKIT_REVIEW_REPAIR_TURN": "0",
+    "GUARDKIT_AUTOBUILD_PRESERVE_DEBUG": "1",
     "FLEET_MEMORY_ENABLED": "true",
     "FLEET_MEMORY_MCP_URL": "http://memory-door:31822/mcp",
     "FLEET_MEMORY_PG_DSN": "postgresql://somewhere/memory",
@@ -130,8 +136,12 @@ def test_the_list_is_short() -> None:
 
     Raised from 39 to 40 on 17 October 2026 for GUARDKIT_SECURITY_CHECK_BLOCKING,
     the security check's operator switch, off today, which must travel when it is
-    turned on rather than be dropped silently as the first switch once was."""
-    assert len(LAUNCH_SETTINGS) <= 40
+    turned on rather than be dropped silently as the first switch once was.
+
+    Raised from 40 to 43 on 1 November 2026 for GUARDKIT_REVIEW_REPAIR_TURN,
+    GUARDKIT_LOCAL_SEAT_HOSTS and GUARDKIT_AUTOBUILD_PRESERVE_DEBUG, which every
+    sandbox carried and this list dropped (see the drift test below)."""
+    assert len(LAUNCH_SETTINGS) <= 43
 
 
 def test_the_list_names_no_language_framework_or_product() -> None:
@@ -465,3 +475,103 @@ def test_the_qa_verifiers_settings_reach_the_build() -> None:
     unset = build_launch_env(parent=without)
     for name in QAV_SETTINGS:
         assert name not in unset
+
+
+# ---------------------------------------------------------------------------
+# The three the sandbox carried and this list dropped (1 November 2026)
+# ---------------------------------------------------------------------------
+
+#: Each is the build system's own setting, written out here rather than
+#: imported from the build system, which this repository does not depend on:
+#: the build reviewer's repair-turn switch, the extra host names the
+#: local-models-only fence accepts, and the keep-debugging-output switch.
+DROPPED_UNTIL_1_NOVEMBER = {
+    "GUARDKIT_REVIEW_REPAIR_TURN": "0",
+    "GUARDKIT_LOCAL_SEAT_HOSTS": "seat.internal,other-seat.internal",
+    "GUARDKIT_AUTOBUILD_PRESERVE_DEBUG": "1",
+}
+
+
+def test_the_three_settings_the_sandbox_carried_reach_the_build() -> None:
+    """Release 2026.10.29-2 set the repair turn off in every sandbox, and it
+    never reached a build, so the repair turn stayed on. Set, each of the three
+    reaches the build with the parent's own value; unset, each stays unset, so
+    the build system's own default applies."""
+    without = {k: v for k, v in PARENT.items() if k not in DROPPED_UNTIL_1_NOVEMBER}
+    env = build_launch_env(parent={**without, **DROPPED_UNTIL_1_NOVEMBER})
+    for name, value in DROPPED_UNTIL_1_NOVEMBER.items():
+        assert env[name] == value, f"{name} was not handed to the launch"
+
+    unset = build_launch_env(parent=without)
+    for name in DROPPED_UNTIL_1_NOVEMBER:
+        assert name not in unset
+
+
+# ---------------------------------------------------------------------------
+# Nothing the sandbox carries is dropped without a reason
+# ---------------------------------------------------------------------------
+
+_REPO = Path(__file__).resolve().parents[2]
+_RUNNER_TEMPLATE = _REPO / "src" / "forge" / "cli" / "deploy_templates" / "sandbox-runner.sh"
+_EXAMPLE_ENV_FILES = (
+    _REPO / "deploy" / "estate" / ".env.example",
+    _REPO / "deploy" / "compose" / ".env.example",
+)
+
+
+def _names_the_host_hands_the_sandbox(path: Path) -> list[str]:
+    match = re.search(r"^SANDBOX_ENV_NAMES=(.*)$", path.read_text(), re.M)
+    assert match, f"{path} has no SANDBOX_ENV_NAMES line"
+    return match.group(1).split()
+
+
+def _names_the_runner_hands_its_containers() -> list[str]:
+    text = _RUNNER_TEMPLATE.read_text()
+    match = re.search(r"^FACTORY_ENV_NAMES=\($(.*?)^\)$", text, re.M | re.S)
+    assert match, "sandbox-runner.sh no longer declares FACTORY_ENV_NAMES"
+    names = []
+    for line in match.group(1).splitlines():
+        line = line.split("#", 1)[0].strip()
+        names.extend(line.split())
+    return names
+
+
+def test_every_build_system_setting_the_sandbox_carries_reaches_the_build() -> None:
+    """The drift test. Four times a GUARDKIT_ setting was set on the machine,
+    handed into the sandbox, and silently dropped before the build (the time
+    limit, the stamp model, the QA verifier's addresses, and on 1 November 2026
+    the repair turn with two others). A setting travels three hops: the host
+    hands the sandbox the names in SANDBOX_ENV_NAMES (the example env files
+    every install starts from), the sandbox's runner hands its containers the
+    names in FACTORY_ENV_NAMES (sandbox-runner.sh), and Forge hands the build
+    the names in LAUNCH_SETTINGS. Every GUARDKIT_ name on the first two lists
+    must be on the next list along, or named, with its reason, in
+    SETTINGS_DELIBERATELY_NOT_PASSED. Only GUARDKIT_ names are held to this:
+    they are the build system's own settings, read by the build process."""
+    left_out = {name for name, _ in SETTINGS_DELIBERATELY_NOT_PASSED}
+    launched = set(launch_setting_names())
+    runner = _names_the_runner_hands_its_containers()
+    assert "GUARDKIT_HARNESS" in runner, "the runner's list was not read"
+
+    problems = []
+    for path in _EXAMPLE_ENV_FILES:
+        for name in _names_the_host_hands_the_sandbox(path):
+            if name.startswith("GUARDKIT_") and name not in left_out:
+                if name not in runner:
+                    problems.append(
+                        f"{name}: {path.relative_to(_REPO)} hands it into the "
+                        "sandbox, but sandbox-runner.sh's FACTORY_ENV_NAMES "
+                        "does not pass it to the runner"
+                    )
+    for name in runner:
+        if name.startswith("GUARDKIT_") and name not in left_out | launched:
+            problems.append(
+                f"{name}: sandbox-runner.sh passes it to the runner, but "
+                "LAUNCH_SETTINGS does not pass it to the build"
+            )
+    assert not problems, (
+        "a build-system setting the sandbox carries is dropped before the "
+        "build. Add it to the next list along, or to "
+        "SETTINGS_DELIBERATELY_NOT_PASSED with the reason:\n  "
+        + "\n  ".join(problems)
+    )

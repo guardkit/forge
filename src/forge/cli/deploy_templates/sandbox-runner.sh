@@ -679,6 +679,16 @@ FACTORY_ENV_NAMES=(
   GUARDKIT_QAV_SHADOW
   GUARDKIT_QAV_SHADOW_URL
   GUARDKIT_QAV_PROBE_URL
+  # THREE MORE OF THE BUILD SYSTEM'S OWN (1 November 2026). The host side
+  # hands the first two into this sandbox, and the third was set in every
+  # sandbox by release 2026.10.29-2, but neither this list nor Forge's launch
+  # list (LAUNCH_SETTINGS) passed them on, so no build ever saw them: the
+  # extra host names the local-models-only fence accepts, the keep-debugging-
+  # output switch, and the build reviewer's repair-turn switch (0 is off).
+  # A test now holds every GUARDKIT_ name here to the launch list.
+  GUARDKIT_LOCAL_SEAT_HOSTS
+  GUARDKIT_AUTOBUILD_PRESERVE_DEBUG
+  GUARDKIT_REVIEW_REPAIR_TURN
   # WHICH RELEASE IMAGE THE BUILD RAN IN (13 October 2026). The identity this
   # script has just checked the running image against, above, so it names the
   # image actually in use. The build system records it beside each build;

@@ -249,6 +249,13 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "build is given",
     ),
     (
+        "GUARDKIT_LOCAL_SEAT_HOSTS",
+        "the extra host names the build system's local-models-only fence "
+        "accepts as a local seat (1 November 2026); the sandbox's settings "
+        "carried it but this list left it out, so a seat on a dotted internal "
+        "name would have been refused as not local",
+    ),
+    (
         "GUARDKIT_TIMEOUT_MULTIPLIER",
         "the build system's own timeout multiplier; the runner's supervision "
         "mirrors this exact number, so the two must see the same value or the "
@@ -380,6 +387,19 @@ LAUNCH_SETTINGS: tuple[tuple[str, str], ...] = (
         "the same shape of switch for the project's own does-it-start check. "
         "Also unset today, and named here so turning it on is one file and "
         "not a hunt through this list",
+    ),
+    (
+        "GUARDKIT_REVIEW_REPAIR_TURN",
+        "whether the build reviewer's located findings get the builder one "
+        "repair turn (0 turns it off; unset, it is on). Release 2026.10.29-2 "
+        "set it to 0 in every sandbox, but this list left it out, so every "
+        "build ran with the repair turn on until 1 November 2026",
+    ),
+    (
+        "GUARDKIT_AUTOBUILD_PRESERVE_DEBUG",
+        "whether the build system keeps its rendered prompts and full model "
+        "message streams for debugging; the sandbox's settings carried it, "
+        "but this list left it out, so turning it on did nothing",
     ),
     # --- the memory --------------------------------------------------------
     (
