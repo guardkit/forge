@@ -2012,6 +2012,34 @@ class TestTheResumeSeam:
         deps = captured["driver_deps_factory"](BUILD_ID, object())
         assert deps.subscribe_resume is None
 
+    def test_the_composition_hands_the_close_out_its_emitter(
+        self, pool: SqliteLifecyclePersistence, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A repair build announces its ending only if the boot passes the
+        emitter through (2 November 2026): without it, the close-out is as
+        silent as it was on 1 November and every other test stays green."""
+        import forge.cli._serve_conductor as conductor_mod
+
+        captured: dict[str, Any] = {}
+        original = conductor_mod.build_conductor_driver_deps_factory
+
+        def _capture(**kwargs: Any) -> Any:
+            captured.update(kwargs)
+            return original(**kwargs)
+
+        monkeypatch.setattr(
+            conductor_mod, "build_conductor_driver_deps_factory", _capture
+        )
+        emitter = object()
+        serve_mod._compose_conductor_router(
+            sqlite_pool=pool,
+            forge_config=_config(conductor_on=True),
+            lifecycle_emitter=emitter,
+            clock=lambda: None,
+        )
+
+        assert captured["lifecycle_emitter"] is emitter
+
 
 # ---------------------------------------------------------------------------
 # Item 5 — the one-card latch, restart-safe
