@@ -202,7 +202,9 @@ schema: 2
 # tasks (reviewer experiment 2): GuardKit bd00dbcd, guardkitfactory a2845cf. Other pins as 2026.11.01-1.
 # 1 November 2026: release 2026.11.01-3, builds receive the repair-turn switch and planning steps are kept:
 # Forge cc150e5e, GuardKit 5ecb1e23 (installs only from declarations, empty test quarantine). Other pins as 2026.11.01-2.
-version: 2026.11.01-3
+# 2 November 2026: release 2026.11.02-1, every declared install runs before any test (GuardKit d93bb0d9) and a repair
+# build announces its own ending (Forge 11e59016). Other pins as 2026.11.01-3.
+version: 2026.11.02-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -263,12 +265,12 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: cc150e5e99606e750b489acccb71dc708ea6af86
+    commit: 11e5901651e9258e15d20f963db9ff858c7a1d33
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 5ecb1e2314e751d10080625008ec6bbfed2ea9df
+    commit: d93bb0d94f8ed39c738c8851f64580617e5fa21c
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
