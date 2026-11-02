@@ -2250,6 +2250,9 @@ def _compose_conductor_router(
         # the redelivery. ``None`` (no bridge this boot) makes the seam
         # say so in one line and do nothing.
         take_ack_handle=take_ack_handle,
+        # THE ENDING, ANNOUNCED (2 November 2026). The bridge stands down
+        # for a fix journey, so the close-out publishes its terminal event.
+        lifecycle_emitter=lifecycle_emitter,
     )
     return build_conductor_router(
         pool=sqlite_pool,

@@ -3627,7 +3627,9 @@ def _terminal_decision_token(report: Any) -> str | None:
     return None
 
 
-def make_conductor_close_out(*, pool: Any) -> Callable[..., Any]:
+def make_conductor_close_out(
+    *, pool: Any, lifecycle_emitter: Any = None
+) -> Callable[..., Any]:
     """Build the driver's ``close_out`` seam — the journey's last write.
 
     Two writes, in this order:
@@ -3655,12 +3657,24 @@ def make_conductor_close_out(*, pool: Any) -> Callable[..., Any]:
     the one careful writer: it refuses to touch an already-terminal row,
     never raises, and composes legal hops so ``apply_transition`` stays the
     sole writer of ``builds.status``.
+
+    **Then the ending is announced** (2 November 2026). Nothing else
+    publishes a fix journey's terminal: the lifecycle bridge stands down for
+    it. On 1 November a repair build stopped at its two-hour cap, was closed
+    out FAILED, and the measurement harness waited seven more hours for a
+    ``build-failed`` that never came. So when ``lifecycle_emitter`` is wired,
+    an ending this seam wrote is published — ``build-failed`` with the
+    reason (annotated when the row write degraded), ``build-complete`` for
+    the clean endings — and the driver awaits that before it releases the
+    queued message, so the next build's events cannot overtake it. A row
+    that was already terminal is not announced again: whoever ended it (a
+    ``forge cancel``, a refusal at the door) published its own.
     """
     from forge.cli._conductor_outcome import finish_mode_c_build
     from forge.lifecycle.persistence import StageLogEntry
-    from forge.lifecycle.state_machine import BuildState
+    from forge.lifecycle.state_machine import TERMINAL_STATES, BuildState
 
-    def close_out(*, build_id: str, report: Any) -> None:
+    def close_out(*, build_id: str, report: Any) -> Awaitable[None] | None:
         now = datetime.now(timezone.utc)
         rationale = getattr(report, "rationale", "") or ""
         try:
@@ -3722,8 +3736,14 @@ def make_conductor_close_out(*, pool: Any) -> Callable[..., Any]:
             )
             to_state = BuildState.FAILED
 
+        # Read before the write: an ending already on the row was announced
+        # by whoever wrote it, and the subject comes off the row.
+        try:
+            row = pool.get_build_row(build_id)
+        except Exception:  # noqa: BLE001 — the writer below logs the fault
+            row = None
         summary = _one_line(rationale) or f"fix journey terminal: {token}"
-        finish_mode_c_build(
+        reason = finish_mode_c_build(
             pool,
             build_id,
             to_state=to_state,
@@ -3731,8 +3751,71 @@ def make_conductor_close_out(*, pool: Any) -> Callable[..., Any]:
             what="the fix journey's terminal close-out",
             log=logger,
         )
+        if lifecycle_emitter is None or row is None or row.status in TERMINAL_STATES:
+            return None
+        return _announce_journey_ending(
+            lifecycle_emitter,
+            row,
+            build_id=build_id,
+            complete=to_state is BuildState.COMPLETE,
+            reason=reason,
+        )
 
     return close_out
+
+
+async def _announce_journey_ending(
+    emitter: Any, row: Any, *, build_id: str, complete: bool, reason: str
+) -> None:
+    """Publish the fix journey's terminal event; never raises.
+
+    The fix journey is one task (``builds.task_id``), so a clean ending is
+    one task completed and nothing to merge.
+    """
+    from forge.pipeline import BuildContext
+
+    ctx = BuildContext(
+        feature_id=getattr(row, "feature_id", "") or "",
+        build_id=build_id,
+        correlation_id=getattr(row, "correlation_id", "") or "",
+        wave_total=1,
+    )
+    try:
+        if complete:
+            await emitter.emit_complete(
+                ctx,
+                repo=getattr(row, "repo", None),
+                branch=getattr(row, "branch", None),
+                tasks_completed=1,
+                tasks_failed=0,
+                tasks_total=1,
+                pr_url=None,
+                duration_seconds=_seconds_since(getattr(row, "started_at", None)),
+                summary=reason,
+            )
+        else:
+            await emitter.emit_failed(
+                ctx,
+                failure_reason=reason,
+                recoverable=False,
+                failed_task_id=getattr(row, "task_id", None),
+            )
+    except Exception as exc:  # noqa: BLE001 — the release must still happen
+        logger.warning(
+            "conductor close-out: announcing the ending of build_id=%s raised "
+            "%s: %s — the row stands, but no terminal event went out",
+            build_id,
+            type(exc).__name__,
+            exc,
+        )
+
+
+def _seconds_since(started_at: Any) -> int:
+    """Whole seconds from ``started_at`` to now; 0 when it cannot be read."""
+    try:
+        return max(0, int((datetime.now(timezone.utc) - started_at).total_seconds()))
+    except Exception:  # noqa: BLE001 — a duration is an annotation
+        return 0
 
 
 def make_conductor_queue_release(
@@ -3935,6 +4018,7 @@ def build_conductor_driver_deps_factory(
     take_ack_handle: Callable[[str], Any] | None = None,
     clock: Callable[[], datetime] | None = None,
     cancel_leg: Callable[..., tuple[bool, str]] | None = None,
+    lifecycle_emitter: Any = None,
 ) -> Callable[[str, Any], ConductorDriverDeps]:
     """Return the ``(build_id, supervisor) -> ConductorDriverDeps`` factory.
 
@@ -3953,7 +4037,9 @@ def build_conductor_driver_deps_factory(
     * ``escalation_resolved`` — whether a budget escalation has cleared,
       read off the build row for the report's rationale.
     * ``export_stage_receipts`` / ``write_failure_pack`` / ``close_out`` —
-      the receipts fold, both directions (design pass §b.2).
+      the receipts fold, both directions (design pass §b.2). ``close_out``
+      also announces the ending through ``lifecycle_emitter`` (injected;
+      ``None`` announces nothing).
     * ``release_queue_message`` — :func:`make_conductor_queue_release`,
       composed over the lifecycle bridge's ``take_ack_handle``. It is what
       lets the next build start when a fix journey ends; ``take_ack_handle``
@@ -3982,7 +4068,9 @@ def build_conductor_driver_deps_factory(
         receipts_root=receipts_root,
         source_build_id_reader=source_build_id_reader,
     )
-    close_out = make_conductor_close_out(pool=pool)
+    close_out = make_conductor_close_out(
+        pool=pool, lifecycle_emitter=lifecycle_emitter
+    )
     release_queue_message = make_conductor_queue_release(
         pool=pool, take_ack_handle=take_ack_handle
     )
