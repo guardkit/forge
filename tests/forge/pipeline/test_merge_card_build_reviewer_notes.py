@@ -120,3 +120,32 @@ def test_more_than_shown_is_counted_and_nonsense_is_dropped() -> None:
     assert "(6 more in the build's records.)" in line
     assert card_line_about_the_build_review({"notes": "x"}) == ""
     assert card_line_about_the_build_review(None) == ""
+
+
+def test_notes_the_last_look_set_aside_are_counted() -> None:
+    """GuardKit's last look (3 November 2026): notes it did not report again
+    leave the card and are counted; a file without ``rechecked`` reads as
+    before."""
+    one = _NOTES["notes"][0]
+    line = card_line_about_the_build_review(
+        {"notes": [one], "total": 1,
+         "rechecked": {"still_true": 1, "no_longer_apply": 3}}
+    )
+    assert "TASK-WC1-002 NOT_TESTED apps/api/src/count.ts:14" in line
+    assert line.endswith("(3 earlier notes no longer apply to the finished code.)")
+    assert "more in the build's records" not in line
+
+    assert card_line_about_the_build_review(
+        {"notes": [], "total": 0, "rechecked": {"still_true": 0, "no_longer_apply": 1}}
+    ) == (
+        "The build reviewer's notes for you: "
+        "(1 earlier note no longer applies to the finished code.)"
+    )
+    assert card_line_about_the_build_review(
+        {"notes": [], "total": 0, "rechecked": {"still_true": 0, "no_longer_apply": 0}}
+    ) == ""
+    without = card_line_about_the_build_review({"notes": [one], "total": 1})
+    assert without == card_line_about_the_build_review(
+        {"notes": [one], "total": 1, "rechecked": "nonsense"}
+    )
+    assert "no longer appl" not in without

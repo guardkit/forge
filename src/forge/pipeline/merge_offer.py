@@ -604,11 +604,18 @@ def card_line_about_the_build_review(record: Any) -> str:
         what = _shorten(note.get("description"), 200).rstrip(".")
         if where or what:
             parts.append(f"{where}: {what}." if where and what else f"{where or what}.")
+    total = record.get("total")
+    if parts and isinstance(total, int) and total > len(parts):
+        parts.append(f"({total - len(parts)} more in the build's records.)")
+    # GuardKit's last look over the finished code (3 November 2026): the
+    # notes it did not report again are only counted. Older files have none.
+    rechecked = record.get("rechecked")
+    gone = rechecked.get("no_longer_apply") if isinstance(rechecked, Mapping) else None
+    if isinstance(gone, int) and not isinstance(gone, bool) and gone > 0:
+        noun = "note no longer applies" if gone == 1 else "notes no longer apply"
+        parts.append(f"({gone} earlier {noun} to the finished code.)")
     if not parts:
         return ""
-    total = record.get("total")
-    if isinstance(total, int) and total > len(parts):
-        parts.append(f"({total - len(parts)} more in the build's records.)")
     return BUILD_REVIEW_NOTES_LINE.format(notes=" ".join(parts))
 
 
