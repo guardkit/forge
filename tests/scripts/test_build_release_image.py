@@ -28,6 +28,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -486,10 +487,15 @@ def test_the_shipped_manifest_plans_every_image_of_the_release(tmp_path):
     result = _plan(copy)
 
     assert result.returncode == 0, result.stderr
-    # Since 25 October 2026 the shipped manifest builds the two Forge images
-    # only; the memory and Jarvis images are added back for a release that
-    # changes them (the manifest says so beside its images list).
-    assert "would build 2 image(s)" in result.stdout
+    # Since 25 October 2026 the shipped manifest builds the two Forge images,
+    # and the memory and Jarvis images only for a release that changes them
+    # (the manifest says so beside its images list), so the count is read from
+    # the manifest rather than fixed here.
+    images = copy.read_text(encoding="utf-8").split("\nimages:\n", 1)[1]
+    images = images.split("\nrepositories:\n", 1)[0]
+    listed = len(re.findall(r"^  - name: ", images, re.M))
+    assert listed >= 2
+    assert f"would build {listed} image(s)" in result.stdout
     assert "forge [coordinator] from forge/Dockerfile" in result.stdout
     assert (
         "forge-publisher [publisher] from forge/src/forge/publisher/Dockerfile"
@@ -532,6 +538,13 @@ def test_an_image_is_tagged_by_the_commit_of_the_repository_it_came_from(tmp_pat
         "    dockerfile: deploy/Dockerfile\n"
         "    role: front-door\n"
         "    proof: scripts/verify-jarvis-image.sh\n"
+    )
+    # Only the ones the shipped manifest does not already list: a release that
+    # changes the memory images lists them itself.
+    listed = text.split("\nimages:\n", 1)[1].split("\nrepositories:\n", 1)[0]
+    entries = ["  - name: " + entry for entry in others.split("  - name: ")[1:]]
+    others = "".join(
+        entry for entry in entries if f"\n{entry.splitlines()[0]}\n" not in listed
     )
     marker = "\nrepositories:\n"
     assert marker in text
