@@ -204,7 +204,10 @@ schema: 2
 # Forge cc150e5e, GuardKit 5ecb1e23 (installs only from declarations, empty test quarantine). Other pins as 2026.11.01-2.
 # 2 November 2026: release 2026.11.02-1, every declared install runs before any test (GuardKit d93bb0d9) and a repair
 # build announces its own ending (Forge 11e59016). Other pins as 2026.11.01-3.
-version: 2026.11.02-1
+# 3 November 2026: release 2026.11.03-1, every memory search pages until ten records pass its filters, and
+# forward supersession reads the whole namespace (fleet-memory 24540c66, with a85fd02 and 9b2205e). The memory and
+# relay images are built again for it. Other pins as 2026.11.02-1.
+version: 2026.11.03-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -252,6 +255,16 @@ images:
     dockerfile: src/forge/publisher/Dockerfile
     role: publisher
     proof: scripts/verify-publisher-image.sh
+  - name: fleet-memory-mcp
+    context: fleet-memory
+    dockerfile: deploy/mcp/Dockerfile
+    role: memory
+    proof: scripts/verify-fleet-memory-image.sh
+  - name: fleet-memory-relay
+    context: fleet-memory
+    dockerfile: deploy/relay/Dockerfile
+    role: memory-relay
+    proof: scripts/verify-fleet-memory-image.sh
   # The memory and Jarvis images are built only by a release that changes
   # them; their entries (and the reasons for them) are in this file's history
   # up to 25 October 2026. Add them back for such a release.
@@ -280,7 +293,7 @@ repositories:
   - name: fleet-memory
     url: https://github.com/guardkit/fleet-memory.git
     branch: main
-    commit: e8ccf1283ff6ddab4882d6a63a3e7fe9b5980a1f
+    commit: 24540c66f324794e7779099a12f5be1d353ddad5
     role: named-context
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
