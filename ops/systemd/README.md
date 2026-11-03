@@ -311,19 +311,19 @@ whether an earlier build of the same feature is still running before it sweeps
 that build's worktrees and branches:
 
 - `src/forge/subagents/autobuild_runner.py:82` — `import sqlite3`
-- `src/forge/subagents/autobuild_runner.py:4281` — `def _prior_build_status(build_id: str) -> str | None:`
-- `src/forge/subagents/autobuild_runner.py:4297` — `from forge.cli._db_resolve import resolve_db_path`
-- `src/forge/subagents/autobuild_runner.py:4299` — `db_path = resolve_db_path()` (this is the `FORGE_DB_PATH` read: the env, else `~/.forge/forge.db`)
-- `src/forge/subagents/autobuild_runner.py:4306` — `"requeue sweep: no forge ledger at %s — the prior-build "` (an absent ledger is logged and the guard fails open — the sweep proceeds as it did before the guard existed)
-- `src/forge/subagents/autobuild_runner.py:4311` — `uri = f"{db_path.resolve().as_uri()}?mode=ro"`
-- `src/forge/subagents/autobuild_runner.py:4312` — `conn = sqlite3.connect(uri, uri=True, timeout=2.0)`
-- `src/forge/subagents/autobuild_runner.py:4315` — `"SELECT status FROM builds WHERE build_id = ?", (build_id,)`
+- `src/forge/subagents/autobuild_runner.py:4296` — `def _prior_build_status(build_id: str) -> str | None:`
+- `src/forge/subagents/autobuild_runner.py:4312` — `from forge.cli._db_resolve import resolve_db_path`
+- `src/forge/subagents/autobuild_runner.py:4314` — `db_path = resolve_db_path()` (this is the `FORGE_DB_PATH` read: the env, else `~/.forge/forge.db`)
+- `src/forge/subagents/autobuild_runner.py:4321` — `"requeue sweep: no forge ledger at %s — the prior-build "` (an absent ledger is logged and the guard fails open — the sweep proceeds as it did before the guard existed)
+- `src/forge/subagents/autobuild_runner.py:4326` — `uri = f"{db_path.resolve().as_uri()}?mode=ro"`
+- `src/forge/subagents/autobuild_runner.py:4327` — `conn = sqlite3.connect(uri, uri=True, timeout=2.0)`
+- `src/forge/subagents/autobuild_runner.py:4330` — `"SELECT status FROM builds WHERE build_id = ?", (build_id,)`
 
 Where the path comes from on the host, and why it does not reach the
 build subprocess:
 
 - `ops/systemd/forge-langgraph-sidecar.service:94` — `Environment=FORGE_DB_PATH=%h/forge-prod-state/.forge/forge.db`
-- `src/forge/subagents/autobuild_runner.py:5451` — `env=launch_env,` (since 2026-09-22 the guardkit build subprocess no longer inherits the whole environment; it gets only the short named list built by `build_launch_env`)
+- `src/forge/subagents/autobuild_runner.py:5466` — `env=launch_env,` (since 2026-09-22 the guardkit build subprocess no longer inherits the whole environment; it gets only the short named list built by `build_launch_env`)
 - `src/forge/launch_environment.py:472` — `"FORGE_DB_PATH",` (named in that module's list of settings deliberately not passed, so a build launched on this side never receives the ledger path; a project that declares it is refused because names starting `FORGE_` are the factory's own)
 
 **What this means for the sandbox runner.** `deploy/sandbox-runner.sh` unsets
