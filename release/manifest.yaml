@@ -207,7 +207,11 @@ schema: 2
 # 3 November 2026: release 2026.11.03-1, every memory search pages until ten records pass its filters, and
 # forward supersession reads the whole namespace (fleet-memory 24540c66, with a85fd02 and 9b2205e). The memory and
 # relay images are built again for it. Other pins as 2026.11.02-1.
-version: 2026.11.03-1
+# 3 November 2026: release 2026.11.03-2, planning records keep the model's usage report (Forge 57b9fb89) and
+# the merge card can count reviewer notes that no longer apply (e9554da5; inert until GuardKit writes the count).
+# The planner image carries specialist-agent 7c89eee: a plan cut off at its answer limit is redrawn shorter.
+# GuardKit stays at d93bb0d9 for the rest of the step 2 measurement. Other pins as 2026.11.03-1.
+version: 2026.11.03-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -278,7 +282,7 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 11e5901651e9258e15d20f963db9ff858c7a1d33
+    commit: 57b9fb8970e3b4b55155fa1b1fd24d1cfc08d869
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
