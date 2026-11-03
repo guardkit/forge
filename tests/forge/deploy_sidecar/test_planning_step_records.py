@@ -13,6 +13,8 @@ tests (no container is ever started) and a real git repository:
 * records older than the bound are removed, and nothing else under the folder;
 * a credential is never kept: a secret-named field or a credential-shaped
   value is replaced, and ordinary text (commit ids, ``max_tokens``) is not;
+* a model's usage report (``token_usage``: token counts, finish reason) is
+  kept, and a credential inside one is still replaced;
 * no receipts folder named: nothing is kept and the step still answers.
 """
 
@@ -386,6 +388,70 @@ class TestNothingSecretIsKept:
         assert clean == {name: "value"} and found == []
 
 
+class TestUsageIsKept:
+    """3 November 2026: every kept trace had ``token_usage`` blanked because
+    its name has the word ``token``, which hid that a lost plan's answer
+    stopped at exactly its 16,384-token limit."""
+
+    def test_a_usage_report_keeps_its_counts_and_finish_reason(self) -> None:
+        usage = {
+            "prompt_tokens": 41234,
+            "completion_tokens": 16384,
+            "total_tokens": 57618,
+            "finish_reason": "length",
+            "completion_tokens_details": {"reasoning_tokens": 9000},
+        }
+        trace = {
+            "iterations": [{"role": "planner", "token_usage": usage}],
+            "max_tokens": 16384,
+            "token_count": 12,
+            "usage_metadata": {
+                "input_tokens": 5,
+                "output_token_details": {"reasoning": 8000},
+            },
+        }
+        clean, found = planning_records.redact_json(trace)
+        assert clean == trace and found == []
+
+    @pytest.mark.parametrize(
+        "record, where",
+        [
+            ({"access_token": "opaque-access-value"}, "/access_token"),
+            ({"refresh_token": "opaque-refresh-value"}, "/refresh_token"),
+            ({"authToken": "opaque-auth-value"}, "/authToken"),
+            ({"api_key": "plain-but-named-as-a-key"}, "/api_key"),
+            ({"headers": {"Authorization": "Basic b3BhcXVl"}}, "/headers/Authorization"),
+            ({"password": 123456}, "/password"),
+            ({"token": "opaque-token-value"}, "/token"),
+            ({"token_usage": "opaque-usage-value"}, "/token_usage"),
+            # A credential put inside a usage report is still found.
+            (
+                {"token_usage": {"prompt_tokens": 1, "credential": "opaque-value"}},
+                "/token_usage/credential",
+            ),
+            (
+                {"token_usage": {"completion_tokens": 2, "access_token": "opaque"}},
+                "/token_usage/access_token",
+            ),
+        ],
+    )
+    def test_credentials_are_still_replaced(
+        self, record: dict[str, Any], where: str
+    ) -> None:
+        clean, found = planning_records.redact_json(record)
+        assert found == [where]
+        assert "opaque" not in json.dumps(clean)
+        assert "plain-but-named" not in json.dumps(clean)
+        assert "123456" not in json.dumps(clean)
+
+    def test_a_key_shaped_value_inside_a_usage_report_is_replaced(self) -> None:
+        clean, found = planning_records.redact_json(
+            {"token_usage": {"prompt_tokens": 3, "note": f"key {FAKE_KEY}"}}
+        )
+        assert clean == {"token_usage": {"prompt_tokens": 3, "note": f"key {REDACTED}"}}
+        assert found == ["/token_usage/note"]
+
+
 class TestTheOutputIsCheckedLikeTheRequest:
     """Review finding R1, 1 November 2026: the planner's output was checked by
     shape only, on its serialized text."""
@@ -451,6 +517,38 @@ class TestTheOutputIsCheckedLikeTheRequest:
         assert kept.endswith("\n")
         step = json.loads((record / "step.json").read_text())
         assert step["redacted"]["output"] == ["result.json"]
+
+    def test_a_trace_keeps_its_usage_and_loses_its_credentials(
+        self, config, clone, first_commit, tmp_path
+    ) -> None:
+        usage = {
+            "prompt_tokens": 41234,
+            "completion_tokens": 16384,
+            "finish_reason": "length",
+        }
+        trace = {
+            "iterations": [
+                {"token_usage": usage},
+                {
+                    "token_usage": usage,
+                    "headers": {"authorization": "Bearer opaque-header-value"},
+                    "access_token": "opaque-access-value",
+                },
+            ]
+        }
+
+        def write(output: Path) -> None:
+            (output / "result.json").write_text(json.dumps(RESULT))
+            (output / "-13a10d4f.json").write_text(json.dumps(trace))
+
+        record = self._keep(config, first_commit, tmp_path, write)
+        kept = json.loads((record / "output" / "-13a10d4f.json").read_text())
+        assert [it["token_usage"] for it in kept["iterations"]] == [usage, usage]
+        assert kept["iterations"][1]["headers"] == {"authorization": REDACTED}
+        assert kept["iterations"][1]["access_token"] == REDACTED
+        assert "opaque" not in _every_kept_byte(record).decode()
+        step = json.loads((record / "step.json").read_text())
+        assert step["redacted"]["output"] == ["-13a10d4f.json"]
 
     def test_json_that_needs_nothing_keeps_its_original_bytes(
         self, config, clone, first_commit, tmp_path

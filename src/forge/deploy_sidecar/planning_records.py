@@ -35,7 +35,9 @@ settings file is never kept). As a guard, any field whose NAME says it is a
 credential, and any value of an unmistakable credential shape (a provider key,
 a GitHub or Slack token, a private key, a password inside an address), is
 replaced before anything is written, and ``step.json`` lists each replacement
-so a replay knows its input was changed. The planner's output files get the
+so a replay knows its input was changed. A model's usage report
+(``token_usage``: its token counts and finish reason) is not a credential and
+is kept. The planner's output files get the
 same check: JSON and JSON-per-line files are read and checked value by value,
 other text by shape. A file that needed nothing keeps its original bytes. Nothing here refuses or stops a step: it only keeps
 records, and a record that cannot be kept is logged and the step goes on.
@@ -89,6 +91,18 @@ _CREDENTIAL_NAME_WORDS: frozenset[str] = frozenset(
 _CREDENTIAL_NAME_PAIRS: frozenset[tuple[str, str]] = frozenset(
     {("api", "key"), ("private", "key"), ("access", "key"), ("secret", "key")}
 )
+
+#: A model's usage report is not a credential although its name has the word
+#: ``token`` in it (3 November 2026). Every kept trace had its ``token_usage``
+#: blanked, and with it the token counts and the finish reason, which hid
+#: that a lost plan's answer stopped at exactly its 16,384-token limit. So a
+#: field whose only credential word is ``token`` is kept when its value is a
+#: number (a count: ``token_count``, ``token``) or, for a name that also says
+#: ``usage`` or ``details`` (``token_usage``, ``output_token_details``), an
+#: object. Such an object is still checked field by field and value by value,
+#: so a credential put inside one is replaced as anywhere else. A string under
+#: any ``token`` name (``access_token``, ``authToken``) is still replaced.
+_USAGE_NAME_WORDS: frozenset[str] = frozenset({"usage", "details"})
 
 #: Values of an unmistakable credential shape. Kept narrow on purpose: the
 #: request is mostly a project's own documents, and replacing ordinary text
@@ -163,12 +177,30 @@ def planning_records_days(env: Mapping[str, str]) -> int:
 # ---------------------------------------------------------------------------
 
 
-def _name_says_secret(name: str) -> bool:
+def _name_words(name: str) -> list[str]:
     spaced = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", name)
-    words = [word for word in re.split(r"[_\-.\s]+", spaced.lower()) if word]
+    return [word for word in re.split(r"[_\-.\s]+", spaced.lower()) if word]
+
+
+def _name_says_secret(name: str) -> bool:
+    words = _name_words(name)
     if any(word in _CREDENTIAL_NAME_WORDS for word in words):
         return True
     return any(pair in _CREDENTIAL_NAME_PAIRS for pair in zip(words, words[1:]))
+
+
+def _is_token_usage(name: str, value: Any) -> bool:
+    """Whether ``value`` under ``name`` is a usage report or count rather than
+    a credential: see :data:`_USAGE_NAME_WORDS`."""
+    words = _name_words(name)
+    named = {word for word in words if word in _CREDENTIAL_NAME_WORDS}
+    if named != {"token"}:
+        return False
+    if any(pair in _CREDENTIAL_NAME_PAIRS for pair in zip(words, words[1:])):
+        return False
+    if isinstance(value, (int, float)):
+        return True
+    return isinstance(value, dict) and any(word in _USAGE_NAME_WORDS for word in words)
 
 
 def redact_text(text: str) -> tuple[str, int]:
@@ -189,7 +221,11 @@ def redact_json(value: Any, where: str = "") -> tuple[Any, list[str]]:
         out: dict[str, Any] = {}
         for key, item in value.items():
             here = f"{where}/{key}"
-            if _name_says_secret(str(key)) and item not in (None, "", [], {}):
+            if (
+                _name_says_secret(str(key))
+                and item not in (None, "", [], {})
+                and not _is_token_usage(str(key), item)
+            ):
                 out[key] = REDACTED
                 found.append(here)
                 continue
