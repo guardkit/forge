@@ -2882,6 +2882,20 @@ def _running_in_this_runner(build_id: str) -> bool:
         )
 
 
+#: One ``git worktree add`` at a time per repository (3 November 2026). Two
+#: builds of one repository starting together each ran ``git worktree add``
+#: in the same ``.git``; git refused one of them with exit 128, and that build
+#: failed before it began (GitHub run of 57b9fb89,
+#: test_two_builds_of_one_repository_run_in_their_own_worktrees). Keyed by the
+#: running event loop as well, since a lock belongs to one loop.
+_WORKTREE_ADD_LOCKS: dict[tuple[int, str], asyncio.Lock] = {}
+
+
+def _worktree_add_lock(repo_path: Path) -> asyncio.Lock:
+    key = (id(asyncio.get_running_loop()), str(repo_path.resolve()))
+    return _WORKTREE_ADD_LOCKS.setdefault(key, asyncio.Lock())
+
+
 async def _materialise_worktree(
     repo_path: Path, branch: str, build_id: str
 ) -> Path:
@@ -2904,10 +2918,11 @@ async def _materialise_worktree(
     base = _worktree_base_dir()
     base.mkdir(parents=True, exist_ok=True)
     worktree_path = (base / build_id).resolve()
-    code, output = await _run_git(
-        ["worktree", "add", "--detach", str(worktree_path), branch],
-        cwd=repo_path,
-    )
+    async with _worktree_add_lock(repo_path):
+        code, output = await _run_git(
+            ["worktree", "add", "--detach", str(worktree_path), branch],
+            cwd=repo_path,
+        )
     if code != 0:
         raise WorktreeMaterialisationError(
             f"git worktree add {worktree_path} for branch {branch!r} failed "
