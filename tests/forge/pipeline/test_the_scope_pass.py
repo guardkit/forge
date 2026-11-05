@@ -169,6 +169,33 @@ class TestAgainstThePlan:
             "src/analytics/service.py",
         ]
 
+    def test_a_task_document_the_build_moved_still_counts(self, repo: Path) -> None:
+        """The build moves each finished task's document to the folder of its
+        state; Python E's card (FEAT-DC55) counted only the two it had not
+        moved, and called files the others named outside the plan."""
+        _git(repo, "checkout", "-q", "-b", BRANCH)
+        (repo / "tasks" / "design_approved").mkdir(parents=True)
+        _git(
+            repo,
+            "mv",
+            "tasks/backlog/daily-counts/TASK-SCOPE-001-the-query.md",
+            "tasks/design_approved/TASK-SCOPE-001-the-query.md",
+        )
+        _write(repo, "src/users/crud.py", "# the users queries\ndef counts():\n    return []\n")
+        _git(repo, "add", "-A")
+        _git(repo, "commit", "-q", "-m", "what the build wrote")
+
+        reading = read_branch_scope(
+            repo_root=repo, base="main", head=BRANCH, feature_id=FEATURE_ID
+        )
+        report = scope_of_the_build(reading=reading, request=REQUEST)
+
+        assert sorted(report.files_the_plan_named) == [
+            "src/users/crud.py",
+            "src/users/router.py",
+        ]
+        assert report.files_the_plan_did_not_name == []
+
     def test_tests_and_documentation_are_the_ordinary_cost_of_the_work(
         self, repo: Path
     ) -> None:

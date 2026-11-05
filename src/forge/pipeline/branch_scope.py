@@ -273,6 +273,14 @@ def _read_the_plan(
 ) -> tuple[str, dict[str, str]]:
     """The feature's own file at ``head`` and every task document it names.
 
+    A task document is read where the feature file put it, or, when it is not
+    there, wherever under ``tasks/`` a file of its name is at ``head``. The
+    build moves each task's document to the folder of its state as it goes
+    (``tasks/design_approved/``, ``tasks/completed/``), so at the end only the
+    unfinished tasks were still where the plan put them. Python E's merge card
+    (FEAT-DC55, 5 November 2026) counted two of its six tasks as the plan and
+    said two files tasks 002 and 005 named were outside it.
+
     A plan that cannot be read is an empty answer, not a failure: the scope
     pass then says the plan declared nothing to compare against, which is the
     truth about every plan written before task documents started declaring
@@ -286,14 +294,32 @@ def _read_the_plan(
     if shown.returncode != 0:
         return "", documents
     feature_file = shown.stdout or ""
+    moved: dict[str, str] | None = None
     for path in plan_document_paths(feature_file):
         try:
             document = _git(repo_root, "show", f"{head}:{path}")
+            if document.returncode != 0:
+                if moved is None:
+                    moved = _task_documents_by_name(repo_root, head)
+                elsewhere = moved.get(path.rsplit("/", 1)[-1])
+                if elsewhere is None:
+                    continue
+                document = _git(repo_root, "show", f"{head}:{elsewhere}")
         except (OSError, subprocess.TimeoutExpired):  # pragma: no cover
             continue
         if document.returncode == 0:
             documents[path] = document.stdout or ""
     return feature_file, documents
+
+
+def _task_documents_by_name(repo_root: "Path | str", head: str) -> dict[str, str]:
+    """Every file under ``tasks/`` at ``head``, by its name (the first found)."""
+    listed = _git(repo_root, "ls-tree", "-r", "--name-only", head, "--", "tasks/")
+    found: dict[str, str] = {}
+    if listed.returncode == 0:
+        for path in (listed.stdout or "").splitlines():
+            found.setdefault(path.rsplit("/", 1)[-1], path)
+    return found
 
 
 def reading_to_answer(reading: BranchScopeReading) -> dict[str, Any]:
