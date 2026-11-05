@@ -211,7 +211,12 @@ schema: 2
 # the merge card can count reviewer notes that no longer apply (e9554da5; inert until GuardKit writes the count).
 # The planner image carries specialist-agent 7c89eee: a plan cut off at its answer limit is redrawn shorter.
 # GuardKit stays at d93bb0d9 for the rest of the step 2 measurement. Other pins as 2026.11.03-1.
-version: 2026.11.03-2
+# 5 November 2026: release 2026.11.05-1, after the step 2 measurement. Forge 898a1b4e (two builds of one repository
+# take turns at git worktree add), 23e4160c (a fix journey always runs its closing review) and 0dd38562 (the scope
+# line finds task documents the build moved). GuardKit 2f0a1f1b: a lost reviewer verdict is asked again (500c4543),
+# exit 5 is no longer always a failure, no flat copy of planned task files, the shared-install guidance sentence, and
+# the last look built but kept out of builds until its replay passes. Other pins as 2026.11.03-2.
+version: 2026.11.05-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -282,12 +287,12 @@ repositories:
   - name: forge
     url: https://github.com/guardkit/forge.git
     branch: main
-    commit: 57b9fb8970e3b4b55155fa1b1fd24d1cfc08d869
+    commit: 0dd38562bc92c8c207fef68573ff57d8c78aaae4
     role: build-context-root
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: d93bb0d94f8ed39c738c8851f64580617e5fa21c
+    commit: 2f0a1f1ba4261443c12f957fe79bad9a0bb02fb4
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
