@@ -1445,3 +1445,206 @@ class TestModeCBudgetEnforcement:
         assert len(recorder) == 1
         # The breach names the review-cycle cap, not the (degraded) coach floor.
         assert recorder[0]["payload"].details["breached_cap"] == "max_review_cycles"
+
+
+# ---------------------------------------------------------------------------
+# Where each cap is judged: the closing review always runs (FEAT-316A)
+# ---------------------------------------------------------------------------
+
+
+#: FEAT-316A's repair, 4 November 2026: 21,211 seconds of work against a
+#: 7,200 second wall-clock cap.
+_FEAT_316A_WORKED_SECONDS = 21_211
+_FEAT_316A_WALLCLOCK_CAP = 7_200
+
+
+def _review(*fix_tasks: str) -> ModeCStageEntry:
+    return ModeCStageEntry(
+        stage_class=StageClass.TASK_REVIEW,
+        status="approved",
+        fix_tasks=tuple(fix_tasks),
+    )
+
+
+def _work(fix_task_id: str) -> ModeCStageEntry:
+    return ModeCStageEntry(
+        stage_class=StageClass.TASK_WORK,
+        status="approved",
+        fix_task_id=fix_task_id,
+    )
+
+
+class TestTheClosingReviewAlwaysRuns:
+    """The wall-clock cap stops a new round of fixes, never a review.
+
+    On 4 November 2026 FEAT-316A's repair ran 11 fix tasks and every one
+    passed. The closing review, the one that checks the fixes landed, was
+    then refused because the build had passed its wall-clock cap (21,211 s
+    against 7,200), and the journey ended FAILED with all that work done.
+    The guard is now consulted at two points: before a review with the
+    review-cycle cap alone, and before the first fix task of a new round
+    with the wall-clock and token caps. These run the real cycle planner.
+    """
+
+    def _supervisor(
+        self, build_id: str, guards: BudgetGuards, history: list[ModeCStageEntry]
+    ) -> tuple[Supervisor, dict[str, Any], list[dict[str, Any]]]:
+        from datetime import UTC, datetime, timedelta
+
+        supervisor, doubles = _build_supervisor()
+        supervisor.budget_guards = guards
+        supervisor.budget_profile_name = "fix-journey"
+        now = datetime(2026, 11, 4, 12, 0, 0, tzinfo=UTC)
+        supervisor.budget_wall_clock = lambda: now
+        supervisor.budget_started_at_reader = lambda _bid: now - timedelta(
+            seconds=_FEAT_316A_WORKED_SECONDS
+        )
+        recorder: list[dict[str, Any]] = []
+
+        async def _pause(**kwargs: Any) -> None:
+            recorder.append(kwargs)
+
+        supervisor.budget_pause = _pause
+        doubles["mode_reader"].modes[build_id] = BuildMode.MODE_C
+        doubles["ordering_reader"].approved.update(
+            {
+                (build_id, StageClass.TASK_REVIEW, None),
+                (build_id, StageClass.TASK_WORK, None),
+            }
+        )
+        doubles["mode_c_history"].histories[build_id] = history
+        return supervisor, doubles, recorder
+
+    def test_the_closing_review_is_dispatched_past_the_wallclock_cap(self) -> None:
+        fixes = [f"FIX-{n}" for n in range(1, 12)]
+        supervisor, doubles, recorder = self._supervisor(
+            "build-316A",
+            BudgetGuards(
+                max_review_cycles=2,
+                max_build_wallclock_seconds=_FEAT_316A_WALLCLOCK_CAP,
+            ),
+            [_review(*fixes), *(_work(f) for f in fixes)],
+        )
+
+        report = _run(supervisor.next_turn("build-316A"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert report.chosen_stage is StageClass.TASK_REVIEW
+        assert recorder == []
+        assert len(doubles["subprocess"].calls) == 1
+        assert doubles["subprocess"].calls[0]["stage"] is StageClass.TASK_REVIEW
+
+    def test_a_wallclock_only_profile_does_not_warn_at_the_review(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """The review point judges no cap of this profile, yet it has caps."""
+        supervisor, doubles, recorder = self._supervisor(
+            "build-WCO",
+            BudgetGuards(max_build_wallclock_seconds=_FEAT_316A_WALLCLOCK_CAP),
+            [_review("FIX-1"), _work("FIX-1")],
+        )
+
+        with caplog.at_level(logging.WARNING, logger="forge.pipeline.supervisor"):
+            report = _run(supervisor.next_turn("build-WCO"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert report.chosen_stage is StageClass.TASK_REVIEW
+        assert recorder == []
+        assert not any(
+            "NOTHING IS ENFORCED" in r.getMessage() for r in caplog.records
+        )
+
+    @pytest.mark.parametrize(
+        ("history", "review_count"),
+        [
+            # The opening review's first fix task.
+            ([_review("FIX-1", "FIX-2")], 1),
+            # A second round, after the first round's closing review.
+            ([_review("FIX-1"), _work("FIX-1"), _review("FIX-2", "FIX-3")], 2),
+        ],
+        ids=["first-round", "second-round"],
+    )
+    def test_the_first_fix_task_of_a_new_round_past_the_cap_pauses(
+        self, history: list[ModeCStageEntry], review_count: int
+    ) -> None:
+        supervisor, doubles, recorder = self._supervisor(
+            "build-NEWROUND",
+            BudgetGuards(
+                max_review_cycles=3,
+                max_build_wallclock_seconds=_FEAT_316A_WALLCLOCK_CAP,
+            ),
+            history,
+        )
+
+        report = _run(supervisor.next_turn("build-NEWROUND"))
+
+        assert report.outcome is TurnOutcome.PAUSED_BUDGET
+        assert report.chosen_stage is StageClass.TASK_WORK
+        # The round did not start.
+        assert doubles["subprocess"].calls == []
+        # One risk=high escalation naming the wall-clock cap, on an id of its
+        # own so it cannot collide with a review-point breach on this count.
+        assert len(recorder) == 1
+        payload = recorder[0]["payload"]
+        assert payload.risk_level == "high"
+        assert payload.details["reason"] == "budget_guard_breach"
+        assert payload.details["breached_cap"] == "max_build_wallclock_seconds"
+        assert payload.request_id == f"budget-build-NEWROUND-{review_count}-fixes"
+
+    def test_a_later_fix_task_in_a_running_round_is_not_stopped(self) -> None:
+        supervisor, doubles, recorder = self._supervisor(
+            "build-MIDROUND",
+            BudgetGuards(
+                max_review_cycles=3,
+                max_build_wallclock_seconds=_FEAT_316A_WALLCLOCK_CAP,
+            ),
+            [_review("FIX-1", "FIX-2"), _work("FIX-1")],
+        )
+
+        report = _run(supervisor.next_turn("build-MIDROUND"))
+
+        assert report.outcome is TurnOutcome.DISPATCHED
+        assert report.chosen_stage is StageClass.TASK_WORK
+        assert recorder == []
+        assert doubles["subprocess"].calls[0]["fix_task"].fix_task_id == "FIX-2"
+
+    def test_the_review_cycle_cap_still_pauses_before_a_review(self) -> None:
+        """Exactly as before: same stage, same cap, same request id."""
+        supervisor, doubles, recorder = self._supervisor(
+            "build-RCCAP",
+            BudgetGuards(
+                max_review_cycles=2,
+                max_build_wallclock_seconds=_FEAT_316A_WALLCLOCK_CAP,
+            ),
+            _review_entries(2),
+        )
+        supervisor.mode_c_planner = _AlwaysReviewPlanner()
+
+        report = _run(supervisor.next_turn("build-RCCAP"))
+
+        assert report.outcome is TurnOutcome.PAUSED_BUDGET
+        assert report.chosen_stage is StageClass.TASK_REVIEW
+        assert doubles["subprocess"].calls == []
+        assert len(recorder) == 1
+        payload = recorder[0]["payload"]
+        assert payload.details["breached_cap"] == "max_review_cycles"
+        assert payload.request_id == "budget-build-RCCAP-2"
+
+    def test_an_already_paused_build_is_parked_at_the_fix_task(self) -> None:
+        """The parked report names the stage that was actually chosen."""
+        supervisor, doubles, recorder = self._supervisor(
+            "build-PARKED",
+            BudgetGuards(
+                max_review_cycles=3,
+                max_build_wallclock_seconds=_FEAT_316A_WALLCLOCK_CAP,
+            ),
+            [_review("FIX-1")],
+        )
+        doubles["state_reader"].states["build-PARKED"] = BuildState.PAUSED
+
+        report = _run(supervisor.next_turn("build-PARKED"))
+
+        assert report.outcome is TurnOutcome.WAITING
+        assert report.chosen_stage is StageClass.TASK_WORK
+        assert recorder == []
+        assert doubles["subprocess"].calls == []

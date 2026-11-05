@@ -576,7 +576,10 @@ class BudgetGuards(BaseModel):
         description=(
             "Cap on total build wall-clock (seconds). ``None`` = no cap. "
             "Distinct from the runner's per-subprocess timeout — this bounds "
-            "the whole build."
+            "the whole build. On a fix journey it is judged before a new "
+            "round of fixes starts, never before a review: a round already "
+            "running goes to its end and its closing review runs "
+            "(FEAT-316A, 4 November 2026)."
         ),
     )
     max_build_tokens: int | None = Field(
@@ -584,7 +587,8 @@ class BudgetGuards(BaseModel):
         ge=1,
         description=(
             "Optional cap on tokens consumed by a build (LangSmith-tagged or "
-            "parsed from harness output). ``None`` = no cap / not measured."
+            "parsed from harness output). ``None`` = no cap / not measured. "
+            "Judged at the same point as the wall-clock cap."
         ),
     )
     min_coach_score: float | None = Field(

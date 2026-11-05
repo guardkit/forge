@@ -129,6 +129,15 @@ def evaluate_budget(
     cap, i.e. the guard is consulted before the step that would exceed it (the
     supervisor asks "may I run another review cycle?" with
     ``review_cycles`` = cycles already done).
+
+    The supervisor consults this at two points and hands it only the caps
+    that belong at each, with the others set to ``None``: before a review,
+    the review-cycle cap; before the first fix task of a new round, the
+    wall-clock and token caps. The wall-clock cap used to be judged before
+    every review, and on 4 November 2026 that refused FEAT-316A's closing
+    review after its 11 fix tasks had all passed, so the journey ended
+    FAILED with the work done. A round already running, and the review that
+    closes it, are no longer refused on time.
     """
     if (
         profile.max_review_cycles is not None

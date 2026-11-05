@@ -1879,7 +1879,9 @@ def make_budget_pause(
        (persistence.py — an optimistic, status-guarded RUNNING → PAUSED that
        atomically records ``pending_approval_request_id``). ``request_id`` is
        the deterministic ``budget-{build_id}-{review_cycles}`` the Supervisor
-       stamped on the payload, so a re-fire is idempotent.
+       stamped on the payload (with ``-fixes`` on the end when the breach
+       was found before a new round of fixes rather than before a review),
+       so a re-fire is idempotent.
     3. **Emit** the ``build-paused`` lifecycle event via
        ``lifecycle_emitter.emit_paused`` (the PLAIN emit — **not**
        ``emit_paused_then_interrupt``, which awaits a LangGraph ``interrupt()``

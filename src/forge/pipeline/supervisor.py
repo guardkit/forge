@@ -151,6 +151,45 @@ __all__ = [
 
 
 # ---------------------------------------------------------------------------
+# Where the fix journey's budget caps are consulted (FEAT-UBS-002)
+# ---------------------------------------------------------------------------
+
+#: The build caps :func:`forge.pipeline.budget_guard.evaluate_budget` reads.
+_BUILD_CAPS: frozenset[str] = frozenset(
+    {"max_review_cycles", "max_build_wallclock_seconds", "max_build_tokens"}
+)
+
+#: Judged before a review: the review-cycle cap alone. The closing review of
+#: a round always runs, however long the round took (FEAT-316A, 4 November
+#: 2026: 11 fix tasks passed and the review that would have checked them was
+#: refused on the wall-clock cap, so the journey ended FAILED).
+_CAPS_BEFORE_A_REVIEW: frozenset[str] = frozenset({"max_review_cycles"})
+
+#: Judged before a new round of fixes starts: the time and token caps. They
+#: stop more work from being started; they do not cut short a round that is
+#: already running, or the review that closes it.
+_CAPS_BEFORE_A_NEW_FIX_ROUND: frozenset[str] = frozenset(
+    {"max_build_wallclock_seconds", "max_build_tokens"}
+)
+
+
+def _starts_a_new_fix_round(history: Sequence[ModeCStageEntry]) -> bool:
+    """Whether a fix task chosen now would be the first of its round.
+
+    True when no fix task (``TASK_WORK``) has been recorded since the latest
+    review (``TASK_REVIEW``), or when there is no review at all. A later fix
+    task in a round that has already started returns False, so the round
+    runs to its end and its closing review runs.
+    """
+    for entry in reversed(history):
+        if entry.stage_class == StageClass.TASK_WORK:
+            return False
+        if entry.stage_class == StageClass.TASK_REVIEW:
+            return True
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Outcome enum + report dataclass — supervisor's structured return shape
 # ---------------------------------------------------------------------------
 
@@ -185,10 +224,14 @@ class TurnOutcome(StrEnum):
             actively reasoned about an empty action.
         PAUSED_BUDGET: An unattended-profile Mode C build breached a
             :class:`~forge.config.models.BudgetGuards` cap (review cycles /
-            wall-clock / tokens / coach score). The supervisor refused to
-            dispatch the next cycle, escalated a ``risk_level="high"``
-            approval request, and paused the build (UBS-002). Never fired
-            for attended profiles (caps off, ASSUM-010).
+            wall-clock / tokens). The supervisor refused to dispatch the
+            chosen stage, escalated a ``risk_level="high"`` approval
+            request, and paused the build (UBS-002). The review-cycle cap
+            is judged before a review; the wall-clock and token caps
+            before the first fix task of a new round, so a round already
+            running and the review that closes it are never refused on
+            time (FEAT-316A, 4 November 2026). Never fired for attended
+            profiles (caps off, ASSUM-010).
     """
 
     DISPATCHED = "dispatched"
@@ -1571,17 +1614,44 @@ class Supervisor:
             self._record_safe(report)
             return report
 
-        # FEAT-UBS-002 — unattended budget-guard enforcement. Evaluated at
-        # the cyclic TASK_REVIEW step (the follow-up review the planner just
-        # chose): if an unattended profile has breached a cap, refuse the
-        # dispatch, escalate a risk=high approval, and pause instead of
-        # spending another cycle. A no-op for attended / unwired profiles.
+        # FEAT-UBS-002 — unattended budget-guard enforcement. If an
+        # unattended profile has breached a cap, refuse the dispatch,
+        # escalate a risk=high approval, and pause. A no-op for attended /
+        # unwired profiles.
+        #
+        # The guard is consulted at two points, each with only the caps
+        # that belong there:
+        #
+        # - before a review, the review-cycle cap alone;
+        # - before a NEW fix round (its first fix task), the wall-clock and
+        #   token caps.
+        #
+        # The wall-clock cap used to be checked before every review. On 4
+        # November 2026 FEAT-316A's repair ran 11 fix tasks, every one of
+        # them passed, and then the closing review, the one that checks the
+        # fixes landed, was refused because the build had passed its
+        # wall-clock cap (21,211 s against 7,200). The journey ended FAILED
+        # and all that finished work was thrown away at the last step. So
+        # the closing review always runs, and the time and token caps stop
+        # only a new round of fixes from starting. A round already running
+        # goes to its end. The review-cycle cap still stops a review; the
+        # planner's own last-cycle exit routes finished work at that cap to
+        # the merge-ready checks.
+        budget_caps: frozenset[str] | None = None
         if chosen_stage is StageClass.TASK_REVIEW:
+            budget_caps = _CAPS_BEFORE_A_REVIEW
+        elif chosen_stage is StageClass.TASK_WORK and _starts_a_new_fix_round(
+            history
+        ):
+            budget_caps = _CAPS_BEFORE_A_NEW_FIX_ROUND
+        if budget_caps is not None:
             budget_report = await self._enforce_mode_c_budget(
                 build_id=build_id,
                 build_state=build_state,
                 history=history,
                 permitted=permitted,
+                chosen_stage=chosen_stage,
+                caps=budget_caps,
             )
             if budget_report is not None:
                 return budget_report
@@ -1663,6 +1733,8 @@ class Supervisor:
         build_state: BuildState,
         history: "Sequence[ModeCStageEntry]",
         permitted: frozenset[StageClass],
+        chosen_stage: StageClass,
+        caps: frozenset[str],
     ) -> "TurnReport | None":
         """Evaluate the unattended budget guard (FEAT-UBS-002).
 
@@ -1671,6 +1743,21 @@ class Supervisor:
         paused), or ``None`` when the build may proceed. A strict no-op for
         an unwired / attended (caps-off) profile so ModeCCyclePlanner
         behaviour is byte-for-byte unchanged (ASSUM-010).
+
+        Args:
+            build_id: The build being judged.
+            build_state: Its current lifecycle state.
+            history: Its Mode C history.
+            permitted: The stages the ordering guard allows now.
+            chosen_stage: The stage the planner chose and this guard may
+                refuse. It is stamped on the report.
+            caps: The names of the :class:`BudgetGuards` caps that apply at
+                this point (:data:`_CAPS_BEFORE_A_REVIEW` or
+                :data:`_CAPS_BEFORE_A_NEW_FIX_ROUND`). Only these are
+                judged. Whether the profile has any caps at all is still
+                read from the whole profile, so a profile with only a
+                wall-clock cap is not reported as enforcing nothing when a
+                review is consulted.
         """
         guards = self.budget_guards
         if guards is None or not guards.caps_enabled:
@@ -1712,7 +1799,7 @@ class Supervisor:
                 outcome=TurnOutcome.WAITING,
                 build_id=build_id,
                 permitted_stages=permitted,
-                chosen_stage=StageClass.TASK_REVIEW,
+                chosen_stage=chosen_stage,
                 rationale="a fix-journey build is already paused; the budget guard parked it",
             )
             self._record_safe(report)
@@ -1746,14 +1833,23 @@ class Supervisor:
             # attended / streaming-path default) leaves it None → floor inert.
             last_coach_score=self._budget_last_coach_score(build_id),
         )
-        verdict = evaluate_budget(guards, metrics)
+        # Only the caps that belong at this point are judged: the others are
+        # set to None on a copy used for this one evaluation.
+        point_guards = guards.model_copy(
+            update={name: None for name in _BUILD_CAPS - caps}
+        )
+        verdict = evaluate_budget(point_guards, metrics)
         if verdict.ok:
             return None
 
         feature_id = self._mode_feature_id_for(build_id) or ""
         # Deterministic per-breach request_id (review_cycles disambiguates a
-        # wall-clock re-breach on a later cycle).
+        # re-breach on a later cycle). The point before a new fix round has
+        # its own suffix, so a breach there and a breach before the next
+        # review can never share an id on the same review count.
         request_id = f"budget-{build_id}-{review_cycles}"
+        if chosen_stage is not StageClass.TASK_REVIEW:
+            request_id = f"{request_id}-fixes"
         payload = build_budget_breach_approval_payload(
             request_id=request_id,
             build_id=build_id,
@@ -1794,7 +1890,7 @@ class Supervisor:
             outcome=TurnOutcome.PAUSED_BUDGET,
             build_id=build_id,
             permitted_stages=permitted,
-            chosen_stage=StageClass.TASK_REVIEW,
+            chosen_stage=chosen_stage,
             chosen_feature_id=feature_id or None,
             rationale=verdict.detail,
         )

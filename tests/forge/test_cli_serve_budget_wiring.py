@@ -52,7 +52,13 @@ from forge.pipeline.budget_guard import (
     BudgetVerdict,
     build_budget_breach_approval_payload,
 )
-from forge.pipeline.supervisor import Supervisor, TurnOutcome
+from forge.pipeline.mode_c_planner import StageEntry as ModeCStageEntry
+from forge.pipeline.stage_taxonomy import StageClass
+from forge.pipeline.supervisor import (
+    _CAPS_BEFORE_A_NEW_FIX_ROUND,
+    Supervisor,
+    TurnOutcome,
+)
 
 # ---------------------------------------------------------------------------
 # Fixtures
@@ -439,6 +445,19 @@ def _wallclock_supervisor(
     )
 
 
+#: A review has approved its fix tasks and none has run yet: the next fix
+#: task starts a new round, the one point the wall-clock cap is judged
+#: (FEAT-316A, 4 November 2026: the review that closes a round is never
+#: refused on time).
+_A_ROUND_ABOUT_TO_START = [
+    ModeCStageEntry(
+        stage_class=StageClass.TASK_REVIEW,
+        status="approved",
+        fix_tasks=("FIX-1",),
+    )
+]
+
+
 class TestWallClockCap:
     """First-ever wall-clock-cap coverage: breach pauses; missing wiring is
     fail-open (0.0 elapsed → never a false pause)."""
@@ -486,8 +505,10 @@ class TestWallClockCap:
         report = await sup._enforce_mode_c_budget(
             build_id="build-x",
             build_state=BuildState.RUNNING,
-            history=[],
+            history=_A_ROUND_ABOUT_TO_START,
             permitted=frozenset(),
+            chosen_stage=StageClass.TASK_WORK,
+            caps=_CAPS_BEFORE_A_NEW_FIX_ROUND,
         )
 
         assert report is not None
@@ -510,8 +531,10 @@ class TestWallClockCap:
         report = await sup._enforce_mode_c_budget(
             build_id="build-x",
             build_state=BuildState.RUNNING,
-            history=[],
+            history=_A_ROUND_ABOUT_TO_START,
             permitted=frozenset(),
+            chosen_stage=StageClass.TASK_WORK,
+            caps=_CAPS_BEFORE_A_NEW_FIX_ROUND,
         )
 
         assert report is None

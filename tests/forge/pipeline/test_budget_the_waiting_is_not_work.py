@@ -65,8 +65,13 @@ from forge.lifecycle.state_machine import (
     BuildState,
     transition as compose_transition,
 )
+from forge.pipeline.mode_c_planner import StageEntry as ModeCStageEntry
 from forge.pipeline.stage_taxonomy import StageClass
-from forge.pipeline.supervisor import Supervisor, TurnOutcome
+from forge.pipeline.supervisor import (
+    _CAPS_BEFORE_A_NEW_FIX_ROUND,
+    Supervisor,
+    TurnOutcome,
+)
 
 # Attempt seventeen's own clock, to the second.
 STARTED_AT = datetime(2026, 9, 8, 22, 3, 3, tzinfo=UTC)
@@ -301,12 +306,27 @@ def _supervisor(
 
 
 def _ask_the_guard(sup: Supervisor, build_id: str) -> Any:
+    """Ask the guard at the one point the wall-clock cap is judged.
+
+    That is the first fix task of a new round: the review has approved its
+    fix tasks and none has run yet. The review that closes a round is never
+    refused on time (FEAT-316A, 4 November 2026), so this is where the
+    waiting either is or is not charged.
+    """
     return asyncio.run(
         sup._enforce_mode_c_budget(
             build_id=build_id,
             build_state=BuildState.RUNNING,
-            history=[],
+            history=[
+                ModeCStageEntry(
+                    stage_class=StageClass.TASK_REVIEW,
+                    status="approved",
+                    fix_tasks=("FIX-1",),
+                )
+            ],
             permitted=frozenset(),
+            chosen_stage=StageClass.TASK_WORK,
+            caps=_CAPS_BEFORE_A_NEW_FIX_ROUND,
         )
     )
 
