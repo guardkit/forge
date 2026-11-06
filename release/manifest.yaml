@@ -216,7 +216,10 @@ schema: 2
 # line finds task documents the build moved). GuardKit 2f0a1f1b: a lost reviewer verdict is asked again (500c4543),
 # exit 5 is no longer always a failure, no flat copy of planned task files, the shared-install guidance sentence, and
 # the last look built but kept out of builds until its replay passes. Other pins as 2026.11.03-2.
-version: 2026.11.05-1
+# 6 November 2026: release 2026.11.06-1, the same as 2026.11.05-1 (which was started and taken back when the Spark's
+# keyring crashed) plus GuardKit 08e6eead (a review's look-up keeps its answer under shared load), db448db9 (the
+# per-task review is told what runs at merge; decision 3) and 9ff0acd4 (the last look's limit fits that grace).
+version: 2026.11.06-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -292,7 +295,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 2f0a1f1ba4261443c12f957fe79bad9a0bb02fb4
+    commit: 9ff0acd491e78dbac447411c206903cb0946ac37
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
