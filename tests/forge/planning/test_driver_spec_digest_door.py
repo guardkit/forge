@@ -3419,14 +3419,14 @@ _LINES_DIGEST = DIGEST_YAML + (
 )
 
 _LINES_BLOCK = (
-    "*Rules this change must have or keep* (no worked example and no proof "
-    "script is written for these):\n"
-    "• Line 1 of the request: The version is read from the build metadata.\n"
-    "• Line 4 of the request: No other endpoint changes.\n\n"
     "*Lines the spec-writer thinks cannot be met* (advice: nothing is stopped "
     "by it):\n"
     "• Line 4 of the request: No other endpoint changes. — why: The version "
-    "endpoint is itself a new endpoint in the shared router."
+    "endpoint is itself a new endpoint in the shared router.\n\n"
+    "*Rules this change must have or keep* (no worked example and no proof "
+    "script is written for these):\n"
+    "• Line 1 of the request: The version is read from the build metadata.\n"
+    "• Line 4 of the request: No other endpoint changes."
 )
 
 
@@ -3488,5 +3488,12 @@ def test_the_block_stays_short_whatever_the_digest_holds() -> None:
         }
     )
     assert len(block) < 1500
-    assert block.endswith("more, in the spec's summary.")
+    # The flag comes first and is never left out (Codex implementation check
+    # R1); the rules take what room is left and the rest are counted.
+    assert block.startswith("*Lines the spec-writer thinks cannot be met*")
+    assert "• Line 2 of the request: word word" in block
+    assert " — why: word word" in block
     assert "Line 1 of the request: word word" in block
+    assert block.endswith("more rules, in the spec's summary.")
+    shown = block.count("\n• Line ") - 1
+    assert block.endswith(f"And {29 - shown} more rules, in the spec's summary.")

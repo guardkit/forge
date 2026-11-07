@@ -975,8 +975,9 @@ _CHANGED_LIST_CARD_LINE = "What changed since your note: {changes}."
 # end of ``what_happened``, which it already shows, and jarvis is unchanged.
 # ---------------------------------------------------------------------------
 
-#: Per-line cuts and the whole block's cut, well inside Slack's 3,000-character
-#: section limit with the rest of ``what_happened``.
+#: Per-line cuts and the room the rules may fill, well inside Slack's
+#: 3,000-character section limit with the rest of ``what_happened``. The
+#: "cannot be met" flags are never left out.
 _LINE_TEXT_CHARS = 160
 _LINE_BLOCK_CHARS = 1400
 
@@ -1001,42 +1002,43 @@ def _request_lines_block(digest_obj: Mapping[str, Any]) -> str:
         line = entry.get("line")
         return f"Line {line} of the request" if isinstance(line, int) else "A line of the request"
 
-    sections: list[list[str]] = []
-    rules = entries("rules")
-    if rules:
-        sections.append(
-            [
-                "*Rules this change must have or keep* (no worked example and no "
-                "proof script is written for these):"
-            ]
-            + [f"• {where(e)}: {_cut(e['text'], _LINE_TEXT_CHARS)}" for e in rules]
-        )
+    # The "cannot be met" flags go first and are never left out; the rules
+    # take whatever room is left, and the overflow line says how many rules
+    # were left out (Codex implementation check R1, 7 November 2026).
+    parts: list[str] = []
     flags = entries("cannot_be_met")
     if flags:
-        sections.append(
-            [
-                "*Lines the spec-writer thinks cannot be met* (advice: nothing is "
-                "stopped by it):"
-            ]
-            + [
-                f"• {where(e)}: {_cut(e['text'], _LINE_TEXT_CHARS)} — why: "
-                f"{_cut(e.get('why') or 'no reason given', _LINE_TEXT_CHARS)}"
-                for e in flags
-            ]
+        parts.append(
+            "\n".join(
+                [
+                    "*Lines the spec-writer thinks cannot be met* (advice: nothing "
+                    "is stopped by it):"
+                ]
+                + [
+                    f"• {where(e)}: {_cut(e['text'], _LINE_TEXT_CHARS)} — why: "
+                    f"{_cut(e.get('why') or 'no reason given', _LINE_TEXT_CHARS)}"
+                    for e in flags
+                ]
+            )
         )
-    kept: list[str] = []
+    rules = entries("rules")
     left_out = 0
-    for section in sections:
-        rows = [section[0]]
-        for row in section[1:]:
-            if len("\n\n".join(kept + ["\n".join(rows + [row])])) > _LINE_BLOCK_CHARS:
+    if rules:
+        rows = [
+            "*Rules this change must have or keep* (no worked example and no "
+            "proof script is written for these):"
+        ]
+        for e in rules:
+            row = f"• {where(e)}: {_cut(e['text'], _LINE_TEXT_CHARS)}"
+            if len("\n\n".join(parts + ["\n".join(rows + [row])])) > _LINE_BLOCK_CHARS:
                 left_out += 1
             else:
                 rows.append(row)
-        kept.append("\n".join(rows))
-    block = "\n\n".join(kept)
+        if len(rows) > 1:
+            parts.append("\n".join(rows))
+    block = "\n\n".join(parts)
     if left_out:
-        block += f"\nAnd {left_out} more, in the spec's summary."
+        block += f"\nAnd {left_out} more rules, in the spec's summary."
     return block
 
 
