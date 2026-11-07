@@ -965,6 +965,82 @@ _SAME_LIST_NOTIFICATION = (
 _CHANGED_LIST_CARD_LINE = "What changed since your note: {changes}."
 
 # ---------------------------------------------------------------------------
+# The request's rules and "cannot be met" flags (7 November 2026, decision 2 of
+# the five fix-at-source decisions: the spec step writes one scenario or one
+# rule for each line of the request). The spec writer's digest carries two
+# extra keys its code writes: ``rules`` (each line that is a property the
+# change must have or keep, so it has no worked example) and ``cannot_be_met``
+# (each line its writer says no change could make true, and why). jarvis shows
+# only the card fields it knows, so they are written as one short block at the
+# end of ``what_happened``, which it already shows, and jarvis is unchanged.
+# ---------------------------------------------------------------------------
+
+#: Per-line cuts and the whole block's cut, well inside Slack's 3,000-character
+#: section limit with the rest of ``what_happened``.
+_LINE_TEXT_CHARS = 160
+_LINE_BLOCK_CHARS = 1400
+
+
+def _cut(text: str, limit: int) -> str:
+    flat = " ".join(str(text).split())
+    return flat if len(flat) <= limit else flat[: limit - 1].rstrip() + "…"
+
+
+def _request_lines_block(digest_obj: Mapping[str, Any]) -> str:
+    """The card's words for the digest's ``rules`` and ``cannot_be_met``
+    entries, or ``""`` when it has none. Plain words: "line 3 of the request"."""
+
+    def entries(key: str) -> list[Mapping[str, Any]]:
+        raw = digest_obj.get(key)
+        return [
+            e for e in (raw if isinstance(raw, list) else [])
+            if isinstance(e, Mapping) and str(e.get("text") or "").strip()
+        ]
+
+    def where(entry: Mapping[str, Any]) -> str:
+        line = entry.get("line")
+        return f"Line {line} of the request" if isinstance(line, int) else "A line of the request"
+
+    sections: list[list[str]] = []
+    rules = entries("rules")
+    if rules:
+        sections.append(
+            [
+                "*Rules this change must have or keep* (no worked example and no "
+                "proof script is written for these):"
+            ]
+            + [f"• {where(e)}: {_cut(e['text'], _LINE_TEXT_CHARS)}" for e in rules]
+        )
+    flags = entries("cannot_be_met")
+    if flags:
+        sections.append(
+            [
+                "*Lines the spec-writer thinks cannot be met* (advice: nothing is "
+                "stopped by it):"
+            ]
+            + [
+                f"• {where(e)}: {_cut(e['text'], _LINE_TEXT_CHARS)} — why: "
+                f"{_cut(e.get('why') or 'no reason given', _LINE_TEXT_CHARS)}"
+                for e in flags
+            ]
+        )
+    kept: list[str] = []
+    left_out = 0
+    for section in sections:
+        rows = [section[0]]
+        for row in section[1:]:
+            if len("\n\n".join(kept + ["\n".join(rows + [row])])) > _LINE_BLOCK_CHARS:
+                left_out += 1
+            else:
+                rows.append(row)
+        kept.append("\n".join(rows))
+    block = "\n\n".join(kept)
+    if left_out:
+        block += f"\nAnd {left_out} more, in the spec's summary."
+    return block
+
+
+# ---------------------------------------------------------------------------
 # The possible contradiction (4 October 2026, the owner: "yes make the change so
 # it's a warning on the card"). The spec writer no longer refuses a spec over a
 # pair its reviewer says cannot both be true; it writes the pair to
@@ -4105,6 +4181,15 @@ class PlanningRunDriver:
             )
             final["card"] = card
             final["repository_facts_unavailable"] = unavailable_line
+        if (final.get("card") or {}).get("request_lines"):
+            # The rules and "cannot be met" flags go last, in what_happened,
+            # the field jarvis already shows (7 November 2026, decision 2).
+            card = dict(final.get("card") or {})
+            block = str(card.pop("request_lines"))
+            card["what_happened"] = (
+                f"{card.get('what_happened', '')}\n\n{block}".strip()
+            )
+            final["card"] = card
         self._record_spec_draft(correlation_id, final)
         return final
 
@@ -4769,6 +4854,12 @@ class PlanningRunDriver:
             # One click deeper. Never the ask, never in front of the reader.
             "worked_examples": feature_text,
         }
+        # The request's rules and "cannot be met" flags (7 November 2026). Held
+        # here and written into what_happened when the card is opened, after
+        # every other line, so a rewrite's same-list text cannot drop them.
+        lines_block = _request_lines_block(digest_obj)
+        if lines_block:
+            card["request_lines"] = lines_block
         feature = str(digest_obj.get("feature") or "").strip()
         if feature:
             card["feature"] = feature

@@ -3394,3 +3394,99 @@ async def test_an_unreadable_checker_file_is_ignored_and_never_fails_the_leg(
     assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
     card = _digest_cards(h)[0].payload["details"]["summary"]
     assert card["what_happened"] == _ROUND_ONE_TEXT
+
+
+# ---------------------------------------------------------------------------
+# The request's rules and "cannot be met" flags (7 November 2026, decision 2:
+# the spec step writes one scenario or one rule for each line of the request).
+# The spec writer's code adds ``rules`` and ``cannot_be_met`` to the digest;
+# the card shows them as one block at the end of ``what_happened``, the field
+# jarvis already shows, so jarvis is unchanged.
+# ---------------------------------------------------------------------------
+
+from forge.planning.driver import _request_lines_block  # noqa: E402
+
+_LINES_DIGEST = DIGEST_YAML + (
+    "rules:\n"
+    "- line: 1\n"
+    "  text: The version is read from the build metadata.\n"
+    "- line: 4\n"
+    "  text: No other endpoint changes.\n"
+    "cannot_be_met:\n"
+    "- line: 4\n"
+    "  text: No other endpoint changes.\n"
+    "  why: The version endpoint is itself a new endpoint in the shared router.\n"
+)
+
+_LINES_BLOCK = (
+    "*Rules this change must have or keep* (no worked example and no proof "
+    "script is written for these):\n"
+    "• Line 1 of the request: The version is read from the build metadata.\n"
+    "• Line 4 of the request: No other endpoint changes.\n\n"
+    "*Lines the spec-writer thinks cannot be met* (advice: nothing is stopped "
+    "by it):\n"
+    "• Line 4 of the request: No other endpoint changes. — why: The version "
+    "endpoint is itself a new endpoint in the shared router."
+)
+
+
+@pytest.mark.asyncio
+async def test_the_card_ends_with_the_rules_and_the_lines_that_cannot_be_met(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory([_answer("approve")]),
+        spec_replies=[_spec_reply(digest=_LINES_DIGEST)],
+    )
+
+    await h.driver.drive(CID)
+
+    card = _digest_cards(h)[0].payload["details"]["summary"]
+    assert card["what_happened"] == _ROUND_ONE_TEXT + "\n\n" + _LINES_BLOCK
+    # Only fields the renderer already knows: the block rides in what_happened.
+    assert "request_lines" not in card
+    assert len(card["what_it_will_do"]) == 2
+    assert store.get_run(CID)["state"] == PlanningState.BUILD_QUEUED.value
+
+
+@pytest.mark.asyncio
+async def test_a_rewrite_that_changed_nothing_still_shows_the_rules(
+    store: SqlitePlanningRunStore,
+) -> None:
+    _queue(store)
+    h = _make_driver(
+        store,
+        subscriber_factory=SharedScriptFactory(
+            [_answer("reject", notes=_THE_NOTE), _answer("approve", attempt=1)]
+        ),
+        spec_replies=[_spec_reply(digest=_LINES_DIGEST)],
+    )
+
+    await h.driver.drive(CID)
+
+    second = _digest_cards(h)[1].payload["details"]["summary"]
+    assert second["what_happened"] == (
+        'The rewrite came back with the same list. Your note was: '
+        f'"{_THE_NOTE}". Approve anyway, send another note, or reject.'
+        "\n\n" + _LINES_BLOCK
+    )
+
+
+def test_a_digest_without_rules_or_flags_adds_nothing() -> None:
+    assert _request_lines_block({}) == ""
+    assert _request_lines_block({"rules": "not a list", "cannot_be_met": [{"line": 2}]}) == ""
+
+
+def test_the_block_stays_short_whatever_the_digest_holds() -> None:
+    long_text = "word " * 200
+    block = _request_lines_block(
+        {
+            "rules": [{"line": n, "text": long_text} for n in range(1, 30)],
+            "cannot_be_met": [{"line": 2, "text": long_text, "why": long_text}],
+        }
+    )
+    assert len(block) < 1500
+    assert block.endswith("more, in the spec's summary.")
+    assert "Line 1 of the request: word word" in block
