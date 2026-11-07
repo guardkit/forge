@@ -219,7 +219,10 @@ schema: 2
 # 6 November 2026: release 2026.11.06-1, the same as 2026.11.05-1 (which was started and taken back when the Spark's
 # keyring crashed) plus GuardKit 08e6eead (a review's look-up keeps its answer under shared load), db448db9 (the
 # per-task review is told what runs at merge; decision 3) and 9ff0acd4 (the last look's limit fits that grace).
-version: 2026.11.06-1
+# 7 November 2026: release 2026.11.07-1, builds run the last look (decision 5): GuardKit 9620dc4d (each note
+# answered by its number), 637e91b9 (a criterion conflict stays until one instruction changes) and 9ffaac3c (on).
+# Its replay kept 60 of 60 true notes. Other pins as 2026.11.06-1.
+version: 2026.11.07-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -295,7 +298,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 9ff0acd491e78dbac447411c206903cb0946ac37
+    commit: 9ffaac3cb180df7b45119d0a645969e82a4dd8a3
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
