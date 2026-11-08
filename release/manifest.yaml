@@ -222,10 +222,11 @@ schema: 2
 # 7 November 2026: release 2026.11.07-1, builds run the last look (decision 5): GuardKit 9620dc4d (each note
 # answered by its number), 637e91b9 (a criterion conflict stays until one instruction changes) and 9ffaac3c (on).
 # Its replay kept 60 of 60 true notes. Other pins as 2026.11.06-1.
-# 8 November 2026: release 2026.11.08-1, a coder attempt that only ran out of time gets another turn while the
-# task's budget holds one (GuardKit ebdbd284; build FEAT-E673's task 005 ended on turn 1 with 10,076 s left).
-# Other pins as 2026.11.07-1.
-version: 2026.11.08-1
+# 8 November 2026: release 2026.11.08-2, a coder attempt that only ran out of time gets another turn while the
+# task's budget holds one (GuardKit ebdbd284; build FEAT-E673's task 005 ended on turn 1 with 10,076 s left), and
+# the wave scheduler reads a task's own file lists before the paths it cites (b803a009; E673's wave 2 ran one task
+# at a time for 290 minutes). 2026.11.08-1 was built but never installed. Other pins as 2026.11.07-1.
+version: 2026.11.08-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -301,7 +302,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: ebdbd2844a7ec601eb9d450f9958b8ae7c5ea241
+    commit: b803a009bb27e942af97dc8b2b8a1cca705f741d
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
