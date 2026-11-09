@@ -226,7 +226,10 @@ schema: 2
 # task's budget holds one (GuardKit ebdbd284; build FEAT-E673's task 005 ended on turn 1 with 10,076 s left), and
 # the wave scheduler reads a task's own file lists before the paths it cites (b803a009; E673's wave 2 ran one task
 # at a time for 290 minutes). 2026.11.08-1 was built but never installed. Other pins as 2026.11.07-1.
-version: 2026.11.08-2
+# 9 November 2026: release 2026.11.09-1, a failed task is tried once more in its own wave, on the same branch, before the
+# next wave starts, so the steps depending on it can run (GuardKit a5e9d77a; build FEAT-E673 skipped three steps after
+# task 005 failed). Other pins as 2026.11.08-2.
+version: 2026.11.09-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -302,7 +305,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: b803a009bb27e942af97dc8b2b8a1cca705f741d
+    commit: a5e9d77a2247d5d91eb182ce2718f77f59ad5da1
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
