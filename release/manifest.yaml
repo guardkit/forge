@@ -229,7 +229,10 @@ schema: 2
 # 9 November 2026: release 2026.11.09-1, a failed task is tried once more in its own wave, on the same branch, before the
 # next wave starts, so the steps depending on it can run (GuardKit a5e9d77a; build FEAT-E673 skipped three steps after
 # task 005 failed). Other pins as 2026.11.08-2.
-version: 2026.11.09-1
+# 9 November 2026: release 2026.11.09-2, the planner image carries specialist-agent 9124b86: one scenario or rule per
+# request line (decision 2) and no reviewer reads a spec any more (Rich: "please remove the spec reviewer"). The Forge
+# image is built again only because the planner image copies its tools from this release's. Other pins as 2026.11.09-1.
+version: 2026.11.09-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
