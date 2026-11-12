@@ -232,7 +232,10 @@ schema: 2
 # 9 November 2026: release 2026.11.09-2, the planner image carries specialist-agent 9124b86: one scenario or rule per
 # request line (decision 2) and no reviewer reads a spec any more (Rich: "please remove the spec reviewer"). The Forge
 # image is built again only because the planner image copies its tools from this release's. Other pins as 2026.11.09-1.
-version: 2026.11.09-2
+# 12 November 2026: release 2026.11.12-1, feature builds get one end review of the whole feature instead of a model
+# review of each task (GuardKit 9a803528, 76645b30, f992853c; Rich: "yes agreed please proceed" on the per-task reviewer
+# head-to-head). Other pins as 2026.11.09-2.
+version: 2026.11.12-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -308,7 +311,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: a5e9d77a2247d5d91eb182ce2718f77f59ad5da1
+    commit: f992853c636e0272b73e18ab003536c3de0b909b
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
