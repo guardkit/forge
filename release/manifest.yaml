@@ -235,7 +235,10 @@ schema: 2
 # 12 November 2026: release 2026.11.12-1, feature builds get one end review of the whole feature instead of a model
 # review of each task (GuardKit 9a803528, 76645b30, f992853c; Rich: "yes agreed please proceed" on the per-task reviewer
 # head-to-head). Other pins as 2026.11.09-2.
-version: 2026.11.12-1
+# 14 November 2026: release 2026.11.14-1, the project's whole-feature check is told the build's own model
+# (FACTORY_MODEL_URL, FACTORY_MODEL_NAME; GuardKit 4bc19fed; Rich: "yes" to checking builds against the real model).
+# Other pins as 2026.11.12-1.
+version: 2026.11.14-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -311,7 +314,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: f992853c636e0272b73e18ab003536c3de0b909b
+    commit: 4bc19fed5c1a600c3a80b3848fc511a2ebe962af
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
