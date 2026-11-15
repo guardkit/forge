@@ -238,7 +238,10 @@ schema: 2
 # 14 November 2026: release 2026.11.14-1, the project's whole-feature check is told the build's own model
 # (FACTORY_MODEL_URL, FACTORY_MODEL_NAME; GuardKit 4bc19fed; Rich: "yes" to checking builds against the real model).
 # Other pins as 2026.11.12-1.
-version: 2026.11.14-1
+# 15 November 2026: release 2026.11.15-1, the end review keeps its findings at the time limit: tool use ends five
+# minutes before it, as read-only reviews already do, including inside a helper it started (guardkitfactory de10c9d;
+# replay of 10 recorded rounds: answered 24/30 to 29/30, true faults 15 to 19). Other pins as 2026.11.14-1.
+version: 2026.11.15-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -329,7 +332,7 @@ repositories:
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
-    commit: a2845cfde3316a1b913d887a429b44cf4f2164a8
+    commit: de10c9ddfaa4d073846810c20a931cdf6a47a990
     role: named-context
   # THE SIXTH REPOSITORY (25 September 2026). It is a named context like the
   # four above — the jarvis image is built from ITS clone, at this pin, and
