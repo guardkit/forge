@@ -241,7 +241,11 @@ schema: 2
 # 15 November 2026: release 2026.11.15-1, the end review keeps its findings at the time limit: tool use ends five
 # minutes before it, as read-only reviews already do, including inside a helper it started (guardkitfactory de10c9d;
 # replay of 10 recorded rounds: answered 24/30 to 29/30, true faults 15 to 19). Other pins as 2026.11.14-1.
-version: 2026.11.15-1
+# 18 November 2026: release 2026.11.18-1, a build's checks use main's test and install commands and limits for what main
+# already declares, as the merge does (GuardKit f0fdc58d, be042e05; FEAT-24BD passed its build under a limit its own
+# builder raised and was refused at merge), and end-review calls reach the call record (GuardKit 4db8f4af). Rich: "Yes".
+# Other pins as 2026.11.15-1.
+version: 2026.11.18-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -317,7 +321,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 4bc19fed5c1a600c3a80b3848fc511a2ebe962af
+    commit: be042e050879a38c16d9d87d5d006914d313dcba
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
