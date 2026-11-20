@@ -245,7 +245,11 @@ schema: 2
 # already declares, as the merge does (GuardKit f0fdc58d, be042e05; FEAT-24BD passed its build under a limit its own
 # builder raised and was refused at merge), and end-review calls reach the call record (GuardKit 4db8f4af). Rich: "Yes".
 # Other pins as 2026.11.15-1.
-version: 2026.11.18-1
+# 20 November 2026: release 2026.11.20-1, the root check runs at the end of each build on the finished tree with the
+# whole-feature check, both again after any repair, under one shared cap (GuardKit 78bdbdfd, 67282d74), and the merge
+# record keeps the failing parts' own output (GuardKit 2f4a8985, 3e742c81). Rich: "yes" to both. Other pins as
+# 2026.11.18-1.
+version: 2026.11.20-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -321,7 +325,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: be042e050879a38c16d9d87d5d006914d313dcba
+    commit: 3e742c810b3c7d2a0cb0b2ac71cfbd1a7a1da6ec
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
