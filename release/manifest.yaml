@@ -249,7 +249,12 @@ schema: 2
 # whole-feature check, both again after any repair, under one shared cap (GuardKit 78bdbdfd, 67282d74), and the merge
 # record keeps the failing parts' own output (GuardKit 2f4a8985, 3e742c81). Rich: "yes" to both. Other pins as
 # 2026.11.18-1.
-version: 2026.11.20-1
+# 23 November 2026: release 2026.11.23-1, the end review no longer loses itself to one refused model call: a picture
+# read over the review's read limit is passed whole and another binary file over it is one plain not-attached line
+# (guardkitfactory 9243a3d), a call refused while holding an attachment is retried once without it (guardkitfactory
+# f56a971), and a review that could not run says so on the merge card (GuardKit f0b55b6d). Rich: "yes please proceed
+# with all three steps". Other pins as 2026.11.20-1.
+version: 2026.11.23-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -325,7 +330,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 3e742c810b3c7d2a0cb0b2ac71cfbd1a7a1da6ec
+    commit: f0b55b6dbe368731d375ba3ee53e97e1a24fb105
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
@@ -340,7 +345,7 @@ repositories:
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
-    commit: de10c9ddfaa4d073846810c20a931cdf6a47a990
+    commit: f56a971db11b97e366b7c446f4f48f145baf6761
     role: named-context
   # THE SIXTH REPOSITORY (25 September 2026). It is a named context like the
   # four above — the jarvis image is built from ITS clone, at this pin, and
