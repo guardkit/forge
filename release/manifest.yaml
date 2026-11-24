@@ -254,7 +254,10 @@ schema: 2
 # (guardkitfactory 9243a3d), a call refused while holding an attachment is retried once without it (guardkitfactory
 # f56a971), and a review that could not run says so on the merge card (GuardKit f0b55b6d). Rich: "yes please proceed
 # with all three steps". Other pins as 2026.11.20-1.
-version: 2026.11.23-1
+# 24 November 2026: release 2026.11.24-1, the merge card says when the end review's last repair was not reviewed again
+# because the review stops after two rounds (GuardKit 92baae97, 0afaa8e1). Rich: "yes please do all three". Other pins as
+# 2026.11.23-1.
+version: 2026.11.24-1
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -330,7 +333,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: f0b55b6dbe368731d375ba3ee53e97e1a24fb105
+    commit: 0afaa8e17c42e502ec862ee028f226a02a8ea964
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
