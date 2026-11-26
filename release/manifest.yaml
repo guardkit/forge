@@ -257,7 +257,11 @@ schema: 2
 # 24 November 2026: release 2026.11.24-1, the merge card says when the end review's last repair was not reviewed again
 # because the review stops after two rounds (GuardKit 92baae97, 0afaa8e1). Rich: "yes please do all three". Other pins as
 # 2026.11.23-1.
-version: 2026.11.24-1
+# 26 November 2026: release 2026.11.26-2, the end review gets a scratch folder it can write to, keeps the faults it
+# wrote down if it is stopped, is told the minutes left only in its last ten minutes, and a command started near its
+# cut-off is limited to the time left (GuardKit 7292ce44, guardkitfactory 35863fb; measured as arm 2b of the end-review
+# replay). Rich: "yes please ship the new end reviewer". Other pins as 2026.11.24-1.
+version: 2026.11.26-2
 
 # The one image this repository's own operator scripts mean by "the release
 # image" (ops/forge-prod-recreate.sh reads this line). It is the same name as
@@ -333,7 +337,7 @@ repositories:
   - name: guardkit
     url: https://github.com/guardkit/guardkit.git
     branch: main
-    commit: 0afaa8e17c42e502ec862ee028f226a02a8ea964
+    commit: 7292ce44f7536f4c0283b975d7f42202f01b6a89
     role: named-context
   - name: nats-core
     url: https://github.com/guardkit/nats-core.git
@@ -348,7 +352,7 @@ repositories:
   - name: guardkitfactory
     url: https://github.com/guardkit/guardkitfactory.git
     branch: main
-    commit: f56a971db11b97e366b7c446f4f48f145baf6761
+    commit: 35863fbf1c2a26a22dfd86a530fe0d0ff281ad5f
     role: named-context
   # THE SIXTH REPOSITORY (25 September 2026). It is a named context like the
   # four above — the jarvis image is built from ITS clone, at this pin, and
